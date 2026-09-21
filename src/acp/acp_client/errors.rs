@@ -8,29 +8,18 @@ use thiserror::Error;
 pub enum AcpError {
     #[error("agent spawn failed: {0}")]
     Spawn(String),
-    /// The session's working directory does not exist on disk. Distinct
-    /// from a generic spawn ENOENT (which on POSIX is indistinguishable
-    /// at the libc level between missing binary, missing interpreter, and
-    /// missing cwd). Surfaced as its own variant so the UI can render a
-    /// targeted remediation banner instead of the default "install the
-    /// adapter" copy. See issue #1089.
+    /// Its own variant because POSIX cannot tell a missing cwd from a missing
+    /// binary at the libc level, and the UI needs a different banner (#1089).
     #[error("project path no longer exists: {path}")]
     ProjectPathMissing { path: PathBuf },
-    /// The ACP `initialize` handshake completed but the adapter failed
-    /// the per-adapter compatibility policy (see
-    /// `src/acp/agent_compat.rs`). Carries the structured detail so
-    /// the supervisor can publish a matching `Event::IncompatibleAgent`
-    /// through the broadcast sink (the in-process event_tx the failed
-    /// `AcpClient::spawn` opened is never delivered, so the structured
-    /// payload has to ride out of band on the typed error). The payload
-    /// is boxed to keep `AcpError` small on the Ok hot path (clippy's
-    /// `result_large_err`).
+    /// The handshake completed but the adapter failed `agent_compat`'s policy.
+    /// The event_tx a failed `AcpClient::spawn` opened is never delivered, so
+    /// the structured detail has to ride out of band on the error. Boxed to
+    /// keep `AcpError` small on the Ok path.
     #[error("incompatible agent: {0}")]
     IncompatibleAgent(Box<IncompatibleAgentError>),
-    /// The agent rejected the handshake with a provider rate limit. Carried
-    /// as a typed failure so the caller parks the session on
-    /// `RateLimit` + `Stopped { rate_limited }` instead of a generic startup
-    /// error that would burn the respawn budget against the same limit.
+    /// Typed so the caller parks on `RateLimit` + `Stopped { rate_limited }`
+    /// instead of burning the respawn budget against the same limit.
     #[error("agent is rate-limited during startup: {}", .0.status)]
     RateLimited(Box<crate::acp::state::RateLimitInfo>),
     #[error("transport error: {0}")]
@@ -45,23 +34,18 @@ pub enum AcpError {
     UnknownNonce,
     #[error("agent did not offer a {0:?} option")]
     NoMatchingOption(ApprovalDecision),
-    /// A submitted elicitation answer failed server-side validation. The
-    /// pending elicitation is left intact so the client can correct the
-    /// answer and resubmit (rather than the question aborting). See #2100.
+    /// The pending elicitation survives so the client can correct and
+    /// resubmit rather than the question aborting (#2100).
     #[error("submitted answer is invalid: {0}")]
     InvalidAnswer(String),
-    /// A driven conversation reset (`session/new` on the live worker for
-    /// a clear command with no native adapter reset, #2979) failed; the
-    /// conversation keeps its prior context.
+    /// A driven `session/new` reset failed (#2979); the conversation keeps
+    /// its prior context.
     #[error("conversation reset failed: {0}")]
     ResetFailed(String),
 }
 
-/// Boxed payload for `AcpError::IncompatibleAgent`. Carries the
-/// structured `StartupErrorDetail` plus a pre-formatted free-form
-/// summary the supervisor mirrors into the legacy
-/// `Event::AgentStartupError { message }` channel for status-derivation
-/// callers that don't yet read the structured detail.
+/// The structured detail plus a formatted summary the supervisor mirrors into
+/// `Event::AgentStartupError { message }` for callers that read only that.
 #[derive(Debug)]
 pub struct IncompatibleAgentError {
     pub detail: crate::acp::state::StartupErrorDetail,
@@ -75,17 +59,11 @@ impl std::fmt::Display for IncompatibleAgentError {
 }
 
 impl AcpError {
-    /// Inspect a `std::io::Error` returned by `Command::spawn` against
-    /// the spawn site's cwd + (resolved) command. POSIX returns ENOENT
-    /// for both "binary not on PATH" and "cwd does not exist", so the
-    /// disambiguation has to happen via filesystem stat. Stats only on
-    /// the ENOENT branch to keep the hot path free.
-    ///
-    /// Belt-and-suspenders for the cwd-missing case: the supervisor
-    /// pre-flights `cwd.exists()` before spawning, but the directory
-    /// can race-disappear between pre-flight and exec. Without this
-    /// classifier the bare ENOENT bubbles up as a generic spawn error
-    /// and the UI lands on the wrong remediation banner. See #1089.
+    /// POSIX returns ENOENT for both "binary not on PATH" and "cwd is gone",
+    /// so only a stat can tell them apart; it runs on the ENOENT branch alone.
+    /// The supervisor pre-flights `cwd.exists()`, but the directory can vanish
+    /// between that and exec, which would land the UI on the wrong banner
+    /// (#1089).
     pub fn classify_spawn_error(
         err: std::io::Error,
         cwd: &std::path::Path,
@@ -99,10 +77,8 @@ impl AcpError {
         AcpError::Spawn(format!("{err} (command `{spawn_command}`)"))
     }
 
-    /// Build the enriched "binary not found" spawn error for a bare-command
-    /// ENOENT (no PATH resolution, cwd present). Appends the exact install
-    /// command when the binary is a known ACP adapter so the web banner can
-    /// show a copyable line instead of making the user guess. See #2109.
+    /// Appends the exact install command for a known ACP adapter so the web
+    /// banner shows a copyable line instead of a guess (#2109).
     pub(super) fn missing_binary_spawn_error(err: &std::io::Error, command: &str) -> Self {
         let hint = crate::acp::install_hints::install_hint_for(command)
             .map(|cmd| format!(". Install with: {cmd}"))
@@ -123,11 +99,9 @@ pub(super) fn acp_internal_error(message: String) -> agent_client_protocol::Erro
     err
 }
 
-/// Reconstruct a crate `Error` from the raw JSON-RPC error object the
-/// runner forwarded in `HandshakeFailed`. Preserves `code` / `message` /
-/// `data` so the downstream `AgentStartupError` surfaces the same
-/// `data.details` remediation the byte-relay handshake did; falls back to a
-/// generic internal error if the object is malformed.
+/// Preserves `code` / `message` / `data` from the runner's `HandshakeFailed`
+/// so `AgentStartupError` surfaces the same `data.details` remediation the
+/// byte-relay handshake did. A malformed object falls back to internal error.
 pub(super) fn acp_error_from_value(error: serde_json::Value) -> agent_client_protocol::Error {
     serde_json::from_value(error.clone())
         .unwrap_or_else(|_| acp_internal_error(format!("runner handshake failed: {error}")))
@@ -136,76 +110,52 @@ pub(super) fn acp_error_from_value(error: serde_json::Value) -> agent_client_pro
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Belt-and-suspenders: even if the pre-flight raced (cwd vanishes
-    /// between `cwd.exists()` and `Command::spawn`), the classifier turns
-    /// the raw ENOENT into `ProjectPathMissing` rather than the generic
-    /// install-the-adapter message.
+
+    fn spawn_message(error: AcpError) -> String {
+        match error {
+            AcpError::Spawn(msg) => msg,
+            other => panic!("expected Spawn, got {other:?}"),
+        }
+    }
+
+    /// Only ENOENT against a vanished cwd becomes `ProjectPathMissing`; the
+    /// pre-flight can race, and a bare ENOENT would land the UI on the
+    /// install-the-adapter banner instead.
     #[test]
-    fn classify_spawn_error_routes_missing_cwd_to_project_path_missing() {
+    fn classify_spawn_error_separates_a_missing_cwd_from_a_missing_binary() {
         let missing =
             std::env::temp_dir().join(format!("aoe-test-classify-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
-        let io_err = std::io::Error::from(std::io::ErrorKind::NotFound);
-        match AcpError::classify_spawn_error(io_err, &missing, "/bin/true") {
+        let enoent = || std::io::Error::from(std::io::ErrorKind::NotFound);
+
+        match AcpError::classify_spawn_error(enoent(), &missing, "/bin/true") {
             AcpError::ProjectPathMissing { path } => assert_eq!(path, missing),
             other => panic!("expected ProjectPathMissing, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn classify_spawn_error_keeps_spawn_when_cwd_exists() {
         let cwd = std::env::temp_dir();
-        let io_err = std::io::Error::from(std::io::ErrorKind::NotFound);
-        match AcpError::classify_spawn_error(io_err, &cwd, "/nonexistent/bin/foo") {
-            AcpError::Spawn(msg) => {
-                assert!(
-                    msg.contains("/nonexistent/bin/foo"),
-                    "spawn message should echo command: {msg}"
-                );
-            }
-            other => panic!("expected Spawn, got {other:?}"),
-        }
+        let msg = spawn_message(AcpError::classify_spawn_error(
+            enoent(),
+            &cwd,
+            "/nonexistent/bin/foo",
+        ));
+        assert!(msg.contains("/nonexistent/bin/foo"), "{msg}");
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        spawn_message(AcpError::classify_spawn_error(denied, &cwd, "/bin/true"));
     }
 
+    /// A known adapter gets a copyable install line; an unknown binary gets
+    /// only its own name.
     #[test]
-    fn missing_binary_spawn_error_appends_install_hint_for_known_agent() {
-        let io_err = std::io::Error::from(std::io::ErrorKind::NotFound);
-        match AcpError::missing_binary_spawn_error(&io_err, "codex-acp") {
-            AcpError::Spawn(msg) => {
-                assert!(msg.contains("codex-acp"), "should echo the binary: {msg}");
-                assert!(
-                    msg.contains(
-                        "Install with: npm install -g @agentclientprotocol/codex-acp@latest"
-                    ),
-                    "should append the exact install command: {msg}"
-                );
-            }
-            other => panic!("expected Spawn, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn missing_binary_spawn_error_omits_hint_for_unknown_binary() {
-        let io_err = std::io::Error::from(std::io::ErrorKind::NotFound);
-        match AcpError::missing_binary_spawn_error(&io_err, "totally-unknown-bin") {
-            AcpError::Spawn(msg) => {
-                assert!(
-                    msg.contains("totally-unknown-bin"),
-                    "should echo binary: {msg}"
-                );
-                assert!(!msg.contains("Install with:"), "no hint for unknown: {msg}");
-            }
-            other => panic!("expected Spawn, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_spawn_error_passes_through_non_enoent() {
-        let cwd = std::env::temp_dir();
-        let io_err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        match AcpError::classify_spawn_error(io_err, &cwd, "/bin/true") {
-            AcpError::Spawn(_) => {}
-            other => panic!("expected Spawn for non-ENOENT, got {other:?}"),
-        }
+    fn missing_binary_spawn_error_appends_a_hint_only_for_known_agents() {
+        let enoent = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let known = spawn_message(AcpError::missing_binary_spawn_error(&enoent, "codex-acp"));
+        assert!(known.contains("codex-acp"), "{known}");
+        assert!(
+            known.contains("Install with: npm install -g @agentclientprotocol/codex-acp@latest"),
+            "{known}"
+        );
+        let unknown = spawn_message(AcpError::missing_binary_spawn_error(&enoent, "unknown-bin"));
+        assert!(unknown.contains("unknown-bin"), "{unknown}");
+        assert!(!unknown.contains("Install with:"), "{unknown}");
     }
 }

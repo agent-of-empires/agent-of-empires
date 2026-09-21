@@ -10,32 +10,26 @@ use crate::tui::components::checkbox::{checkbox_line, CheckboxStyle};
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
 
-/// Options for what to clean up when deleting a session
 #[derive(Clone, Debug, Default)]
 pub struct DeleteOptions {
     pub delete_worktree: bool,
     pub force_delete: bool,
     pub delete_branch: bool,
     pub delete_sandbox: bool,
-    /// For scratch sessions: keep the scratch directory on disk instead of
-    /// removing it. No effect when `DeleteDialogConfig.is_scratch` is false.
+    /// Keep the scratch directory on disk. Only read when `is_scratch`.
     pub keep_scratch: bool,
 }
 
-/// Configuration for what cleanup options to show in the dialog
 #[derive(Clone, Debug, Default)]
 pub struct DeleteDialogConfig {
     pub worktree_branch: Option<String>,
     pub has_sandbox: bool,
-    /// Project path used to load repo-level config overrides.
     pub project_path: Option<String>,
-    /// True iff the session being deleted is a scratch session. Surfaces a
-    /// "Keep scratch directory" opt-in checkbox so users can rescue files
-    /// mid-delete; defaults off so the normal flow stays one-keystroke.
+    /// Surfaces the "Keep scratch directory" opt-in, off by default so the
+    /// normal flow stays one keystroke.
     pub is_scratch: bool,
 }
 
-/// Focus states for navigation
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FocusElement {
     WorktreeCheckbox,
@@ -47,28 +41,19 @@ enum FocusElement {
     NoButton,
 }
 
-/// Unified delete dialog that adapts based on available cleanup options
 pub struct UnifiedDeleteDialog {
     session_title: String,
     config: DeleteDialogConfig,
     options: DeleteOptions,
     focus: FocusElement,
     focusable_elements: Vec<FocusElement>,
-    /// Screen rect of the rendered `[Yes]` button. Captured during
-    /// `render` so `handle_click` can hit-test the same cells the user
-    /// sees. `Rect::default()` until the dialog has been rendered at
-    /// least once.
+    /// The `[Yes]` button, zero-sized until the first render.
     yes_button_area: Rect,
-    /// Screen rect of the rendered `[No]` button, paired with
-    /// `yes_button_area`.
     no_button_area: Rect,
-    /// Per-focusable hit rect captured during `render`. Drives both
-    /// hover (move focus) and click (toggle / submit). Yes/No still
-    /// have dedicated fields above because the renderer returns them
-    /// from `render_yes_no` already; everything else lives here.
+    /// Hit rect per focusable row. Yes/No keep their own fields above,
+    /// since `render_yes_no` already returns them.
     focusable_rects: Vec<(FocusElement, Rect)>,
-    /// Which Yes/No button the mouse is over, for the hover highlight.
-    /// Visual only; never moves keyboard `focus`.
+    /// The hovered button. Visual only; never moves keyboard `focus`.
     hover: HoverState,
 }
 
@@ -88,8 +73,6 @@ impl UnifiedDeleteDialog {
             delete_branch: config.worktree_branch.is_some()
                 && user_config.worktree.delete_branch_on_cleanup,
             delete_sandbox: config.has_sandbox && user_config.sandbox.auto_cleanup,
-            // Scratch sessions default to remove. The user has to explicitly
-            // opt in to keep the directory.
             keep_scratch: false,
         };
 
@@ -118,13 +101,9 @@ impl UnifiedDeleteDialog {
         }
     }
 
-    /// Route a left-click. Returns `Some(Submit)` for `[Yes]`,
-    /// `Some(Cancel)` for `[No]`, `Some(Continue)` for a click on a
-    /// checkbox row (which is treated as a focus-then-toggle), and
-    /// `None` for clicks that landed elsewhere inside the dialog
-    /// (those are silently absorbed by the modal, no fall-through to
-    /// the list). Rects are written during `render`; before the first
-    /// render every rect is zero-sized so `contains()` returns false.
+    /// Route a left-click: `Submit` on `[Yes]`, `Cancel` on `[No]`,
+    /// `Continue` on a checkbox row (focus then toggle), `None` elsewhere
+    /// inside the dialog, which the modal absorbs.
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<DeleteOptions>> {
         let pos = ratatui::layout::Position::from((col, row));
         if self.yes_button_area.contains(pos) {
@@ -141,20 +120,16 @@ impl UnifiedDeleteDialog {
         None
     }
 
-    /// Highlight the Yes/No button or checkbox row under the cursor.
-    /// Hover never moves keyboard `focus` (mouse drift between reading the
-    /// dialog and pressing Enter would otherwise silently flip which
-    /// action fires); it only drives the visual highlight. Click still
-    /// moves focus and (for checkboxes) toggles state. Returns `true` when
-    /// the highlighted target changed so the caller can redraw.
+    /// Highlight the row under the cursor without moving keyboard `focus`:
+    /// a drift between reading the dialog and pressing Enter must not flip
+    /// which action fires. True when the highlight changed.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
         let mut rects = vec![self.yes_button_area, self.no_button_area];
         rects.extend(self.focusable_rects.iter().map(|(_, r)| *r));
         self.hover.update(col, row, &rects)
     }
 
-    /// Rects of the checkbox rows captured this frame, for the hover
-    /// highlight. Yes/No are excluded; they're painted by `render_yes_no`.
+    /// Checkbox rows captured this frame; Yes/No are painted elsewhere.
     fn checkbox_rects(&self) -> Vec<Rect> {
         self.focusable_rects.iter().map(|(_, r)| *r).collect()
     }
@@ -334,19 +309,9 @@ impl UnifiedDeleteDialog {
             7
         };
 
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.error))
-            .title(" Delete Session ")
-            .title_style(Style::default().fg(theme.error).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = super::toned_dialog_block(" Delete Session ", theme.error, theme.error);
+        let (_, inner) =
+            super::render_dialog_frame(frame, area, dialog_width, dialog_height, block);
 
         let mut constraints = vec![
             Constraint::Length(1), // message
@@ -564,12 +529,9 @@ impl UnifiedDeleteDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crate::tui::dialogs::test_keys::key;
 
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
+    /// No worktree, sandbox or scratch, so only the two buttons focus.
     fn simple_dialog() -> UnifiedDeleteDialog {
         UnifiedDeleteDialog::new(
             "Test Session".to_string(),
@@ -578,12 +540,15 @@ mod tests {
         )
     }
 
+    /// Every checkbox present, over a config that turns both auto-cleanups on
+    /// and branch deletion off.
     fn full_dialog() -> UnifiedDeleteDialog {
         let _home = crate::session::test_support::isolate_app_dir();
         std::fs::write(
             crate::session::config::config_path().unwrap(),
             "[worktree]\nauto_cleanup = true\ndelete_branch_on_cleanup = false\n[sandbox]\nauto_cleanup = true\n",
-        ).unwrap();
+        )
+        .unwrap();
         UnifiedDeleteDialog::new(
             "Test Session".to_string(),
             DeleteDialogConfig {
@@ -609,212 +574,86 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_default_options() {
-        let options = DeleteOptions::default();
-        assert!(!options.delete_worktree);
-        assert!(!options.force_delete);
-        assert!(!options.delete_branch);
-        assert!(!options.delete_sandbox);
+    /// Stage the rects `render` would capture: the two buttons, plus a row per
+    /// checkbox for `full_dialog`.
+    fn stage_rects(dialog: &mut UnifiedDeleteDialog, checkboxes: bool) {
+        dialog.focusable_rects.clear();
+        if checkboxes {
+            dialog
+                .focusable_rects
+                .push((FocusElement::WorktreeCheckbox, Rect::new(5, 3, 30, 1)));
+            if dialog.options.delete_worktree {
+                dialog
+                    .focusable_rects
+                    .push((FocusElement::ForceCheckbox, Rect::new(5, 4, 30, 1)));
+            }
+            dialog
+                .focusable_rects
+                .push((FocusElement::BranchCheckbox, Rect::new(5, 5, 30, 1)));
+            dialog
+                .focusable_rects
+                .push((FocusElement::SandboxCheckbox, Rect::new(5, 6, 30, 1)));
+        }
+        dialog.yes_button_area = Rect::new(10, 8, 5, 1);
+        dialog.no_button_area = Rect::new(19, 8, 4, 1);
     }
 
     #[test]
     #[serial_test::serial]
-    fn test_simple_dialog_focuses_no_button() {
-        let dialog = simple_dialog();
-        assert_eq!(dialog.focus, FocusElement::NoButton);
-    }
+    fn opening_focus_and_checkbox_defaults_follow_the_config() {
+        assert_eq!(simple_dialog().focus, FocusElement::NoButton);
 
-    #[test]
-    #[serial_test::serial]
-    fn test_full_dialog_focuses_first_checkbox() {
         let dialog = full_dialog();
         assert_eq!(dialog.focus, FocusElement::WorktreeCheckbox);
+        assert!(dialog.options.delete_worktree, "worktree.auto_cleanup");
+        assert!(!dialog.options.delete_branch, "delete_branch_on_cleanup");
+        assert!(dialog.options.delete_sandbox, "sandbox.auto_cleanup");
+
+        let dialog = scratch_dialog();
+        assert_eq!(dialog.focus, FocusElement::KeepScratchCheckbox);
+        assert!(!dialog.options.keep_scratch, "keeping is opt-in");
     }
 
     #[test]
     #[serial_test::serial]
-    fn test_full_dialog_respects_config_defaults() {
-        let dialog = full_dialog();
-        assert!(
-            dialog.options.delete_worktree,
-            "With default config (auto_cleanup: true), delete_worktree should be true"
-        );
-        assert!(
-            !dialog.options.delete_branch,
-            "With default config (delete_branch_on_cleanup: false), delete_branch should be false"
-        );
-        assert!(
-            dialog.options.delete_sandbox,
-            "With default config (auto_cleanup: true), delete_sandbox should be true"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_tab_cycles_through_elements() {
+    fn tab_cycles_every_focusable_and_arrows_pick_a_button() {
         let mut dialog = full_dialog();
-        assert_eq!(dialog.focus, FocusElement::WorktreeCheckbox);
+        for expected in [
+            FocusElement::ForceCheckbox,
+            FocusElement::BranchCheckbox,
+            FocusElement::SandboxCheckbox,
+            FocusElement::YesButton,
+            FocusElement::NoButton,
+            FocusElement::WorktreeCheckbox,
+        ] {
+            dialog.handle_key(key(KeyCode::Tab));
+            assert_eq!(dialog.focus, expected);
+        }
 
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focus, FocusElement::ForceCheckbox);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focus, FocusElement::BranchCheckbox);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focus, FocusElement::SandboxCheckbox);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focus, FocusElement::YesButton);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focus, FocusElement::NoButton);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focus, FocusElement::WorktreeCheckbox);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_branch_checkbox_toggle() {
-        let mut dialog = full_dialog();
-        dialog.focus = FocusElement::BranchCheckbox;
-        let initial = dialog.options.delete_branch;
-
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert_eq!(dialog.options.delete_branch, !initial);
-
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert_eq!(dialog.options.delete_branch, initial);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_space_toggles_checkbox() {
-        let mut dialog = full_dialog();
-        let initial = dialog.options.delete_worktree;
-
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert_eq!(dialog.options.delete_worktree, !initial);
-
-        dialog.handle_key(key(KeyCode::Char(' ')));
-        assert_eq!(dialog.options.delete_worktree, initial);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_esc_cancels() {
-        let mut dialog = full_dialog();
-        let result = dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_n_cancels() {
-        let mut dialog = full_dialog();
-        let result = dialog.handle_key(key(KeyCode::Char('n')));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_y_confirms() {
-        let mut dialog = full_dialog();
-        let result = dialog.handle_key(key(KeyCode::Char('y')));
-        assert!(matches!(result, DialogResult::Submit(_)));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_enter_on_no_cancels() {
-        let mut dialog = simple_dialog();
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_enter_on_yes_submits() {
-        let mut dialog = simple_dialog();
-        dialog.focus = FocusElement::YesButton;
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Submit(_)));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_left_focuses_yes() {
         let mut dialog = simple_dialog();
         dialog.handle_key(key(KeyCode::Left));
         assert_eq!(dialog.focus, FocusElement::YesButton);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_right_focuses_no() {
-        let mut dialog = simple_dialog();
-        dialog.focus = FocusElement::YesButton;
         dialog.handle_key(key(KeyCode::Right));
         assert_eq!(dialog.focus, FocusElement::NoButton);
     }
 
     #[test]
     #[serial_test::serial]
-    fn test_click_before_render_is_noop() {
-        // Both button rects default to Rect::default() (zero-sized) so
-        // the contains() check returns false until the dialog has been
-        // painted at least once.
-        let mut dialog = simple_dialog();
-        assert!(dialog.handle_click(5, 5).is_none());
-    }
+    fn space_toggles_the_focused_checkbox() {
+        let mut dialog = full_dialog();
+        for focus in [FocusElement::WorktreeCheckbox, FocusElement::BranchCheckbox] {
+            dialog.focus = focus;
+            let read = |d: &UnifiedDeleteDialog| match focus {
+                FocusElement::WorktreeCheckbox => d.options.delete_worktree,
+                _ => d.options.delete_branch,
+            };
+            let before = read(&dialog);
+            dialog.handle_key(key(KeyCode::Char(' ')));
+            assert_eq!(read(&dialog), !before, "{focus:?}");
+            dialog.handle_key(key(KeyCode::Char(' ')));
+            assert_eq!(read(&dialog), before, "{focus:?}");
+        }
 
-    #[test]
-    #[serial_test::serial]
-    fn test_click_on_yes_button_submits() {
-        let mut dialog = simple_dialog();
-        // Stage the button rects manually since the real coordinates
-        // come from render(), which a unit test can't easily invoke.
-        dialog.yes_button_area = Rect::new(10, 8, 5, 1);
-        dialog.no_button_area = Rect::new(19, 8, 4, 1);
-
-        let result = dialog.handle_click(12, 8).expect("yes hit");
-        assert!(matches!(result, DialogResult::Submit(_)));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_click_on_no_button_cancels() {
-        let mut dialog = simple_dialog();
-        dialog.yes_button_area = Rect::new(10, 8, 5, 1);
-        dialog.no_button_area = Rect::new(19, 8, 4, 1);
-
-        let result = dialog.handle_click(20, 8).expect("no hit");
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_click_between_buttons_misses() {
-        let mut dialog = simple_dialog();
-        dialog.yes_button_area = Rect::new(10, 8, 5, 1);
-        dialog.no_button_area = Rect::new(19, 8, 4, 1);
-        // The four-space gap between "[Yes]" and "[No]" is dead space.
-        assert!(dialog.handle_click(16, 8).is_none());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_scratch_dialog_focuses_keep_scratch_checkbox() {
-        let dialog = scratch_dialog();
-        assert_eq!(dialog.focus, FocusElement::KeepScratchCheckbox);
-        assert!(!dialog.options.keep_scratch, "default must be off");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_scratch_dialog_toggles_keep_scratch_on_space() {
         let mut dialog = scratch_dialog();
         dialog.handle_key(key(KeyCode::Char(' ')));
         assert!(dialog.options.keep_scratch);
@@ -824,143 +663,113 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_submit_returns_options() {
+    fn confirm_and_cancel_keys_decide_the_dialog() {
+        for code in [KeyCode::Esc, KeyCode::Char('n')] {
+            assert!(matches!(
+                full_dialog().handle_key(key(code)),
+                DialogResult::Cancel
+            ));
+        }
+        assert!(matches!(
+            simple_dialog().handle_key(key(KeyCode::Enter)),
+            DialogResult::Cancel
+        ));
+
+        let mut dialog = simple_dialog();
+        dialog.focus = FocusElement::YesButton;
+        assert!(matches!(
+            dialog.handle_key(key(KeyCode::Enter)),
+            DialogResult::Submit(_)
+        ));
+
+        // Submitting carries the staged options out.
         let mut dialog = full_dialog();
         dialog.options.delete_worktree = true;
         dialog.options.force_delete = true;
         dialog.options.delete_branch = true;
         dialog.options.delete_sandbox = true;
-
-        let result = dialog.handle_key(key(KeyCode::Char('y')));
-        match result {
+        match dialog.handle_key(key(KeyCode::Char('y'))) {
             DialogResult::Submit(opts) => {
                 assert!(opts.delete_worktree);
                 assert!(opts.force_delete);
                 assert!(opts.delete_branch);
                 assert!(opts.delete_sandbox);
             }
-            _ => panic!("Expected Submit"),
+            _ => panic!("expected Submit"),
         }
-    }
-
-    /// Stage button + checkbox rects manually (the real ones come from
-    /// `render`, which is impractical to invoke in a unit test).
-    fn stage_rects_for_simple(dialog: &mut UnifiedDeleteDialog) {
-        dialog.yes_button_area = Rect::new(10, 8, 5, 1);
-        dialog.no_button_area = Rect::new(19, 8, 4, 1);
-        // simple_dialog has no worktree/sandbox/scratch, so the only
-        // focusable elements are the two buttons; no checkbox rects.
-    }
-
-    fn stage_rects_for_full(dialog: &mut UnifiedDeleteDialog) {
-        dialog.focusable_rects.clear();
-        dialog
-            .focusable_rects
-            .push((FocusElement::WorktreeCheckbox, Rect::new(5, 3, 30, 1)));
-        if dialog.options.delete_worktree {
-            dialog
-                .focusable_rects
-                .push((FocusElement::ForceCheckbox, Rect::new(5, 4, 30, 1)));
-        }
-        dialog
-            .focusable_rects
-            .push((FocusElement::BranchCheckbox, Rect::new(5, 5, 30, 1)));
-        dialog
-            .focusable_rects
-            .push((FocusElement::SandboxCheckbox, Rect::new(5, 6, 30, 1)));
-        dialog.yes_button_area = Rect::new(10, 10, 5, 1);
-        dialog.no_button_area = Rect::new(19, 10, 4, 1);
     }
 
     #[test]
     #[serial_test::serial]
-    fn hover_highlights_button_without_changing_focus() {
-        // Hover drives the visual highlight only; it must leave focus
-        // alone, otherwise mouse drift between reading the dialog and
-        // pressing Enter / Space silently shifts which element the next
-        // keystroke targets.
+    fn clicks_hit_the_buttons_and_the_checkbox_rows() {
+        // Every rect is zero-sized before the first render, so nothing hits.
+        assert!(simple_dialog().handle_click(5, 5).is_none());
+
         let mut dialog = simple_dialog();
-        stage_rects_for_simple(&mut dialog);
-        dialog.focus = FocusElement::NoButton;
-        let yes = dialog.yes_button_area;
-        let no = dialog.no_button_area;
-
-        // Over Yes: highlight Yes, focus stays put.
-        assert!(dialog.handle_hover(12, 8));
-        assert_eq!(dialog.hover.current(), Some(yes));
-        assert_eq!(dialog.focus, FocusElement::NoButton);
-
-        // Over No: highlight follows, focus still unchanged.
-        assert!(dialog.handle_hover(20, 8));
-        assert_eq!(dialog.hover.current(), Some(no));
-        assert_eq!(dialog.focus, FocusElement::NoButton);
-
-        // Same cell again: nothing changed, so no redraw is requested.
-        assert!(!dialog.handle_hover(20, 8));
-
-        // Off the buttons: highlight clears, focus unchanged.
-        assert!(dialog.handle_hover(50, 50));
-        assert_eq!(dialog.hover.current(), None);
-        assert_eq!(dialog.focus, FocusElement::NoButton);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn hover_on_checkbox_row_highlights_without_stealing_focus() {
-        let mut dialog = full_dialog();
-        stage_rects_for_full(&mut dialog);
-        dialog.focus = FocusElement::YesButton;
-        // (10, 5) lands on the branch checkbox row staged by the helper.
-        assert!(dialog.handle_hover(10, 5));
-        assert_eq!(dialog.hover.current(), Some(Rect::new(5, 5, 30, 1)));
-        assert_eq!(
-            dialog.focus,
-            FocusElement::YesButton,
-            "hover must not move keyboard focus"
+        stage_rects(&mut dialog, false);
+        assert!(matches!(
+            dialog.handle_click(12, 8),
+            Some(DialogResult::Submit(_))
+        ));
+        assert!(matches!(
+            dialog.handle_click(20, 8),
+            Some(DialogResult::Cancel)
+        ));
+        assert!(
+            dialog.handle_click(16, 8).is_none(),
+            "the gap between the buttons is dead space"
         );
-    }
 
-    #[test]
-    #[serial_test::serial]
-    fn click_on_checkbox_toggles_and_focuses() {
         let mut dialog = full_dialog();
-        stage_rects_for_full(&mut dialog);
+        stage_rects(&mut dialog, true);
         let before = dialog.options.delete_branch;
-        let result = dialog
-            .handle_click(10, 5)
-            .expect("checkbox click should return Continue");
-        assert!(matches!(result, DialogResult::Continue));
+        assert!(matches!(
+            dialog.handle_click(10, 5),
+            Some(DialogResult::Continue)
+        ));
         assert_eq!(dialog.focus, FocusElement::BranchCheckbox);
         assert_eq!(dialog.options.delete_branch, !before);
-    }
 
-    #[test]
-    #[serial_test::serial]
-    fn click_on_worktree_checkbox_toggles_and_rebuilds_focusables() {
+        // Turning worktree off clears force_delete and drops its row from the
+        // focusables.
         let mut dialog = full_dialog();
-        // Force a known starting state so the test doesn't depend on
-        // whatever the default config's `worktree.auto_cleanup` is.
         dialog.options.delete_worktree = true;
         dialog.options.force_delete = true;
         dialog.rebuild_focusable_elements();
-        stage_rects_for_full(&mut dialog);
+        stage_rects(&mut dialog, true);
+        let focusables = dialog.focusable_elements.len();
+        assert!(matches!(
+            dialog.handle_click(10, 3),
+            Some(DialogResult::Continue)
+        ));
+        assert!(!dialog.options.delete_worktree);
+        assert!(!dialog.options.force_delete);
+        assert!(dialog.focusable_elements.len() < focusables);
+    }
 
-        let before_focusables = dialog.focusable_elements.len();
-        let result = dialog
-            .handle_click(10, 3)
-            .expect("worktree click should return Continue");
-        assert!(matches!(result, DialogResult::Continue));
-        assert!(
-            !dialog.options.delete_worktree,
-            "worktree click should toggle the option off"
-        );
-        assert!(
-            !dialog.options.force_delete,
-            "turning worktree off also clears force_delete"
-        );
-        assert!(
-            dialog.focusable_elements.len() < before_focusables,
-            "ForceCheckbox should drop out of focusables when worktree is off"
-        );
+    #[test]
+    #[serial_test::serial]
+    fn hover_highlights_without_moving_keyboard_focus() {
+        // Drift between reading the dialog and pressing Enter or Space must
+        // not shift which element the next keystroke targets.
+        let mut dialog = simple_dialog();
+        stage_rects(&mut dialog, false);
+        dialog.focus = FocusElement::NoButton;
+        for (col, want) in [(12, dialog.yes_button_area), (20, dialog.no_button_area)] {
+            assert!(dialog.handle_hover(col, 8));
+            assert_eq!(dialog.hover.current(), Some(want));
+            assert_eq!(dialog.focus, FocusElement::NoButton);
+        }
+        assert!(!dialog.handle_hover(20, 8), "same cell is no redraw");
+        assert!(dialog.handle_hover(50, 50));
+        assert_eq!(dialog.hover.current(), None);
+        assert_eq!(dialog.focus, FocusElement::NoButton);
+
+        let mut dialog = full_dialog();
+        stage_rects(&mut dialog, true);
+        dialog.focus = FocusElement::YesButton;
+        assert!(dialog.handle_hover(10, 5));
+        assert_eq!(dialog.hover.current(), Some(Rect::new(5, 5, 30, 1)));
+        assert_eq!(dialog.focus, FocusElement::YesButton);
     }
 }

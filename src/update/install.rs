@@ -20,10 +20,6 @@ pub enum InstallMethod {
     Unknown { binary_path: PathBuf },
 }
 
-/// Pure prefix-based classification used by `detect_install_method`.
-/// Returns the method as far as path prefixes can determine; Homebrew
-/// detection requires running `brew list` and is layered on by
-/// `classify_with_brew`.
 fn classify_path_prefix(binary_path: &Path, home: &Path) -> InstallMethod {
     let path = binary_path;
 
@@ -53,10 +49,7 @@ fn classify_path_prefix(binary_path: &Path, home: &Path) -> InstallMethod {
     }
 }
 
-/// Layer Homebrew detection on top of the prefix classification:
-/// only return `Homebrew` if `brew list aoe` produced a path that
-/// canonicalizes to the same file as the running binary. Otherwise
-/// keep the prefix classification.
+/// `Homebrew` only when `brew list aoe` resolves to the running binary.
 fn classify_with_brew(
     prefix: InstallMethod,
     brew_path: Option<&Path>,
@@ -82,12 +75,7 @@ fn paths_canonicalize_equal(a: &Path, b: &Path) -> bool {
 pub fn detect_install_method() -> Result<InstallMethod> {
     let exe = std::env::current_exe().context("locating current executable")?;
     let exe = exe.canonicalize().unwrap_or(exe);
-    // Canonicalize home too, otherwise on macOS a binary at /tmp/.../.local/bin/aoe
-    // gets a canonicalized exe path of /private/tmp/.../.local/bin/aoe but home is
-    // still /tmp/..., the parent-prefix comparison fails, and the binary
-    // misclassifies as Unknown. Same failure mode for any user whose HOME
-    // resolves through a symlink. canonicalize() can fail (home doesn't exist
-    // on disk, permission errors, etc.) so we fall back to the raw path.
+    // Canonicalize home too: a symlinked HOME (macOS `/tmp`) would otherwise misclassify as Unknown.
     let home = dirs::home_dir().context("locating home directory")?;
     let home = home.canonicalize().unwrap_or(home);
     let prefix = classify_path_prefix(&exe, &home);
@@ -95,20 +83,9 @@ pub fn detect_install_method() -> Result<InstallMethod> {
     Ok(classify_with_brew(prefix, brew_path.as_deref(), &exe))
 }
 
-/// How long we wait for `brew list aoe` to come back before assuming
-/// brew is hung (locked formula DB, network-bound auto-update, etc.)
-/// and giving up on the probe. Detection runs on TUI startup, so this
-/// directly bounds startup latency on machines with brew.
+/// Detection runs on TUI startup, so this bounds startup latency.
 const BREW_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Run `brew list aoe` and return the path to the installed binary, if any.
-/// We parse the output (one path per line) and pick the line that ends in
-/// `/aoe` or `/bin/aoe`. If brew is not installed, the formula is not installed,
-/// or the command fails for any other reason, return `None`.
-///
-/// Bounded by `BREW_PROBE_TIMEOUT`: if brew doesn't return in time we
-/// kill the child and treat it as "not a brew install" rather than
-/// blocking the TUI's startup-update path.
 fn probe_brew_aoe_path() -> Option<PathBuf> {
     probe_brew_aoe_path_with_timeout(BREW_PROBE_TIMEOUT)
 }
@@ -117,9 +94,6 @@ fn probe_brew_aoe_path_with_timeout(timeout: std::time::Duration) -> Option<Path
     let mut cmd = Command::new("brew");
     cmd.args(["list", "aoe"]);
 
-    // run_with_timeout kills brew at the deadline and captures output in a
-    // temporary regular file, so neither a hung brew nor a grandchild that
-    // inherits the handle can block the probe.
     let output = crate::process::run_with_timeout(&mut cmd, timeout)
         .ok()
         .flatten()?;
@@ -136,9 +110,6 @@ fn probe_brew_aoe_path_with_timeout(timeout: std::time::Duration) -> Option<Path
     None
 }
 
-/// Return the platform string used in release tarball asset names
-/// (e.g. `linux-amd64`). `os` matches `std::env::consts::OS`,
-/// `arch` matches `std::env::consts::ARCH`.
 fn platform_string_for(os: &str, arch: &str) -> Result<&'static str> {
     let os_norm = match os {
         "linux" => "linux",
@@ -150,7 +121,6 @@ fn platform_string_for(os: &str, arch: &str) -> Result<&'static str> {
         "aarch64" | "arm64" => "arm64",
         other => anyhow::bail!("unsupported architecture: {other}"),
     };
-    // Static lookup so we can return &'static str.
     Ok(match (os_norm, arch_norm) {
         ("linux", "amd64") => "linux-amd64",
         ("linux", "arm64") => "linux-arm64",
@@ -173,9 +143,6 @@ fn release_tarball_url(version: &str, platform: &str) -> String {
     format!("{base}/v{version}/aoe-{platform}.tar.gz")
 }
 
-/// Download a release tarball to `dest`. Streams bytes; reports
-/// progress via the optional callback (current bytes, total bytes
-/// if known).
 async fn download_tarball(
     url: &str,
     dest: &Path,
@@ -210,16 +177,10 @@ async fn download_tarball(
     Ok(())
 }
 
-/// Extract a `.tar.gz` into `dest_dir`. Shells out to `tar xzf`, which is
-/// universally available on macOS/Linux and matches what `scripts/install.sh`
-/// does. Returns the path to the extracted binary
-/// (`dest_dir/aoe-{platform}`).
 fn extract_tarball(tarball: &Path, dest_dir: &Path, platform: &str) -> Result<PathBuf> {
     let mut cmd = Command::new("tar");
     cmd.arg("xzf").arg(tarball).arg("-C").arg(dest_dir);
-    // Reachable from `perform_update` inside `IgnoreSignalsGuard`'s window
-    // (`src/tui/app.rs`); reset SIGINT/SIGQUIT so `tar` doesn't inherit
-    // the parent's ignore (SIG_IGN survives exec).
+    // Runs inside `IgnoreSignalsGuard`'s window; reset signals so `tar` can be interrupted.
     #[cfg(unix)]
     crate::process::reset_signals_on_exec(&mut cmd);
     let status = cmd.status().context("running `tar xzf`")?;
@@ -233,15 +194,10 @@ fn extract_tarball(tarball: &Path, dest_dir: &Path, platform: &str) -> Result<Pa
     Ok(extracted)
 }
 
-/// Run the candidate binary with `--version` and confirm its output
-/// contains the expected version string. Defends against corrupt
-/// downloads and wrong-arch tarballs that downloaded successfully but
-/// won't run.
 fn sanity_check_binary(binary: &Path, expected_version: &str) -> Result<()> {
     let mut cmd = Command::new(binary);
     cmd.arg("--version");
-    // See the comment in `extract_tarball`: this runs inside the same
-    // guarded window.
+    // Runs inside `IgnoreSignalsGuard`'s window; see `extract_tarball`.
     #[cfg(unix)]
     crate::process::reset_signals_on_exec(&mut cmd);
     let output = cmd
@@ -267,14 +223,7 @@ fn sanity_check_binary(binary: &Path, expected_version: &str) -> Result<()> {
     Ok(())
 }
 
-/// Atomically replace `target` with `source`. Both paths must be on the
-/// same filesystem (callers ensure this by placing the temp file in the
-/// same parent directory as the target). On `EACCES`, falls back to two
-/// sequential `sudo` invocations (`sudo mv` then `sudo chmod 0755`); the
-/// user gets one password prompt thanks to sudo's timestamp cache.
-///
-/// On Unix, this is safe to do while the target is the running binary -
-/// the kernel keeps the old inode alive for the running process.
+/// Both paths must share a filesystem. Falls back to `sudo mv` + `sudo chmod` on `EACCES`.
 fn atomic_replace(source: &Path, target: &Path) -> Result<()> {
     match std::fs::rename(source, target) {
         Ok(()) => {
@@ -290,7 +239,7 @@ fn atomic_replace(source: &Path, target: &Path) -> Result<()> {
 fn sudo_replace(source: &Path, target: &Path) -> Result<()> {
     let mut mv_cmd = Command::new("sudo");
     mv_cmd.arg("mv").arg(source).arg(target);
-    // Runs inside the same guarded window; see `extract_tarball`.
+    // Runs inside `IgnoreSignalsGuard`'s window; see `extract_tarball`.
     #[cfg(unix)]
     crate::process::reset_signals_on_exec(&mut mv_cmd);
     let mv_status = mv_cmd.status().context("invoking `sudo mv`")?;
@@ -308,13 +257,6 @@ fn sudo_replace(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Probes whether the directory containing `binary_path` is writable
-/// without sudo by creating and removing a uniquely-named temp file.
-///
-/// Uses `tempfile::Builder` so a process killed mid-probe leaves no
-/// stale file behind that could poison subsequent calls. (An earlier
-/// version used a fixed name and would return `false` forever if the
-/// process died between create and unlink.)
 pub fn parent_is_writable(binary_path: &Path) -> bool {
     let Some(parent) = binary_path.parent() else {
         return false;
@@ -325,9 +267,6 @@ pub fn parent_is_writable(binary_path: &Path) -> bool {
         .is_ok()
 }
 
-/// Perform an in-place tarball update at `binary_path`, fetching the
-/// release for `version`. Caller has already detected the install
-/// method and confirmed with the user.
 pub async fn update_via_tarball(
     binary_path: &Path,
     version: &str,
@@ -351,9 +290,6 @@ pub async fn update_via_tarball(
     Ok(())
 }
 
-/// How long we wait for `brew info aoe --json=v2` before giving up on
-/// learning what version Homebrew has. Same rationale as
-/// `BREW_PROBE_TIMEOUT`: don't let a hung `brew` block the update flow.
 const BREW_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Deserialize)]
@@ -366,9 +302,6 @@ struct BrewVersions {
     stable: Option<String>,
 }
 
-/// Return the `versions.stable` Homebrew currently advertises for the
-/// `aoe` formula, or `None` if brew isn't installed, the formula isn't
-/// known, the probe times out, or the JSON can't be parsed.
 fn brew_available_version() -> Option<String> {
     brew_available_version_with_timeout(BREW_INFO_TIMEOUT)
 }
@@ -376,12 +309,10 @@ fn brew_available_version() -> Option<String> {
 fn brew_available_version_with_timeout(timeout: std::time::Duration) -> Option<String> {
     let mut cmd = Command::new("brew");
     cmd.args(["info", "aoe", "--json=v2"]);
-    // Reachable from `update_via_brew`, which runs inside
-    // `IgnoreSignalsGuard`'s window; see `extract_tarball`.
+    // Runs inside `IgnoreSignalsGuard`'s window; see `extract_tarball`.
     #[cfg(unix)]
     crate::process::reset_signals_on_exec(&mut cmd);
 
-    // Same bounded-wait rationale as probe_brew_aoe_path_with_timeout.
     let output = crate::process::run_with_timeout(&mut cmd, timeout)
         .ok()
         .flatten()?;
@@ -391,10 +322,7 @@ fn brew_available_version_with_timeout(timeout: std::time::Duration) -> Option<S
     parse_brew_stable_version(&output.stdout)
 }
 
-/// `brew info --json=v2` wraps the formula list under a top-level
-/// `formulae` array; older `--json=v1` (and some shims) return the bare
-/// array. Accept either so this keeps working if Homebrew reshuffles the
-/// envelope, and so the unit tests can use the simpler shape.
+/// Accepts both the v2 `formulae` envelope and the bare v1 array.
 fn parse_brew_stable_version(stdout: &[u8]) -> Option<String> {
     if let Ok(entries) = serde_json::from_slice::<Vec<BrewInfoEntry>>(stdout) {
         return entries.into_iter().next()?.versions.stable;
@@ -413,18 +341,8 @@ fn brew_formula_lag_message(target_version: &str) -> String {
     )
 }
 
-/// True if the running install can pull `target_version` right now.
-///
-/// Returns `false` only for the specific Homebrew-formula-lag case
-/// (release is on GitHub but the formula hasn't caught up yet). All
-/// other install methods return `true`, as do Homebrew installs where
-/// the formula already has the version, where brew probing fails, or
-/// where install detection fails. Callers use this to suppress the
-/// TUI's "update available" ribbon during the lag window so users
-/// aren't nagged about an update they can't apply yet.
-///
-/// Synchronous (runs `brew info` with a timeout); call from a
-/// `spawn_blocking` task if you're on the tokio runtime.
+/// `false` only while the Homebrew formula lags the release, so the TUI does not nag.
+/// Blocking; call from `spawn_blocking` on tokio.
 pub fn install_method_supports_target(target_version: &str) -> bool {
     let Ok(method) = detect_install_method() else {
         return true;
@@ -452,8 +370,7 @@ pub fn install_method_supports_target(target_version: &str) -> bool {
 fn update_via_brew(target_version: &str) -> Result<()> {
     let mut update_cmd = Command::new("brew");
     update_cmd.args(["update"]);
-    // Runs inside the caller's `IgnoreSignalsGuard` window; see
-    // `extract_tarball`.
+    // Runs inside `IgnoreSignalsGuard`'s window; see `extract_tarball`.
     #[cfg(unix)]
     crate::process::reset_signals_on_exec(&mut update_cmd);
     let status = update_cmd.status().context("running `brew update`")?;
@@ -461,11 +378,7 @@ fn update_via_brew(target_version: &str) -> Result<()> {
         anyhow::bail!("`brew update` failed (exit {})", status);
     }
 
-    // Homebrew formulae lag behind GitHub releases by minutes to hours.
-    // If brew's formula is still on an older version, `brew upgrade aoe`
-    // exits 0 silently and leaves the user on the old binary, with the TUI
-    // still nagging about an available update. Detect the lag up front
-    // and bail with a clear explanation instead.
+    // A lagging formula makes `brew upgrade aoe` exit 0 without upgrading.
     if let Some(brew_version) = brew_available_version() {
         if is_newer_version(target_version, &brew_version) {
             anyhow::bail!(brew_formula_lag_message(target_version));
@@ -518,9 +431,6 @@ fn print_unknown_refusal(binary_path: &Path) {
     println!("{}", unknown_refusal_message(binary_path));
 }
 
-/// Render the four-line confirm-prompt block. Used by both the CLI and
-/// the TUI dialog. Produces no trailing newline; caller adds the
-/// "Proceed? [Y/n]" line.
 pub fn format_prompt_block(
     current_version: &str,
     latest_version: &str,
@@ -546,9 +456,6 @@ pub fn format_prompt_block(
     out
 }
 
-/// Top-level dispatch. The caller has already chosen the version and
-/// done the user confirmation. `on_progress` is forwarded to the
-/// tarball downloader (other paths ignore it).
 pub async fn perform_update(
     method: &InstallMethod,
     version: &str,
@@ -584,79 +491,44 @@ mod tests {
     }
 
     #[test]
-    fn classifies_nix_store() {
-        let p = PathBuf::from("/nix/store/abc123-aoe-0.4.5/bin/aoe");
-        assert_eq!(classify_path_prefix(&p, &home()), InstallMethod::Nix);
+    fn classify_path_prefix_maps_install_locations() {
+        let home = home();
+        let nix = |_: &Path| InstallMethod::Nix;
+        let cargo = |_: &Path| InstallMethod::Cargo;
+        let tarball = |p: &Path| InstallMethod::Tarball {
+            binary_path: p.to_path_buf(),
+        };
+        let unknown = |p: &Path| InstallMethod::Unknown {
+            binary_path: p.to_path_buf(),
+        };
+        let cases: &[(PathBuf, &dyn Fn(&Path) -> InstallMethod)] = &[
+            (PathBuf::from("/nix/store/abc123-aoe-0.4.5/bin/aoe"), &nix),
+            (home.join(".cargo/bin/aoe"), &cargo),
+            (PathBuf::from("/usr/local/bin/aoe"), &tarball),
+            (home.join(".local/bin/aoe"), &tarball),
+            (home.join("bin/aoe"), &tarball),
+            (PathBuf::from("/opt/aoe-custom/bin/aoe"), &unknown),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                classify_path_prefix(path, &home),
+                expected(path.as_path()),
+                "{path:?}"
+            );
+        }
     }
 
-    #[test]
-    fn classifies_cargo_bin() {
-        let p = home().join(".cargo/bin/aoe");
-        assert_eq!(classify_path_prefix(&p, &home()), InstallMethod::Cargo);
-    }
-
-    #[test]
-    fn classifies_usr_local_bin_as_tarball() {
-        let p = PathBuf::from("/usr/local/bin/aoe");
-        assert_eq!(
-            classify_path_prefix(&p, &home()),
-            InstallMethod::Tarball { binary_path: p }
-        );
-    }
-
-    #[test]
-    fn classifies_local_bin_as_tarball() {
-        let p = home().join(".local/bin/aoe");
-        assert_eq!(
-            classify_path_prefix(&p, &home()),
-            InstallMethod::Tarball {
-                binary_path: p.clone()
-            }
-        );
-    }
-
-    #[test]
-    fn classifies_home_bin_as_tarball() {
-        let p = home().join("bin/aoe");
-        assert_eq!(
-            classify_path_prefix(&p, &home()),
-            InstallMethod::Tarball {
-                binary_path: p.clone()
-            }
-        );
-    }
-
-    #[test]
-    fn classifies_random_path_as_unknown() {
-        let p = PathBuf::from("/opt/aoe-custom/bin/aoe");
-        assert_eq!(
-            classify_path_prefix(&p, &home()),
-            InstallMethod::Unknown { binary_path: p }
-        );
-    }
-
-    /// Regression: on macOS `/tmp` is a symlink to `/private/tmp`. If the
-    /// caller passes a canonicalized exe (`/private/tmp/...`) but a
-    /// non-canonicalized home (`/tmp/...`), the parent-prefix comparison
-    /// fails and a perfectly fine tarball install at `~/.local/bin/aoe`
-    /// looks like Unknown.
-    ///
-    /// This test exercises classify_path_prefix specifically — the caller
-    /// is responsible for canonicalizing both sides. The fix lives in
-    /// detect_install_method (canonicalize home too).
     #[test]
     fn classifier_requires_consistent_canonicalization() {
         let raw_home = PathBuf::from("/tmp/test-home");
         let canon_home = PathBuf::from("/private/tmp/test-home");
         let canonicalized_exe = canon_home.join(".local/bin/aoe");
 
-        // With raw home + canonicalized exe → misclassifies as Unknown.
         assert!(matches!(
             classify_path_prefix(&canonicalized_exe, &raw_home),
             InstallMethod::Unknown { .. }
         ));
 
-        // With both canonicalized → correct Tarball classification.
         assert_eq!(
             classify_path_prefix(&canonicalized_exe, &canon_home),
             InstallMethod::Tarball {
@@ -665,12 +537,6 @@ mod tests {
         );
     }
 
-    /// Real-filesystem regression test: build a symlinked HOME on disk,
-    /// place an aoe binary at $HOME/.local/bin/aoe through the symlink,
-    /// and verify detect_install_method (which does its own canonicalize)
-    /// still classifies it as Tarball, not Unknown.
-    ///
-    /// Skipped if symlink creation fails (e.g., Windows without privileges).
     #[cfg(unix)]
     #[test]
     fn detects_tarball_through_symlinked_home() {
@@ -684,22 +550,15 @@ mod tests {
         #[cfg(unix)]
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        // Create a symlink that points at real_dir, then run the classifier
-        // with the symlink path as home and the canonical exe path.
         let link_dir = TempDir::new().unwrap();
         let symlinked_home = link_dir.path().join("symlinked-home");
         std::os::unix::fs::symlink(real_dir.path(), &symlinked_home).unwrap();
 
-        // canonicalized exe goes through real_dir
         let canon_exe = exe.canonicalize().unwrap();
-        // canonicalized home also goes through real_dir
         let canon_home = symlinked_home.canonicalize().unwrap();
 
-        // Sanity: the symlinked path differs from the canonical one
         assert_ne!(symlinked_home, canon_home);
 
-        // With both canonicalized (what detect_install_method does after
-        // the fix), the classifier sees a matching parent.
         assert_eq!(
             classify_path_prefix(&canon_exe, &canon_home),
             InstallMethod::Tarball {
@@ -709,82 +568,48 @@ mod tests {
     }
 
     #[test]
-    fn brew_takes_priority_when_paths_match() {
-        // brew probe returned a path that canonicalizes to the running binary
-        let exe = PathBuf::from("/opt/homebrew/Cellar/aoe/0.4.5/bin/aoe");
-        let brew_path = Some(exe.clone());
-        let prefix_class = InstallMethod::Unknown {
-            binary_path: exe.clone(),
+    fn brew_classification_needs_a_probe_path_equal_to_the_exe() {
+        let brew_exe = PathBuf::from("/opt/homebrew/Cellar/aoe/0.4.5/bin/aoe");
+        let other_exe = PathBuf::from("/usr/local/bin/aoe");
+        let tarball = InstallMethod::Tarball {
+            binary_path: other_exe.clone(),
         };
-        let result = classify_with_brew(prefix_class, brew_path.as_deref(), &exe);
-        assert_eq!(result, InstallMethod::Homebrew);
+        let cases = [
+            (
+                &brew_exe,
+                Some(brew_exe.as_path()),
+                InstallMethod::Unknown {
+                    binary_path: brew_exe.clone(),
+                },
+                InstallMethod::Homebrew,
+            ),
+            (
+                &other_exe,
+                Some(brew_exe.as_path()),
+                tarball.clone(),
+                tarball.clone(),
+            ),
+            (&other_exe, None, tarball.clone(), tarball.clone()),
+        ];
+        for (exe, brew_path, prefix_class, expected) in cases {
+            assert_eq!(classify_with_brew(prefix_class, brew_path, exe), expected);
+        }
     }
 
     #[test]
-    fn brew_ignored_when_paths_differ() {
-        // brew is installed (probe returned a path) but the running binary
-        // is somewhere else - keep the prefix classification
-        let exe = PathBuf::from("/usr/local/bin/aoe");
-        let brew_path = Some(PathBuf::from("/opt/homebrew/Cellar/aoe/0.4.5/bin/aoe"));
-        let prefix_class = InstallMethod::Tarball {
-            binary_path: exe.clone(),
-        };
-        let result = classify_with_brew(prefix_class.clone(), brew_path.as_deref(), &exe);
-        assert_eq!(result, prefix_class);
-    }
-
-    #[test]
-    fn brew_ignored_when_probe_returned_none() {
-        let exe = PathBuf::from("/usr/local/bin/aoe");
-        let prefix_class = InstallMethod::Tarball {
-            binary_path: exe.clone(),
-        };
-        let result = classify_with_brew(prefix_class.clone(), None, &exe);
-        assert_eq!(result, prefix_class);
-    }
-
-    #[test]
-    fn platform_string_linux_x86_64() {
-        assert_eq!(
-            platform_string_for("linux", "x86_64").unwrap(),
-            "linux-amd64"
-        );
-    }
-
-    #[test]
-    fn platform_string_linux_aarch64() {
-        assert_eq!(
-            platform_string_for("linux", "aarch64").unwrap(),
-            "linux-arm64"
-        );
-    }
-
-    #[test]
-    fn platform_string_macos_amd64() {
-        assert_eq!(
-            platform_string_for("macos", "x86_64").unwrap(),
-            "darwin-amd64"
-        );
-    }
-
-    #[test]
-    fn platform_string_macos_arm64() {
-        assert_eq!(
-            platform_string_for("macos", "aarch64").unwrap(),
-            "darwin-arm64"
-        );
-    }
-
-    #[test]
-    fn platform_string_unsupported_arch_errors() {
-        let err = platform_string_for("linux", "riscv64").unwrap_err();
-        assert!(err.to_string().contains("riscv64"));
-    }
-
-    #[test]
-    fn platform_string_unsupported_os_errors() {
-        let err = platform_string_for("windows", "x86_64").unwrap_err();
-        assert!(err.to_string().contains("windows"));
+    fn platform_string_maps_supported_targets_and_rejects_the_rest() {
+        for (os, arch, expected) in [
+            ("linux", "x86_64", "linux-amd64"),
+            ("linux", "aarch64", "linux-arm64"),
+            ("macos", "x86_64", "darwin-amd64"),
+            ("macos", "aarch64", "darwin-arm64"),
+        ] {
+            assert_eq!(platform_string_for(os, arch).unwrap(), expected);
+        }
+        for (os, arch) in [("linux", "riscv64"), ("windows", "x86_64")] {
+            let err = platform_string_for(os, arch).unwrap_err().to_string();
+            assert!(err.contains(arch) || err.contains(os), "{err}");
+        }
     }
 
     #[test]
@@ -813,59 +638,46 @@ mod tests {
     }
 
     #[test]
-    fn prompt_block_tarball_no_sudo() {
-        let m = InstallMethod::Tarball {
-            binary_path: PathBuf::from("/home/u/.local/bin/aoe"),
+    fn prompt_block_reports_method_location_and_sudo() {
+        let tarball = |p: &str| InstallMethod::Tarball {
+            binary_path: PathBuf::from(p),
         };
-        let s = format_prompt_block("0.4.5", "0.5.0", &m, false);
-        assert!(s.contains("Update v0.4.5 → v0.5.0"));
-        assert!(s.contains("Method:    tarball install"));
-        assert!(s.contains("Location:  /home/u/.local/bin/aoe"));
-        assert!(!s.contains("Sudo:"));
+        let cases = [
+            (
+                tarball("/home/u/.local/bin/aoe"),
+                false,
+                "Update v0.4.5 \u{2192} v0.5.0|Method:    tarball install|Location:  /home/u/.local/bin/aoe",
+            ),
+            (
+                tarball("/usr/local/bin/aoe"),
+                true,
+                "Sudo:      required (write-protected directory)",
+            ),
+            (
+                InstallMethod::Homebrew,
+                false,
+                "Method:    homebrew|Location:  managed by Homebrew",
+            ),
+            (InstallMethod::Nix, false, "Method:    nix"),
+        ];
+        for (method, sudo, needles) in &cases {
+            let s = format_prompt_block("0.4.5", "0.5.0", method, *sudo);
+            for needle in needles.split('|') {
+                assert!(s.contains(needle), "{needle} missing from {s}");
+            }
+            assert_eq!(s.contains("Sudo:"), *sudo);
+        }
     }
 
     #[test]
-    fn prompt_block_tarball_sudo_required() {
-        let m = InstallMethod::Tarball {
-            binary_path: PathBuf::from("/usr/local/bin/aoe"),
-        };
-        let s = format_prompt_block("0.4.5", "0.5.0", &m, true);
-        assert!(s.contains("Sudo:      required (write-protected directory)"));
-    }
-
-    #[test]
-    fn prompt_block_homebrew_omits_location_path() {
-        let s = format_prompt_block("0.4.5", "0.5.0", &InstallMethod::Homebrew, false);
-        assert!(s.contains("Method:    homebrew"));
-        assert!(s.contains("Location:  managed by Homebrew"));
-    }
-
-    #[test]
-    fn prompt_block_nix() {
-        let s = format_prompt_block("0.4.5", "0.5.0", &InstallMethod::Nix, false);
-        assert!(s.contains("Method:    nix"));
-    }
-
-    #[test]
-    fn nix_refusal_message_contains_nix_run() {
+    fn refusal_messages_point_at_the_owning_installer() {
         assert!(nix_refusal_message().contains("nix run github:agent-of-empires/agent-of-empires"));
-    }
-
-    #[test]
-    fn cargo_refusal_message_contains_cargo_install() {
         assert!(cargo_refusal_message().contains("cargo install"));
+        let unknown = unknown_refusal_message(Path::new("/opt/weird/aoe"));
+        assert!(unknown.contains("install.sh"));
+        assert!(unknown.contains("/opt/weird/aoe"));
     }
 
-    #[test]
-    fn unknown_refusal_message_contains_install_script_url() {
-        let s = unknown_refusal_message(Path::new("/opt/weird/aoe"));
-        assert!(s.contains("install.sh"));
-        assert!(s.contains("/opt/weird/aoe"));
-    }
-
-    /// Tests for `sudo_replace` using a PATH-shimmed `sudo` that just
-    /// `exec`s its arguments. Avoids needing real root or a real sudo
-    /// password prompt while still exercising the actual code path.
     mod sudo_replace_tests {
         use super::*;
         use serial_test::serial;
@@ -882,8 +694,6 @@ mod tests {
 
         fn write_failing_sudo_shim(dir: &Path) {
             let shim = dir.join("sudo");
-            // Returns 1, never execs the wrapped command. Models the user
-            // entering the wrong password or hitting Ctrl+C at the prompt.
             std::fs::write(&shim, "#!/bin/sh\nexit 1\n").unwrap();
             #[cfg(unix)]
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -951,7 +761,6 @@ mod tests {
         assert_eq!(parse_brew_stable_version(b"not json"), None);
         assert_eq!(parse_brew_stable_version(b""), None);
         assert_eq!(parse_brew_stable_version(b"[]"), None);
-        // v2 envelope with no formulae
         assert_eq!(
             parse_brew_stable_version(br#"{"formulae":[],"casks":[]}"#),
             None
@@ -966,9 +775,6 @@ mod tests {
         assert!(msg.to_lowercase().contains("try again"));
     }
 
-    /// Hermetic tests for `update_via_brew`: PATH-shim a brew script that
-    /// records its argv so we can assert the right commands ran in the
-    /// right order, and that failures are surfaced.
     mod brew_upgrade_tests {
         use super::*;
         use serial_test::serial;
@@ -976,10 +782,6 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
 
-        /// Brew shim that handles `info aoe --json=v2` (emits the supplied
-        /// stable version as a v1-style top-level array) and records every
-        /// invocation. `fail_on` lets a test simulate a brew subcommand
-        /// failing (matched on the first arg).
         fn write_recording_brew_shim(
             dir: &Path,
             stable_version: &str,
@@ -1010,102 +812,60 @@ mod tests {
 
         #[test]
         #[serial]
-        fn runs_update_info_then_upgrade_aoe() {
-            let dir = TempDir::new().unwrap();
-            let log = write_recording_brew_shim(dir.path(), "1.5.2", None);
+        fn brew_upgrade_stops_at_the_first_failing_step() {
+            // (formula version, step the shim fails on, brew calls expected, error substrings)
+            let cases: [(&str, Option<&str>, &[&str], &[&str]); 4] = [
+                (
+                    "1.5.2",
+                    None,
+                    &["update", "info aoe --json=v2", "upgrade aoe"],
+                    &[],
+                ),
+                ("1.5.2", Some("update"), &["update"], &["brew update"]),
+                (
+                    "1.5.2",
+                    Some("upgrade"),
+                    &["update", "info aoe --json=v2", "upgrade aoe"],
+                    &["brew upgrade aoe"],
+                ),
+                (
+                    "1.5.1",
+                    None,
+                    &["update", "info aoe --json=v2"],
+                    &["v1.5.2", "Homebrew"],
+                ),
+            ];
+            for (formula_version, fail_on, expected_calls, expected_error) in cases {
+                let dir = TempDir::new().unwrap();
+                let log = write_recording_brew_shim(dir.path(), formula_version, fail_on);
 
-            let _path = crate::session::test_support::path_prepended(dir.path());
-            update_via_brew("1.5.2").expect("brew upgrade should succeed");
+                let _path = crate::session::test_support::path_prepended(dir.path());
+                let result = update_via_brew("1.5.2");
+                match expected_error {
+                    [] => {
+                        result.unwrap_or_else(|e| panic!("{formula_version} {fail_on:?}: {e}"));
+                    }
+                    needles => {
+                        let msg = result.expect_err("expected a failure").to_string();
+                        for needle in needles {
+                            assert!(msg.contains(needle), "{needle} missing from {msg}");
+                        }
+                    }
+                }
 
-            let invocations = std::fs::read_to_string(&log).unwrap();
-            let lines: Vec<_> = invocations.lines().collect();
-            assert_eq!(lines.len(), 3, "expected 3 brew calls; got {invocations:?}");
-            assert_eq!(lines[0], "update");
-            assert_eq!(lines[1], "info aoe --json=v2");
-            assert_eq!(lines[2], "upgrade aoe");
+                let invocations = std::fs::read_to_string(&log).unwrap();
+                assert_eq!(
+                    invocations.lines().collect::<Vec<_>>(),
+                    expected_calls,
+                    "{formula_version} {fail_on:?}"
+                );
+            }
         }
 
-        #[test]
-        #[serial]
-        fn brew_update_failure_aborts_before_upgrade() {
-            let dir = TempDir::new().unwrap();
-            let log = write_recording_brew_shim(dir.path(), "1.5.2", Some("update"));
-
-            let _path = crate::session::test_support::path_prepended(dir.path());
-            let err = update_via_brew("1.5.2");
-            let err = err.expect_err("brew update failure should propagate");
-            assert!(
-                err.to_string().contains("brew update"),
-                "expected `brew update` failure message; got: {err}"
-            );
-
-            let invocations = std::fs::read_to_string(&log).unwrap();
-            let lines: Vec<_> = invocations.lines().collect();
-            assert_eq!(
-                lines,
-                vec!["update"],
-                "info/upgrade should not run after update failure"
-            );
-        }
-
-        #[test]
-        #[serial]
-        fn brew_upgrade_failure_is_reported() {
-            let dir = TempDir::new().unwrap();
-            let log = write_recording_brew_shim(dir.path(), "1.5.2", Some("upgrade"));
-
-            let _path = crate::session::test_support::path_prepended(dir.path());
-            let err = update_via_brew("1.5.2");
-            let err = err.expect_err("brew upgrade failure should propagate");
-            assert!(
-                err.to_string().contains("brew upgrade aoe"),
-                "expected `brew upgrade aoe` failure message; got: {err}"
-            );
-
-            let invocations = std::fs::read_to_string(&log).unwrap();
-            let lines: Vec<_> = invocations.lines().collect();
-            assert_eq!(lines.len(), 3, "expected update, info, upgrade calls");
-        }
-
-        /// Regression for #913: when the GitHub release is newer than the
-        /// version Homebrew's formula advertises, `update_via_brew` must
-        /// bail loudly. Without the pre-check, `brew upgrade aoe` exits 0
-        /// and leaves the user on the old binary while the TUI keeps
-        /// nagging about an available update.
-        #[test]
-        #[serial]
-        fn bails_when_brew_formula_lags_target() {
-            let dir = TempDir::new().unwrap();
-            // brew has 1.5.1 but we're trying to install 1.5.2
-            let log = write_recording_brew_shim(dir.path(), "1.5.1", None);
-
-            let _path = crate::session::test_support::path_prepended(dir.path());
-            let err = update_via_brew("1.5.2");
-            let err = err.expect_err("formula lag should fail loudly");
-            let msg = err.to_string();
-            assert!(
-                msg.contains("v1.5.2") && msg.to_lowercase().contains("homebrew"),
-                "expected formula-lag explanation; got: {msg}"
-            );
-
-            let invocations = std::fs::read_to_string(&log).unwrap();
-            let lines: Vec<_> = invocations.lines().collect();
-            assert_eq!(
-                lines,
-                vec!["update", "info aoe --json=v2"],
-                "upgrade should not run when brew is behind"
-            );
-        }
-
-        /// If `brew info` returns no parseable data (older brew, network
-        /// blip, formula not tapped yet), fall back to the legacy
-        /// behavior of just running `brew upgrade aoe`. Better to attempt
-        /// the upgrade than to block users on a parsing edge case.
         #[test]
         #[serial]
         fn proceeds_when_brew_info_returns_no_data() {
             let dir = TempDir::new().unwrap();
-            // No JSON branch in this shim; `info` emits nothing.
             let log = dir.path().join("brew.log");
             let shim = dir.path().join("brew");
             let body = format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log.display());
@@ -1123,9 +883,6 @@ mod tests {
         }
     }
 
-    /// Hermetic test that the brew probe times out instead of blocking
-    /// forever when `brew` hangs (locked formula DB, network-bound auto-
-    /// update, etc.). Uses a sleep-forever shim on PATH.
     mod brew_probe_timeout_tests {
         use super::*;
         use serial_test::serial;

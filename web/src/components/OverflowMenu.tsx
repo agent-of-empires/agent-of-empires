@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { type TourAnchorId } from "../lib/tourSteps";
+import { StrokeIcon } from "./icons";
 
 export interface OverflowItem {
   label: string;
@@ -43,20 +44,11 @@ export function OverflowMenu({ items, triggerDataTour }: Props) {
         aria-haspopup="menu"
         aria-expanded={open}
       >
-        <svg
-          width="16"
-          height="16"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
+        <StrokeIcon size={16} strokeWidth="1.5">
           <circle cx="5" cy="12" r="1.5" />
           <circle cx="12" cy="12" r="1.5" />
           <circle cx="19" cy="12" r="1.5" />
-        </svg>
+        </StrokeIcon>
       </button>
 
       {open && (

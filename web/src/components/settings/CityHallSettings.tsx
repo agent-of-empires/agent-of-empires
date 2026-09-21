@@ -2,19 +2,7 @@ import { useState } from "react";
 
 import { fetchCityHallBundle } from "../../lib/api";
 
-/// Export this install's CityHall config bundle: the settings and projects a
-/// CityHall deployment should give every workspace it spawns (#8).
-///
-/// One-way on purpose. An admin configures a normal aoe install, exports the
-/// bundle here, and pastes it into CityHall; CityHall then serves it to each
-/// workspace, which applies it at boot. There is no import button because a
-/// workspace never authors its own config: the routes that would write it are
-/// closed in CityHall client mode, and applying a bundle by hand is
-/// `aoe cityhall apply`.
-///
-/// This tab is absent from the curated CityHall sidebar, and the endpoint
-/// refuses CityHall mode outright, so an end user inside a workspace can reach
-/// it by neither route.
+/// Exports the CityHall config bundle. Export only: workspaces apply bundles at boot.
 export function CityHallSettings() {
   const [bundle, setBundle] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -51,8 +39,7 @@ export function CityHallSettings() {
       await navigator.clipboard.writeText(bundle);
       setCopied(true);
     } catch {
-      // Clipboard access needs a secure context and can be denied outright;
-      // Download is always available, so this needs no error of its own.
+      // Download remains available when clipboard access is denied.
     }
   }
 

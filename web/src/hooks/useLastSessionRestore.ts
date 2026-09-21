@@ -3,30 +3,9 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { isStandalone } from "../lib/platform";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "../lib/safeStorage";
 
-// Device-local id of the last session the user had open, so an installed PWA
-// reopens to it instead of the dashboard (#2103). Not registered in webUiSync:
-// sessions/worktrees are host-specific, so syncing this across devices would
-// redirect to ids that don't exist locally.
 export const LAST_SESSION_KEY = "aoe-last-session-id";
 
-/**
- * Remember the active session and restore it on a PWA relaunch (#2103).
- *
- * An installed PWA reopens at its install URL "/", so it always landed on the
- * dashboard instead of the session the user last had open. This persists the
- * active session id whenever it changes and, on a cold launch that lands on the
- * dashboard root, redirects to it once sessions have loaded.
- *
- * Restore is gated on `isStandalone()`: `location.key === "default"` (the
- * initial history entry) is true for every fresh page load, not just an
- * installed PWA relaunch, so without the standalone check a plain browser tab
- * with a stale stored id would get redirected off the dashboard too. The
- * standalone check still lets an in-app navigation to the dashboard through
- * unaffected, since that never has `location.key === "default"`. The persist
- * effect only clears the key on such an in-app return, never on the initial
- * entry, so the restore below still sees it on a cold launch. A stored id that
- * no longer matches a loaded session is dropped.
- */
+// Restore only in a standalone PWA: every fresh page load has `location.key === "default"`.
 export function useLastSessionRestore(params: {
   activeSessionId: string | null;
   sessions: readonly { id: string }[];
@@ -45,10 +24,6 @@ export function useLastSessionRestore(params: {
   }, [activeSessionId, location.pathname, location.key]);
 
   useEffect(() => {
-    // Restore reacts to router state (cold-launch URL, back/forward, deep links,
-    // push-driven navigation), not a single DOM event, so it must be an effect.
-    // The rule misreads the hook's params as component props and the navigate as
-    // passing data to a parent; neither applies to a router-state reactor.
     /* eslint-disable react-you-might-not-need-an-effect/no-event-handler */
     if (
       location.key !== "default" ||

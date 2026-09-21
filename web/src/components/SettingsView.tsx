@@ -142,7 +142,7 @@ const CITYHALL_THEME_HIDDEN = ["color_mode", "idle_decay_minutes"];
 /** `session.*` fields the app shell reads into its own state and hands down by
  *  context. Saving one has to re-read settings, or the shell keeps the old
  *  value until a reload: the field is written and the surface it drives does
- *  not move. Keep in step with `applyAppSettings` in App.tsx. */
+ *  not move. Keep in step with `parseAppSettings` in App.tsx. */
 const SESSION_FIELDS_THE_APP_READS = new Set([
   "row_tag",
   "show_session_colors",

@@ -1,7 +1,4 @@
 //! CLI argument definitions for documentation generation
-//!
-//! This module contains the CLI struct definitions used by clap.
-//! They're separated from main.rs so xtask can generate documentation.
 
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
@@ -259,12 +256,6 @@ pub enum Commands {
     },
 }
 
-/// Every command name [`command_name`] can return, used as the closed
-/// allowlist when building the `cli_usage` telemetry event: any key loaded from
-/// a hand-edited or corrupt `telemetry.json` that is not in this set is dropped
-/// before sending, so the wire payload can only ever carry these tokens. Keep
-/// in sync with [`command_name`]; the unit test asserts every `command_name`
-/// output is a member.
 pub const CLI_COMMAND_NAMES: &[&str] = &[
     "add",
     "agents",
@@ -301,16 +292,6 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "completion",
 ];
 
-/// The canonical, telemetry-safe name of a CLI subcommand, or `None` for the
-/// hidden internal commands that are machine-spawned rather than user-invoked
-/// (`__acp-runner`, `__extract-session-id`) and must never be counted.
-///
-/// This is an exhaustive match with **no catch-all**: adding a [`Commands`]
-/// variant fails to compile until it is named here, so the telemetry vocabulary
-/// can never silently drift. The returned tokens are identifier-safe
-/// (`snake_case`, never clap's kebab-case like `log-level`) because the
-/// telemetry gateway drops map keys that do not match `^[a-z][a-z0-9_]{0,63}$`.
-/// They carry no arguments, flags, or paths, only the closed command name.
 pub fn command_name(command: &Commands) -> Option<&'static str> {
     Some(match command {
         Commands::Add(_) => "add",
@@ -324,7 +305,6 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Send(_) => "send",
         Commands::Status(_) => "status",
         Commands::Killall(_) => "killall",
-        // Hidden trap; never a user action, never counted.
         Commands::Stop { .. } => return None,
         Commands::Session { .. } => "session",
         Commands::Group { .. } => "group",
@@ -344,7 +324,6 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Serve(_) => "serve",
         Commands::Url(_) => "url",
         Commands::Acp { .. } => "acp",
-        // Internal, machine-spawned commands: never a user action, never counted.
         Commands::AcpRunner(_) => return None,
         Commands::ExtractSessionId(_) => return None,
         Commands::Uninstall(_) => "uninstall",
@@ -359,11 +338,6 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    /// Every name `command_name` returns must be in the `CLI_COMMAND_NAMES`
-    /// allowlist and be an identifier-safe token (no args, no kebab-case), so a
-    /// privacy reviewer can trust the only strings reaching the wire are closed
-    /// command names. Parsed via clap so alias collapse (`ls` -> `list`,
-    /// `rm` -> `remove`) and the real kebab/underscore mapping are exercised.
     #[test]
     fn command_name_is_allowlisted_and_identifier_safe() {
         let cases: &[(&[&str], &str)] = &[
@@ -392,20 +366,12 @@ mod tests {
         }
     }
 
-    /// Hidden, machine-spawned commands are never counted.
     #[test]
     fn hidden_commands_are_not_named() {
         let cli = Cli::try_parse_from(["aoe", "__extract-session-id"]).expect("parse");
         assert_eq!(command_name(cli.command.as_ref().expect("command")), None);
     }
 
-    /// The compiler forces a `command_name` arm per `Commands` variant, but
-    /// nothing forces a matching `CLI_COMMAND_NAMES` entry. Without this guard a
-    /// contributor could add a counted command and silently drop it from the
-    /// `cli_usage` payload (`build_cli_usage` filters unknown keys). Assert every
-    /// visible clap subcommand is in the allowlist (subset direction: an
-    /// extra allowlist entry is a harmless never-matched filter key).
-    /// `log-level` maps to `log_level`.
     #[test]
     fn allowlist_covers_every_visible_subcommand() {
         use clap::CommandFactory;

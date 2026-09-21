@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-//
-// Unit tests for MobileTerminalToolbar's keyboard wiring (#1432). The strip
-// is never rendered under the chromium Playwright coverage run (pointer:coarse
-// does not match there), so these exercise it directly: the paste button and
-// the Ctrl latch. The parent (a live terminal
-// view) always owns the keyboard inset now, so the strip carries none.
 
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -71,9 +65,8 @@ describe("MobileTerminalToolbar", () => {
     await waitFor(() => expect(sendData).toHaveBeenCalledWith("\x1b[200~line 1\nline 2\x1b[201~"));
   });
 
-  // Every toolbar send bypasses the textarea's beforeinput, so the retained
-  // syllable must be gone before the PTY sees the key, or the next Korean
-  // keystroke rewrites the stale value into the new line. See #3877.
+  // Every toolbar send bypasses the textarea's beforeinput, so the retained syllable must be gone before the PTY
+  // sees the key, or the next Korean keystroke rewrites the stale value into the new line.
   it("drops the retained IME shadow before each out-of-band send", async () => {
     vi.useFakeTimers();
     try {
@@ -166,15 +159,8 @@ describe("MobileTerminalToolbar", () => {
   });
 });
 
-// User story (ported from the live Playwright acp-stories suite): the
-// Ctrl toggle latches the modifier so the next keystroke combines with
-// Ctrl. Tapping Ctrl flips aria-pressed to "true"; tapping again flips
-// it back. The latch state lives in the parent (TerminalView /
-// PairedTerminal hold a useState and pass `onCtrlToggle={() =>
-// setCtrlActive(v => !v)}`); this harness mirrors that wiring so the
-// toolbar's aria-pressed contract is exercised end to end. The
-// modifier-applied keystroke itself is handled by the terminal helper
-// textarea and is out of scope here.
+// User story (ported from the live Playwright acp-stories suite): the Ctrl toggle latches the modifier so the next
+// keystroke combines with Ctrl.
 function CtrlLatchHarness({ sendData }: { sendData: (data: string) => void }) {
   const [ctrlActive, setCtrlActive] = useState(false);
   return (

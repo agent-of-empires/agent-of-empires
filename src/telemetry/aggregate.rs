@@ -1,65 +1,31 @@
-//! Windowed aggregate of live session state for `aoe serve`.
-//!
-//! A point-in-time `usage_snapshot` only sees sessions alive at the instant the
-//! periodic tick fires, so a session that opens and closes between two ticks is
-//! invisible in the agent/model attribution and never lifts the concurrency
-//! peak. `aoe serve` folds a sample of the live session list into a
-//! [`UsageAggregator`] every ~30 min and reports the window's peak concurrency
-//! and distinct-sessions-seen maps at flush time, while keeping the send cadence
-//! at one POST per send window (see `src/server/serve_snapshot.rs`).
-//!
-//! Sampling is coarse on purpose (the issue, #1870, chose a ~30-min interval):
-//! a session born and gone entirely between two samples is still missed, but
-//! its raw count survives in `session_creates_since_last_snapshot`. What this
-//! recovers is the agent/model mix and peak/typical concurrency of sessions
-//! that live long enough to be sampled at least once.
+//! Windowed aggregate of live session state for `aoe serve`, so sessions between
+//! snapshot ticks still count toward the agent/model mix and concurrency peak.
 
 use std::collections::BTreeMap;
 
 use crate::session::Instance;
 
-/// Soft cap on distinct session ids tracked in one window. The aggregate is
-/// reset only on a confirmed send, so a daemon whose endpoint stays unreachable
-/// for a long stretch would otherwise keep folding new ids forever. Past the
-/// cap we stop adding new ids (peak concurrency and already-seen sessions still
-/// update), bounding worst-case memory without touching the happy path. The
-/// limit is far above any realistic distinct-session count for one send window.
+/// The window resets only on a confirmed send, so cap new ids while the endpoint is down.
 const MAX_SEEN: usize = 10_000;
 
-/// In-memory accumulator folded by the serve telemetry loop. Reset (dropped /
-/// re-defaulted) only after a confirmed send so a failed send retains the
-/// window for the next attempt.
+/// Reset only after a confirmed send so a failed send keeps the window.
 #[derive(Default)]
 pub struct UsageAggregator {
     peak_concurrent_sessions: u32,
-    /// session id -> (agent bucket, model bucket), latest observed. Keyed by
-    /// session id so a session sampled in multiple windows-internal ticks
-    /// counts once; storing the *latest* buckets (rather than a per-bucket set)
-    /// means a session whose model bucket changes mid-window is counted in one
-    /// bucket, not double-counted.
+    /// Latest buckets per session id, so a mid-window model change is not double-counted.
     seen: BTreeMap<String, (String, String)>,
 }
 
 impl UsageAggregator {
-    /// Fold one sample of the live session list into the running window.
-    ///
-    /// Trashed sessions are excluded, matching the point-in-time census
-    /// (#3258). The exclusion is by observation, not retroactive: a session
-    /// sampled while live and trashed later stays in `seen`, because it was
-    /// genuinely seen during the window.
+    /// Trash is excluded at sample time: a session seen live stays counted if trashed later.
     pub fn sample(&mut self, instances: &[Instance]) {
         let mut concurrent = 0u32;
         for inst in instances {
             if inst.is_trashed() {
                 continue;
             }
-            // Counted here rather than from `instances.len()`, which would let
-            // trashed rows keep inflating the peak even with the loop filtered.
             concurrent += 1;
             let buckets = super::instance_buckets(inst);
-            // Refresh an already-seen session's bucket regardless; only gate
-            // *new* ids on the cap so a stuck-offline daemon can't grow `seen`
-            // without bound.
             if self.seen.contains_key(&inst.id) || self.seen.len() < MAX_SEEN {
                 self.seen.insert(inst.id.clone(), buckets);
             }
@@ -67,12 +33,10 @@ impl UsageAggregator {
         self.peak_concurrent_sessions = self.peak_concurrent_sessions.max(concurrent);
     }
 
-    /// Max concurrent `session_total` seen across the window.
     pub fn peak_concurrent_sessions(&self) -> u32 {
         self.peak_concurrent_sessions
     }
 
-    /// Distinct sessions seen per agent bucket across the window.
     pub fn distinct_by_agent(&self) -> BTreeMap<String, u32> {
         let mut out: BTreeMap<String, u32> = BTreeMap::new();
         for (agent, _model) in self.seen.values() {
@@ -81,7 +45,6 @@ impl UsageAggregator {
         out
     }
 
-    /// Distinct sessions seen per model bucket across the window.
     pub fn distinct_by_model(&self) -> BTreeMap<String, u32> {
         let mut out: BTreeMap<String, u32> = BTreeMap::new();
         for (_agent, model) in self.seen.values() {
@@ -107,8 +70,6 @@ mod tests {
     #[test]
     fn folds_distinct_sessions_across_samples() {
         let mut agg = UsageAggregator::default();
-        // Window: two sessions early, a different one later. None concurrent
-        // with all the others, but all three are "seen" across the window.
         agg.sample(&[
             inst("a", "claude", Status::Running),
             inst("b", "claude", Status::Idle),
@@ -118,7 +79,6 @@ mod tests {
         let by_agent = agg.distinct_by_agent();
         assert_eq!(by_agent.get("claude"), Some(&2));
         assert_eq!(by_agent.get("codex"), Some(&1));
-        // Distinct-seen total (3) exceeds any single concurrent count.
         let distinct_total: u32 = by_agent.values().sum();
         assert_eq!(distinct_total, 3);
     }
@@ -139,8 +99,6 @@ mod tests {
     #[test]
     fn same_session_counts_once_with_latest_bucket() {
         let mut agg = UsageAggregator::default();
-        // The same session id sampled twice must count once; a later sample's
-        // bucket wins, so it is never double-counted across buckets.
         agg.sample(&[inst("a", "claude", Status::Running)]);
         agg.sample(&[inst("a", "codex", Status::Running)]);
 
@@ -153,7 +111,6 @@ mod tests {
     #[test]
     fn caps_distinct_ids_but_keeps_tracking_peak() {
         let mut agg = UsageAggregator::default();
-        // Fill `seen` past the cap with distinct ids across many samples.
         for i in 0..(MAX_SEEN + 50) {
             agg.sample(&[inst(&format!("s{i}"), "claude", Status::Running)]);
         }
@@ -163,14 +120,12 @@ mod tests {
             "new ids stop being added past cap"
         );
 
-        // A large concurrent sample still lifts the peak even when `seen` is full.
         let big: Vec<Instance> = (0..MAX_SEEN + 200)
             .map(|i| inst(&format!("s{i}"), "claude", Status::Running))
             .collect();
         agg.sample(&big);
         assert_eq!(agg.peak_concurrent_sessions(), (MAX_SEEN + 200) as u32);
 
-        // An already-seen id still refreshes its bucket past the cap.
         agg.sample(&[inst("s0", "codex", Status::Running)]);
         assert_eq!(
             agg.seen.get("s0"),
@@ -178,9 +133,6 @@ mod tests {
         );
     }
 
-    // Trash is excluded from the window the same way it is from the
-    // point-in-time census (#3258), and the exclusion applies at sample time:
-    // a session seen live and trashed afterwards keeps its place in the window.
     #[test]
     fn trashed_sessions_are_excluded_at_sample_time() {
         let mut agg = UsageAggregator::default();
@@ -196,8 +148,6 @@ mod tests {
         assert_eq!(agg.distinct_by_agent().get("codex"), None);
         assert_eq!(agg.distinct_by_agent().get("claude"), Some(&1));
 
-        // Trashed after being seen: the earlier live observation stands, so the
-        // session stays counted rather than being erased from the window.
         let mut later_trashed = inst("live", "claude", Status::Running);
         later_trashed.trash();
         agg.sample(&[later_trashed]);

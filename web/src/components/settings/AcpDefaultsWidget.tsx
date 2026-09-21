@@ -1,13 +1,5 @@
-// Per-agent structured-view defaults editor (#2631).
-//
-// Replaces the raw-JSON textarea for `session.acp_defaults` with one card per
-// ACP-capable agent, each offering model / mode / thinking dropdowns plus
-// per-model thinking overrides. The dropdown choices come from the recall
-// catalog (`GET /api/acp/option-catalog`), which is whatever each agent last
-// advertised over ACP, so new models and new agents flow in with no code
-// change. When an agent has no cached options yet, or a saved value is not in
-// the catalog, the control degrades to free text and flags the value as
-// unverified. The raw-JSON escape hatch stays available under an advanced fold.
+// Per-agent structured view defaults. Choices come from what each agent last
+// advertised over ACP; unknown values degrade to free text marked unverified.
 
 import { useEffect, useState } from "react";
 
@@ -46,10 +38,7 @@ function optionByCategory(
   return options?.find((o) => o.category === category);
 }
 
-/** Build `<select>` options: an "adapter default" empty choice, the advertised
- *  choices, and, when the saved value is not among them, an "(unverified)"
- *  entry so a stale or hand-entered value stays selected rather than silently
- *  resetting. */
+/** Keeps a saved value missing from the catalog selected as "(unverified)". */
 function selectOptions(
   descriptor: ConfigOptionDescriptor | undefined,
   saved: string | undefined,
@@ -73,8 +62,7 @@ function freshness(entry: AgentOptionEntry | undefined): string {
   return `Options last seen ${stamp}.`;
 }
 
-/** One field: a dropdown when the agent advertised choices for the category,
- *  else a free-text input (with the same unverified-preservation intent). */
+/** A dropdown when the agent advertised choices, else free text. */
 function OptionField({
   label,
   descriptor,
@@ -139,7 +127,6 @@ function AgentDefaultsCard({
   const perModel = Object.entries(defaults.effort_by_model ?? {});
   const modelChoices = modelDesc?.options ?? [];
   const effortChoices = effortDesc?.options ?? [];
-  // Models not already overridden, offered in the "add override" picker.
   const addableModels = modelChoices.filter((c) => !(c.value in (defaults.effort_by_model ?? {})));
 
   return (
@@ -274,8 +261,7 @@ export function AcpDefaultsWidget({ descriptor, value, save }: CustomWidgetProps
   }, []);
 
   const map = asMap(value);
-  // ACP-capable agents drive the cards; a saved default for an agent no longer
-  // in the list is still reachable through the raw-JSON fold.
+  // Defaults for agents no longer listed stay editable in the raw JSON fold.
   const acpAgents = agents.filter((a) => a.acp_capable);
 
   const saveAgent = (agentName: string, next: AcpAgentDefaults) => {

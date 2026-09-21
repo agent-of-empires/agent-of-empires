@@ -1,16 +1,10 @@
 import { test, expect } from "./helpers/mockedTest";
+import { sessionResponse } from "./helpers/sessions";
 import { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
 import { makePatch } from "./helpers/patch";
 
-// In-diff comments end-to-end (#928), against the @pierre/diffs renderer.
-// - Structured-view-only feature: a session without the structured view
-//   can't select lines to comment.
-// - Select a line (click its gutter number) to comment; save; card renders.
-// - Open the send dialog, edit intro, send; comments clear; POST
-//   reaches /acp/prompt/diff-comments with the structured body
-//   (intro/outro/comments/isMultiRepo/assembledMarkdown). See #1123.
-// - Comments persist to localStorage and reload back into the UI.
+// In-diff comments (#928, #1123): structured view only, saved to localStorage, sent as a structured body.
 
 const FILE_PATH = "src/example.ts";
 
@@ -28,9 +22,7 @@ const DIFF_FILES_RESPONSE = {
   warning: null,
 };
 
-// Contents shape consumed by the @pierre/diffs renderer. The new-side line
-// numbers below line up with the comment assertions (new line 3 =
-// `function greet`, new line 4 = `return ...`).
+// New-side line 3 is `function greet`, line 4 is `return ...`.
 const DIFF_FILE_RESPONSE = {
   file: {
     path: FILE_PATH,
@@ -49,7 +41,6 @@ const DIFF_FILE_RESPONSE = {
   is_binary: false,
   truncated: false,
 };
-// Server-computed patch, generated from the same contents.
 (DIFF_FILE_RESPONSE as { patch?: string }).patch = makePatch(
   FILE_PATH,
   DIFF_FILE_RESPONSE.old_content,
@@ -90,27 +81,15 @@ async function setup(page: Page, opts: SetupOpts = {}) {
     return r.fulfill({
       json: {
         sessions: [
-          {
+          sessionResponse({
             id: "sess-1",
             title: "diff-comments-test",
-            project_path: "/tmp/diff-comments-test",
             group_path: "/tmp",
-            tool: "claude",
             status: "Running",
-            yolo_mode: false,
-            created_at: new Date().toISOString(),
-            last_accessed_at: null,
-            last_error: null,
-            branch: null,
-            main_repo_path: null,
-            is_sandboxed: false,
-            has_terminal: true,
-            profile: "default",
-            workspace_repos: [],
             view: structuredView ? "structured" : "terminal",
             acp_worker_state: acpWorkerState,
             claude_fullscreen: false,
-          },
+          }),
         ],
         workspace_ordering: [],
       },
@@ -120,7 +99,6 @@ async function setup(page: Page, opts: SetupOpts = {}) {
   await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
   await page.route("**/api/sessions/*/diff/files", (r) => r.fulfill({ json: DIFF_FILES_RESPONSE }));
   await page.route(/\/api\/sessions\/[^/]+\/diff\/file\?/, (r) => r.fulfill({ json: DIFF_FILE_RESPONSE }));
-  // Structured view panel endpoints — content irrelevant for these tests.
   await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
   await page.routeWebSocket(/\/sessions\/.*\/(ws|acp-ws)$/, () => {
     // No-op: we don't need a working stream for diff comment tests.
@@ -140,21 +118,15 @@ async function openSessionAndFile(page: Page) {
   });
 }
 
-/** Click the @pierre/diffs gutter line-number cell for `lineNum`. The
- *  renderer lives in a shadow root; Playwright locators pierce it. A single
- *  click selects that line and fires onLineSelected, which opens the draft
- *  comment form. `[data-line-number-content]` cells contain only the number,
- *  so an exact-text filter is unambiguous. */
+/** Select one line via its gutter number cell (inside a shadow root), which opens the comment form. */
 function gutterLine(page: Page, lineNum: number) {
   return page.locator("[data-line-number-content]").filter({ hasText: new RegExp(`^${lineNum}$`) });
 }
 
-/** Open a single-line comment form by selecting one line. */
 async function startSingleLineComment(page: Page, lineNum: number) {
   await gutterLine(page, lineNum).first().click();
 }
 
-/** Select a multi-line range: click the first line, shift-click the last. */
 async function selectRange(page: Page, startLine: number, endLine: number) {
   await gutterLine(page, startLine).first().click();
   await gutterLine(page, endLine)
@@ -184,7 +156,6 @@ test.describe("Diff comments (#928)", () => {
     await selectRange(page, 3, 4);
     const textarea = page.getByPlaceholder(/Leave a comment \(markdown supported\)/);
     await expect(textarea).toBeVisible();
-    // Form heading should reflect the range
     await expect(page.getByText("lines 3-4 (new)").first()).toBeVisible();
     await textarea.fill("fix the function body");
     await page.getByRole("button", { name: "Save" }).click();
@@ -198,11 +169,8 @@ test.describe("Diff comments (#928)", () => {
     await page.getByPlaceholder(/Leave a comment \(markdown supported\)/).fill("nit");
     await page.getByRole("button", { name: "Save" }).click();
     await expect(page.getByText(/^1 comment$/).first()).toBeVisible();
-    // (Banner renders once per visible right-pane instance; on desktop
-    // both the standard and the resizing layout mount it, so `.first()`
-    // is the cleanest way to assert presence rather than count.)
+    // The banner renders once per mounted right pane.
 
-    // Reload and confirm the comment came back from localStorage.
     await page.reload();
     await expect(page.locator("header")).toBeVisible();
     await clickSidebarSession(page, "diff-comments-test");
@@ -227,8 +195,6 @@ test.describe("Diff comments (#928)", () => {
       captured = JSON.parse(r.request().postData() || "{}");
       return r.fulfill({ json: {} });
     });
-    // Capture the usage-signal pings so we can assert `diff_comments` fires
-    // on a confirmed send (#1881).
     const seenSignals: string[] = [];
     await page.route("**/api/telemetry/seen", (r) => {
       try {
@@ -243,52 +209,41 @@ test.describe("Diff comments (#928)", () => {
     await startSingleLineComment(page, 3);
     await page.getByPlaceholder(/Leave a comment \(markdown supported\)/).fill("**rename** this please");
     await page.getByRole("button", { name: "Save" }).click();
-    // Open the send dialog via the banner's Send button.
     await page
       .getByRole("button", { name: /^Send$/ })
       .first()
       .click();
-    // Dialog open: heading "Send diff comments"
     await expect(page.getByText("Send diff comments")).toBeVisible();
     await page.getByPlaceholder(/Anything you want to say/).fill("Hey:");
-    // Confirm send (dialog's own Send button is the last one in the DOM).
+    // The dialog's Send button is the last in the DOM.
     await page
       .getByRole("button", { name: /^Send$/ })
       .last()
       .click();
     await expect.poll(() => captured?.assembledMarkdown).toBeTruthy();
-    // Structured fields the transcript card renders from.
     expect(captured?.intro).toBe("Hey:");
     expect(captured?.outro).toBe("Please address these comments.");
     expect(captured?.isMultiRepo).toBe(false);
     expect(captured?.comments).toHaveLength(1);
     expect(captured?.comments?.[0]?.body).toContain("rename");
-    // assembledMarkdown is the agent-visible body, no base64 sentinel.
     expect(captured?.assembledMarkdown).toContain("Hey:");
     expect(captured?.assembledMarkdown).toContain("## Diff comments");
     expect(captured?.assembledMarkdown).toContain("rename");
     expect(captured?.assembledMarkdown).toContain("Please address these comments.");
     expect(captured?.assembledMarkdown).not.toContain("aoe:diff-comments");
-    // Banner cleared.
     await expect(page.getByText(/^1 comment$/)).toHaveCount(0);
-    // The confirmed send fired the diff_comments usage signal (#1881).
+    // #1881 usage signal.
     await expect.poll(() => seenSignals).toContain("diff_comments");
   });
 
   test("hides feature for non-structured view sessions", async ({ page }) => {
     await setup(page, { structuredView: false });
     await openSessionAndFile(page);
-    // Line selection is disabled for tmux sessions, so selecting a line must
-    // not open a comment form.
     await startSingleLineComment(page, 3);
     await expect(page.getByPlaceholder(/Leave a comment \(markdown supported\)/)).toHaveCount(0);
   });
 
-  // A dormant session (worker auto-stopped for inactivity, `acp_worker_state:
-  // "absent"`) is still sendable: the diff-comments handler runs the same
-  // auto-wake as a plain composer prompt, so the send respawns the worker
-  // instead of sinking. The old gate blocked this, leaving a dead Send button
-  // on every idle session.
+  // A dormant worker is woken by the send, so Send stays enabled.
   test("send still works when the worker is absent (dormant session auto-wakes)", async ({ page }) => {
     await setup(page, { structuredView: true, acpWorkerState: "absent" });
     let posted = false;

@@ -717,99 +717,46 @@ impl DiffView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::diff::{DiffFile, DiffHunk, DiffLine, FileContents, FileDiff};
     use crate::tui::diff::BranchSelectState;
     use crate::tui::styles::load_theme;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::path::PathBuf;
 
-    fn make_view_with_branches(branches: Vec<String>, selected: usize) -> DiffView {
+    fn render_to_string(view: &mut DiffView, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let theme = load_theme("empire");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                view.render(f, area, &theme);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn branch_dialog(branches: Vec<String>) -> String {
         let mut view = DiffView::test_default();
-        view.branch_select = Some(BranchSelectState { branches, selected });
-        view
+        view.branch_select = Some(BranchSelectState {
+            branches,
+            selected: 0,
+        });
+        render_to_string(&mut view, 80, 24)
     }
 
-    fn render_dialog_to_string(view: &mut DiffView) -> String {
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let theme = load_theme("empire");
-        terminal
-            .draw(|f| {
-                let area = f.area();
-                view.render(f, area, &theme);
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer();
-        let mut out = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                out.push_str(buf[(x, y)].symbol());
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    #[test]
-    fn branch_select_shows_more_below_when_overflowing() {
-        let branches: Vec<String> = (0..40).map(|i| format!("branch-{:02}", i)).collect();
-        let mut view = make_view_with_branches(branches, 0);
-        let out = render_dialog_to_string(&mut view);
-        assert!(
-            out.contains("more below"),
-            "expected '[N more below]' indicator when branches overflow dialog, got:\n{out}"
-        );
-        assert!(!out.contains("more above"));
-    }
-
-    #[test]
-    fn branch_select_shows_more_above_when_cursor_near_end() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-        let branches: Vec<String> = (0..40).map(|i| format!("branch-{:02}", i)).collect();
-        let mut view = make_view_with_branches(branches, 0);
-
-        // Walk cursor to the last branch.
-        for _ in 0..39 {
-            view.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        }
-
-        let out = render_dialog_to_string(&mut view);
-        assert!(
-            out.contains("more above"),
-            "expected '[N more above]' indicator when cursor is near end, got:\n{out}"
-        );
-        assert!(!out.contains("more below"));
-        // Selected branch (last one) must be visible.
-        assert!(
-            out.contains("branch-39"),
-            "selected branch must be rendered, got:\n{out}"
-        );
-    }
-
-    fn render_diff_to_string(view: &mut DiffView, width: u16, height: u16) -> String {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let theme = load_theme("empire");
-        terminal
-            .draw(|f| {
-                let area = f.area();
-                view.render(f, area, &theme);
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer();
-        let mut out = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                out.push_str(buf[(x, y)].symbol());
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    fn diff_file(path: &str) -> crate::git::diff::DiffFile {
-        crate::git::diff::DiffFile {
-            path: std::path::PathBuf::from(path),
+    fn diff_file(path: &str) -> DiffFile {
+        DiffFile {
+            path: PathBuf::from(path),
             old_path: None,
             status: FileStatus::Modified,
             additions: 1,
@@ -817,30 +764,97 @@ mod tests {
         }
     }
 
-    fn markdown_contents(
-        path: &str,
-        status: FileStatus,
-        old_content: &str,
-        new_content: &str,
-    ) -> crate::git::diff::FileContents {
-        crate::git::diff::FileContents {
-            path: std::path::PathBuf::from(path),
+    /// A one-hunk diff over `lines`, each `(tag, old_line_num, new_line_num,
+    /// content)`; the trailing newline is added here.
+    fn file_diff(
+        file: DiffFile,
+        lines: Vec<(ChangeTag, Option<usize>, Option<usize>, &str)>,
+    ) -> FileDiff {
+        let old_lines = lines.iter().filter(|l| l.1.is_some()).count();
+        let new_lines = lines.iter().filter(|l| l.2.is_some()).count();
+        FileDiff {
+            file,
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines,
+                new_start: 1,
+                new_lines,
+                lines: lines
+                    .into_iter()
+                    .map(|(tag, old_line_num, new_line_num, content)| DiffLine {
+                        tag,
+                        old_line_num,
+                        new_line_num,
+                        content: format!("{content}\n"),
+                    })
+                    .collect(),
+            }],
+            is_binary: false,
+        }
+    }
+
+    /// A view with `file` selected and its diff already cached.
+    fn view_showing(file: DiffFile, diff: FileDiff) -> DiffView {
+        let mut view = DiffView::test_default();
+        view.diff_cache.insert(file.path.clone(), diff);
+        view.files = vec![file];
+        view.selected_file = 0;
+        view
+    }
+
+    fn markdown_contents(path: &str, status: FileStatus, old: &str, new: &str) -> FileContents {
+        FileContents {
+            path: PathBuf::from(path),
             old_path: None,
             status,
-            old_content: old_content.to_string(),
-            new_content: new_content.to_string(),
+            old_content: old.to_string(),
+            new_content: new.to_string(),
             patch: String::new(),
             is_binary: false,
         }
     }
 
+    /// A branch list that fits shows no indicators; one that overflows shows
+    /// "more below" until the cursor walks down, and then "more above" with the
+    /// selection still on screen.
     #[test]
-    fn markdown_file_renders_formatted_content_by_default() {
-        let path = std::path::PathBuf::from("README.md");
+    fn branch_select_indicators_track_the_cursor() {
+        let out = branch_dialog((0..3).map(|i| format!("br-{i}")).collect());
+        assert!(!out.contains("more above") && !out.contains("more below"));
+        for want in ["br-0", "br-1", "br-2"] {
+            assert!(out.contains(want), "got:\n{out}");
+        }
+
+        let branches: Vec<String> = (0..40).map(|i| format!("branch-{i:02}")).collect();
+        let out = branch_dialog(branches.clone());
+        assert!(out.contains("more below"), "got:\n{out}");
+        assert!(!out.contains("more above"));
+
+        let mut view = DiffView::test_default();
+        view.branch_select = Some(BranchSelectState {
+            branches,
+            selected: 0,
+        });
+        for _ in 0..39 {
+            view.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        let out = render_to_string(&mut view, 80, 24);
+        assert!(out.contains("more above"), "got:\n{out}");
+        assert!(!out.contains("more below"));
+        assert!(
+            out.contains("branch-39"),
+            "selection must stay visible:\n{out}"
+        );
+    }
+
+    /// Markdown files render as prose by default, with the source markers gone,
+    /// and a deleted one falls back to its base content.
+    #[test]
+    fn markdown_files_render_formatted_by_default() {
         let mut view = DiffView::test_default();
         view.files = vec![diff_file("README.md")];
         view.file_contents_cache.insert(
-            path,
+            PathBuf::from("README.md"),
             markdown_contents(
                 "README.md",
                 FileStatus::Modified,
@@ -848,66 +862,24 @@ mod tests {
                 "# Preview\n\n- first item\n\n**bold** and `code`",
             ),
         );
+        let out = render_to_string(&mut view, 120, 24);
+        for want in [
+            "README.md \u{b7} Rendered",
+            "Preview",
+            "\u{2022} first item",
+        ] {
+            assert!(out.contains(want), "got:\n{out}");
+        }
+        for leaked in ["# Preview", "**bold**", "`"] {
+            assert!(!out.contains(leaked), "{leaked} leaked:\n{out}");
+        }
 
-        let out = render_diff_to_string(&mut view, 120, 24);
-
-        assert!(out.contains("README.md · Rendered"), "got:\n{out}");
-        assert!(out.contains("Preview"), "got:\n{out}");
-        assert!(out.contains("• first item"), "got:\n{out}");
-        assert!(!out.contains("# Preview"), "heading marker leaked:\n{out}");
-        assert!(!out.contains("**bold**"), "strong marker leaked:\n{out}");
-        assert!(!out.contains('`'), "code marker leaked:\n{out}");
-    }
-
-    #[test]
-    fn raw_markdown_mode_renders_the_existing_diff() {
-        use crate::git::diff::{DiffHunk, DiffLine, FileDiff};
-
-        let path = std::path::PathBuf::from("README.md");
-        let file = diff_file("README.md");
-        let mut view = DiffView::test_default();
-        view.files = vec![file.clone()];
-        view.markdown_rendered = false;
-        view.file_contents_cache.insert(
-            path.clone(),
-            markdown_contents("README.md", FileStatus::Modified, "", "# Raw heading"),
-        );
-        view.diff_cache.insert(
-            path,
-            FileDiff {
-                file,
-                hunks: vec![DiffHunk {
-                    old_start: 1,
-                    old_lines: 0,
-                    new_start: 1,
-                    new_lines: 1,
-                    lines: vec![DiffLine {
-                        tag: ChangeTag::Insert,
-                        old_line_num: None,
-                        new_line_num: Some(1),
-                        content: "# Raw heading\n".to_string(),
-                    }],
-                }],
-                is_binary: false,
-            },
-        );
-
-        let out = render_diff_to_string(&mut view, 120, 24);
-
-        assert!(out.contains("README.md · Raw"), "got:\n{out}");
-        assert!(out.contains("# Raw heading"), "got:\n{out}");
-        assert!(out.contains("@@ -1,0 +1,1 @@"), "got:\n{out}");
-    }
-
-    #[test]
-    fn deleted_markdown_file_renders_its_base_content() {
-        let path = std::path::PathBuf::from("removed.markdown");
         let mut file = diff_file("removed.markdown");
         file.status = FileStatus::Deleted;
         let mut view = DiffView::test_default();
         view.files = vec![file];
         view.file_contents_cache.insert(
-            path,
+            PathBuf::from("removed.markdown"),
             markdown_contents(
                 "removed.markdown",
                 FileStatus::Deleted,
@@ -915,187 +887,106 @@ mod tests {
                 "",
             ),
         );
-
-        let out = render_diff_to_string(&mut view, 120, 24);
-
+        let out = render_to_string(&mut view, 120, 24);
         assert!(out.contains("Before deletion"), "got:\n{out}");
         assert!(!out.contains("# Before deletion"), "got:\n{out}");
     }
 
     #[test]
-    fn file_list_render_keeps_selected_file_visible_after_scroll() {
-        use crate::git::diff::{DiffHunk, DiffLine, FileDiff};
+    fn raw_markdown_mode_renders_the_ordinary_diff() {
+        let file = diff_file("README.md");
+        let diff = file_diff(
+            file.clone(),
+            vec![(ChangeTag::Insert, None, Some(1), "# Raw heading")],
+        );
+        let mut view = view_showing(file, diff);
+        view.markdown_rendered = false;
+        view.file_contents_cache.insert(
+            PathBuf::from("README.md"),
+            markdown_contents("README.md", FileStatus::Modified, "", "# Raw heading"),
+        );
 
+        let out = render_to_string(&mut view, 120, 24);
+        for want in ["README.md \u{b7} Raw", "# Raw heading", "@@ -1,0 +1,1 @@"] {
+            assert!(out.contains(want), "got:\n{out}");
+        }
+    }
+
+    #[test]
+    fn file_list_keeps_the_selected_file_visible_after_scroll() {
+        let selected = diff_file("src/file_14.rs");
+        let diff = file_diff(
+            selected.clone(),
+            vec![(
+                ChangeTag::Equal,
+                Some(1),
+                Some(1),
+                "selected file diff content",
+            )],
+        );
         let mut view = DiffView::test_default();
+        view.diff_cache.insert(selected.path.clone(), diff);
         view.files = (0..20)
             .map(|i| diff_file(&format!("src/file_{i:02}.rs")))
             .collect();
         view.selected_file = 14;
 
-        let selected = view.files[14].clone();
-        view.diff_cache.insert(
-            selected.path.clone(),
-            FileDiff {
-                file: selected,
-                hunks: vec![DiffHunk {
-                    old_start: 1,
-                    old_lines: 1,
-                    new_start: 1,
-                    new_lines: 1,
-                    lines: vec![DiffLine {
-                        tag: ChangeTag::Equal,
-                        old_line_num: Some(1),
-                        new_line_num: Some(1),
-                        content: "selected file diff content\n".to_string(),
-                    }],
-                }],
-                is_binary: false,
-            },
-        );
-
-        let out = render_diff_to_string(&mut view, 100, 16);
-        assert!(
-            out.contains("> M src/file_14.rs"),
-            "selected file marker must remain visible in the file list, got:\n{out}"
-        );
-        assert!(
-            out.contains("selected file diff content"),
-            "selected file diff content should render in the diff pane, got:\n{out}"
-        );
+        let out = render_to_string(&mut view, 100, 16);
+        assert!(out.contains("> M src/file_14.rs"), "got:\n{out}");
+        assert!(out.contains("selected file diff content"), "got:\n{out}");
     }
 
     #[test]
-    fn split_view_renders_divider_and_both_sides() {
-        use crate::git::diff::{DiffFile, DiffHunk, DiffLine, FileDiff};
-        use std::path::PathBuf;
-
-        let path = PathBuf::from("example.txt");
-        let file = DiffFile {
-            path: path.clone(),
-            old_path: None,
-            status: FileStatus::Modified,
-            additions: 1,
-            deletions: 1,
-        };
-        let diff = FileDiff {
-            file: file.clone(),
-            hunks: vec![DiffHunk {
-                old_start: 1,
-                old_lines: 1,
-                new_start: 1,
-                new_lines: 1,
-                lines: vec![
-                    DiffLine {
-                        tag: ChangeTag::Delete,
-                        old_line_num: Some(1),
-                        new_line_num: None,
-                        content: "OLDCONTENT\n".to_string(),
-                    },
-                    DiffLine {
-                        tag: ChangeTag::Insert,
-                        old_line_num: None,
-                        new_line_num: Some(1),
-                        content: "NEWCONTENT\n".to_string(),
-                    },
-                ],
-            }],
-            is_binary: false,
-        };
-
-        let mut view = DiffView::test_default();
-        view.files = vec![file];
-        view.selected_file = 0;
-        view.diff_cache.insert(path, diff);
+    fn split_view_renders_both_sides_around_one_divider() {
+        let file = diff_file("example.txt");
+        let diff = file_diff(
+            file.clone(),
+            vec![
+                (ChangeTag::Delete, Some(1), None, "OLDCONTENT"),
+                (ChangeTag::Insert, None, Some(1), "NEWCONTENT"),
+            ],
+        );
+        let mut view = view_showing(file, diff);
         view.split_view = true;
 
-        let out = render_diff_to_string(&mut view, 120, 24);
-        assert!(
-            out.contains('\u{2502}'),
-            "expected the split divider, got:\n{out}"
-        );
-        assert!(
-            out.contains("OLDCONTENT"),
-            "expected old content on left side, got:\n{out}"
-        );
-        assert!(
-            out.contains("NEWCONTENT"),
-            "expected new content on right side, got:\n{out}"
-        );
+        let out = render_to_string(&mut view, 120, 24);
+        for want in ["\u{2502}", "OLDCONTENT", "NEWCONTENT"] {
+            assert!(out.contains(want), "got:\n{out}");
+        }
     }
 
+    /// Deliberately varied left-content lengths: an unpadded column would put
+    /// the divider at different offsets. The divider is " | " (spaces on both
+    /// sides), which panel borders never are, so the search finds only splits.
     #[test]
-    fn split_view_aligns_divider_into_one_column() {
-        use crate::git::diff::{DiffFile, DiffHunk, DiffLine, FileDiff};
-        use std::path::PathBuf;
-
-        let path = PathBuf::from("a.txt");
-        let dl = |tag, o: Option<usize>, n: Option<usize>, c: &str| DiffLine {
-            tag,
-            old_line_num: o,
-            new_line_num: n,
-            content: format!("{c}\n"),
-        };
-        let file = DiffFile {
-            path: path.clone(),
-            old_path: None,
-            status: FileStatus::Modified,
-            additions: 1,
-            deletions: 1,
-        };
-        let diff = FileDiff {
-            file: file.clone(),
-            hunks: vec![DiffHunk {
-                old_start: 1,
-                old_lines: 3,
-                new_start: 1,
-                new_lines: 3,
-                lines: vec![
-                    // Deliberately varied left-content lengths: an unpadded
-                    // column would put the divider at different offsets.
-                    dl(ChangeTag::Equal, Some(1), Some(1), "short"),
-                    dl(
-                        ChangeTag::Delete,
-                        Some(2),
-                        None,
-                        "a considerably longer line of content",
-                    ),
-                    dl(ChangeTag::Insert, None, Some(2), "x"),
-                    dl(ChangeTag::Equal, Some(3), Some(3), "mid length"),
-                ],
-            }],
-            is_binary: false,
-        };
-
-        let mut view = DiffView::test_default();
-        view.files = vec![file];
-        view.selected_file = 0;
-        view.diff_cache.insert(path, diff);
+    fn split_view_aligns_every_divider_into_one_column() {
+        let file = diff_file("a.txt");
+        let diff = file_diff(
+            file.clone(),
+            vec![
+                (ChangeTag::Equal, Some(1), Some(1), "short"),
+                (
+                    ChangeTag::Delete,
+                    Some(2),
+                    None,
+                    "a considerably longer line of content",
+                ),
+                (ChangeTag::Insert, None, Some(2), "x"),
+                (ChangeTag::Equal, Some(3), Some(3), "mid length"),
+            ],
+        );
+        let mut view = view_showing(file, diff);
         view.split_view = true;
 
-        let out = render_diff_to_string(&mut view, 200, 20);
-        // The split divider is rendered as " | " (space-pipe-space); panel
-        // borders never have spaces on both sides, so this finds only the
-        // split dividers. Every one must sit in the same column.
+        let out = render_to_string(&mut view, 200, 20);
         let cols: Vec<usize> = out.lines().filter_map(|l| l.find(" \u{2502} ")).collect();
         assert!(
             cols.len() >= 3,
-            "expected a divider on each split row, got {cols:?}:\n{out}"
+            "expected a divider per split row: {cols:?}"
         );
         assert!(
             cols.iter().all(|&c| c == cols[0]),
-            "split divider must align into one column, got {cols:?}:\n{out}"
+            "dividers must align: {cols:?}\n{out}"
         );
-    }
-
-    #[test]
-    fn branch_select_no_indicators_when_fits() {
-        let branches: Vec<String> = (0..3).map(|i| format!("br-{i}")).collect();
-        let mut view = make_view_with_branches(branches, 0);
-        let out = render_dialog_to_string(&mut view);
-        assert!(!out.contains("more above"));
-        assert!(!out.contains("more below"));
-        assert!(out.contains("br-0"));
-        assert!(out.contains("br-1"));
-        assert!(out.contains("br-2"));
     }
 }

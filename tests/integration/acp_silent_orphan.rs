@@ -1,32 +1,18 @@
-//! Daemon-side coverage for the silent-orphan watchdog (#1240). Spawns the
-//! Node test shim behind a real `__acp-runner`, prompts it into one of the
-//! parked shapes of the upstream
-//! `agentclientprotocol/claude-agent-acp#688` failure mode (the adapter
-//! stops without returning the `PromptResponse`), and asserts the terminal
-//! `Stopped` the daemon synthesizes.
+//! Silent-orphan watchdog (#1240): the adapter stops without returning the
+//! `PromptResponse`, and the daemon synthesizes a terminal `Stopped`. What the
+//! turn emitted before going quiet decides the reason:
+//!   1. wrapped up (cost-bearing usage_update) then silent: the turn finished,
+//!      so `prompt_complete` on the fast grace, no cancel, no restart (#2237).
+//!   2. never wrapped up: a real wedge, so the base grace expires and the
+//!      watchdog cancels with `prompt_orphaned`.
+//!   3. off-protocol work pending (async agent, backgrounded Bash, scheduled
+//!      wakeup): suppressed until the work can be over.
+//!   4. grace = 0: watchdog skipped entirely.
 //!
-//! What the turn emitted before going quiet decides the outcome, so the
-//! cost-bearing and no-cost shapes are separate scenarios:
-//!   1. wrapped up (cost-populated usage_update) then silent: the turn
-//!      demonstrably finished, so it ends as `prompt_complete` with no
-//!      cancel and no worker restart (#2237).
-//!   2. never wrapped up (usage without cost, or none at all): a genuine
-//!      wedge, so the base grace expires and the watchdog cancels and
-//!      reports `prompt_orphaned`.
-//!   3. off-protocol work pending (async agent, backgrounded Bash,
-//!      scheduled wakeup): suppressed until the work can be over.
-//!   4. disabled (grace = 0): watchdog skipped entirely, no Stopped.
-//!
-//! A scenario that depends on a `usage_update` asserts the daemon received
-//! it, so a fixture the schema rejects cannot quietly pass as case 2 (#3811).
-//!
-//! Skipped automatically if `node` is missing.
-//!
-//! Note: the parent `main.rs` only compiles this module under
-//! `cfg(debug_assertions)`. Debug-only because
-//! the watchdog grace is tunable via `AOE_SILENT_ORPHAN_GRACE_MS` /
-//! `AOE_SILENT_ORPHAN_FAST_GRACE_MS` only under `cfg(debug_assertions)`;
-//! release builds would wait the full 60s production default.
+//! Scenarios that depend on a `usage_update` assert the daemon received it, so
+//! a fixture the schema rejects cannot pass as case 2 (#3811). Skipped without
+//! `node`, and compiled only under `cfg(debug_assertions)` by `main.rs`,
+//! because the graces are only tunable there.
 
 use std::time::{Duration, Instant};
 
@@ -34,9 +20,7 @@ use agent_of_empires::acp::acp_client::AcpClient;
 use agent_of_empires::acp::state::{AcpSessionId, Event};
 use serial_test::serial;
 
-use crate::common::{shim_ready, spawn_runner_with_shim};
-
-use crate::common::EnvGuard;
+use crate::common::{shim_ready, spawn_runner_with_shim, EnvGuard};
 
 /// Evidence retained across every observation phase of one turn.
 #[derive(Default)]
@@ -97,62 +81,83 @@ impl TurnOutcome {
     }
 }
 
-/// #2237: a turn that emitted its cost-populated end-of-turn
-/// `usage_update` and then never returned the `PromptResponse` finished;
-/// the adapter only failed to say so. The watchdog must end it on the fast
-/// grace as `prompt_complete`, the reason that neither cancels the turn nor
-/// restarts the worker over work that succeeded.
-#[tokio::test]
-#[serial]
-async fn cost_bearing_wrap_up_without_response_ends_as_prompt_complete() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-
-    // Base grace outside the drain below, fast grace far inside it: the
-    // turn can only end in time if the cost marker armed the fast grace,
-    // so a regression that stops arming it fails here instead of reaching
-    // the same reason later on the base grace. Polling cadence dropped to
-    // 50ms so the watchdog evaluation tracks the configured grace closely
-    // instead of waiting up to the default 5s tick.
+/// One watchdog scenario: park the shim on `prompt` with the given base and
+/// fast graces (ms), optionally wait for qualifying activity first, then drain
+/// for `drain_secs` and return what was observed.
+///
+/// The check interval is pinned at 50ms throughout so the watchdog tracks the
+/// configured grace instead of the default 5s tick; without that a regressed
+/// grace could slip past a short deadline simply by not having ticked.
+async fn observe_parked_turn(
+    preseed: &str,
+    (base_grace, fast_grace): (&'static str, &'static str),
+    prompt: &str,
+    await_marker: Option<Option<&str>>,
+    drain_secs: u64,
+) -> TurnOutcome {
     let _env = EnvGuard::from_pairs(&[
-        ("AOE_SILENT_ORPHAN_GRACE_MS", "60000"),
-        ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "300"),
+        ("AOE_SILENT_ORPHAN_GRACE_MS", base_grace),
+        ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", fast_grace),
         ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
     ]);
-
-    let preseed = "silent-orphan-positive";
-    let (socket_path, _tmp) =
+    let (socket_path, _runner) =
         spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
-
-    let client = AcpClient::attach(
+    let mut client = AcpClient::attach(
         socket_path,
         std::env::temp_dir(),
         vec![],
         preseed.to_string(),
         false,
-        AcpSessionId("silent-orphan-positive".into()),
+        AcpSessionId(preseed.into()),
         None,
         "claude".into(),
         None,
     )
     .await
-    .expect("attach for silent-orphan positive test");
+    .expect("attach to the parked runner");
+    client.send_prompt(prompt, &[]).await.expect("send prompt");
 
-    let mut client = client;
-    client
-        .send_prompt("COST_THEN_SILENCE trigger", &[])
-        .await
-        .expect("send prompt");
-
-    // Allow scheduling slack while staying below the 60s base grace:
-    // only the fast grace can set outcome.stopped within this window.
     let mut outcome = TurnOutcome::default();
+    if let Some(marker) = await_marker {
+        outcome.await_activity(&mut client, marker).await;
+    }
     outcome
-        .drain_turn(&mut client, Instant::now() + Duration::from_secs(15))
+        .drain_turn(
+            &mut client,
+            Instant::now() + Duration::from_secs(drain_secs),
+        )
         .await;
     let _ = client.shutdown().await;
+    outcome
+}
+
+macro_rules! skip_without_shim {
+    () => {
+        if let Err(reason) = shim_ready() {
+            eprintln!("skipping: {reason}");
+            return;
+        }
+    };
+}
+
+/// #2237: a turn that emitted its cost-bearing end-of-turn `usage_update` and
+/// then never returned the `PromptResponse` finished; the adapter only failed
+/// to say so. Base grace sits outside the drain and the fast grace far inside
+/// it, so the turn can only end in time if the cost marker armed the fast
+/// grace, and it must end as `prompt_complete`, which neither cancels the turn
+/// nor restarts the worker over work that succeeded.
+#[tokio::test]
+#[serial]
+async fn cost_bearing_wrap_up_without_response_ends_as_prompt_complete() {
+    skip_without_shim!();
+    let outcome = observe_parked_turn(
+        "silent-orphan-positive",
+        ("60000", "300"),
+        "COST_THEN_SILENCE trigger",
+        None,
+        15,
+    )
+    .await;
 
     assert_eq!(
         outcome.usage_cost,
@@ -166,56 +171,21 @@ async fn cost_bearing_wrap_up_without_response_ends_as_prompt_complete() {
     );
 }
 
-/// The genuine wedge: the adapter streams a chunk and a cost-less
-/// mid-turn `usage_update`, then goes silent without ever wrapping up.
-/// Nothing arms the fast grace, so the base grace expires and the
-/// watchdog cancels the turn and reports `prompt_orphaned`.
+/// The genuine wedge: a chunk and a cost-less mid-turn `usage_update`, then
+/// silence. Nothing arms the fast grace (set far longer than the drain here),
+/// so the base grace expires and the watchdog cancels the turn.
 #[tokio::test]
 #[serial]
 async fn silent_orphan_fires_when_the_turn_never_wraps_up() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-
-    // Base grace tight, fast grace far longer: only the no-cost path can
-    // fire inside the drain, so a usage frame that wrongly armed the fast
-    // grace would not be mistaken for this one.
-    let _env = EnvGuard::from_pairs(&[
-        ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
-        ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "5000"),
-        ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
-    ]);
-
-    let preseed = "silent-orphan-no-cost";
-    let (socket_path, _tmp) =
-        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
-
-    let client = AcpClient::attach(
-        socket_path,
-        std::env::temp_dir(),
-        vec![],
-        preseed.to_string(),
-        false,
-        AcpSessionId("silent-orphan-no-cost".into()),
+    skip_without_shim!();
+    let outcome = observe_parked_turn(
+        "silent-orphan-no-cost",
+        ("300", "5000"),
+        "SILENCE_NO_COST trigger",
         None,
-        "claude".into(),
-        None,
+        15,
     )
-    .await
-    .expect("attach for no-cost silent-orphan test");
-
-    let mut client = client;
-    client
-        .send_prompt("SILENCE_NO_COST trigger", &[])
-        .await
-        .expect("send prompt");
-
-    let mut outcome = TurnOutcome::default();
-    outcome
-        .drain_turn(&mut client, Instant::now() + Duration::from_secs(15))
-        .await;
-    let _ = client.shutdown().await;
+    .await;
 
     assert_eq!(
         outcome.usage_cost,
@@ -229,121 +199,44 @@ async fn silent_orphan_fires_when_the_turn_never_wraps_up() {
     );
 }
 
+/// A healthy turn (no parking keyword) completes long before either grace, so
+/// the natural `prompt_complete` wins and the watchdog stays disarmed.
 #[tokio::test]
 #[serial]
 async fn silent_orphan_suppressed_during_normal_turn() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-
-    // Generous enough grace that the shim's healthy tool round-trip
-    // completes long before the watchdog could fire; we then assert
-    // the only Stopped we see is prompt_complete, not prompt_orphaned.
-    // Tight polling cadence so a regressed grace would fire within the
-    // assertion window instead of waiting for the default 5s tick.
-    let _env = EnvGuard::from_pairs(&[
-        ("AOE_SILENT_ORPHAN_GRACE_MS", "10000"),
-        ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "10000"),
-        ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
-    ]);
-
-    let preseed = "silent-orphan-negative";
-    let (socket_path, _tmp) =
-        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
-
-    let client = AcpClient::attach(
-        socket_path,
-        std::env::temp_dir(),
-        vec![],
-        preseed.to_string(),
-        false,
-        AcpSessionId("silent-orphan-negative".into()),
+    skip_without_shim!();
+    let outcome = observe_parked_turn(
+        "silent-orphan-negative",
+        ("10000", "10000"),
+        "normal turn",
         None,
-        "claude".into(),
-        None,
+        5,
     )
-    .await
-    .expect("attach for silent-orphan negative test");
-
-    let mut client = client;
-    // No parking keyword: the shim's default prompt() runs the
-    // healthy chunk + tool_call + tool_call_update + chunk sequence
-    // and returns stopReason=end_turn. The watchdog must stay silent
-    // and the natural prompt_complete must win.
-    client
-        .send_prompt("normal turn", &[])
-        .await
-        .expect("send prompt");
-
-    let mut outcome = TurnOutcome::default();
-    outcome
-        .drain_turn(&mut client, Instant::now() + Duration::from_secs(5))
-        .await;
-    let _ = client.shutdown().await;
+    .await;
 
     assert_eq!(
         outcome.stopped.as_deref(),
         Some("prompt_complete"),
-        "silent-orphan watchdog must stay disarmed on a normal turn; saw {:?}",
+        "the watchdog must stay disarmed on a normal turn; saw {:?}",
         outcome.stopped
     );
 }
 
+/// `0` disables the watchdog entirely. The fast grace is short enough that a
+/// wrongly-armed watchdog would fire inside the drain, so the silence is a real
+/// assertion rather than an untested window.
 #[tokio::test]
 #[serial]
 async fn silent_orphan_disabled_by_zero_grace() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-
-    // `0` disables the watchdog entirely. With the shim parked on
-    // COST_THEN_SILENCE we'd otherwise see prompt_complete within a few
-    // hundred milliseconds; instead we should see no Stopped frame at
-    // all within the deadline, because nothing else fires.
-    //
-    // Override the polling cadence too: the default 5s tick would let
-    // a regressed "disabled" knob slip past a 2s deadline simply
-    // because the watchdog hadn't ticked yet. Forcing a 50ms cadence
-    // means a wrongly-armed watchdog WOULD fire within the deadline,
-    // turning a silent assertion into a real one.
-    let _env = EnvGuard::from_pairs(&[
-        ("AOE_SILENT_ORPHAN_GRACE_MS", "0"),
-        ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "200"),
-        ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
-    ]);
-
-    let preseed = "silent-orphan-disabled";
-    let (socket_path, _tmp) =
-        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
-
-    let client = AcpClient::attach(
-        socket_path,
-        std::env::temp_dir(),
-        vec![],
-        preseed.to_string(),
-        false,
-        AcpSessionId("silent-orphan-disabled".into()),
-        None,
-        "claude".into(),
-        None,
+    skip_without_shim!();
+    let outcome = observe_parked_turn(
+        "silent-orphan-disabled",
+        ("0", "200"),
+        "COST_THEN_SILENCE trigger",
+        Some(None),
+        2,
     )
-    .await
-    .expect("attach for silent-orphan disabled test");
-
-    let mut client = client;
-    client
-        .send_prompt("COST_THEN_SILENCE trigger", &[])
-        .await
-        .expect("send prompt");
-
-    let mut outcome = TurnOutcome::default();
-    outcome.await_activity(&mut client, None).await;
-    outcome
-        .drain_turn(&mut client, Instant::now() + Duration::from_secs(2))
-        .await;
-    let _ = client.shutdown().await;
+    .await;
 
     assert_eq!(
         outcome.usage_cost,
@@ -352,196 +245,73 @@ async fn silent_orphan_disabled_by_zero_grace() {
     );
     assert!(
         outcome.stopped.is_none(),
-        "silent-orphan watchdog must stay fully disarmed when grace = 0; saw Stopped reason={:?}",
+        "the watchdog must stay fully disarmed when grace = 0; saw Stopped reason={:?}",
         outcome.stopped
     );
 }
 
-/// #1360: a `ToolCallUpdate` whose completion content carries the Claude
-/// SDK marker `"Async agent launched successfully"` must flip the prompt
-/// loop's sticky off-protocol state so the watchdog promotes its effective
-/// grace to at least `OFF_PROTOCOL_WORK_GRACE_FLOOR` (30 minutes). Without
-/// the fix, the watchdog would fire ~300ms after the completion; with it,
-/// the test window stays silent.
+/// Off-protocol work promotes the effective grace to
+/// `OFF_PROTOCOL_WORK_GRACE_FLOOR` (30 minutes), so a short drain stays silent
+/// even with both graces set tight: the Claude SDK async-agent marker (#1360),
+/// a backgrounded Bash launch (#1401, the production false positive that killed
+/// a legitimate wait), and a `ScheduleWakeup` whose absolute deadline must
+/// override the fast grace the trailing cost frame arms (#1401).
 #[tokio::test]
 #[serial]
-async fn silent_orphan_suppressed_during_async_agent_wait() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
+async fn silent_orphan_suppressed_while_off_protocol_work_is_pending() {
+    skip_without_shim!();
+    // (preseed, prompt, awaited marker, expected usage evidence)
+    let cases = [
+        (
+            "silent-orphan-async-agent",
+            "ASYNC_AGENT_ORPHAN trigger",
+            Some("Async agent launched successfully"),
+            None,
+        ),
+        (
+            "silent-orphan-background-bash",
+            "BACKGROUND_BASH_ORPHAN trigger",
+            Some("Command running in background with ID:"),
+            // A usage frame here would drop the off-protocol floor instead.
+            Some(None),
+        ),
+        (
+            "silent-orphan-wakeup",
+            "WAKEUP_ORPHAN trigger",
+            None,
+            // The wakeup deadline must beat the fast grace this frame arms.
+            Some(Some(true)),
+        ),
+    ];
+    for (preseed, prompt, marker, expected_usage) in cases {
+        let outcome = observe_parked_turn(preseed, ("300", "100"), prompt, Some(marker), 2).await;
+        if let Some(expected) = expected_usage {
+            assert_eq!(outcome.usage_cost, expected, "{preseed}");
+        }
+        assert!(
+            outcome.stopped.is_none(),
+            "{preseed}: the watchdog must stay suppressed while off-protocol work is pending; saw Stopped reason={:?}",
+            outcome.stopped
+        );
     }
-
-    // Base grace 300ms; if the async detection works, effective grace
-    // jumps to OFF_PROTOCOL_WORK_GRACE_FLOOR (30 minutes), so a 2s drain
-    // must see no `prompt_orphaned`. The fast grace is set tight so a
-    // wrongly ordered effective_grace branch (cost-seen > off-protocol)
-    // would still false-fire and fail the assertion.
-    let _env = EnvGuard::from_pairs(&[
-        ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
-        ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "100"),
-        ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
-    ]);
-
-    let preseed = "silent-orphan-async-agent";
-    let (socket_path, _tmp) =
-        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
-
-    let client = AcpClient::attach(
-        socket_path,
-        std::env::temp_dir(),
-        vec![],
-        preseed.to_string(),
-        false,
-        AcpSessionId("silent-orphan-async-agent".into()),
-        None,
-        "claude".into(),
-        None,
-    )
-    .await
-    .expect("attach for async-agent silent-orphan test");
-
-    let mut client = client;
-    client
-        .send_prompt("ASYNC_AGENT_ORPHAN trigger", &[])
-        .await
-        .expect("send prompt");
-
-    let mut outcome = TurnOutcome::default();
-    outcome
-        .await_activity(&mut client, Some("Async agent launched successfully"))
-        .await;
-    outcome
-        .drain_turn(&mut client, Instant::now() + Duration::from_secs(2))
-        .await;
-    let _ = client.shutdown().await;
-
-    assert!(
-        outcome.stopped.is_none(),
-        "silent-orphan watchdog must stay suppressed while async-agent is running; saw Stopped reason={:?}",
-        outcome.stopped
-    );
 }
 
-/// #1401: a backgrounded Bash launch (`run_in_background: true` plus the
-/// `"Command running in background with ID:"` completion marker) must NOT
-/// trigger the watchdog while the turn is still open. This reproduces the
-/// production false-positive shape from session `65c7bd0f22424242` where
-/// npm install / cargo build were backgrounded and the watchdog killed the
-/// legitimate wait via the fast-grace path.
-#[tokio::test]
-#[serial]
-async fn silent_orphan_suppressed_during_background_bash() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-
-    // Tight grace and fast grace; if either marker (content text or
-    // raw_input.run_in_background) feeds the off-protocol path, the
-    // watchdog stays armed-but-suppressed and the 2s drain sees no
-    // Stopped.
-    let _env = EnvGuard::from_pairs(&[
-        ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
-        ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "100"),
-        ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
-    ]);
-
-    let preseed = "silent-orphan-background-bash";
-    let (socket_path, _tmp) =
-        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
-
-    let client = AcpClient::attach(
-        socket_path,
-        std::env::temp_dir(),
-        vec![],
-        preseed.to_string(),
-        false,
-        AcpSessionId("silent-orphan-background-bash".into()),
-        None,
-        "claude".into(),
-        None,
-    )
-    .await
-    .expect("attach for backgrounded-bash silent-orphan test");
-
-    let mut client = client;
-    client
-        .send_prompt("BACKGROUND_BASH_ORPHAN trigger", &[])
-        .await
-        .expect("send prompt");
-
-    let mut outcome = TurnOutcome::default();
-    outcome
-        .await_activity(&mut client, Some("Command running in background with ID:"))
-        .await;
-    outcome
-        .drain_turn(&mut client, Instant::now() + Duration::from_secs(2))
-        .await;
-    let _ = client.shutdown().await;
-
-    assert_eq!(
-        outcome.usage_cost, None,
-        "this scenario must not wrap up its accounting; a usage frame here would drop the off-protocol floor instead"
-    );
-    assert!(
-        outcome.stopped.is_none(),
-        "silent-orphan watchdog must stay suppressed while a backgrounded Bash task is running; saw Stopped reason={:?}",
-        outcome.stopped
-    );
-}
-
-/// #1858: a backgrounded command is fire-and-forget, so it legitimately
-/// outlives its turn. Once the turn emits its cost-populated end-of-turn
-/// `usage_update` the off-protocol floor is dropped, and a missing
-/// `PromptResponse` recovers on the fast grace as `prompt_complete`
-/// instead of holding the connection for the 30-minute floor. The
-/// suppression above therefore has an end, and this is where it ends.
+/// #1858: a backgrounded command outlives its turn, so once the turn emits its
+/// cost-bearing end-of-turn `usage_update` the off-protocol floor is dropped
+/// and a missing `PromptResponse` recovers on the fast grace instead of holding
+/// the connection for 30 minutes. The suppression above therefore has an end.
 #[tokio::test]
 #[serial]
 async fn background_bash_wrap_up_ends_as_prompt_complete() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-
-    // Base grace outside the 15s drain below and the off-protocol floor
-    // (30 min) further still, so only the fast grace the dropped floor
-    // uncovers can end this turn in time.
-    let _env = EnvGuard::from_pairs(&[
-        ("AOE_SILENT_ORPHAN_GRACE_MS", "60000"),
-        ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "300"),
-        ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
-    ]);
-
-    let preseed = "silent-orphan-background-bash-wrap-up";
-    let (socket_path, _tmp) =
-        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
-
-    let client = AcpClient::attach(
-        socket_path,
-        std::env::temp_dir(),
-        vec![],
-        preseed.to_string(),
-        false,
-        AcpSessionId("silent-orphan-background-bash-wrap-up".into()),
+    skip_without_shim!();
+    let outcome = observe_parked_turn(
+        "silent-orphan-background-bash-wrap-up",
+        ("60000", "300"),
+        "BACKGROUND_BASH_ORPHAN WRAP_UP trigger",
         None,
-        "claude".into(),
-        None,
+        15,
     )
-    .await
-    .expect("attach for wrapped-up backgrounded-bash test");
-
-    let mut client = client;
-    client
-        .send_prompt("BACKGROUND_BASH_ORPHAN WRAP_UP trigger", &[])
-        .await
-        .expect("send prompt");
-
-    let mut outcome = TurnOutcome::default();
-    outcome
-        .drain_turn(&mut client, Instant::now() + Duration::from_secs(15))
-        .await;
-    let _ = client.shutdown().await;
+    .await;
 
     assert_eq!(
         outcome.usage_cost,
@@ -555,84 +325,12 @@ async fn background_bash_wrap_up_ends_as_prompt_complete() {
     );
 }
 
-/// #1401: `ScheduleWakeup` registers an absolute wake timestamp. The
-/// watchdog must suppress firing until `at + base_grace`, not snap-fire
-/// the moment the sleep ends. A cost-populated `usage_update` is sent
-/// after the wakeup tool completes so the test exercises the fast-grace
-/// path; a regression where the wakeup deadline didn't override fast
-/// grace would false-fire inside the 2s drain.
-#[tokio::test]
-#[serial]
-async fn silent_orphan_suppressed_during_scheduled_wakeup() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-
-    let _env = EnvGuard::from_pairs(&[
-        ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
-        ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "100"),
-        ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
-    ]);
-
-    let preseed = "silent-orphan-wakeup";
-    let (socket_path, _tmp) =
-        spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
-
-    let client = AcpClient::attach(
-        socket_path,
-        std::env::temp_dir(),
-        vec![],
-        preseed.to_string(),
-        false,
-        AcpSessionId("silent-orphan-wakeup".into()),
-        None,
-        "claude".into(),
-        None,
-    )
-    .await
-    .expect("attach for wakeup silent-orphan test");
-
-    let mut client = client;
-    client
-        .send_prompt("WAKEUP_ORPHAN trigger", &[])
-        .await
-        .expect("send prompt");
-
-    let mut outcome = TurnOutcome::default();
-    outcome.await_activity(&mut client, None).await;
-    outcome
-        .drain_turn(&mut client, Instant::now() + Duration::from_secs(2))
-        .await;
-    let _ = client.shutdown().await;
-
-    assert_eq!(
-        outcome.usage_cost,
-        Some(true),
-        "the fixture's cost-bearing UsageUpdate must reach the daemon, otherwise the fast grace this scenario overrides is never armed"
-    );
-    assert!(
-        outcome.stopped.is_none(),
-        "silent-orphan watchdog must stay suppressed until ScheduleWakeup `at + base_grace`; saw Stopped reason={:?}",
-        outcome.stopped
-    );
-}
-
+/// Usage seen before a tool completion, or only during the drain, must survive
+/// both observation phases rather than being lost with the phase that saw it.
 #[tokio::test]
 #[serial]
 async fn usage_evidence_survives_activity_and_drain() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-
-    // Park after the ordered notifications; drain through the watchdog terminal
-    // rather than let an immediate PromptResponse overtake notification delivery.
-    let _env = EnvGuard::from_pairs(&[
-        ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
-        ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "300"),
-        ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
-    ]);
+    skip_without_shim!();
     let mut observed = Vec::new();
     for (prompt, marker) in [
         ("normal turn", Some("")),
@@ -640,6 +338,13 @@ async fn usage_evidence_survives_activity_and_drain() {
         ("USAGE_BEFORE_COST USAGE_AFTER_NO_COST", Some("")),
         ("USAGE_BEFORE_COST USAGE_AFTER_NO_COST", None),
     ] {
+        // Park after the ordered notifications and drain through the watchdog
+        // terminal, so an immediate PromptResponse cannot overtake delivery.
+        let _env = EnvGuard::from_pairs(&[
+            ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
+            ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "300"),
+            ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
+        ]);
         let preseed = "usage-observation";
         let (socket_path, _runner) =
             spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())])

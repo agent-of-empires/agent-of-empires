@@ -2,11 +2,8 @@ import { useEffect } from "react";
 
 import { openExternal, type CommandLink } from "../../lib/pluginCommands";
 
-/** A numbered overlay shown when a plugin `open-ui-link` keybind resolves to
- *  more than one link (a multi-repo workspace with several open PRs): a single
- *  chord cannot disambiguate, so the picker lists them and `1`-`9` (or a click)
- *  opens the chosen one. Opening happens inside the keypress/click gesture so a
- *  remote dashboard is not popup-blocked. Esc closes. */
+/** Picker for an `open-ui-link` keybind that resolved to several links. Opens
+ *  inside the key/click gesture so a remote dashboard is not popup-blocked. */
 export function PluginLinkPicker({ links, onClose }: { links: CommandLink[]; onClose: () => void }) {
   const open = (href: string) => {
     openExternal(href);
@@ -20,8 +17,7 @@ export function PluginLinkPicker({ links, onClose }: { links: CommandLink[]; onC
         onClose();
         return;
       }
-      // `1` is the first link; only unmodified single-digit rows are hotkeyed,
-      // so Ctrl/Meta/Alt+digit browser shortcuts are left alone.
+      // Modified digits stay browser shortcuts.
       if (!e.ctrlKey && !e.metaKey && !e.altKey && e.key >= "1" && e.key <= "9") {
         const idx = e.key.charCodeAt(0) - "1".charCodeAt(0);
         const link = links[idx];
@@ -33,7 +29,6 @@ export function PluginLinkPicker({ links, onClose }: { links: CommandLink[]; onC
     };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-    // `links` is stable for the lifetime of one open picker.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [links]);
 

@@ -1,20 +1,8 @@
 //! Migration v021: move `[app_state]` out of `config.toml` into a sibling
-//! `state.toml`.
-//!
-//! `app_state` is global-only runtime/UI bookkeeping (welcome/tour seen,
-//! last browse dir, tips seen, sort order, ...), not a settings-schema
-//! section. Keeping it inside `config.toml` put its high write churn (every
-//! sidebar toggle, every tip dismissal) on the same lock as real settings
-//! changes, so a UI toggle and a settings save contended for the same file.
-//! Splitting it into its own file, with its own lock, removes that churn from
-//! the settings path entirely (see `session::config::update_config` /
-//! `session::config::update_app_state`). `state.toml` still gets the same
-//! serialised read-modify-write guarantee as `config.toml`, via
-//! `storage::locked_update`, so two `aoe` processes never lose an update.
-//!
-//! Global app dir only: unlike v020's per-profile setting, `app_state` has
-//! always been global-only (never merged from a profile override), so there
-//! is no `profiles/*/config.toml` to walk.
+//! `state.toml`, so its UI write churn (sidebar toggles, tip dismissals) stops
+//! sharing a lock with settings saves. `state.toml` gets the same serialised
+//! read-modify-write guarantee via `storage::locked_update`. Global app dir
+//! only: `app_state` was never profile-overridable.
 
 use anyhow::Result;
 use std::fs;

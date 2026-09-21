@@ -1,10 +1,5 @@
-//! Shared test helpers for hook-base scaffolding.
-//!
-//! Used by `dir_guard`, `status_file`, `cli::extract_session_id`, and
-//! `session::config::container_config` tests so the override-and-reset dance lives
-//! in one place. Tests using these helpers MUST also gate via
-//! `serial_test::serial(hook_base)` so the thread-local override stays
-//! consistent across parallel runs.
+//! Shared hook test helpers. Hook-base tests must also run under
+//! `serial_test::serial(hook_base)`, since the base override is thread-local.
 
 #![cfg(test)]
 
@@ -12,14 +7,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-/// RAII guard that installs a per-test hook-base override on construction
-/// and clears it on drop.
+/// Installs a hook-base override, cleared on drop.
 pub(crate) struct BaseGuard;
 
 impl BaseGuard {
-    /// Tempdir created, override registered, base path NOT created on disk.
-    /// Use for tests that exercise mkdir semantics themselves (mode/owner
-    /// rejection, symlink rejection, fresh-init behavior).
+    /// Base under a fresh tempdir, not yet created on disk.
     pub(crate) fn fresh() -> (Self, PathBuf, TempDir) {
         let tmp = TempDir::new().unwrap();
         let base = tmp.path().join("aoe-hooks");
@@ -28,21 +20,14 @@ impl BaseGuard {
         (Self, base, tmp)
     }
 
-    /// As [`Self::fresh`] but with the base already created at 0o700. Use for
-    /// tests that just need a working hook base in place.
+    /// As [`Self::fresh`], with the base created at 0o700.
     pub(crate) fn ready() -> (Self, PathBuf, TempDir) {
         let (g, base, tmp) = Self::fresh();
         make_correct_base(&base);
         (g, base, tmp)
     }
 
-    /// As [`Self::fresh`] but with an explicit base path instead of the
-    /// default tempdir layout. Use for fixtures whose base must sit under a
-    /// specific parent (symlink chains, shared roots). The helper touches no
-    /// disk state, so pre-create whatever parent chain `base` requires;
-    /// whether `base` itself exists is up to the fixture, since guard entry
-    /// points verify-and-create it when absent. The override is cleared on
-    /// drop like the other constructors.
+    /// An explicit base; the caller creates any parents it needs.
     pub(crate) fn with_base(base: PathBuf) -> Self {
         super::dir_guard::override_base_for_test(base);
         super::dir_guard::reset_for_test();
@@ -57,9 +42,6 @@ impl Drop for BaseGuard {
     }
 }
 
-/// Create the hook base directory at `p` with mode 0o700. Companion to
-/// [`BaseGuard::fresh`] for tests that want to verify mkdir semantics
-/// then continue with a normally-shaped base.
 pub(crate) fn make_correct_base(p: &Path) {
     std::fs::create_dir(p).unwrap();
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -98,4 +80,55 @@ pub(crate) fn make_alien_owned(path: &Path) -> u32 {
         "fixture owner did not change"
     );
     alien_uid.as_raw()
+}
+
+/// Resolved default hook events for `agent`, with `overrides` applied to its status map.
+pub(crate) fn agent_events(
+    agent: &str,
+    overrides: &[(&str, crate::agents::HookStatus)],
+) -> Vec<crate::agents::ResolvedHookEvent> {
+    let mut config = crate::session::config::Config::default();
+    for (event, status) in overrides {
+        config
+            .agents
+            .entry(agent.to_string())
+            .or_default()
+            .status_map
+            .insert(event.to_string(), *status);
+    }
+    let agent = crate::agents::get_agent(agent).unwrap();
+    if agent.hook_config.is_some() {
+        crate::agents::resolved_hook_events(agent, &config).unwrap()
+    } else {
+        crate::agents::resolved_sidecar_hook_events(agent, &config).unwrap()
+    }
+}
+
+pub(crate) fn read_json(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// Runs `f` and asserts `path` kept its bytes, inode and mtime.
+pub(crate) fn assert_not_rewritten(path: &Path, f: impl FnOnce()) {
+    use std::os::unix::fs::MetadataExt;
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+        .unwrap();
+    let meta = file.metadata().unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    f();
+    let after = std::fs::metadata(path).unwrap();
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        bytes,
+        "{} bytes changed",
+        path.display()
+    );
+    assert_eq!(after.ino(), meta.ino(), "{} replaced", path.display());
+    assert_eq!(
+        after.modified().unwrap(),
+        meta.modified().unwrap(),
+        "{} rewritten",
+        path.display()
+    );
 }

@@ -1,5 +1,4 @@
 //! `aoe sandbox`: inspect and reclaim the per-session agent stores that
-//! sandboxed sessions mount as their agent's config directory.
 
 use anyhow::Result;
 use clap::{Args, Subcommand};

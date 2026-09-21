@@ -14,16 +14,15 @@ pub struct DeleteSessionBody {
     pub delete_sandbox: bool,
     #[serde(default)]
     pub force_delete: bool,
-    /// For scratch sessions, keep the scratch directory on disk instead of
-    /// removing it. The session record is still deleted. No effect on
-    /// non-scratch sessions.
+    /// For scratch sessions, keep the scratch directory on disk. The session
+    /// record is still deleted. No effect on non-scratch sessions.
     #[serde(default)]
     pub keep_scratch: bool,
 }
 
 /// Flip a session out of `Status::Deleting` into `Status::Error` so a
 /// bookkeeping failure after teardown does not strand it greyed-out and
-/// unclickable, the exact state this detached-task delete exists to prevent.
+/// unclickable, the state this detached-task delete exists to prevent.
 async fn mark_delete_error(state: &AppState, id: &str, message: String) {
     let mut instances = state.instances.write().await;
     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
@@ -32,18 +31,16 @@ async fn mark_delete_error(state: &AppState, id: &str, message: String) {
     }
 }
 
-/// Permanently purge a session: irreversible ACP teardown (structured
-/// view), optional sidecar cleanup (worktree/branch/container/scratch per
-/// `body`), and removal from both `sessions.json` and the in-memory list.
-/// Shared by the `DELETE /api/sessions/{id}` handler and the retention
-/// auto-purge worker so the permanent-delete path cannot diverge between the
-/// two. Returns user-facing deletion messages on success, or a descriptive
-/// error string on failure. Blocking reservation, hook, and completion phases
-/// are dispatched internally; no caller-held lifecycle guard crosses an await.
-/// The `bool` in the success tuple is `true` when the session row was actually
-/// removed, and `false` when a concurrent restore won the race and the row was
-/// deliberately kept (see the `kept_restored` branch). Callers must not report
-/// a kept row as deleted.
+/// Permanently purge a session: irreversible ACP teardown, optional sidecar
+/// cleanup per `body`, and removal from both `sessions.json` and the in-memory
+/// list. Shared by `DELETE /api/sessions/{id}` and the retention auto-purge
+/// worker so the permanent-delete path cannot diverge. Blocking reservation,
+/// hook and completion phases are dispatched internally, so no caller-held
+/// lifecycle guard crosses an await.
+///
+/// The success `bool` is `true` when the row was actually removed and `false`
+/// when a concurrent restore won the race and the row was kept. Callers must
+/// not report a kept row as deleted.
 async fn purge_session_artifacts(
     state: &Arc<AppState>,
     id: &str,
@@ -115,10 +112,9 @@ async fn purge_session_artifacts(
     let transcript_purged = instance.is_structured();
 
     let deletion_result = if transcript_purged {
-        // Commit the row removal before deleting the ACP transcript. A lost
-        // restore/generation race therefore leaves both row and transcript
-        // intact; a successful commit makes later cleanup failures
-        // non-restorable by construction.
+        // Commit the row removal before deleting the ACP transcript, so a lost
+        // restore/generation race leaves both intact and a successful commit
+        // makes later cleanup failures non-restorable by construction.
         let committed = tokio::task::spawn_blocking(move || transaction.begin_irreversible())
             .await
             .map_err(|e| format!("Irreversible deletion commit task failed: {e}"))?;
@@ -126,9 +122,9 @@ async fn purge_session_artifacts(
             Err(result) => *result,
             Ok(committed) => {
                 // Remove the local mirror before awaiting ACP so the reconciler
-                // cannot surface a durable row that no longer exists. Bumps the
-                // epoch under the same lock: the ACP teardown below is slow, and
-                // a reload landing inside it would otherwise restore the row.
+                // cannot surface a durable row that no longer exists. The epoch
+                // bump is under the same lock: ACP teardown is slow, and a
+                // reload landing inside it would otherwise restore the row.
                 remove_instance(
                     &mut *state.instances.write().await,
                     id,
@@ -136,7 +132,7 @@ async fn purge_session_artifacts(
                 );
 
                 // The worker may still use the worktree, so ACP teardown stays
-                // ahead of sidecar cleanup. The durable row is already gone.
+                // ahead of sidecar cleanup.
                 match state.acp_supervisor.shutdown_and_delete(id).await {
                     Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
                     Err(e) => {
@@ -203,13 +199,12 @@ async fn purge_session_artifacts(
     }
 
     {
-        // The row is now gone from both disk and memory, so any reloader still
-        // carrying a `sessions.json` snapshot that predates either removal must
-        // drop it rather than fold the deleted row back in. `remove_instance`
-        // bumps while still holding the `instances` write lock: a reloader
-        // checks the epoch under that same lock, so the removal and the bump
-        // land as one step and a reload cannot slip between them. See
-        // invariant 8 on `reload_state_instances_from_disk`.
+        // The row is gone from disk and memory, so a reloader carrying an older
+        // `sessions.json` snapshot must drop it rather than fold the row back
+        // in. `remove_instance` bumps while holding the `instances` write lock
+        // and the reloader checks under that same lock, so no reload can slip
+        // between removal and bump. See invariant 8 on
+        // `reload_state_instances_from_disk`.
         let mut instances = state.instances.write().await;
         remove_instance(&mut instances, id, &state.mutation_epoch);
     }
@@ -225,15 +220,13 @@ async fn purge_session_artifacts(
 }
 
 /// Heal managed worktree sessions whose recorded `project_path` no longer
-/// exists because the directory was moved outside aoe, rewriting it from git's
-/// own worktree listing. Runs once on daemon startup, so every later
-/// path-derived decision (worker cwd, diff, the rename pre-flight gates) acts
-/// on the live location. See #2002.
+/// exists because the directory moved outside aoe, rewriting it from git's own
+/// worktree listing. Runs once on daemon startup so every later path-derived
+/// decision acts on the live location (#2002).
 ///
-/// The recorded path existing short-circuits the whole pass inside
-/// [`crate::session::worktree_reconcile::reconcile_and_persist`], so a healthy
-/// session costs one `stat` and never shells out to git. Every non-move outcome
-/// leaves the row untouched.
+/// A healthy session costs one `stat` and never shells out to git, because the
+/// recorded path existing short-circuits the pass inside
+/// [`crate::session::worktree_reconcile::reconcile_and_persist`].
 pub(crate) async fn reconcile_worktree_paths(state: &Arc<AppState>) {
     let candidates: Vec<String> = {
         let instances = state.instances.read().await;
@@ -254,15 +247,15 @@ pub(crate) async fn reconcile_worktree_paths(state: &Arc<AppState>) {
                 None => continue,
             }
         };
-        // `exists()` and the git listing are blocking filesystem work, so the
-        // whole reconcile runs off the runtime and only the resulting path is
-        // reapplied under the write lock.
+        // `exists()` and the git listing are blocking, so the whole reconcile
+        // runs off the runtime and only the resulting path is reapplied under
+        // the write lock.
         let reconciled = match tokio::task::spawn_blocking(move || {
             let mut instance = snapshot;
-            // An empty profile resolves to the *default* profile rather than
+            // An empty profile resolves to the default profile rather than
             // failing, which would aim the persist at another profile's
-            // sessions.json. The compare-and-set inside the reconcile makes
-            // that a no-op, but refuse outright rather than lean on it.
+            // sessions.json. Refuse outright rather than lean on the
+            // compare-and-set inside the reconcile.
             anyhow::ensure!(
                 !instance.source_profile.is_empty(),
                 "session has no source profile; refusing worktree path reconciliation"
@@ -298,12 +291,11 @@ pub(crate) async fn reconcile_worktree_paths(state: &Arc<AppState>) {
     }
 }
 
-/// Relocate any trashed managed worktree still sitting in the active dir into
-/// the holding area, and heal a pointer left stale by a crash between the move
-/// and its persist. Backfills rows trashed before relocation existed. Runs
-/// once on daemon startup, best-effort and per-session locked; a failure on one
-/// session logs and moves on. The git move is blocking, so it runs off the
-/// async runtime.
+/// Relocate any trashed managed worktree still in the active dir into the
+/// holding area, and heal a pointer left stale by a crash between the move and
+/// its persist. Backfills rows trashed before relocation existed. Runs once on
+/// daemon startup, best-effort and per-session locked. The git move is blocking,
+/// so it runs off the async runtime.
 pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
     let candidates: Vec<(String, String)> = {
         let instances = state.instances.read().await;
@@ -355,13 +347,11 @@ pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
     }
 }
 
-/// Auto-purge trashed sessions whose retention window has elapsed
-/// (`trashed_at + session.trash_retention_days`). Runs on daemon startup and
-/// hourly thereafter. Routed through [`purge_session_artifacts`] so the
-/// permanent-delete path matches `DELETE` exactly. Each candidate is
-/// per-instance locked and its trashed+expired state re-validated under the
-/// lock, so a concurrent restore wins the race and is never purged. See
-/// #2489.
+/// Auto-purge trashed sessions past their retention window
+/// (`trashed_at + session.trash_retention_days`), on daemon startup and hourly.
+/// Routed through [`purge_session_artifacts`] so it matches `DELETE` exactly.
+/// Each candidate is per-instance locked and re-validated under the lock, so a
+/// concurrent restore wins the race and is never purged (#2489).
 pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
     use std::collections::HashMap;
 
@@ -391,10 +381,9 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
             continue;
         }
 
-        // Submission authority before `instance_lock`, as the permanent
-        // `DELETE` path takes them: teardown must not start under an in-flight
-        // queue drain (#3650). A row that vanished since the snapshot is
-        // skipped here rather than below.
+        // Submission authority before `instance_lock`, as the permanent DELETE
+        // path takes them: teardown must not start under an in-flight queue
+        // drain (#3650). A row that vanished since the snapshot is skipped here.
         let Some(_submission) = state
             .session_service
             .prompt_submission_for_session(&id)
@@ -405,8 +394,8 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
         let lock = state.instance_lock(&id).await;
         let _guard = lock.lock().await;
 
-        // Re-validate under the lock: a restore (or an earlier purge) may
-        // have landed since the snapshot.
+        // Re-validate under the lock: a restore or earlier purge may have
+        // landed since the snapshot.
         let (instance, recent_entry) = {
             let instances = state.instances.read().await;
             match instances.iter().find(|i| i.id == id) {
@@ -417,8 +406,7 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
             }
         };
 
-        // Permanent retention purge cleans sidecars per the profile defaults,
-        // but forces removal so a dirty worktree can't keep an expired
+        // Forces sidecar removal so a dirty worktree cannot keep an expired
         // session pinned in the trash forever.
         let cfg = crate::session::config::profile_config::resolve_config_or_warn(
             &instance.source_profile,
@@ -450,9 +438,6 @@ pub async fn delete_session(
     Path(id): Path<String>,
     body: Option<Json<DeleteSessionBody>>,
 ) -> impl IntoResponse {
-    // CityHall: only act on structured sessions this mode created; refuse a
-    // non-structured (or unknown) target so a locked-down client cannot
-    // respawn/destroy/edit an enumerated plain session. See #7.
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
@@ -462,48 +447,38 @@ pub async fn delete_session(
 
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
-    // Serialize concurrent mutations. Prompt submission first, per
-    // `prompt_submission`: a queue drain snapshots an idle turn under that
-    // guard and never takes `instance_lock`, so without it the delivery runs
-    // against a worker, worktree and transcript this is tearing down (#3650).
-    // Both guards are owned so they move into the detached deletion task below
-    // and stay held until the bookkeeping finishes, rather than only until
-    // this request future is dropped.
+    // Serialize concurrent mutations, prompt submission first: a queue drain
+    // snapshots an idle turn under that guard and never takes `instance_lock`,
+    // so without it delivery runs against a worker, worktree and transcript
+    // this is tearing down (#3650). Both guards are owned so they move into the
+    // detached task below and stay held until the bookkeeping finishes.
     let Some(submission) = state
         .session_service
         .prompt_submission_for_session(&id)
         .await
     else {
-        return crate::server::api::session_not_found();
+        return session_not_found();
     };
     let lock = state.instance_lock(&id).await;
     let guard = lock.lock_owned().await;
 
-    // Find and clone the instance (need the full Instance for deletion)
-    let instance = {
-        let instances = state.instances.read().await;
-        instances.iter().find(|i| i.id == id).cloned()
-    };
+    let instance = find_instance(&state, &id).await;
 
     let Some(instance) = instance else {
-        return crate::server::api::session_not_found();
+        return session_not_found();
     };
 
     // Captured before `instance` moves into the deletion task; recorded into
-    // the persisted recent-projects store only once the delete fully
-    // succeeds, so the project survives in the wizard Recent tab (#2141).
+    // the recent-projects store only once the delete succeeds, so the project
+    // survives in the wizard Recent tab (#2141).
     let recent_entry = crate::session::recent_project_entry_for(&instance);
 
-    // Run the whole teardown + bookkeeping in a detached task. The
-    // git / docker / tmux teardown below is irreversible once it starts, but
-    // the disk-removal and in-memory cleanup that must follow it live in this
-    // request future. If the client disconnects mid-delete (e.g. closes the
-    // tab during a multi-second worktree removal), dropping the request future
-    // would abandon that bookkeeping after the session was already physically
-    // gone, stranding it greyed-out in the "Deleting" state forever. A
-    // detached task is not cancelled when the request future drops, so it
-    // always runs to completion; the owned lock guard moves in and is held
-    // until the bookkeeping finishes.
+    // Run teardown and bookkeeping in a detached task. The git / docker / tmux
+    // teardown is irreversible once started, so if the client disconnects
+    // mid-delete, dropping the request future would abandon the disk-removal
+    // and in-memory cleanup and strand the session greyed-out in "Deleting"
+    // forever. A detached task is not cancelled when the request future drops;
+    // the owned lock guard moves in and is held until the bookkeeping finishes.
     let join = tokio::spawn(async move {
         let _guard = guard;
         let _submission = submission;
@@ -545,26 +520,22 @@ pub async fn delete_session(
         Err(e) => {
             tracing::error!(target: "http.api.sessions",
                 "Deletion task panicked or was cancelled: {e}");
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "internal",
-                    "message": "Deletion task failed",
-                })),
+                "internal",
+                "Deletion task failed",
             )
-                .into_response()
         }
     }
 }
 
 // --- Delete workspace (atomic multi-session) ---
 
-/// Body for `DELETE /api/workspaces`. `session_ids` is the full set of
-/// sessions in one web-UI workspace, all sharing a single git worktree +
-/// branch, ordered so the first id is the worktree owner (the web
-/// `sessions[0]` primary). The cleanup flags mirror [`DeleteSessionBody`]:
-/// they apply to the whole workspace, and the shared worktree/branch is
-/// removed exactly once, on the owner.
+/// Body for `DELETE /api/workspaces`. `session_ids` is the full set of sessions
+/// in one web-UI workspace, sharing a single git worktree and branch, ordered so
+/// the first id is the worktree owner. The cleanup flags mirror
+/// [`DeleteSessionBody`] and apply to the whole workspace; the shared
+/// worktree/branch is removed exactly once, on the owner.
 #[derive(Default, Deserialize)]
 pub struct DeleteWorkspaceBody {
     #[serde(default)]
@@ -587,11 +558,10 @@ pub(super) struct WorkspaceDeleteFailure {
     pub(super) error: String,
 }
 
-/// Drop duplicate session ids while preserving first-seen order. A workspace
-/// delete must never list the same session twice: with `["owner", "owner"]`
-/// the first pass would delete the owner using the record-only sibling flags
-/// and the second pass would skip the now-missing row, returning success
-/// without ever removing the shared worktree or branch (#2536 review).
+/// Drop duplicate session ids, preserving first-seen order. With
+/// `["owner", "owner"]` the first pass would delete the owner using the
+/// record-only sibling flags and the second would skip the missing row,
+/// returning success without removing the shared worktree (#2536 review).
 pub(super) fn dedupe_session_ids(ids: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     ids.iter()
@@ -601,17 +571,14 @@ pub(super) fn dedupe_session_ids(ids: &[String]) -> Vec<String> {
 }
 
 /// Build the per-session deletion order for a workspace delete. All sessions
-/// in a workspace share one git worktree + branch, so worktree/branch cleanup
-/// must run exactly once. The owner (`session_ids[0]`, the web primary)
-/// carries the caller's worktree/branch flags and is deleted LAST; every
-/// sibling is deleted first with worktree/branch removal forced off.
+/// share one worktree and branch, so that cleanup must run exactly once: the
+/// owner carries the caller's worktree/branch flags and is deleted LAST, every
+/// sibling first with worktree/branch removal forced off.
 ///
-/// Owner-last is the safety property. Siblings hold only a record + container,
-/// never the shared worktree, so tearing them down while the worktree is still
-/// present lets a sibling failure abort before the worktree is touched, leaving
-/// nothing orphaned. Deleting the owner first (worktree gone) and then failing
-/// on a sibling would strand a live record pointing at a deleted worktree, the
-/// exact failure #2536 exists to remove.
+/// Owner-last is the safety property. Siblings hold only a record and container,
+/// so a sibling failure aborts before the worktree is touched. Deleting the
+/// owner first and then failing on a sibling would strand a live record pointing
+/// at a deleted worktree (#2536).
 pub(super) fn order_workspace_deletion(
     session_ids: &[String],
     body: &DeleteWorkspaceBody,
@@ -641,10 +608,9 @@ pub(super) fn order_workspace_deletion(
     plan
 }
 
-/// Owner-worktree dirty preflight for a workspace delete. Mirrors the per-
-/// session dirty gate in `perform_deletion` so a non-force delete of a dirty
-/// shared worktree is refused before any session is torn down, keeping dirty +
-/// non-force all-or-nothing. Returns the first dirty message found.
+/// Owner-worktree dirty preflight for a workspace delete, mirroring the
+/// per-session gate in `perform_deletion` so dirty plus non-force stays
+/// all-or-nothing. Returns the first dirty message found.
 fn workspace_dirty_message(instance: &Instance) -> Option<String> {
     if let Some(wt) = &instance.worktree_info {
         if wt.managed_by_aoe {
@@ -670,23 +636,16 @@ fn workspace_dirty_message(instance: &Instance) -> Option<String> {
 }
 
 /// Tear down every session in a workspace: record-only siblings first, then the
-/// shared-worktree owner last (see [`order_workspace_deletion`]). Each session
-/// goes through the shared [`purge_session_artifacts`].
+/// shared-worktree owner last (see [`order_workspace_deletion`]), each through
+/// [`purge_session_artifacts`].
 ///
-/// The owner's submission guard and instance lock are acquired up front and
-/// held for the whole teardown, and the dirty-worktree gate is re-checked
-/// under them right before any sibling is torn down. This serializes the dirty
-/// check with the teardown so dirty + non-force stays all-or-nothing even if
-/// the worktree is dirtied between the handler preflight and now, and it
-/// cannot deadlock: a session belongs to exactly one workspace, so two
-/// workspace deletes never contend for each other's locks, and single-session
-/// deletes only ever hold one session's locks at a time. Sibling locks are
-/// then taken one session at a time. A session already gone (a retention purge
-/// won the race) is skipped, not failed; a
-/// pre-owner failure aborts before the worktree is removed, so the shared
-/// worktree keeps its live owning session rather than being orphaned. A
-/// session whose row a concurrent restore kept (`removed == false`) is reported
-/// neither deleted nor failed.
+/// The owner's submission guard and instance lock are held for the whole
+/// teardown and the dirty gate is re-checked under them, so dirty plus
+/// non-force stays all-or-nothing even if the worktree is dirtied after the
+/// handler preflight. This cannot deadlock: a session belongs to exactly one
+/// workspace, and sibling locks are taken one at a time. A session already gone
+/// is skipped, not failed; a row a concurrent restore kept (`removed == false`)
+/// is reported neither deleted nor failed.
 pub(super) async fn purge_workspace_artifacts(
     state: &Arc<AppState>,
     owner_id: String,
@@ -707,8 +666,8 @@ pub(super) async fn purge_workspace_artifacts(
     let _owner_guard = owner_lock.lock_owned().await;
 
     // Authoritative dirty re-check under the owner lock, before any sibling is
-    // torn down (#2536 review). If the worktree went dirty since the handler
-    // preflight, abort with nothing deleted.
+    // torn down: if the worktree went dirty since the preflight, abort with
+    // nothing deleted (#2536 review).
     if owner_needs_dirty_check {
         let owner = {
             let instances = state.instances.read().await;
@@ -726,8 +685,7 @@ pub(super) async fn purge_workspace_artifacts(
     }
 
     for (id, body) in plan {
-        // The owner's locks are already held; only siblings need their own,
-        // one at a time. Re-locking the owner here would self-deadlock.
+        // The owner's locks are already held; re-locking here would deadlock.
         let _sibling_locks = if id == owner_id {
             None
         } else {
@@ -740,14 +698,10 @@ pub(super) async fn purge_workspace_artifacts(
             ))
         };
 
-        let instance = {
-            let instances = state.instances.read().await;
-            instances.iter().find(|i| i.id == id).cloned()
-        };
+        let instance = find_instance(state, &id).await;
         let Some(instance) = instance else {
-            // Already deleted (a concurrent retention auto-purge won the race).
-            // The row we were asked to delete is gone, so this is a no-op, not
-            // a failure.
+            // A concurrent retention auto-purge won the race, so the row we
+            // were asked to delete is gone. A no-op, not a failure.
             continue;
         };
 
@@ -762,9 +716,9 @@ pub(super) async fn purge_workspace_artifacts(
         match purge_session_artifacts(state, &id, instance, &body, recent_entry).await {
             Ok((removed, mut msgs)) => {
                 messages.append(&mut msgs);
-                // A concurrent restore can keep the row (removed=false); only
-                // report rows that were actually removed as deleted, so the
-                // client never drops local state for a session that survived.
+                // A concurrent restore can keep the row, so only actually
+                // removed rows are reported deleted; otherwise the client drops
+                // local state for a session that survived.
                 if removed {
                     deleted.push(id.clone());
                 }
@@ -776,8 +730,8 @@ pub(super) async fn purge_workspace_artifacts(
                     error: msg,
                 });
                 // Stop before the remaining plan entries. The owner is last, so
-                // a sibling failure here leaves the shared worktree intact with
-                // its owning session still present, never orphaned.
+                // a sibling failure leaves the shared worktree intact with its
+                // owning session still present.
                 break;
             }
         }
@@ -786,11 +740,10 @@ pub(super) async fn purge_workspace_artifacts(
     (deleted, failed, messages)
 }
 
-/// `DELETE /api/workspaces`: atomic multi-session workspace delete. Replaces
-/// the web client's N-call fan-out (one `DELETE /api/sessions/:id` per session)
-/// with a single call that tears the whole workspace down in the correct order
-/// under one detached task, so a mid-delete client disconnect can no longer
-/// leave the workspace half-removed. See #2536.
+/// `DELETE /api/workspaces`: atomic multi-session workspace delete, replacing
+/// the web client's per-session fan-out with one call that tears the workspace
+/// down in order under a single detached task, so a mid-delete disconnect
+/// cannot leave it half-removed (#2536).
 pub async fn delete_workspace(
     State(state): State<Arc<AppState>>,
     body: Option<Json<DeleteWorkspaceBody>>,
@@ -800,24 +753,20 @@ pub async fn delete_workspace(
     }
 
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    // Dedupe up front so a repeated id can't have the owner deleted with
+    // Dedupe up front so a repeated id cannot have the owner deleted with
     // sibling flags and then skipped (#2536 review).
     let session_ids = dedupe_session_ids(&body.session_ids);
     let Some(owner_id) = session_ids.first().cloned() else {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "invalid_request",
-                "message": "session_ids must not be empty",
-            })),
-        )
-            .into_response();
+            "invalid_request",
+            "session_ids must not be empty",
+        );
     };
 
-    // CityHall: `purge_workspace_artifacts` tears down EVERY id in the list, not
-    // just the owner, so every id (not only `session_ids.first()`) must be a
-    // structured session this mode created. Otherwise a client could smuggle a
-    // foreign plain session in as a sibling and have it destroyed. See #7.
+    // CityHall: `purge_workspace_artifacts` tears down EVERY id, so every one
+    // must be a structured session this mode created; otherwise a client could
+    // smuggle a foreign plain session in as a sibling (#7).
     if let Some(resp) = cityhall_block_any_non_structured(&state, &session_ids).await {
         return resp;
     }
@@ -825,10 +774,8 @@ pub async fn delete_workspace(
     let owner_needs_dirty_check = body.delete_worktree && !body.force_delete;
 
     // Preflight: refuse a non-force delete of a dirty shared worktree before
-    // tearing down any session, so dirty + non-force stays all-or-nothing. The
-    // owner (session_ids[0]) is the session that carries the shared worktree.
-    // This is a fast early 409 for the common case; `purge_workspace_artifacts`
-    // re-checks authoritatively under the owner lock.
+    // tearing down any session. A fast early 409;
+    // `purge_workspace_artifacts` re-checks authoritatively under the owner lock.
     if owner_needs_dirty_check {
         let owner = {
             let instances = state.instances.read().await;
@@ -836,21 +783,14 @@ pub async fn delete_workspace(
         };
         if let Some(owner) = owner {
             if let Some(msg) = workspace_dirty_message(&owner) {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": "dirty_worktree",
-                        "message": msg,
-                    })),
-                )
-                    .into_response();
+                return api_error(StatusCode::CONFLICT, "dirty_worktree", msg);
             }
         }
     }
 
     let plan = order_workspace_deletion(&session_ids, &body);
 
-    // Detached task, mirroring `delete_session`: the teardown must run to
+    // Detached task, mirroring `delete_session`: teardown must run to
     // completion even if the client disconnects mid-delete.
     let join = tokio::spawn(async move {
         purge_workspace_artifacts(&state, owner_id, plan, owner_needs_dirty_check).await
@@ -889,14 +829,11 @@ pub async fn delete_workspace(
         Err(e) => {
             tracing::error!(target: "http.api.sessions",
                 "Workspace deletion task panicked or was cancelled: {e}");
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "internal",
-                    "message": "Workspace deletion task failed",
-                })),
+                "internal",
+                "Workspace deletion task failed",
             )
-                .into_response()
         }
     }
 }

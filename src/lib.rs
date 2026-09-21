@@ -1,4 +1,4 @@
-//! Agent of Empires library - Core functionality for the terminal session manager
+//! Agent of Empires library: core functionality for the terminal session manager.
 
 #![deny(rustdoc::private_intra_doc_links)]
 #![deny(rustdoc::broken_intra_doc_links)]
@@ -10,8 +10,6 @@ pub mod claude_settings;
 pub mod cli;
 pub mod containers;
 pub mod daemon;
-/// Protocol-agnostic durable event log, the storage substrate behind the
-/// ACP transcript store and (later) the plugin host's event bus.
 pub mod events;
 pub mod file_watch;
 pub mod git;

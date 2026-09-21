@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   IDLE_DECAY_WINDOW_MS,
   getStatusDotClass,
@@ -10,9 +10,7 @@ import {
 import type { SessionResponse, SessionStatus } from "./types";
 
 const NOW = Date.parse("2026-05-01T12:00:00Z");
-/** Explicit window for tests that exercise the freshness path. The
- *  module default is 0 (off), so tests opt in by passing this explicitly. */
-const TEST_WINDOW_MS = 20 * 60 * 1000;
+const WINDOW = 20 * 60 * 1000;
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -23,155 +21,61 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function session(
+/** A session that entered its status `ago` ms before NOW (null for no timestamp). */
+const session = (
   status: SessionStatus,
-  idleEnteredAt: string | null,
+  ago: number | null | string,
   dormant = false,
-): Pick<SessionResponse, "status" | "idle_entered_at" | "dormant"> {
-  return { status, idle_entered_at: idleEnteredAt, dormant };
-}
-
-describe("IDLE_DECAY_WINDOW_MS default", () => {
-  it("is 0 (off) by default — opt-in feature", () => {
-    // Guards against an accidental flip back to a non-zero default. The
-    // freshness signal needs to stay opt-in across the dashboard since
-    // the rattle pulses are visually noisy in steady-state usage.
-    expect(IDLE_DECAY_WINDOW_MS).toBe(0);
-  });
+): Pick<SessionResponse, "status" | "idle_entered_at" | "dormant"> => ({
+  status,
+  idle_entered_at: typeof ago === "number" ? new Date(NOW - ago).toISOString() : ago,
+  dormant,
 });
 
-describe("idleAgeMs", () => {
-  it("returns null for non-Idle sessions", () => {
-    expect(idleAgeMs(session("Running", new Date(NOW - 1000).toISOString()))).toBeNull();
-  });
-
-  it("returns null when idle_entered_at is missing", () => {
-    expect(idleAgeMs(session("Idle", null))).toBeNull();
-  });
-
-  it("returns null when idle_entered_at is unparseable", () => {
-    expect(idleAgeMs(session("Idle", "not-a-date"))).toBeNull();
-  });
-
-  it("returns null for future timestamps (clock skew)", () => {
-    // Clock skew between server and browser must not look like a fresh idle.
-    expect(idleAgeMs(session("Idle", new Date(NOW + 60_000).toISOString()))).toBeNull();
-  });
-
-  it("returns elapsed milliseconds for past Idle transition", () => {
-    expect(idleAgeMs(session("Idle", new Date(NOW - 5_000).toISOString()))).toBe(5_000);
-  });
+it("freshness is off by default", () => {
+  expect(IDLE_DECAY_WINDOW_MS).toBe(0);
 });
 
-describe("isFreshIdle", () => {
-  it("is false by default (window is 0)", () => {
-    // Default-window call: even a session that just transitioned should
-    // be treated as not-fresh, because the freshness signal is opt-in.
-    expect(isFreshIdle(session("Idle", new Date(NOW - 1_000).toISOString()))).toBe(false);
-  });
-
-  it("is true within the explicit window", () => {
-    expect(isFreshIdle(session("Idle", new Date(NOW - 60_000).toISOString()), TEST_WINDOW_MS)).toBe(true);
-  });
-
-  it("is false past the explicit window", () => {
-    expect(isFreshIdle(session("Idle", new Date(NOW - TEST_WINDOW_MS - 1).toISOString()), TEST_WINDOW_MS)).toBe(false);
-  });
-
-  it("is false for non-Idle sessions even with a recent timestamp", () => {
-    expect(isFreshIdle(session("Running", new Date(NOW - 1_000).toISOString()), TEST_WINDOW_MS)).toBe(false);
-  });
-
-  it("is false when window is non-positive", () => {
-    // Defensive: negative or zero window short-circuits before any
-    // timestamp math, so a positive `idle_entered_at` can't sneak in.
-    expect(isFreshIdle(session("Idle", new Date(NOW - 1).toISOString()), 0)).toBe(false);
-    expect(isFreshIdle(session("Idle", new Date(NOW - 1).toISOString()), -1)).toBe(false);
-  });
+it.each<[SessionStatus, number | null | string, number | null]>([
+  ["Running", 1000, null],
+  ["Idle", null, null],
+  ["Idle", "not-a-date", null],
+  ["Idle", -60_000, null],
+  ["Idle", 5_000, 5_000],
+])("idleAgeMs(%s, %j) is %j", (status, ago, expected) => {
+  expect(idleAgeMs(session(status, ago))).toBe(expected);
 });
 
-describe("getStatusDotClass", () => {
-  it("uses idle class by default (freshness opt-in)", () => {
-    // No explicit window → falls back to the off default → idle class.
-    expect(getStatusDotClass(session("Idle", new Date(NOW - 1_000).toISOString()))).toBe("bg-status-idle");
-  });
-
-  it("uses fresh-idle class when explicitly within window", () => {
-    expect(getStatusDotClass(session("Idle", new Date(NOW - 1_000).toISOString()), TEST_WINDOW_MS)).toBe(
-      "bg-status-fresh-idle",
-    );
-  });
-
-  it("falls back to idle class past the explicit window", () => {
-    expect(
-      getStatusDotClass(session("Idle", new Date(NOW - TEST_WINDOW_MS - 1_000).toISOString()), TEST_WINDOW_MS),
-    ).toBe("bg-status-idle");
-  });
-
-  it("preserves non-Idle classes regardless of idle_entered_at", () => {
-    expect(getStatusDotClass(session("Waiting", new Date(NOW - 1_000).toISOString()), TEST_WINDOW_MS)).toBe(
-      "bg-status-waiting",
-    );
-  });
-
-  it("uses the dormant class for an idle-reaped (dormant) session", () => {
-    // Structured worker parked for inactivity: distinct dim-amber dot, not
-    // the live-idle grey. See #2250.
-    expect(getStatusDotClass(session("Idle", null, true))).toBe("bg-status-dormant");
-  });
-
-  it("dormant wins over the fresh-idle window", () => {
-    expect(getStatusDotClass(session("Idle", new Date(NOW - 1_000).toISOString(), true), TEST_WINDOW_MS)).toBe(
-      "bg-status-dormant",
-    );
-  });
-
-  it("keeps the Stopped grey for a deliberate stop (dormant false)", () => {
-    // The server reports dormant=false for a deliberately-stopped row even
-    // though it carries the idle-dormant marker, so the dot stays grey.
-    expect(getStatusDotClass(session("Stopped", null, false))).toBe("bg-status-stopped");
-  });
+it.each<[SessionStatus, number, number | undefined, boolean]>([
+  ["Idle", 1_000, undefined, false],
+  ["Idle", 60_000, WINDOW, true],
+  ["Idle", WINDOW + 1, WINDOW, false],
+  ["Running", 1_000, WINDOW, false],
+  ["Idle", 1, 0, false],
+  ["Idle", 1, -1, false],
+])("isFreshIdle(%s, %s ms ago, window %s) is %s", (status, ago, window, expected) => {
+  expect(isFreshIdle(session(status, ago), window)).toBe(expected);
 });
 
-describe("getStatusTextClass", () => {
-  it("uses idle text class by default (freshness opt-in)", () => {
-    expect(getStatusTextClass(session("Idle", new Date(NOW - 1_000).toISOString()))).toBe("text-status-idle");
-  });
-
-  it("uses fresh-idle text class when explicitly within window", () => {
-    expect(getStatusTextClass(session("Idle", new Date(NOW - 1_000).toISOString()), TEST_WINDOW_MS)).toBe(
-      "text-status-fresh-idle",
-    );
-  });
-
-  it("falls back to idle class when idle_entered_at is missing", () => {
-    expect(getStatusTextClass(session("Idle", null), TEST_WINDOW_MS)).toBe("text-status-idle");
-  });
-
-  it("uses the dormant text class for an idle-reaped (dormant) session", () => {
-    expect(getStatusTextClass(session("Idle", null, true))).toBe("text-status-dormant");
-  });
+it.each<[SessionStatus, number | null, boolean, number | undefined, string]>([
+  ["Idle", 1_000, false, undefined, "idle"],
+  ["Idle", 1_000, false, WINDOW, "fresh-idle"],
+  ["Idle", WINDOW + 1_000, false, WINDOW, "idle"],
+  ["Idle", null, false, WINDOW, "idle"],
+  ["Waiting", 1_000, false, WINDOW, "waiting"],
+  ["Idle", null, true, undefined, "dormant"],
+  ["Idle", 1_000, true, WINDOW, "dormant"],
+  ["Stopped", null, false, undefined, "stopped"],
+])("status classes for %s (%s ms ago, dormant=%s, window %s) use %s", (status, ago, dormant, window, suffix) => {
+  const s = session(status, ago, dormant);
+  expect(getStatusDotClass(s, window)).toBe(`bg-status-${suffix}`);
+  expect(getStatusTextClass(s, window)).toBe(`text-status-${suffix}`);
 });
 
-describe("isSessionActive", () => {
-  it("treats Idle as inactive by default (freshness opt-in)", () => {
-    expect(isSessionActive(session("Idle", new Date(NOW - 1_000).toISOString()))).toBe(false);
-  });
-
-  it("treats fresh-idle as active when window is enabled", () => {
-    expect(isSessionActive(session("Idle", new Date(NOW - 1_000).toISOString()), TEST_WINDOW_MS)).toBe(true);
-  });
-
-  it("treats decayed Idle as inactive even with window enabled", () => {
-    expect(isSessionActive(session("Idle", new Date(NOW - TEST_WINDOW_MS - 1_000).toISOString()), TEST_WINDOW_MS)).toBe(
-      false,
-    );
-  });
-
-  it("retains the legacy string-only API for callers without idle_entered_at", () => {
-    // Some callers (legacy paths, unit tests) still pass a bare status. The
-    // overload must keep classifying Running/Waiting/Starting as active.
-    expect(isSessionActive("Running")).toBe(true);
-    expect(isSessionActive("Idle")).toBe(false);
-  });
+it("isSessionActive counts fresh idle only with a window, and accepts a bare status", () => {
+  expect(isSessionActive(session("Idle", 1_000))).toBe(false);
+  expect(isSessionActive(session("Idle", 1_000), WINDOW)).toBe(true);
+  expect(isSessionActive(session("Idle", WINDOW + 1_000), WINDOW)).toBe(false);
+  expect(isSessionActive("Running")).toBe(true);
+  expect(isSessionActive("Idle")).toBe(false);
 });

@@ -1,340 +1,105 @@
-# Structured view Interface
+# Structured View Interface
 
-Structured view renders in both the TUI and the web dashboard. This page covers
-how the two surfaces differ, the keybinds, how the composer behaves
-across desktop and touch, and how the timeline keeps long turns
-readable. For setup and the overview, see [Structured view](../structured-view.md).
+The structured view renders in both the TUI and the web dashboard. This page covers how they differ, the keybinds, how the composer behaves on desktop and touch, and how the timeline keeps long turns readable. For setup, see [Structured view](../structured-view.md).
 
 ![The web structured view composer with mode and model controls, above a stream of tool-call cards](../assets/structured-view/interface.png)
 
-## TUI vs web dashboard
+## TUI versus web dashboard
 
-Both surfaces consume the same `aoe serve` daemon over the same HTTP/WS
-surface, so the conversation log, pending approvals, and worker state
-stay in sync.
+Both surfaces consume the same `aoe serve` daemon over the same HTTP and WebSocket API, so the conversation log, pending approvals, and worker state stay in sync.
 
-- **Sessions started in structured view** appear in the TUI session list
-  with a `[structured]` badge. Pressing Enter opens the native structured view,
-  which requires an `aoe serve` daemon to be already running. If one
-  isn't, the view shows an actionable error pointing at
-  `aoe serve --daemon` (localhost), `aoe serve --daemon --remote`
-  (Tailscale/Cloudflare), or `AOE_DAEMON_URL` (attach to a remote daemon
-  you already have running). The TUI does not start a daemon for you, so
-  the choice between localhost, tunnel, and named tunnel stays explicit.
-- **Sessions started in tmux mode** work in both surfaces. The TUI
-  attaches to the pane; the dashboard streams the pane's rendered rows and
-  draws them as text (see [Terminal view](../guides/web/terminal.md)).
-- **Switching views** (the per-session "Switch to terminal" / "Switch to
-  structured view" action in the web sidebar or the TUI context menu)
-  keeps the git worktree, files on disk, and any commits. For a **claude**
-  session the conversation is kept in both directions: to the terminal via
-  `claude --resume`, and back to structured view by reloading the
-  transcript. Every other agent starts a fresh conversation under the new
-  view.
-- **TUI status indicators**: a healthy structured view session shows as
-  Idle/Active in the session list, observed via the ACP event stream
-  rather than tmux pane probing.
-- **`--auth=passphrase` daemons**: the local TUI attaches to a same-host
-  daemon without the passphrase exchange (loopback callers are protected
-  by the 0600 serve files on disk). Remote callers proxied through a
-  tunnel still hit the passphrase wall. Adding `--behind-proxy` withdraws
-  the same-host carve-out (see
-  [Behind a reverse proxy](../guides/web-dashboard.md#behind-a-reverse-proxy)),
-  and the TUI has no passphrase exchange to fall back on, so it cannot
-  attach to that daemon.
+- Structured sessions show a `[structured]` badge in the TUI session list, and Enter opens the native view. It needs a running daemon and says so, pointing at `aoe serve --daemon`, `--daemon --remote`, or `AOE_DAEMON_URL`; the TUI never starts one for you.
+- Terminal sessions work in both surfaces: the TUI attaches to the pane and the dashboard streams it (see [Terminal view](../guides/web/terminal.md)).
+- Switching views keeps the worktree, files, and commits. A **claude** session keeps its conversation in both directions; every other agent starts fresh under the new view.
+- A healthy structured session shows Idle or Active in the session list, observed through the ACP event stream rather than tmux pane probing.
+- The local TUI attaches to a same-host `--auth=passphrase` daemon without the passphrase exchange, since loopback callers are protected by the 0600 serve files. Adding `--behind-proxy` withdraws that carve-out and the TUI then cannot attach at all.
 
-### TUI structured view keybinds
+### TUI keybinds
 
-The TUI structured view opens with the composer ready for typing. The
-transcript remains scrollable from the composer, while a pending tool
-authorization opens a focused approval shelf above it. The status line
-keeps the current worker state and primary controls visible.
-
-**Visual hierarchy.** The active session uses a compact metadata card in
-the upper-left for the agent, session, directory, and permission mode. The
-conversation stays on the terminal background instead of sitting inside a
-full-width frame: user turns use a `›` gutter, agent replies use a `•`
-gutter, and the composer repeats the same open prompt treatment. Session
-identity and readiness stay on the bottom status line. Only modal decisions,
-such as a pending approval, receive a full-width border.
+The view opens with the composer ready. The transcript stays scrollable from the composer, a pending authorization opens a focused approval shelf above it, and the status line keeps the worker state and primary controls visible. The active session's agent, directory, and permission mode sit in a compact card in the upper left; user turns use a `›` gutter and agent replies a `•` gutter, so only modal decisions get a full-width border.
 
 | Focus       | Key             | Action                                                |
 | ----------- | --------------- | ----------------------------------------------------- |
-| Composer    | `Enter`         | Send the buffered text, or queue it if it cannot be sent yet |
-| Composer    | `Shift+Enter`   | Insert a newline (multi-line prompts)                 |
-| Composer    | `@`             | Open the file-mention picker; keep typing to filter   |
-| Composer    | `Enter` (empty) | Retry draining the queue when idle (e.g. after a failed send) |
-| Composer    | `/`             | Type a slash at the start of an empty line to open the command picker |
-| Composer    | `↑` / `↓`       | Recall queued prompts to edit (caret at start); `↓` past the newest restores your draft |
-| Composer    | `↑` / `↓`       | Move the picker highlight (picker open)               |
-| Composer    | `Ctrl+n` / `Ctrl+p` | Move the picker highlight down / up (picker open) |
-| Composer    | `Enter` / `Tab` | Insert the highlighted command or file (picker open)  |
+| Composer    | `Enter`         | Send, or queue if the session cannot accept it yet |
+| Composer    | `Shift+Enter`   | Insert a newline |
+| Composer    | `@`             | Open the file-mention picker; keep typing to filter |
+| Composer    | `/`             | Open the slash-command picker (start of an empty line) |
+| Composer    | `Enter` (empty) | Retry draining the queue when idle |
+| Composer    | `↑` / `↓`       | Recall queued prompts to edit (caret at start), or move the picker highlight |
+| Composer    | `Ctrl+n` / `Ctrl+p` | Move the picker highlight |
+| Composer    | `Enter` / `Tab` | Insert the highlighted command or file |
 | Composer    | `Esc`           | Dismiss the picker, or return focus to the transcript |
-| Transcript  | `j` / `↓`       | Scroll down one line                                  |
-| Transcript  | `k` / `↑`       | Scroll up one line                                    |
-| Transcript  | `PgDn` / `PgUp` | Scroll ten lines                                      |
-| Transcript  | `g` / `G`       | Jump to top / bottom                                  |
-| Transcript  | `i`             | Focus the composer                                    |
-| Transcript  | `Tab`           | Cycle to the approval card (if any pending)           |
-| Transcript  | `m`             | Open the permission-mode picker (when the agent advertises modes) |
-| Transcript  | `a`             | Answer a pending question natively (single-select forms) |
-| Transcript  | `s` / `c`       | Skip / cancel a pending question                      |
-| Transcript  | `o`             | Open this session in the web dashboard                |
-| Transcript  | `Esc`           | Close the structured view and return to the session list |
-| Approval    | `a`             | Allow once                                            |
-| Approval    | `Shift+A`       | Allow always (session-scoped allow-list entry)        |
-| Approval    | `d`             | Deny                                                  |
-| Approval    | `Esc`           | Stop the in-flight turn                               |
-| Any         | `Ctrl+C`        | Cancel the in-flight prompt                           |
-| Any         | `Ctrl+O`        | Open the session in the web dashboard                 |
-| Any         | `Ctrl+X`        | Clear every queued (not-yet-sent) prompt              |
+| Transcript  | `j` / `k`, arrows | Scroll a line |
+| Transcript  | `PgDn` / `PgUp` | Scroll ten lines |
+| Transcript  | `g` / `G`       | Jump to top / bottom |
+| Transcript  | `i`             | Focus the composer |
+| Transcript  | `Tab`           | Cycle to a pending approval card |
+| Transcript  | `m`             | Open the permission-mode picker |
+| Transcript  | `a`             | Answer a pending question (single-select forms) |
+| Transcript  | `s` / `c`       | Skip / cancel a pending question |
+| Transcript  | `o`             | Open this session in the web dashboard |
+| Transcript  | `Esc`           | Close the structured view |
+| Approval    | `a` / `Shift+A` / `d` | Allow once / allow always / deny |
+| Approval    | `Esc`           | Stop the in-flight turn |
+| Any         | `Ctrl+C`        | Cancel the in-flight prompt |
+| Any         | `Ctrl+O`        | Open the session in the web dashboard |
+| Any         | `Ctrl+X`        | Clear every queued prompt |
 
-**Slash-command picker.** When the composer holds a single-word slash
-query (`/comp`, no spaces yet), a picker floats above it listing the
-agent's advertised commands ranked against what you typed. Navigate
-with the arrows or `Ctrl+n` / `Ctrl+p`, then press `Enter` or `Tab` to
-insert `/{command} ` (it does not auto-send, so you can add arguments
-first). `Esc` dismisses the picker. A query with no matching command is
-left alone: `Enter` sends it verbatim. The picker only appears once the
-agent has advertised commands.
+Approval keys resolve only while the approval card has focus, so typing "always allow" into the composer can never approve a tool.
 
-**Focus isolation.** Approval keys (`a`/`Shift+A`/`d`) only resolve when
-the approval card has focus. Typing "always allow" into the composer
-will never approve a pending tool; the composer captures every
-keystroke.
+The **slash-command picker** appears once the composer holds a single-word slash query and the agent has advertised commands; `Enter` or `Tab` inserts `/{command} ` without sending, so you can add arguments. A query matching no command is left alone and sent verbatim. The **file-mention picker** (`@`) lists the session's workspace files, fetched once per session, and inserts the choice as `:file[<path>]`, matching what the web composer sends.
 
-**Compact activity.** Successful tool calls collapse to one line with
-their target and, for edits, added and removed line counts. Running and
-failed calls stay expanded so progress and errors remain visible. The
-latest agent plan is pinned as a single progress summary above the
-transcript instead of adding a new checklist for every update. Press
-`o` to inspect full tool output and plan history in the web dashboard.
+### What the TUI renders
 
-**Approval shelf.** A pending authorization is pinned above the composer
-with the command or path, destructive warning, and decision keys. The
-transcript records the final decision after the shelf closes, without
-showing internal approval identifiers. Multiple requests advance by
-their stable identity, so the action shown is always the action resolved.
+Successful tool calls collapse to one line with their target and, for edits, added and removed line counts; running and failed calls stay expanded. The latest plan is pinned as a single progress summary rather than a new checklist per update. Agent messages render as styled markdown using text attributes only (bold, italic, dim), so they track your theme; syntax highlighting is deferred, and `o` opens the dashboard for full fidelity.
 
-**Approval card detail.** The web approval card shows a one-line preview
-of the tool call in its header (the command for a shell call, the path
-for a read or edit) so you can act without expanding. A benign approval
-starts collapsed; a destructive one starts expanded so the full
-arguments are in view before a hold-to-allow. Click the header to toggle
-the full argument list; the Allow / Always / Deny buttons stay reachable
-either way.
+## Tool cards
 
-**Markdown rendering.** Agent messages render as styled markdown:
-headings and `**bold**` in bold, `*italics*` in italic, `` `inline
-code` `` and fenced blocks in a dim block, and `-`/`1.` lists with
-markers. The raw markup characters are not shown. Styling uses text
-attributes only (bold, italic, dim) so it tracks your theme colors.
-Syntax highlighting in code blocks is deferred; press `o` to open the
-web dashboard for full-fidelity rendering. In the web dashboard, links
-in transcript messages open in a new tab so following a docs, CI, or
-repo link keeps your session open. Local `path:line` references (which
-agents like Codex emit when citing source) are an exception: clicking
-one opens that file in the in-app diff/file viewer and keeps you on the
-session. A file outside the session's repo shows a brief notice and
-leaves the view unchanged.
+Tool calls render per kind rather than as one generic line: an edit or write shows the path and a compact diff in your theme's diff colors, an execute shows the command and a bounded output preview, a read shows the path and a content preview, a delete shows the target. Diffs cap at 20 changed lines and previews at 12, with a "+N more" footer. A single patch touching several files shows each file in one card. In the dashboard, Claude's harness tools get dedicated cards too (a tool search shows its query, a background monitor its description and command, a task stop the stopped task id). Other kinds fall back to a generic one-liner.
 
-**Tool cards.** Tool calls render per kind rather than as a single
-generic line. An edit or write shows the file path and a compact
-added/removed diff (in your theme's diff colors); an execute shows the
-command and a bounded output preview; a read shows the path and a
-content preview; a delete shows the target path. The diff is capped at
-20 changed lines and previews at 12 lines, with a "+N more" footer when
-there is more; press `o` to open the web dashboard for the full diff and
-output. A single patch touching several files shows each file's path and
-diff in one card. In the web dashboard, Claude's harness tools render as dedicated cards too:
-a tool search shows its query, a background monitor shows its description
-and command, and a task stop shows the stopped task id. Other tool kinds
-fall back to a generic one-liner (name, arguments, output).
+When a tool returns images, audio, or resources they render inline on the card (a textual placeholder in the TUI), and anything that cannot be shown degrades to a labelled placeholder rather than being dropped.
 
-**Structured completion payloads.** When a tool returns images, audio,
-or resources, they render inline on the card (a textual placeholder in
-the TUI, which can't draw them); anything that can't be shown degrades
-to a labelled placeholder so output is never silently dropped.
+In the dashboard, links in transcript messages open in a new tab. Local `path:line` references are the exception: clicking one opens that file in the in-app viewer and keeps you on the session, unless the file lives outside the session's repo, which shows a brief notice.
 
-**File-mention picker.** Typing `@` in the composer opens a picker
-listing the session's workspace files, fetched once per session from the
-daemon. Keep typing to fuzzy-filter; prefix matches rank above substring
-matches. Selecting a file inserts it as `:file[<path>]`, matching what
-the web composer sends, so both surfaces hand the agent identical
-prompts. The picker closes on `Esc`.
+## Composer
 
-### Web composer Enter behavior
+On desktop, Enter sends and Shift+Enter inserts a newline, in both surfaces. On touch-primary devices plain Enter inserts a newline and the Send button is the only way to dispatch, avoiding accidental partial sends; a tablet with a hardware keyboard keeps the desktop convention. On-screen dictation commits into the composer correctly.
 
-On desktop, Enter sends the prompt and Shift+Enter inserts a newline,
-matching the TUI convention above.
+Tapping anywhere in the transcript focuses the composer and raises the soft keyboard, while tapping a control inside a message still does its own thing. While the composer is folded away (see [the dashboard guide](../guides/web/dashboard.md#on-mobile)) it cannot be typed into or focused, and tapping the transcript does nothing.
 
-On touch-primary devices (phones, tablets without an attached keyboard),
-plain Enter inserts a newline and the explicit Send button is the only
-way to dispatch, avoiding accidental partial sends when reaching for a
-line break. Devices with a hardware keyboard (for example an iPad with a
-Bluetooth keyboard) keep the desktop Enter-to-send convention.
+### Attachments
 
-On-screen keyboard dictation (the mic icon, e.g. iOS Safari) commits
-into the composer correctly.
+The web composer sends attachments alongside the prompt when the active agent advertises support: the paperclip button, Cmd/Ctrl+V to paste an image, or drag and drop. Staged attachments show as removable chips, images with a thumbnail, and a prompt can be attachment-only.
 
-On touch devices, tapping anywhere in the transcript focuses the composer
-and brings up the soft keyboard, so you do not have to reach for the
-composer field to start typing. Tapping a control inside a message (a
-tool-call card, a link, a button) still does its own thing instead.
+The paperclip is disabled with a tooltip when the agent accepts no attachments, and the picker offers only the kinds it does accept. `claude-agent-acp` advertises images and embedded resources; others vary. The server re-checks the capability and enforces size, count, and MIME limits, so an unsupported attachment comes back as an error rather than reaching the agent.
 
-This applies while the composer is showing. On a phone the composer can
-be folded away with the tab above it (see [the dashboard
-guide](../guides/web/dashboard.md#on-mobile)); while it is collapsed it
-cannot be typed into or focused, so tapping the transcript does nothing
-and the composer is skipped when tabbing through the page. Tap the same
-tab to bring it back, draft text and all.
+Attachments persist with the transcript and queue alongside the prompt text, so sending one mid-turn parks the whole message until the session resumes. A full page reload drops a queued row carrying an attachment (reattach and resend). Audio and embedded resources are stored and sent but render as a labelled chip.
 
-## Composer attachments (images, audio, files)
+### Queued prompts
 
-The web composer can send attachments alongside the prompt text when the
-active agent advertises support. Three ways to add one:
+The composer keeps messages the session cannot accept yet:
 
-- the paperclip button in the composer toolbar opens a file picker;
-- paste an image (for example a screenshot) with Cmd/Ctrl+V while the
-  composer is focused;
-- drag and drop files onto the composer.
+1. **Mid-turn follow-up.** With a steerable agent (Claude Code, from `claude-agent-acp` 0.64.0) your message goes into the running turn, the same as typing ahead in the CLI, so nothing is queued and `aoe acp prompt` works mid-turn too. Without steering, the text lands in the **Queued (N)** strip and drains when the agent reports `Stopped`, joined into one combined prompt (a clear command fires alone so it keeps its meaning).
+2. **Inactive session.** While the WebSocket is reconnecting or the worker is stopped, submissions are still accepted and parked, and drain once both are back.
+3. **Idle-dormant session.** The POST itself is the wake path: the server respawns the worker, holds the request until it is ready, then delivers it.
 
-Staged attachments show as removable chips above the text area; images
-render a thumbnail. A prompt can be attachment-only (no text), handy for
-"what is wrong here?" screenshots.
+Web queue entries persist in per-origin local storage, so a reload keeps them across the reconnect window; there is no server-side durability. The TUI queue is in-memory only and does not survive leaving the view.
 
-Support depends on the agent's advertised capabilities: the paperclip is
-disabled (with a tooltip) when the current agent doesn't accept
-attachments, and the file picker only offers the kinds it does accept
-(images, audio, embedded resources). `claude-agent-acp` advertises
-images and embedded resources; other agents vary. The server re-checks
-the capability and enforces size, count, and MIME limits, so oversize or
-unsupported attachments come back as an error instead of reaching the
-agent.
-
-Attachments persist with the transcript so they re-render on reload, and
-they queue alongside the prompt text: sending one while the agent is
-mid-turn, disconnected, or restarting parks the message (the queued row
-shows a thumbnail or chip) and the drain fires it once the session
-resumes. A full page reload drops any queued attachment row (reattach
-and resend). Audio and embedded resources are sent and stored, but
-render as a labelled chip rather than an inline player or preview.
-
-## Queued prompts (mid-turn + inactive session)
-
-The web composer keeps your messages around even when the session can't
-accept them yet. Three cases:
-
-1. **Mid-turn follow-up.** What happens depends on whether the agent
-   supports steering. Claude Code does, from `claude-agent-acp` 0.64.0;
-   no other agent does yet.
-
-   With steering, your message goes into the turn already running, the
-   same as typing ahead in the `claude` CLI. The agent picks it up
-   mid-work and course-corrects rather than finishing first and reading
-   it after. Nothing is queued, and this applies to every client, so
-   `aoe acp prompt` works mid-turn too.
-
-   Without it, your text lands in the **Queued (N)** strip above the
-   composer. Once the agent reports `Stopped`, the queue drains: every
-   parked entry is joined into one combined prompt (clear commands like
-   `/clear` fire alone so they keep their meaning).
-2. **Inactive session.** If the WebSocket is mid-reconnect or the worker
-   is stopped or restarting, the composer still accepts submissions. The
-   tooltip swaps to `Queue message until session resumes` and the parked
-   entry stays editable. The drain fires once the connection and worker
-   are back and the session's `Stopped` flag clears.
-3. **Idle-dormant session.** If the worker was auto-stopped for
-   inactivity, your prompt does not park indefinitely: the POST itself is
-   the wake path. The server respawns the worker and holds the request
-   until the fresh worker is ready, then delivers it. A prompt queued
-   before the worker went dormant drains the same way.
-
-Queued entries persist in per-origin local storage, so a page reload (or
-closing and reopening the tab on the same origin) keeps them across the
-reconnect window. Queued rows carrying attachments are the exception:
-the whole row is dropped on reload rather than draining a text-only
-prompt with the image missing. There is no server-side durability;
-clearing site data wipes the queue.
-
-**Editing a queued prompt.** Click any queued row to edit it inline, or,
-with the composer empty (caret at the start), press `↑` to pull the most
-recent queued prompt back into the composer; `↑` again walks toward older
-entries and `↓` walks back toward newer ones, restoring your in-progress
-draft once you step past the newest. While recalling, a banner above the
-composer reads **Editing queued message N of M** so the mode is
-unmistakable; `Esc` abandons the edit and restores your draft. Editing a
-recalled prompt and pressing `Enter` updates that entry in place rather
-than queueing a duplicate.
-
-**TUI structured view.** The TUI has the same client-side queue, and the
-same steering behavior: against a steerable agent `Enter` mid-turn sends
-straight into the running turn. Otherwise, pressing `Enter` while a turn
-is active (or while the WebSocket is down)
-parks the prompt in a **Queued (N)** strip instead of sending; the queue
-drains on the next `Stopped` as one combined prompt, the same batching
-as the web composer. `Ctrl+X` clears the queue, and pressing `Enter` on an empty
-composer when idle retries the drain (useful if a send failed and left
-prompts parked). Queued prompts can be recalled for editing the same way
-as the web: with the composer empty (caret at the start), `↑` pulls
-the newest queued prompt back into the composer, `↑` / `↓` walk the queue,
-and editing then `Enter` updates that entry in place. While recalling, the
-composer border title reads **Editing queued message N of M**, and `Esc`
-restores your draft. One difference from the web composer remains: the TUI
-queue is in-memory only, so it does not survive leaving the structured
-view.
+Click a queued row to edit it inline, or, with the composer empty and the caret at the start, press `↑` to pull the most recent queued prompt back in; `↑` and `↓` walk the queue and restore your draft once you step past the newest. A banner (TUI: the composer border title) reads **Editing queued message N of M** while you recall, `Esc` abandons the edit, and sending updates that entry in place rather than queueing a duplicate.
 
 ## Stopping a turn
 
-While an agent turn is running, the composer shows a **Stop** button.
-Clicking it sends a graceful cancel to the agent and the working spinner
-switches to **Stopping...** with a short countdown to the escalation
-deadline.
+While a turn runs, the composer shows **Stop**, which sends a graceful cancel; the spinner switches to **Stopping...** with a countdown to the escalation deadline. Some tools (a monitor or `until` loop, a long blocking command) do not honor a graceful cancel, and a **Force stop** button then appears beside the spinner. Clicking **Stop** a second time always escalates too, without waiting for the server to confirm the first cancel, so the button is always a working escape.
 
-Some tools the agent runs internally (a monitor or `until` loop, a long
-blocking command) do not honor a graceful cancel. When that happens a
-**Force stop** button appears next to the spinner, even while a tool is
-in flight. Force stop ends the turn immediately: it restarts the agent
-worker and kills the whole command tree, so a runaway loop actually
-stops instead of waiting out the grace window.
-
-Clicking **Stop** a second time always escalates to a force stop, even
-when the spinner is stuck "active" but the daemon no longer has a turn in
-flight (for example after the worker was restarted mid-turn). The second
-press no longer waits for the server to confirm the first cancel, so the
-button is always a working escape and you should not need
-`aoe acp restart` to clear a wedged spinner.
-
-Force stop is a hard interrupt. The agent resumes from its saved
-transcript on the next prompt, but any partial output from the tool that
-was in flight is lost. Reach for **Force stop** only when a turn is
-genuinely wedged; the graceful **Stop** is enough for a turn that is
-merely taking a while.
+Force stop restarts the worker and kills the whole command tree. The agent resumes from its saved transcript on the next prompt, but partial output from the tool in flight is lost, so reach for it only when a turn is genuinely wedged.
 
 ## Timeline card grouping
 
-To keep the timeline readable, structured view folds two kinds of runs
-into single collapsible cards:
+Two kinds of runs fold into single collapsible cards:
 
-- **Silent tool work.** A run of three or more consecutive tool calls
-  with no agent text between them (for example Read, Read, Grep, Read
-  during investigation) collapses into one "actions" card. Expand it to
-  see each call as its normal per-tool card.
-- **Consecutive TodoWrite updates.** Three or more back-to-back todo
-  updates fold into one todo card titled "updated N times". Collapsed,
-  it shows the latest list so you see what the agent is working on
-  without expanding. Expand it to inspect each update in order and audit
-  how the plan evolved.
+- **Silent tool work**: three or more consecutive tool calls with no agent text between them collapse into one "actions" card.
+- **Consecutive TodoWrite updates**: three or more back-to-back todo updates fold into one card titled "updated N times", showing the latest list while collapsed.
 
-Folding only fires on an unbroken run of the same shape. A todo update
-sandwiched between real tool work (Read, Edit) stays inline as its own
-card, so a status update between actions is never buried. Two-in-a-row
-stays inline; the threshold is three. A phase where the agent narrates
-between each action produces a long stream of individual cards instead.
+Folding only fires on an unbroken run of the same shape, and the threshold is three, so a status update between two real actions stays inline as its own card.
 
-The **Compact tools** toggle at the top of the transcript collapses
-every tool card to its header for scanning, and new cards arrive
-collapsed while it stays on; the agent's narration stays visible and
-errored cards stay open so a failure is never hidden. It is a
-per-browser preference saved locally, and you can still expand any single
-card while compact mode is on.
+The **Compact tools** toggle at the top of the transcript collapses every tool card to its header for scanning, and new cards arrive collapsed while it is on. The agent's narration stays visible, errored cards stay open, and you can still expand a single card. It is a per-browser preference.

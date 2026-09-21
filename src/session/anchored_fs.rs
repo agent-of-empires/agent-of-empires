@@ -19,15 +19,8 @@ pub(crate) struct AnchoredDir {
 }
 
 impl AnchoredDir {
-    /// Anchor at `path`, whose ancestors are resolved the way any other
-    /// caller resolves them and whose own leaf may not be a symlink.
-    ///
-    /// Walking the ancestors with `O_NOFOLLOW` defended nothing: a hostile
-    /// `/var` is not a threat this type can answer, while macOS reaches both
-    /// `/tmp` and the per-user temp root through a symlink, so the walk
-    /// refused every anchored read on that platform. The leaf keeps
-    /// `O_NOFOLLOW` because it is the swap an attacker controls, and so does
-    /// every component below it, which is the escape this type exists to stop.
+    /// Anchor at `path`, whose ancestors are resolved the way any other caller resolves them and
+    /// whose own leaf may not be a symlink.
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let root = path.to_path_buf();
         for component in path.components() {
@@ -195,15 +188,8 @@ impl AnchoredDir {
         self.modified(relative, true)
     }
 
-    /// What `relative` names: `Some(true)` a regular file, `Some(false)`
-    /// something that is not one, `None` nothing at all. `Err` when the
-    /// lookup itself could not be made, which callers that treat absence as
-    /// evidence must keep distinct from `None`.
-    ///
-    /// Inspects with `fstatat` rather than opening, so an entry this process
-    /// may stat but not read still answers `Some(true)`. A sandbox writes its
-    /// files as the container's user, and the host side only needs to know
-    /// they are there.
+    /// What `relative` names: `Some(true)` a regular file, `Some(false)` something that is not one,
+    /// `None` nothing at all.
     pub(crate) fn regular_lookup(&self, relative: &Path) -> Result<Option<bool>> {
         let (parent, leaf) = self.open_parent(relative)?;
         match fstatat(&parent, leaf.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
@@ -353,10 +339,6 @@ fn normal_components(path: &Path) -> Result<Vec<std::ffi::OsString>> {
 mod tests {
     use super::*;
 
-    /// A symlinked ancestor of the anchor is normal on macOS, where `/tmp`
-    /// and the per-user temp root under `/var` both resolve through one, and
-    /// it says nothing about whether the store below the anchor is safe.
-    /// Refusing it made every anchored read fail there.
     #[cfg(unix)]
     #[test]
     fn opens_through_a_symlinked_ancestor() {
@@ -379,8 +361,6 @@ mod tests {
         );
     }
 
-    /// The anchor's own leaf still may not be a symlink: that is the swap an
-    /// attacker controls, unlike the system directories above it.
     #[cfg(unix)]
     #[test]
     fn refuses_a_symlinked_anchor_leaf() {

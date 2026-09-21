@@ -1,18 +1,10 @@
 //! Per-session ownership of a structured-view runner.
-//!
-//! Every effect on a runner (spawn install, drain respawn, shutdown,
-//! process-group signal, registry delete, reaper removal) must present a
-//! [`Lease`] minted by this table for the session's current epoch. A lease
-//! from an older epoch is refused, so a late spawn, a stale reaper snapshot,
-//! or a drain respawn racing a shutdown cannot install or remove a runner
-//! it does not own.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// Exact identity of a runner process: its pid plus the generation stamped
-/// into its registry record at spawn. Records written by older binaries
-/// carry generation 0, which matches on pid alone.
+/// into its registry record at spawn. Generation 0 (older records) matches on pid alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunnerIdentity {
     pub pid: u32,
@@ -27,9 +19,7 @@ impl RunnerIdentity {
     }
 }
 
-/// Which code path is bringing a worker up. The UI treats both as
-/// `Resuming`; capacity accounting only counts `Spawn`, because an attach
-/// takes over a runner the registry already counts.
+/// Which code path is bringing a worker up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeKind {
     Attach,
@@ -107,12 +97,11 @@ pub enum AdmitError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallError {
-    /// The lease no longer names the session's current epoch.
     Stale,
-    /// A stop arrived while the worker was coming up. The entry is now
-    /// `Stopping` under this lease; the caller must tear the runner down
-    /// exactly and then [`LifecycleTable::settle`].
-    Cancelled { reason: String },
+    /// A stop arrived while the worker was coming up.
+    Cancelled {
+        reason: String,
+    },
 }
 
 #[derive(Debug)]
@@ -181,8 +170,7 @@ pub struct LifecycleTable {
     /// stay unique across daemon restarts; the supervisor seeds it from
     /// the wall clock.
     next_epoch: u64,
-    /// Highest generation ever admitted or observed per session. Bounds
-    /// restart-marker authority: a marker older than this is stale.
+    /// Highest generation ever admitted or observed per session.
     last_generation: HashMap<String, u64>,
     /// Stops asked of resumes that were abandoned before they installed,
     /// consumed by the next `admit` so the reconciler cannot spawn over
@@ -200,9 +188,7 @@ impl LifecycleTable {
         }
     }
 
-    /// Next epoch. Only a spawn or respawn stamps its epoch on a runner, so
-    /// only those note it as a generation; an attach or an adopted stop
-    /// records the generation it finds on the runner at install instead.
+    /// Next epoch.
     fn mint(&mut self, session_id: &str, stamped: bool) -> u64 {
         let epoch = self.next_epoch;
         self.next_epoch += 1;
@@ -235,13 +221,10 @@ impl LifecycleTable {
         *slot = (*slot).max(generation);
     }
 
-    /// Drop a stop kept for the next admission: the user is resuming the
-    /// session on purpose, so the earlier stop no longer applies.
     pub fn forget_stale_cancel(&mut self, session_id: &str) {
         self.stale_cancels.remove(session_id);
     }
 
-    /// Drop everything remembered for a session that no longer exists.
     pub fn forget(&mut self, session_id: &str) {
         self.entries.remove(session_id);
         self.last_generation.remove(session_id);
@@ -252,9 +235,7 @@ impl LifecycleTable {
         self.last_generation.get(session_id).copied().unwrap_or(0)
     }
 
-    /// Reserve the session for a spawn or attach. Only an absent session
-    /// can be admitted; the new epoch is the generation a spawned runner
-    /// must carry.
+    /// Reserve the session for a spawn or attach.
     pub fn admit(&mut self, session_id: &str, kind: ResumeKind) -> Result<Lease, AdmitError> {
         match self.entries.get(session_id).map(|e| &e.phase) {
             None => {}
@@ -304,8 +285,7 @@ impl LifecycleTable {
         Ok(())
     }
 
-    /// Give up a starting or respawning epoch that built nothing. Returns
-    /// whether the lease was current; a stale lease is a no-op.
+    /// Give up a starting or respawning epoch that built nothing.
     pub fn abandon(&mut self, lease: &Lease) -> bool {
         let Some(entry) = self.current(lease) else {
             return false;
@@ -322,8 +302,7 @@ impl LifecycleTable {
     }
 
     /// Drop a running worker whose runner is left alive on disk (a
-    /// rate-limit park, a burned budget). The registry, not this daemon,
-    /// owns it from here.
+    /// rate-limit park, a burned budget).
     pub fn release_running(&mut self, lease: &Lease) -> bool {
         let Some(entry) = self.current(lease) else {
             return false;
@@ -401,9 +380,7 @@ impl LifecycleTable {
         }
     }
 
-    /// Move a running worker into its respawn epoch. The returned lease is
-    /// the generation the replacement runner must carry; the identity is
-    /// the runner being replaced, for a stop that lands before the launch.
+    /// Move a running worker into its respawn epoch.
     pub fn begin_respawn(
         &mut self,
         lease: &Lease,
@@ -534,8 +511,7 @@ impl LifecycleTable {
             .collect()
     }
 
-    /// Whether a worker is up or coming up. A stopping worker is owned
-    /// but not running, so a prompt against it is refused.
+    /// Whether a worker is up or coming up.
     pub fn is_running(&self, session_id: &str) -> bool {
         matches!(
             self.phase(session_id),

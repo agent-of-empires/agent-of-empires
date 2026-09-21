@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { fetchBranches, type BranchInfo } from "../../../lib/api";
+import { useState } from "react";
+import { useBranchSuggestions } from "./branchSuggestions";
 import { ProjectSearchList } from "./ProjectSearchList";
 import { useProjectPicker } from "./projectPicker";
 
@@ -7,19 +7,14 @@ interface Props {
   primaryPath: string;
   selectedPaths: string[];
   onChange: (paths: string[]) => void;
-  /** Base branch per repo path. Empty or missing means the repo falls back to
-   *  the session-wide base branch. See #3329. */
+  /** Per repo base branch; missing falls back to the session base branch. */
   repoBases: Record<string, string>;
   onRepoBasesChange: (bases: Record<string, string>) => void;
-  /** False while attaching to an existing branch, when no branch is created
-   *  and a base has nothing to apply to. */
+  /** False when attaching to an existing branch. */
   basesEnabled: boolean;
 }
 
-/// Base-branch typeahead for one extra repo. The branch list comes from that
-/// repo's own path, so a workspace member offers its own epic branches rather
-/// than the launch repo's. Free text is accepted: a ref that exists only on a
-/// remote still resolves at worktree creation. See #3329.
+/** Base-branch typeahead listing branches from this repo's own path; free text is accepted. */
 function RepoBaseInput({
   repoPath,
   label,
@@ -31,22 +26,8 @@ function RepoBaseInput({
   value: string;
   onChange: (value: string) => void;
 }) {
-  const [branches, setBranches] = useState<BranchInfo[] | null>(null);
   const [focused, setFocused] = useState(false);
-
-  useEffect(() => {
-    if (!focused || branches !== null) return;
-    let cancelled = false;
-    fetchBranches(repoPath, true).then((rows) => {
-      if (!cancelled) setBranches(rows ?? []);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [focused, branches, repoPath]);
-
-  const query = value.trim().toLowerCase();
-  const suggestions = (branches ?? []).filter((b) => !query || b.name.toLowerCase().includes(query)).slice(0, 6);
+  const { suggestions } = useBranchSuggestions(repoPath, focused, value, 6);
 
   return (
     <div className="relative flex-1 min-w-0">
@@ -98,8 +79,7 @@ export function ExtraReposPicker({
 }: Props) {
   const [freeText, setFreeText] = useState("");
 
-  // Hide the primary repo from the picker so users can't accidentally
-  // duplicate it (the builder rejects duplicate repo names).
+  // The builder rejects duplicate repo names.
   const { loading, saved, recent, query, setQuery, filteredSaved, filteredRecent, hasAnyProjects } = useProjectPicker([
     primaryPath,
   ]);

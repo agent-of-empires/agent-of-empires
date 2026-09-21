@@ -1,7 +1,4 @@
 //! `agent-of-empires agents` command implementation
-//!
-//! Lists all supported agents, shows which are installed, and prints
-//! install commands for missing ones.
 
 use anyhow::Result;
 

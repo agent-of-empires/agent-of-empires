@@ -1,5 +1,5 @@
 //! Misc system endpoints: agents, settings, themes, profiles, filesystem,
-//! groups, docker status, system health, devices, about.
+//! groups, docker, system health, devices, about.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use super::validate_profile_name;
 use super::AppState;
+use super::{api_error, read_only_response};
 use crate::server::auth::AuthenticatedTokenHash;
 use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
 use crate::session::config::settings_schema::{
@@ -21,19 +22,16 @@ use crate::session::config::settings_schema::{
     validate_patch_with, PatchRejection, Scope,
 };
 
-/// Foreground state reported by one browser dashboard. This is intentionally
-/// separate from normal API traffic: background polling must not suppress a
-/// phone's push notification.
+/// Foreground state reported by one browser dashboard. Kept out of normal API
+/// traffic so background polling cannot suppress a phone's push notification.
 #[derive(Deserialize)]
 pub struct DashboardPresenceBody {
     pub active: bool,
 }
 
-/// `POST /api/presence`. Record or clear this browser's foreground presence.
-/// The device-binding header is already attached to authenticated dashboard
-/// requests. Hashing it gives each browser an ephemeral server-side key without
-/// retaining the secret itself. Older clients without that header fall back to
-/// their authenticated token owner.
+/// `POST /api/presence`. Records or clears this browser's foreground presence.
+/// The device-binding header is hashed into an ephemeral per-browser key rather
+/// than retained; clients without it fall back to their token owner.
 pub async fn post_dashboard_presence(
     State(state): State<Arc<AppState>>,
     Extension(owner): Extension<AuthenticatedTokenHash>,
@@ -59,57 +57,37 @@ pub struct AgentInfo {
     pub host_only: bool,
     pub installed: bool,
     pub install_hint: String,
-    /// True when this agent has a one-shot mode (a `oneshot_flag`), so it can
-    /// be used for the smart-rename title call. The settings smart-rename agent
-    /// picker filters on this together with `installed`. Always false for
-    /// custom agents (no built-in one-shot contract).
+    /// Whether the agent has a one-shot mode, so it can serve the smart-rename
+    /// title call. Always false for custom agents.
     pub oneshot_capable: bool,
-    /// True when this agent can run in the structured acp UI: a
-    /// built-in with an ACP adapter, or a custom agent that declares a
-    /// valid `agent_acp_cmd`. The web wizard reads this to decide
-    /// whether a session created for the agent runs in acp or tmux.
+    /// Whether the agent can run in the structured ACP UI: a built-in with an ACP
+    /// adapter, or a custom agent declaring a valid `agent_acp_cmd`.
     pub acp_capable: bool,
-    /// True when the agent's ACP adapter binary (`acp_command`) is actually
-    /// resolvable on this host, not just registered. Distinct from
-    /// `installed` (the agent's own CLI binary) and `acp_capable` (registry
-    /// knows an adapter exists). The wizard's "Import from Claude" tab gates
-    /// on this so it never shows when claude-agent-acp is missing. See #2276.
+    /// Whether the agent's ACP adapter binary resolves on this host, not just that
+    /// the registry knows one exists. Gates the wizard's "Import from Claude" tab.
     pub acp_installed: bool,
-    /// True when `[acp] allowed_agents` permits this agent in the structured
-    /// view. Deliberately separate from `acp_capable`, which states an intrinsic
-    /// fact (an ACP adapter exists for this agent) that an operator policy does
-    /// not change. Folding policy into `acp_capable` would hide a disallowed
-    /// agent from the settings surfaces that enumerate this endpoint to edit
-    /// per-agent structured-view defaults, which is a legitimate thing to do for
-    /// an agent that is currently off the allowlist. The wizard gates its
-    /// structured-view option on this in addition to `acp_capable`. See #3241.
+    /// Whether `[acp] allowed_agents` permits this agent. Kept separate from
+    /// `acp_capable`, which states an intrinsic fact that operator policy does not
+    /// change, so settings surfaces can still edit a disallowed agent's defaults.
     pub acp_allowed: bool,
-    /// The ACP command a built-in agent launches in acp, e.g.
-    /// `claude-agent-acp` for claude or `opencode` for opencode. This is
-    /// the registry command (post `${aoe_data_dir}` substitution), which
-    /// can differ from `binary`; the wizard previews it so the user sees
-    /// the real launch command before starting. Omitted for custom
-    /// agents, whose command values are never serialized here (see the
-    /// custom-agent serialization tests below).
+    /// The ACP command a built-in agent launches, after `${aoe_data_dir}`
+    /// substitution; it can differ from `binary`. Omitted for custom agents, whose
+    /// command values are never serialized here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_command: Option<String>,
-    /// The registry args appended to `acp_command` (e.g. `["acp"]`
-    /// for opencode, `["--acp"]` for gemini). Empty when there are none
-    /// or for custom agents.
+    /// Registry args appended to `acp_command`. Empty when there are none or for
+    /// custom agents.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub acp_args: Vec<String>,
-    /// Registry lifecycle state. Omitted while Active so the common wire
-    /// shape is unchanged; the dashboard mirrors the shape in
-    /// `web/src/lib/types.ts` (`AgentLifecycleInfo`) and renders a
-    /// deprecated badge in the wizard picker and switch-agent modal.
+    /// Registry lifecycle state. Omitted while Active so the common wire shape is
+    /// unchanged; mirrored by `AgentLifecycleInfo` in `web/src/lib/types.ts`.
     #[serde(skip_serializing_if = "crate::agents::AgentLifecycle::is_active")]
     pub lifecycle: crate::agents::AgentLifecycle,
 }
 
-/// Resolve the acp launch command + args for a built-in agent from
-/// its registry spec, substituting `${aoe_data_dir}` so the preview
-/// matches what `supervisor::spawn_inner` actually runs. Returns
-/// `(None, [])` for agents without a registry entry.
+/// Resolve a built-in agent's ACP command and args from its registry spec,
+/// substituting `${aoe_data_dir}` so the preview matches what the supervisor
+/// runs. `(None, [])` for agents without a registry entry.
 fn acp_command_fields(
     spec: Option<&crate::acp::AgentSpec>,
     data_dir: Option<&std::path::Path>,
@@ -157,12 +135,9 @@ fn build_custom_agent_infos(
                 .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok())
                 || crate::acp::inherited_acp_base(name, agent_detect_as).is_some(),
             acp_allowed: policy.allows(name),
-            // Custom agents' acp_command is never serialized here (it can hold
-            // hostnames or secrets), so we don't probe its install state; the
-            // import tab is claude-only regardless.
+            // A custom agent's acp_command is never serialized (it can hold
+            // hostnames or secrets), so its install state is not probed.
             acp_installed: false,
-            // Custom agents' command values are deliberately never
-            // serialized here; they can hold hostnames or secrets.
             acp_command: None,
             acp_args: Vec::new(),
         })
@@ -246,27 +221,27 @@ pub async fn get_settings(
             Ok(val) => (StatusCode::OK, Json(val)).into_response(),
             Err(e) => {
                 tracing::error!(target: "http.api.system", "Settings serialization failed: {}", e);
-                (
+                api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "serialize_failed", "message": "Failed to serialize settings"})),
+                    "serialize_failed",
+                    "Failed to serialize settings",
                 )
-                    .into_response()
             }
         },
         Err(e) => {
             tracing::error!(target: "http.api.system", "Settings load failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "load_failed", "message": "Failed to load settings"})),
+                "load_failed",
+                "Failed to load settings",
             )
-                .into_response()
         }
     }
 }
 
-/// Map a schema [`PatchRejection`] to the HTTP response shape the dashboard
-/// expects. `elevation_required` mirrors the path-shape gate's 403 so the web
-/// client's interceptor fires the passphrase prompt unchanged.
+/// Map a schema [`PatchRejection`] onto the dashboard's HTTP shape.
+/// `elevation_required` mirrors the path-shape gate's 403 so the web client's
+/// interceptor fires the passphrase prompt unchanged.
 fn reject_response(rej: PatchRejection) -> axum::response::Response {
     let status = StatusCode::from_u16(rej.status_code()).unwrap_or(StatusCode::BAD_REQUEST);
     (
@@ -280,40 +255,29 @@ pub async fn update_settings(
     State(state): State<Arc<AppState>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    // CityHall mode exposes only the theme control, which writes through the
-    // dedicated `PATCH /api/theme` endpoint; the general settings PATCH stays
-    // fully closed so advanced settings cannot be reached. See #7.
+    // CityHall exposes only the theme control, which writes through
+    // `PATCH /api/theme`; the general settings PATCH stays fully closed (#7).
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return read_only_response();
     }
     let Json(mut body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    // Strip host-execution surfaces (`local_only`: node_path, agent
-    // argv/command, status-hook commands) before anything else, so a bundled
-    // or echoed-back patch keeps its safe leaves and silently drops the
-    // local-only ones (#1692). They can never reach disk from the web.
+    // Strip host-execution surfaces (`local_only`) first, so a bundled or
+    // echoed-back patch keeps its safe leaves and drops the rest (#1692).
     strip_local_only(&mut body);
     // Validate every remaining leaf against the runtime schema (core plus
-    // active-plugin `plugin:<id>` sections): unknown section/field -> 400, bad
-    // value -> 400. `PATCH /api/settings` is already elevation-gated by the
-    // auth middleware, so any field reaching here is treated as elevated.
+    // active-plugin `plugin:<id>` sections). The auth middleware already
+    // elevation-gates this route, so anything reaching here counts as elevated.
     if let Err(rej) = validate_patch_with(&runtime_schema(), &body, Scope::Global, true) {
         return reject_response(rej);
     }
-    // Capture which plugins this patch touches (top-level `plugin:<id>`
-    // sections and their changed field keys) BEFORE the rewrite folds them
-    // into `plugins.<id>.settings.*`, so we can emit `plugin.settings.changed`
+    // Record which plugins the patch touches BEFORE the rewrite folds them into
+    // `plugins.<id>.settings.*`, so `plugin.settings.changed` can be emitted
     // after a successful write (#2897).
     let plugin_changes: Vec<(String, Vec<String>)> = body
         .as_object()
@@ -348,9 +312,8 @@ pub async fn update_settings(
 
     match result {
         Ok(Ok(config)) => {
-            // Settings touched [logging]? Apply the new filter live to
-            // the daemon + persist runtime_filter so acp runners pick
-            // it up via the notify watcher.
+            // Apply the new filter live and persist runtime_filter so acp
+            // runners pick it up via the notify watcher.
             if let Ok(app_dir) = crate::session::get_app_dir() {
                 crate::logging::apply_persisted_config(
                     &config.logging.default_level,
@@ -358,8 +321,7 @@ pub async fn update_settings(
                     &app_dir,
                 );
             }
-            // Tell each touched plugin's worker its settings changed (#2897),
-            // after the durable write. Best-effort; config.get is the fallback.
+            // Notify each touched plugin's worker after the durable write (#2897).
             if !plugin_changes.is_empty() {
                 if let Some(host) = &state.plugin_host {
                     host.emit_settings_changed(&plugin_changes).await;
@@ -369,40 +331,36 @@ pub async fn update_settings(
                 Ok(val) => (StatusCode::OK, Json(val)).into_response(),
                 Err(e) => {
                     tracing::error!(target: "http.api.system", "Settings serialization failed: {}", e);
-                    (
+                    api_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": "serialize_failed", "message": "Failed to serialize settings"})),
+                        "serialize_failed",
+                        "Failed to serialize settings",
                     )
-                        .into_response()
                 }
             }
         }
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Settings update failed: {}", e);
-            (
+            api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "update_failed", "message": "Failed to update settings"})),
+                "update_failed",
+                "Failed to update settings",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Settings update panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
 
 /// `GET /api/cityhall/bundle` returns this install's CityHall config bundle as
-/// TOML, for an admin to paste into CityHall. See
-/// `crate::session::cityhall_bundle`.
-///
-/// Refused in CityHall client mode: this is the surface an admin uses to
-/// configure workspaces, and an end user inside one has no business reading it.
-/// `cityhall_gate` only guards mutations, so a read needs its own block.
+/// TOML. Refused in CityHall client mode: `cityhall_gate` only guards
+/// mutations, so this read needs its own block.
 pub async fn get_cityhall_bundle(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> axum::response::Response {
@@ -422,39 +380,34 @@ pub async fn get_cityhall_bundle(
             .into_response(),
         Ok(Err(e)) => {
             tracing::error!(target: "http.api.system", "CityHall bundle export failed: {e}");
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "export_failed", "message": e.to_string()})),
+                "export_failed",
+                e.to_string(),
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "CityHall bundle export panicked: {e}");
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
 
 /// `GET /api/settings/schema` returns the flat list of settings field
-/// descriptors (the single source of truth, see #1692). The web dashboard
-/// renders a generic field component from this list instead of hand-written
-/// per-field JSX, so a new config field appears on the web automatically. No
-/// secrets: descriptors are pure metadata (labels, widgets, validation, write
-/// policy), so this needs no elevation, only normal authentication.
+/// descriptors the dashboard renders generic field components from, so a new
+/// config field appears on the web automatically (#1692). Pure metadata, so
+/// normal authentication is enough.
 pub async fn get_settings_schema(
 ) -> Json<Vec<crate::session::config::settings_schema::FieldDescriptor>> {
     Json(runtime_schema())
 }
 
 /// `GET /api/settings/resolved` returns every setting's effective value plus
-/// its provenance chain (user value > highest-priority plugin default > schema
-/// default for core; stored value > manifest default for plugin settings). The
-/// dashboard uses it to show where a value comes from. Pure metadata derived
-/// from the same schema the surfaces render, so only normal authentication.
+/// its provenance chain, so the dashboard can show where a value comes from.
 pub async fn get_settings_resolved(
 ) -> Json<Vec<crate::session::config::settings_schema::ResolvedSetting>> {
     Json(
@@ -464,8 +417,7 @@ pub async fn get_settings_resolved(
     )
 }
 
-/// Body of `PATCH /api/theme`. Either field may be omitted to leave it
-/// unchanged.
+/// Body of `PATCH /api/theme`. Either field may be omitted to leave it unchanged.
 #[derive(serde::Deserialize)]
 pub struct ThemePatch {
     #[serde(default)]
@@ -475,60 +427,42 @@ pub struct ThemePatch {
 }
 
 /// `PATCH /api/theme` sets the global theme name and/or color mode and returns
-/// the freshly resolved theme so the caller can repaint.
-///
-/// The theme is a global preference (see `config::resolve_theme_name`): it
-/// lives in the global config, never a profile, so one theme paints every
-/// surface. This is a dedicated, non-elevated write (like the web-tour flag)
-/// rather than routing through `PATCH /api/settings`: a cosmetic theme change
-/// must not trip the passphrase wall that guards the general settings surface
-/// (`requires_elevation` keeps profile-settings preference writes off that wall
-/// for the same reason). `read_only` still blocks it.
+/// the freshly resolved theme so the caller can repaint. Theme is global, never
+/// per profile. Deliberately non-elevated, like the web-tour flag: a cosmetic
+/// change must not trip the passphrase wall. `read_only` still blocks it.
 pub async fn update_theme(
     State(state): State<Arc<AppState>>,
     body: Result<Json<ThemePatch>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return read_only_response();
     }
     let Json(mut patch) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    // CityHall hides the color-mode control in the Theme tab, so drop any
-    // client-supplied color_mode; only the theme name is writable here (#7).
+    // CityHall hides the color-mode control, so only the name is writable (#7).
     if state.cityhall_mode {
         patch.color_mode = None;
     }
-    // Reject an unknown theme name so a typo can't repaint to the `default`
-    // fallback. Empty is allowed (clears back to the default builtin).
+    // Reject an unknown name so a typo cannot silently repaint to `default`.
+    // Empty is allowed and clears back to the default builtin.
     if let Some(name) = &patch.name {
         if !name.is_empty()
             && !crate::tui::styles::available_themes()
                 .iter()
                 .any(|t| t == name)
         {
-            return (
+            return api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "unknown_theme",
-                    "message": format!("Unknown theme '{name}'"),
-                })),
-            )
-                .into_response();
+                "unknown_theme",
+                format!("Unknown theme '{name}'"),
+            );
         }
     }
     let result = tokio::task::spawn_blocking(move || {
-        // `update_config` re-loads via `Config::load()` (not `load_or_warn`),
-        // so a corrupt config.toml surfaces as an error instead of being
-        // silently replaced with defaults, wiping every other setting, just
-        // to change a theme. A parse error surfaces as a 400 below.
+        // `update_config` re-loads via `Config::load()`, so a corrupt
+        // config.toml errors out instead of being replaced with defaults.
         let theme_name = crate::session::update_config(|config| {
             if let Some(name) = patch.name {
                 config.theme.name = name;
@@ -547,50 +481,41 @@ pub async fn update_theme(
             Ok(val) => (StatusCode::OK, Json(val)).into_response(),
             Err(e) => {
                 tracing::error!(target: "http.api.system", "theme serialization failed: {}", e);
-                (
+                api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "serialize_failed", "message": "Failed to serialize theme"})),
+                    "serialize_failed",
+                    "Failed to serialize theme",
                 )
-                    .into_response()
             }
         },
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "theme update failed: {}", e);
-            (
+            api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "update_failed", "message": "Failed to update theme"})),
+                "update_failed",
+                "Failed to update theme",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "theme update panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
 
-/// Marks the web dashboard's first-run tour as seen for this server.
+/// Marks the web dashboard's first-run tour as seen.
 ///
-/// Single-purpose write so the cosmetic flag never widens the
-/// `PATCH /api/settings` surface (which carries security-sensitive
-/// sections like `sandbox`/`worktree`). Deliberately exempt from the
-/// elevation/passphrase wall: it flips one cosmetic bool, grants no
-/// capability, and `read_only` still blocks it. Persisted via
-/// `update_app_state` into `state.toml`, entirely separate from
-/// `config.toml`, so a corrupt global config can never block this flag.
+/// Single-purpose write so the cosmetic flag never widens the security-sensitive
+/// `PATCH /api/settings` surface, and deliberately exempt from the elevation
+/// wall; `read_only` still blocks it. Persisted to `state.toml`, so a corrupt
+/// `config.toml` cannot block it.
 pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return read_only_response();
     }
 
     let result = tokio::task::spawn_blocking(|| {
@@ -608,19 +533,19 @@ pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl Into
             .into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Marking web tour seen failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tour state"})),
+                "save_failed",
+                "Failed to persist tour state",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Marking web tour seen panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -635,21 +560,16 @@ pub struct TipDto {
 
 #[derive(Serialize)]
 pub struct TipsResponse {
-    /// Mirror of `session.show_tips`. The dashboard hides the badge and panel
-    /// when this is false. This payload is a read projection; the toggle is
-    /// written through the dedicated `POST /api/tips/show` ([`set_show_tips`]),
-    /// and the same preference is also editable from the settings schema.
+    /// Mirror of `session.show_tips`; the dashboard hides the badge and panel
+    /// when false. Written through `POST /api/tips/show`, not here.
     pub enabled: bool,
-    /// Web-eligible tips in catalog order, each flagged with whether it has been
-    /// seen. The frontend derives the badge count from the unseen ones and can
-    /// still show seen tips in a collapsed section.
+    /// Web-eligible tips in catalog order, each flagged as seen. The frontend
+    /// derives the badge count from the unseen ones.
     pub tips: Vec<TipDto>,
 }
 
 /// Returns the web-surface tips and whether tips are enabled, composed from the
-/// shared `crate::tips` catalog plus `app_state.tips_seen` and
-/// `session.show_tips`. A read projection, so it stays a plain GET behind the
-/// token wall like [`get_web_ui_state`]; the TUI-only tips never appear here.
+/// `crate::tips` catalog plus `app_state.tips_seen` and `session.show_tips`.
 pub async fn get_tips(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(|| {
         let config = crate::session::Config::load()?;
@@ -678,8 +598,8 @@ pub async fn get_tips(State(_state): State<Arc<AppState>>) -> impl IntoResponse 
 
     match result {
         Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
-        // Best-effort: an unreadable config yields an empty, disabled payload so
-        // the dashboard simply shows no badge rather than erroring.
+        // Best-effort: an unreadable config yields an empty, disabled payload
+        // so the dashboard shows no badge rather than erroring.
         _ => (
             StatusCode::OK,
             Json(TipsResponse {
@@ -696,35 +616,26 @@ pub struct MarkTipSeenBody {
     pub id: String,
 }
 
-/// Marks one tip seen by appending its id to the shared `app_state.tips_seen`
-/// in `state.toml`, so the dashboard's mark-seen-on-view sticks across devices
-/// and matches the TUI. Single-purpose write mirroring [`mark_web_tour_seen`]:
-/// exempt from the elevation wall, still blocked by `read_only`. Rejects an id
-/// that is not in the catalog so junk can't accumulate in the persisted seen
-/// list.
+/// Marks one tip seen in the shared `app_state.tips_seen`, so mark-seen-on-view
+/// sticks across devices. Rejects an id outside the catalog so junk cannot
+/// accumulate. Exempt from elevation like [`mark_web_tour_seen`].
 pub async fn mark_tip_seen(
     State(state): State<Arc<AppState>>,
     body: Result<Json<MarkTipSeenBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return read_only_response();
     }
     let Json(MarkTipSeenBody { id }) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
     if !crate::tips::id_in_catalog(&id) {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "unknown_tip", "message": format!("Unknown tip id '{id}'")})),
-        )
-            .into_response();
+            "unknown_tip",
+            format!("Unknown tip id '{id}'"),
+        );
     }
 
     let result = tokio::task::spawn_blocking(move || {
@@ -740,19 +651,19 @@ pub async fn mark_tip_seen(
         Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Marking tip seen failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tip state"})),
+                "save_failed",
+                "Failed to persist tip state",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Marking tip seen panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -762,25 +673,15 @@ pub struct SetShowTipsBody {
     pub enabled: bool,
 }
 
-/// Sets `session.show_tips`, the "Show tips on startup" checkbox in the tip-of-
-/// the-day modal. A dedicated single-purpose write rather than `PATCH
-/// /api/settings`, which the auth middleware elevation-gates: this is a cosmetic
-/// preference and must not trip the passphrase wall on a remote server. Mirrors
-/// [`mark_web_tour_seen`]: exempt from elevation, still blocked by `read_only`,
-/// and uses `Config::load()` so a corrupt config is not silently replaced. The
-/// same preference is also editable from the settings Interaction tab.
+/// Sets `session.show_tips`, the "Show tips on startup" checkbox. A cosmetic
+/// preference, so it is a dedicated write exempt from the elevation wall that
+/// guards `PATCH /api/settings`; `read_only` still blocks it.
 pub async fn set_show_tips(
     State(state): State<Arc<AppState>>,
     body: Result<Json<SetShowTipsBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return read_only_response();
     }
     let Json(SetShowTipsBody { enabled }) = match body {
         Ok(b) => b,
@@ -802,19 +703,19 @@ pub async fn set_show_tips(
             .into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Setting show_tips failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tips state"})),
+                "save_failed",
+                "Failed to persist tips state",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Setting show_tips panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -824,24 +725,15 @@ pub struct DismissUpdateBody {
     pub version: String,
 }
 
-/// Records that the user dismissed the update banner for a specific version,
-/// persisting to the shared `app_state.dismissed_update_version` in
-/// `state.toml` so the dismissal sticks across devices (and matches the
-/// TUI's snooze) rather than living in per-browser localStorage.
-/// Single-purpose write mirroring [`mark_web_tour_seen`]: exempt from the
-/// elevation wall, still blocked by `read_only`.
+/// Records the version whose update banner the user dismissed, in the shared
+/// `app_state.dismissed_update_version`, so the dismissal sticks across devices
+/// and matches the TUI. Exempt from elevation like [`mark_web_tour_seen`].
 pub async fn dismiss_update(
     State(state): State<Arc<AppState>>,
     body: Result<Json<DismissUpdateBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -865,28 +757,26 @@ pub async fn dismiss_update(
             .into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Dismissing update failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist dismissal"})),
+                "save_failed",
+                "Failed to persist dismissal",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Dismissing update panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
 
-/// Return the web dashboard's server-side UI-state blob (`app_state.web_ui_state`):
-/// a flat map of the frontend's localStorage keys to their opaque string values.
-/// Single-tenant, so this is the one user's synced prefs. GET is unauthenticated
-/// beyond the normal token wall (it grants no capability and exposes only UI
-/// preferences).
+/// Returns the dashboard's server-side UI-state blob (`app_state.web_ui_state`):
+/// a flat map of frontend localStorage keys to opaque string values. Exposes only
+/// UI preferences, so the normal token wall is enough.
 pub async fn get_web_ui_state(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(|| {
         let config = crate::session::Config::load()?;
@@ -895,18 +785,16 @@ pub async fn get_web_ui_state(State(_state): State<Arc<AppState>>) -> impl IntoR
     .await;
     match result {
         Ok(Ok(map)) => (StatusCode::OK, Json(serde_json::json!(map))).into_response(),
-        // Best-effort: an unreadable config yields an empty blob rather than an
-        // error, so the dashboard just falls back to its localStorage cache.
+        // Best-effort: an unreadable config yields an empty blob, so the
+        // dashboard falls back to its localStorage cache.
         _ => (StatusCode::OK, Json(serde_json::json!({}))).into_response(),
     }
 }
 
-/// Merge a partial update into `app_state.web_ui_state`. The body is a flat JSON
-/// object keyed by the frontend's localStorage keys: a string value sets the
-/// key, `null` deletes it. Mirrors [`mark_web_tour_seen`]'s exemptions (off the
-/// elevation wall, still blocked by `read_only`, `Config::load()` to avoid
-/// clobbering a corrupt config). Non-string, non-null values are ignored since
-/// localStorage values are always strings.
+/// Merges a partial update into `app_state.web_ui_state`: a string value sets a
+/// key, `null` deletes it. Non-string, non-null values are ignored since
+/// localStorage values are always strings. Exempt from elevation like
+/// [`mark_web_tour_seen`].
 pub async fn patch_web_ui_state(
     State(state): State<Arc<AppState>>,
     body: Result<
@@ -915,22 +803,15 @@ pub async fn patch_web_ui_state(
     >,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return read_only_response();
     }
     let Json(patch) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
 
-    // Values must be string (set) or null (delete); reject anything else
-    // explicitly so a client regression surfaces instead of silently dropping
-    // part of the sync.
+    // Reject anything that is not a string (set) or null (delete), so a client
+    // regression surfaces instead of silently dropping part of the sync.
     let invalid: Vec<&String> = patch
         .iter()
         .filter(|(_, v)| !v.is_string() && !v.is_null())
@@ -958,7 +839,7 @@ pub async fn patch_web_ui_state(
                     serde_json::Value::String(s) => {
                         state.web_ui_state.insert(key, s);
                     }
-                    // Already rejected above; keep exhaustive for safety.
+                    // Already rejected above; kept exhaustive.
                     _ => {}
                 }
             }
@@ -970,39 +851,31 @@ pub async fn patch_web_ui_state(
         Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Persisting web UI state failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist UI state"})),
+                "save_failed",
+                "Failed to persist UI state",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Persisting web UI state panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
 
-/// Records that the user has acknowledged glob `volume_ignores` snapshot
-/// expansion (#2045), so the new-session wizard's confirm modal is shown once
-/// and never again. Single-purpose write mirroring [`mark_web_tour_seen`]: it
-/// flips one bool, grants no capability, stays exempt from the elevation wall,
-/// and `read_only` still blocks it.
+/// Records that the user acknowledged glob `volume_ignores` snapshot expansion
+/// (#2045), so the wizard's confirm modal is shown once. Exempt from elevation
+/// like [`mark_web_tour_seen`].
 pub async fn mark_volume_ignores_globs_acknowledged(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return read_only_response();
     }
 
     let result = tokio::task::spawn_blocking(|| {
@@ -1020,19 +893,19 @@ pub async fn mark_volume_ignores_globs_acknowledged(
             .into_response(),
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.system", "Marking volume_ignores globs acknowledged failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist acknowledgment"})),
+                "save_failed",
+                "Failed to persist acknowledgment",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.system", "Marking volume_ignores globs acknowledged panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -1048,22 +921,15 @@ pub async fn list_themes() -> Json<Vec<String>> {
     )
 }
 
-/// Upper bound on the `:name` path segment for `/api/themes/:name`.
-/// Builtin names are <= 20 chars and custom theme filenames are
-/// inherently capped by the host filesystem; 128 is far past any
-/// real theme name. Past the cap we resolve Empire without logging
-/// the body to keep tracing output sane under fuzzing.
+/// Upper bound on the `:name` path segment for `/api/themes/:name`. Past the
+/// cap we resolve Empire without logging the body, to keep tracing sane under
+/// fuzzing.
 const MAX_THEME_NAME_LEN: usize = 128;
 
-/// `GET /api/themes/:name` returns the resolved theme projection (web
-/// CSS vars, terminal CSS vars, syntax highlighter selection,
-/// appearance) for the named theme. Unknown names resolve to the
-/// `default` builtin with `source: "fallback"`, mirroring
-/// `load_theme`'s behaviour.
-///
-/// Wrapped in `spawn_blocking`: the resolver does sync file I/O
-/// (`discover_custom_themes` directory scan + TOML parse) which must
-/// not run on a tokio worker thread.
+/// `GET /api/themes/:name` returns the resolved theme projection for the named
+/// theme. Unknown names resolve to the `default` builtin with
+/// `source: "fallback"`, mirroring `load_theme`. Runs in `spawn_blocking`: the
+/// resolver does sync file I/O.
 pub async fn get_resolved_theme(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Json<crate::tui::styles::ResolvedTheme> {
@@ -1086,10 +952,7 @@ pub async fn get_resolved_theme(
 }
 
 /// `GET /api/theme/current` returns the resolved theme to paint. Theme is a
-/// global preference, not profile-merged, so this reads the global config
-/// (see `config::resolve_theme_name`); every surface paints the same theme
-/// regardless of the active session profile. Sync work runs in
-/// `spawn_blocking`.
+/// global preference, not profile-merged, so every surface paints the same one.
 pub async fn get_current_theme(
     State(state): State<Arc<AppState>>,
 ) -> Json<crate::tui::styles::ResolvedTheme> {
@@ -1113,33 +976,26 @@ pub async fn get_current_theme(
 pub struct ProfileInfo {
     pub name: String,
     pub is_default: bool,
-    /// Optional short description, surfaced as helper text in the wizard
-    /// profile picker. `None` (and therefore omitted from JSON) when the
-    /// profile has no description configured. See #949.
+    /// Optional short description, shown as helper text in the wizard profile
+    /// picker. Omitted when the profile has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
 
 pub async fn list_profiles(State(state): State<Arc<AppState>>) -> Json<Vec<ProfileInfo>> {
-    // Profile enumeration plus per-profile description lookups all hit disk;
-    // do that off the async runtime so a slow filesystem (network home, fuse,
-    // etc.) cannot stall Tokio workers for every API client. See CodeRabbit
-    // feedback on #1274.
+    // Profile enumeration and description lookups all hit disk; keep them off
+    // the async runtime so a slow filesystem cannot stall Tokio workers.
     let active_profile = state.profile.clone();
     let result = tokio::task::spawn_blocking(move || {
-        // Resolve the active profile *before* enumerating. A server launched
-        // without --profile carries an empty profile; resolution then picks
-        // the first profile, bootstrapping `main` on a genuine first run.
-        // That bootstrap creates the profile directory as a side effect, so
-        // it must run before `list_profiles()` or the freshly bootstrapped
-        // profile would be absent from the returned list.
+        // Resolve the active profile before enumerating: on a genuine first run
+        // resolution bootstraps `main` and creates its directory, which must
+        // happen before `list_profiles()` or the new profile would be missing.
         let active: String = if active_profile.is_empty() {
             crate::session::config::resolve_default_profile()
         } else {
             active_profile
         };
-        // Picker order (`default` last); `active` came from the plain
-        // enumeration.
+        // Picker order (`default` last); `active` came from the enumeration.
         let profiles = crate::session::list_profiles_for_display().unwrap_or_default();
         profiles
             .into_iter()
@@ -1166,9 +1022,8 @@ pub struct BrowseQuery {
     pub path: String,
     pub limit: Option<usize>,
     pub filter: Option<String>,
-    /// Include dotfile-prefixed directories in the listing. Mirrors the TUI
-    /// picker's Ctrl+H toggle (`src/tui/components/dir_picker.rs`). Omitted
-    /// means false, so existing callers keep the old behavior.
+    /// Include dotfile-prefixed directories, mirroring the TUI picker's Ctrl+H
+    /// toggle. Omitted means false.
     #[serde(default)]
     pub show_hidden: bool,
 }
@@ -1205,10 +1060,9 @@ pub async fn filesystem_home(State(state): State<Arc<AppState>>) -> impl IntoRes
     }
 }
 
-/// Standard system folders that live directly under $HOME. On macOS several
-/// of these (Downloads, Desktop, Pictures/Photos, Music) are TCC-protected:
-/// opening them triggers a permission prompt. None is ever a git repo, so the
-/// directory browser skips its `.git` probe for them and avoids the prompt.
+/// Standard system folders directly under $HOME. On macOS several are
+/// TCC-protected, so opening them prompts. None is ever a git repo, so the
+/// browser skips its `.git` probe for them.
 const HOME_SYSTEM_DIRS: &[&str] = &[
     "Desktop",
     "Documents",
@@ -1220,8 +1074,7 @@ const HOME_SYSTEM_DIRS: &[&str] = &[
     "Library",
 ];
 
-/// The TCC prompt only exists on macOS, so gate the skip there. On other
-/// platforms these folders are probed normally and keep their git badge.
+/// The TCC prompt is macOS-only, so gate the skip there.
 fn skip_git_probe(parent: &std::path::Path, name: &str, home: Option<&std::path::Path>) -> bool {
     if !cfg!(target_os = "macos") {
         return false;
@@ -1275,10 +1128,8 @@ pub async fn browse_filesystem(
                     continue;
                 }
             }
-            // Probing `.git` inside a directory opens it, which on macOS
-            // triggers a TCC permission prompt. Skip the probe for the
-            // standard system folders directly under $HOME (Downloads,
-            // Desktop, Music, Pictures, etc.); none of them is ever a repo.
+            // Probing `.git` opens the directory, which prompts under macOS
+            // TCC. None of the standard $HOME folders is ever a repo.
             let is_git_repo = if skip_git_probe(&canonical, &name, home.as_deref()) {
                 false
             } else {
@@ -1291,8 +1142,8 @@ pub async fn browse_filesystem(
                 is_git_repo,
             });
         }
-        // Cached: avoids re-allocating the lowercase String on every comparison
-        // (sort_by_key calls the keyfn O(n log n) times, sort_by_cached_key calls it O(n)).
+        // Cached: `sort_by_cached_key` calls the keyfn O(n) times rather than
+        // O(n log n), so the lowercase String is allocated once per entry.
         entries.sort_by_cached_key(|e| e.name.to_lowercase());
         let has_more = entries.len() > limit;
         entries.truncate(limit);
@@ -1302,16 +1153,8 @@ pub async fn browse_filesystem(
 
     match result {
         Ok(Ok(resp)) => (StatusCode::OK, Json(serde_json::to_value(resp).unwrap())).into_response(),
-        Ok(Err(msg)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "browse_failed", "message": msg})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
-        )
-            .into_response(),
+        Ok(Err(msg)) => api_error(StatusCode::BAD_REQUEST, "browse_failed", msg),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
@@ -1455,35 +1298,26 @@ pub async fn docker_status() -> Json<DockerStatus> {
     Json(result)
 }
 
-/// Read-only runtime view of the `aoe serve` daemon's sleep-inhibit reconciler.
-/// Derived from a snapshot the poll loop publishes plus the live backend latch;
-/// never a control surface.
+/// Read-only runtime view of the `aoe serve` daemon's sleep-inhibit reconciler,
+/// derived from the poll loop's snapshot plus the live backend latch.
 #[derive(Serialize)]
 pub struct SleepInhibitStatus {
     /// The `session.prevent_sleep_when_active` toggle as the reconciler last
-    /// read it: the raw config toggle only, not the reconciler's `desired`
-    /// (which also folds in recent activity), nor whether an assertion is held.
+    /// read it: the raw config toggle only.
     pub prevent_sleep_enabled: bool,
-    /// Whether the daemon is holding an OS sleep assertion, as of the last
-    /// reconcile. Refreshed on the poll loop's interval, so it can trail the
-    /// death of the backing child (an external kill, or a backend that spawns
-    /// then fails, as on WSL2 with no logind) by up to that interval. Requires
-    /// both a retained inhibitor slot and an available backend, so a slot
-    /// lingering under the unavailable latch does not report held.
+    /// Whether the daemon holds an OS sleep assertion as of the last reconcile,
+    /// so it can trail the death of the backing child by up to the poll interval.
+    /// Requires both a retained slot and an available backend.
     pub currently_held: bool,
-    /// Whether a real OS backend is still believed able to hold the assertion
-    /// on this host. Optimistic: `true` means no failure has latched yet, not
-    /// that the backend was verified working. It is never actively probed, so
-    /// while the toggle is off the backend is never exercised and this stays
-    /// `true` even on a host where it would fail. `false` once a failure
-    /// latches, and false on unsupported platforms.
+    /// Whether a real OS backend is still believed able to hold the assertion.
+    /// Optimistic: `true` only means no failure has latched yet, since the
+    /// backend is never actively probed.
     pub backend_available: bool,
 }
 
-/// Fold the reconciler snapshot bits and the live backend-availability read into
-/// the reported status. `currently_held` gates the retained slot on the backend
-/// being available, so the unavailable latch (which keeps a doomed slot around
-/// to suppress respawns) and the no-op platform backend never report held.
+/// Fold the reconciler snapshot and the live backend-availability read into the
+/// reported status. `currently_held` gates the retained slot on the backend being
+/// available, so a doomed slot kept to suppress respawns never reports held.
 fn derive_sleep_inhibit_status(
     prevent_sleep_enabled: bool,
     slot_present: bool,
@@ -1501,52 +1335,36 @@ pub struct ServerAbout {
     pub version: String,
     pub auth_required: bool,
     pub passphrase_enabled: bool,
-    /// Resolved value of `--auth`: `"token"`, `"passphrase"`, or
-    /// `"none"`. The frontend Security panel renders the explicit mode
-    /// label off this so `--auth=passphrase` is not mislabeled as
-    /// `--no-auth`. Derived from `token_manager.is_no_auth()` plus
-    /// `login_manager.is_enabled()` because the CLI mode is not
-    /// retained in `AppState` (only its effects are).
+    /// Resolved `--auth` mode: `"token"`, `"passphrase"`, or `"none"`. Derived
+    /// from the token and login managers because the CLI mode itself is not
+    /// retained in `AppState`.
     pub auth_mode: &'static str,
     pub read_only: bool,
     pub behind_tunnel: bool,
-    /// CityHall client mode (`AOE_CITYHALL_MODE`). Drives the web
-    /// dashboard's locked-down end-user client: composer + structured
-    /// view only, name-only session creation, theme-only settings, and
-    /// no terminal / diff / project-management surfaces. See #7.
+    /// CityHall client mode (`AOE_CITYHALL_MODE`), which drives the dashboard's
+    /// locked-down end-user client. See #7.
     pub cityhall_mode: bool,
     pub profile: String,
-    /// Resolved value of `acp.show_tool_durations` from the active
-    /// profile's config. Drives the per-tool elapsed-time label in the
-    /// web UI; cross-device since it lives in config.toml.
+    /// Resolved `acp.show_tool_durations`, driving the per-tool elapsed-time
+    /// label in the web UI.
     pub acp_show_tool_durations: bool,
-    /// Resolved value of `acp.replay_events` from the active
-    /// profile's config. Per-session retention cap on the acp
-    /// event log; 0 means unlimited. The web client mirrors this on
-    /// its in-memory activity buffer so the rendered transcript
-    /// honours the user's chosen ceiling instead of clipping at a
-    /// hard-coded constant. See #1111.
+    /// Resolved `acp.replay_events`: per-session retention cap on the acp event
+    /// log, 0 for unlimited. The web client mirrors it on its in-memory activity
+    /// buffer instead of clipping at a hard-coded constant (#1111).
     pub acp_replay_events: u32,
-    /// Resolved value of `acp.compaction_reminder` from the active
-    /// profile. Gates the structured view's compaction reminder; off by
-    /// default. See #3253.
+    /// Resolved `acp.compaction_reminder`, gating the structured view's
+    /// compaction reminder. Off by default.
     pub acp_compaction_reminder: bool,
-    /// Resolved value of `acp.compaction_reminder_percent` from the
-    /// active profile. Context-window percentage at which the reminder
-    /// appears.
+    /// Resolved `acp.compaction_reminder_percent`: the context-window
+    /// percentage at which the reminder appears.
     pub acp_compaction_reminder_percent: u8,
-    /// `"debug"` when built with `debug_assertions`, `"release"`
-    /// otherwise. The web UI renders a "DEV" badge in the topbar
-    /// when this is `"debug"` so users can tell concurrently-running
-    /// debug (port 8081) and release (port 8080) instances apart at
-    /// a glance, including PWA installs where the port disappears
-    /// from the window chrome. See #1055.
+    /// `"debug"` when built with `debug_assertions`, else `"release"`. The web
+    /// UI renders a DEV badge from it so concurrent debug (8081) and release
+    /// (8080) instances are distinguishable, PWA installs included.
     pub build_flavor: &'static str,
-    /// Content-hashed entry bundle name (`index-<hash>.js`) of the
-    /// embedded dashboard build. The client compares this against its
-    /// own entry script tag and offers a reload when they differ, so
-    /// installed PWAs (which have no refresh affordance) pick up new
-    /// dashboard code after the binary updates.
+    /// Content-hashed entry bundle name of the embedded dashboard build. The
+    /// client compares it against its own entry script tag and offers a reload
+    /// when they differ, since installed PWAs have no refresh affordance.
     pub web_build_id: Option<&'static str>,
     /// Read-only runtime state of the daemon's sleep-inhibit reconciler.
     pub sleep_inhibit: SleepInhibitStatus,
@@ -1597,9 +1415,8 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
 // --- Update status ---
 
 /// Web-facing snapshot of `update::check_for_update`. `update_check_mode`
-/// mirrors `updates.update_check_mode` so the frontend can hide its banner
-/// (mode = `off`) or skip nagging while a background install runs
-/// (mode = `auto`) without separately fetching settings. See #984 and #1140.
+/// mirrors `updates.update_check_mode` so the frontend can hide its banner or
+/// skip nagging during a background install without fetching settings.
 #[derive(Serialize)]
 pub struct UpdateStatusResponse {
     pub update_check_mode: crate::session::config::UpdateCheckMode,
@@ -1681,13 +1498,7 @@ pub async fn create_profile(
     body: Result<Json<CreateProfileBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return read_only_response();
     }
     // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
     if let Some(resp) = super::cityhall_block(&state) {
@@ -1698,11 +1509,7 @@ pub async fn create_profile(
         Err(rej) => return rej.into_response(),
     };
     if let Err(e) = validate_profile_name(&body.name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": e})),
-        )
-            .into_response();
+        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
     }
     let name_for_create = body.name.clone();
     match tokio::task::spawn_blocking(move || crate::session::create_profile(&name_for_create))
@@ -1712,16 +1519,8 @@ pub async fn create_profile(
             crate::server::add_profile_disk_watch(&state, &body.name).await;
             (StatusCode::CREATED, Json(serde_json::json!({"ok": true}))).into_response()
         }
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "create_failed", "message": e.to_string()})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
-        )
-            .into_response(),
+        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "create_failed", e.to_string()),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
@@ -1730,31 +1529,21 @@ pub async fn delete_profile(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return read_only_response();
     }
     // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
     if let Err(e) = validate_profile_name(&name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": e})),
-        )
-            .into_response();
+        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
     }
     if name == state.profile {
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "active_profile", "message": "Cannot delete the active profile"})),
-        )
-            .into_response();
+            "active_profile",
+            "Cannot delete the active profile",
+        );
     }
     let name_for_delete = name.clone();
     match tokio::task::spawn_blocking(move || crate::session::delete_profile(&name_for_delete))
@@ -1764,16 +1553,8 @@ pub async fn delete_profile(
             crate::server::remove_profile_disk_watch(&state, &name).await;
             (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
         }
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "delete_failed", "message": e.to_string()})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
-        )
-            .into_response(),
+        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "delete_failed", e.to_string()),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
@@ -1788,13 +1569,7 @@ pub async fn rename_profile(
     body: Result<Json<RenameProfileBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return read_only_response();
     }
     // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
     if let Some(resp) = super::cityhall_block(&state) {
@@ -1805,18 +1580,10 @@ pub async fn rename_profile(
         Err(rej) => return rej.into_response(),
     };
     if let Err(e) = validate_profile_name(&name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": e})),
-        )
-            .into_response();
+        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
     }
     if let Err(e) = validate_profile_name(&body.new_name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": e})),
-        )
-            .into_response();
+        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
     }
     let old = name;
     let new = body.new_name;
@@ -1828,16 +1595,8 @@ pub async fn rename_profile(
                 .await;
             (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
         }
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "rename_failed", "message": e.to_string()})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
-        )
-            .into_response(),
+        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "rename_failed", e.to_string()),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
@@ -1851,13 +1610,7 @@ pub async fn default_profile(
     body: Result<Json<DefaultProfileBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return read_only_response();
     }
     // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
     if let Some(resp) = super::cityhall_block(&state) {
@@ -1868,25 +1621,13 @@ pub async fn default_profile(
         Err(rej) => return rej.into_response(),
     };
     if let Err(e) = validate_profile_name(&body.name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": e})),
-        )
-            .into_response();
+        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
     }
     let name = body.name;
     match tokio::task::spawn_blocking(move || crate::session::set_default_profile(&name)).await {
         Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "update_failed", "message": e.to_string()})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
-        )
-            .into_response(),
+        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "update_failed", e.to_string()),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
@@ -1894,30 +1635,23 @@ pub async fn get_profile_settings(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> impl IntoResponse {
     if let Err(e) = validate_profile_name(&name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": e})),
-        )
-            .into_response();
+        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
     }
     let result = tokio::task::spawn_blocking(move || {
         let profile = crate::session::load_profile_config(&name)?;
         let global = crate::session::Config::load_or_warn();
         let mut val = serde_json::to_value(&profile)?;
-        // The `logging` section lives on global Config (no profile
-        // override surface yet). Splice it into the response so the
-        // settings UI can render its current values from a single
-        // GET — without this the dropdowns would reset on every page
-        // load even after a successful PATCH.
+        // `logging` lives on the global Config with no profile override
+        // surface, so splice it in; otherwise the settings dropdowns reset on
+        // every page load even after a successful PATCH.
         if let Some(obj) = val.as_object_mut() {
             obj.insert(
                 "logging".to_string(),
                 serde_json::to_value(&global.logging)?,
             );
-            // Plugin settings live in the global config (global-only at Tier 0),
-            // not the profile override. Splice them in so the dashboard's plugin
-            // settings render their persisted values instead of reverting to the
-            // manifest default on every profile-view load (#2094).
+            // Plugin settings are global-only at Tier 0, so splice them in or
+            // the dashboard reverts to manifest defaults on every profile-view
+            // load (#2094).
             obj.insert(
                 "plugins".to_string(),
                 serde_json::to_value(&global.plugins)?,
@@ -1928,23 +1662,18 @@ pub async fn get_profile_settings(
     .await;
     match result {
         Ok(Ok(val)) => (StatusCode::OK, Json(val)).into_response(),
-        Ok(Err(e)) => (
+        Ok(Err(e)) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "load_failed", "message": e.to_string()})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
-        )
-            .into_response(),
+            "load_failed",
+            e.to_string(),
+        ),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
-/// Leaf paths CityHall mode may write via the profile-settings PATCH: only the
-/// curated trash cluster the Sessions tab exposes. Everything else is closed so
-/// the endpoint (which must stay open for those toggles) cannot double as an
-/// arbitrary profile-override writer. See #7.
+/// Leaf paths CityHall mode may write through the profile-settings PATCH: only
+/// the curated trash cluster the Sessions tab exposes, so an endpoint that must
+/// stay open cannot double as an arbitrary profile-override writer (#7).
 const CITYHALL_PROFILE_LEAVES: &[&str] = &[
     "session.delete_to_trash",
     "session.confirm_delete",
@@ -1984,64 +1713,44 @@ pub async fn update_profile_settings(
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return read_only_response();
     }
     let Json(mut body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
     if let Err(e) = validate_profile_name(&name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "validation_failed", "message": e})),
-        )
-            .into_response();
+        return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
     }
-    // Strip host-execution surfaces (`local_only`) before validation + merge,
-    // so a bundled patch keeps its safe leaves and silently drops the
-    // local-only ones; they can never become a profile override (#1692).
+    // Strip host-execution surfaces (`local_only`) before validation and merge,
+    // so they can never become a profile override (#1692).
     strip_local_only(&mut body);
-    // CityHall mode keeps this endpoint open for the curated Sessions trash
-    // toggles, but nothing else: reject any leaf outside that allowlist so the
-    // open endpoint cannot double as an arbitrary profile-override writer (#7).
+    // Reject any leaf outside the CityHall allowlist, so the endpoint kept open
+    // for the Sessions trash toggles cannot write arbitrary overrides (#7).
     if state.cityhall_mode {
         if let Some(bad) = first_non_cityhall_profile_leaf(&body) {
-            return (
+            return api_error(
                 StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": "cityhall_mode",
-                    "message": format!("Field '{bad}' is not writable in CityHall mode"),
-                })),
-            )
-                .into_response();
+                "cityhall_mode",
+                format!("Field '{bad}' is not writable in CityHall mode"),
+            );
         }
     }
-    // Resolve elevation up front via the shared resolver: login disabled
-    // means always elevated, a loopback-trusted caller is elevated per the
-    // #1168 carve-out (#2610), otherwise only an elevated session may write
-    // a requires-elevation field.
+    // Elevation up front: login disabled means always elevated, a
+    // loopback-trusted caller is elevated per the #1168 carve-out (#2610).
     let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
 
-    // Validate every remaining leaf against the schema (single source of
-    // truth, #1692): unknown section/field -> 400, requires-elevation without
-    // elevation -> 403 elevation_required (mirrors the path-shape gate's
-    // payload so web/src/lib/fetchInterceptor.ts fires the passphrase prompt
-    // unchanged, see #1510), bad value -> 400. `description` is accepted here
-    // (a profile-only field) but rejected on the global endpoint.
+    // Validate every remaining leaf against the schema (#1692). An
+    // elevation_required 403 mirrors the path-shape gate's payload so
+    // web/src/lib/fetchInterceptor.ts fires the passphrase prompt (#1510).
+    // `description` is profile-only and rejected on the global endpoint.
     if let Err(rej) = validate_patch(&body, Scope::Profile, elevated) {
         return reject_response(rej);
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        // The `logging` section is process-global (no profile overrides
-        // for v1), so peel it off the patch and write it into the
-        // global Config. Everything else stays a per-profile override.
+        // `logging` is process-global, so peel it off and write it to the
+        // global Config; everything else stays a per-profile override.
         let mut body = body;
         let logging_patch = body.as_object_mut().and_then(|obj| obj.remove("logging"));
         if let Some(patch) = logging_patch {
@@ -2080,11 +1789,9 @@ pub async fn update_profile_settings(
 
         let config = crate::session::load_profile_config(&name).unwrap_or_default();
         let mut current = serde_json::to_value(&config)?;
-        // Apply each validated leaf onto the sparse override object. A null
-        // clears the override (revert to inheriting the global); anything else
-        // sets it. Sections are created lazily so a single-field patch never
-        // wipes its siblings. `description` is a top-level string, handled the
-        // same way (set, or removed on null).
+        // Apply each validated leaf onto the sparse override object: null
+        // clears it, anything else sets it. Sections are created lazily so a
+        // single-field patch never wipes its siblings.
         if let Some(update_obj) = body.as_object() {
             for (key, value) in update_obj {
                 match value {
@@ -2124,22 +1831,14 @@ pub async fn update_profile_settings(
     match result {
         Ok(Ok(config)) => match serde_json::to_value(&config) {
             Ok(val) => (StatusCode::OK, Json(val)).into_response(),
-            Err(e) => (
+            Err(e) => api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "serialize_failed", "message": e.to_string()})),
-            )
-                .into_response(),
+                "serialize_failed",
+                e.to_string(),
+            ),
         },
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "update_failed", "message": e.to_string()})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
-        )
-            .into_response(),
+        Ok(Err(e)) => api_error(StatusCode::BAD_REQUEST, "update_failed", e.to_string()),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
@@ -2149,19 +1848,14 @@ pub async fn list_sounds() -> Json<Vec<String>> {
     Json(crate::sound::list_available_sounds())
 }
 
-/// Serve a sound file by name so the acp's browser-side approval
-/// player can fetch it from the same origin as the dashboard. The name
-/// is validated against `list_available_sounds()` to block path
-/// traversal: an attacker who can hit `/api/sounds/file/<x>` cannot
-/// read arbitrary disk paths, only files already present in the user's
-/// `sounds/` directory.
+/// Serve a sound file by name so the acp's browser-side approval player can
+/// fetch it same-origin. The name is validated against
+/// `list_available_sounds()`, so this cannot read arbitrary disk paths.
 pub async fn serve_sound_file(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    // The validation step (directory enumeration) stays on the blocking
-    // pool because `list_available_sounds` does sync `read_dir`. The
-    // file read itself uses `tokio::fs::read` so the larger I/O cost
-    // does not block a runtime worker.
+    // `list_available_sounds` does a sync `read_dir`, so validation stays on
+    // the blocking pool; the file read uses `tokio::fs::read`.
     let lookup_name = name.clone();
     let validated = tokio::task::spawn_blocking(move || {
         if !crate::sound::list_available_sounds().contains(&lookup_name) {
@@ -2211,18 +1905,16 @@ mod tests {
 
     #[test]
     fn derive_sleep_inhibit_status_gates_held_on_backend() {
-        // First three rows are reconciler-reachable states; the last two are
-        // not reachable from the writer (toggle off releases the slot) but pin
-        // the pure gate, proving `currently_held` excludes prevent_sleep_enabled.
+        // The last two rows are unreachable from the writer but pin the pure
+        // gate, proving `currently_held` excludes prevent_sleep_enabled.
         // (prevent_sleep_enabled, slot_present, backend_available) -> currently_held
         let cases = [
             // supported host actively holding the assertion
             ((true, true, true), true),
             // toggle on but every session idle past grace: slot released
             ((true, false, true), false),
-            // backend latched unavailable (helper missing / WSL2) or no-op
-            // platform: is_held_alive keeps the slot to suppress respawns, yet
-            // no real assertion is held
+            // backend latched unavailable or no-op platform: the slot is kept
+            // to suppress respawns, yet no real assertion is held
             ((true, true, false), false),
             // gate guard: enabled must not force held when the backend is down
             ((false, true, false), false),
@@ -2275,12 +1967,10 @@ mod tests {
     fn skip_git_probe_avoids_protected_home_folders() {
         let home = std::path::Path::new("/Users/alice");
 
-        // The skip is macOS-only: the TCC prompt does not exist elsewhere,
-        // so other platforms probe normally and keep the git badge.
+        // The TCC prompt is macOS-only, so other platforms probe normally.
         let macos = cfg!(target_os = "macos");
 
-        // Protected/system folders directly under $HOME: skipped on macOS so
-        // it never prompts for Downloads/Desktop/Music/Pictures.
+        // Protected folders directly under $HOME: skipped on macOS.
         for name in ["Downloads", "Desktop", "Music", "Pictures", "Documents"] {
             assert_eq!(
                 skip_git_probe(home, name, Some(home)),
@@ -2293,8 +1983,7 @@ mod tests {
         // badge is preserved.
         assert!(!skip_git_probe(home, "myproject", Some(home)));
 
-        // A folder named like a system dir but NOT directly under $HOME is
-        // probed normally (only the direct-$HOME set is protected).
+        // A system-looking name that is not directly under $HOME is probed.
         let sub = std::path::Path::new("/Users/alice/code");
         assert!(!skip_git_probe(sub, "Downloads", Some(home)));
 
@@ -2309,17 +1998,14 @@ mod tests {
             .collect()
     }
 
-    /// The default policy, for the tests that predate the allowlist and care
-    /// about other fields.
+    /// The default policy, for tests that predate the allowlist.
     fn unrestricted() -> crate::acp::agent_policy::AgentPolicy {
         crate::acp::agent_policy::AgentPolicy::for_test(false, &[])
     }
 
-    /// #3241: policy is a separate axis from capability. A disallowed agent must
-    /// still report `acp_capable: true` so the settings surfaces that enumerate
-    /// this endpoint can keep editing its per-agent structured-view defaults;
-    /// only `acp_allowed` goes false. Overloading `acp_capable` would have hidden
-    /// it from the operator's own settings UI.
+    /// #3241: policy is a separate axis from capability. A disallowed agent
+    /// still reports `acp_capable: true` so the settings surfaces can edit its
+    /// per-agent defaults; only `acp_allowed` goes false.
     #[test]
     fn acp_allowed_is_independent_of_acp_capable() {
         let custom = custom_agents(&[("oc-sp", "ocp run sp"), ("blocked", "ssh host claude")]);
@@ -2367,22 +2053,6 @@ mod tests {
     }
 
     #[test]
-    fn custom_agent_entries_never_serialize_command_values() {
-        let entries = build_custom_agent_infos(
-            &custom_agents(&[("remote-agent", "ssh -t prod.example claude")]),
-            &HashMap::new(),
-            &HashMap::new(),
-            &unrestricted(),
-        );
-
-        let json = serde_json::to_string(&entries).unwrap();
-        assert!(json.contains("remote-agent"));
-        assert!(!json.contains("ssh"));
-        assert!(!json.contains("prod.example"));
-        assert!(!json.contains("claude"));
-    }
-
-    #[test]
     fn serialized_custom_agent_response_contains_no_command_or_detect_as_data() {
         let entries = build_custom_agent_infos(
             &custom_agents(&[("remote-agent", "ssh -t prod.example claude")]),
@@ -2407,9 +2077,8 @@ mod tests {
 
     #[test]
     fn agent_info_lifecycle_wire_shape() {
-        // The /api/agents contract: lifecycle omitted for Active agents,
-        // full metadata for deprecated ones. Mirrored by
-        // web/src/lib/types.ts (AgentLifecycleInfo).
+        // The /api/agents contract: lifecycle omitted for Active agents, full
+        // metadata for deprecated ones. Mirrored by web/src/lib/types.ts.
         let mk = |name: &str| {
             let def = crate::agents::get_agent(name).unwrap();
             AgentInfo {
@@ -2492,9 +2161,8 @@ mod tests {
 
     #[test]
     fn custom_agent_acp_capable_via_detect_as_inheritance() {
-        // A wrapper that inherits a registry-backed base (claude) is
-        // structured-capable through the base adapter, with no agent_acp_cmd.
-        // A wrapper inheriting a terminal-only base (cursor) stays tmux-only.
+        // A wrapper inheriting a registry-backed base (claude) is capable
+        // through that adapter; one inheriting cursor stays tmux-only.
         let custom = custom_agents(&[
             ("lenovo-claude", "CLAUDE_CONFIG_DIR=/work claude"),
             ("my-cursor", "agent"),
@@ -2575,24 +2243,18 @@ mod tests {
         assert!(!value.to_string().contains("ocp run sp"));
     }
 
+    /// A name outside `list_available_sounds()` is refused, traversal included,
+    /// and a 404 that still streamed a body would be worse than the wrong
+    /// status.
     #[tokio::test]
-    async fn serve_sound_file_rejects_unknown_name() {
-        let resp = serve_sound_file(axum::extract::Path("does-not-exist-xyz.wav".to_string()))
-            .await
-            .into_response();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn serve_sound_file_rejects_path_traversal() {
-        let resp = serve_sound_file(axum::extract::Path("../../../etc/passwd".to_string()))
-            .await
-            .into_response();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        // A NOT_FOUND that somehow still streamed a body would be a
-        // worse failure than the wrong status, so assert the body is
-        // empty rather than just "not /etc/passwd".
-        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert!(body.is_empty(), "unexpected body bytes: {body:?}");
+    async fn serve_sound_file_rejects_names_outside_the_sounds_dir() {
+        for name in ["does-not-exist-xyz.wav", "../../../etc/passwd"] {
+            let resp = serve_sound_file(axum::extract::Path(name.to_string()))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name}");
+            let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+            assert!(body.is_empty(), "{name}: unexpected body bytes: {body:?}");
+        }
     }
 }

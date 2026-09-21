@@ -153,23 +153,14 @@ fn snapshot(sessions: &[AttachedStatusHookSession]) -> Vec<StatusUpdate> {
             id: session.instance.id.clone(),
             status: session.instance.status,
             last_error: session.instance.last_error.clone(),
-            // Watcher never observed a poll of its own => baseline is None
-            // and idle_entered_at is whatever the parent clone carried at
-            // attach-time. Emitting `Keep` here honors "producer has no
-            // observation" and prevents the snapshot from clobbering a
-            // real value the main-thread poller already wrote onto the
-            // real Instance during attach. This window is bounded by
-            // `REFRESH_INTERVAL` at the top of the module: the watcher
-            // seeds baseline on its first poll, after which `Some(_)` +
-            // `apply_updates`'s writes cover the field. Once the watcher
-            // has polled at least once, baseline is Some and
-            // idle_entered_at was written by `apply_updates` above, so
-            // `Set(ts)` / `Clear` reflect the real observation.
-            //
-            // Arm order matches consumer sites (`apply_updates` above,
-            // `apply_status_update` in `src/tui/home/status.rs`) and the
-            // enum declaration in `src/tui/status_poller.rs`:
-            // `Set` first, `Clear` second, `Keep` last.
+            // The watcher never polled of its own, so baseline is None and
+            // idle_entered_at is whatever the parent clone carried at attach
+            // time. `Keep` honors "producer has no observation" and stops the
+            // snapshot clobbering a real value the main-thread poller wrote.
+            // The window is bounded by `REFRESH_INTERVAL`: after the watcher's
+            // first poll, baseline is `Some` and `Set`/`Clear` reflect a real
+            // observation. Arm order matches the consumer sites and the enum
+            // declaration: `Set`, `Clear`, `Keep`.
             idle_entered_at: match (
                 session.instance.live_status_baseline,
                 session.instance.idle_entered_at,
@@ -238,17 +229,11 @@ mod tests {
     #[serial]
     fn apply_updates_maps_idle_intent_set_and_clear_arms() {
         // Regression guard for #2690: the Set/Clear arm mapping in
-        // `apply_updates` (the `match update.idle_entered_at` arms
-        // above) is the attached-hooks copy of the same match that
-        // `HomeView::apply_status_update` performs in
-        // `src/tui/home/status.rs`. The `home` copy is covered by
-        // `apply_status_update_clears_idle_entered_at_on_idle_to_running`
-        // in `src/tui/home/tests/status_rows_menu.rs`. This test locks the equivalent
-        // shape here so a Set<->Clear swap in either consumer is
-        // caught at review time; without it, a swap in this file
-        // compiles cleanly and passes the existing
-        // `apply_updates_runs_status_hook_for_transition` test (which
-        // only exercises `Keep`).
+        // `apply_updates` is the attached-hooks copy of the match
+        // `HomeView::apply_status_update` performs. Locking the shape here
+        // catches a Set<->Clear swap that would otherwise compile cleanly and
+        // still pass `apply_updates_runs_status_hook_for_transition`, which only
+        // exercises `Keep`.
         let mut instance = Instance::new("Idle Target", "/tmp/idle-target");
         instance.status = Status::Running;
         instance.idle_entered_at = None;

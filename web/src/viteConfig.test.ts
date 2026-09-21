@@ -1,11 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SESSION_WS_PROXY } from "../vite.config";
 
-// Guards the dev-server proxy contract that `cargo xtask dev` relies on: when
-// VITE_PROXY points at a running `aoe serve`, the Vite dev server must forward
-// REST (/api) and every AoE session WebSocket relay there, with the WS target
-// switched to the ws:// scheme. See vite.config.ts.
-
 type ProxyEntry = { target: string; ws?: boolean };
 
 async function loadProxy(env: Record<string, string | undefined>): Promise<Record<string, ProxyEntry> | undefined> {

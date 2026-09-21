@@ -1,37 +1,13 @@
 // @vitest-environment jsdom
-//
-// Payload-permutation coverage for the schema-driven settings tabs, ported
-// from the live Playwright story specs (settings-tmux-select, settings-tmux-
-// mouse, settings-logging-level, settings-snooze-duration, settings-sound-
-// toggle, plus the UI half of settings-persistence-tmux):
-//
-//   - change the tmux status_bar / mouse selects and the change reaches the
-//     selected profile as { tmux: { status_bar | mouse: ... } }
-//   - change the logging default level select and it lands as
-//     { logging: { default_level: ... } }
-//   - commit a new snooze duration and it lands as
-//     { session: { snooze_duration_minutes: <number> } }
-//   - flip the sound Enabled toggle and it lands as { sound: { enabled: true } }
-//   - the global-only, advanced session_id_poller_max_threads number sits in
-//     the Session tab's Advanced fold, carries the "not profile-overridable"
-//     note, and commits as { session: { session_id_poller_max_threads: <n> } }
-//
-// Each tab is a SchemaSection fed by `GET /api/settings/schema`, so the mock
-// schema below mirrors the real `#[setting(...)]` shapes (labels, widgets,
-// options) from src/session/config/mod.rs / src/sound/config.rs. What this pins is
-// the exact (profile, { section: { field: value } }) PATCH leaf each control
-// emits; server-side persistence of the PATCH is the server's contract, not
-// the dashboard's.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SettingsView } from "../../SettingsView";
 import * as api from "../../../lib/api";
+import { descriptor } from "./fixtures";
+import type { SettingsFieldDescriptor } from "../../../lib/types";
 
 const PROFILES = [{ name: "main", is_default: true }];
-
-const ALLOW = { policy: "allow" } as const;
-const NONE = { rule: "none" } as const;
 
 const TMUX_MODES = [
   { value: "auto", label: "Auto" },
@@ -39,84 +15,33 @@ const TMUX_MODES = [
   { value: "disabled", label: "Disabled" },
 ];
 
+const field = (
+  section: string,
+  name: string,
+  label: string,
+  widget: SettingsFieldDescriptor["widget"],
+  extra: Partial<SettingsFieldDescriptor> = {},
+) => descriptor({ section, field: name, category: section, label, widget, ...extra });
+
 const SCHEMA = [
-  {
-    section: "tmux",
-    field: "status_bar",
-    category: "Tmux",
-    label: "Status Bar",
-    description: "",
-    widget: { kind: "select", options: TMUX_MODES },
-    web_write: ALLOW,
-    profile_overridable: true,
-    validation: NONE,
-    advanced: false,
-  },
-  {
-    section: "tmux",
-    field: "mouse",
-    category: "Tmux",
-    label: "Mouse Support",
-    description: "",
-    widget: { kind: "select", options: TMUX_MODES },
-    web_write: ALLOW,
-    profile_overridable: true,
-    validation: NONE,
-    advanced: false,
-  },
-  {
-    section: "logging",
-    field: "default_level",
-    category: "Logging",
-    label: "Default level",
-    description: "",
-    widget: {
-      kind: "select",
-      options: ["trace", "debug", "info", "warn", "error"].map((v) => ({ value: v, label: v })),
-    },
-    web_write: ALLOW,
-    // global_only in the real schema: shown but not profile-overridable.
-    profile_overridable: false,
-    validation: NONE,
-    advanced: false,
-  },
-  {
-    section: "session",
-    field: "snooze_duration_minutes",
-    category: "Session",
-    label: "Snooze Duration (minutes)",
-    description: "",
-    widget: { kind: "number", min: 1, max: 43200 },
-    web_write: ALLOW,
-    profile_overridable: true,
-    validation: { rule: "range", min: 1, max: 43200 },
-    advanced: false,
-  },
-  {
-    section: "session",
-    field: "session_id_poller_max_threads",
-    category: "Session",
-    label: "Session-id poller threads (restart req.)",
-    description: "Ceiling on concurrent session-id poller threads in one aoe process. 0 keeps the default (50).",
-    widget: { kind: "number", min: 0 },
-    web_write: ALLOW,
-    // global_only + advanced in the real schema.
-    profile_overridable: false,
-    validation: NONE,
-    advanced: true,
-  },
-  {
-    section: "sound",
-    field: "enabled",
-    category: "Sound",
-    label: "Enabled",
-    description: "Play sounds on agent state transitions.",
-    widget: { kind: "toggle" },
-    web_write: ALLOW,
-    profile_overridable: true,
-    validation: NONE,
-    advanced: false,
-  },
+  field("tmux", "status_bar", "Status Bar", { kind: "select", options: TMUX_MODES }),
+  field("tmux", "mouse", "Mouse Support", { kind: "select", options: TMUX_MODES }),
+  field(
+    "logging",
+    "default_level",
+    "Default level",
+    { kind: "select", options: ["trace", "debug", "info", "warn", "error"].map((v) => ({ value: v, label: v })) },
+    { profile_overridable: false },
+  ),
+  field("session", "snooze_duration_minutes", "Snooze Duration (minutes)", { kind: "number", min: 1, max: 43200 }),
+  field(
+    "session",
+    "session_id_poller_max_threads",
+    "Session-id poller threads (restart req.)",
+    { kind: "number", min: 0 },
+    { profile_overridable: false, advanced: true, description: "Ceiling on concurrent session-id poller threads." },
+  ),
+  field("sound", "enabled", "Enabled", { kind: "toggle" }, { description: "Play sounds on agent state transitions." }),
 ];
 
 vi.mock("../../../lib/api", () => ({
@@ -137,8 +62,7 @@ function renderTab(tab: string) {
   return render(<SettingsView onClose={() => {}} tab={tab} onSelectTab={() => {}} onServerAboutRefresh={() => {}} />);
 }
 
-/** The <select> rendered next to a unique field label. Labels in FormFields
- *  are not wired to their controls, so walk from the label element. */
+// FormFields labels are not wired to their controls, so walk from the label.
 function selectByLabel(container: HTMLElement, label: string): HTMLSelectElement {
   const match = Array.from(container.querySelectorAll("label")).find((l) => l.textContent === label);
   const select = match?.parentElement?.querySelector("select");
@@ -153,16 +77,13 @@ function numberInputByLabel(container: HTMLElement, label: string): HTMLInputEle
   return input as HTMLInputElement;
 }
 
-// NumberField re-syncs from its prop unless focused, so focus before typing;
-// it commits on blur.
+// NumberField only accepts typing while focused and commits on blur.
 function commit(input: HTMLInputElement, value: string) {
   fireEvent.focus(input);
   fireEvent.change(input, { target: { value } });
   fireEvent.blur(input);
 }
 
-// ToggleField renders a label div next to a role=switch button inside a flex
-// row; click the switch that pairs with the given label.
 function clickToggle(container: HTMLElement, label: string) {
   const labelDiv = Array.from(container.querySelectorAll("div")).find(
     (d) => d.textContent === label && d.querySelector("*") === null,
@@ -178,40 +99,18 @@ describe("schema-driven settings field PATCH payloads", () => {
     vi.clearAllMocks();
   });
 
-  it("tmux Status Bar select emits { tmux: { status_bar } } to the selected profile", async () => {
-    const { container } = renderTab("tmux");
-    await screen.findByText("Status Bar");
-
-    fireEvent.change(selectByLabel(container, "Status Bar"), {
-      target: { value: "disabled" },
-    });
-
-    await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        tmux: { status_bar: "disabled" },
-      }),
-    );
-  });
-
-  it("tmux Mouse Support select emits { tmux: { mouse } }", async () => {
-    const { container } = renderTab("tmux");
-    await screen.findByText("Mouse Support");
-
-    fireEvent.change(selectByLabel(container, "Mouse Support"), {
-      target: { value: "disabled" },
-    });
-
-    await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        tmux: { mouse: "disabled" },
-      }),
-    );
+  it.each([
+    ["tmux", "Status Bar", "disabled", { tmux: { status_bar: "disabled" } }],
+    ["tmux", "Mouse Support", "disabled", { tmux: { mouse: "disabled" } }],
+    ["logging", "Default level", "debug", { logging: { default_level: "debug" } }],
+  ])("%s %s select emits its leaf", async (tab, label, value, patch) => {
+    const { container } = renderTab(tab);
+    await screen.findByText(label);
+    fireEvent.change(selectByLabel(container, label), { target: { value } });
+    await waitFor(() => expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", patch));
   });
 
   it("a tmux field edit never leaks sibling fields into the PATCH (sparse leaf)", async () => {
-    // The live tmux persistence spec PATCHed both fields at once; the UI
-    // contract is the opposite: each control writes only its own leaf so a
-    // concurrent edit on another surface is never clobbered.
     vi.mocked(api.fetchSettings).mockResolvedValueOnce({
       tmux: { status_bar: "enabled", mouse: "enabled" },
       logging: {},
@@ -236,21 +135,6 @@ describe("schema-driven settings field PATCH payloads", () => {
     }
   });
 
-  it("logging Default level select emits { logging: { default_level } }", async () => {
-    const { container } = renderTab("logging");
-    await screen.findByText("Default level");
-
-    fireEvent.change(selectByLabel(container, "Default level"), {
-      target: { value: "debug" },
-    });
-
-    await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        logging: { default_level: "debug" },
-      }),
-    );
-  });
-
   it("session Snooze Duration commit emits { session: { snooze_duration_minutes } } as a number", async () => {
     const { container } = renderTab("session");
     await screen.findByText("Snooze Duration (minutes)");
@@ -269,7 +153,6 @@ describe("schema-driven settings field PATCH payloads", () => {
     const { container } = renderTab("session");
     await screen.findByText("Snooze Duration (minutes)");
 
-    // Advanced fields live behind the collapsed "Advanced" fold.
     expect(screen.queryByText(LABEL)).toBeNull();
     const fold = Array.from(container.querySelectorAll("button[aria-expanded]")).find((b) =>
       b.textContent?.includes("Advanced"),
@@ -279,7 +162,6 @@ describe("schema-driven settings field PATCH payloads", () => {
     fireEvent.click(fold);
     await screen.findByText(LABEL);
 
-    // Global-only: the description says so instead of looking profile-scoped.
     const labelEl = Array.from(container.querySelectorAll("label")).find((l) => l.textContent === LABEL);
     expect(labelEl?.parentElement?.textContent).toContain("Applies to all profiles (not profile-overridable).");
 

@@ -15,6 +15,7 @@ use crate::session::projects::{self, RegistryError};
 use crate::session::{Project, ProjectScope};
 
 use super::AppState;
+use super::{api_error, read_only_response};
 
 #[derive(Serialize)]
 pub struct ProjectResponse {
@@ -23,8 +24,8 @@ pub struct ProjectResponse {
     pub scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_base_branch: Option<String>,
-    /// Whether the project shows as a sessionless sidebar header. The web
-    /// derives the pin marker and empty-header visibility from this. See #2208.
+    /// Whether the project shows as a sessionless sidebar header, which drives
+    /// the pin marker and empty-header visibility (#2208).
     pub pinned: bool,
 }
 
@@ -57,14 +58,14 @@ pub async fn list_projects(
         Some("profile") => projects::load_profile(&state.profile),
         Some(other) => {
             tracing::warn!(target: "http.api.projects", scope = other, "rejected bad scope");
-            return (
+            return api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "bad_scope",
-                    "message": format!("Unknown scope '{}'. Use 'global', 'profile', or omit.", other),
-                })),
-            )
-                .into_response();
+                "bad_scope",
+                format!(
+                    "Unknown scope '{}'. Use 'global', 'profile', or omit.",
+                    other
+                ),
+            );
         }
         None => projects::load_merged(&state.profile),
     };
@@ -81,11 +82,11 @@ pub async fn list_projects(
         }
         Err(e) => {
             tracing::error!(target: "http.api.projects", error = %e, "load_failed");
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "load_failed", "message": e.to_string()})),
+                "load_failed",
+                e.to_string(),
             )
-                .into_response()
         }
     }
 }
@@ -98,19 +99,16 @@ pub struct CreateProjectBody {
     /// "global" (default) or "profile".
     #[serde(default)]
     pub scope: Option<String>,
-    /// When true, allow registering this path even if it already exists in
-    /// the other scope. Defaults to false; cross-scope path collisions
-    /// otherwise return 409.
+    /// Allow registering this path even when it already exists in the other
+    /// scope. Cross-scope path collisions otherwise return 409.
     #[serde(default)]
     pub allow_override: bool,
     /// Default base branch for new worktree branches created against this
-    /// project, whether it is the launch repo or an extra repo in a multi-repo
-    /// workspace. Empty/whitespace is treated as unset.
+    /// project. Empty or whitespace is treated as unset.
     #[serde(default)]
     pub default_base_branch: Option<String>,
-    /// Whether to pin the project (show it as a sessionless sidebar header).
-    /// Defaults to false: the Projects view just saves a project, while the
-    /// sidebar "Pin project" action sends `true`. See #2208.
+    /// Pin the project as a sessionless sidebar header. The Projects view just
+    /// saves a project; the sidebar "Pin project" action sends `true` (#2208).
     #[serde(default)]
     pub pinned: bool,
 }
@@ -134,13 +132,7 @@ pub async fn create_project(
     }
     if state.read_only {
         tracing::warn!(target: "http.api.projects", reason = "read_only", "rejected create");
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -156,14 +148,11 @@ pub async fn create_project(
         Some("global") | None => ProjectScope::Global,
         Some(other) => {
             tracing::warn!(target: "http.api.projects", scope = other, "rejected bad scope");
-            return (
+            return api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "bad_scope",
-                    "message": format!("Unknown scope '{}'. Use 'global' or 'profile'.", other),
-                })),
-            )
-                .into_response();
+                "bad_scope",
+                format!("Unknown scope '{}'. Use 'global' or 'profile'.", other),
+            );
         }
     };
 
@@ -177,19 +166,18 @@ pub async fn create_project(
             .unwrap_or_else(|| "project".to_string())
     });
 
-    // Non-git directories are allowed: their sessions run in place, with no
-    // worktrees or branches. We still reject paths that don't resolve to a
-    // directory, which the previous git-repo gate rejected implicitly.
+    // Non-git directories are allowed: their sessions run in place. A path that
+    // does not resolve to a directory is still rejected.
     if !canonical.is_dir() {
         tracing::warn!(target: "http.api.projects", path = %canonical.display(), "rejected non-directory path");
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "not_a_directory",
-                "message": format!("Path does not exist or is not a directory: {}", canonical.display()),
-            })),
-        )
-            .into_response();
+            "not_a_directory",
+            format!(
+                "Path does not exist or is not a directory: {}",
+                canonical.display()
+            ),
+        );
     }
 
     let project = Project::new(name, canonical.to_string_lossy(), scope)
@@ -202,27 +190,19 @@ pub async fn create_project(
         }
         Err(RegistryError::Conflict(msg)) => {
             tracing::warn!(target: "http.api.projects", reason = "conflict", message = %msg, "rejected create");
-            (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "conflict", "message": msg})),
-            )
-                .into_response()
+            api_error(StatusCode::CONFLICT, "conflict", msg)
         }
         Err(RegistryError::NotFound(msg)) => {
             tracing::warn!(target: "http.api.projects", reason = "not_found", message = %msg, "rejected create");
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "not_found", "message": msg})),
-            )
-                .into_response()
+            api_error(StatusCode::NOT_FOUND, "not_found", msg)
         }
         Err(RegistryError::Other(e)) => {
             tracing::error!(target: "http.api.projects", error = %e, "add_failed");
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "add_failed", "message": e.to_string()})),
+                "add_failed",
+                e.to_string(),
             )
-                .into_response()
         }
     }
 }
@@ -246,13 +226,7 @@ pub async fn delete_project(
     }
     if state.read_only {
         tracing::warn!(target: "http.api.projects", reason = "read_only", "rejected delete");
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return read_only_response();
     }
 
     let scope = match q.scope.as_deref() {
@@ -260,14 +234,11 @@ pub async fn delete_project(
         Some("global") | None => ProjectScope::Global,
         Some(other) => {
             tracing::warn!(target: "http.api.projects", scope = other, "rejected bad scope");
-            return (
+            return api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "bad_scope",
-                    "message": format!("Unknown scope '{}'. Use 'global' or 'profile'.", other),
-                })),
-            )
-                .into_response();
+                "bad_scope",
+                format!("Unknown scope '{}'. Use 'global' or 'profile'.", other),
+            );
         }
     };
 
@@ -278,37 +249,27 @@ pub async fn delete_project(
         }
         Err(RegistryError::NotFound(msg)) => {
             tracing::warn!(target: "http.api.projects", reason = "not_found", message = %msg, "rejected delete");
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "not_found", "message": msg})),
-            )
-                .into_response()
+            api_error(StatusCode::NOT_FOUND, "not_found", msg)
         }
         Err(RegistryError::Conflict(msg)) => {
             tracing::warn!(target: "http.api.projects", reason = "conflict", message = %msg, "rejected delete");
-            (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "conflict", "message": msg})),
-            )
-                .into_response()
+            api_error(StatusCode::CONFLICT, "conflict", msg)
         }
         Err(RegistryError::Other(e)) => {
             tracing::error!(target: "http.api.projects", error = %e, "remove_failed");
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "remove_failed", "message": e.to_string()})),
+                "remove_failed",
+                e.to_string(),
             )
-                .into_response()
         }
     }
 }
 
-/// Parsed PATCH body for a project. Each field is `None` when its key is
-/// absent (leave that attribute untouched), `Some(_)` when present. The raw
-/// JSON is inspected rather than deserialized into a struct because a missing
-/// `default_base_branch` key must be distinguishable from an explicit `null`
-/// (which clears the value); serde would fold both to `None`. At least one
-/// recognized key must be present, else the request is a no-op.
+/// Parsed PATCH body for a project. The raw JSON is inspected rather than
+/// deserialized because a missing `default_base_branch` key must be
+/// distinguishable from an explicit `null` (which clears the value), and serde
+/// folds both to `None`. At least one recognized key must be present.
 #[derive(Debug, PartialEq)]
 struct ProjectPatch {
     /// `None`: key absent. `Some(None)`: clear. `Some(Some(s))`: set to `s`
@@ -357,13 +318,7 @@ pub async fn update_project(
     }
     if state.read_only {
         tracing::warn!(target: "http.api.projects", reason = "read_only", "rejected update");
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return read_only_response();
     }
 
     let Json(body) = match body {
@@ -376,14 +331,11 @@ pub async fn update_project(
         Some("global") | None => ProjectScope::Global,
         Some(other) => {
             tracing::warn!(target: "http.api.projects", scope = other, "rejected bad scope");
-            return (
+            return api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "bad_scope",
-                    "message": format!("Unknown scope '{}'. Use 'global' or 'profile'.", other),
-                })),
-            )
-                .into_response();
+                "bad_scope",
+                format!("Unknown scope '{}'. Use 'global' or 'profile'.", other),
+            );
         }
     };
 
@@ -391,17 +343,13 @@ pub async fn update_project(
         Ok(patch) => patch,
         Err((err, msg)) => {
             tracing::warn!(target: "http.api.projects", reason = err, "rejected update");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": err, "message": msg })),
-            )
-                .into_response();
+            return api_error(StatusCode::BAD_REQUEST, err, msg);
         }
     };
 
     // Apply each present field in turn. Both are read-modify-write over the
     // same registry file, so the last call's returned project reflects every
-    // applied change. `parse_project_patch` guarantees at least one field.
+    // change. `parse_project_patch` guarantees at least one field.
     let mut result: Option<std::result::Result<Project, RegistryError>> = None;
     if let Some(base) = patch.base_branch {
         result = Some(projects::update_base_branch(
@@ -412,8 +360,8 @@ pub async fn update_project(
         ));
     }
     if let Some(pinned) = patch.pinned {
-        // Don't run the pinned write if a prior base-branch write already
-        // failed (e.g. NotFound), so its error is surfaced rather than masked.
+        // Skip the pinned write if a prior base-branch write failed, so its
+        // error is surfaced rather than masked.
         if !matches!(&result, Some(Err(_))) {
             result = Some(projects::set_pinned(&state.profile, scope, &name, pinned));
         }
@@ -426,27 +374,19 @@ pub async fn update_project(
         }
         Err(RegistryError::NotFound(msg)) => {
             tracing::warn!(target: "http.api.projects", reason = "not_found", message = %msg, "rejected update");
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "not_found", "message": msg})),
-            )
-                .into_response()
+            api_error(StatusCode::NOT_FOUND, "not_found", msg)
         }
         Err(RegistryError::Conflict(msg)) => {
             tracing::warn!(target: "http.api.projects", reason = "conflict", message = %msg, "rejected update");
-            (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "conflict", "message": msg})),
-            )
-                .into_response()
+            api_error(StatusCode::CONFLICT, "conflict", msg)
         }
         Err(RegistryError::Other(e)) => {
             tracing::error!(target: "http.api.projects", error = %e, "update_failed");
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "update_failed", "message": e.to_string()})),
+                "update_failed",
+                e.to_string(),
             )
-                .into_response()
         }
     }
 }
@@ -458,10 +398,8 @@ mod tests {
 
     #[test]
     fn project_patch_requires_at_least_one_field() {
-        // An empty body is a no-op, not an intent to clear: this guard stops a
-        // `{}` body from silently wiping the default base branch (#2208 made
-        // the base-branch key optional, so the old "missing_field" guard moved
-        // here as "no_fields").
+        // An empty body is a no-op, not an intent to clear: this stops a `{}`
+        // body from silently wiping the default base branch (#2208).
         assert_eq!(
             parse_project_patch(&json!({})),
             Err((

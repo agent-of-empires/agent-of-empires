@@ -1,119 +1,47 @@
 # Worktrees Reference
 
-Reference documentation for git worktree commands and configuration in `aoe`.
+A worktree session gets its own branch and checkout, created when the session is created and cleaned up when it is deleted.
 
-## CLI vs TUI Behavior
-
-| Feature | CLI | TUI |
-|---------|-----|-----|
-| Create new branch | Use `-b` flag | Always creates new branch |
-| Use existing branch | Omit `-b` flag | "Attach to existing branch" toggle (TUI: `Ctrl+P`; web: in the session step under the branch field, inside the "Advanced" disclosure) |
-| Branch validation | Checks if branch exists | None (always creates) |
-| Pick a base branch | `--base-branch <name>` | `Base` field in `Ctrl+P` overlay |
-
-## CLI Commands
+## Creating one
 
 ```bash
-# Create worktree session (new branch, branched off the repo default)
-aoe add . -w feat/my-feature -b
-
-# Create worktree session (new branch, branched off a specific base)
-aoe add . -w hotfix-1 -b --base-branch release-1.2
-
-# Attach to an existing branch + worktree (or check out the branch into a
-# new worktree if no worktree exists yet). The `-b` flag is what flips
-# between "create a new branch" and "attach"; omitting it = attach.
-aoe add . -w feat/my-feature
-
-# List all worktrees
-aoe worktree list
-
-# Show session info
+aoe add . -w feat/my-feature -b                          # new branch off the repo default
+aoe add . -w hotfix-1 -b --base-branch release-1.2       # new branch off a specific base
+aoe add . -w feat/my-feature                             # attach: re-use or check out that branch
+aoe worktree list                                        # every worktree
 aoe worktree info <session>
-
-# Find orphaned worktrees
-aoe worktree cleanup
-
-# Remove session (prompts for worktree cleanup)
-aoe remove <session>
-
-# Remove session and delete worktree
-aoe remove <session> --delete-worktree
+aoe worktree cleanup                                     # find orphaned worktrees
+aoe remove <session> [--delete-worktree]
 ```
 
-`--base-branch` only matters with `--new-branch` / `-b`. The base is
-resolved against the remote first, then against a local branch with
-that name, so passing a teammate's not-yet-fetched branch works
-without a manual `git fetch`. When omitted, the new branch is based
-on the repository's default branch (`main`/`master`).
+`-b` is what switches between creating a branch and attaching to an existing one. `--base-branch` only matters with `-b`, and is resolved against the remotes first, then a local branch, so a teammate's not-yet-fetched branch works without a manual `git fetch`. Remote selection scores every configured remote, not just `origin`: in a fork plus `upstream` layout where `upstream/main` is ahead, aoe fetches and branches from there even when you typed `main`. Ties break toward `origin`. Without `--base-branch`, the branch starts from the repo's default.
 
-Remote selection scores every configured remote (not just `origin`),
-for both the autodetected default branch (issue \#1029) and an
-explicit `--base-branch` (issue \#1511). In a fork plus `upstream`
-layout where `upstream/main` is ahead of `origin/main`, aoe fetches
-and branches off `upstream/main` even when you typed `main` into the
-wizard's base-branch field. Ties break in favor of `origin` so the
-historical single-remote behavior still applies when there is no
-freshness signal.
+In the TUI, enable the Worktree checkbox in the new-session dialog (`n`); the directory is derived from the session title. `Ctrl+P` on the Worktree field sets an explicit name, attaches to an existing branch, picks a base branch, or configures extra repos, and `Ctrl+P` on the Base field opens a branch picker over local and remote-tracking branches. The web wizard has the same controls under **More options**, with a base-branch typeahead and an **Attach to existing branch** toggle.
 
-## TUI Keyboard Shortcuts
+## Naming
 
-| Key | Action |
-|-----|--------|
-| `n` | New session dialog |
-| `Tab` | Next field |
-| `Shift+Tab` | Previous field |
-| `Enter` | Submit and create session |
-| `Esc` | Cancel |
+A worktree session's title and its directory stay tied by default (`session.tie_workdir_to_name`), which applies only to aoe-managed worktree sessions:
 
-In the TUI, enable the Worktree checkbox to create a new branch and worktree. By default, the worktree name is derived from the session title. Press `Ctrl+P` on the Worktree field to set an explicit `Name`, attach to an existing branch, pick a `Base` branch the new branch is based on (defaults to the repo default), or configure extra repos. `Ctrl+P` on the `Base` field opens a branch picker over local and remote-tracking branches.
+- Renaming a session (TUI, web, `aoe session rename`, or `PATCH /api/sessions/{id}`) moves the directory to the title's path-safe slug before committing the title. A failed move leaves the title unchanged.
+- The git branch is never renamed by default, since it may carry an upstream or an open PR. Opt in with the TUI rename dialog's "Also rename git branch", `--rename-branch`, or `rename_branch: true`. The TUI warns when the branch tracks a remote, because the remote branch and any open PR do not follow.
+- A rename that would relocate the checkout or re-point its branch needs a stopped session and is refused while it runs. A title-only rename whose slug leaves the directory unchanged is allowed on a running session from the CLI and REST (the TUI still asks for a stopped session), and leaves a live structured-view worker alone.
 
-The web dashboard's new-session wizard folds the worktree controls behind the single "More options" disclosure, leaving only the project picker, session title, and agent choice visible by default. Inside More options, a "Base branch" disclosure beneath the worktree name input shows a typeahead populated from local + remote branches via `GET /api/git/branches?include_remote=true`. The same section also exposes an "Attach to existing branch" toggle that flips the request from "create new branch" to "attach to whichever branch is named": when on, the server re-uses any existing worktree for that branch and otherwise checks the branch out into a new worktree. Mirrors the TUI / CLI behavior (CLI: omit `-b`). See #969 and #1514.
-
-## Tying the Title and Worktree Directory
-
-By default a worktree session's title and its worktree directory name stay tied: renaming the session moves the directory to match, and a new session's directory leaf is derived from its title (so "Auth refactor" lands in `.../auth-refactor` rather than a random codename). This is controlled by the `session.tie_workdir_to_name` setting (default `true`), which applies only to aoe-managed worktree sessions. Non-worktree (scratch, plain tmux) and attached worktree sessions ignore it.
-
-```toml
-[session]
-tie_workdir_to_name = true
-```
-
-When tied:
-
-- Renaming a session (TUI rename, web inline rename, `aoe session rename`, or `PATCH /api/sessions/{id}`) moves the worktree directory to the title's path-safe slug before committing the title. A failed move leaves the title unchanged. A metadata failure after a successful move is reported as a partial failure.
-- The git branch is never swept in by a title rename by default. To rename it too, check "Also rename git branch" in the TUI rename dialog, pass `--rename-branch` to `aoe session rename`, or send `rename_branch: true` to the PATCH. It stays opt-in because a branch may carry an upstream or an open PR; the TUI toggle warns when the branch tracks a remote, since the remote branch (and any open PR) won't follow the local rename.
-- A tied rename that relocates the worktree directory, or renames its branch, needs a stopped session: moving or re-pointing a live checkout is unsafe, so it is refused with a clear message while the session is active. Stop the session, or disable the setting, to relabel it freely.
-- A title-only rename whose slug leaves the directory unchanged moves no checkout. `PATCH /api/sessions/{id}` and `aoe session rename` accept it while the session runs unless `rename_branch: true` would change the branch. The PATCH also leaves a live structured-view worker alone. The TUI requires a stopped session for a title-changing tied rename.
-- Naming collapses into the single rename action: the standalone "edit workdir name" affordance is hidden (TUI and web) and the standalone CLI / REST workdir-name edit is rejected, since the directory now follows the title.
-
-Toggle the setting off (TUI settings, web settings, or the toml above) to relabel sessions freely while running and to edit the directory name independently of the title.
-
-## Editing the Workdir Name After Creation
-
-When `session.tie_workdir_to_name` is **off**, a worktree session's workdir (worktree directory) name is edited independently of its title. The worktree directory is moved in place via `git worktree move`, keeping its parent directory and swapping only the final path component (the new name's path-safe slug). Renaming the underlying git branch is opt-in, since a session may already have meaningful work or an upstream on its branch.
-
-This supports only sessions whose worktree is aoe-managed (`worktree_info.managed_by_aoe = true`), and the session must not be running; otherwise you get a clear validation error and no change is made. The session title is left untouched.
+Turn the setting off to relabel sessions freely while they run and to edit the directory name independently:
 
 | Surface | How |
 |---------|-----|
-| CLI | `aoe session set-worktree-name <session> --name <new-name>` (add `--rename-branch` to also rename the git branch) |
-| TUI | Select the session, press `W` (or open the command palette and pick "Edit worktree workdir name"). Toggle "Also rename git branch" in the dialog. |
-| Web | Right-click the session row, choose "Edit workdir name", enter a name, and optionally check "Also rename git branch". |
-| REST | `PATCH /api/sessions/{id}/worktree-name` with `{ "name": "<new-name>", "rename_branch": <bool> }` |
+| CLI | `aoe session set-worktree-name <session> --name <new-name> [--rename-branch]` |
+| TUI | Select the session and press `W`, or use the command palette |
+| Web | Right-click the row, "Edit workdir name" |
+| REST | `PATCH /api/sessions/{id}/worktree-name` with `{ "name", "rename_branch" }` |
 
-The new directory and branch persist across reload and restart. See #1723 and #1927.
+Renaming moves the checkout with `git worktree move`, keeping its parent directory and swapping only the final component. It works only on aoe-managed worktrees of a stopped session; anything else is a validation error that changes nothing.
 
-### When the Directory Moves Outside aoe
+### When the directory moves outside aoe
 
-aoe records a worktree session's directory at creation, so relocating it from another shell leaves that record stale. aoe repairs it from `git worktree list`, matching on the session's branch: shortly after TUI startup, on a background sweep, at `aoe serve` startup, and on each CLI workdir edit. The TUI paints before that sweep lands, so a session whose directory moved can briefly show its old path. If exactly one live worktree checks out the branch, the recorded path is rewritten to it and the session keeps working. If two do, aoe leaves the path alone rather than guessing which checkout is yours.
+aoe records a worktree's directory at creation, so relocating it from another shell leaves that record stale. aoe repairs it from `git worktree list`, matching on the session's branch, shortly after TUI startup, on a background sweep, at `aoe serve` startup, and on each CLI workdir edit. If exactly one live worktree checks out the branch, the path is rewritten; if two do, aoe leaves it alone rather than guessing. Reconciliation is point-in-time, so a directory moved while a process is already running stays stale until it restarts.
 
-Two caveats:
-
-- aoe locks the worktrees it creates, so an out-of-band `git worktree move` needs `git worktree unlock <path>` first.
-- A plain `mv` is not recoverable on its own. It leaves git's record naming the old path, which is indistinguishable from a deleted checkout, so aoe reports the worktree as missing and changes nothing. Run `git worktree repair <new-path>` from the repo to bring git's record up to date, and aoe will then find it.
-
-Reconciliation is point-in-time, not a watcher: a directory moved while a TUI or `aoe serve` is already running stays stale for that process until it restarts. See #2002.
+Two caveats: aoe locks the worktrees it creates, so an out-of-band `git worktree move` needs `git worktree unlock <path>` first, and a plain `mv` is not recoverable on its own, because git's record still names the old path. Run `git worktree repair <new-path>` and aoe will find it.
 
 ## Configuration
 
@@ -127,92 +55,30 @@ delete_branch_on_cleanup = false
 init_submodules = true
 ```
 
-Use `[session] row_tag = "branch"` to show worktree and workspace branch tags in
-the TUI session list, or `"none"` to hide suffix metadata next to session names.
+Template variables are `{repo-name}` (repository folder name), `{branch}` (slashes become hyphens), and `{session-id}` (the first 8 characters of the session UUID), so `../wt/{branch}-{session-id}` or `./worktrees/{branch}` both work. Use `[session] row_tag = "branch"` to show branch tags in the TUI list.
 
-### Skipping submodule init
+### Bare repos
 
-`init_submodules = false` skips the `git submodule update --init --recursive` step that runs after `git worktree add` when the checkout contains a `.gitmodules` file. Useful for repos that vendor deep submodule trees (e.g. OpenROAD-flow-scripts, llvm-project, chromium) where every new session would otherwise sit in `Creating…` for minutes while submodules clone. Per-invocation override on the CLI: `aoe add --worktree <branch> --no-submodules`.
+Bare repos are auto-detected and use `bare_repo_path_template` instead, so worktrees land as siblings inside the project directory. A sandboxed session needs this layout to reach the repo's git directory from the container.
 
-On the delete side, aoe runs `git submodule deinit -f --all` before `git worktree remove` for any worktree with `.gitmodules`, so the panic-button `Force` checkbox is not required just because the worktree has submodules. If git still refuses (e.g. a partially-broken submodule), aoe falls back to clearing `<main>/.git/worktrees/<name>/modules/` and pruning the stale entry manually.
+### Submodules
 
-### Trashing relocates the worktree
+After `git worktree add`, a checkout with a `.gitmodules` file gets `git submodule update --init --recursive`. Set `init_submodules = false` (or pass `--no-submodules`) for repos vendoring deep submodule trees, where every new session would otherwise sit in `Creating…` for minutes. On delete, aoe runs `git submodule deinit -f --all` first, so the `Force` checkbox is not needed just because a worktree has submodules; if git still refuses, aoe clears `<main>/.git/worktrees/<name>/modules/` and prunes the stale entry itself.
 
-Moving a worktree session to the trash (rather than purging it) relocates its worktree out of the active worktree dir into a sibling `.aoe-trash/<session-id>` holding directory via `git worktree move`, so trashed sessions stop cluttering the active checkouts. The worktree stays a live checkout, so previewing a trashed session still works. Restoring the session moves the worktree back to its original path; if that path is now occupied, the restore is refused so nothing is overwritten. Purging a trashed session removes the worktree from the holding dir. Sessions trashed before this behavior existed are relocated the next time the daemon starts or the TUI loads.
+## Cleanup
 
-### The default branch's checkout is never removed
+Deleting a session prompts to remove an aoe-managed worktree (or pass `--delete-worktree`); a manual worktree or a non-worktree session is left alone.
 
-A bare-repo layout (git dir at `<project>/.bare`, default branch checked out at `<project>/main`) keeps the default branch in a linked worktree that other tooling expects to stay put. AOE therefore refuses to remove that checkout, refuses to delete the branch, and leaves the checkout where it is when the session is trashed. The refusal is reported as a message and the session is still deleted; only the worktree and branch survive.
+**Trashing relocates the worktree** into a sibling `.aoe-trash/<session-id>` holding directory with `git worktree move`, so trashed sessions stop cluttering the active checkouts while staying previewable. Restoring moves it back, and is refused if that path is now occupied. Purging removes it.
 
-Detection uses what git itself states: a bare repo's own `HEAD`, plus every remote's `refs/remotes/<remote>/HEAD`. When neither exists (a repo that never ran `git remote set-head`), local `main` and `master` are protected by convention. A repo that explicitly names some other default leaves a branch merely called `main` deletable.
+**The default branch's checkout is never removed.** In a bare-repo layout the default branch lives in a linked worktree other tooling expects to stay put, so aoe refuses to remove that checkout or delete its branch, reports the refusal, and deletes the session anyway. Force does not bypass this, including trash auto-purge and `aoe session empty-trash`, and `aoe worktree cleanup` lists such a checkout as skipped. Detection uses what git states: the bare repo's own `HEAD` plus every remote's `refs/remotes/<remote>/HEAD`, falling back to `main` and `master` by convention when neither exists. To remove one anyway, do it with git and then delete the session.
 
-Force does not bypass this, including the forced trash auto-purge and `aoe session empty-trash`. `aoe worktree cleanup` lists such a checkout as skipped rather than removing it. To remove one anyway, do it with git (`git worktree remove`, `git branch -D`) and then delete the session.
+An externally placed `git worktree lock` is not a deletion guard: aoe locks every worktree it creates and unlocks before each intentional remove or move, so it unlocks yours too.
 
-Note that an externally placed `git worktree lock` is not a deletion guard: AOE locks every worktree it creates and unlocks before every intentional remove or move, so it unlocks yours too.
+## Warnings during create
 
-### Template Variables
+Two kinds of non-fatal failure surface through the same channel instead of aborting the session: a `⚠` line on stderr for `aoe add`, a **Worktree warnings** dialog in the TUI, and a toast plus `warnings: string[]` on the `POST /api/sessions` response for the web.
 
-| Variable | Description |
-|----------|-------------|
-| `{repo-name}` | Repository folder name |
-| `{branch}` | Branch name (slashes converted to hyphens) |
-| `{session-id}` | First 8 characters of session UUID |
+**Post-checkout hooks.** Some repos install pre-commit hooks at the `post-checkout` stage (`uv-sync`, `npm install`, LFS smudge) that fire when `git worktree add` checks out the branch. If one fails, the worktree and its `.git` pointer already exist and are usable. Usually the hook needs network access or credentials the new worktree does not have yet: re-run it by hand once the environment is set up, or set `core.hooksPath` per checkout.
 
-### Path Template Examples
-
-```toml
-# Default (sibling directory), used for non-bare repos
-path_template = "../{repo-name}-worktrees/{branch}"
-
-# Nested in repo
-path_template = "./worktrees/{branch}"
-
-# With session ID for uniqueness
-path_template = "../wt/{branch}-{session-id}"
-```
-
-## Worktree Warnings
-
-Two classes of non-fatal failures surface through the same warning channel during session create. AOE does not abort the session; instead it captures the failure and surfaces it so you know what to investigate.
-
-| Surface | Where warnings appear |
-|---|---|
-| CLI (`aoe add`) | `⚠ <message>` line on stderr after `✓ Worktree created successfully` |
-| TUI | `Worktree warnings` info dialog opens after the session is added |
-| Web | Toast per warning, plus `warnings: string[]` on the `POST /api/sessions` response body |
-
-### Post-checkout hooks
-
-Some repos install pre-commit hooks at the `post-checkout` stage (`uv-sync`, `npm install`, LFS smudge, etc.) that fire when `git worktree add` checks out the new branch. If such a hook fails, the worktree directory and its `.git` pointer have already been created, and the worktree is usable.
-
-Common cause: the hook calls a tool (uv, npm, pip) that needs network access or credentials the new worktree does not yet have. Re-run the hook manually inside the worktree once the environment is set up, or disable it for AOE-created worktrees by configuring `core.hooksPath` per checkout.
-
-### Fetch failures
-
-Before checking out the new branch, AOE runs `git fetch <remote> <branch>` so the worktree starts from the latest remote state. Network errors, missing remotes, SSH key issues, and 10s timeouts no longer pass silently; they surface as warnings shaped like:
-
-```text
-git fetch <remote> <branch> failed for <repo>: <stderr>
-```
-
-The session is still created when the fetch fails. The worktree branches off whatever local ref already exists, which may be stale. Multi-repo sessions emit one warning per repo whose fetch failed, so a single bad remote in a workspace of five repos shows up as one toast rather than aborting the whole workspace. See issue \#1511 for the rationale.
-
-## Cleanup Behavior
-
-| Scenario | Cleanup Prompt? |
-|----------|-----------------|
-| aoe-managed worktree | Yes |
-| Manual worktree | No |
-| `--delete-worktree` flag | Yes (deletes worktree) |
-| Non-worktree session | No |
-
-## Bare Repos
-
-AOE auto-detects bare repos and uses `bare_repo_path_template` (default `./{branch}`) instead of `path_template`, creating worktrees as siblings within the project directory.
-
-## File Locations
-
-| Item | Path |
-|------|------|
-| Config | `~/.agent-of-empires/config.toml` |
-| Sessions | `~/.agent-of-empires/profiles/<profile>/sessions.json` |
+**Fetch failures.** aoe runs `git fetch <remote> <branch>` before checking out, and network errors, missing remotes, SSH key problems, and 10s timeouts surface as `git fetch <remote> <branch> failed for <repo>: <stderr>`. The session is still created, branching off whatever local ref exists, which may be stale. A multi-repo session emits one warning per failing repo.

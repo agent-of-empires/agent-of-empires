@@ -1,14 +1,9 @@
-//! Data migrations for handling breaking changes across versions.
-//!
-//! Each migration is a one-time transformation that runs when upgrading from
-//! an older version. Migrations are numbered sequentially and run in order.
-//!
-//! To add a new migration:
-//! 1. Create a new module `vNNN_description.rs`
-//! 2. Implement the migration function
-//! 3. Add it to the `MIGRATIONS` array below
+//! One-time transformations of persisted data, run in order on upgrade. See
+//! `docs/development/adding-a-migration.md` to add one.
 
+mod config_file;
 pub mod progress;
+mod sessions_file;
 mod store_fs;
 mod v001_xdg_linux;
 mod v002_seed_sandbox_from_volumes;
@@ -40,6 +35,46 @@ pub(crate) mod v027_isolate_sandbox_stores;
 mod v028_clear_archived_live_status;
 mod v029_fold_pending_initial_turn;
 
+/// Fixtures shared by the migrations that rewrite agent hook files.
+#[cfg(test)]
+mod hook_fixtures {
+    use crate::session::test_support::EnvGuard;
+    use serde_json::Value;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    /// Clear every agent config-dir override, so a migration's path
+    /// resolution sees only the fixtures under `home` and `app_dir`.
+    pub(super) fn unset_agent_home_env() -> EnvGuard {
+        EnvGuard::unset(&[
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "CURSOR_CONFIG_DIR",
+            "GEMINI_CONFIG_DIR",
+            "QWEN_CONFIG_DIR",
+        ])
+    }
+
+    /// A tempdir holding an empty `home` and app dir.
+    pub(super) fn setup_dirs() -> (TempDir, PathBuf, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let app_dir = tmp.path().join("app");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&app_dir).unwrap();
+        (tmp, home, app_dir)
+    }
+
+    /// Write `value` as pretty JSON, creating the parent directory.
+    pub(super) fn write_json(path: &Path, value: &Value) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
+    }
+}
+
 use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
@@ -47,158 +82,107 @@ use tracing::{debug, info};
 const CURRENT_VERSION: u32 = 29;
 const VERSION_FILE: &str = ".schema_version";
 
-struct Migration {
-    version: u32,
-    name: &'static str,
-    run: fn() -> Result<()>,
-}
+/// Version, log name, and the one-time transformation to run.
+type Migration = (u32, &'static str, fn() -> Result<()>);
 
 const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        name: "xdg_linux",
-        run: v001_xdg_linux::run,
-    },
-    Migration {
-        version: 2,
-        name: "seed_sandbox_from_volumes",
-        run: v002_seed_sandbox_from_volumes::run,
-    },
-    Migration {
-        version: 3,
-        name: "yolo_mode_config",
-        run: v003_yolo_mode_config::run,
-    },
-    Migration {
-        version: 4,
-        name: "unified_environment",
-        run: v004_unified_environment::run,
-    },
-    Migration {
-        version: 5,
-        name: "acp_defaults",
-        run: v005_cockpit_defaults::run,
-    },
-    Migration {
-        version: 6,
-        name: "unlimited_cockpit_history",
-        run: v006_unlimited_cockpit_history::run,
-    },
-    Migration {
-        version: 7,
-        name: "serve_log_to_legacy",
-        run: v007_serve_log_to_legacy::run,
-    },
-    Migration {
-        version: 8,
-        name: "lock_in_default_profile",
-        run: v008_lock_in_default_profile::run,
-    },
-    Migration {
-        version: 9,
-        name: "update_check_mode",
-        run: v009_update_check_mode::run,
-    },
-    Migration {
-        version: 10,
-        name: "drop_legacy_live_send_exit_chord",
-        run: v010_drop_legacy_live_send_exit_chord::run,
-    },
-    Migration {
-        version: 11,
-        name: "relocate_sandbox_image",
-        run: v011_relocate_sandbox_image::run,
-    },
-    Migration {
-        version: 12,
-        name: "acp_rename",
-        run: v012_acp_rename::run,
-    },
-    Migration {
-        version: 13,
-        name: "strip_profile_theme",
-        run: v013_strip_profile_theme::run,
-    },
-    Migration {
-        version: 14,
-        name: "rename_default_theme",
-        run: v014_rename_default_theme::run,
-    },
-    Migration {
-        version: 15,
-        name: "rewrite_hook_strings",
-        run: v015_rewrite_hook_strings::run,
-    },
-    Migration {
-        version: 16,
-        name: "clear_archived_tmux_gone_error",
-        run: v016_clear_archived_tmux_gone_error::run,
-    },
-    Migration {
-        version: 17,
-        name: "rewrite_hook_strings_for_per_user_base",
-        run: v017_rewrite_hook_strings_for_per_user_base::run,
-    },
-    Migration {
-        version: 18,
-        name: "strip_codex_config_toml_hooks",
-        run: v018_strip_codex_config_toml_hooks::run,
-    },
-    Migration {
-        version: 19,
-        name: "move_acp_defaults_to_acp",
-        run: v019_move_acp_defaults_to_acp::run,
-    },
-    Migration {
-        version: 20,
-        name: "move_tui_branch_suffix_to_row_tag",
-        run: v020_move_tui_branch_suffix_to_row_tag::run,
-    },
-    Migration {
-        version: 21,
-        name: "split_app_state_to_state_toml",
-        run: v021_split_app_state_to_state_toml::run,
-    },
-    Migration {
-        version: 22,
-        name: "prune_tuning_settings",
-        run: v022_prune_tuning_settings::run,
-    },
-    Migration {
-        version: 23,
-        name: "clear_structured_container_error",
-        run: v023_clear_structured_container_error::run,
-    },
-    Migration {
-        version: 24,
-        name: "backfill_detect_as",
-        run: v024_backfill_detect_as::run,
-    },
-    Migration {
-        version: 25,
-        name: "reenable_confirm_delete",
-        run: v025_reenable_confirm_delete::run,
-    },
-    Migration {
-        version: 26,
-        name: "repoint_acp_default_agent",
-        run: v026_repoint_acp_default_agent::run,
-    },
-    Migration {
-        version: 27,
-        name: "isolate_sandbox_stores",
-        run: v027_isolate_sandbox_stores::run,
-    },
-    Migration {
-        version: 28,
-        name: "clear_archived_live_status",
-        run: v028_clear_archived_live_status::run,
-    },
-    Migration {
-        version: 29,
-        name: "fold_pending_initial_turn",
-        run: v029_fold_pending_initial_turn::run,
-    },
+    (1, "xdg_linux", v001_xdg_linux::run),
+    (
+        2,
+        "seed_sandbox_from_volumes",
+        v002_seed_sandbox_from_volumes::run,
+    ),
+    (3, "yolo_mode_config", v003_yolo_mode_config::run),
+    (4, "unified_environment", v004_unified_environment::run),
+    (5, "acp_defaults", v005_cockpit_defaults::run),
+    (
+        6,
+        "unlimited_cockpit_history",
+        v006_unlimited_cockpit_history::run,
+    ),
+    (7, "serve_log_to_legacy", v007_serve_log_to_legacy::run),
+    (
+        8,
+        "lock_in_default_profile",
+        v008_lock_in_default_profile::run,
+    ),
+    (9, "update_check_mode", v009_update_check_mode::run),
+    (
+        10,
+        "drop_legacy_live_send_exit_chord",
+        v010_drop_legacy_live_send_exit_chord::run,
+    ),
+    (
+        11,
+        "relocate_sandbox_image",
+        v011_relocate_sandbox_image::run,
+    ),
+    (12, "acp_rename", v012_acp_rename::run),
+    (13, "strip_profile_theme", v013_strip_profile_theme::run),
+    (14, "rename_default_theme", v014_rename_default_theme::run),
+    (15, "rewrite_hook_strings", v015_rewrite_hook_strings::run),
+    (
+        16,
+        "clear_archived_tmux_gone_error",
+        v016_clear_archived_tmux_gone_error::run,
+    ),
+    (
+        17,
+        "rewrite_hook_strings_for_per_user_base",
+        v017_rewrite_hook_strings_for_per_user_base::run,
+    ),
+    (
+        18,
+        "strip_codex_config_toml_hooks",
+        v018_strip_codex_config_toml_hooks::run,
+    ),
+    (
+        19,
+        "move_acp_defaults_to_acp",
+        v019_move_acp_defaults_to_acp::run,
+    ),
+    (
+        20,
+        "move_tui_branch_suffix_to_row_tag",
+        v020_move_tui_branch_suffix_to_row_tag::run,
+    ),
+    (
+        21,
+        "split_app_state_to_state_toml",
+        v021_split_app_state_to_state_toml::run,
+    ),
+    (22, "prune_tuning_settings", v022_prune_tuning_settings::run),
+    (
+        23,
+        "clear_structured_container_error",
+        v023_clear_structured_container_error::run,
+    ),
+    (24, "backfill_detect_as", v024_backfill_detect_as::run),
+    (
+        25,
+        "reenable_confirm_delete",
+        v025_reenable_confirm_delete::run,
+    ),
+    (
+        26,
+        "repoint_acp_default_agent",
+        v026_repoint_acp_default_agent::run,
+    ),
+    (
+        27,
+        "isolate_sandbox_stores",
+        v027_isolate_sandbox_stores::run,
+    ),
+    (
+        28,
+        "clear_archived_live_status",
+        v028_clear_archived_live_status::run,
+    ),
+    (
+        29,
+        "fold_pending_initial_turn",
+        v029_fold_pending_initial_turn::run,
+    ),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -286,32 +270,27 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
 
     let pending: Vec<&Migration> = MIGRATIONS
         .iter()
-        .filter(|migration| migration.version > current)
+        .filter(|(version, ..)| *version > current)
         .collect();
-    for (index, migration) in pending.iter().enumerate() {
+    for (index, (version, name, run)) in pending.iter().enumerate() {
         let start = std::time::Instant::now();
-        info!(
-            target: "migrations",
-            version = migration.version,
-            name = migration.name,
-            "running migration"
-        );
+        info!(target: "migrations", version, name, "running migration");
         progress::report(progress::Event::Started {
-            version: migration.version,
-            name: migration.name,
+            version: *version,
+            name,
             position: index + 1,
             total: pending.len(),
         });
-        (migration.run)()?;
-        set_version(migration.version)?;
+        run()?;
+        set_version(*version)?;
         progress::report(progress::Event::Finished {
-            version: migration.version,
+            version: *version,
             elapsed: start.elapsed(),
         });
         info!(
             target: "migrations",
-            version = migration.version,
-            name = migration.name,
+            version,
+            name,
             duration_ms = start.elapsed().as_millis() as u64,
             "migration completed"
         );
@@ -345,14 +324,9 @@ mod tests {
     #[test]
     fn test_migrations_are_sequential() {
         let mut prev = 0;
-        for m in MIGRATIONS {
-            assert!(
-                m.version > prev,
-                "Migration {} should be > {}",
-                m.version,
-                prev
-            );
-            prev = m.version;
+        for (version, ..) in MIGRATIONS {
+            assert!(*version > prev, "migration {version} should be > {prev}");
+            prev = *version;
         }
     }
 
@@ -372,8 +346,8 @@ mod tests {
 
     #[test]
     fn test_current_version_matches_last_migration() {
-        if let Some(last) = MIGRATIONS.last() {
-            assert_eq!(CURRENT_VERSION, last.version);
+        if let Some((version, ..)) = MIGRATIONS.last() {
+            assert_eq!(CURRENT_VERSION, *version);
         }
     }
 }

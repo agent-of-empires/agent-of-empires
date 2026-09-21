@@ -1,8 +1,5 @@
-//! Edit-worktree-workdir-name dialog.
-//!
-//! A focused dialog (separate from the title/group rename flow) for changing
-//! a managed worktree session's directory name, with an opt-in to also rename
-//! the git branch. See #1723.
+//! Change a managed worktree session's directory name, with an opt-in to
+//! rename the git branch too. Separate from the title/group rename flow.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -14,12 +11,9 @@ use super::DialogResult;
 use crate::tui::components::render_text_field;
 use crate::tui::styles::Theme;
 
-/// Data returned when the dialog is submitted.
 #[derive(Debug, Clone)]
 pub struct WorktreeNameData {
-    /// New workdir name (raw; sanitized downstream).
     pub name: String,
-    /// Whether to also rename the underlying git branch.
     pub rename_branch: bool,
 }
 
@@ -90,9 +84,6 @@ impl WorktreeNameDialog {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let dialog_area = super::centered_rect(area, 54, 13);
-        frame.render_widget(Clear, dialog_area);
-
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -100,8 +91,7 @@ impl WorktreeNameDialog {
             .border_style(Style::default().fg(theme.accent))
             .title(" Edit Workdir Name ")
             .title_style(Style::default().fg(theme.title).bold());
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let (_, inner) = super::render_dialog_frame(frame, area, 54, 13, block);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)

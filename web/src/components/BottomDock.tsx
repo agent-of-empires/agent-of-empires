@@ -30,10 +30,7 @@ interface Props {
   onNewTerminal?: () => void;
 }
 
-/** Full-width bottom dock: a height-resizable strip below the main+right-dock
- *  row. Hidden by the parent when it has no open panes. Holds one or more
- *  stacked groups. Desktop only; mobile uses the single full-viewport view
- *  picker. */
+/** Full-width bottom dock: a height-resizable strip below the main+right-dock row. */
 export function BottomDock({ groups, descriptorFor, renderBody, onActivate, onClose, onMove, onNewTerminal }: Props) {
   const [height, setHeight] = useState(loadHeight);
   const ref = useRef<HTMLDivElement>(null);

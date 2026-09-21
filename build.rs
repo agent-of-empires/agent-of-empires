@@ -1,6 +1,4 @@
-// Git path-resolution shared with the regression test in
-// `tests/build_version_rerun.rs` so the test exercises the real watch-path
-// logic against a temporary worktree.
+// Shared with `tests/build_version_rerun.rs`.
 include!("build_git_watch.rs");
 
 fn main() {
@@ -12,9 +10,7 @@ fn main() {
     build_frontend();
 }
 
-/// `serve` is an alias for `web` and is removed after one release. Cargo sets
-/// `CARGO_FEATURE_SERVE` only when the alias itself was selected, so this
-/// stays quiet for a plain `--features web` build.
+/// Cargo sets `CARGO_FEATURE_SERVE` only when the `serve` alias itself was selected.
 fn warn_on_deprecated_serve_feature() {
     if std::env::var_os("CARGO_FEATURE_SERVE").is_some() {
         println!(
@@ -24,40 +20,12 @@ fn warn_on_deprecated_serve_feature() {
     }
 }
 
-/// Emit `AOE_BUILD_VERSION`, the build identity stamped on each structured view
-/// worker record so the daemon can tell whether a surviving worker is
-/// running the current binary or an older one (see issue #1754).
-///
-/// `CARGO_PKG_VERSION` alone is insufficient: it stays constant across
-/// many local rebuilds, so a dev who rebuilds and restarts the daemon
-/// would silently re-adopt a worker on stale code. We append a git
-/// commit identity so dev rebuilds across commits are distinguishable.
-///
-/// Source order (first hit wins):
-///   1. `AOE_BUILD_VERSION` env override (release packaging, reproducible
-///      builds, downstream packagers).
-///   2. `GITHUB_SHA` (CI builds where `.git` may be a shallow checkout).
-///   3. Local `git rev-parse` + a coarse dirty flag.
-///   4. `CARGO_PKG_VERSION` alone (source tarball without `.git`).
-///
-/// The dirty flag is intentionally coarse (a boolean suffix, not a
-/// content hash): two different uncommitted edits at the same commit read
-/// as equal. This is a respawn gate, not a cryptographic binary hash, and
-/// a content hash would force a recompile on every source save.
+/// `AOE_BUILD_VERSION` lets the daemon detect a worker running an older binary. First hit
+/// wins: env override, `GITHUB_SHA`, local git sha plus a coarse dirty flag, then
+/// `CARGO_PKG_VERSION`.
 fn emit_build_version() {
     use std::process::Command;
 
-    // Re-run when the committed revision changes or an override toggles.
-    // HEAD moves on checkout; logs/HEAD moves on every commit, pull, merge,
-    // rebase, or reset. `index` is not watched: git rewrites it on a plain
-    // `git status`, which forced a full recompile on builds with no source
-    // change (see `git_watch_paths`'s doc comment). Resolve the real paths
-    // via `git rev-parse --git-path` rather than hardcoding
-    // `.git/HEAD`: in a git worktree `.git` is a file pointing at
-    // `<main>/.git/worktrees/<name>/`, so the literal `.git/HEAD` path does not
-    // exist. Cargo treats a missing `rerun-if-changed` input as perpetually
-    // stale, which reran this script (and recompiled the lib + binary that read
-    // AOE_BUILD_VERSION) on every build inside a worktree (issue #1962).
     for path in git_watch_paths(std::path::Path::new(".")) {
         println!("cargo:rerun-if-changed={path}");
     }
@@ -84,8 +52,6 @@ fn emit_build_version() {
     println!("cargo:rustc-env=AOE_BUILD_VERSION={build_version}");
 }
 
-/// Short (12-char) HEAD commit hash, or `None` when git is unavailable or
-/// this is not a git checkout (e.g. a source tarball).
 fn git_short_sha(cmd: &mut std::process::Command) -> Option<String> {
     let out = cmd
         .args(["rev-parse", "--short=12", "HEAD"])
@@ -102,8 +68,6 @@ fn git_short_sha(cmd: &mut std::process::Command) -> Option<String> {
     }
 }
 
-/// Coarse working-tree dirty check: any tracked or untracked change makes
-/// `git status --porcelain` print at least one line.
 fn git_is_dirty(cmd: &mut std::process::Command) -> bool {
     match cmd.args(["status", "--porcelain"]).output() {
         Ok(out) => out.status.success() && !out.stdout.is_empty(),
@@ -111,25 +75,16 @@ fn git_is_dirty(cmd: &mut std::process::Command) -> bool {
     }
 }
 
-/// Detect stale build caches by tracking Cargo.lock content hash.
-///
-/// When Cargo.lock changes (dependency updates, feature additions, branch
-/// switches in worktrees), the target/ directory can contain incompatible
-/// artifacts that cause cryptic compilation errors like "can't find crate"
-/// or "found possibly newer version of crate." This check catches that
-/// early with a clear message instead of letting the build fail inscrutably.
+/// A changed Cargo.lock can leave incompatible artifacts in target/; warn clearly.
 fn check_stale_build_cache() {
     use std::path::Path;
 
-    // Re-run this check whenever Cargo.lock changes.
     println!("cargo:rerun-if-changed=Cargo.lock");
 
     let lockfile = Path::new("Cargo.lock");
     let target_dir = std::env::var("OUT_DIR")
         .ok()
         .and_then(|out| {
-            // OUT_DIR is something like target/debug/build/agent-of-empires-xxx/out
-            // Walk up to find the target/ root.
             let mut p = Path::new(&out).to_path_buf();
             while p.pop() {
                 if p.file_name().is_some_and(|n| n == "target") {
@@ -146,8 +101,7 @@ fn check_stale_build_cache() {
         return; // No Cargo.lock, nothing to check.
     };
 
-    // Simple, fast hash: use the file length + first/last 1KB as a fingerprint.
-    // This avoids pulling in a hash crate in build.rs.
+    // Length plus first/last 1KB, avoiding a hash crate in build.rs.
     let len = lock_content.len();
     let head: u64 = lock_content[..len.min(1024)]
         .iter()
@@ -166,7 +120,6 @@ fn check_stale_build_cache() {
         }
     }
 
-    // Always update the stored hash.
     let _ = std::fs::write(&hash_file, &current_hash);
 }
 
@@ -182,19 +135,10 @@ fn build_frontend() {
     println!("cargo:rerun-if-changed=web/vite.config.ts");
     println!("cargo:rerun-if-changed=web/tsconfig.json");
 
-    // AOE_WEB_DIST allows Nix (and other reproducible build systems) to supply
-    // a pre-built frontend directory, bypassing the npm build entirely. When
-    // set, the directory is copied to web/dist/ and npm is not invoked.
-    //
-    // Registered unconditionally so Cargo re-runs build.rs when the var is
-    // added or removed, not only when it is already set.
+    // Lets Nix supply a pre-built frontend. Registered unconditionally so toggling it reruns.
     println!("cargo:rerun-if-env-changed=AOE_WEB_DIST");
 
-    // AOE_COVERAGE=1 instructs Vite to build the web bundle with inline
-    // sourcemaps (see web/vite.config.ts) so Playwright can collect raw V8
-    // coverage against the embedded frontend and remap it to web/src. The env
-    // var is read by the npm child process below; we only need to tell Cargo
-    // to invalidate the build script's cache when it toggles.
+    // Builds the bundle with inline sourcemaps for Playwright coverage.
     println!("cargo:rerun-if-env-changed=AOE_COVERAGE");
     if let Ok(dist_src) = std::env::var("AOE_WEB_DIST") {
         eprintln!("Using pre-built web frontend from AOE_WEB_DIST={dist_src}");
@@ -203,15 +147,9 @@ fn build_frontend() {
         if dst.exists() {
             std::fs::remove_dir_all(dst).expect("Failed to remove existing web/dist");
         }
-        // Recursively copy src -> web/dist
         copy_dir(src, dst);
         return;
     }
-
-    // Always rebuild: the rerun-if-changed directives above ensure this
-    // function only runs when web source files actually changed.
-    // Previously this short-circuited when dist/ existed, which meant
-    // source changes were silently ignored.
 
     eprintln!("Building web frontend...");
 
@@ -233,15 +171,6 @@ fn build_frontend() {
     }
 }
 
-/// Install web dependencies when node_modules is missing OR stale relative to
-/// package.json / package-lock.json.
-///
-/// The previous check only looked for `web/node_modules/.package-lock.json` and
-/// skipped install when it existed. That broke a real workflow: after pulling
-/// new commits that add a dependency (e.g. `cmdk`), contributors hit cryptic
-/// TypeScript errors like "Cannot find module 'cmdk'" because the old
-/// node_modules was considered "good enough." This now compares mtimes so any
-/// lockfile change triggers a reinstall.
 #[cfg(feature = "web")]
 fn maybe_install_web_deps() {
     use std::path::Path;
@@ -264,17 +193,14 @@ fn maybe_install_web_deps() {
         return;
     }
 
-    // Prefer `npm ci` when a lockfile exists: it is deterministic and cleans
-    // up drift from manual edits. Fall back to `npm install` for projects
-    // without a lockfile (unusual, but keeps first-time setup working).
+    // `npm ci` when a lockfile exists; `npm install` otherwise.
     let install_cmd = if package_lock.exists() {
         "ci"
     } else {
         "install"
     };
 
-    // Use `cargo:warning=` so the notice shows in a default `cargo build`
-    // (plain eprintln! is suppressed unless the user passes -vv).
+    // `cargo:warning=` shows in a default build; eprintln! needs -vv.
     println!(
         "cargo:warning=Installing web dependencies via `npm {install_cmd}` (node_modules is stale or missing)..."
     );

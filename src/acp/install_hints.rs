@@ -1,13 +1,6 @@
 //! Per-binary install hint catalog for ACP adapters and native CLIs.
-//!
-//! Surfaced by the doctor (`aoe acp doctor`), the `aoe add` path, and
-//! the ACP handshake failure path so the user sees the correct command
-//! for whichever agent they tried to spawn.
 
-/// Friendly binary token for aoe's own multi-provider agent. Shared by the
-/// registry's spawn registration and [`env_allowlist_for`] so the two cannot
-/// drift onto different spellings (which would silently drop the agent's
-/// provider keys). Also the registry's `AgentSpec.command` for this agent.
+/// Friendly binary token for aoe's own multi-provider agent.
 pub const AOE_AGENT_BINARY: &str = "aoe-agent";
 
 /// Returns the install command for a known ACP binary, or `None` for
@@ -28,9 +21,6 @@ pub fn install_hint_for(binary: &str) -> Option<&'static str> {
         "omp" => "curl -fsSL https://omp.sh/install | sh",
         // Bundled in the aoe binary; installed into the data dir on demand.
         AOE_AGENT_BINARY => "aoe acp doctor --fix --adapter aoe-agent",
-        // The official installer wraps a checksum-verified `npm install -g`
-        // of a release tarball, so the curl script is the supported path;
-        // the package is not on the npm registry.
         "prime-agent" => {
             "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh  (then `/login` once)"
         }
@@ -40,10 +30,7 @@ pub fn install_hint_for(binary: &str) -> Option<&'static str> {
 
 /// The npm package spec for an agent the daemon can install itself via a
 /// plain `npm install -g <pkg>`, or `None` for agents that need a different
-/// installer (curl|bash, brew, manual). Distinct from `install_hint_for`,
-/// whose strings are human-facing and not shell-safe to execute. Only the
-/// npm subset is eligible for the web "Update & restart" action; everything
-/// else falls back to the displayed manual hint. See #2109.
+/// installer (curl|bash, brew, manual).
 pub fn npm_package_for(binary: &str) -> Option<&'static str> {
     Some(match binary {
         "claude-agent-acp" => "@agentclientprotocol/claude-agent-acp@latest",
@@ -54,35 +41,15 @@ pub fn npm_package_for(binary: &str) -> Option<&'static str> {
 }
 
 /// Operator env vars to forward to a given ACP binary, on top of the
-/// infrastructure-only `ALWAYS_FORWARD_ENV` in `acp_client/spawn.rs`. Empty slice
-/// means no ambient provider credentials. Four adapters (`pi-acp`, `omp`,
-/// `kimi`, `vibe-acp`) are intentionally deferred because
-/// their env-var names could not be source-verified for #3238 and shipping a
-/// guess that never matches would silently no-op the fix. Follow-up: verify
-/// each adapter's real reads from its own package/binary and add its arm.
-/// Every arm below cites the artifact its names came from; do not add one on
-/// convention alone.
-///
-/// The key is the friendly binary token used at registration time (e.g.
-/// [`AOE_AGENT_BINARY`]).
+/// infrastructure-only `ALWAYS_FORWARD_ENV` in `acp_client/spawn.rs`.
 pub fn env_allowlist_for(binary: &str) -> &'static [&'static str] {
     match binary {
-        // Existing Claude adapter contract, previously supplied through
-        // ALWAYS_FORWARD_ENV. Keep all four names on the Claude adapter while
-        // stopping unrelated and custom adapters from receiving them.
         "claude-agent-acp" => &[
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN",
             "CLAUDE_CONFIG_DIR",
         ],
-        // Verified from source: acp-worker/aoe-agent/src/index.ts imports only
-        // @ai-sdk/{anthropic,openai,google}, and those providers read their key
-        // from the environment themselves. @ai-sdk/anthropic reads
-        // ANTHROPIC_API_KEY; @ai-sdk/openai 4.0.27 reads OPENAI_API_KEY and
-        // OPENAI_BASE_URL (src/openai-provider.ts); @ai-sdk/google 4.0.31 reads
-        // GOOGLE_GENERATIVE_AI_API_KEY, NOT GEMINI_API_KEY (the gemini CLI's
-        // own name).
         AOE_AGENT_BINARY => &[
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
@@ -90,24 +57,13 @@ pub fn env_allowlist_for(binary: &str) -> &'static [&'static str] {
             "GOOGLE_GENERATIVE_AI_API_KEY",
         ],
         // Verified from codex-acp 1.3.0 (dist, `readApiKeyFromEnv`): it takes
-        // CODEX_API_KEY first, then OPENAI_API_KEY. It then execs the codex
-        // CLI, which resolves its config dir from CODEX_HOME and its endpoint
-        // from OPENAI_BASE_URL, so both ride along for the operator's
-        // `codex login` auth.json and any proxy endpoint.
+        // CODEX_API_KEY first, then OPENAI_API_KEY.
         "codex-acp" => &[
             "CODEX_API_KEY",
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
             "CODEX_HOME",
         ],
-        // Verified from the models.dev provider registry opencode resolves
-        // against: its `google` entry accepts GOOGLE_API_KEY,
-        // GOOGLE_GENERATIVE_AI_API_KEY, and GEMINI_API_KEY alike, so all three
-        // are here, and its `anthropic` entry declares ANTHROPIC_API_KEY, which
-        // opencode needs for a Claude model now that the key no longer rides
-        // the shared forward list. OPENROUTER_API_KEY and OPENCODE_API_KEY
-        // (OpenCode Zen) are the `openrouter` / `opencode` entries' declared
-        // env.
         "opencode" => &[
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
@@ -117,11 +73,6 @@ pub fn env_allowlist_for(binary: &str) -> &'static [&'static str] {
             "OPENROUTER_API_KEY",
             "OPENCODE_API_KEY",
         ],
-        // Verified from @google/gemini-cli 0.55.1: CLI-native GEMINI_API_KEY /
-        // GOOGLE_API_KEY (distinct from AI-SDK's GOOGLE_GENERATIVE_AI_API_KEY),
-        // plus the Vertex set. GOOGLE_GENAI_USE_VERTEXAI is what selects Vertex
-        // at all, and GOOGLE_CLOUD_LOCATION pairs with GOOGLE_CLOUD_PROJECT, so
-        // forwarding the credential without them leaves that path dead.
         "gemini" => &[
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
@@ -130,13 +81,6 @@ pub fn env_allowlist_for(binary: &str) -> &'static [&'static str] {
             "GOOGLE_CLOUD_PROJECT",
             "GOOGLE_CLOUD_LOCATION",
         ],
-        // Verified from prime-agent's packages/ai at 032e3ee74574:
-        // env-api-keys.ts names every provider key plus PRIME_TEAM_ID;
-        // providers/google-vertex.ts adds GCLOUD_PROJECT and
-        // GOOGLE_CLOUD_LOCATION; providers/amazon-bedrock.ts adds the region
-        // pair. Bedrock hands the rest to the AWS SDK default chain, whose
-        // env, web-identity, http, and shared-ini providers (3.972.x) read
-        // the session token, role, container-auth, and config-file companions.
         "prime-agent" => &[
             "PRIME_API_KEY",
             "PRIME_TEAM_ID",

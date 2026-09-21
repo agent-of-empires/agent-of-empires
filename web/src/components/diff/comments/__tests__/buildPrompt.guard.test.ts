@@ -1,9 +1,4 @@
 // @vitest-environment node
-//
-// Regression test for the diff-comments payload shape guard. StructuredView
-// reads this payload from untyped message metadata via a cast; without a
-// runtime guard a malformed payload crashes DiffCommentsUserCard, which
-// assumes `comments` is iterable.
 
 import { describe, expect, it } from "vitest";
 

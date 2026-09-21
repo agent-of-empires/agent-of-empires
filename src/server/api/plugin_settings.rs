@@ -1,13 +1,10 @@
 //! Host option-source resolver for plugin `dynamic_select` widgets (#2897).
 //!
-//! A `dynamic_select` names an [`OptionSource`]; the host resolves the actual
-//! choices from its own state (agent registry, ACP option catalog, project
-//! registry, session groups). The web and TUI renderers stay ignorant of
-//! where a source's data comes from: they post the source plus any
-//! `depends_on` values and render the returned `{value,label}` list. Saved
-//! ids are authoritatively revalidated at `sessions.create`, so this endpoint
-//! is advisory UI data, not an authorization surface; it still requires an
-//! authenticated dashboard session like every other `/api/*` route.
+//! A `dynamic_select` names an [`OptionSource`]; the host resolves the choices
+//! from its own state, so the web and TUI renderers stay ignorant of where a
+//! source's data comes from. Saved ids are authoritatively revalidated at
+//! `sessions.create`, so this endpoint is advisory UI data, not an
+//! authorization surface.
 
 use std::sync::Arc;
 
@@ -38,9 +35,8 @@ pub struct ResolveOptionsResponse {
 }
 
 /// `POST /api/plugins/{id}/settings/options/resolve`: resolve one
-/// dynamic-select source for the settings UI. The `{id}` path segment scopes
-/// the request to a plugin for auditing/consistency but does not change the
-/// result: option sources are host-global.
+/// dynamic-select source for the settings UI. `{id}` scopes the request for
+/// auditing only; option sources are host-global.
 pub async fn resolve_options(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(_plugin_id): axum::extract::Path<String>,
@@ -60,8 +56,8 @@ pub async fn resolve_options(
     }
 }
 
-/// Resolve a dynamic-select option source to a normalized `{value,label}`
-/// list. Shared by the HTTP endpoint (web) and any in-process caller (TUI).
+/// Resolve a dynamic-select option source to a normalized `{value,label}` list.
+/// Shared by the HTTP endpoint and any in-process caller.
 pub async fn resolve_option_source(
     state: &Arc<AppState>,
     source: OptionSource,
@@ -70,13 +66,10 @@ pub async fn resolve_option_source(
     match source {
         OptionSource::AcpAgents => Ok(acp_agent_options(&state.profile).await),
         OptionSource::AcpModels => {
-            // When the resolved profile pins the selected agent's model
-            // (`acp.acp_defaults.<agent>.pin_model`), the picker collapses to
-            // that one entry. Enforcement lives at creation (`sessions.create`
-            // refuses any other model; the spawn resolver applies the pin on
-            // every path), so this is presentation only: the wizard must not
-            // offer choices the create call will refuse. The catalog supplies
-            // the display label when it knows the pinned model.
+            // A profile that pins the selected agent's model collapses the
+            // picker to that entry. Enforcement lives at creation, so this is
+            // presentation only: the wizard must not offer choices the create
+            // call will refuse.
             if let Some(agent) = depends.first().filter(|a| !a.is_empty()) {
                 if let Some(model) = pinned_model_for_agent(&state.profile, agent).await {
                     let label = catalog_options(Some(agent), CatalogCategory::Model)
@@ -99,7 +92,7 @@ pub async fn resolve_option_source(
 
 /// Registry agents whose ACP adapter is filtered by `present`, mapped to
 /// `{value,label}`. Split out so the install filter is unit-testable without
-/// depending on which adapters happen to be on the test host's PATH.
+/// depending on the test host's PATH.
 fn installed_agent_options<'a>(
     entries: impl IntoIterator<Item = (&'a String, &'a crate::acp::AgentSpec)>,
     present: impl Fn(&str) -> bool,
@@ -111,21 +104,20 @@ fn installed_agent_options<'a>(
         .collect()
 }
 
-/// ACP-capable agents from the static registry whose adapter binary actually
-/// resolves on this host, plus any custom ACP agents the resolved profile
-/// config declares via a valid `agent_acp_cmd`. Sorted, deduped by id (a custom
-/// entry shadowing a built-in is dropped by the dedup).
+/// ACP-capable registry agents whose adapter binary resolves on this host, plus
+/// any custom ACP agents the resolved profile declares via a valid
+/// `agent_acp_cmd`. Sorted and deduped by id, so a custom entry shadowing a
+/// built-in is dropped.
 ///
-/// The registry filter mirrors `list_agents` (`acp_installed`): an agent is
-/// only offered as a choice when the host could actually launch it, so the
-/// picker never lists uninstalled harnesses (#3-plugin-cron picker fix).
+/// The registry filter mirrors `list_agents`, so the picker never lists
+/// uninstalled harnesses.
 async fn acp_agent_options(profile: &str) -> Vec<SelectOption> {
     let registry = crate::acp::AgentRegistry::with_defaults();
     let mut opts = installed_agent_options(registry.list(), crate::cli::acp::command_present);
 
-    // Custom ACP agents live in the per-profile config; resolve the profile
-    // (global -> profile, no repo) and keep entries whose command parses as a
-    // valid ACP adapter. Config IO runs off the async runtime.
+    // Custom ACP agents live in the per-profile config, so resolve the profile
+    // and keep entries whose command parses as a valid ACP adapter. Config IO
+    // runs off the async runtime.
     let profile = profile.to_string();
     let custom = tokio::task::spawn_blocking(move || {
         let session =
@@ -138,9 +130,8 @@ async fn acp_agent_options(profile: &str) -> Vec<SelectOption> {
                 !name.is_empty() && crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok()
             })
             .map(|(name, _)| name.clone())
-            // Plus custom agents that inherit a registry-backed base via
-            // `agent_detect_as` (e.g. a Claude wrapper); they run in structured
-            // view through the base adapter.
+            // Plus custom agents inheriting a registry-backed base via
+            // `agent_detect_as`; they run structured through the base adapter.
             .chain(
                 detect_as
                     .keys()
@@ -169,12 +160,10 @@ enum CatalogCategory {
     Mode,
 }
 
-/// Like [`catalog_options`], but when the selected agent's catalog has never
-/// been discovered, run a one-shot handshake probe to populate it first, so a
-/// model/mode picker self-fills on first open instead of showing empty until
-/// the agent has run a live session. The probe records into the shared option
-/// catalog, so it is effectively one spawn per agent; the cache then suppresses
-/// repeats.
+/// Like [`catalog_options`], but runs a one-shot handshake probe when the
+/// selected agent's catalog has never been discovered, so a model/mode picker
+/// self-fills on first open. The probe records into the shared catalog, so it is
+/// effectively one spawn per agent.
 async fn catalog_options_probing(
     agent: Option<&String>,
     category: CatalogCategory,
@@ -186,7 +175,7 @@ async fn catalog_options_probing(
     let Some(agent) = agent.filter(|a| !a.is_empty()) else {
         return first;
     };
-    // Already discovered (this category is just genuinely empty): don't respawn.
+    // Already discovered, so this category is genuinely empty: do not respawn.
     if crate::acp::option_catalog::load()
         .agents
         .contains_key(agent)
@@ -210,8 +199,7 @@ async fn catalog_options_probing(
 }
 
 /// Model or mode choices the given agent last advertised. Empty when no agent
-/// is selected yet or the agent's catalog has not been discovered; the UI then
-/// shows an empty/"run the agent first" state, and sessions.create is the
+/// is selected or its catalog is undiscovered; sessions.create is the
 /// authoritative validator regardless.
 fn catalog_options(agent: Option<&String>, category: CatalogCategory) -> Vec<SelectOption> {
     let Some(agent) = agent.filter(|a| !a.is_empty()) else {
@@ -257,10 +245,9 @@ async fn group_options(state: &Arc<AppState>) -> Vec<SelectOption> {
     paths.iter().map(|p| SelectOption::new(p, p)).collect()
 }
 
-/// The model pinned under the profile for the agent `agent` spawns as, if
-/// any; see `pinned_model_for_tool`. A plain `model` without `pin_model` is a
-/// default an explicit request still beats at creation, so it yields `None`
-/// and the picker keeps the full catalog.
+/// The model pinned under the profile for the agent `agent` spawns as, if any.
+/// A plain `model` without `pin_model` is a default an explicit request still
+/// beats at creation, so it yields `None` and the picker keeps the full catalog.
 async fn pinned_model_for_agent(profile: &str, agent: &str) -> Option<String> {
     let profile = profile.to_string();
     let agent = agent.to_string();
@@ -303,10 +290,9 @@ mod tests {
             .await
             .expect("models");
         assert!(models.is_empty());
-        // Models for a registry-unknown agent: empty and hermetic. A *known*
-        // undiscovered agent would trigger a live handshake probe (see
-        // `catalog_options_probing`), which is not something a unit test should
-        // spawn, so we assert the empty path via an id the probe declines.
+        // Models for a registry-unknown agent: empty and hermetic. A known
+        // undiscovered agent would trigger a live handshake probe, which a unit
+        // test should not spawn.
         let models = resolve_option_source(
             &state,
             OptionSource::AcpModels,
@@ -348,11 +334,10 @@ mod tests {
         assert!(picked.iter().any(|o| &o.value == name));
     }
 
-    /// The picker collapses only on an explicit pin. A plain
-    /// `acp_defaults.<agent>.model` is a default (an explicit request still
-    /// wins at `sessions.create`), so it must keep the full catalog. The pin
-    /// is keyed by the agent a session spawns as: a wrapper mapped to a base
-    /// agent through `agent_detect_as` reads the base pin.
+    /// The picker collapses only on an explicit pin: a plain
+    /// `acp_defaults.<agent>.model` is a default an explicit request still beats
+    /// at `sessions.create`. The pin is keyed by the agent a session spawns as,
+    /// so a wrapper mapped through `agent_detect_as` reads the base pin.
     #[tokio::test]
     #[serial_test::serial]
     async fn picker_collapses_on_a_pin_but_not_on_a_default() {

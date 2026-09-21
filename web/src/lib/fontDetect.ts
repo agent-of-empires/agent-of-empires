@@ -1,21 +1,10 @@
-// Client-side detection of installed monospace fonts, so the Terminal
-// settings can list fonts the viewer actually has (e.g. a Nerd Font with the
-// powerline/icon glyphs the bundled Geist Mono lacks). Uses the permission-
-// free, cross-browser width-probe: a candidate font is installed iff a test
-// string measured in `"<candidate>", <baseline>` differs from the baseline
-// generic alone. queryLocalFonts() would enumerate everything, but it is
-// Chromium-only and needs a permission prompt.
-//
-// caveat: probe only finds fonts on this curated list; the settings combobox
-// stays free-text so any other installed font is still selectable by name.
+// Detect installed monospace fonts from a curated list by width probing, which needs no permission, unlike queryLocalFonts().
 
 const BASELINES = ["monospace", "serif", "sans-serif"] as const;
-// Mixed glyphs so a font with different metrics than the baseline shows a
-// measurable width delta.
+// Mixed glyphs so differing metrics show a width delta.
 const PROBE = "mmmmmmmmmmlliWQ0Ogq{}[]#@";
 
-// Common developer + Nerd Font families. Nerd Font variants are listed under
-// the names their installers register (e.g. "MesloLGS NF").
+// Nerd Fonts are listed under their installed family names.
 export const MONOSPACE_FONT_CANDIDATES = [
   "JetBrains Mono",
   "JetBrainsMono Nerd Font",

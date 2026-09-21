@@ -1,24 +1,13 @@
-//! Named slices of a pane capture that manifest rules match against.
-//!
-//! A rule names the part of the screen its shape can appear in, so a match
-//! cannot drift onto unrelated text: the completion line is only meaningful
-//! directly above the input box, and the interrupt hint only in the footer.
-//! Naming the slice is what keeps the shapes themselves simple.
+//! Named slices of a pane capture that manifest rules match against, so a
+//! shape cannot drift onto unrelated text.
 
 use std::sync::OnceLock;
 
-/// The pane, sliced once per capture and shared by every rule that runs
-/// against it. Regions are computed lazily: a capture whose first rule
-/// matches never pays for the rest.
+/// The pane, sliced lazily once per capture.
 pub(super) struct Screen<'a> {
-    /// Non-empty lines, most recent [`RECENT_LINES`] of them. Claude parks the
-    /// cursor below its output and small responses sit in a tall pane, so the
-    /// blank tail carries nothing and filtering it keeps window sizes
-    /// meaningful.
+    /// The most recent [`RECENT_LINES`] non-empty lines.
     recent: Vec<&'a str>,
-    /// Whether a blank row sat above each [`Self::recent`] line. Blank rows are
-    /// dropped from the window, so this is the only thing left that says two
-    /// stacked characters came from different blocks rather than one word.
+    /// Whether a blank row sat above each [`Self::recent`] line.
     blank_before: Vec<bool>,
     osc_title: &'a str,
     joined: OnceLock<String>,
@@ -31,51 +20,29 @@ pub(super) struct Screen<'a> {
     before_marker: OnceLock<String>,
 }
 
-/// How far back a rule may look. Claude's footer, input box and status slot
-/// fit well inside this, and a shorter window would drop the completion line
-/// on a pane whose box carries several rows of chrome.
 const RECENT_LINES: usize = 30;
 
-/// A landmark line a manifest names so its rules can be scoped relative to it:
-/// the divider a finished turn draws, the rule pair around an input box, an
-/// interruption banner. Regions like `after(<name>)` and `above(<name>, n)`
-/// resolve through one of these.
+/// A landmark line (a turn divider, an input box rule, a banner) that regions
+/// like `after(<name>)` and `above(<name>, n)` resolve through.
 pub(super) struct Marker {
-    /// Any of these matching a line makes it a candidate.
     pub(super) line_regex: Vec<regex::Regex>,
-    /// Case-insensitive substrings, all of which must appear in the candidate.
     pub(super) contains: Vec<String>,
-    /// Which candidate to take, counting from the bottom. Pi's input box is
-    /// its *second* rule from the bottom, since it draws one above and one
-    /// below the prompt.
+    /// Which candidate, counting from the bottom.
     pub(super) occurrence: usize,
-    /// A candidate further from the bottom than this is transcript content
-    /// drawing the same shape, not the landmark, and resolves to absent.
-    /// Doubles as the fallback window for `above`.
+    /// Deeper candidates are transcript content; also the fallback window for `above`.
     pub(super) max_depth: Option<usize>,
-    /// Join up to this many consecutive lines before matching, for a banner a
-    /// narrow pane wraps. The marker resolves to the last line of the window.
+    /// Join up to this many lines, for a banner a narrow pane wraps.
     pub(super) wrap: usize,
-    /// Dropped from the front of each line before matching, so a banner glyph
-    /// does not have to appear in every pattern.
+    /// Stripped from each line's front before matching.
     pub(super) strip_prefix: Option<String>,
-    /// What `after(<marker>)` means when the marker is not on screen. A
-    /// landmark whose absence is meaningful (an interruption banner) leaves
-    /// the region empty, so a rule scoped to it cannot fire. One that only
-    /// bounds a region (the divider between turns) leaves the whole window,
-    /// since with no divider the current block *is* the whole window.
+    /// `after(<marker>)` with the marker absent: empty for a meaningful landmark,
+    /// the whole window for one that only bounds a region.
     pub(super) absent_is_whole: bool,
 }
 
 impl Marker {
-    /// Index into `lines` of the marker, or `None` when it is absent, deeper
-    /// than `max_depth`, or occurs fewer than `occurrence` times.
-    ///
-    /// A wrapped marker is located by growing a window *forward* from each
-    /// candidate start and taking the line where the phrase completes, not by
-    /// asking which windows contain it: every window that reaches back far
-    /// enough contains it, so the latter resolves to the bottom of the pane
-    /// and leaves `after(<marker>)` empty.
+    /// Index of the marker line, or `None`. A wrapped marker resolves to the line
+    /// where the phrase completes, growing forward from each candidate start.
     fn resolve(&self, lines: &[&str]) -> Option<usize> {
         let body = |line: &str| -> String {
             let trimmed = line.trim_start();
@@ -121,51 +88,34 @@ impl Marker {
     }
 }
 
-/// What a rule matches against, resolved from its `region` key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Region {
-    /// Every recent line, joined.
     WholeRecent,
-    /// Recent lines with runs of ASCII whitespace collapsed to one space, so a
-    /// footer hint that word-wrapped mid-phrase still reads as one string.
+    /// Recent lines with whitespace runs collapsed, so a wrapped hint reads whole.
     CollapsedRecent,
-    /// Recent lines with runs of single-character lines glued back into one
-    /// line, so a word a Textual pane stacks one character per row reads as a
-    /// word. Wider lines keep their newline, so this cannot spell a word out
-    /// of two ordinary lines that only meet at their ends.
+    /// Recent lines with runs of single-character lines glued into words.
     UnstackedRecent,
-    /// The last `n` non-empty lines.
     BottomLines(usize),
-    /// The transcript line the input box's status slot sits on: the live
-    /// spinner, the background-agent wait line, or the completion line once a
-    /// turn ends. Box chrome is skipped to reach it.
+    /// The input box's status slot line (spinner, wait line or completion), box
+    /// chrome skipped.
     AboveInputBox,
-    /// The input box's own line, from `❯` to end of line.
     PromptBoxBody,
-    /// Everything below the last horizontal rule, i.e. the current dialog or
-    /// footer rather than the transcript above it.
+    /// Below the last horizontal rule: the current dialog or footer.
     AfterLastRule,
-    /// The terminal title the agent sets through OSC 0/2, which several CLIs
-    /// use to publish their own state.
+    /// The OSC 0/2 terminal title.
     OscTitle,
-    /// The manifest's `prompt_marker` line and everything below it: the live
-    /// area an agent redraws, as opposed to the transcript above. Falls back
-    /// to the whole window when the marker is off screen.
+    /// The `prompt_marker` line and below, else the whole window.
     FromPromptMarker,
-    /// Everything above the `prompt_marker` line.
     BeforePromptMarker,
-    /// Everything below a named marker, exclusive, optionally limited to that
-    /// slice's own last `n` lines. Empty when the marker is absent, so a rule
-    /// scoped to it cannot fire without its landmark.
+    /// Below a named marker (exclusive), optionally its last `n` lines; empty when
+    /// the marker is absent.
     AfterMarker(&'static str, Option<usize>),
-    /// The `n` lines directly above a named marker, falling back to the
-    /// marker's `max_depth` lines at the bottom when it is absent.
+    /// The `n` lines above a named marker, else its `max_depth` bottom lines.
     AboveMarker(&'static str, usize),
 }
 
 impl Region {
-    /// Region names carrying a marker are leaked once at manifest compile
-    /// time, which happens on a `OnceLock` path that lives for the process.
+    /// Marker region names are leaked once at compile time (process lifetime).
     pub(super) fn parse(raw: &str) -> Option<Self> {
         if let Some(rest) = raw.strip_prefix("after(").and_then(|r| r.strip_suffix(')')) {
             let (name, limit) = match rest.split_once(',') {
@@ -188,9 +138,7 @@ impl Region {
             .strip_prefix("bottom_non_empty_lines(")
             .and_then(|r| r.strip_suffix(')'))
         {
-            // Zero is rejected rather than clamped: an empty region matches
-            // nothing, so a rule asking for it is a manifest bug, and
-            // `manifests_compile` names the rule at build time.
+            // Zero is a manifest bug, reported at build time by `manifests_compile`.
             return n
                 .trim()
                 .parse()
@@ -242,9 +190,7 @@ impl<'a> Screen<'a> {
         }
     }
 
-    /// The region's text, or `""` when the pane has no such slice (no input
-    /// box on screen, no title set). An empty region matches nothing, which is
-    /// the safe direction: a rule that cannot see its evidence must not fire.
+    /// `""` when the pane has no such slice; an empty region matches nothing.
     pub(super) fn region_text(
         &self,
         region: Region,
@@ -260,8 +206,6 @@ impl<'a> Screen<'a> {
                 .unstacked
                 .get_or_init(|| unstack(&self.recent, &self.blank_before)),
             Region::BottomLines(n) => {
-                // Bottom-n is a suffix of the joined recent window, so it is
-                // sliced from it rather than joined again per rule.
                 let start = self.recent.len().saturating_sub(n);
                 if start == 0 {
                     return std::borrow::Cow::Borrowed(self.joined());
@@ -297,9 +241,6 @@ impl<'a> Screen<'a> {
                         None => self.joined().to_string(),
                     })
             }
-            // The marker regions are built per lookup rather than cached: a
-            // manifest scopes only a handful of rules to a marker, and the
-            // capture they run against is discarded at the end of the poll.
             Region::AfterMarker(name, limit) => {
                 return std::borrow::Cow::Owned(match markers.get(name) {
                     Some(marker) => match marker.resolve(&self.recent) {
@@ -332,7 +273,6 @@ impl<'a> Screen<'a> {
         })
     }
 
-    /// The last line matching any of the manifest's prompt-marker patterns.
     fn marker_index(&self, prompt_marker: &[regex::Regex]) -> Option<usize> {
         self.recent
             .iter()
@@ -375,18 +315,13 @@ impl<'a> Screen<'a> {
     }
 }
 
-/// A run of box-drawing dashes, optionally broken by the right-aligned label
-/// an agent renders inside it. Requiring a leading run *and* a trailing dash
-/// separates it from transcript prose that merely contains a rule.
+/// A run of box-drawing dashes, optionally broken by a right-aligned label.
 fn line_is_horizontal_rule(trimmed: &str) -> bool {
     trimmed.chars().take_while(|c| *c == '─').count() >= 3 && trimmed.ends_with('─')
 }
 
-/// Input-box furniture as opposed to transcript content: the box's own
-/// separators, `⎿ Tip:` rows, the right-aligned context hint, and the mode
-/// footer under the box. [`Region::AboveInputBox`] skips these to reach the
-/// status slot; a shape missing here reads as transcript and hides the
-/// evidence behind it, so new furniture belongs in this list.
+/// Input-box furniture that [`Region::AboveInputBox`] skips; unlisted furniture
+/// hides the status slot.
 fn line_is_input_box_chrome(line: &str) -> bool {
     let trimmed = line.trim();
     line_is_horizontal_rule(trimmed)
@@ -396,19 +331,13 @@ fn line_is_input_box_chrome(line: &str) -> bool {
         || line_is_update_banner(trimmed)
 }
 
-/// The mode/permission footer under the input box (`⏵⏵ accept edits on`,
-/// `⏸ plan mode on`), including the shortcut tail it carries.
 fn line_is_mode_footer(trimmed: &str) -> bool {
     let lower = trimmed.to_lowercase();
     (trimmed.starts_with('⏵') || trimmed.starts_with('⏸'))
         && (lower.contains(" on") || lower.contains("shift+tab"))
 }
 
-/// The self-update notice Claude renders between the transcript and the input
-/// box (`✔ Update installed · Restart to update`). It is chrome, not
-/// transcript: leaving it out of this list let it stand in for the status slot
-/// and hide a finished turn's completion line, pinning parked sessions on
-/// Running for hours.
+/// Claude's self-update notice, which otherwise hides the completion line.
 fn line_is_update_banner(trimmed: &str) -> bool {
     let lower = trimmed.to_lowercase();
     (trimmed.starts_with('✔') || trimmed.starts_with('✓'))
@@ -416,14 +345,8 @@ fn line_is_update_banner(trimmed: &str) -> bool {
         && (lower.contains("restart") || lower.contains("installed"))
 }
 
-/// Glue each run of single-character lines into one line, leaving wider lines
-/// alone. A Textual pane too narrow for its status word stacks the word one
-/// character per row, and a run of such rows is the word; anything wider is
-/// ordinary content, so it keeps its own line and cannot be glued to the text
-/// under it.
-///
-/// A blank row ends a run for the same reason: characters either side of one
-/// came from different blocks, so they are not one word.
+/// Glue runs of single-character lines (a narrow Textual pane stacking a word);
+/// wider lines and blank rows end a run.
 fn unstack(lines: &[&str], blank_before: &[bool]) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut run = String::new();

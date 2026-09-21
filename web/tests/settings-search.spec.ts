@@ -5,6 +5,7 @@
 // isolation; this spec is the real-DOM cross-tab jump.
 
 import { test, expect } from "./helpers/mockedTest";
+import { mockSettingsApis } from "./helpers/apiMocks";
 import type { Page } from "@playwright/test";
 
 const ALLOW = { policy: "allow" };
@@ -42,26 +43,7 @@ const SCHEMA = [
 }));
 
 async function installMocks(page: Page) {
-  await page.route(
-    (url) => url.pathname === "/api/sessions",
-    (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }),
-  );
-  await page.route(
-    (url) => url.pathname === "/api/about",
-    (r) => r.fulfill({ json: { read_only: false, auth_mode: "none", behind_tunnel: false, profile: "main" } }),
-  );
-  await page.route(
-    (url) => url.pathname === "/api/profiles",
-    (r) => r.fulfill({ json: [{ name: "main", is_default: true }] }),
-  );
-  await page.route(
-    (url) => url.pathname === "/api/settings/schema",
-    (r) => r.fulfill({ json: SCHEMA }),
-  );
-  await page.route(
-    (url) => url.pathname === "/api/settings",
-    (r) => r.fulfill({ json: { sandbox: {}, acp: {} } }),
-  );
+  await mockSettingsApis(page, { schema: SCHEMA, settings: () => ({ sandbox: {}, acp: {} }) });
   await page.route(
     (url) => /^\/api\/profiles\/[^/]+\/settings$/.test(url.pathname),
     (route) => route.fulfill({ json: { ok: true } }),

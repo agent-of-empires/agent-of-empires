@@ -1,12 +1,4 @@
-//! Domain core for creating a session: build the instance, persist it, upsert
-//! it into the live state, and (for a structured session) spawn its ACP worker.
-//!
-//! Extracted from the `create_session` HTTP handler so a non-HTTP caller (for
-//! example a scheduler) can create a structured-view ACP session without
-//! duplicating the build/persist/spawn logic. The handler keeps all request
-//! decoding, validation, and response construction; it decodes a request into a
-//! [`StructuredSessionSpec`], calls [`spawn_structured_session`], and builds its
-//! HTTP response from the returned [`SpawnOutcome`].
+//! Domain core for creating a session.
 
 use std::sync::Arc;
 
@@ -14,9 +6,7 @@ use crate::session::Instance;
 
 use super::session_service::SessionService;
 
-/// Already-decoded, already-validated inputs the create core needs. The HTTP
-/// handler fills this in after it has finished request parsing, auth, and
-/// validation; a future non-HTTP caller builds it directly.
+/// Already-decoded, already-validated inputs the create core needs.
 pub(crate) struct StructuredSessionSpec {
     pub title: Option<String>,
     pub path: String,
@@ -46,9 +36,7 @@ pub(crate) struct StructuredSessionSpec {
     pub idempotency_key: Option<String>,
     /// Resolved source profile (request profile, else the server default).
     pub profile: String,
-    /// Creating plugin id, when the caller is a plugin worker rather than a
-    /// user surface. Stamped by `SessionService::create_structured_session`,
-    /// never decoded from a request body. See #2897.
+    /// Creating plugin id, when the caller is a plugin worker rather than a user surface.
     pub created_by_plugin: Option<String>,
     /// Plugin create-idempotency record to persist with the instance,
     /// stamped alongside `created_by_plugin`.
@@ -56,9 +44,8 @@ pub(crate) struct StructuredSessionSpec {
     /// Initial prompt to persist with the instance and deliver once the ACP
     /// worker is live, stamped by `SessionService::create_structured_session`.
     pub pending_initial_turn: Option<String>,
-    /// Explicit ACP approval-mode id to persist on the instance; the
-    /// supervisor applies it after every worker (re)spawn. Stamped by the
-    /// plugin host create path after host-side classification.
+    /// Explicit ACP approval-mode id to persist on the instance; the supervisor applies it
+    /// after every worker (re)spawn.
     pub acp_mode_id: Option<String>,
     pub view: crate::session::View,
     pub agent_name: Option<String>,
@@ -69,17 +56,14 @@ pub(crate) struct StructuredSessionSpec {
 }
 
 /// What the create core returns to its caller once the session exists in state.
-/// The HTTP handler builds its `SessionResponse` from `instance` and threads
-/// `warnings` onto it exactly as the inline handler did.
 pub(crate) struct SpawnOutcome {
     pub instance: Instance,
     pub warnings: Vec<String>,
 }
 
-/// Marker error the core returns when the blocking build task panicked, so the
-/// HTTP handler can keep answering `500 Internal Server Error` for that case
-/// while a plain build failure stays `400`. Mirrors the existing
-/// `HooksNeedTrust` downcast pattern in the handler.
+/// Marker error the core returns when the blocking build task panicked, so the HTTP handler
+/// can keep answering `500 Internal Server Error` for that case while a plain build failure
+/// stays `400`.
 #[derive(Debug)]
 pub(crate) struct SessionBuildPanicked(pub String);
 
@@ -91,10 +75,8 @@ impl std::fmt::Display for SessionBuildPanicked {
 
 impl std::error::Error for SessionBuildPanicked {}
 
-/// Build, persist, and register a session, spawning its ACP worker when the
-/// resolved view is structured. Returns the created instance and any build
-/// warnings; a build-time panic is surfaced as a [`SessionBuildPanicked`] error
-/// and a repo-trust refusal propagates as-is so the caller can map it.
+/// Build, persist, and register a session, spawning its ACP worker when the resolved view
+/// is structured.
 pub(crate) async fn spawn_structured_session(
     service: &Arc<SessionService>,
     spec: StructuredSessionSpec,
@@ -165,13 +147,7 @@ pub(crate) async fn spawn_structured_session(
             .filter(|s| !s.is_empty())
             .collect();
 
-        // Resolve repo hook trust BEFORE building the worktree (#2066): a repo
-        // whose hooks need approval and that was not sent `trust_hooks: true`
-        // is refused here, so the handler never leaves an orphan worktree on
-        // disk. The original `path` is the trust anchor (the same source the
-        // CLI/TUI use); `check_repo_trust` resolves a worktree path to its main
-        // repo, so a worktree created from an already-trusted repo inherits its
-        // trust without a separate prompt.
+        // Resolve repo hook trust BEFORE building the worktree.
         let original_path = path.clone();
         let hook_plan = crate::server::api::sessions::resolve_create_hook_plan(
             &profile,
@@ -244,16 +220,10 @@ pub(crate) async fn spawn_structured_session(
             }
         }
 
-        // Apply structured-view fields from the request body. structured_view is
-        // re-validated below against real ACP capability; non-ACP tools
-        // fall back to terminal view rather than erroring at spawn time.
+        // Apply structured-view fields from the request body.
         let agent_effort = {
             instance.view = view;
-            // #2276: importing an existing Claude session forces the
-            // structured view and adopts the on-disk session id, so the
-            // structured spawn resumes it via session/load and seeds the
-            // transcript from the agent's history replay. `path` is the
-            // session's original cwd (the wizard prefills it).
+            // #2276.
             if let Some(import_id) = import_acp_session_id
                 .clone()
                 .filter(|s| !s.trim().is_empty())
@@ -278,26 +248,16 @@ pub(crate) async fn spawn_structured_session(
                 instance.agent_name.as_deref(),
             );
             let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
-            // Preserve the explicit request model separately (trimmed to match
-            // the resolver's normalization) so a terminal fallback below can
-            // keep it while dropping any ACP-derived default; agent_model is
-            // ACP-only.
+            // Preserve the explicit request model separately (trimmed to match the
+            // resolver's normalization) so a terminal fallback below can keep it while
+            // dropping any ACP-derived default; agent_model is ACP-only.
             let explicit_model = agent_model
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
-            // A profile pin wins, else the explicit request, else the per-agent
-            // default; effort is keyed on the resolved model. Same single-source
-            // resolver the spawn path uses; persist the model here so the
-            // composer shows it and the session stays on it. See
-            // resolve_spawn_model_effort.
-            // Persist only an EXPLICIT effort, never the resolved default:
-            // `acp_effort` is a pin, and `None` means "inherit whatever the
-            // configured default resolves to at spawn time". Snapshotting the
-            // default here would freeze the session on today's value and make a
-            // later config change invisible to it. The resolved effort still
-            // reaches this session's first spawn below.
+            // A profile pin wins, else the explicit request, else the per-agent default;
+            // effort is keyed on the resolved model.
             let explicit_effort = agent_effort
                 .as_deref()
                 .map(str::trim)
@@ -311,10 +271,7 @@ pub(crate) async fn spawn_structured_session(
                 );
             instance.agent_model = resolved_model;
             instance.acp_effort = explicit_effort;
-            // Don't trust the client's capability decision. Re-resolve
-            // whether this agent can actually run in structured view; a custom
-            // agent without an `agent_acp_cmd` (or any non-ACP tool)
-            // falls back to tmux here rather than erroring at spawn time.
+            // Don't trust the client's capability decision.
             if instance.is_structured() {
                 let resolved = instance
                     .agent_name
@@ -322,22 +279,15 @@ pub(crate) async fn spawn_structured_session(
                     .filter(|s| !s.is_empty())
                     .unwrap_or(instance.tool.as_str());
                 let resolved_session = &resolved_config.session;
-                // Check the resolved agent key AND the raw tool, the same pair
-                // `aoe add`'s precondition uses. Checking only `tool` for the
-                // `agent_acp_cmd` / inheritance legs downgraded a session that
-                // `agent_is_acp_capable` had already accepted as Structured,
-                // whenever `agent_name` differed from `tool` (a custom agent,
-                // or a wrapper inheriting a registry base), and the downgrade
-                // also cleared its pending markers.
+                // Check the resolved agent key AND the raw tool, the same pair `aoe add`'s
+                // precondition uses.
                 let acp_capable_key = |key: &str| {
                     acp_registry.get(key).is_some()
                         || resolved_session
                             .agent_acp_cmd
                             .get(key)
                             .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(key, cmd).is_ok())
-                        // A custom agent that inherits a registry-backed base
-                        // (e.g. a Claude wrapper) is structured-capable through
-                        // the base adapter; keep the requested Structured view.
+                        // A custom agent that inherits a registry-backed base (e.g.
                         || crate::acp::inherited_acp_base(key, &resolved_session.agent_detect_as)
                             .is_some()
                 };
@@ -346,11 +296,7 @@ pub(crate) async fn spawn_structured_session(
                     instance.view = crate::session::View::Structured;
                 } else {
                     instance.view = crate::session::View::Terminal;
-                    // A non-ACP tool cannot run the structured session/fork
-                    // handshake. If a malformed request seeded a structured
-                    // fork (fork_pending/import_pending set by the builder),
-                    // drop those markers so a later switch-to-structured does
-                    // not fire an unexpected session/fork against the parent.
+                    // A non-ACP tool cannot run the structured session/fork handshake.
                     instance.fork_pending = None;
                     instance.import_pending = None;
                 }
@@ -368,11 +314,8 @@ pub(crate) async fn spawn_structured_session(
             agent_effort
         };
 
-        // Run on_create hooks now that the worktree exists, before the session
-        // is persisted or started (#2066). Mirrors the TUI/CLI ordering so the
-        // worktree is bootstrapped (`.env` copies, venv symlinks, DB seeds)
-        // before the agent launches. On failure, tear down the just-built
-        // worktree/container so a broken hook doesn't leave an orphan.
+        // Run on_create hooks now that the worktree exists, before the session is persisted
+        // or started.
         if let Err(e) = crate::server::api::sessions::run_create_hooks(
             &mut instance,
             &hook_plan,
@@ -387,13 +330,10 @@ pub(crate) async fn spawn_structured_session(
             return Err(anyhow::anyhow!("on_create hook failed: {e:#}"));
         }
 
-        // Anything that fails between here and the final `Ok(..)`
-        // would otherwise orphan the scratch directory `build_instance`
-        // already provisioned (Storage::new, storage.update,
-        // instance.start). Wrap the tail in an IIFE-equivalent closure
-        // so we can run cleanup on Err once, regardless of which step
-        // tripped. Matches the CLI cleanup path in
-        // `cleanup_partial_session(... scratch_dir: Some(...))`.
+        // Anything that fails between here and the final `Ok(..)` would otherwise orphan
+        // the scratch directory `build_instance` already provisioned (Storage::new,
+        // storage.update, instance.start). Wrap the tail in an IIFE-equivalent closure so
+        // we can run cleanup on Err once, regardless of which step tripped.
         let mut persist_and_start = || -> anyhow::Result<()> {
             let storage = Storage::new(&profile, file_watch_for_create.clone())?;
             let to_persist = instance.clone();
@@ -402,10 +342,8 @@ pub(crate) async fn spawn_structured_session(
                 Ok(())
             })?;
 
-            // Acp-mode sessions are not backed by tmux; the structured view
-            // supervisor spawns the ACP agent on demand. Skip the tmux
-            // `start()` to avoid creating an empty pane that no one will
-            // attach to.
+            // Acp-mode sessions are not backed by tmux; the structured view supervisor
+            // spawns the ACP agent on demand.
             let skip_tmux_start = instance.is_structured();
             if !skip_tmux_start {
                 instance.start()?;
@@ -414,10 +352,7 @@ pub(crate) async fn spawn_structured_session(
         };
 
         if let Err(e) = persist_and_start() {
-            // Guarded the same way as the deletion path: only remove a
-            // path that `is_scratch_path` blesses, so a corrupted
-            // `project_path` cannot trick us into wiping unrelated
-            // state.
+            // Guarded the same way as the deletion path.
             if instance.scratch {
                 let scratch_path = std::path::PathBuf::from(&instance.project_path);
                 if crate::session::scratch::is_scratch_path(&scratch_path) {
@@ -467,9 +402,7 @@ pub(crate) async fn spawn_structured_session(
             };
             publish_created_instance(service, instance).await;
 
-            // Count the create for the opt-in telemetry trend counter. Bounded
-            // accumulator, read-and-decremented by the snapshot loop; no-op for
-            // opted-out installs (the snapshot is never built / sent).
+            // Count the create for the opt-in telemetry trend counter.
             service
                 .telemetry_session_creates
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -558,11 +491,7 @@ pub(crate) async fn spawn_structured_session(
                         .await
                     {
                         Ok(()) => {
-                            // Fast path for a create that carried an initial
-                            // turn: deliver it now that the worker is live.
-                            // The reconciler tick is the retry owner for
-                            // every other case (spawn failure here, daemon
-                            // restart, adopted runner).
+                            // Fast path for a create that carried an initial turn.
                             if has_pending_initial_turn {
                                 service_for_check.drain_pending_initial_turn(&id).await;
                             }
@@ -574,9 +503,8 @@ pub(crate) async fn spawn_structured_session(
                                 .await
                                 .iter()
                                 .any(|i| i.id == id);
-                            // Capacity-aware banner selection (and the benign
-                            // first-tick duplicate) is documented on
-                            // `structured_spawn_error_message`.
+                            // Capacity-aware banner selection (and the benign first-tick
+                            // duplicate) is documented on `structured_spawn_error_message`.
                             let message =
                                 crate::server::api::structured_spawn_error_message(&e, &agent);
                             if still_present {
@@ -731,9 +659,8 @@ mod tests {
         state.acp_supervisor.test_remove_worker("occupant").await;
     }
 
-    /// The test above runs on a current-thread runtime, where an unlock moved
-    /// above the epoch bump has no await to yield at and still passes (#3968).
-    /// Pin the order instead: the guard must outlive the bump.
+    /// The test above runs on a current-thread runtime, where an unlock moved above the
+    /// epoch bump has no await to yield at and still passes.
     #[test]
     fn publication_bumps_the_epoch_before_releasing_the_instances_lock() {
         // Whitespace-normalised so rustfmt's wrapping cannot change the result.

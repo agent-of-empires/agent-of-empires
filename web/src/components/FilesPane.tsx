@@ -7,13 +7,7 @@ interface Props {
   sessionId: string | null;
 }
 
-/**
- * Browse the files under a session's project_path and view them (#3088).
- * Backed by `GET /api/sessions/:id/acp/files` (git-agnostic, so non-git scratch
- * sessions list their files too); selecting a file opens it in
- * {@link FileContentViewer}, which renders Markdown and confines reads server
- * side. A flat, filterable list (ponytail: add a tree if it gets unwieldy).
- */
+/** Browse the files under a session's project_path and view them. */
 export function FilesPane({ sessionId }: Props) {
   const { files, loading, error, reload } = useFilesIndex(sessionId ?? "");
   const [filter, setFilter] = useState("");

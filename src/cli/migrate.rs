@@ -1,9 +1,4 @@
 //! `aoe migrate`: run pending data migrations now, with progress on stderr.
-//!
-//! Every `aoe` command runs pending migrations before it starts; this command
-//! exists so a user who deferred a long one (see `DEFER_ENV` in
-//! `crate::migrations::v027_isolate_sandbox_stores`) can finish it when
-//! convenient and watch it happen.
 
 use std::io::{IsTerminal, Write};
 use std::sync::{Arc, Mutex};
@@ -13,20 +8,12 @@ use anyhow::Result;
 
 use crate::migrations::progress::{fit_width, ConsoleProgress, Event, Reporter};
 
-/// How long a migration may run before a CLI command mentions it. Quick
-/// migrations stay silent; anything slower gets its name and steps.
 const QUIET_FOR: Duration = Duration::from_millis(1500);
 
-/// Columns assumed when the terminal width is unknown.
 const FALLBACK_WIDTH: usize = 80;
 
 const PREFIX: &str = "aoe: ";
 
-/// Renders migration events into stderr writes. Notices always print. The
-/// migration's name and steps print once it has run for `QUIET_FOR` (or once
-/// a notice makes the context necessary). On a TTY the status line is redrawn
-/// in place and clamped to the terminal width; on a pipe each new step prints
-/// as its own line and per-file progress is dropped.
 struct StderrRenderer {
     console: ConsoleProgress,
     started: Option<Instant>,
@@ -44,8 +31,6 @@ impl StderrRenderer {
         }
     }
 
-    /// The bytes to write for `event`, observed at `now` on a `width`-column
-    /// terminal.
     fn render(&mut self, event: Event, now: Instant, width: usize) -> String {
         match &event {
             Event::Started { .. } => {
@@ -85,10 +70,6 @@ impl StderrRenderer {
                     width.max(FALLBACK_WIDTH.min(width)),
                 ));
             } else if !notice && (discrete || newly_shown) {
-                // A pipe gets each new step once; the first line after the
-                // quiet period also goes out even when a progress tick is
-                // what crossed it, so a slow copy is never silent. A notice
-                // stands alone; the status follows with the next step.
                 out.push_str(PREFIX);
                 out.push_str(&status);
                 out.push('\n');
@@ -175,7 +156,6 @@ mod tests {
         let t0 = Instant::now();
         r.render(started(), t0, 80);
         r.render(Event::Step("copying agent store 1/2".into()), t0, 80);
-        // Still inside the quiet period: nothing.
         assert_eq!(
             r.render(
                 Event::Progress("100 files, 5 MB".into()),
@@ -184,7 +164,6 @@ mod tests {
             ),
             ""
         );
-        // The tick that crosses the quiet period prints the status once.
         let out = r.render(
             Event::Progress("200 files, 11 MB".into()),
             t0 + QUIET_FOR,
@@ -194,7 +173,6 @@ mod tests {
             "aoe: Data migration v27 (isolate_sandbox_stores): copying agent store 1/2, 200 files"
         ));
         assert!(out.ends_with('\n'));
-        // Later ticks stay quiet on a pipe; a new step prints.
         assert_eq!(
             r.render(
                 Event::Progress("300 files, 17 MB".into()),
@@ -224,7 +202,6 @@ mod tests {
             80,
         );
         assert_eq!(out, "aoe: AOE_DEFER_SANDBOX_MIGRATION is set\n");
-        // Context is now shown: the next step prints as a line.
         let out = r.render(
             Event::Step("checking which sandbox containers are running".into()),
             t0,
@@ -244,7 +221,6 @@ mod tests {
         let status = out.trim_start_matches("\r\x1b[2K");
         assert_eq!(status.chars().count(), 40, "{status:?}");
         assert!(!status.contains('\n'));
-        // A finished migration leaves its summary line and clears the status.
         let out = r.render(
             Event::Finished {
                 version: 27,

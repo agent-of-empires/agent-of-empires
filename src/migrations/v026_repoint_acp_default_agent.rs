@@ -1,24 +1,16 @@
-//! Migration v026: repoint a persisted `acp.default_agent = "aoe-agent"`.
+//! Migration v026: repoint a persisted `acp.default_agent = "aoe-agent"` to
+//! the current default.
 //!
-//! `aoe-agent` is not packaged: nothing builds the registry's
-//! `${aoe_data_dir}/acp-worker/dist/aoe-agent` command (#3553). It was
-//! nonetheless the compiled default, v005 seeded it into `[cockpit]` (renamed
-//! to `[acp]` by v012), and `update_config` re-serializes the whole `Config` on
-//! every write, so nearly every existing install carries an explicit
-//! `default_agent = "aoe-agent"` in its `config.toml`. Now that the setting
-//! actually selects the spawned agent, that persisted value would outrank the
-//! new `claude-code` default forever and pick an agent that cannot start.
-//!
-//! Only the seeded value is rewritten; any other name is a real choice.
-//!
-//! Profile configs are deliberately untouched. They are sparse, holding only
-//! the keys a user actually overrode, so an `aoe-agent` there is a decision.
-//! Repo configs cannot carry `[acp]` at all (see `repo_config`).
+//! Nothing packages or builds the `aoe-agent` command (#3553), but it was the
+//! compiled default and `update_config` re-serializes every key, so nearly
+//! every install carries it explicitly and would keep selecting an agent that
+//! cannot start. Any other name is a real choice, and profile configs are
+//! sparse so they stay untouched.
 
+use super::config_file;
 use anyhow::Result;
-use std::fs;
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::info;
 
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
@@ -28,45 +20,29 @@ pub fn run() -> Result<()> {
 /// Inner body so the test can drive the migration end-to-end against a temp
 /// file instead of inlining a near-copy of the production logic.
 pub(crate) fn run_in(path: &Path) -> Result<()> {
-    if !path.exists() {
-        debug!("No global config.toml, nothing to repoint for v026");
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(path)?;
-    // A config that does not parse is skipped rather than aborting startup:
-    // this migration is a default correction, not a load-bearing relocation.
-    let mut doc: toml::Table = match content.parse() {
-        Ok(table) => table,
-        Err(e) => {
-            debug!("failed to parse {}: {e}, skipping", path.display());
-            return Ok(());
+    config_file::rewrite(path, |doc| {
+        let Some(acp) = doc.get_mut("acp").and_then(|s| s.as_table_mut()) else {
+            return false;
+        };
+        if acp.get("default_agent").and_then(|v| v.as_str()) != Some("aoe-agent") {
+            return false;
         }
-    };
-
-    let Some(acp) = doc.get_mut("acp").and_then(|s| s.as_table_mut()) else {
-        return Ok(());
-    };
-    if acp.get("default_agent").and_then(|v| v.as_str()) != Some("aoe-agent") {
-        return Ok(());
-    }
-    acp.insert(
-        "default_agent".into(),
-        crate::session::config::DEFAULT_ACP_AGENT.into(),
-    );
-
-    info!(
-        "v026: repointed acp.default_agent away from the unpackaged aoe-agent in {}",
-        path.display()
-    );
-    let new_content = toml::to_string_pretty(&doc)?;
-    crate::session::atomic_write(path, new_content.as_bytes())?;
-    Ok(())
+        acp.insert(
+            "default_agent".into(),
+            crate::session::config::DEFAULT_ACP_AGENT.into(),
+        );
+        info!(
+            "v026: repointed acp.default_agent away from the unpackaged aoe-agent in {}",
+            path.display()
+        );
+        true
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn write(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::TempDir::new().unwrap();

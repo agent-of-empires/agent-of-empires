@@ -30,11 +30,9 @@ pub struct SessionSandbox {
 }
 
 impl SessionSandbox {
-    /// Build a `SessionSandbox` + `SandboxPathMap` from a `SandboxInfo`
-    /// and the session's host-side project_path. Path-map entries
-    /// cover only the workspace volume(s) the container was built
-    /// with; see `docs/acp.md` for the known-limitations note on
-    /// agent-config and `extra_volumes`.
+    /// Path-map entries cover only the workspace volume(s) the container was
+    /// built with; see `docs/acp.md` for the agent-config and `extra_volumes`
+    /// limitations.
     pub fn from_info(
         sandbox: &SandboxInfo,
         project_path: &Path,
@@ -47,16 +45,10 @@ impl SessionSandbox {
                 &project_path_str,
             )
             .map_err(|e| AcpError::Spawn(format!("compute container workdir: {e}")))?;
-        // The workdir must be what the container was actually created with, not
-        // a live recompute. `compute_volume_paths` resolves the worktree's git
-        // linkage and silently collapses to `/workspace/<basename>` once that
-        // linkage breaks on the host (and it ignores multi-repo `workspace_info`),
-        // which would `docker exec -w` into a path the container never mounted
-        // (#2414). Prefer the create-time-pinned value, then the live container's
-        // own `WorkingDir`, and only fall back to the recompute when neither is
-        // available (no container created yet). The mount map stays the computed
-        // project volumes; making it workspace-complete needs `workspace_info`,
-        // which the reattach path does not carry (tracked separately).
+        // Must be what the container was created with. `compute_volume_paths`
+        // collapses to `/workspace/<basename>` once the worktree's git linkage
+        // breaks, naming a path the container never mounted (#2414), so prefer
+        // the create-time pin, then the live container, then the recompute.
         let workdir = sandbox
             .container_workdir
             .clone()
@@ -81,15 +73,10 @@ impl SessionSandbox {
         ))
     }
 
-    /// Re-resolve env entries for this session's sandbox. Called on every
-    /// `terminal/create` so rotated host values (e.g. refreshed tokens)
-    /// reach the agent's shell commands without requiring a container
-    /// recreate.
-    ///
-    /// A missing `source_profile` only happens for legacy `WorkerRecord`
-    /// entries written before the field was persisted. Warns once per
-    /// call rather than failing, since refusing resolution would break
-    /// `terminal/create` for sessions that are otherwise healthy.
+    /// Re-resolved on every `terminal/create` so rotated host values reach the
+    /// agent's shell commands without a container recreate. A missing
+    /// `source_profile` (legacy `WorkerRecord`) warns rather than failing, which
+    /// would break `terminal/create` for an otherwise healthy session.
     pub fn current_env_entries(&self) -> Vec<crate::containers::container_interface::EnvEntry> {
         let profile = match self.source_profile.as_deref() {
             Some(p) => p,
@@ -109,25 +96,18 @@ impl SessionSandbox {
     }
 }
 
-/// `docker exec` arguments for a sandboxed structured view spawn.
-/// `docker_binary` is `argv[0]` (docker/podman); `docker_args` contains the
-/// remaining arguments. Export `inherit_env` so the `-e KEY` flags in
-/// `docker_args` forward those values into the container.
+/// `docker_binary` is `argv[0]` (docker/podman). Export `inherit_env` so the
+/// `-e KEY` flags in `docker_args` forward those values into the container.
 pub(super) struct SandboxArgv {
     pub(super) docker_binary: String,
     pub(super) docker_args: Vec<String>,
     pub(super) inherit_env: Vec<(String, String)>,
 }
 
-/// Build the `docker exec` argv for a sandboxed structured view spawn. The
-/// resulting command is what the runner executes; docker proxies the
-/// agent's stdio across the container boundary. Mirrors the tmux
-/// view's env handling so the same `sandbox.environment` and
-/// `extra_env` entries take effect.
-///
-/// `container_workdir` is the in-container working directory for the
-/// session, pre-computed by `SessionSandbox::from_info` and passed
-/// through to avoid re-running `compute_volume_paths`.
+/// Docker proxies the agent's stdio across the container boundary. Mirrors the
+/// tmux view's env handling so the same `sandbox.environment` and `extra_env`
+/// entries take effect. `container_workdir` comes pre-computed from
+/// `SessionSandbox::from_info`.
 pub(super) fn build_sandbox_docker_argv(
     config: &SpawnConfig,
     sandbox: &SandboxInfo,
@@ -144,9 +124,8 @@ pub(super) fn build_sandbox_docker_argv(
         crate::session::environment::resolved_sandbox_config(profile_for_env, project_path);
     let mut env_entries =
         crate::session::environment::collect_environment(&sandbox_config, sandbox);
-    // The session artifact dir is bind-mounted at the fixed container path by
-    // build_container_config; export it so the agent writes viewable artifacts
-    // there. See #2587.
+    // Bind-mounted at the fixed container path by build_container_config;
+    // export it so the agent writes viewable artifacts there (#2587).
     env_entries.push(crate::containers::EnvEntry::Literal {
         key: crate::session::artifacts::ARTIFACT_DIR_ENV.to_string(),
         value: crate::session::artifacts::CONTAINER_ARTIFACT_DIR.to_string(),
@@ -158,59 +137,34 @@ pub(super) fn build_sandbox_docker_argv(
         "-w".into(),
         container_workdir.to_string(),
     ];
-    // `collect_environment` already dedupes by key, so the entry list is
-    // unique. We still track `seen_keys` so the explicit auth sources below
-    // cannot override sandbox configuration.
+    // First claim wins, so the sandbox config below outranks both auth sources.
     let mut seen_keys: std::collections::HashSet<String> =
         env_entries.iter().map(|e| e.key().to_string()).collect();
     let (env_argv, inherit_pairs) = docker_env_args(&env_entries);
     docker_args.extend(env_argv);
     let mut inherit_env: Vec<(String, String)> = inherit_pairs;
 
-    // Auth sources are claimed highest-priority first, because `seen_keys` is
-    // first-claim-wins. The order mirrors the non-sandboxed paths, where the
-    // per-request `provider_env` is applied last and so wins a shared key over
-    // the ambient host keys: request auth (`provider_env`) > per-adapter
-    // allowlist. The sandbox env list (`collect_environment` above) is claimed
-    // before both, matching the operator-config precedence on the host paths.
-
-    // Per-spawn provider_env entries (the request's auth payload).
-    for (key, value) in &config.provider_env {
-        if provider_env_denyreason(key).is_some() {
-            continue;
-        }
-        if seen_keys.insert(key.clone()) {
-            docker_args.push("-e".into());
-            docker_args.push(key.clone());
-            inherit_env.push((key.clone(), value.clone()));
-        }
-    }
-
-    // Per-adapter env allowlist (#3238). The same keys `apply_env_filter`
-    // forwards on the non-sandboxed paths must also cross the container
-    // boundary, or a sandboxed non-Claude session silently loses its
-    // provider auth (the #3238 symptom). docker only forwards a name handed
-    // to it via `-e`, so each allowlisted host value is set on the runner
-    // (`inherit_env`) and named with `-e KEY`.
-    //
-    // Value-typed entries only: a host path names nothing inside the container,
-    // so forwarding it points the adapter at a directory that does not exist
-    // instead of the one `AGENT_CONFIG_MOUNTS` bind-mounts at the canonical
-    // container path. These keys stay host-only and keep flowing on the two
-    // non-sandboxed spawn paths, where they are the point.
-    for (key, value) in allowlisted_env_pairs(config) {
-        if is_host_only_path_env(&key) {
-            continue;
-        }
+    // The request's auth payload (`provider_env`) is claimed ahead of the
+    // per-adapter allowlist (#3238), mirroring the non-sandboxed paths where
+    // `provider_env` is applied last and so wins a shared key. Denied keys and
+    // host-only paths (which name nothing inside the container) never cross.
+    // docker forwards only a name handed to it via `-e`, so the value is set on
+    // the runner via `inherit_env` and the key alone goes in the argv.
+    let request_auth = config
+        .provider_env
+        .iter()
+        .filter(|&(key, _)| provider_env_denyreason(key).is_none())
+        .cloned();
+    let adapter_allowlist = allowlisted_env_pairs(config)
+        .into_iter()
+        .filter(|(key, _)| !is_host_only_path_env(key));
+    for (key, value) in request_auth.chain(adapter_allowlist) {
         if seen_keys.insert(key.clone()) {
             docker_args.push("-e".into());
             docker_args.push(key.clone());
             inherit_env.push((key, value));
         }
     }
-
-    // Model override (AOE_AGENT_MODEL): the supervisor folds the
-    // requested model into provider_env above, so it's already covered.
 
     docker_args.push(sandbox.container_name.clone());
     docker_args.push(config.spec.command.clone());
@@ -225,14 +179,10 @@ pub(super) fn build_sandbox_docker_argv(
     })
 }
 
-/// The `cwd` to send on `session/new` / `session/load` / `session/fork`.
-///
-/// A sandboxed agent runs inside the container (via `docker exec`), so it
-/// must be given the container workdir, not the host project path; the host
-/// path does not exist in the container and the agent rejects it with
-/// "'cwd' does not exist on the machine running the agent" (#2871). The
-/// container workdir is the create-time-pinned value resolved by
-/// `SessionSandbox::from_info`. Non-sandbox sessions keep the host `cwd`.
+/// The `cwd` for `session/new` / `session/load` / `session/fork`. A sandboxed
+/// agent runs in the container, where the host project path does not exist and
+/// is rejected as "'cwd' does not exist on the machine running the agent"
+/// (#2871). Non-sandbox sessions keep the host `cwd`.
 pub(super) fn agent_request_cwd(
     container_workdir: Option<&std::path::Path>,
     host_cwd: &std::path::Path,
@@ -244,13 +194,29 @@ pub(super) fn agent_request_cwd(
 mod tests {
     use super::*;
     use crate::acp::acp_client::test_helpers::env_test_spawn_config;
-    use crate::acp::agent_registry::AgentSpec;
 
-    /// Regression for issue #2414 on the structured-view path: `from_info`
-    /// must use the create-time-pinned `SandboxInfo::container_workdir`, not a
-    /// live recompute. With the worktree's git linkage broken,
-    /// `compute_volume_paths` collapses to `/workspace/<basename>` (a path the
-    /// container never mounted), so the pin has to win.
+    fn sandbox(container_name: &str, container_workdir: Option<&str>) -> SandboxInfo {
+        SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: container_name.into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: container_workdir.map(str::to_string),
+        }
+    }
+
+    /// Sandboxed spawn config for `container`, wrapping the default host one.
+    fn sandbox_config(cwd: &std::path::Path, info: &SandboxInfo) -> SpawnConfig {
+        let mut config = env_test_spawn_config(cwd.to_path_buf());
+        config.sandbox_info = Some(info.clone());
+        config
+    }
+
+    /// #2414: the create-time pin must beat a live recompute, which collapses
+    /// to `/workspace/<basename>` once the worktree's git linkage breaks.
     #[test]
     fn from_info_prefers_pinned_workdir_over_live_recompute() {
         let tmp = tempfile::tempdir().unwrap();
@@ -262,27 +228,18 @@ mod tests {
             "gitdir: ../../does-not-exist/.git/worktrees/feature\n",
         )
         .unwrap();
+        let info = sandbox(
+            "aoe-sandbox-pinned1",
+            Some("/workspace/repo-worktrees/feature"),
+        );
 
-        let sandbox = SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "alpine:latest".into(),
-            container_name: "aoe-sandbox-pinned1".into(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: Some("/workspace/repo-worktrees/feature".into()),
-        };
-
-        // Pin present, so no live inspect is attempted; the pinned value is used.
-        let (resources, _map) = SessionSandbox::from_info(&sandbox, &worktree, None).unwrap();
+        let (resources, _map) = SessionSandbox::from_info(&info, &worktree, None).unwrap();
         assert_eq!(
             resources.container_workdir,
             PathBuf::from("/workspace/repo-worktrees/feature"),
         );
 
-        // The pin is load-bearing: the live recompute on this orphaned worktree
-        // collapses to the basename, which is the path that never got mounted.
+        // The pin is load-bearing: the recompute names a path never mounted.
         let (_volumes, computed) = crate::session::config::container_config::compute_volume_paths(
             &worktree,
             &worktree.to_string_lossy(),
@@ -292,268 +249,111 @@ mod tests {
     }
 
     /// #2871: a sandboxed agent runs in-container, so session/new|load|fork
-    /// must carry the container workdir, not the host path (which does not
-    /// exist inside the container, worktree `..` or not). Non-sandbox
-    /// sessions keep the host cwd.
+    /// must carry the container workdir, not the host path.
     #[test]
     fn agent_request_cwd_prefers_container_workdir_when_sandboxed() {
-        let host = PathBuf::from(
-            "/Users/nbrake/scm/agent-of-empires/../agent-of-empires-worktrees/bohemians",
-        );
+        let host = PathBuf::from("/scm/aoe/../aoe-worktrees/bohemians");
         let container = PathBuf::from("/workspace/bohemians");
-
         assert_eq!(
             agent_request_cwd(Some(container.as_path()), &host),
-            container,
-            "sandboxed request must use the container workdir"
+            container
         );
-        assert_eq!(
-            agent_request_cwd(None, &host),
-            host,
-            "non-sandbox request must use the host cwd unchanged"
-        );
+        assert_eq!(agent_request_cwd(None, &host), host);
     }
 
-    /// Sandboxed structured view spawn must wrap the agent command in
-    /// `docker exec` argv with `-i`, the container workdir, an `-e`
-    /// flag per env entry, then the container name, then the agent
-    /// argv. The docker binary must be `argv[0]`. Mirrors the tmux
-    /// view's wrap so the same `claude-agent-acp` invocation
-    /// goes inside the container instead of running on the host.
+    /// The agent command is wrapped as `docker exec -i -w <workdir> ... <container>
+    /// <argv>`, with literal env entries inlined as `-e KEY=VALUE` and never
+    /// duplicated into `inherit_env` (which is for parent-process values).
     #[test]
     fn build_sandbox_docker_argv_wraps_agent_in_docker_exec() {
         let tmp = tempfile::tempdir().unwrap();
-        let cwd = tmp.path().to_path_buf();
-        let sandbox = SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "alpine:latest".into(),
-            container_name: "aoe-sandbox-abc12345".into(),
-            extra_env: Some(vec!["MY_LITERAL=hello".into()]),
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        };
-        let config = SpawnConfig {
-            wrapper_substitution: None,
-            agent_key: "claude".into(),
-            tool: "claude".into(),
-            spec: AgentSpec {
-                command: "claude-agent-acp".into(),
-                args: vec!["--stdio".into()],
-                description: "test".into(),
-                env_allowlist: None,
-            },
-            cwd,
-            additional_dirs: vec![],
-            provider_env: vec![],
-            host_environment: vec![],
-            default_effort: None,
-            default_effort_explicit: false,
-            default_mode: None,
-            socket_path: None,
-            stored_acp_session_id: None,
-            fork_from: None,
-            seed_history_replay: false,
-            generation: 0,
-            artifact_dir: None,
-            sandbox_info: Some(sandbox.clone()),
-            source_profile: None,
-            mcp_servers: Vec::new(),
-        };
-        let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
-            .expect("docker argv built");
+        let mut info = sandbox("aoe-sandbox-abc12345", None);
+        info.extra_env = Some(vec!["MY_LITERAL=hello".into()]);
+        let mut config = sandbox_config(tmp.path(), &info);
+        config.spec.args = vec!["--stdio".into()];
+
+        let argv = build_sandbox_docker_argv(&config, &info, "/workspace/proj").unwrap();
+
         assert!(
             argv.docker_binary == "docker" || argv.docker_binary == "podman",
-            "expected docker/podman binary, got {:?}",
+            "{:?}",
             argv.docker_binary
         );
-        assert_eq!(argv.docker_args[0], "exec");
-        assert_eq!(argv.docker_args[1], "-i");
-        assert_eq!(argv.docker_args[2], "-w");
-        let cn_idx = argv
+        assert_eq!(argv.docker_args[..3], ["exec", "-i", "-w"]);
+        let container = argv
             .docker_args
             .iter()
             .position(|a| a == "aoe-sandbox-abc12345")
             .expect("container name in argv");
-        let cmd_idx = cn_idx + 1;
-        assert_eq!(argv.docker_args[cmd_idx], "claude-agent-acp");
-        assert_eq!(argv.docker_args[cmd_idx + 1], "--stdio");
-        // Literal env entry lands as `-e KEY=VALUE`.
-        assert!(
-            argv.docker_args.iter().any(|a| a == "MY_LITERAL=hello"),
-            "literal env entry must be propagated as `-e KEY=VALUE`"
+        assert_eq!(
+            argv.docker_args[container + 1..],
+            ["claude-agent-acp", "--stdio"]
         );
-        // The literal entry's KEY=VALUE form must NOT also appear in
-        // `inherit_env` (that vec is for Inherit-style entries whose
-        // value comes from the parent process env, not for literals).
-        assert!(
-            !argv.inherit_env.iter().any(|(k, _)| k == "MY_LITERAL"),
-            "literal entries must not duplicate into inherit_env"
-        );
+        assert!(argv.docker_args.iter().any(|a| a == "MY_LITERAL=hello"));
+        assert!(!argv.inherit_env.iter().any(|(k, _)| k == "MY_LITERAL"));
     }
 
-    /// Inherit-style env entries (provider auth keys) must lower into a
-    /// pair of `-e KEY` (key only) in docker_args plus a `(KEY, VALUE)`
-    /// pair in inherit_env so the runner can re-export the value and
-    /// docker can forward it into the container.
+    /// A credential must reach the container as `-e KEY` plus an `inherit_env`
+    /// pair, never as `-e KEY=VALUE`, which would leak the secret into argv.
     #[test]
     fn build_sandbox_docker_argv_inherit_env_shape() {
         let tmp = tempfile::tempdir().unwrap();
-        let cwd = tmp.path().to_path_buf();
-        let sandbox = SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "alpine:latest".into(),
-            container_name: "aoe-sandbox-abc12345".into(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        };
-        let config = SpawnConfig {
-            wrapper_substitution: None,
-            agent_key: "claude".into(),
-            tool: "claude".into(),
-            spec: AgentSpec {
-                command: "claude-agent-acp".into(),
-                args: vec![],
-                description: "test".into(),
-                env_allowlist: None,
-            },
-            cwd,
-            additional_dirs: vec![],
-            // Per-spawn provider_env entry: must end up Inherit-style.
-            provider_env: vec![("ANTHROPIC_API_KEY".into(), "sk-test-value".into())],
-            host_environment: vec![],
-            default_effort: None,
-            default_effort_explicit: false,
-            default_mode: None,
-            socket_path: None,
-            stored_acp_session_id: None,
-            fork_from: None,
-            seed_history_replay: false,
-            generation: 0,
-            artifact_dir: None,
-            sandbox_info: Some(sandbox.clone()),
-            source_profile: None,
-            mcp_servers: Vec::new(),
-        };
-        let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
-            .expect("docker argv built");
-        // The `-e KEY` flag (without value) must appear consecutively.
-        let key_flag_idx = argv
-            .docker_args
-            .windows(2)
-            .position(|w| w[0] == "-e" && w[1] == "ANTHROPIC_API_KEY")
-            .expect("ANTHROPIC_API_KEY -e flag must be present");
-        // Value-typed forms like `-e ANTHROPIC_API_KEY=...` must NOT
-        // appear; that would leak the secret into argv.
+        let info = sandbox("aoe-sandbox-abc12345", None);
+        let mut config = sandbox_config(tmp.path(), &info);
+        config.provider_env = vec![("ANTHROPIC_API_KEY".into(), "sk-test-value".into())];
+
+        let argv = build_sandbox_docker_argv(&config, &info, "/workspace/proj").unwrap();
+
+        assert_named_without_value(&argv, "ANTHROPIC_API_KEY", "sk-test-value");
+    }
+
+    /// `-e KEY` names the credential, the value rides `inherit_env`, and the
+    /// secret never appears in argv.
+    fn assert_named_without_value(argv: &SandboxArgv, key: &str, value: &str) {
+        assert!(
+            argv.docker_args
+                .windows(2)
+                .any(|w| w[0] == "-e" && w[1] == key),
+            "{key} must be named with `-e KEY`, got {:?}",
+            argv.docker_args
+        );
         assert!(
             !argv
                 .docker_args
                 .iter()
-                .any(|a| a.starts_with("ANTHROPIC_API_KEY=")),
-            "secret must not appear as `KEY=VALUE` in argv (slot {key_flag_idx})"
+                .any(|a| a.starts_with(&format!("{key}="))),
+            "{key} must not appear as `KEY=VALUE` in argv"
         );
-        // The value must travel via inherit_env so the parent process
-        // sets it before exec-ing docker.
         assert_eq!(
             argv.inherit_env
                 .iter()
-                .find(|(k, _)| k == "ANTHROPIC_API_KEY")
+                .find(|(k, _)| k == key)
                 .map(|(_, v)| v.as_str()),
-            Some("sk-test-value"),
+            Some(value),
         );
     }
 
-    /// A host filesystem path is not a credential, so it must NOT be
-    /// auto-forwarded into the container even when set on the host and even
-    /// when the adapter's `env_allowlist` names it (#3238). The path resolves
-    /// to nothing inside the container, so forwarding it points the adapter
-    /// away from the config dir `AGENT_CONFIG_MOUNTS` bind-mounts at the
-    /// canonical container location.
-    ///
-    /// Tagged `#[serial]` because the test mutates the process-wide
-    /// env; parallel readers of `std::env::var` would race.
+    fn assert_absent(argv: &SandboxArgv, key: &str) {
+        assert!(
+            !argv.docker_args.iter().any(|a| a == key)
+                && !argv
+                    .docker_args
+                    .iter()
+                    .any(|a| a.starts_with(&format!("{key}=")))
+                && !argv.inherit_env.iter().any(|(k, _)| k == key),
+            "{key} must not cross the container boundary, got {:?}",
+            argv.docker_args
+        );
+    }
+
+    /// #3238: the per-adapter `env_allowlist` must cross the boundary, but a
+    /// host filesystem path resolves to nothing inside the container and a
+    /// denied linker hook must be dropped even when allowlisted. `serial`
+    /// because the cases set process-wide env.
     #[test]
     #[serial_test::serial]
-    fn build_sandbox_docker_argv_drops_host_only_path_env() {
-        // Set the vars to simulate the host having them; the function under
-        // test must still skip every one. `OPENAI_API_KEY` rides along as the
-        // control: a value-typed allowlist entry alongside them must still
-        // cross, or the assertion below would pass on a function that forwards
-        // nothing at all.
-        let _env = crate::session::test_support::EnvGuard::set(&[
-            ("CLAUDE_CONFIG_DIR", "/Users/operator/.claude"),
-            ("CODEX_HOME", "/Users/operator/.codex"),
-            (
-                "GOOGLE_APPLICATION_CREDENTIALS",
-                "/Users/operator/gcp-key.json",
-            ),
-            ("AWS_CONFIG_FILE", "/Users/operator/.aws/config"),
-            (
-                "AWS_SHARED_CREDENTIALS_FILE",
-                "/Users/operator/.aws/credentials",
-            ),
-            ("AWS_WEB_IDENTITY_TOKEN_FILE", "/Users/operator/.aws/token"),
-            (
-                "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
-                "/Users/operator/.aws/container-token",
-            ),
-            ("OPENAI_API_KEY", "sk-test-value"),
-        ]);
-        let tmp = tempfile::tempdir().unwrap();
-        let sandbox = SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "alpine:latest".into(),
-            container_name: "aoe-sandbox-cfgdir".into(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        };
-        let config = SpawnConfig {
-            wrapper_substitution: None,
-            agent_key: "codex".into(),
-            tool: "codex".into(),
-            spec: AgentSpec {
-                command: "codex-acp".into(),
-                args: vec![],
-                description: "test".into(),
-                env_allowlist: Some(vec![
-                    "CLAUDE_CONFIG_DIR".into(),
-                    "CODEX_HOME".into(),
-                    "GOOGLE_APPLICATION_CREDENTIALS".into(),
-                    "AWS_CONFIG_FILE".into(),
-                    "AWS_SHARED_CREDENTIALS_FILE".into(),
-                    "AWS_WEB_IDENTITY_TOKEN_FILE".into(),
-                    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE".into(),
-                    "OPENAI_API_KEY".into(),
-                ]),
-            },
-            cwd: tmp.path().to_path_buf(),
-            additional_dirs: vec![],
-            provider_env: vec![],
-            host_environment: vec![],
-            default_effort: None,
-            default_effort_explicit: false,
-            default_mode: None,
-            socket_path: None,
-            stored_acp_session_id: None,
-            fork_from: None,
-            seed_history_replay: false,
-            generation: 0,
-            artifact_dir: None,
-            sandbox_info: Some(sandbox.clone()),
-            source_profile: None,
-            mcp_servers: Vec::new(),
-        };
-        let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
-            .expect("docker argv built");
-
-        for key in [
+    fn build_sandbox_docker_argv_applies_env_allowlist() {
+        const HOST_ONLY: [&str; 7] = [
             "CLAUDE_CONFIG_DIR",
             "CODEX_HOME",
             "GOOGLE_APPLICATION_CREDENTIALS",
@@ -561,112 +361,39 @@ mod tests {
             "AWS_SHARED_CREDENTIALS_FILE",
             "AWS_WEB_IDENTITY_TOKEN_FILE",
             "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
-        ] {
-            assert!(
-                !argv.docker_args.iter().any(|a| a == key),
-                "{key} is a host path and must not be forwarded as `-e KEY`"
-            );
-            assert!(
-                !argv
-                    .docker_args
-                    .iter()
-                    .any(|a| a.starts_with(&format!("{key}="))),
-                "{key} must not appear as a literal `KEY=VALUE` either"
-            );
-            assert!(
-                !argv.inherit_env.iter().any(|(k, _)| k == key),
-                "{key} must not land in inherit_env"
-            );
-        }
-        assert_eq!(
-            argv.inherit_env
-                .iter()
-                .find(|(k, _)| k == "OPENAI_API_KEY")
-                .map(|(_, v)| v.as_str()),
-            Some("sk-test-value"),
-            "the value-typed allowlist entry must still cross the boundary"
-        );
-    }
-
-    /// #3238 regression guard: the per-adapter `env_allowlist` must cross the
-    /// container boundary for a sandboxed session. Before the fix,
-    /// `build_sandbox_docker_argv` forwarded only a fixed Claude-key block plus
-    /// `provider_env`, so an operator's `OPENAI_API_KEY` never reached a
-    /// sandboxed `codex`/`aoe-agent` session and auth silently failed. The
-    /// value must ride `inherit_env` (not `-e KEY=VALUE`, which would leak the
-    /// secret into argv), and a denied key (`LD_PRELOAD`) must still be
-    /// dropped even when allowlisted.
-    #[test]
-    #[serial_test::serial]
-    fn build_sandbox_docker_argv_forwards_env_allowlist() {
-        let _env = crate::session::test_support::EnvGuard::set(&[
+        ];
+        let mut env: Vec<(&str, &str)> = HOST_ONLY.iter().map(|k| (*k, "/host/path")).collect();
+        env.extend([
             ("OPENAI_API_KEY", "sk-openai"),
             ("ANTHROPIC_API_KEY", "sk-unrelated-anthropic"),
             ("LD_PRELOAD", "/tmp/evil.so"),
         ]);
+        let _env = crate::session::test_support::EnvGuard::set(&env);
+
         let tmp = tempfile::tempdir().unwrap();
-        let sandbox = SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "alpine:latest".into(),
-            container_name: "aoe-sandbox-allowlist".into(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        };
-        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        let info = sandbox("aoe-sandbox-allowlist", None);
+        let mut config = sandbox_config(tmp.path(), &info);
         config.spec.command = "codex-acp".into();
-        config.spec.env_allowlist = Some(vec!["OPENAI_API_KEY".into(), "LD_PRELOAD".into()]);
-        config.sandbox_info = Some(sandbox.clone());
+        let mut allowlist: Vec<String> = HOST_ONLY.iter().map(|k| (*k).to_string()).collect();
+        allowlist.extend(["OPENAI_API_KEY".into(), "LD_PRELOAD".into()]);
+        config.spec.env_allowlist = Some(allowlist);
 
-        let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
-            .expect("docker argv built");
+        let argv = build_sandbox_docker_argv(&config, &info, "/workspace/proj").unwrap();
 
-        assert!(
-            argv.docker_args
-                .windows(2)
-                .any(|w| w[0] == "-e" && w[1] == "OPENAI_API_KEY"),
-            "allowlisted OPENAI_API_KEY must be named with `-e KEY`, got {:?}",
-            argv.docker_args
-        );
-        assert_eq!(
-            argv.inherit_env
-                .iter()
-                .find(|(k, _)| k == "OPENAI_API_KEY")
-                .map(|(_, v)| v.as_str()),
-            Some("sk-openai"),
-            "the value must ride inherit_env so it stays out of argv"
-        );
-        assert!(
-            !argv
-                .docker_args
-                .iter()
-                .any(|a| a.starts_with("OPENAI_API_KEY=")),
-            "secret must not appear as `KEY=VALUE` in argv"
-        );
-        assert!(
-            !argv.docker_args.iter().any(|a| a == "LD_PRELOAD")
-                && !argv.inherit_env.iter().any(|(k, _)| k == "LD_PRELOAD"),
-            "a denied linker hook must not cross the boundary even when allowlisted, got {:?}",
-            argv.docker_args
-        );
-        assert!(
-            !argv.docker_args.iter().any(|a| a == "ANTHROPIC_API_KEY")
-                && !argv
-                    .inherit_env
-                    .iter()
-                    .any(|(k, _)| k == "ANTHROPIC_API_KEY"),
-            "a credential outside this adapter's allowlist must not cross the boundary"
-        );
+        // The value-typed allowlist entry crosses, so the assertions below
+        // cannot pass on a function that forwards nothing at all.
+        assert_named_without_value(&argv, "OPENAI_API_KEY", "sk-openai");
+        for key in HOST_ONLY {
+            assert_absent(&argv, key);
+        }
+        assert_absent(&argv, "LD_PRELOAD");
+        assert_absent(&argv, "ANTHROPIC_API_KEY");
     }
 
-    /// The per-session `provider_env` auth payload must win a shared key over
-    /// the adapter's ambient allowlist, matching the non-sandboxed paths (where
-    /// `provider_env` is applied last). Before the ordering fix the sandbox
-    /// claimed the host key first, so a session that selected a different
-    /// Anthropic credential silently ran under the operator's ambient one
-    /// inside the container.
+    /// The request's `provider_env` must win a shared key over the adapter's
+    /// ambient allowlist, matching the non-sandboxed paths. Before the ordering
+    /// fix a session that selected its own credential silently ran under the
+    /// operator's ambient one inside the container.
     #[test]
     #[serial_test::serial]
     fn build_sandbox_docker_argv_provider_env_beats_ambient_host_key() {
@@ -675,24 +402,13 @@ mod tests {
             "sk-host-ambient",
         )]);
         let tmp = tempfile::tempdir().unwrap();
-        let sandbox = SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "alpine:latest".into(),
-            container_name: "aoe-sandbox-precedence".into(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        };
-        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        let info = sandbox("aoe-sandbox-precedence", None);
+        let mut config = sandbox_config(tmp.path(), &info);
         let reg = crate::acp::agent_registry::AgentRegistry::with_defaults();
         config.spec = reg.get("claude").expect("claude default").clone();
         config.provider_env = vec![("ANTHROPIC_API_KEY".into(), "sk-session-request".into())];
-        config.sandbox_info = Some(sandbox.clone());
 
-        let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
-            .expect("docker argv built");
+        let argv = build_sandbox_docker_argv(&config, &info, "/workspace/proj").unwrap();
 
         let values: Vec<&str> = argv
             .inherit_env
@@ -703,8 +419,7 @@ mod tests {
         assert_eq!(
             values,
             vec!["sk-session-request"],
-            "the request credential must win and be forwarded exactly once, got {:?}",
-            argv.inherit_env
+            "the request credential must win and be forwarded exactly once"
         );
     }
 }

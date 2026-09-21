@@ -10,9 +10,7 @@ interface Props {
   onCancel: () => void;
 }
 
-/** Inline composer rendered beneath the last row of the selected range.
- *  Cmd/Ctrl+Enter saves; Esc cancels. Empty bodies are rejected (the
- *  Save button stays disabled). */
+/** Inline composer; Cmd/Ctrl+Enter saves, Esc cancels, empty bodies cannot be saved. */
 export function CommentForm({ startLine, endLine, side, initialBody = "", onSave, onCancel }: Props) {
   const [body, setBody] = useState(initialBody);
   const textareaRef = useRef<HTMLTextAreaElement>(null);

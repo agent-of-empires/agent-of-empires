@@ -1,11 +1,9 @@
 //! REST handlers for the unified MCP management surface (#1996).
 //!
 //! `GET /api/mcp/servers` resolves the effective MCP set for an agent and
-//! returns the redaction-safe view (provenance, shadow chain, kept-on-removal,
-//! conflicts) the dashboard renders. The mutating routes resolve a conflict
-//! (feature C) and keep / drop a server removed from a native config
-//! (feature D). All values are redacted; AoE never writes an agent-native
-//! config. The project-local layer reflects the daemon's working directory.
+//! returns the redaction-safe view the dashboard renders. The mutating routes
+//! resolve a conflict and keep or drop a server removed from a native config.
+//! All values are redacted; AoE never writes an agent-native config.
 
 use std::sync::Arc;
 
@@ -17,6 +15,7 @@ use axum::{
 };
 use serde::Deserialize;
 
+use super::read_only_response;
 use super::AppState;
 use crate::session::config::profile_config;
 use crate::session::mcp::mcp_model;
@@ -126,7 +125,7 @@ pub async fn resolve_mcp_conflict(
 
     let profile = state.profile.clone();
     let result = tokio::task::spawn_blocking(move || {
-        // Re-resolve the current conflicts and find the one for `name`. The
+        // Re-resolve the current conflicts and find the one for `name`; the
         // fingerprint guard in resolve_conflict rejects a stale resolution.
         let profile_opt = (!profile.is_empty()).then_some(profile.as_str());
         let session_env = mcp_model::session_env_for_discovery(profile_opt);
@@ -165,8 +164,8 @@ pub struct AgentBody {
     agent: String,
 }
 
-/// `POST /api/mcp/servers/{name}/keep`: keep a removed server (feature D),
-/// promoting it into the global `mcp.json`.
+/// `POST /api/mcp/servers/{name}/keep`: keep a removed server, promoting it
+/// into the global `mcp.json`.
 pub async fn keep_mcp_server(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -218,14 +217,6 @@ pub async fn drop_mcp_server(
         Ok(Ok(())) => Json(serde_json::json!({"status": "dropped"})).into_response(),
         _ => internal_error(),
     }
-}
-
-fn read_only_response() -> axum::response::Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"})),
-    )
-        .into_response()
 }
 
 fn bad_body() -> axum::response::Response {

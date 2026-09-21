@@ -22,10 +22,6 @@ pub enum AuthMode {
 }
 
 impl AuthMode {
-    /// CLI string form, matching what `--auth=<MODE>` accepts. The
-    /// match arms are kept in lockstep with clap's `value(rename_all =
-    /// "lowercase")` derive by the `auth_mode_cli_str_matches_clap`
-    /// unit test, which round-trips each string through `ValueEnum`.
     pub(crate) fn as_cli_str(self) -> &'static str {
         match self {
             AuthMode::Token => "token",
@@ -190,17 +186,12 @@ pub struct ServeArgs {
 }
 
 impl ServeArgs {
-    /// Resolve the port: explicit `--port` wins; otherwise 8081 in debug
-    /// builds, 8080 in release. The `-dev` suffix on the app dir keeps
-    /// state isolated, but two daemons cannot share a port, so the default
-    /// shifts as well.
     pub fn resolved_port(&self) -> u16 {
         self.port
             .unwrap_or(if cfg!(debug_assertions) { 8081 } else { 8080 })
     }
 }
 
-/// Pure check used by both the CLI validator and its unit tests.
 fn host_is_localhost(host: &str) -> bool {
     host == "localhost"
         || host
@@ -208,10 +199,6 @@ fn host_is_localhost(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Resolve the effective `AuthMode` from the two CLI surfaces
-/// (`--auth=<mode>` and the legacy `--no-auth` alias). Clap's
-/// `conflicts_with` already rejects passing both, so the
-/// `(Some, true)` arm is unreachable in practice.
 fn resolve_auth_mode(auth: Option<AuthMode>, no_auth: bool) -> AuthMode {
     match (auth, no_auth) {
         (Some(mode), false) => mode,
@@ -221,9 +208,6 @@ fn resolve_auth_mode(auth: Option<AuthMode>, no_auth: bool) -> AuthMode {
     }
 }
 
-/// Reject mode + flag combinations that the daemon refuses to start
-/// with. Pure for unit testing; produces the same `anyhow::Error`
-/// shape as the inline guards used to.
 fn validate_auth_combination(
     auth_mode: AuthMode,
     has_passphrase: bool,
@@ -232,8 +216,6 @@ fn validate_auth_combination(
     remote: bool,
     host: &str,
 ) -> Result<()> {
-    // --auth=passphrase needs a passphrase: passphrase is the sole
-    // human gate, an empty wall means no auth at all.
     if matches!(auth_mode, AuthMode::Passphrase) && !has_passphrase {
         bail!(
             "--auth=passphrase requires --passphrase <VALUE> or AOE_SERVE_PASSPHRASE.\n\
@@ -241,15 +223,10 @@ fn validate_auth_combination(
         );
     }
 
-    // --auth=none silently discarding a provided passphrase is the
-    // legacy misleading behavior of `--no-auth --passphrase`; reject
-    // explicitly so the user picks the mode they actually want.
     if matches!(auth_mode, AuthMode::None) && has_passphrase {
         bail!("--auth=none does not honor --passphrase; use --auth=passphrase instead.");
     }
 
-    // Reduced-auth modes on a non-loopback bind require an upstream
-    // proxy that terminates TLS.
     if matches!(auth_mode, AuthMode::None | AuthMode::Passphrase) && !is_localhost && !behind_proxy
     {
         bail!(
@@ -262,10 +239,6 @@ fn validate_auth_combination(
         );
     }
 
-    // Block reduced-auth with --remote: --remote auto-spawns a public
-    // ingress and mandates token + passphrase. Collapsing the token
-    // away (or dropping auth entirely) on a publicly-reachable tunnel
-    // is never the intent.
     if matches!(auth_mode, AuthMode::None | AuthMode::Passphrase) && remote {
         bail!(
             "Refusing to start with --auth={} in remote mode.\n\
@@ -279,12 +252,6 @@ fn validate_auth_combination(
     Ok(())
 }
 
-/// A daemon behind an external reverse proxy (`--behind-proxy`, no `--remote`)
-/// answers to the operator's public hostname, which aoe cannot derive (there
-/// is no tunnel handle to read it from). Without at least one `--allowed-host`
-/// the DNS-rebinding gate would 403 every proxied request, so refuse to start
-/// with an explicit message instead of failing silently at runtime (#2735).
-/// `--remote` is exempt: it auto-injects the tunnel host.
 fn validate_behind_proxy_allowlist(
     behind_proxy: bool,
     remote: bool,
@@ -302,27 +269,14 @@ fn validate_behind_proxy_allowlist(
     Ok(())
 }
 
-/// Characters a bare `Host` value or an `Origin` authority can never contain:
-/// their presence means a path, query, fragment, or userinfo crept in, so the
-/// value can never equal a browser-sent `Host`/`Origin`. Shared by both
-/// allowlist validators so the two lists cannot drift (#2735).
 const FORBIDDEN_AUTHORITY_CHARS: [char; 4] = ['/', '?', '#', '@'];
 
-/// A browser `Origin` is always `scheme://host[:port]` with no path, so a
-/// schemeless (`aoe.example.com:8443`), hostless (`https://`, `https://:8443`),
-/// path/query/userinfo-bearing (`https://x/app`, `https://x?y`, `https://u@x`)
-/// `--allowed-origin` normalizes to a value no `Origin` header can ever equal:
-/// it would silently 403 the very requests it was meant to permit. Reject it at
-/// startup with the corrected form instead of failing closed at runtime (#2735).
 fn validate_allowed_origins(allowed_origins: &[String]) -> Result<()> {
     for origin in allowed_origins {
         let lower = origin.trim().to_ascii_lowercase();
         let host = lower
             .strip_prefix("https://")
             .or_else(|| lower.strip_prefix("http://"));
-        // A purely trailing slash is harmless (`norm_origin` strips it). Reject
-        // a host that carries a path/query/userinfo or normalizes to nothing
-        // (e.g. `:8443`), since none can equal a browser `Origin`.
         let valid = host.is_some_and(|h| {
             let h = h.trim_end_matches('/');
             !h.contains(FORBIDDEN_AUTHORITY_CHARS) && !crate::server::norm_host(h).is_empty()
@@ -356,14 +310,6 @@ fn validate_allowed_origins(allowed_origins: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// A `--allowed-host` is a bare `Host` value (a port is harmless: `norm_host`
-/// strips it symmetrically on both sides), never a scheme, path, query, or
-/// userinfo. A pasted URL (`https://aoe.example.com`), a path
-/// (`aoe.example.com/app`), or a port-only value (`:8080`, which `norm_host`
-/// collapses to nothing yet satisfies `--behind-proxy`'s non-empty check) leaves
-/// a value the gate can never match, silently 403ing the requests it was meant
-/// to permit. Reject such values at startup instead of failing closed at
-/// runtime (#2735).
 fn validate_allowed_hosts(allowed_hosts: &[String]) -> Result<()> {
     for host in allowed_hosts {
         let trimmed = host.trim();
@@ -397,12 +343,6 @@ fn validate_allowed_hosts(allowed_hosts: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// True when `aoe serve --remote` will route through Cloudflare and therefore
-/// needs `cloudflared` on PATH. That covers both an explicit named tunnel
-/// (`--tunnel-name`) and the quick-tunnel fallback path that runs when
-/// Tailscale isn't usable or the user passed `--no-tailscale`. Mirrors the
-/// transport selection inside `start_server()` so the early guard doesn't
-/// reject Tailscale-only setups (issue #813).
 fn cloudflared_required(
     no_tailscale: bool,
     has_tunnel_name: bool,
@@ -416,26 +356,10 @@ pub fn pid_file_path() -> Result<PathBuf> {
     Ok(dir.join("serve.pid"))
 }
 
-/// Persisted launch state for a running `aoe serve --daemon`. Written
-/// only by `start_daemon`, so its presence is the signal that the daemon
-/// is self-managed (started by `aoe serve --daemon`) rather than run in
-/// the foreground or under a service supervisor; that is what lets
-/// `aoe update` decide whether it may restart the daemon. `aoe serve
-/// --restart` and the post-update restart replay it. It is removed on
-/// stop, on the daemon's own graceful exit, and in `daemon_pid`'s
-/// stale-PID sweep, so nothing relies on a stale copy. The passphrase is
-/// never stored here; it is recalled from `serve.passphrase` /
-/// `AOE_SERVE_PASSPHRASE` at restart time.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ServeLaunch {
-    /// Informational only: nothing branches on it. Compatibility is handled
-    /// field by field instead (`#[serde(default)]` for fields added later, and
-    /// `launch_authorizes` accepting a record with no `instance_id`), which
-    /// keeps a record written by an older or newer build usable rather than
-    /// rejecting it wholesale.
     pub schema: u32,
     pub pid: u32,
-    /// Absent in records written before instance IDs existed (schema 1).
     #[serde(default)]
     pub instance_id: Option<String>,
     pub profile: String,
@@ -444,9 +368,6 @@ pub struct ServeLaunch {
     pub auth_mode: AuthMode,
     pub behind_proxy: bool,
     pub read_only: bool,
-    /// CityHall client mode. Persisted so `--restart` and the `aoe update`
-    /// re-exec replay it; without this the mode would silently drop because it
-    /// is otherwise only carried by the `AOE_CITYHALL_MODE` env var (#7).
     #[serde(default)]
     pub cityhall: bool,
     pub remote: bool,
@@ -463,10 +384,6 @@ const SERVE_LAUNCH_SCHEMA: u32 = 2;
 const SERVE_INSTANCE_ENV: &str = "AOE_SERVE_INSTANCE_ID";
 
 impl ServeLaunch {
-    /// Rebuild the `ServeArgs` needed to relaunch this daemon. The
-    /// effective auth mode is replayed via `--auth`; clap's `--no-auth`
-    /// alias is not needed since `--auth=none` covers it. The passphrase
-    /// is injected by the caller after recall.
     fn to_serve_args(&self, passphrase: Option<String>) -> ServeArgs {
         ServeArgs {
             port: Some(self.port),
@@ -493,9 +410,6 @@ impl ServeLaunch {
     }
 }
 
-/// True when relaunching this config requires a passphrase that must be
-/// recovered before the running daemon is stopped: remote mode mandates
-/// one, and `--auth=passphrase` is meaningless without it.
 fn launch_needs_passphrase(launch: &ServeLaunch) -> bool {
     launch.remote || matches!(launch.auth_mode, AuthMode::Passphrase)
 }
@@ -505,9 +419,6 @@ fn serve_launch_path() -> Result<PathBuf> {
     Ok(dir.join("serve.launch"))
 }
 
-/// Write `serve.launch` with owner-only (0600) permissions: it records
-/// the daemon's bind host/port, tunnel URL, auth posture, and profile,
-/// which should not be world-readable on a shared machine.
 fn write_serve_launch(state: &ServeLaunch) -> Result<()> {
     let path = serve_launch_path()?;
     let json = serde_json::to_string_pretty(state)?;
@@ -527,10 +438,6 @@ fn read_serve_launch() -> Result<ServeLaunch> {
     serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// Whether this launch record authorizes aoe to restart the process at `pid`.
-/// A record written before instance IDs existed has only the PID to go on;
-/// rejecting it would tell the user their daemon was externally launched, which
-/// is both false and hides the `aoe serve --restart` that does work for it.
 fn launch_authorizes(launch: &ServeLaunch, pid: u32, instance_is_live: bool) -> bool {
     launch.pid == pid && !launch_contradicts(launch, pid, instance_is_live)
 }
@@ -547,11 +454,6 @@ fn instance_is_live(launch: &ServeLaunch, pid: u32) -> bool {
         .is_some_and(|instance_id| live_daemon_instance_matches(pid, instance_id))
 }
 
-/// `true` when `serve.launch` claims this PID as our daemon but the live
-/// process carries a different instance ID, which is the PID-recycle
-/// signature. A missing launch record (a foreground `aoe serve` writes only
-/// the PID file) or a record for a different PID is not a contradiction, so
-/// stopping those still falls back to executable + subcommand verification.
 fn launch_contradicts(launch: &ServeLaunch, pid: u32, instance_is_live: bool) -> bool {
     launch.pid == pid && launch.instance_id.is_some() && !instance_is_live
 }
@@ -590,10 +492,6 @@ fn live_daemon_instance_matches(pid: u32, instance_id: &str) -> bool {
         .is_some_and(|output| environment_has_daemon_instance(&output.stdout, instance_id))
 }
 
-/// Recall the daemon passphrase for a restart: the plaintext
-/// `serve.passphrase` file the server writes while running first,
-/// then the `AOE_SERVE_PASSPHRASE` env override. Returns None when
-/// neither yields a non-empty value.
 fn recall_serve_passphrase() -> Option<String> {
     if let Ok(dir) = crate::session::get_app_dir() {
         if let Ok(raw) = std::fs::read_to_string(dir.join("serve.passphrase")) {
@@ -611,21 +509,12 @@ fn recall_serve_passphrase() -> Option<String> {
     None
 }
 
-/// One URL we can show in the Active state. Tunnel mode has a public primary
-/// plus a loopback alternate for same-host clients. Local mode may have
-/// multiple entries (Tailscale + LAN + localhost), and the user can Tab-cycle
-/// between them.
 #[derive(Debug, Clone)]
 pub struct ServeUrl {
-    /// Optional human-readable label ("tailscale", "lan", "localhost").
-    /// None for the primary URL, which does not need one.
     pub label: Option<String>,
     pub url: String,
 }
 
-/// Read `$APP_DIR/serve.url`. Returns `[]` when the file is missing or
-/// empty. The primary URL gets `label: None` for rendering; alternates
-/// carry their label.
 pub fn read_serve_urls() -> Vec<ServeUrl> {
     let Ok(dir) = crate::session::get_app_dir() else {
         return Vec::new();
@@ -640,7 +529,6 @@ pub fn read_serve_urls() -> Vec<ServeUrl> {
             continue;
         }
         if i == 0 {
-            // Primary line is the bare URL.
             out.push(ServeUrl {
                 label: None,
                 url: line.to_string(),
@@ -651,7 +539,6 @@ pub fn read_serve_urls() -> Vec<ServeUrl> {
                 url: url.to_string(),
             });
         } else {
-            // Defensive: unlabeled extra line. Show as a nameless extra.
             out.push(ServeUrl {
                 label: None,
                 url: line.to_string(),
@@ -661,16 +548,6 @@ pub fn read_serve_urls() -> Vec<ServeUrl> {
     out
 }
 
-/// Cached read of `$APP_DIR/serve.mode`, keyed on the current daemon
-/// PID. The status bar calls this on every render frame; without
-/// caching, that's a syscall + file read per frame just to compute a
-/// one-word label. We re-read the mode file only when the PID changes
-/// (daemon restart, fresh spawn), which is exactly when the mode could
-/// have changed.
-///
-/// Returns `None` when no daemon is running OR when the mode file is
-/// missing/unparseable. Callers can treat both cases the same way:
-/// "show the generic Serving label, no mode tag."
 pub fn cached_serve_mode_label() -> Option<&'static str> {
     static CACHE: Mutex<Option<(u32, Option<&'static str>)>> = Mutex::new(None);
 
@@ -685,9 +562,6 @@ pub fn cached_serve_mode_label() -> Option<&'static str> {
         *guard = Some((pid, label));
         label
     } else {
-        // Lock poisoned (only happens if a previous holder panicked
-        // while reading the file); fall back to a fresh read so the
-        // status bar still works.
         read_serve_mode_label()
     }
 }
@@ -733,9 +607,6 @@ fn command_is_aoe_serve(command: &[u8]) -> bool {
         return false;
     }
 
-    // The top-level globals declared on `Cli` in `src/cli/definition.rs`, so a
-    // value like `--profile work` is not mistaken for the subcommand.
-    // `parser_knows_every_top_level_global` fails if that list changes.
     let mut index = 1;
     while let Some(arg) = args.get(index) {
         match *arg {
@@ -758,11 +629,7 @@ fn command_is_aoe_serve(command: &[u8]) -> bool {
     false
 }
 
-/// Cross-platform check that `pid` belongs to an `aoe serve` process.
-/// PIDs get recycled, so a successful signal probe alone cannot authorize
-/// process control.
 fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
-    // Linux fast path: read /proc directly, no subprocess.
     let proc_path = format!("/proc/{}/cmdline", pid);
     if std::path::Path::new(&proc_path).exists() {
         return match std::fs::read(&proc_path) {
@@ -772,9 +639,6 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
         };
     }
 
-    // macOS / other: shell out to `ps`. `-o command=` prints the full
-    // command (path + args) with no header, and `-ww` stops it being clipped
-    // at the terminal width before `serve` shows up.
     match std::process::Command::new("ps")
         .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
         .output()
@@ -789,15 +653,6 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
     }
 }
 
-/// Loose companion to `command_is_aoe_serve`, for the `ps` path only. `ps`
-/// joins argv with spaces, so an executable path or option value that itself
-/// contains a space cannot be split back into argv and the strict parse fails
-/// on a genuine daemon. When the raw output still names an aoe executable,
-/// report `Indeterminate` rather than `Foreign`: the two costs are not
-/// symmetric, since `Foreign` deletes `serve.launch` and `serve.passphrase`
-/// and so throws away the only way to restart a daemon that is still running.
-/// A trailing space is required so a mention in an unrelated argument
-/// (`vim src/aoe.rs`) still classifies as foreign.
 fn command_mentions_aoe_executable(command: &[u8]) -> bool {
     command.windows(4).any(|window| window == b"aoe ")
         || command
@@ -826,13 +681,28 @@ fn classify_daemon_probe(
     }
 }
 
+/// Files `aoe serve --daemon` leaves beside its pid file.
+const SERVE_STATE_FILES: [&str; 4] = [
+    "serve.url",
+    "serve.mode",
+    "serve.passphrase",
+    "serve.launch",
+];
+
 fn remove_stale_serve_state(pid_path: &std::path::Path) {
     let _ = std::fs::remove_file(pid_path);
     if let Ok(dir) = crate::session::get_app_dir() {
-        let _ = std::fs::remove_file(dir.join("serve.url"));
-        let _ = std::fs::remove_file(dir.join("serve.mode"));
-        let _ = std::fs::remove_file(dir.join("serve.passphrase"));
-        let _ = std::fs::remove_file(dir.join("serve.launch"));
+        for name in SERVE_STATE_FILES {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+    }
+}
+
+async fn clear_serve_state() {
+    if let Ok(dir) = crate::session::get_app_dir() {
+        for name in SERVE_STATE_FILES {
+            let _ = tokio::fs::remove_file(dir.join(name)).await;
+        }
     }
 }
 
@@ -870,15 +740,10 @@ pub(crate) fn daemon_status() -> DaemonStatus {
             remove_stale_serve_state(&path);
             DaemonStatus::Absent
         }
-        // EPERM proves the process may still exist, while other errors are
-        // likewise insufficient evidence of staleness. Preserve lifecycle
-        // state, but do not return an unverified PID to control callers.
         DaemonProbeDisposition::Indeterminate => DaemonStatus::Unverified,
     }
 }
 
-/// Returns the PID only when the process can be verified as `aoe serve`.
-/// The TUI uses this to detect and display a running local daemon.
 pub fn daemon_pid() -> Option<u32> {
     match daemon_status() {
         DaemonStatus::Verified(pid) => Some(pid),
@@ -900,33 +765,10 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         return restart_daemon().await;
     }
 
-    // A fresh start files sessions under `profile`; the lifecycle verbs
-    // above never read it. Refuse an unknown name before any side effect
-    // (#148).
     crate::session::require_known_profile(profile)?;
 
-    // Resolve CityHall mode once: the `--cityhall` flag and the
-    // `AOE_CITYHALL_MODE` env var are equivalent. `main` already seeded the env
-    // var from the flag (before the tokio worker pool), so this is a pure read
-    // that folds the env var back into `args.cityhall` for the child spawn +
-    // ServeLaunch; the env-driven readers (`AppState`, `profile_config`, the
-    // banner) already agree. See #7.
     args.cityhall = args.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
 
-    // A fresh start with `aoe.web` disabled never reaches here: `main` rejects
-    // it as an unrecognized subcommand before dispatch (the lifecycle verbs
-    // above are exempt so a running daemon can always be brought down).
-
-    // Refuse to start a second instance (daemon or foreground) while another
-    // aoe serve is already running. Without this gate, a foreground
-    // `aoe serve` would overwrite the existing daemon's PID file in the
-    // non-daemon write below before its own port-bind eventually failed; the
-    // post-exit cleanup would then delete the (now-foreground) PID file and
-    // orphan the real daemon.
-    //
-    // Skip the bail if the PID file already points to our own process: that
-    // means we are the daemonized child that start_daemon() just spawned and
-    // pre-populated the file for, not a competing instance.
     if let Some(existing) = daemon_pid() {
         if existing != std::process::id() {
             bail!(
@@ -956,12 +798,6 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
     validate_allowed_hosts(&args.allowed_host)?;
     validate_allowed_origins(&args.allowed_origin)?;
 
-    // --behind-proxy + --remote is meaningless: --remote manages its
-    // own ingress, --behind-proxy assumes an external one. Warn but
-    // do not hard-fail; --remote wins for the tunnel-spawn decision
-    // and both set behind_tunnel anyway. Emit on both stderr (for
-    // foreground users) and the tracing pipeline (for daemon users
-    // whose stderr lands inside debug.log unread).
     if args.behind_proxy && args.remote {
         let msg = "--behind-proxy is ignored when --remote is set; \
              --remote already enables the equivalent cookie-Secure and \
@@ -970,7 +806,6 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         tracing::warn!(target: "serve", "{msg}");
     }
 
-    // Named tunnel requires --tunnel-url
     if args.tunnel_name.is_some() && args.tunnel_url.is_none() {
         bail!(
             "Named tunnels require --tunnel-url to specify the hostname.\n\
@@ -983,10 +818,6 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         );
     }
 
-    // Remote mode: check cloudflared (only when Tailscale Funnel can't carry the
-    // traffic) and force localhost binding. start_server() prefers Tailscale when
-    // it's available, so requiring cloudflared up front would falsely reject
-    // Tailscale-only setups (issue #813).
     let host = if args.remote {
         let tailscale_ok =
             tokio::task::spawn_blocking(crate::server::tunnel::tailscale_available_sync)
@@ -997,13 +828,11 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!(e))??;
         }
-        // Force localhost since the tunnel connects to localhost
         "127.0.0.1".to_string()
     } else {
         args.host.clone()
     };
 
-    // Warn about security implications of network binding (non-remote, non-localhost)
     if !is_localhost && !args.remote {
         eprintln!("==========================================================");
         eprintln!("  SECURITY WARNING: Binding to {}", args.host);
@@ -1026,10 +855,6 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
             eprintln!("  Read-only mode is ON: terminal input is disabled.");
             eprintln!();
         }
-        // A wildcard bind trusts loopback + any routable IP literal (which
-        // cannot be DNS-rebound), so the by-IP URLs printed below work as-is.
-        // Only access by a HOSTNAME/mDNS name still needs an allowlist entry.
-        // See #2735.
         if crate::server::is_wildcard_bind(&args.host) && args.allowed_host.is_empty() {
             let msg = "Wildcard bind: the LAN/VPN IP URLs above work as-is. \
                        To reach this server by a HOSTNAME or mDNS name \
@@ -1050,7 +875,6 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         eprintln!();
     }
 
-    // Passphrase strength check
     if let Some(ref passphrase) = args.passphrase {
         if let Some(warning) = crate::server::login::check_passphrase_strength(passphrase) {
             eprintln!("{}", warning);
@@ -1058,7 +882,6 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         }
     }
 
-    // Block remote mode without passphrase
     if args.remote && args.passphrase.is_none() {
         bail!(
             "Refusing to start in remote mode without a passphrase.\n\
@@ -1071,9 +894,6 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         return start_daemon(profile, &args);
     }
 
-    // Past the daemon fork, so exactly the process that serves applies the
-    // bundle, and before the server resolves any config, because the bundle can
-    // change every setting it is about to read.
     apply_cityhall_bundle().await?;
 
     tracing::info!(
@@ -1086,7 +906,6 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
         "starting foreground serve",
     );
 
-    // Write PID file for non-daemon mode too (so --stop works either way)
     if let Ok(path) = pid_file_path() {
         let _ = tokio::fs::write(&path, std::process::id().to_string()).await;
         tracing::debug!(target: "serve.lifecycle", path = %path.display(), pid = std::process::id(), "wrote pid file");
@@ -1111,9 +930,6 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
     })
     .await;
 
-    // Clean up PID and URL files on exit, but only if the PID file
-    // still belongs to this process. A newer daemon spawn may have
-    // overwritten it; removing their file would orphan them.
     if let Ok(path) = pid_file_path() {
         let is_ours = tokio::fs::read_to_string(&path)
             .await
@@ -1122,23 +938,13 @@ pub async fn run(profile: &str, mut args: ServeArgs) -> Result<()> {
             .is_some_and(|pid| pid == std::process::id());
         if is_ours {
             let _ = tokio::fs::remove_file(&path).await;
-            if let Ok(dir) = crate::session::get_app_dir() {
-                let _ = tokio::fs::remove_file(dir.join("serve.url")).await;
-                let _ = tokio::fs::remove_file(dir.join("serve.mode")).await;
-                let _ = tokio::fs::remove_file(dir.join("serve.passphrase")).await;
-                let _ = tokio::fs::remove_file(dir.join("serve.launch")).await;
-            }
+            clear_serve_state().await;
         }
     }
 
     result
 }
 
-/// Path the daemon's stdout/stderr are redirected to. Resolved from the
-/// configured `[logging].file_path` so panic backtraces interleave with
-/// the structured tracing stream. Used by `start_daemon()` for the stdio
-/// redirect, by the TUI serve dialog for the tail pane, and by `aoe logs`
-/// for the viewer target.
 pub fn stdio_redirect_path() -> Result<PathBuf> {
     let dir = crate::session::get_app_dir()?;
     let log_cfg = crate::session::load_config()
@@ -1149,31 +955,10 @@ pub fn stdio_redirect_path() -> Result<PathBuf> {
     Ok(crate::logging::resolve_log_path(&log_cfg, &dir))
 }
 
-/// URL a CityHall-hosted workspace fetches its config bundle from. Unset means
-/// this install is not CityHall-managed and the fetch is skipped entirely.
 const BUNDLE_URL_ENV: &str = "AOE_CITYHALL_BUNDLE_URL";
-/// Bearer token for [`BUNDLE_URL_ENV`]. CityHall issues one per workspace.
 const BUNDLE_TOKEN_ENV: &str = "AOE_CITYHALL_BUNDLE_TOKEN";
-/// The bundle is small and the workspace cannot serve until it lands, so a short
-/// ceiling is better than a slow start behind an unresponsive CityHall.
 const BUNDLE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Fetch and apply the CityHall config bundle when this install is pointed at
-/// one. See `crate::session::cityhall_bundle`.
-///
-/// Failure is deliberately asymmetric:
-///
-/// - **No cached bundle** means this is a first boot. Continuing would leave the
-///   user in a workspace with default settings and no projects, which is the
-///   exact confusion the bundle exists to remove, so the boot fails loudly and
-///   CityHall surfaces it as a workspace that would not start.
-/// - **A cached bundle exists**, so the workspace is already configured. A
-///   transient CityHall outage must not brick it, so this warns and serves with
-///   what is on disk.
-///
-/// A bundle that arrives but is malformed or carries an unknown settings key is
-/// fatal either way: that is an admin error, and swallowing it would leave the
-/// admin believing a broken document had been applied.
 async fn apply_cityhall_bundle() -> Result<()> {
     use crate::session::cityhall_bundle::{self, CityHallBundle};
 
@@ -1218,8 +1003,6 @@ async fn apply_cityhall_bundle() -> Result<()> {
         tracing::warn!(target: "serve.cityhall", "{failure}");
     }
 
-    // Cache last: a document that failed to apply must not be remembered as the
-    // configuration this workspace is running.
     if let Err(e) = std::fs::write(&cache, &raw) {
         tracing::warn!(target: "serve.cityhall", error = %e, "could not cache the bundle");
     }
@@ -1237,9 +1020,6 @@ async fn fetch_cityhall_bundle(url: &str, token: &str) -> Result<String> {
     let response = request.send().await?;
     let status = response.status();
     if !status.is_success() {
-        // On a first boot this error is fatal and is the only thing the operator
-        // sees, so carry CityHall's own explanation (bad token, wrong path, a
-        // validation message) instead of just the status.
         let body = response.text().await.unwrap_or_default();
         let body = body.trim();
         if body.is_empty() {
@@ -1281,10 +1061,6 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     if args.read_only {
         cmd.arg("--read-only");
     }
-    // Replay CityHall mode to the child explicitly (the child gets a fresh env,
-    // so relying on AOE_CITYHALL_MODE inheritance would drop it). The flag is
-    // seeded from the env var at `run` entry, so checking `args.cityhall` here
-    // covers both the flag and env invocations.
     if args.cityhall {
         cmd.arg("--cityhall");
     }
@@ -1307,7 +1083,6 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
         cmd.args(["--allowed-origin", o]);
     }
     if let Some(ref passphrase) = args.passphrase {
-        // Pass via env var to avoid exposing the passphrase in the process list
         cmd.env("AOE_SERVE_PASSPHRASE", passphrase);
     }
     if !profile.is_empty() {
@@ -1316,13 +1091,10 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
 
     cmd.stdin(Stdio::null());
 
-    // Create a new session so the daemon is not killed by SIGHUP when the
-    // parent terminal closes. setsid() is async-signal-safe.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         // SAFETY: setsid() is async-signal-safe per POSIX, which is the
-        // only requirement for pre_exec closures.
         unsafe {
             cmd.pre_exec(|| {
                 nix::unistd::setsid().map_err(std::io::Error::other)?;
@@ -1331,12 +1103,6 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
         }
     }
 
-    // Route the child's stdout/stderr into the configured log file so panic
-    // backtraces and stray prints land alongside structured tracing rather
-    // than disappearing into /dev/null. The tracing subscriber inside the
-    // child resolves the same path via `logging::resolve_log_path`, so the
-    // two streams interleave in one file. Inherited fds may go stale across
-    // a rotation; that is best-effort behavior.
     let stdio_path = stdio_redirect_path().ok();
     match stdio_path.as_ref().and_then(|p| {
         std::fs::OpenOptions::new()
@@ -1368,16 +1134,11 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
         "daemon child spawned",
     );
 
-    // Write PID file
     if let Ok(path) = pid_file_path() {
         std::fs::write(&path, pid.to_string())?;
         tracing::debug!(target: "serve.lifecycle", path = %path.display(), pid, "wrote pid file");
     }
 
-    // Persist the launch state so `aoe serve --restart` and the
-    // post-update restart can replay this daemon's exact config. Mirrors
-    // the argv reconstruction above; the passphrase is deliberately left
-    // out (recalled from serve.passphrase / the env on restart).
     let launch = ServeLaunch {
         schema: SERVE_LAUNCH_SCHEMA,
         pid,
@@ -1405,15 +1166,6 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     Ok(())
 }
 
-/// Restart the running `aoe serve` daemon from its persisted launch state
-/// (`serve.launch`). Everything needed to relaunch is read into memory
-/// before the old daemon is stopped, because `stop_daemon` deletes
-/// `serve.passphrase`; a daemon that needs a passphrase is never killed
-/// without the means to bring it back. The replacement is spawned via
-/// `start_daemon`, which uses the current executable. That is correct
-/// both for a hand-run `aoe serve --restart` and for the post-update
-/// path, where `aoe update` re-execs the freshly installed binary as
-/// `aoe serve --restart` so the new code spawns the new daemon.
 #[tracing::instrument(target = "serve.lifecycle", skip_all)]
 pub async fn restart_daemon() -> Result<()> {
     let Some(pid) = daemon_pid() else {
@@ -1440,8 +1192,6 @@ pub async fn restart_daemon() -> Result<()> {
         );
     }
 
-    // Recall the passphrase BEFORE stopping: stop_daemon() deletes
-    // serve.passphrase, so reading it afterwards would always fail.
     let passphrase = recall_serve_passphrase();
     if launch_needs_passphrase(&launch) && passphrase.is_none() {
         bail!(
@@ -1456,9 +1206,6 @@ pub async fn restart_daemon() -> Result<()> {
         );
     }
 
-    // Re-validate the persisted config before tearing anything down, so a
-    // config that can no longer start (e.g. policy changed) fails loudly
-    // instead of leaving the user with no daemon.
     validate_auth_combination(
         launch.auth_mode,
         passphrase.is_some(),
@@ -1521,23 +1268,17 @@ pub(crate) async fn stop_daemon() -> Result<()> {
         }
     }
 
-    // Send SIGTERM
     match nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(pid),
         nix::sys::signal::Signal::SIGTERM,
     ) {
         Ok(()) => {
-            // Wait for the process to actually exit so the port is
-            // released before a new daemon can be spawned. Without
-            // this, closing the dialog and immediately reopening
-            // races with the dying daemon and can orphan it.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
                     Err(nix::errno::Errno::ESRCH) => break,
                     _ if std::time::Instant::now() >= deadline => {
-                        // Still alive after timeout; escalate.
                         let _ = nix::sys::signal::kill(
                             nix::unistd::Pid::from_raw(pid),
                             nix::sys::signal::Signal::SIGKILL,
@@ -1548,26 +1289,13 @@ pub(crate) async fn stop_daemon() -> Result<()> {
                     _ => {}
                 }
             }
-            // The daemon's own cleanup may have already removed some
-            // of these; that's fine.
             let _ = tokio::fs::remove_file(&path).await;
-            if let Ok(dir) = crate::session::get_app_dir() {
-                let _ = tokio::fs::remove_file(dir.join("serve.url")).await;
-                let _ = tokio::fs::remove_file(dir.join("serve.mode")).await;
-                let _ = tokio::fs::remove_file(dir.join("serve.passphrase")).await;
-                let _ = tokio::fs::remove_file(dir.join("serve.launch")).await;
-            }
+            clear_serve_state().await;
             println!("Stopped aoe serve daemon (PID {})", pid);
         }
         Err(nix::errno::Errno::ESRCH) => {
-            // Process doesn't exist; clean up stale PID file
             tokio::fs::remove_file(&path).await?;
-            if let Ok(dir) = crate::session::get_app_dir() {
-                let _ = tokio::fs::remove_file(dir.join("serve.url")).await;
-                let _ = tokio::fs::remove_file(dir.join("serve.mode")).await;
-                let _ = tokio::fs::remove_file(dir.join("serve.passphrase")).await;
-                let _ = tokio::fs::remove_file(dir.join("serve.launch")).await;
-            }
+            clear_serve_state().await;
             println!("Daemon was not running (stale PID file cleaned up)");
         }
         Err(e) => bail!("Failed to stop daemon (PID {}): {}", pid, e),
@@ -1576,14 +1304,7 @@ pub(crate) async fn stop_daemon() -> Result<()> {
     Ok(())
 }
 
-/// Print the running daemon's PID, mode, URLs, and log path. Exits
-/// non-zero (via `bail!`) when no daemon is running so shell scripts
-/// can branch on it (`aoe serve --status && …`).
 async fn print_status() -> Result<()> {
-    // `AOE_DAEMON_URL` retargets every `aoe` invocation at a remote
-    // daemon (see docs/acp.md). `--status` follows the same rule:
-    // when the env override is set, report the remote endpoint's
-    // health instead of the local PID file.
     if let Some(endpoint) = crate::acp::client::discovery::discover_env() {
         let client = crate::acp::client::HttpClient::new(endpoint.clone())
             .map_err(|e| anyhow::anyhow!("http client init failed: {e}"))?;
@@ -1615,9 +1336,6 @@ fn print_local_status() -> Result<()> {
 
     let mode = read_serve_mode_label().unwrap_or("unknown");
     let urls = read_serve_urls();
-    // Resolve the configured log path (default debug.log under app_dir).
-    // The daemon's tracing and stdout/stderr both land here post-consolidation;
-    // `serve.log` is retired.
     let log_path = stdio_redirect_path().ok();
 
     println!("Daemon: running (PID {})", pid);
@@ -1642,16 +1360,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cloudflared_skipped_when_tailscale_available_and_default_flags() {
-        // Regression: aoe serve --remote with Tailscale up and cloudflared
-        // missing was failing because of the unconditional check. Tailscale
-        // alone is enough.
-        assert!(!cloudflared_required(false, false, true));
-    }
-
-    #[test]
-    fn cloudflared_required_when_no_tailscale_flag_set() {
-        assert!(cloudflared_required(true, false, true));
+    fn cloudflared_required_unless_tailscale_serves_the_default_flags() {
+        let cases = [
+            ("default flags with tailscale", false, false, true, false),
+            ("--no-tailscale", true, false, true, true),
+            ("named tunnel pinned", false, true, true, true),
+            ("tailscale unavailable", false, false, false, true),
+        ];
+        for (name, no_tailscale, named_tunnel, tailscale_available, expected) in cases {
+            assert_eq!(
+                cloudflared_required(no_tailscale, named_tunnel, tailscale_available),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -1724,161 +1446,79 @@ mod tests {
     }
 
     #[test]
-    fn cloudflared_required_when_named_tunnel_pinned() {
-        assert!(cloudflared_required(false, true, true));
+    fn host_is_localhost_accepts_only_loopback_forms() {
+        let cases = [
+            ("localhost", true),
+            ("127.0.0.1", true),
+            ("::1", true),
+            ("0.0.0.0", false),
+            ("192.168.1.1", false),
+            ("aoe.example.com", false),
+        ];
+        for (host, expected) in cases {
+            assert_eq!(host_is_localhost(host), expected, "{host}");
+        }
     }
 
     #[test]
-    fn cloudflared_required_when_tailscale_unavailable() {
-        assert!(cloudflared_required(false, false, false));
+    fn resolve_auth_mode_defaults_to_token_and_honors_explicit_choices() {
+        let cases = [
+            (None, false, AuthMode::Token),
+            (None, true, AuthMode::None),
+            (Some(AuthMode::Passphrase), false, AuthMode::Passphrase),
+            (Some(AuthMode::None), false, AuthMode::None),
+        ];
+        for (auth, no_auth, expected) in cases {
+            assert_eq!(resolve_auth_mode(auth, no_auth), expected, "{auth:?}");
+        }
     }
 
     #[test]
-    fn host_is_localhost_accepts_loopback_forms() {
-        assert!(host_is_localhost("localhost"));
-        assert!(host_is_localhost("127.0.0.1"));
-        assert!(host_is_localhost("::1"));
-    }
+    fn validate_auth_combination_gates_reduced_auth_modes() {
+        let err = |mode, has_passphrase, is_localhost, behind_proxy, remote, host: &str| {
+            validate_auth_combination(
+                mode,
+                has_passphrase,
+                is_localhost,
+                behind_proxy,
+                remote,
+                host,
+            )
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default()
+        };
+        const LOCAL: &str = "127.0.0.1";
+        const WIDE: &str = "0.0.0.0";
 
-    #[test]
-    fn host_is_localhost_rejects_routable_addresses() {
-        assert!(!host_is_localhost("0.0.0.0"));
-        assert!(!host_is_localhost("192.168.1.1"));
-        assert!(!host_is_localhost("aoe.example.com"));
-    }
-
-    #[test]
-    fn resolve_auth_mode_defaults_to_token() {
-        assert_eq!(resolve_auth_mode(None, false), AuthMode::Token);
-    }
-
-    #[test]
-    fn resolve_auth_mode_no_auth_alias_maps_to_none() {
-        assert_eq!(resolve_auth_mode(None, true), AuthMode::None);
-    }
-
-    #[test]
-    fn resolve_auth_mode_explicit_wins() {
+        assert_eq!(err(AuthMode::Token, false, true, false, false, LOCAL), "");
+        assert_eq!(err(AuthMode::Token, true, true, false, true, LOCAL), "");
         assert_eq!(
-            resolve_auth_mode(Some(AuthMode::Passphrase), false),
-            AuthMode::Passphrase
+            err(AuthMode::Passphrase, true, true, false, false, LOCAL),
+            ""
         );
+        assert_eq!(err(AuthMode::None, false, true, false, false, LOCAL), "");
         assert_eq!(
-            resolve_auth_mode(Some(AuthMode::None), false),
-            AuthMode::None
+            err(AuthMode::Passphrase, true, false, true, false, WIDE),
+            ""
         );
-    }
 
-    #[test]
-    fn validate_token_mode_loopback_ok() {
+        assert!(err(AuthMode::Passphrase, false, true, false, false, LOCAL)
+            .contains("--auth=passphrase requires"));
+        assert!(err(AuthMode::None, true, true, false, false, LOCAL)
+            .contains("--auth=none does not honor --passphrase"));
         assert!(
-            validate_auth_combination(AuthMode::Token, false, true, false, false, "127.0.0.1")
-                .is_ok()
+            err(AuthMode::Passphrase, true, false, false, false, WIDE).contains("--behind-proxy")
         );
-    }
-
-    #[test]
-    fn validate_passphrase_without_passphrase_fails() {
-        let err =
-            validate_auth_combination(AuthMode::Passphrase, false, true, false, false, "127.0.0.1")
-                .unwrap_err();
-        assert!(err.to_string().contains("--auth=passphrase requires"));
-    }
-
-    #[test]
-    fn validate_passphrase_with_passphrase_loopback_ok() {
-        assert!(validate_auth_combination(
-            AuthMode::Passphrase,
-            true,
-            true,
-            false,
-            false,
-            "127.0.0.1"
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn validate_none_with_passphrase_rejected() {
-        let err = validate_auth_combination(AuthMode::None, true, true, false, false, "127.0.0.1")
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("--auth=none does not honor --passphrase"));
-        assert!(msg.contains("--auth=passphrase"));
-    }
-
-    #[test]
-    fn validate_passphrase_non_loopback_needs_behind_proxy() {
-        let err =
-            validate_auth_combination(AuthMode::Passphrase, true, false, false, false, "0.0.0.0")
-                .unwrap_err();
-        assert!(err.to_string().contains("--behind-proxy"));
-    }
-
-    #[test]
-    fn validate_passphrase_non_loopback_with_behind_proxy_ok() {
-        assert!(validate_auth_combination(
-            AuthMode::Passphrase,
-            true,
-            false,
-            true,
-            false,
-            "0.0.0.0"
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn validate_none_non_loopback_needs_behind_proxy() {
-        let err = validate_auth_combination(AuthMode::None, false, false, false, false, "0.0.0.0")
-            .unwrap_err();
-        assert!(err.to_string().contains("--behind-proxy"));
-    }
-
-    #[test]
-    fn validate_none_loopback_ok() {
-        // Regression: --no-auth (== --auth=none) on loopback must still
-        // start, matching the legacy --no-auth behavior.
+        assert!(err(AuthMode::None, false, false, false, false, WIDE).contains("--behind-proxy"));
         assert!(
-            validate_auth_combination(AuthMode::None, false, true, false, false, "127.0.0.1")
-                .is_ok()
+            err(AuthMode::Passphrase, true, true, false, true, LOCAL).contains("in remote mode")
         );
+        assert!(err(AuthMode::None, false, true, false, true, LOCAL).contains("in remote mode"));
     }
 
     #[test]
-    fn validate_passphrase_with_remote_rejected() {
-        let err =
-            validate_auth_combination(AuthMode::Passphrase, true, true, false, true, "127.0.0.1")
-                .unwrap_err();
-        assert!(err.to_string().contains("in remote mode"));
-    }
-
-    #[test]
-    fn validate_none_with_remote_rejected() {
-        let err = validate_auth_combination(AuthMode::None, false, true, false, true, "127.0.0.1")
-            .unwrap_err();
-        assert!(err.to_string().contains("in remote mode"));
-    }
-
-    #[test]
-    fn validate_token_with_remote_ok() {
-        // --remote requires token + passphrase; the passphrase requirement
-        // is enforced separately. Token + remote alone is the existing
-        // valid combination and must keep passing.
-        assert!(
-            validate_auth_combination(AuthMode::Token, true, true, false, true, "127.0.0.1")
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn auth_mode_cli_str_matches_clap() {
-        // Drift guard: `as_cli_str()` and clap's `value(rename_all =
-        // "lowercase")` derive must agree. If someone renames a variant
-        // or changes the rename_all rule without updating the match,
-        // this round-trip fails. Catches the silent split where
-        // `--auth=passphrase` parses but the daemon respawn emits
-        // `--auth Passphrase`.
+    fn auth_mode_cli_str_matches_clap_and_serde() {
         for variant in <AuthMode as ValueEnum>::value_variants() {
             let cli_str = variant.as_cli_str();
             let parsed = AuthMode::from_str(cli_str, true).unwrap_or_else(|_| {
@@ -1889,18 +1529,9 @@ mod tests {
                 .to_possible_value()
                 .expect("non-skipped variant has a PossibleValue");
             assert_eq!(pv.get_name(), cli_str);
-        }
-    }
 
-    #[test]
-    fn auth_mode_serde_matches_cli_str() {
-        // serve.launch persists the auth mode as JSON; the serde
-        // representation must match clap's `--auth=<mode>` spelling so a
-        // restart replays the same flag. Guards the serde `rename_all`
-        // against drift from `as_cli_str()`.
-        for variant in <AuthMode as ValueEnum>::value_variants() {
             let json = serde_json::to_string(variant).expect("serialize AuthMode");
-            assert_eq!(json, format!("\"{}\"", variant.as_cli_str()));
+            assert_eq!(json, format!("\"{cli_str}\""));
             let back: AuthMode = serde_json::from_str(&json).expect("deserialize AuthMode");
             assert_eq!(back, *variant);
         }
@@ -1927,11 +1558,6 @@ mod tests {
         }
     }
 
-    /// `command_is_aoe_serve` hand-parses the top-level globals to find the
-    /// subcommand position in a raw command line. A global added to `Cli`
-    /// without being taught there stops a real daemon's command line from
-    /// parsing, which classifies it `Foreign` and deletes its lifecycle state,
-    /// so derive the set from clap and fail here instead.
     #[test]
     fn parser_knows_every_top_level_global() {
         use clap::CommandFactory;
@@ -1961,20 +1587,16 @@ mod tests {
     #[test]
     fn space_joined_ps_output_is_unverifiable_not_foreign() {
         let cases = [
-            // `ps` cannot round-trip these back into argv, so the strict parse
-            // fails; they must not reach the state-destroying Foreign branch.
             (&b"/Users/me/My Apps/aoe serve --daemon-child"[..], true),
             (
                 &b"/usr/local/bin/aoe -p my profile serve --daemon-child"[..],
                 true,
             ),
-            // Clipped before `serve` (what `ps` did without `-ww`).
             (
                 &b"/usr/local/bin/aoe --profile work --host 0.0.0.0 --port"[..],
                 true,
             ),
             (&b"/opt/homebrew/bin/agent-of-empires serve"[..], true),
-            // An unrelated process that merely mentions aoe is still foreign.
             (&b"/usr/bin/vim src/aoe.rs"[..], false),
             (&b"/usr/bin/python3 manage.py runserver"[..], false),
         ];
@@ -1990,18 +1612,10 @@ mod tests {
 
     #[test]
     fn launch_contradiction_only_flags_recycled_pids() {
-        // (recorded pid, recorded instance, instance is live, contradicts, authorizes)
         let cases = [
-            // Recorded PID, live instance gone: the PID was recycled by another
-            // aoe serve, so refuse to signal it.
             (4242, Some("instance-1"), false, true, false),
             (4242, Some("instance-1"), true, false, true),
-            // A launch record for a different PID says nothing about this one, so
-            // it is not a contradiction, but it authorizes nothing either.
             (99, Some("instance-1"), false, false, false),
-            // No instance ID recorded (a record written before instance IDs
-            // existed): the PID match is all the evidence there is, and it is
-            // what pre-upgrade builds acted on.
             (4242, None, false, false, true),
         ];
         for (launch_pid, instance_id, live, contradicts, authorizes) in cases {
@@ -2029,30 +1643,13 @@ mod tests {
         let launch = sample_launch();
         let json = serde_json::to_string(&launch).expect("serialize");
         let back: ServeLaunch = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.pid, launch.pid);
-        assert_eq!(back.instance_id, launch.instance_id);
-        assert_eq!(back.profile, launch.profile);
-        assert_eq!(back.host, launch.host);
-        assert_eq!(back.port, launch.port);
-        assert_eq!(back.auth_mode, launch.auth_mode);
-        assert_eq!(back.behind_proxy, launch.behind_proxy);
-        assert_eq!(back.read_only, launch.read_only);
-        assert_eq!(back.cityhall, launch.cityhall);
-        assert_eq!(back.remote, launch.remote);
-        assert_eq!(back.tunnel_name, launch.tunnel_name);
-        assert_eq!(back.tunnel_url, launch.tunnel_url);
-        assert_eq!(back.no_tailscale, launch.no_tailscale);
-        assert_eq!(back.allowed_host, launch.allowed_host);
-        assert_eq!(back.allowed_origin, launch.allowed_origin);
+        assert_eq!(back, launch);
     }
 
     #[test]
     fn to_serve_args_replays_launch_config() {
         let launch = sample_launch();
         let args = launch.to_serve_args(Some("hunter2".to_string()));
-        // Bind config is replayed; auth goes through --auth, never the
-        // --no-auth alias; daemon mode is forced; the child markers and
-        // restart flag are cleared so re-entry does not loop.
         assert_eq!(args.port, Some(9090));
         assert_eq!(args.host, "0.0.0.0");
         assert_eq!(args.auth, Some(AuthMode::Passphrase));
@@ -2076,58 +1673,52 @@ mod tests {
     }
 
     #[test]
-    fn behind_proxy_without_allowed_host_errors_at_startup() {
+    fn behind_proxy_needs_an_allowed_host_unless_remote() {
         let err = validate_behind_proxy_allowlist(true, false, &[])
             .expect_err("behind-proxy with no allowed host must be rejected");
         assert!(err.to_string().contains("--allowed-host"));
-    }
-
-    #[test]
-    fn behind_proxy_with_allowed_host_ok() {
         validate_behind_proxy_allowlist(true, false, &["aoe.example.com".to_string()])
             .expect("behind-proxy with an allowed host starts");
-    }
-
-    #[test]
-    fn behind_proxy_remote_is_exempt_from_allowed_host() {
         validate_behind_proxy_allowlist(true, true, &[])
             .expect("remote auto-injects the tunnel host, so no flag is required");
     }
 
     #[test]
-    fn schemeless_allowed_origin_errors_at_startup() {
-        assert!(validate_allowed_origins(&["aoe.example.com:8443".to_string()]).is_err());
-        assert!(validate_allowed_origins(&["".to_string()]).is_err());
-    }
-
-    #[test]
-    fn hostless_allowed_origin_errors_at_startup() {
-        assert!(validate_allowed_origins(&["https://".to_string()]).is_err());
-        assert!(validate_allowed_origins(&["https:///".to_string()]).is_err());
-        assert!(validate_allowed_origins(&["https://:8443".to_string()]).is_err());
-    }
-
-    #[test]
-    fn malformed_allowed_origin_errors_at_startup() {
-        assert!(validate_allowed_origins(&["https://aoe.example.com/app".to_string()]).is_err());
-        assert!(validate_allowed_origins(&["https://aoe.example.com?x".to_string()]).is_err());
-        assert!(validate_allowed_origins(&["https://user@aoe.example.com".to_string()]).is_err());
-    }
-
-    #[test]
-    fn scheme_qualified_allowed_origin_ok() {
+    fn allowed_origins_need_a_scheme_a_host_and_nothing_else() {
+        for origin in [
+            "aoe.example.com:8443",
+            "",
+            "https://",
+            "https:///",
+            "https://:8443",
+            "https://aoe.example.com/app",
+            "https://aoe.example.com?x",
+            "https://user@aoe.example.com",
+            "http://0.0.0.0:8080",
+            "https://[::]",
+            "http://169.254.169.254",
+            "https://[fe80::1]:8443",
+            "http://224.0.0.1",
+        ] {
+            assert!(
+                validate_allowed_origins(&[origin.to_string()]).is_err(),
+                "{origin:?} must be rejected"
+            );
+        }
         validate_allowed_origins(&[
             "https://aoe.example.com:8443".to_string(),
             "http://localhost:3000".to_string(),
             "HTTPS://aoe.example.com".to_string(),
             "https://aoe.example.com/".to_string(),
             "https://[::1]".to_string(),
+            "http://127.0.0.1:3000".to_string(),
+            "https://192.168.1.5:8443".to_string(),
         ])
-        .expect("full scheme://host[:port] origins (incl. IPv6, trailing slash) are accepted");
+        .expect("scheme://host[:port] origins, IPv6 and routable literals included, are accepted");
     }
 
     #[test]
-    fn allowed_hosts_accept_bare_host_and_port() {
+    fn allowed_hosts_take_a_bare_authority_and_reject_untrusted_literals() {
         validate_allowed_hosts(&[
             "aoe.example.com".to_string(),
             "aoe.example.com:8443".to_string(),
@@ -2138,10 +1729,7 @@ mod tests {
             "::1".to_string(),
         ])
         .expect("a bare host or host:port (incl. IPv6 and loopback) is a valid --allowed-host");
-    }
 
-    #[test]
-    fn allowed_hosts_reject_untrusted_ip_literals() {
         for host in [
             "0.0.0.0",
             "0.0.0.0:8080",
@@ -2153,52 +1741,19 @@ mod tests {
             "::ffff:169.254.169.254",
             "224.0.0.1",
             "ff02::1",
+            "https://aoe.example.com",
+            "aoe.example.com/app",
+            "aoe.example.com?x",
+            "user@aoe.example.com",
+            ":8080",
+            ":",
+            "   ",
         ] {
             assert!(
                 validate_allowed_hosts(&[host.to_string()]).is_err(),
-                "{host} must be rejected as an untrusted IP literal"
+                "{host:?} must be rejected"
             );
         }
-    }
-
-    #[test]
-    fn allowed_origins_reject_untrusted_ip_literals() {
-        for origin in [
-            "http://0.0.0.0:8080",
-            "https://[::]",
-            "http://169.254.169.254",
-            "https://[fe80::1]:8443",
-            "http://224.0.0.1",
-        ] {
-            assert!(
-                validate_allowed_origins(&[origin.to_string()]).is_err(),
-                "{origin} must be rejected as an untrusted IP-literal origin"
-            );
-        }
-        validate_allowed_origins(&[
-            "http://127.0.0.1:3000".to_string(),
-            "https://[::1]".to_string(),
-            "https://192.168.1.5:8443".to_string(),
-        ])
-        .expect("loopback and routable IP-literal origins stay valid");
-    }
-
-    #[test]
-    fn allowed_hosts_reject_malformed_authorities() {
-        // pasted URL / path / query / userinfo
-        assert!(validate_allowed_hosts(&["https://aoe.example.com".to_string()]).is_err());
-        assert!(validate_allowed_hosts(&["aoe.example.com/app".to_string()]).is_err());
-        assert!(validate_allowed_hosts(&["aoe.example.com?x".to_string()]).is_err());
-        assert!(validate_allowed_hosts(&["user@aoe.example.com".to_string()]).is_err());
-        // port-only: satisfies --behind-proxy's non-empty check but normalizes
-        // to nothing, silently allowlisting no host (the #2735 guard defeat).
-        assert!(validate_allowed_hosts(&[":8080".to_string()]).is_err());
-        assert!(validate_allowed_hosts(&[":".to_string()]).is_err());
-    }
-
-    #[test]
-    fn allowed_hosts_reject_empty() {
-        assert!(validate_allowed_hosts(&["   ".to_string()]).is_err());
     }
 
     #[test]
@@ -2217,8 +1772,6 @@ mod tests {
         assert!(!launch_needs_passphrase(&launch));
     }
 
-    /// Parses real argv and dispatches like `main`, pinning which `serve`
-    /// shapes consume `--profile` (#148).
     mod profile_guard {
         use super::super::run;
         use crate::cli::{Cli, Commands};
@@ -2235,7 +1788,6 @@ mod tests {
             }
         }
 
-        /// Isolated app dir with one profile, so the guard is armed.
         fn armed_profiles_dir() -> (crate::session::test_support::AppDirGuard, PathBuf) {
             let guard = crate::session::test_support::isolate_app_dir();
             let profiles = crate::session::get_app_dir().unwrap().join("profiles");
@@ -2249,8 +1801,6 @@ mod tests {
             let (_guard, profiles) = armed_profiles_dir();
             for verb in ["--stop", "--status", "--restart"] {
                 let (profile, args) = dispatch_argv(&["aoe", "serve", verb, "-p", "ghost-profile"]);
-                // No daemon runs here; the report must be about the daemon,
-                // never the profile.
                 if let Err(e) = run(&profile, args).await {
                     let msg = e.to_string();
                     assert!(
@@ -2269,8 +1819,6 @@ mod tests {
         #[serial]
         async fn fresh_start_refuses_unknown_profile_before_any_side_effect() {
             let (_guard, profiles) = armed_profiles_dir();
-            // `--behind-proxy` without `--allowed-host` fails right after the
-            // guard, so no port is ever bound.
             let (profile, args) =
                 dispatch_argv(&["aoe", "serve", "--behind-proxy", "-p", "ghost-profile"]);
             let msg = run(&profile, args)

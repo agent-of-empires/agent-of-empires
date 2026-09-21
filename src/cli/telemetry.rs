@@ -1,5 +1,4 @@
 //! `aoe telemetry` subcommands: inspect and control anonymous opt-in usage
-//! telemetry from the CLI.
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -81,8 +80,6 @@ fn run_set_enabled(enabled: bool) -> Result<()> {
             }
         }
     } else if crate::telemetry::install_id().is_some() {
-        // apply_opt_in_change only logs delete failures, so confirm rather
-        // than assume the file is gone.
         println!(
             "Telemetry disabled, but the local install id could not be removed; see the debug log."
         );

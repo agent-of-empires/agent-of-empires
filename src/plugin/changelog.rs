@@ -1,17 +1,4 @@
 //! Best-effort changelog assembly for an in-UI plugin update preview.
-//!
-//! Given the prior installed ref/commit and the target ref/commit, produce a
-//! human-readable list of what changed between them. Release-tracking updates
-//! show GitHub release notes; everything else (a branch/ref-tracked install, a
-//! moved tag whose content changed, or a release whose notes cannot be
-//! bracketed) falls back to commit subjects from the compare endpoint.
-//!
-//! This is presentation metadata, not a gate: every failure path (rate limit,
-//! 404, a local source) returns [`UpdateChangelog::unavailable`] rather than an
-//! error, so a missing changelog never blocks an update the user already chose
-//! to review. It is assembled only in `install::preview_update`, behind an
-//! explicit user action, so the extra unauthenticated GitHub request (60/hr/IP)
-//! is never spent on a background sweep.
 
 use std::time::Duration;
 
@@ -24,30 +11,18 @@ use crate::github::{
 
 use super::source::PluginSource;
 
-/// At most this many release entries before marking the changelog truncated.
 const RELEASES_CAP: usize = 20;
-/// At most this many commit entries before marking the changelog truncated.
 const COMMITS_CAP: usize = 50;
-/// Truncate a release body to this many bytes (on a char boundary) so a
-/// pathological release note does not bloat the preview payload.
 const BODY_CAP: usize = 8 * 1024;
 
-/// What changed between the installed version and the update target. `entries`
-/// is newest-first. `truncated` flags that more existed than are shown.
-/// `unavailable_reason` distinguishes "could not load the changelog" from "there
-/// were genuinely no entries" (both leave `entries` empty).
 #[derive(Debug, Clone, Serialize)]
 pub struct UpdateChangelog {
     pub entries: Vec<ChangelogEntry>,
     pub truncated: bool,
     pub unavailable_reason: Option<String>,
-    /// A GitHub URL for the full history when the changelog is capped or a
-    /// surface cannot show it all (the releases page, or the compare view). The
-    /// non-scrollable TUI popup links to it; the web modal shows it on truncation.
     pub more_url: Option<String>,
 }
 
-/// One changelog item: a published release's notes, or a single commit subject.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChangelogEntry {
@@ -83,13 +58,10 @@ impl UpdateChangelog {
     }
 }
 
-/// The human GitHub base URL for a source, `https://github.com/{owner}/{repo}`.
 fn github_web_base(owner: &str, repo: &str) -> String {
     format!("https://github.com/{owner}/{repo}")
 }
 
-/// Map a GitHub error to a short, user-facing "unavailable" reason. A rate limit
-/// is the common one worth naming so the user knows to retry later.
 fn unavailable_for(err: &GitHubError) -> UpdateChangelog {
     let reason = match err {
         GitHubError::RateLimited => "GitHub rate limit reached; changelog unavailable.",
@@ -106,13 +78,10 @@ fn client() -> Result<GitHubClient, GitHubError> {
     })
 }
 
-/// The first line of a commit message, the conventional "subject".
 fn subject(message: &str) -> String {
     message.lines().next().unwrap_or("").trim().to_string()
 }
 
-/// Truncate `body` to [`BODY_CAP`] bytes on a char boundary, appending an
-/// ellipsis when cut.
 fn cap_body(body: String) -> String {
     if body.len() <= BODY_CAP {
         return body;
@@ -124,9 +93,6 @@ fn cap_body(body: String) -> String {
     format!("{}…", &body[..end])
 }
 
-/// Build the changelog between the installed version and the update target.
-/// Best-effort: returns an `unavailable` changelog rather than erroring on any
-/// failure.
 pub async fn build(
     source: &PluginSource,
     prior_ref: Option<&str>,
@@ -146,9 +112,6 @@ pub async fn build(
         Err(e) => return unavailable_for(&e),
     };
 
-    // Release path: only when the refs are distinct release tags we can bracket
-    // in the releases list. A moved tag (same ref, changed content) or an
-    // unbracketable pair falls through to the commit compare.
     if let (Some(prior_ref), Some(target_ref)) = (prior_ref, target_ref) {
         if prior_ref != target_ref {
             if let Some(changelog) =
@@ -165,12 +128,6 @@ pub async fn build(
     }
 }
 
-/// Collect release notes for the published releases strictly newer than
-/// `prior_ref` up to and including `target_ref`, bracketed by tag identity in
-/// the list order GitHub returns (newest-first). Returns `None` to signal "fall
-/// back to commits" when the pair cannot be bracketed (target tag absent, no
-/// release entries between them); returns `Some(unavailable)` on an API error so
-/// a rate limit does not silently turn into a noisy commit dump.
 async fn release_changelog(
     client: &GitHubClient,
     owner: &str,
@@ -191,12 +148,6 @@ async fn release_changelog(
     })
 }
 
-/// Pure release-bracketing: from the releases list (newest-first as GitHub
-/// returns it), collect published (non-draft, non-prerelease) entries from
-/// `target_ref` down to, but excluding, `prior_ref`. Returns `None` when the
-/// pair cannot be bracketed (target tag absent, or nothing sits between them),
-/// signalling the caller to fall back to commits. The bool is the truncation
-/// flag (cap hit, or the prior tag was older than the fetched page).
 fn bracket_releases(
     releases: &[GitHubRelease],
     prior_ref: &str,
@@ -233,18 +184,11 @@ fn bracket_releases(
     }
 
     if entries.is_empty() {
-        // Target tag never appeared, or nothing sits between the two tags: not a
-        // usable release bracket.
         return None;
     }
-    // The prior tag was older than the fetched page (or filtered out), so there
-    // may be releases we did not show.
     Some((entries, truncated || !found_prior))
 }
 
-/// Commit subjects on `head` not on `base`, newest-first. The compare endpoint
-/// returns commits oldest-first and caps the list at 250, so reverse for display
-/// and mark truncation off `total_commits`.
 async fn commit_changelog(
     client: &GitHubClient,
     owner: &str,
@@ -257,7 +201,6 @@ async fn commit_changelog(
         Err(e) => return unavailable_for(&e),
     };
 
-    // identical / behind have nothing meaningful to show going forward.
     if compare.commits.is_empty() {
         return UpdateChangelog::empty();
     }
@@ -274,10 +217,6 @@ async fn commit_changelog(
     }
 }
 
-/// Pure commit mapping: the compare endpoint returns commits oldest-first and
-/// caps the list at 250, so reverse for newest-first display, take [`COMMITS_CAP`],
-/// and mark truncation off the gap between `total_commits` and what was returned
-/// or shown.
 fn map_commits(commits: &[GitHubCompareCommit], total_commits: u64) -> (Vec<ChangelogEntry>, bool) {
     let returned = commits.len() as u64;
     let entries: Vec<ChangelogEntry> = commits
@@ -299,24 +238,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subject_takes_first_line() {
+    fn subject_and_body_are_trimmed_to_one_line_within_the_cap() {
         assert_eq!(subject("feat: add thing\n\nlong body"), "feat: add thing");
         assert_eq!(subject("  trimmed  "), "trimmed");
         assert_eq!(subject(""), "");
-    }
 
-    #[test]
-    fn cap_body_truncates_on_char_boundary() {
-        let body = "é".repeat(BODY_CAP); // each 'é' is 2 bytes, so this exceeds the cap
-        let capped = cap_body(body);
-        assert!(capped.ends_with('…'));
-        // The slice point landed on a valid boundary (no panic) and is bounded.
-        assert!(capped.len() <= BODY_CAP + "…".len());
-    }
-
-    #[test]
-    fn cap_body_keeps_short_bodies() {
         assert_eq!(cap_body("short".to_string()), "short");
+        // Each 'é' is two bytes, so this exceeds the cap.
+        let capped = cap_body("é".repeat(BODY_CAP));
+        assert!(capped.ends_with('…'));
+        assert!(capped.len() <= BODY_CAP + "…".len());
     }
 
     fn release(tag: &str, body: Option<&str>, prerelease: bool, draft: bool) -> GitHubRelease {
@@ -342,40 +273,30 @@ mod tests {
 
     #[test]
     fn bracket_collects_between_target_and_prior_exclusive() {
-        // Newest-first, as GitHub returns. prior=v1.0.0, target=v1.2.0.
         let releases = vec![
             release("v1.3.0", Some("newer, excluded"), false, false),
             release("v1.2.0", Some("target notes"), false, false),
+            release("v1.2.0-rc1", Some("rc"), true, false),
+            release("v1.1.5-draft", Some("draft"), false, true),
             release("v1.1.0", Some("middle notes"), false, false),
             release("v1.0.0", Some("prior, excluded"), false, false),
         ];
         let (entries, truncated) = bracket_releases(&releases, "v1.0.0", "v1.2.0").unwrap();
-        assert_eq!(release_tags(&entries), vec!["v1.2.0", "v1.1.0"]);
+        assert_eq!(
+            release_tags(&entries),
+            vec!["v1.2.0", "v1.1.0"],
+            "drafts and prereleases are filtered out of the bracket"
+        );
         assert!(!truncated, "prior tag was found in the page");
+
+        assert!(
+            bracket_releases(&releases, "v1.0.0", "v9.9.9").is_none(),
+            "an absent target has no bracket"
+        );
     }
 
     #[test]
-    fn bracket_filters_drafts_and_prereleases() {
-        let releases = vec![
-            release("v1.2.0", Some("target"), false, false),
-            release("v1.2.0-rc1", Some("rc"), true, false),
-            release("v1.1.5-draft", Some("draft"), false, true),
-            release("v1.1.0", Some("middle"), false, false),
-            release("v1.0.0", None, false, false),
-        ];
-        let (entries, _) = bracket_releases(&releases, "v1.0.0", "v1.2.0").unwrap();
-        assert_eq!(release_tags(&entries), vec!["v1.2.0", "v1.1.0"]);
-    }
-
-    #[test]
-    fn bracket_returns_none_when_target_absent() {
-        let releases = vec![release("v1.1.0", None, false, false)];
-        assert!(bracket_releases(&releases, "v1.0.0", "v9.9.9").is_none());
-    }
-
-    #[test]
-    fn bracket_truncates_when_prior_older_than_page() {
-        // prior tag is not present (older than the fetched page) => truncated.
+    fn bracket_truncates_when_prior_is_older_than_the_page() {
         let releases = vec![
             release("v2.0.0", Some("a"), false, false),
             release("v1.9.0", Some("b"), false, false),
@@ -410,7 +331,6 @@ mod tests {
 
     #[test]
     fn map_commits_reverses_to_newest_first_and_takes_subject() {
-        // GitHub returns oldest-first; display is newest-first.
         let commits = vec![
             commit("aaa", "first\n\nbody", "http://x/aaa"),
             commit("bbb", "second", ""),

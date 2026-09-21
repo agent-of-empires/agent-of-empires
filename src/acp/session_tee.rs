@@ -1,26 +1,3 @@
-//! Per-session tracing tee: mirrors session-scoped events into each
-//! session's `acp-workers/<id>.log` so `aoe acp logs --session <id>`
-//! surfaces the daemon's watchdog/cancel breadcrumbs, not just the
-//! startup marker plus agent stderr. Additive: events still flow to the
-//! shared `debug.log`. See issue #1864.
-//!
-//! Capture. Events are routed by their `session` (or rare `session_id`)
-//! field. A `tracing::info_span!("acp_session", session = %id)` wraps
-//! each daemon per-session connection task, so events that do not set the
-//! field explicitly still inherit it through the span scope. The layer
-//! reads the event's own fields first, then walks the span scope.
-//!
-//! I/O. Synchronous best-effort writes through a `SizeRotatingWriter` per
-//! session, mirroring the shared `debug.log` writer (same rare-rotation
-//! stall profile, so no new failure class). Writers are bounded by count
-//! and the least-recently-used one is evicted, so a long-lived daemon
-//! does not leak file handles. No background thread, no channel: dropping
-//! a breadcrumb during a spike would lose exactly the diagnostics this
-//! exists to capture.
-//!
-//! Re-entrancy. The writer never emits tracing; events with target
-//! `acp.tee` are skipped so any future self-reporting cannot loop.
-
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -35,22 +12,14 @@ use tracing_subscriber::Layer;
 use crate::logging::{RotationPolicy, SizeRotatingWriter};
 use crate::session::config::RotationKind;
 
-// The layer is installed generically (un-boxed) in the daemon subscriber
-// stack so its `Layer<S> for any S` impl resolves against the full layered
-// subscriber type, which a `Box<dyn Layer<Registry>>` could not name.
-
-/// Span name carrying the session id for scope-based capture. Entered at
-/// the daemon per-session connection task so nested events inherit the
-/// `session` field even when they do not set it explicitly.
+/// Span name carrying the session id for scope-based capture.
 pub const SESSION_SPAN: &str = "acp_session";
 
 /// Target reserved for the tee's own diagnostics; skipped on the event
 /// path to prevent re-entrancy.
 const TEE_TARGET: &str = "acp.tee";
 
-/// Cap on simultaneously-open per-session log files. Realistic concurrent
-/// session counts sit well under this; the bound only matters for a
-/// daemon that churns through many sessions over days.
+/// Cap on simultaneously-open per-session log files.
 const MAX_OPEN_SESSION_LOGS: usize = 64;
 const PER_SESSION_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const PER_SESSION_KEEP: u8 = 2;
@@ -92,8 +61,6 @@ impl SessionTeeLayer {
     }
 
     /// Resolve (or open) the per-session writer, updating LRU bookkeeping.
-    /// Returns `None` when the session id is unsafe or the file cannot be
-    /// opened; the caller silently drops the line in that case.
     fn writer_for(&self, session: &str) -> Option<Arc<Mutex<SizeRotatingWriter>>> {
         let mut cache = lock(&self.writers);
         cache.tick += 1;
@@ -104,11 +71,7 @@ impl SessionTeeLayer {
         }
         let path = crate::process::worker_registry::log_path_for(session).ok()?;
         // At capacity: evict the oldest entry whose writer is idle
-        // (`strong_count == 1`, only the cache holds it). Evicting a writer
-        // still in flight on another thread would let this call open a
-        // second `SizeRotatingWriter` on the same file and race its appends
-        // and rotation. If every cached writer is in flight, drop this event
-        // rather than open a racing writer.
+        // (`strong_count == 1`, only the cache holds it).
         if cache.map.len() >= MAX_OPEN_SESSION_LOGS {
             let evict = cache
                 .map
@@ -191,14 +154,14 @@ where
 }
 
 /// Lock that never panics on poison: a writer panic must not propagate
-/// out of the tracing event path. Recovers the inner guard instead.
+/// out of the tracing event path.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Debug-formatted values arrive quoted (`"abc"`); strip surrounding
 /// quotes so `session` values pass `log_path_for` validation and the
-/// rendered line reads cleanly. Mirrors `StageRecorder` in `deletion.rs`.
+/// rendered line reads cleanly.
 fn unquote(s: &str) -> String {
     s.trim_matches('"').to_string()
 }
@@ -228,9 +191,7 @@ impl Visit for SessionVisitor {
 }
 
 /// Visitor that both finds the session id and collects the renderable
-/// message plus remaining fields for the per-session line. The session
-/// field itself is not echoed into the line: the file is already
-/// per-session, so repeating it would be noise.
+/// message plus remaining fields for the per-session line.
 #[derive(Default)]
 struct LineVisitor {
     session: Option<String>,
@@ -288,11 +249,6 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::Registry;
 
-    fn with_temp_home<F: FnOnce()>(f: F) {
-        let _home = crate::session::test_support::isolate_app_dir();
-        f();
-    }
-
     fn read_log(session: &str) -> String {
         let p = crate::process::worker_registry::log_path_for(session).unwrap();
         std::fs::read_to_string(p).unwrap_or_default()
@@ -300,77 +256,39 @@ mod tests {
 
     #[test]
     #[serial]
-    fn routes_event_with_session_field_to_its_file() {
-        with_temp_home(|| {
-            let sub = Registry::default().with(SessionTeeLayer::new());
-            with_default(sub, || {
-                tracing::warn!(target: "acp.protocol", session = %"sess-a", "watchdog fired");
-            });
-            let body = read_log("sess-a");
-            assert!(body.contains("watchdog fired"), "got: {body}");
-            assert!(body.contains("acp.protocol"), "got: {body}");
+    fn tee_routes_each_event_to_its_own_session_log() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let sub = Registry::default().with(SessionTeeLayer::new());
+        with_default(sub, || {
+            tracing::info!(target: "acp.protocol", "no session here");
+            // `acp.tee` is skipped so the layer cannot re-enter itself.
+            tracing::warn!(target: "acp.tee", session = %"sess-z", "internal");
         });
-    }
+        let dir = crate::process::worker_registry::workers_dir().unwrap();
+        assert_eq!(
+            std::fs::read_dir(&dir).map(|rd| rd.count()).unwrap_or(0),
+            0,
+            "a sessionless event and an acp.tee event must not create a log file"
+        );
 
-    #[test]
-    #[serial]
-    fn no_cross_session_leakage() {
-        with_temp_home(|| {
-            let sub = Registry::default().with(SessionTeeLayer::new());
-            with_default(sub, || {
-                tracing::info!(target: "acp.protocol", session = %"sess-x", "x only");
-                tracing::info!(target: "acp.protocol", session = %"sess-y", "y only");
-            });
-            let x = read_log("sess-x");
-            let y = read_log("sess-y");
-            assert!(x.contains("x only") && !x.contains("y only"), "x log: {x}");
-            assert!(y.contains("y only") && !y.contains("x only"), "y log: {y}");
+        let sub = Registry::default().with(SessionTeeLayer::new());
+        with_default(sub, || {
+            tracing::warn!(target: "acp.protocol", session = %"sess-a", "watchdog fired");
+            tracing::info!(target: "acp.protocol", session = %"sess-x", "x only");
+            tracing::info!(target: "acp.protocol", session = %"sess-y", "y only");
+            let span = tracing::info_span!("acp_session", session = %"sess-span");
+            let _g = span.enter();
+            tracing::warn!(target: "acp.protocol", "inherited via span");
         });
-    }
-
-    #[test]
-    #[serial]
-    fn drops_event_without_session() {
-        with_temp_home(|| {
-            let sub = Registry::default().with(SessionTeeLayer::new());
-            with_default(sub, || {
-                tracing::info!(target: "acp.protocol", "no session here");
-            });
-            let dir = crate::process::worker_registry::workers_dir().unwrap();
-            let count = std::fs::read_dir(&dir).map(|rd| rd.count()).unwrap_or(0);
-            assert_eq!(count, 0, "a sessionless event must not create a log file");
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn inherits_session_from_span_scope() {
-        with_temp_home(|| {
-            let sub = Registry::default().with(SessionTeeLayer::new());
-            with_default(sub, || {
-                let span = tracing::info_span!("acp_session", session = %"sess-span");
-                let _g = span.enter();
-                // Event carries no explicit `session` field; it must be
-                // attributed via the enclosing span scope.
-                tracing::warn!(target: "acp.protocol", "inherited via span");
-            });
-            let body = read_log("sess-span");
-            assert!(body.contains("inherited via span"), "got: {body}");
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn skips_tee_target_to_avoid_reentrancy() {
-        with_temp_home(|| {
-            let sub = Registry::default().with(SessionTeeLayer::new());
-            with_default(sub, || {
-                tracing::warn!(target: "acp.tee", session = %"sess-z", "internal");
-            });
-            assert!(
-                read_log("sess-z").is_empty(),
-                "events on the acp.tee target must be skipped"
-            );
-        });
+        let a = read_log("sess-a");
+        assert!(
+            a.contains("watchdog fired") && a.contains("acp.protocol"),
+            "{a}"
+        );
+        let (x, y) = (read_log("sess-x"), read_log("sess-y"));
+        assert!(x.contains("x only") && !x.contains("y only"), "x log: {x}");
+        assert!(y.contains("y only") && !y.contains("x only"), "y log: {y}");
+        assert!(read_log("sess-span").contains("inherited via span"));
+        assert!(read_log("sess-z").is_empty());
     }
 }

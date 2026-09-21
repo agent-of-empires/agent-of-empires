@@ -65,7 +65,6 @@ describe("usePluginCommands keybinds", () => {
   it("invokes the worker on an action-less chord", async () => {
     fetchMock.mockResolvedValue({ commands: [refresh] });
     const { result } = renderHook(() => usePluginCommands([], "s1"));
-    // Action-less commands surface as palette actions once a session is active.
     await waitFor(() => expect(result.current.actions.length).toBe(1));
 
     fireEvent.keyDown(document, ctrl("r"));
@@ -89,7 +88,6 @@ describe("usePluginCommands keybinds", () => {
     fireEvent.keyDown(document, ctrl("g"));
     await waitFor(() => expect(result.current.overlay).not.toBeNull());
 
-    // Rendering the overlay lists both links.
     rerender();
     render(result.current.overlay!);
     expect(screen.getByText("one")).toBeTruthy();

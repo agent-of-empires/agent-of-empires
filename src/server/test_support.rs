@@ -1,9 +1,6 @@
 //! Test-only constructors that integration tests in `tests/` need to drive
-//! `reload_state_instances_from_disk` and the dynamic-profile-rewire helpers
-//! without going through the full daemon. Mirrors the pattern at
-//! `src/tmux/mod.rs`'s `test_support` module: gated on
-//! `#[cfg(any(test, feature = "test-support"))]` so the surface stays out of
-//! production builds, and `#[doc(hidden)]` so it's invisible in rustdoc.
+//! `reload_state_instances_from_disk` and the dynamic-profile-rewire helpers without going
+//! through the full daemon.
 
 use super::*;
 use crate::file_watch::FileWatchService;
@@ -17,10 +14,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 
-/// Build a minimal `Arc<AppState>` for helper-equivalence tests. Most
-/// fields are seeded with empty / default values; only `instances`,
-/// `recently_restarted`, and the file-watch trio are real. Acp
-/// fields are stubbed because the helper's acp overlay reads them.
+/// Build a minimal `Arc<AppState>` for helper-equivalence tests.
 pub fn build_test_app_state(prior: Vec<Instance>) -> Arc<AppState> {
     build_test_app_state_with_policy(prior, Vec::new(), Vec::new(), None)
 }
@@ -198,15 +192,11 @@ pub async fn rename_profile_disk_watch(state: &Arc<AppState>, old: &str, new: &s
 }
 
 /// Replace the `Arc<FileWatchService>` on a unique-Arc'd `AppState`.
-/// Tests build state with a `noop` service, then swap to live before
-/// exercising propagation paths. Crate-internal field access is
-/// hidden behind this helper so the field can stay `pub(crate)`.
 pub fn replace_file_watch(state: &mut AppState, fw: Arc<crate::file_watch::FileWatchService>) {
     state.file_watch = fw;
 }
 
-/// Read the current `Arc<FileWatchService>` for tests asserting on
-/// `subscriber_count`. The Arc clone is cheap.
+/// Read the current `Arc<FileWatchService>` for tests asserting on `subscriber_count`.
 pub fn file_watch(state: &AppState) -> Arc<crate::file_watch::FileWatchService> {
     state.file_watch.clone()
 }

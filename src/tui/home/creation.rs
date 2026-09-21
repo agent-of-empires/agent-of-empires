@@ -27,10 +27,9 @@ pub(super) enum CreationCommit {
     Duplicate(Box<Instance>),
 }
 
-/// Cross-process guards for a single-session title mutation or profile move.
-/// The source profile's lifecycle flock is intentionally nested inside the
-/// per-session title flock; callers retain this value through durable
-/// persistence and any tmux rekey so a terminal launch cannot observe the
+/// Cross-process guards for a single-session title mutation or profile move. The source
+/// profile's lifecycle flock nests inside the per-session title flock; callers retain this
+/// through durable persistence and any tmux rekey, so a terminal launch cannot observe the
 /// transition halfway through.
 pub(in crate::tui) struct SessionMutationGuards {
     pub(super) _session_title: crate::session::StorageFlock,
@@ -38,18 +37,17 @@ pub(in crate::tui) struct SessionMutationGuards {
 }
 
 impl HomeView {
-    /// Request background session creation. Used for sandbox sessions to avoid blocking UI.
-    /// Creates a stub instance in the session list with Status::Creating so the user
-    /// can see progress in the preview pane while continuing to use the TUI.
+    /// Request background session creation, used for sandbox sessions so the UI does not
+    /// block. A `Status::Creating` stub appears in the list, so progress shows in the
+    /// preview pane while the TUI stays usable.
     pub fn request_creation(
         &mut self,
         mut data: NewSessionData,
         hooks: Option<crate::session::HooksConfig>,
     ) {
-        // Pre-resolve the title using the same logic the builder will run, so the
-        // stub instance, the background creation, and the eventual real instance
-        // all agree on the title (otherwise an empty title would show as the path
-        // basename in the stub but a civilization name in the final instance).
+        // Pre-resolve the title with the logic the builder will run, so the stub, the
+        // background creation and the final instance agree; otherwise an empty title shows
+        // as the path basename in the stub and a civilization name in the instance.
         if data.title.is_empty() {
             let existing_titles: Vec<&str> = self
                 .instances()
@@ -91,9 +89,8 @@ impl HomeView {
         stub.yolo_mode = data.yolo_mode;
         stub.source_profile = data.profile.clone();
 
-        // Set stub worktree_info so project-mode grouping works during creation.
-        // The real worktree_info (with resolved main_repo_path) replaces this
-        // once build_instance completes.
+        // Set stub worktree_info so project-mode grouping works during creation; the real
+        // one, with a resolved main_repo_path, replaces it once build_instance completes.
         let stub_branch = data
             .worktree_branch
             .as_deref()
@@ -213,10 +210,9 @@ impl HomeView {
 
         // Clean up the stub and progress tracking
         let stub_id = self.creating_stub_id.take();
-        // Taken (not borrowed) so every early return below leaves the field
-        // empty: the provisional group paths belong to this stub alone, and a
-        // rolled-back or failed finalize must not carry them into the next
-        // creation.
+        // Taken, not borrowed, so every early return leaves the field empty: the
+        // provisional group paths belong to this stub alone and must not carry into the
+        // next creation.
         let provisional_group_paths = std::mem::take(&mut self.creating_provisional_group_paths);
         if let Some(ref id) = stub_id {
             self.creating_hook_progress.remove(id);
@@ -296,16 +292,15 @@ impl HomeView {
                 }
 
                 let Some(storage) = self.storages.get(&target_profile) else {
-                    // The block above either found or inserted this profile's
-                    // storage, so this is unreachable; bail without attaching
-                    // rather than panicking on a production path.
+                    // The block above found or inserted this profile's storage, so this is
+                    // unreachable; bail without attaching rather than panicking.
                     return None;
                 };
                 let persist_result = storage.update(|instances, groups| {
-                    // `save()` can run while the builder is working and persist
-                    // the placeholder. Remove that exact row under the same
-                    // storage lock used for collision detection and insertion,
-                    // otherwise the placeholder collides with its own result.
+                    // `save()` can run while the builder works and persist the
+                    // placeholder, so remove that exact row under the same storage lock used
+                    // for collision detection and insertion, or it collides with its own
+                    // result.
                     let removed_persisted_stub = stub_id.as_deref().is_some_and(|stub_id| {
                         let before = instances.len();
                         instances.retain(|row| row.id != stub_id);
@@ -313,10 +308,9 @@ impl HomeView {
                     });
                     if removed_persisted_stub && !provisional_group_paths.is_empty() {
                         groups.retain(|group| !provisional_group_paths.contains(&group.path));
-                        // A peer may have committed another row into one of
-                        // these paths. Rebuild from the remaining rows so its
-                        // group survives even though the stub-created metadata
-                        // was provisional.
+                        // A peer may have committed another row into one of these paths,
+                        // so rebuild from the remaining rows and let its group survive the
+                        // provisional stub metadata.
                         *groups = GroupTree::new_with_groups(instances, groups).get_all_groups();
                     }
                     if let Some(owner) = crate::session::find_duplicate_session(
@@ -407,10 +401,9 @@ impl HomeView {
                     },
                 }
 
-                // `publish_persisted_instance` records the create-count and
-                // clears the id from `pending_added` (the row is authoritative
-                // now, not a provisional add). Its in-memory insert is
-                // superseded by the `reload()` below on success, but is the
+                // `publish_persisted_instance` records the create-count and clears the id
+                // from `pending_added`, since the row is authoritative now. Its in-memory
+                // insert is superseded by the `reload()` below on success and is the
                 // fallback that keeps the row visible if that reload fails.
                 self.publish_persisted_instance(instance.clone());
                 self.rebuild_group_trees();
@@ -422,11 +415,10 @@ impl HomeView {
                 if let Err(e) = self.reload() {
                     tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
                 }
-                // The creation poller may have minted `before_start_env` while
-                // bringing the container up. It is `#[serde(skip)]`, so the
-                // reload above dropped it; carry it back onto the live instance
-                // (mirroring the CLI's `merge_post_start` and the structured-view
-                // stamp-back) so the agent launch reuses it instead of re-minting.
+                // The creation poller may have minted `before_start_env` while bringing the
+                // container up. It is `#[serde(skip)]`, so the reload dropped it; carry it
+                // back onto the live instance (as the CLI's `merge_post_start` does) so the
+                // agent launch reuses it instead of re-minting.
                 let minted = instance
                     .sandbox_info
                     .as_mut()
@@ -439,13 +431,9 @@ impl HomeView {
                         }
                     });
                 }
-                // reload()'s restore-previous-selection fallback lands
-                // the cursor on whichever flat_items index is closest
-                // to the now-removed stub, which in project-grouped
-                // layouts is often the new session's group folder.
-                // Pin selection onto the new session directly so the
-                // preview pane and dispatch in app.rs see the right
-                // row.
+                // reload()'s restore-previous-selection fallback lands the cursor on
+                // whichever index is closest to the removed stub, often the new session's
+                // group folder, so pin the selection onto the new session directly.
                 self.select_and_reveal_session(&session_id);
                 self.new_dialog = None;
 
@@ -525,9 +513,8 @@ impl HomeView {
         );
     }
 
-    /// Persist `confirm_before_quit = false` and update the cached flag so
-    /// the quit confirmation stops appearing. Called when the user ticks
-    /// "don't warn me again" in the quit dialog.
+    /// Persist `confirm_before_quit = false` and update the cached flag, when the user
+    /// ticks "don't warn me again" in the quit dialog.
     pub(in crate::tui) fn disable_confirm_before_quit(&mut self) {
         self.confirm_before_quit = false;
         if let Err(e) = update_config(|config| {
@@ -537,16 +524,15 @@ impl HomeView {
         }
     }
 
-    /// Persist the "don't warn me again" opt-out for whichever confirm
-    /// offered the checkbox. Both call sites (keyboard and click) route
-    /// through this so the two paths can't disagree about which confirms
-    /// are opt-out-able. Actions without a checkbox never reach it.
+    /// Persist the "don't warn me again" opt-out for whichever confirm offered the
+    /// checkbox. Both call sites route through this, so keyboard and click cannot disagree
+    /// about which confirms are opt-out-able; actions without a checkbox never reach it.
     pub(in crate::tui) fn apply_confirm_dont_ask_again(&mut self, action: &str) {
         match action {
             "quit" => self.disable_confirm_before_quit(),
-            // Written globally, matching the quit opt-out. A profile that
-            // overrides confirm_delete = true keeps prompting; that override
-            // is cleared from the settings pane, not from here.
+            // Written globally, matching the quit opt-out. A profile that overrides
+            // confirm_delete = true keeps prompting; that override is cleared from the
+            // settings pane.
             "trash_session" => {
                 if let Err(e) = update_config(|config| {
                     config.session.confirm_delete = false;
@@ -558,10 +544,9 @@ impl HomeView {
         }
     }
 
-    /// Clean up a pending creation on TUI shutdown. Waits briefly for the
-    /// background thread to finish so we can clean up worktrees/instances.
-    /// If the thread doesn't finish in time, the hook subprocess will
-    /// complete on its own and orphaned Creating stubs are cleaned up on
+    /// Clean up a pending creation on shutdown, waiting briefly for the background thread
+    /// so worktrees and instances can be cleaned up. If it does not finish in time the hook
+    /// subprocess completes on its own and orphaned Creating stubs are cleaned up on the
     /// next launch.
     pub fn cleanup_pending_creation(&mut self) {
         if !self.creation_poller.is_pending() {

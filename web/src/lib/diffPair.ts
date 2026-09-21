@@ -1,8 +1,4 @@
-// Convert an `(old_string, new_string)` pair into a `RichDiffHunk`
-// plus add/del counts, so the structured view Edit/Write card can drive its
-// body and its `+N −N` chip off a single line-diff pass. Uses
-// `@pierre/diffs` `parseDiffFromFile`, the same diff engine the diff
-// surfaces render with. See #1073 / #1074.
+// Line-diff an `(old_string, new_string)` pair into a `RichDiffHunk` plus counts, using the `@pierre/diffs` engine.
 
 import { parseDiffFromFile } from "@pierre/diffs";
 import type { RichDiffHunk, RichDiffLine } from "./types";
@@ -13,25 +9,18 @@ export interface DiffPairResult {
   dels: number;
 }
 
-/** Force a single trailing newline so the line diff doesn't treat
- *  "last line without `\n`" as a distinct token from "same line with
- *  `\n`". Without this, `"a\nb\nc"` vs `"a\nb\nc\nd"` registers as
- *  remove("c") + add("c\nd\n") instead of add("d\n"). */
+/** Without a shared trailing newline, appending a line diffs as a changed last line. */
 function withTrailingNewline(s: string): string {
   if (s === "") return s;
   return s.endsWith("\n") ? s : s + "\n";
 }
 
-/** `parseDiffFromFile` keeps the trailing newline on every line but
- *  the file's last; drop it (and a preceding `\r` from CRLF input) so
- *  `content` is the bare line text. */
+/** `parseDiffFromFile` keeps newlines on every line but the last; strip them (and CRLF's `\r`). */
 function stripNewline(s: string): string {
   return s.replace(/\r?\n$/, "");
 }
 
-/** Run a line-level diff over the pair and emit a `RichDiffHunk`
- *  shaped the same way the file-diff endpoint does, plus the running
- *  add/del tallies. Snippet line numbers start at 1 on each side. */
+/** Line numbers start at 1 on each side. */
 export function diffPair(oldText: string, newText: string): DiffPairResult {
   if (oldText === "" && newText === "") {
     return {
@@ -57,8 +46,7 @@ export function diffPair(oldText: string, newText: string): DiffPairResult {
   let dels = 0;
 
   if (oldNormalized === newNormalized) {
-    // Identical content yields no hunks; surface every line as `equal`
-    // so the renderer still shows the snippet.
+    // Identical content has no hunks; show every line as equal.
     for (const content of stripNewline(oldNormalized).split(/\r?\n/)) {
       lines.push({
         type: "equal",
@@ -68,9 +56,7 @@ export function diffPair(oldText: string, newText: string): DiffPairResult {
       });
     }
   } else {
-    // A context window this wide keeps every unchanged line in the hunk
-    // (no `@@`-collapsing), so the snippet renders in full and line
-    // numbers stay contiguous on both sides.
+    // A huge context keeps every unchanged line, so the snippet renders in full.
     const meta = parseDiffFromFile(
       { name: "f", contents: oldNormalized },
       { name: "f", contents: newNormalized },

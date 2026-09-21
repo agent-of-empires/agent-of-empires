@@ -1,4 +1,4 @@
-//! Linux-specific process utilities
+//! Linux-specific process utilities.
 
 use std::collections::HashMap;
 use std::fs;
@@ -9,9 +9,6 @@ pub(super) use super::unix::{
     configure_process_group, kill_process_group, terminate_process_group,
 };
 
-/// Collect `pid` and every descendant by walking `/proc` once to build a
-/// parent -> children map, then descending it. One `/proc` scan regardless of
-/// tree depth.
 pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
     let children_map = build_children_map();
     let mut pids = vec![pid];
@@ -19,7 +16,6 @@ pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
     pids
 }
 
-/// Scan `/proc` once and group every live PID by its parent.
 pub(super) fn build_children_map() -> HashMap<u32, Vec<u32>> {
     let mut children_map: HashMap<u32, Vec<u32>> = HashMap::new();
     let proc_dir = Path::new("/proc");
@@ -48,17 +44,8 @@ pub(super) fn build_children_map() -> HashMap<u32, Vec<u32>> {
     children_map
 }
 
-/// One `/proc` walk deciding, for each candidate `i`, whether a live process
-/// belongs to it: an `/proc/<pid>/environ` *entry* exactly equals
-/// `env_needles[i]` (NUL-delimited, so no prefix-collision), and
-/// `/proc/<pid>/cmdline` contains `cmdline_needles[i]` when both are supplied.
-/// An executable needle matches an exact argv-token basename. A candidate with
-/// one signal uses that one; otherwise every supplied signal must match.
-/// `environ` is owner-only,
-/// so only same-uid processes (our agent children among them) contribute an
-/// environment match. Skips entries that vanish or are unreadable mid-scan;
-/// stops early once every candidate is matched. Best-effort: an unreadable
-/// `/proc` yields all `false`.
+/// Environment entries are compared NUL-delimited, so there is no prefix collision.
+/// `environ` is owner-only, so only same-uid processes can match on it.
 pub(super) fn processes_matching(
     env_needles: &[String],
     cmdline_needles: &[Option<String>],
@@ -131,11 +118,6 @@ pub(super) fn processes_matching(
     found
 }
 
-/// Sample system memory from `/proc` and `/sys`: a handful of small pseudo-file
-/// reads, cheap enough for the background sampler. Any file that is missing or
-/// unparseable leaves its field at the default (0 for the always-present RAM
-/// figures, `None` for the optional ones) so a transient read never fabricates
-/// a reading.
 pub(super) fn sample_memory() -> super::metrics::MemorySample {
     let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let total = parse_meminfo_field(&meminfo, "MemTotal").map(kib_to_bytes);
@@ -146,10 +128,7 @@ pub(super) fn sample_memory() -> super::metrics::MemorySample {
     let psi_io_some_avg10 =
         parse_psi_some_avg10(&fs::read_to_string("/proc/pressure/io").unwrap_or_default());
 
-    // Both figures must be known together: a 0 available against a real total
-    // reads as 100% used, a false Critical. Old kernels (and WSL1) omit
-    // MemAvailable, so require both and otherwise report "unknown" (0/0), which
-    // the renderer shows as counts-only.
+    // Old kernels and WSL1 omit MemAvailable; report unknown rather than a false 100% used.
     let (total_bytes, available_bytes) = match (total, avail) {
         (Some(t), Some(a)) => (t, a),
         _ => (0, 0),
@@ -233,9 +212,6 @@ fn kib_to_bytes(kib: u64) -> u64 {
     kib.saturating_mul(1024)
 }
 
-/// Parse a `/proc/meminfo` line like `MemAvailable:   12345 kB` into its kB
-/// value. All meminfo size fields are in kB. Returns `None` if the key is
-/// absent or the value is not a number.
 fn parse_meminfo_field(meminfo: &str, key: &str) -> Option<u64> {
     for line in meminfo.lines() {
         let Some((name, rest)) = line.split_once(':') else {
@@ -244,15 +220,12 @@ fn parse_meminfo_field(meminfo: &str, key: &str) -> Option<u64> {
         if name.trim() != key {
             continue;
         }
-        // `rest` is like "   12345 kB"; the first whitespace token is the value.
         return rest.split_whitespace().next()?.parse().ok();
     }
     None
 }
 
-/// Parse the `some avg10` stall percentage from a `/proc/pressure/*` file. The
-/// `some` line looks like `some avg10=0.00 avg60=0.00 avg300=0.00 total=12345`.
-/// `None` if absent (e.g. PSI not compiled into the kernel), never a false 0.0.
+/// `None` when PSI is unavailable, never a false 0.0.
 fn parse_psi_some_avg10(psi: &str) -> Option<f32> {
     for line in psi.lines() {
         let mut fields = line.split_whitespace();
@@ -264,8 +237,6 @@ fn parse_psi_some_avg10(psi: &str) -> Option<f32> {
     None
 }
 
-/// Per-boot identity from `/proc/sys/kernel/random/boot_id`: constant for the
-/// boot's lifetime and immune to clock changes (the property the ledger needs).
 pub(super) fn boot_id() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
@@ -273,36 +244,26 @@ pub(super) fn boot_id() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Get the foreground process group leader for a shell PID
-/// Walks the process tree to find the actual foreground process
 pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
-    // Read the shell's stat to get its controlling terminal
     let stat_path = format!("/proc/{}/stat", shell_pid);
     let stat_content = fs::read_to_string(&stat_path).ok()?;
 
-    // Parse stat: pid (comm) state ppid pgrp session tty_nr tpgid ...
-    // tpgid (field 8, 0-indexed 7) is the foreground process group ID
     let tpgid = parse_stat_field(&stat_content, 7)?;
 
     if tpgid <= 0 {
         return Some(shell_pid);
     }
 
-    // Find a process in the foreground process group
-    // The tpgid is a process group ID, we need to find a process in that group
     find_process_in_group(tpgid as u32).or(Some(shell_pid))
 }
 
-/// Find a process that belongs to the given process group
 fn find_process_in_group(pgrp: u32) -> Option<u32> {
     let proc_dir = Path::new("/proc");
     if !proc_dir.exists() {
         return None;
     }
 
-    // Skip-and-continue on any unreadable or non-PID entry (a process can
-    // exit between readdir and the stat read); aborting the whole scan on
-    // one transient entry would silently fall back to the shell PID.
+    // A process can exit mid-scan; skip it rather than abort to the shell pid.
     for entry in fs::read_dir(proc_dir).ok()?.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
@@ -316,7 +277,6 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
             continue;
         };
 
-        // Field 5 (0-indexed 4) is the process group ID
         if let Some(proc_pgrp) = parse_stat_field(&content, 4) {
             if proc_pgrp as u32 == pgrp {
                 return Some(pid);
@@ -335,21 +295,16 @@ pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     Some((ppid, String::from_utf8_lossy(argv0).into_owned()))
 }
 
-/// Parse a field from `/proc/[pid]/stat`; `comm` (field 2) may contain spaces.
+/// `comm` (field 2) may contain spaces.
 fn parse_stat_field(content: &str, field_idx: usize) -> Option<i64> {
-    // Find the closing paren of comm field, then parse from there
     let close_paren = content.rfind(')')?;
     let after_comm = &content[close_paren + 2..]; // Skip ") "
 
-    // Fields after comm start at index 2 (state is index 2)
-    // So field_idx 4 means we want the 3rd field after comm (index 2 in after_comm split)
     let adjusted_idx = field_idx.checked_sub(2)?;
     let fields: Vec<&str> = after_comm.split_whitespace().collect();
     fields.get(adjusted_idx)?.parse().ok()
 }
 
-/// Prevents user-idle system sleep by holding a `systemd-inhibit` block lock.
-/// `--what=idle:sleep` blocks idle sleep only (the display still sleeps).
 pub(super) struct SystemdInhibitor {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
@@ -391,20 +346,14 @@ impl super::SleepInhibit for SystemdInhibitor {
             }
             Err(e) => return Err(e.into()),
         };
-        // Retain the piped stdin: `systemd-inhibit` holds the lock only while
-        // the wrapped `cat` runs, and `cat` runs until its stdin hits EOF.
-        // Dropping this handle early sends EOF and releases the lock at once,
-        // so it stays owned for the whole assertion.
+        // `systemd-inhibit` holds the lock only while `cat` runs, which ends at stdin EOF.
         self.stdin = child.stdin.take();
         self.child = Some(child);
         Ok(())
     }
 
     fn release(&mut self) {
-        // Close our stdin fd (cat sees EOF), then SIGKILL as a guaranteed
-        // fallback: logind releases the lock on the holder's death by any
-        // cause, and an uncatchable kill means `wait` cannot wedge on a stuck
-        // child. Then reap.
+        // logind releases the lock when the holder dies by any cause.
         self.stdin = None;
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -427,9 +376,7 @@ mod tests {
 
     #[test]
     fn test_parse_stat_field() {
-        // Example stat line (simplified)
         let stat = "1234 (bash) S 1233 1234 1234 34816 1234 4194304 1234 0 0 0";
-        // Fields: pid(0) comm(1) state(2) ppid(3) pgrp(4) session(5) tty(6) tpgid(7) ...
 
         assert_eq!(parse_stat_field(stat, 3), Some(1233)); // ppid
         assert_eq!(parse_stat_field(stat, 4), Some(1234)); // pgrp
@@ -450,7 +397,6 @@ Cached:          5678901 kB
             ("MemAvailable", Some(9876543)),
             ("MemFree", Some(1234567)),
             ("Nonexistent", None),
-            // Substring of a real key must not match (split on ':' + trim).
             ("Mem", None),
         ];
         for (key, expected) in cases {
@@ -460,7 +406,6 @@ Cached:          5678901 kB
 
     #[test]
     fn test_sample_used_derivation() {
-        // used = total - available, and used_fraction tracks it.
         let total = parse_meminfo_field(MEMINFO, "MemTotal")
             .map(kib_to_bytes)
             .unwrap();
@@ -483,9 +428,7 @@ some avg10=1.23 avg60=4.56 avg300=7.89 total=123456789
 full avg10=0.10 avg60=0.20 avg300=0.30 total=42
 ";
         assert_eq!(parse_psi_some_avg10(psi), Some(1.23));
-        // PSI not compiled in / empty file -> None (not a false 0.0).
         assert_eq!(parse_psi_some_avg10(""), None);
-        // Only a `full` line, no `some` -> None.
         assert_eq!(parse_psi_some_avg10("full avg10=5.0 total=9"), None);
     }
 }

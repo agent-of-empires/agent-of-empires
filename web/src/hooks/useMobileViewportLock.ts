@@ -1,8 +1,6 @@
 import { useEffect } from "react";
 
-// The dashboard has no document-level scrolling surface. Keep that invariant
-// at the app boundary so a Safari gesture or focus adjustment cannot move a
-// terminal, composer, or toolbar as a single page-sized sheet.
+// The dashboard has no document-level scroll; keep Safari from panning the whole page.
 export function useMobileViewportLock() {
   useEffect(() => {
     const media = window.matchMedia?.("(pointer: coarse)");

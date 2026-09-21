@@ -1,21 +1,14 @@
-// Sidebar "rate-limited" indicator, computed from the session payload the
-// sidebar already polls. The daemon reports `rate_limit` from its durable
-// event-store park, so a session that resumed overnight with no tab open
-// clears here on the next poll; the old localStorage mirror only updated
-// while a structured view hook was mounted (#3514).
+// Sidebar rate-limit indicator from the polled session payload.
 
 import type { SessionResponse } from "./types";
 
 export interface SidebarRateLimit {
-  /** How many of the given sessions are currently rate-limited. */
   count: number;
-  /** Soonest `resets_at` across the rate-limited sessions, or null. */
+  /** Soonest `resets_at`, or null. */
   resetsAt: string | null;
 }
 
-/** Aggregate for one workspace row, or null when none of its sessions is
- *  rate-limited. A session whose agent reported no reset still counts; it
- *  just contributes no time to the "resets at" hint (#3152). */
+/** Null when no session is rate-limited; one without a reported reset still counts. */
 export function summarizeRateLimits(sessions: readonly Pick<SessionResponse, "rate_limit">[]): SidebarRateLimit | null {
   let count = 0;
   let soonest: string | null = null;

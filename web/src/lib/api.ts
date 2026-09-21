@@ -16,9 +16,21 @@ import type {
   SettingsFieldDescriptor,
 } from "./types";
 import type { ConfigOptionDescriptor } from "./acpTypes";
+import type { ResolvedTheme } from "./theme";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
 
-// GET a JSON endpoint; returns null on non-2xx or network/parse errors.
+// --- Request helpers ---
+
+type Payload = Record<string, unknown>;
+
+interface Reply {
+  ok: boolean;
+  status: number;
+  /** Parsed JSON body, or null when the body is not JSON. */
+  payload: Payload | null;
+}
+
+/** Null on non-2xx or network/parse errors. */
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T | null> {
   try {
     const res = await fetch(url, init);
@@ -27,6 +39,63 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T | null> 
   } catch {
     return null;
   }
+}
+
+async function fetchOk(url: string, init?: RequestInit): Promise<boolean> {
+  try {
+    return (await fetch(url, init)).ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Rejects only on a network failure. */
+async function send(url: string, init?: RequestInit): Promise<Reply> {
+  const res = await fetch(url, init);
+  const payload = (await res.json().catch(() => null)) as Payload | null;
+  return { ok: res.ok, status: res.status, payload };
+}
+
+const jsonInit = (method: string, body?: unknown, headers: Record<string, string> = {}): RequestInit => ({
+  method,
+  headers: { "Content-Type": "application/json", ...headers },
+  body: JSON.stringify(body),
+});
+
+const ACCEPT_JSON = { Accept: "application/json" };
+
+const stringField = (payload: Payload | null | undefined, key: string): string | undefined =>
+  typeof payload?.[key] === "string" ? (payload[key] as string) : undefined;
+
+/** The unchecked `message` of an error body. */
+const rawMessage = (payload: Payload | null | undefined) => payload?.message as string | undefined;
+
+const networkError = (e: unknown) => `Network error: ${e instanceof Error ? e.message : "connection failed"}`;
+
+type Failure = { kind: "error"; message: string };
+
+/** Map a reply to `toOk`'s variant, or a failure carrying the server message. */
+async function kindRequest<Ok>(
+  url: string,
+  init: RequestInit,
+  toOk: (payload: Payload) => Ok | null,
+  fallback: string | ((status: number) => string),
+): Promise<Ok | Failure> {
+  const reply = await send(url, init).catch(() => null);
+  if (!reply) return { kind: "error", message: "Network error." };
+  const ok = reply.ok && reply.payload ? toOk(reply.payload) : null;
+  if (ok) return ok;
+  const message =
+    stringField(reply.payload, "message") ??
+    (typeof fallback === "string" ? `${fallback} (HTTP ${reply.status}).` : fallback(reply.status));
+  return { kind: "error", message };
+}
+
+/** `{ ok }` plus the server's string `message` on failure. */
+async function okWithMessage(url: string, init: RequestInit): Promise<{ ok: boolean; message?: string }> {
+  const reply = await send(url, init).catch(() => null);
+  if (!reply) return { ok: false };
+  return reply.ok ? { ok: true } : { ok: false, message: stringField(reply.payload, "message") };
 }
 
 // --- Sessions ---
@@ -48,17 +117,12 @@ export interface ConversationSearchHit {
   match_count: number;
 }
 
-interface ConversationSearchResponse {
-  results: ConversationSearchHit[];
-}
-
-// Full-text search over session conversation content. Returns one hit per
-// matching session, newest first. `signal` lets the caller abort a stale
-// in-flight search when the query changes.
+/** Full-text search over conversations: one hit per matching session, newest first. */
 export async function searchConversations(query: string, signal?: AbortSignal): Promise<ConversationSearchHit[]> {
-  const res = await fetchJson<ConversationSearchResponse>(`/api/sessions/search?q=${encodeURIComponent(query)}`, {
-    signal,
-  });
+  const res = await fetchJson<{ results: ConversationSearchHit[] }>(
+    `/api/sessions/search?q=${encodeURIComponent(query)}`,
+    { signal },
+  );
   return res?.results ?? [];
 }
 
@@ -75,24 +139,12 @@ export interface RecentProjectsEnvelope {
   projects: RecentProjectEntry[];
 }
 
-// Persisted recent projects (newest first), so a project stays in the wizard
-// Recent tab after its last session is deleted. Merged with the live
-// session-derived list in ProjectStep.
 export function fetchRecentProjects(): Promise<RecentProjectsEnvelope | null> {
   return fetchJson<RecentProjectsEnvelope>("/api/recent-projects");
 }
 
-export async function updateWorkspaceOrdering(order: string[]): Promise<boolean> {
-  try {
-    const res = await fetch("/api/workspace-ordering", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ order }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+export function updateWorkspaceOrdering(order: string[]): Promise<boolean> {
+  return fetchOk("/api/workspace-ordering", jsonInit("PUT", { order }));
 }
 
 export interface EnsureSessionResult {
@@ -104,43 +156,24 @@ export interface EnsureSessionResult {
 
 export async function ensureSession(id: string, signal?: AbortSignal): Promise<EnsureSessionResult> {
   try {
-    const res = await fetch(`/api/sessions/${id}/ensure`, {
-      method: "POST",
-      signal,
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) {
+    const { ok, status, payload } = await send(`/api/sessions/${id}/ensure`, { method: "POST", signal });
+    if (!ok) {
       return {
         ok: false,
-        error: typeof body.error === "string" ? body.error : undefined,
-        message: typeof body.message === "string" ? body.message : `Server error (${res.status})`,
+        error: stringField(payload, "error"),
+        message: stringField(payload, "message") ?? `Server error (${status})`,
       };
     }
-    return {
-      ok: true,
-      status: body.status as "alive" | "restarted" | undefined,
-    };
+    return { ok: true, status: payload?.status as "alive" | "restarted" | undefined };
   } catch (e) {
-    if ((e as { name?: string }).name === "AbortError") {
-      return { ok: false, error: "aborted" };
-    }
-    return {
-      ok: false,
-      message: e instanceof Error ? e.message : "Network error",
-    };
+    if ((e as { name?: string }).name === "AbortError") return { ok: false, error: "aborted" };
+    return { ok: false, message: e instanceof Error ? e.message : "Network error" };
   }
 }
 
-export async function ensureTerminal(id: string, index = 0, container = false): Promise<boolean> {
+export function ensureTerminal(id: string, index = 0, container = false): Promise<boolean> {
   const path = container ? "container-terminal" : "terminal";
-  try {
-    const res = await fetch(`/api/sessions/${id}/${path}?index=${index}`, {
-      method: "POST",
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+  return fetchOk(`/api/sessions/${id}/${path}?index=${index}`, { method: "POST" });
 }
 
 function fileToBase64(file: File): Promise<string> {
@@ -149,7 +182,7 @@ function fileToBase64(file: File): Promise<string> {
     reader.onerror = () => reject(reader.error ?? new Error("read failed"));
     reader.onload = () => {
       const result = reader.result as string;
-      // Drop the `data:<mime>;base64,` prefix; the server wants raw base64.
+      // The server wants raw base64 without the `data:<mime>;base64,` prefix.
       const comma = result.indexOf(",");
       resolve(comma >= 0 ? result.slice(comma + 1) : result);
     };
@@ -157,51 +190,29 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
-/**
- * Upload a clipboard image pasted into the live terminal. The host writes it
- * into the session worktree and returns the path the tmux pane can read, so
- * the CLI agent (e.g. Claude Code) attaches it. Returns null on any failure.
- * See #2678.
- */
+/** Upload a clipboard image pasted into the live terminal; returns the host path the agent can read. */
 export async function pasteImage(id: string, file: File): Promise<string | null> {
   try {
     const data = await fileToBase64(file);
-    const res = await fetch(`/api/sessions/${id}/paste-image`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mime_type: file.type, data }),
-    });
-    if (!res.ok) return null;
-    const body = await res.json().catch(() => ({}));
-    return typeof body.path === "string" ? body.path : null;
+    const body = await fetchJson<Payload>(
+      `/api/sessions/${id}/paste-image`,
+      jsonInit("POST", { mime_type: file.type, data }),
+    );
+    return stringField(body, "path") ?? null;
   } catch {
     return null;
   }
 }
 
-/** Kill an extra terminal tab's host + container shells (index >= 1). Index 0
- *  is the primary terminal shared with the native TUI and cannot be killed
- *  from the web UI (the server rejects it); closing that tab only hides it. */
-export async function killTerminal(id: string, index: number): Promise<boolean> {
-  try {
-    const res = await fetch(`/api/sessions/${id}/terminal?index=${index}`, {
-      method: "DELETE",
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+/** Kill an extra terminal tab (index >= 1); the server rejects the primary terminal. */
+export function killTerminal(id: string, index: number): Promise<boolean> {
+  return fetchOk(`/api/sessions/${id}/terminal?index=${index}`, { method: "DELETE" });
 }
 
 export function getSessionDiffFiles(id: string): Promise<RichDiffFilesResponse | null> {
   return fetchJson<RichDiffFilesResponse>(`/api/sessions/${id}/diff/files`);
 }
 
-/**
- * Fetch raw old/new contents plus a server-computed unified patch for a
- * file; the client renders the patch via `@pierre/diffs` without re-diffing.
- * See {@link RichFileContentsResponse}.
- */
 export function getSessionFileContents(
   id: string,
   filePath: string,
@@ -218,11 +229,7 @@ export interface SessionFileResponse {
   truncated: boolean;
 }
 
-/**
- * Read a session file for the file viewer (#3088). Path may be project-relative
- * or an absolute path the agent touched this session; the server enforces
- * provenance confinement. See `GET /api/sessions/{id}/file`.
- */
+/** Read a session file; the server confines the path to the session's provenance. */
 export function getSessionFile(id: string, filePath: string): Promise<SessionFileResponse | null> {
   const params = new URLSearchParams({ path: filePath });
   return fetchJson<SessionFileResponse>(`/api/sessions/${id}/file?${params.toString()}`);
@@ -271,29 +278,19 @@ export function fetchSettings(profile?: string): Promise<SettingsResponse | null
   return fetchJson<SettingsResponse>(`/api/settings${params}`);
 }
 
-/** Fetch this install's CityHall config bundle as TOML text (settings +
- *  projects), for an admin to hand to CityHall. Throws with the server's
- *  message so the Settings page can show why an export failed. */
+/** This install's CityHall config bundle as TOML; throws with the server's message. */
 export async function fetchCityHallBundle(): Promise<string> {
   const res = await fetch("/api/cityhall/bundle");
   if (!res.ok) {
-    // The failure body is JSON (`{error, message}`); fall back to the status
-    // when it is not, e.g. the 403 CityHall client mode returns.
     const detail = await res.json().catch(() => null);
     throw new Error(detail?.message ?? `Export failed (HTTP ${res.status})`);
   }
   return res.text();
 }
 
-// The schema is static for the server's run, and the profile-settings write
-// guard (`updateProfileSettings`) derives its section allowlist from it, so we
-// cache the first successful fetch and reuse it instead of refetching on every
-// save. A failed fetch is not cached, so the next call retries.
+// The schema is static per server run; only a successful fetch is cached.
 let schemaPromise: Promise<SettingsFieldDescriptor[] | null> | null = null;
 
-/** Fetch the settings schema (single source of truth, #1692). The generic
- *  settings renderer builds form rows from these descriptors instead of
- *  hand-written per-field JSX. */
 export function getSettingsSchema(): Promise<SettingsFieldDescriptor[] | null> {
   if (!schemaPromise) {
     schemaPromise = fetchJson<SettingsFieldDescriptor[]>("/api/settings/schema").then((s) => {
@@ -304,7 +301,7 @@ export function getSettingsSchema(): Promise<SettingsFieldDescriptor[] | null> {
   return schemaPromise;
 }
 
-/** Test-only seam: drop the cached schema so each test starts cold. */
+/** Test-only seam: drop the cached schema. */
 export function resetSettingsSchemaCache(): void {
   schemaPromise = null;
 }
@@ -316,20 +313,15 @@ export interface PluginView {
   name: string;
   version: string;
   description: string;
-  /** Lucide kebab-case identity icon name, straight from the manifest. */
+  /** Lucide kebab-case icon name. */
   icon: string | null;
-  /** Resolved URL for the manifest's `icon_asset` (served from the plugin's
-   *  install directory), null for a builtin or a plugin with no icon_asset. */
   icon_asset_url: string | null;
   enabled: boolean;
   builtin: boolean;
-  /** Validation provenance: "builtin" | "featured" | "community" | "local". */
+  /** "builtin" | "featured" | "community" | "local". */
   validation: string;
   source: string | null;
   capabilities: string[];
-  /** UI slots the plugin declares it will render into (#2366), disclosed so the
-   *  user sees the plugin modifies the dashboard. Not a capability (needs no
-   *  grant). `slot` is the kebab-case slot name. */
   ui_contributions: { slot: string; id: string }[];
   granted: boolean;
   needs_reapproval: boolean;
@@ -340,23 +332,15 @@ export interface PluginListResponse {
   load_errors: string[];
 }
 
-/** Outcome of a plugin enable/disable toggle. On success the server returns
- *  the refreshed list; on failure it returns the error JSON (403 read_only /
- *  elevation_required, or 400 plugin_error). A 403 `elevation_required` is
- *  handled globally by the fetch interceptor, which pops the passphrase
- *  prompt, the same as any other elevated request. */
-export type PluginToggleResult = { kind: "ok"; data: PluginListResponse } | { kind: "error"; message: string };
+export type PluginToggleResult = { kind: "ok"; data: PluginListResponse } | Failure;
 
 export function fetchPlugins(): Promise<PluginListResponse | null> {
   return fetchJson<PluginListResponse>("/api/plugins");
 }
 
-/** A command's client-executed action (`api_version >= 6`). `open-ui-link` opens
- *  the `href` from the plugin's own per-session UI-state entry at `(slot, id)`. */
+/** `open-ui-link` opens the `href` from the plugin's UI-state entry at `(slot, id)`. */
 export type PluginClientAction = { kind: "open-ui-link"; slot: PluginUiSlot; id: string };
 
-/** One active plugin command (`GET /api/plugins/commands`), normalized for the
- *  command palette and keymap. */
 export interface PluginCommand {
   fqid: string;
   plugin_id: string;
@@ -375,19 +359,7 @@ export function fetchPluginCommands(): Promise<PluginCommandsResponse | null> {
   return fetchJson<PluginCommandsResponse>("/api/plugins/commands");
 }
 
-function isValidPluginListResponse(payload: unknown): payload is PluginListResponse {
-  return (
-    typeof payload === "object" &&
-    payload !== null &&
-    Array.isArray((payload as Record<string, unknown>).plugins) &&
-    Array.isArray((payload as Record<string, unknown>).load_errors)
-  );
-}
-
-/** One plugin's update status (`GET /api/plugins/updates`). An on-demand
- *  network check, kept off the always-on plugin list. `available` is a short
- *  commit for an outdated GitHub source, "modified" for a changed local tree,
- *  or null when current. `error` is set when the check could not run. */
+/** `available` is a short commit for an outdated GitHub source, "modified" for a changed local tree, or null. */
 export interface PluginUpdateStatus {
   id: string;
   source: string;
@@ -397,28 +369,17 @@ export interface PluginUpdateStatus {
   error: string | null;
 }
 
-export type PluginUpdatesResult = { kind: "ok"; updates: PluginUpdateStatus[] } | { kind: "error"; message: string };
+export type PluginUpdatesResult = { kind: "ok"; updates: PluginUpdateStatus[] } | Failure;
 
-/** Check installed plugins for updates. Returns a discriminated result (like
- *  discoverPlugins) so this explicit action can report why it failed instead of
- *  silently doing nothing on an HTTP/network/JSON error. */
-export async function fetchPluginUpdates(): Promise<PluginUpdatesResult> {
-  try {
-    const res = await fetch("/api/plugins/updates", { headers: { Accept: "application/json" } });
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && Array.isArray(payload.updates)) {
-      return { kind: "ok", updates: payload.updates as PluginUpdateStatus[] };
-    }
-    const message =
-      typeof payload?.message === "string" ? (payload.message as string) : `Update check failed (HTTP ${res.status}).`;
-    return { kind: "error", message };
-  } catch {
-    return { kind: "error", message: "Network error." };
-  }
+export function fetchPluginUpdates(): Promise<PluginUpdatesResult> {
+  return kindRequest(
+    "/api/plugins/updates",
+    { headers: ACCEPT_JSON },
+    (p) => (Array.isArray(p.updates) ? { kind: "ok" as const, updates: p.updates as PluginUpdateStatus[] } : null),
+    "Update check failed",
+  );
 }
 
-/** One discovery result (`GET /api/plugins/discover`). Repo-level: the dashboard
- *  has no install path, so it shows `install_command` for the user to copy. */
 export interface PluginDiscoveryResult {
   slug: string;
   html_url: string;
@@ -426,37 +387,23 @@ export interface PluginDiscoveryResult {
   stars: number;
   badge: "installed" | "featured" | "unvetted";
   install_command: string;
-  /** The repo owner's GitHub avatar; a source-identity affordance, NOT the
-   *  plugin's own icon (unknown until a manifest fetch, which discovery
-   *  results never do). */
+  /** The repo owner's GitHub avatar, not the plugin's own icon. */
   source_avatar_url: string;
 }
 
-export type DiscoverResult = { kind: "ok"; results: PluginDiscoveryResult[] } | { kind: "error"; message: string };
+export type DiscoverResult = { kind: "ok"; results: PluginDiscoveryResult[] } | Failure;
 
-/** Search the `aoe-plugin` GitHub topic. Returns the error message (notably the
- *  unauthenticated rate limit) so the UI can show it rather than failing
- *  silently. */
-export async function discoverPlugins(query: string): Promise<DiscoverResult> {
+/** Search the `aoe-plugin` GitHub topic. */
+export function discoverPlugins(query: string): Promise<DiscoverResult> {
   const qs = query.trim() ? `?q=${encodeURIComponent(query.trim())}` : "";
-  try {
-    const res = await fetch(`/api/plugins/discover${qs}`, {
-      headers: { Accept: "application/json" },
-    });
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && Array.isArray(payload.results)) {
-      return { kind: "ok", results: payload.results as PluginDiscoveryResult[] };
-    }
-    const message =
-      typeof payload?.message === "string" ? (payload.message as string) : `Discovery failed (HTTP ${res.status}).`;
-    return { kind: "error", message };
-  } catch {
-    return { kind: "error", message: "Network error." };
-  }
+  return kindRequest(
+    `/api/plugins/discover${qs}`,
+    { headers: ACCEPT_JSON },
+    (p) => (Array.isArray(p.results) ? { kind: "ok" as const, results: p.results as PluginDiscoveryResult[] } : null),
+    "Discovery failed",
+  );
 }
 
-/** A plugin's manifest fields as shown in the detail modal (parsed leniently
- *  server-side, so a plugin targeting a newer api_version still renders). */
 export interface PluginDetailManifest {
   id: string;
   name: string;
@@ -465,16 +412,11 @@ export interface PluginDetailManifest {
   api_version: number;
   capabilities: string[];
   ui_contributions: { slot: string; id: string }[];
-  /** Screenshot/GIF previews, each resolved server-side to a raw.githubusercontent.com URL. */
   screenshots: { src: string; alt: string; caption: string }[];
-  /** Lucide kebab-case identity icon name. */
   icon: string | null;
-  /** The manifest's `icon_asset`, resolved server-side to a raw.githubusercontent.com URL. */
   icon_asset_url: string | null;
 }
 
-/** On-demand detail for one plugin source (`GET /api/plugins/details`): manifest
- *  fields plus the repo's published release tags (the available versions). */
 export interface PluginDetail {
   source: string;
   manifest: PluginDetailManifest | null;
@@ -482,54 +424,36 @@ export interface PluginDetail {
   release_tags: string[];
 }
 
-export type PluginDetailResult = { kind: "ok"; detail: PluginDetail } | { kind: "error"; message: string };
+export type PluginDetailResult = { kind: "ok"; detail: PluginDetail } | Failure;
 
-/** Fetch a plugin source's detail (manifest + release tags) for the modal.
- *  Only gh:owner/repo sources are supported server-side. */
-export async function fetchPluginDetails(source: string): Promise<PluginDetailResult> {
-  try {
-    const res = await fetch(`/api/plugins/details?source=${encodeURIComponent(source)}`, {
-      headers: { Accept: "application/json" },
-    });
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && typeof payload.source === "string") {
-      return { kind: "ok", detail: payload as unknown as PluginDetail };
-    }
-    const message =
-      typeof payload?.message === "string" ? (payload.message as string) : `Details failed (HTTP ${res.status}).`;
-    return { kind: "error", message };
-  } catch {
-    return { kind: "error", message: "Network error." };
-  }
+export function fetchPluginDetails(source: string): Promise<PluginDetailResult> {
+  return kindRequest(
+    `/api/plugins/details?source=${encodeURIComponent(source)}`,
+    { headers: ACCEPT_JSON },
+    (p) => (typeof p.source === "string" ? { kind: "ok" as const, detail: p as unknown as PluginDetail } : null),
+    "Details failed",
+  );
 }
 
-/** One UI slot disclosed in an update consent (mirrors the engine `UiView`). */
 export interface PluginUpdateUiView {
   slot: string;
   id: string;
 }
 
-/** One changelog item between the installed and target version: a release's
- *  notes, or a single commit subject. Mirrors Rust `ChangelogEntry`. */
+/** Mirrors Rust `ChangelogEntry`. */
 export type PluginChangelogEntry =
   | { kind: "release"; tag: string; body: string | null; published_at: string | null }
   | { kind: "commit"; sha: string; subject: string; url: string | null };
 
-/** What changed between the installed version and the update target, mirroring
- *  Rust `UpdateChangelog`. `unavailable_reason` distinguishes "could not load"
- *  from "no entries" (both leave `entries` empty); `truncated` flags that more
- *  existed than are shown. */
+/** Mirrors Rust `UpdateChangelog`; `unavailable_reason` separates "could not load" from "no entries". */
 export interface PluginUpdateChangelog {
   entries: PluginChangelogEntry[];
   truncated: boolean;
   unavailable_reason: string | null;
-  /** GitHub URL for the full history (releases page or compare view), shown when
-   *  the changelog is truncated. */
   more_url: string | null;
 }
 
-/** Structured disclosure for a capability-expanding plugin update, mirroring the
- *  Rust `UpdateConsent`. Drives the consent modal. */
+/** Mirrors Rust `UpdateConsent`. */
 export interface PluginUpdateConsent {
   id: string;
   from_version: string;
@@ -547,22 +471,16 @@ export interface PluginUpdateConsent {
   changelog: PluginUpdateChangelog;
 }
 
-/** Result of `GET /api/plugins/{id}/update/preview`: a tagged union mirroring the
- *  Rust `UpdatePreview`. */
+/** Mirrors Rust `UpdatePreview`. */
 export type PluginUpdatePreview =
   | { kind: "no_update" }
   | { kind: "safe_update"; to_version: string; fingerprint: string; changelog: PluginUpdateChangelog }
   | { kind: "consent_required"; consent: PluginUpdateConsent; dismissed: boolean };
 
-export type PluginUpdatePreviewResult =
-  | { kind: "ok"; preview: PluginUpdatePreview }
-  | { kind: "error"; message: string };
+export type PluginUpdatePreviewResult = { kind: "ok"; preview: PluginUpdatePreview } | Failure;
 
-/** Validate a preview payload against the discriminated union, so a drifted
- *  server response is rejected rather than passed on: a safe_update must carry a
- *  string fingerprint (else the apply would send no pin) and a consent_required
- *  must carry a consent object (else the modal path would blow up). */
-function isValidPreview(payload: Record<string, unknown>): payload is PluginUpdatePreview {
+/** Reject drifted payloads: an apply needs the fingerprint and the modal needs the consent. */
+function isValidPreview(payload: Payload): payload is PluginUpdatePreview {
   switch (payload.kind) {
     case "no_update":
       return true;
@@ -575,49 +493,31 @@ function isValidPreview(payload: Record<string, unknown>): payload is PluginUpda
   }
 }
 
-/** Classify the available update for one installed plugin (no install happens).
- *  When consent is required the payload carries the full disclosure. */
-export async function previewPluginUpdate(id: string): Promise<PluginUpdatePreviewResult> {
-  try {
-    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/update/preview`, {
-      headers: { Accept: "application/json" },
-    });
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && isValidPreview(payload)) {
-      return { kind: "ok", preview: payload };
-    }
-    const message =
-      typeof payload?.message === "string"
-        ? (payload.message as string)
-        : `Update preview failed (HTTP ${res.status}).`;
-    return { kind: "error", message };
-  } catch {
-    return { kind: "error", message: "Network error." };
-  }
+export function previewPluginUpdate(id: string): Promise<PluginUpdatePreviewResult> {
+  return kindRequest(
+    `/api/plugins/${encodeURIComponent(id)}/update/preview`,
+    { headers: ACCEPT_JSON },
+    (p) => (isValidPreview(p) ? { kind: "ok" as const, preview: p } : null),
+    "Update preview failed",
+  );
 }
 
-/** Start a host-side update job, pinned to the fingerprint the user saw. The
- *  update runs as a job (like install/uninstall) so its build is observable;
- *  poll the returned job id with `fetchPluginJob`. A fingerprint mismatch (the
- *  remote moved since the preview) surfaces as a failed job, which the UI
- *  recovers from by re-previewing. */
-export async function applyPluginUpdate(id: string, expectedFingerprint: string | null): Promise<PluginJobStartResult> {
+/** Start an update job pinned to the previewed fingerprint; a moved remote fails the job. */
+export function applyPluginUpdate(id: string, expectedFingerprint: string | null): Promise<PluginJobStartResult> {
   return startPluginJob(`/api/plugins/${encodeURIComponent(id)}/update/apply`, {
     expected_fingerprint: expectedFingerprint,
   });
 }
 
-/** Structured install disclosure (`POST /api/plugins/install/preview`),
- *  mirroring the Rust `InstallConsent`. Drives the install consent modal. */
+/** Mirrors Rust `InstallConsent`. */
 export interface PluginInstallConsent {
   id: string;
   version: string;
   source: string;
-  /** One line stating what is being installed (resolved release, ref, etc). */
   notice: string;
-  /** The source is off the audited-release default path; warn on it. */
+  /** The source is off the audited-release default path. */
   unverified: boolean;
-  /** Trust class: "featured" | "community" | "local". */
+  /** "featured" | "community" | "local". */
   validation: string;
   capabilities: string[];
   ui: PluginUpdateUiView[];
@@ -625,72 +525,40 @@ export interface PluginInstallConsent {
   fingerprint: string;
 }
 
-export type PluginInstallPreviewResult =
-  | { kind: "ok"; consent: PluginInstallConsent }
-  | { kind: "error"; message: string };
+export type PluginInstallPreviewResult = { kind: "ok"; consent: PluginInstallConsent } | Failure;
 
-/** Classify a gh: install candidate and return its disclosure, without
- *  installing. Backs the install consent modal. */
-export async function previewPluginInstall(source: string): Promise<PluginInstallPreviewResult> {
-  try {
-    const res = await fetch("/api/plugins/install/preview", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ source }),
-    });
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && typeof payload.fingerprint === "string") {
-      return { kind: "ok", consent: payload as unknown as PluginInstallConsent };
-    }
-    const message =
-      typeof payload?.message === "string"
-        ? (payload.message as string)
-        : `Install preview failed (HTTP ${res.status}).`;
-    return { kind: "error", message };
-  } catch {
-    return { kind: "error", message: "Network error." };
-  }
+export function previewPluginInstall(source: string): Promise<PluginInstallPreviewResult> {
+  return kindRequest(
+    "/api/plugins/install/preview",
+    jsonInit("POST", { source }, ACCEPT_JSON),
+    (p) =>
+      typeof p.fingerprint === "string" ? { kind: "ok" as const, consent: p as unknown as PluginInstallConsent } : null,
+    "Install preview failed",
+  );
 }
 
-/** Outcome of starting a lifecycle job: a job id to poll, or an error (403
- *  read_only / elevation_required is handled by the fetch interceptor). */
-export type PluginJobStartResult = { kind: "ok"; jobId: string } | { kind: "error"; message: string };
+export type PluginJobStartResult = { kind: "ok"; jobId: string } | Failure;
 
-async function startPluginJob(url: string, body: unknown): Promise<PluginJobStartResult> {
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify(body),
-    });
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && typeof payload.job_id === "string") {
-      return { kind: "ok", jobId: payload.job_id as string };
-    }
-    const message =
-      typeof payload?.message === "string" ? (payload.message as string) : `Request failed (HTTP ${res.status}).`;
-    return { kind: "error", message };
-  } catch {
-    return { kind: "error", message: "Network error." };
-  }
+function startPluginJob(url: string, body: unknown): Promise<PluginJobStartResult> {
+  return kindRequest(
+    url,
+    jsonInit("POST", body, ACCEPT_JSON),
+    (p) => (typeof p.job_id === "string" ? { kind: "ok" as const, jobId: p.job_id } : null),
+    "Request failed",
+  );
 }
 
-/** Start a host-side install job for an approved gh: source. Poll the returned
- *  job id with `fetchPluginJob`. */
-export async function startPluginInstall(source: string, expectedFingerprint: string): Promise<PluginJobStartResult> {
+export function startPluginInstall(source: string, expectedFingerprint: string): Promise<PluginJobStartResult> {
   return startPluginJob("/api/plugins/install", { source, expected_fingerprint: expectedFingerprint });
 }
 
-/** Start a host-side uninstall job for an installed external plugin. */
-export async function startPluginUninstall(id: string): Promise<PluginJobStartResult> {
+export function startPluginUninstall(id: string): Promise<PluginJobStartResult> {
   return startPluginJob(`/api/plugins/${encodeURIComponent(id)}/uninstall`, {});
 }
 
-/** A lifecycle job's status, mirroring the Rust `PluginJobStatus` tag. */
+/** Mirrors Rust `PluginJobStatus`. */
 export type PluginJobState = { state: "running" } | { state: "succeeded" } | { state: "failed"; error: string };
 
-/** A lifecycle job plus a bounded tail of its host-side log
- *  (`GET /api/plugins/jobs/{id}`). */
 export interface PluginJob {
   job: {
     id: string;
@@ -710,57 +578,36 @@ export interface PluginJob {
 
 export type PluginJobResult = { kind: "ok"; job: PluginJob } | { kind: "error"; status: number; message: string };
 
-/** Fetch a lifecycle job's status plus a tail of its log. Polled by the
- *  progress modal until the job reaches a terminal state. The HTTP `status` is
- *  preserved so the caller can tell a terminal 404 (the job is gone, e.g. after
- *  a daemon restart) from a transient failure worth retrying. */
+/** Job status plus a log tail. `status` lets the caller tell a terminal 404 from a transient failure. */
 export async function fetchPluginJob(jobId: string, tail = 200): Promise<PluginJobResult> {
-  try {
-    const res = await fetch(`/api/plugins/jobs/${encodeURIComponent(jobId)}?tail=${tail}`, {
-      headers: { Accept: "application/json" },
-    });
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && typeof payload.job === "object" && payload.job !== null) {
-      return { kind: "ok", job: payload as unknown as PluginJob };
-    }
-    const message =
-      typeof payload?.message === "string" ? (payload.message as string) : `Job status failed (HTTP ${res.status}).`;
-    return { kind: "error", status: res.status, message };
-  } catch {
-    return { kind: "error", status: 0, message: "Network error." };
+  const reply = await send(`/api/plugins/jobs/${encodeURIComponent(jobId)}?tail=${tail}`, {
+    headers: ACCEPT_JSON,
+  }).catch(() => null);
+  if (!reply) return { kind: "error", status: 0, message: "Network error." };
+  const { ok, status, payload } = reply;
+  if (ok && typeof payload?.job === "object" && payload.job !== null) {
+    return { kind: "ok", job: payload as unknown as PluginJob };
   }
+  return { kind: "error", status, message: stringField(payload, "message") ?? `Job status failed (HTTP ${status}).` };
 }
 
-export type PluginDismissResult = { kind: "ok" } | { kind: "error"; message: string };
+export type PluginDismissResult = { kind: "ok" } | Failure;
 
-/** Record an in-app decline of an available update so it stops nagging until the
- *  next version. */
+/** Decline an available update until the next version. */
 export async function dismissPluginUpdate(id: string, fingerprint: string): Promise<PluginDismissResult> {
-  try {
-    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/update/dismiss`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fingerprint }),
-    });
-    if (res.ok) {
-      return { kind: "ok" };
-    }
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    const message =
-      typeof payload?.message === "string" ? (payload.message as string) : `Dismiss failed (HTTP ${res.status}).`;
-    return { kind: "error", message };
-  } catch {
-    return { kind: "error", message: "Network error." };
-  }
+  const reply = await send(
+    `/api/plugins/${encodeURIComponent(id)}/update/dismiss`,
+    jsonInit("POST", { fingerprint }),
+  ).catch(() => null);
+  if (!reply) return { kind: "error", message: "Network error." };
+  if (reply.ok) return { kind: "ok" };
+  return { kind: "error", message: stringField(reply.payload, "message") ?? `Dismiss failed (HTTP ${reply.status}).` };
 }
 
-// Plugin UI extension points (#2366).
+// --- Plugin UI extension points ---
 
-/** Display tone a plugin attaches to a slot entry or notification. The host
- *  validates it to this closed set; each surface maps it to a color. */
 export type PluginUiTone = "neutral" | "info" | "success" | "warn" | "danger";
 
-/** The host-rendered slots, kebab-case as the host serializes them. */
 export type PluginUiSlot =
   | "status-bar"
   | "row-badge"
@@ -774,8 +621,7 @@ export type PluginUiSlot =
   | "home-pane"
   | "notification";
 
-/** One piece of UI state a worker pushed. `payload` shape is determined by
- *  `slot`; the dashboard renders it (no plugin code runs here). */
+/** `payload` shape is determined by `slot`. */
 export interface PluginUiEntry {
   plugin_id: string;
   slot: PluginUiSlot;
@@ -784,8 +630,7 @@ export interface PluginUiEntry {
   payload: Record<string, unknown>;
 }
 
-/** A notification pushed via `ui.notify`. `seq` is monotonic so the client
- *  toasts each one exactly once. */
+/** `seq` is monotonic so each notification toasts once. */
 export interface PluginUiNotification {
   seq: number;
   plugin_id: string;
@@ -793,158 +638,76 @@ export interface PluginUiNotification {
   title: string;
   body?: string;
   session_id?: string;
-  /** A URL a worker asked the surface to open (`ui.open_url`). When present the
-   *  toast is rendered as click-to-open: a browser blocks `window.open` from an
-   *  async push, so the open happens on the user's click. Always http/https. */
+  /** http/https URL opened on click, since browsers block `window.open` from an async push. */
   href?: string;
 }
 
 export interface PluginUiState {
   entries: PluginUiEntry[];
   notifications: PluginUiNotification[];
-  /** Mutation counter per plugin, then per scope (a session id, or `""` for a
-   *  global slot). A manual pane action records the baseline the action POST
-   *  returns and holds its spinner until its own scope's counter moves off it,
-   *  so another session's push never clears it. Absent on an older daemon. */
+  /** Mutation counter per plugin, then per scope (session id, or `""` for global). Absent on older daemons. */
   revisions?: Record<string, Record<string, number>>;
 }
 
-/** The host's aggregated UI-state snapshot. Returns an empty state (not null)
- *  shape on the server when no plugin host is running. */
 export function fetchPluginUiState(): Promise<PluginUiState | null> {
   return fetchJson<PluginUiState>("/api/plugins/ui-state");
 }
 
-export async function setPluginEnabled(id: string, enabled: boolean): Promise<PluginToggleResult> {
-  try {
-    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/enabled`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled }),
-    });
-    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (res.ok && payload && isValidPluginListResponse(payload)) {
-      return { kind: "ok", data: payload };
-    }
-    const message =
-      typeof payload?.message === "string"
-        ? (payload.message as string)
-        : `Failed to ${enabled ? "enable" : "disable"} plugin (${res.status}).`;
-    return { kind: "error", message };
-  } catch {
-    return { kind: "error", message: "Network error." };
-  }
+export function setPluginEnabled(id: string, enabled: boolean): Promise<PluginToggleResult> {
+  return kindRequest(
+    `/api/plugins/${encodeURIComponent(id)}/enabled`,
+    jsonInit("POST", { enabled }),
+    (p) =>
+      Array.isArray(p.plugins) && Array.isArray(p.load_errors)
+        ? { kind: "ok" as const, data: p as unknown as PluginListResponse }
+        : null,
+    (status) => `Failed to ${enabled ? "enable" : "disable"} plugin (${status}).`,
+  );
 }
 
-/** A worker accepted an action. `baselineRevision` is the scope's UI mutation
- *  counter the host read before forwarding; the UI action can hold its spinner
- *  until the polled counter moves off this value. `null` means the daemon did
- *  not report a baseline (older daemon), so the caller skips the wait and just
- *  clears when the POST settles. */
+/** `baselineRevision` is the scope's UI mutation counter before forwarding; null when the daemon omits it. */
 export interface PluginActionAccepted {
   baselineRevision: number | null;
 }
 
-/**
- * Forward a plugin UI action (e.g. a "Refresh" or composer button) to the
- * plugin's worker. Fire-and-forget at the worker: the worker runs the named
- * method and re-pushes its UI state, which a later ui-state poll renders.
- * `sessionId` scopes the baseline revision to the firing UI's session. Returns the
- * accepted baseline (or null if the daemon omitted one), or null on read-only
- * (403), no running worker (404), or network failure.
- */
+/** Forward a plugin UI action to its worker. Null on 403, 404 (no worker), or network failure. */
 export async function invokePluginAction(
   pluginId: string,
   method: string,
   sessionId?: string,
   params: Record<string, unknown> = {},
 ): Promise<PluginActionAccepted | null> {
-  try {
-    const res = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/action`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ method, params, session_id: sessionId ?? null }),
-    });
-    if (!res.ok) return null;
-    const body = (await res.json().catch(() => null)) as { baseline_revision?: unknown } | null;
-    // A missing baseline (older daemon) is a sentinel, not revision 0: 0 would
-    // wedge the spinner until timeout since the polled revision is also 0.
-    const rev = typeof body?.baseline_revision === "number" ? body.baseline_revision : null;
-    return { baselineRevision: rev };
-  } catch {
-    return null;
-  }
+  const reply = await send(
+    `/api/plugins/${encodeURIComponent(pluginId)}/action`,
+    jsonInit("POST", { method, params, session_id: sessionId ?? null }),
+  ).catch(() => null);
+  if (!reply?.ok) return null;
+  // A missing baseline is a sentinel, not revision 0, which would wedge the spinner.
+  const rev = reply.payload?.baseline_revision;
+  return { baselineRevision: typeof rev === "number" ? rev : null };
 }
 
-/**
- * Invoke an action-less plugin command (`POST /api/plugins/commands/{fqid}/invoke`).
- * These commands (e.g. the GitHub plugin's `status` / `refresh`) carry no client
- * `action`, so the host dispatches a fixed `plugin.command.invoke` notification
- * to the worker. Fire-and-forget: `true` means the daemon accepted and
- * dispatched it, `false` on read-only, unknown command/session, no worker, or
- * network failure.
- */
-export async function invokePluginCommand(fqid: string, sessionId: string): Promise<boolean> {
-  try {
-    const res = await fetch(`/api/plugins/commands/${encodeURIComponent(fqid)}/invoke`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sessionId }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+/** Invoke an action-less plugin command; true when the daemon dispatched it. */
+export function invokePluginCommand(fqid: string, sessionId: string): Promise<boolean> {
+  return fetchOk(
+    `/api/plugins/commands/${encodeURIComponent(fqid)}/invoke`,
+    jsonInit("POST", { session_id: sessionId }),
+  );
 }
 
-export async function updateSettings(updates: Record<string, unknown>): Promise<boolean> {
-  try {
-    const res = await fetch("/api/settings", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(updates),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+export function updateSettings(updates: Record<string, unknown>): Promise<boolean> {
+  return fetchOk("/api/settings", jsonInit("PATCH", updates));
 }
 
-/**
- * Sets the global theme (name and/or color mode). Dedicated endpoint, not
- * `PATCH /api/settings`: the theme is a global preference but cosmetic, so it
- * must not trip the passphrase/elevation wall the general settings surface
- * carries. Returns false on read-only servers (403) or network failure.
- */
-export async function updateTheme(patch: { name?: string; color_mode?: string }): Promise<boolean> {
-  try {
-    const res = await fetch("/api/theme", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(patch),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+// Theme, tour, tips and acknowledgement flags use dedicated endpoints so these
+// cosmetic writes stay off the passphrase/elevation wall of PATCH /api/settings.
+
+export function updateTheme(patch: { name?: string; color_mode?: string }): Promise<boolean> {
+  return fetchOk("/api/theme", jsonInit("PATCH", patch));
 }
 
-/**
- * Marks the first-run dashboard tour as seen for this server. Single-purpose
- * endpoint (not PATCH /api/settings) so the cosmetic flag stays off the
- * passphrase/elevation wall. Returns false on read-only servers (403) or
- * network failure; callers treat that as nonfatal and suppress the tour in
- * memory for the current page.
- */
-export async function markWebTourSeen(): Promise<boolean> {
-  try {
-    const res = await fetch("/api/app-state/web-tour-seen", {
-      method: "POST",
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+export function markWebTourSeen(): Promise<boolean> {
+  return fetchOk("/api/app-state/web-tour-seen", { method: "POST" });
 }
 
 // --- Tips ---
@@ -957,248 +720,117 @@ export interface TipDto {
 }
 
 export interface TipsResponse {
-  /** Mirror of `session.show_tips`; the badge and panel hide when false. */
+  /** Mirror of `session.show_tips`. */
   enabled: boolean;
-  /** Web-eligible tips in catalog order, each flagged with its seen state. */
   tips: TipDto[];
 }
 
-/** Fetch the web-surface tips and whether tips are enabled. Null on failure so
- *  the caller simply shows no badge. */
 export function fetchTips(): Promise<TipsResponse | null> {
   return fetchJson<TipsResponse>("/api/tips");
 }
 
-/** Mark one tip seen (mark-seen-on-view). Best-effort; returns success. Mirrors
- *  {@link markWebTourSeen}: off the elevation wall, blocked on read-only. */
-export async function markTipSeen(id: string): Promise<boolean> {
-  try {
-    const res = await fetch("/api/app-state/tip-seen", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+export function markTipSeen(id: string): Promise<boolean> {
+  return fetchOk("/api/app-state/tip-seen", jsonInit("POST", { id }));
 }
 
-/** Set "Show tips on startup" (`session.show_tips`). Dedicated endpoint, not
- *  `PATCH /api/settings`, so this cosmetic toggle stays off the passphrase/
- *  elevation wall. Returns false on read-only (403) or network failure. */
-export async function setShowTips(enabled: boolean): Promise<boolean> {
-  try {
-    const res = await fetch("/api/tips/show", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+export function setShowTips(enabled: boolean): Promise<boolean> {
+  return fetchOk("/api/tips/show", jsonInit("POST", { enabled }));
 }
 
-// --- Web UI state sync (server-side mirror of synced localStorage keys) ---
+// --- Web UI state sync ---
 
-/** Fetch the server-side UI-state blob: a flat map of localStorage key ->
- *  stored string value. Null on failure so the caller falls back to its local
- *  cache. Single-tenant: this is the one user's synced preferences. */
-export async function getWebUiState(): Promise<Record<string, string> | null> {
+/** Server-side mirror of synced localStorage keys. */
+export function getWebUiState(): Promise<Record<string, string> | null> {
   return fetchJson<Record<string, string>>("/api/app-state/web-ui-state");
 }
 
-/** Merge a partial update into the server UI-state blob. Values are strings to
- *  set, or `null` to delete the key. Best-effort; returns success. */
-export async function patchWebUiState(patch: Record<string, string | null>): Promise<boolean> {
-  try {
-    const res = await fetch("/api/app-state/web-ui-state", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(patch),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+/** `null` values delete the key. */
+export function patchWebUiState(patch: Record<string, string | null>): Promise<boolean> {
+  return fetchOk("/api/app-state/web-ui-state", jsonInit("PATCH", patch));
 }
 
-// --- Sandbox volume_ignores glob expansion (#2045) ---
+// --- Sandbox volume_ignores glob expansion ---
 
 export interface VolumeIgnoresGlobPreview {
   pattern: string;
-  /** Container-side paths the pattern matches in the workspace right now. */
+  /** Container-side paths the pattern currently matches. */
   matched_paths: string[];
 }
 
 export interface VolumeIgnoresPreviewResponse {
-  /** True once the snapshot-expansion behavior has been acknowledged. */
   acknowledged: boolean;
-  /** One entry per configured glob pattern; empty when none are configured. */
   globs: VolumeIgnoresGlobPreview[];
 }
 
-/**
- * Dry-run how glob `volume_ignores` entries (recursive `**` patterns) expand for a
- * sandbox session rooted at `path`. The wizard calls this before creating to
- * decide whether to show the one-time snapshot-expansion confirm modal (#2045).
- * Returns null on failure; callers treat that as "nothing to confirm".
- */
-export async function fetchVolumeIgnoresPreview(
+/** Dry-run glob `volume_ignores` expansion for a sandbox rooted at `path`. */
+export function fetchVolumeIgnoresPreview(
   path: string,
   profile?: string,
 ): Promise<VolumeIgnoresPreviewResponse | null> {
-  try {
-    const params = new URLSearchParams({ path });
-    if (profile) params.set("profile", profile);
-    const res = await fetch(`/api/sandbox/volume-ignores-preview?${params.toString()}`);
-    if (!res.ok) return null;
-    return (await res.json()) as VolumeIgnoresPreviewResponse;
-  } catch {
-    return null;
-  }
+  const params = new URLSearchParams({ path });
+  if (profile) params.set("profile", profile);
+  return fetchJson<VolumeIgnoresPreviewResponse>(`/api/sandbox/volume-ignores-preview?${params.toString()}`);
 }
 
-/**
- * Records that the user acknowledged glob `volume_ignores` snapshot expansion,
- * so the confirm modal shows once and never again. Single-purpose endpoint
- * (not PATCH /api/settings) so the flag stays off the passphrase/elevation
- * wall. Returns false on read-only servers (403) or network failure.
- */
-export async function markVolumeIgnoresGlobsAcknowledged(): Promise<boolean> {
-  try {
-    const res = await fetch("/api/app-state/volume-ignores-globs-acknowledged", {
-      method: "POST",
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+export function markVolumeIgnoresGlobsAcknowledged(): Promise<boolean> {
+  return fetchOk("/api/app-state/volume-ignores-globs-acknowledged", { method: "POST" });
 }
 
 // --- Profile management ---
 
-export async function createProfile(name: string): Promise<boolean> {
-  try {
-    const res = await fetch("/api/profiles", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+export function createProfile(name: string): Promise<boolean> {
+  return fetchOk("/api/profiles", jsonInit("POST", { name }));
 }
 
-export async function deleteProfile(name: string): Promise<boolean> {
-  try {
-    const res = await fetch(`/api/profiles/${encodeURIComponent(name)}`, {
-      method: "DELETE",
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+export function deleteProfile(name: string): Promise<boolean> {
+  return fetchOk(`/api/profiles/${encodeURIComponent(name)}`, { method: "DELETE" });
 }
 
-export async function renameProfile(name: string, newName: string): Promise<boolean> {
-  try {
-    const res = await fetch(`/api/profiles/${encodeURIComponent(name)}/rename`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ new_name: newName }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+export function renameProfile(name: string, newName: string): Promise<boolean> {
+  return fetchOk(`/api/profiles/${encodeURIComponent(name)}/rename`, jsonInit("PATCH", { new_name: newName }));
 }
 
-export async function setDefaultProfile(name: string): Promise<boolean> {
-  try {
-    const res = await fetch("/api/default-profile", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+export function setDefaultProfile(name: string): Promise<boolean> {
+  return fetchOk("/api/default-profile", jsonInit("PATCH", { name }));
 }
 
 export function getProfileSettings(name: string): Promise<ProfileSettingsResponse | null> {
   return fetchJson<ProfileSettingsResponse>(`/api/profiles/${encodeURIComponent(name)}/settings`);
 }
 
-/** Profile-settings sections the dashboard is allowed to PATCH, derived from
- *  the live settings schema (single source of truth, #1692) so the client
- *  guard cannot drift from the server. Every schema section is profile-
- *  writable; `description` is the profile-only top-level field that carries no
- *  schema descriptor. Sections absent from the schema, notably `hooks` plus the
- *  agent-command and env fields, are remote-code-execution surfaces the server
- *  rejects (`validate_patch` in src/session/config/settings_schema/policy.rs); we
- *  reject them client side too as defense in depth. Because both sides read the
- *  same schema, there is no hand-kept list to keep in sync. */
+/** Sections a profile PATCH may touch: every schema section plus `description`. Sections absent
+ *  from the schema (hooks, agent commands, env) are RCE surfaces the server also rejects. */
 export function profileWritableSections(schema: SettingsFieldDescriptor[]): Set<string> {
   const sections = new Set(schema.map((d) => d.section));
   sections.add("description");
   return sections;
 }
 
-/** PATCH a profile's settings, refusing any section the schema does not list as
- *  writable (see {@link profileWritableSections}) before sending. Returns
- *  whether the server accepted the write. */
+/** PATCH profile settings, refusing blocked sections. Without a schema, defers to the server's guard. */
 export async function updateProfileSettings(name: string, updates: Record<string, unknown>): Promise<boolean> {
   const schema = await getSettingsSchema();
-  // With the schema in hand, refuse a blocked section before sending. If the
-  // schema fetch failed, defer to the server's authoritative guard rather than
-  // blocking a legitimate save on a transient network error.
   if (schema) {
     const writable = profileWritableSections(schema);
-    for (const key of Object.keys(updates)) {
-      if (!writable.has(key)) {
-        // Refuse loudly rather than silently dropping the key. A blocked
-        // section in a profile PATCH (e.g. `hooks`) is a caller bug; the
-        // server would 400 it anyway. Failing here keeps a buggy caller
-        // from reporting a partial save as success.
-        console.error(`updateProfileSettings: refusing to send blocked profile section "${key}"`);
-        return false;
-      }
+    const blocked = Object.keys(updates).find((key) => !writable.has(key));
+    if (blocked !== undefined) {
+      console.error(`updateProfileSettings: refusing to send blocked profile section "${blocked}"`);
+      return false;
     }
   }
-  try {
-    const res = await fetch(`/api/profiles/${encodeURIComponent(name)}/settings`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(updates),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+  return fetchOk(`/api/profiles/${encodeURIComponent(name)}/settings`, jsonInit("PATCH", updates));
 }
 
 // --- Themes & Sounds ---
-
-import type { ResolvedTheme } from "./theme";
 
 export async function fetchThemes(): Promise<string[]> {
   return (await fetchJson<string[]>("/api/themes")) ?? [];
 }
 
-/** Fetch the resolved theme projection (web CSS vars, terminal CSS
- *  vars, syntax highlighter selection) for a named theme. The server
- *  falls back to Empire for unknown names; check `source` to detect. */
+/** The server falls back to Empire for unknown names; check `source` to detect. */
 export function fetchResolvedTheme(name: string): Promise<ResolvedTheme | null> {
   return fetchJson<ResolvedTheme>(`/api/themes/${encodeURIComponent(name)}`);
 }
 
-/** Fetch the resolved theme for the active profile's current
- *  selection. Server reads from profile_config so per-profile overrides
- *  land in the right place. */
 export function fetchCurrentTheme(): Promise<ResolvedTheme | null> {
   return fetchJson<ResolvedTheme>("/api/theme/current");
 }
@@ -1207,11 +839,7 @@ export async function fetchSounds(): Promise<string[]> {
   return (await fetchJson<string[]>("/api/sounds")) ?? [];
 }
 
-/** Fetch a sound file as a Blob so the acp's browser-side approval
- *  player can hand a blob URL to `new Audio(...)`. The fetch path runs
- *  through `fetchInterceptor.ts`, which injects `Authorization: Bearer`
- *  on every request; an `<audio src="...">` element does not, so a
- *  blob round-trip is necessary in PWA mode. See #1038. */
+/** Fetched as a Blob because `<audio src>` would skip the interceptor's bearer token. */
 export async function fetchSoundBlob(name: string): Promise<Blob | null> {
   try {
     const res = await fetch(`/api/sounds/file/${encodeURIComponent(name)}`);
@@ -1228,59 +856,24 @@ export interface ServerAbout {
   version: string;
   auth_required: boolean;
   passphrase_enabled: boolean;
-  /** Resolved `--auth` mode. `"token"` means the URL token gates
-   *  requests; `"passphrase"` means the passphrase login wall is the
-   *  only human gate; `"none"` means no authentication at all. The
-   *  Security panel renders an accurate label off this instead of
-   *  guessing "--no-auth" from `auth_required === false`. */
   auth_mode: "token" | "passphrase" | "none";
   read_only: boolean;
   behind_tunnel: boolean;
-  /** CityHall client mode (`AOE_CITYHALL_MODE`). Locks the dashboard
-   *  down to a composer + structured-view end-user client: name-only
-   *  session creation, theme-only settings, no terminal / diff /
-   *  project-management. Enforced server-side too. See #7. */
+  /** CityHall client mode: a locked-down composer-only client, enforced server-side too. */
   cityhall_mode: boolean;
   profile: string;
-  /** Resolved `acp.show_tool_durations` from the active profile's
-   *  config. Drives the per-tool elapsed-time label in the acp
-   *  web UI; cross-device since it lives in config.toml. */
   acp_show_tool_durations: boolean;
-  /** Resolved `acp.replay_events` from the active profile's
-   *  config. Per-session retention cap on the acp event log;
-   *  0 means unlimited. Mirrored onto the in-memory activity buffer
-   *  so the rendered transcript matches the user's chosen ceiling
-   *  instead of clipping at a hard-coded frontend constant. See #1111. */
+  /** Per-session event log retention cap; 0 means unlimited. */
   acp_replay_events: number;
-  /** Resolved `acp.compaction_reminder` from the active profile's
-   *  config; gates the structured view's compaction reminder (#3253). */
   acp_compaction_reminder: boolean;
-  /** Resolved `acp.compaction_reminder_percent` from the active
-   *  profile's config. */
   acp_compaction_reminder_percent: number;
-  build_flavor: "debug" | "release"; // `"debug"` => debug_assertions; drives topbar DEV badge. See #1055.
-  /** Content-hashed entry bundle name (`index-<hash>.js`) of the
-   *  embedded dashboard build. Compared against this page's own entry
-   *  script by DashboardUpdateBanner to detect a stale client (an
-   *  installed PWA has no refresh affordance, so it keeps running old
-   *  code after the binary updates until prompted to reload). */
+  build_flavor: "debug" | "release";
+  /** Entry bundle name, compared against this page's own to detect a stale client. */
   web_build_id?: string | null;
-  /** Read-only runtime state of the daemon's sleep-inhibit reconciler.
-   *  Always present: `get_about` emits it unconditionally
-   *  (`SleepInhibitStatus`, not `Option`). Informational only; no dashboard
-   *  flow consumes it yet. */
   sleep_inhibit: {
-    /** The `session.prevent_sleep_when_active` toggle as the reconciler
-     *  last read it: the raw config toggle, not whether an assertion is
-     *  held. */
     prevent_sleep_enabled: boolean;
-    /** Whether the daemon holds an OS sleep assertion as of the last
-     *  reconcile; can trail the backing child's death by up to one poll
-     *  interval. */
     currently_held: boolean;
-    /** Whether a real OS backend is still believed able to hold the
-     *  assertion. Optimistic: `true` means no failure latched yet, not
-     *  verified working. */
+    /** Optimistic: true means no failure has latched yet. */
     backend_available: boolean;
   };
 }
@@ -1299,57 +892,26 @@ export function fetchTelemetryStatus(): Promise<TelemetryStatus | null> {
   return fetchJson<TelemetryStatus>("/api/telemetry/status");
 }
 
-/// Set the opt-in state. The daemon owns the anonymous install id; the
-/// browser never posts to the telemetry backend itself. Returns the updated
-/// status, or null on failure.
-export async function setTelemetryConsent(enabled: boolean): Promise<TelemetryStatus | null> {
-  try {
-    const res = await fetch("/api/telemetry/consent", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled }),
-    });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
+export function setTelemetryConsent(enabled: boolean): Promise<TelemetryStatus | null> {
+  return fetchJson<TelemetryStatus>("/api/telemetry/consent", jsonInit("POST", { enabled }));
 }
 
-/// Allowlisted usage-signal names the daemon accepts on `/api/telemetry/seen`.
-/// Mirrors `USAGE_SIGNALS` in `src/telemetry/usage_signals.rs`; an off-list
-/// name is rejected with a 400 server-side. `web` / `structured_view` are whole-UI
-/// opens; the rest are feature-level opens within the dashboard (#1881).
+/** Mirrors `USAGE_SIGNALS` in `src/telemetry/usage_signals.rs`. */
 export type TelemetrySignal = "web" | "structured_view" | "diff_panel" | "diff_comments" | "web_terminal";
 
-/// Tell the daemon an allowlisted surface or feature was opened, so its next
-/// opt-in snapshot can carry the `usage_seen` open-count map plus the coarse
-/// client form-factor class (#1883). Best-effort; the daemon only forwards the
-/// count when the install is opted in. The browser never posts to the telemetry
-/// backend; it pings the local daemon, which folds both into its own snapshot.
+/** Best-effort ping to the local daemon, which only forwards counts when opted in. */
 export function reportTelemetrySeen(surface: TelemetrySignal): void {
-  void fetch("/api/telemetry/seen", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ surface, form_factor: clientFormFactor() }),
-  }).catch(() => {});
+  void fetch("/api/telemetry/seen", jsonInit("POST", { surface, form_factor: clientFormFactor() })).catch(() => {});
 }
 
-/// Report a browser ACP interaction for the daemon's next opt-in snapshot.
-/// Best-effort; the daemon only sends counts when the user is opted in.
 export function reportAcpInteraction(kind: "prompt_queued"): void {
-  void fetch("/api/telemetry/structured-interaction", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ kind }),
-  }).catch(() => {});
+  void fetch("/api/telemetry/structured-interaction", jsonInit("POST", { kind })).catch(() => {});
 }
 
-/** Runtime helper around `ServerAbout.build_flavor`. See #1055. */
 export function isDebugBuild(about: ServerAbout | null | undefined): boolean {
-  if (!about) return false;
-  return about.build_flavor === "debug";
+  return about?.build_flavor === "debug";
 }
+
 export type UpdateCheckMode = "auto" | "notify" | "off";
 
 export interface UpdateStatus {
@@ -1359,8 +921,6 @@ export interface UpdateStatus {
   update_available: boolean;
   release_url: string | null;
   error: string | null;
-  /** Version the user already dismissed the banner for, persisted server-side
-   *  in app_state so the acknowledgement is once-per-account, not per device. */
   dismissed_version: string | null;
 }
 
@@ -1368,20 +928,8 @@ export function fetchUpdateStatus(): Promise<UpdateStatus | null> {
   return fetchJson<UpdateStatus>("/api/system/update-status");
 }
 
-/** Persist that the update banner was dismissed for `version`, server-side, so
- *  it stays dismissed across devices (and matches the TUI). Returns true on
- *  success; the banner optimistically hides regardless. */
-export async function dismissUpdate(version: string): Promise<boolean> {
-  try {
-    const res = await fetch("/api/app-state/dismiss-update", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ version }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+export function dismissUpdate(version: string): Promise<boolean> {
+  return fetchOk("/api/app-state/dismiss-update", jsonInit("POST", { version }));
 }
 
 // --- Branches ---
@@ -1392,27 +940,20 @@ export interface BranchInfo {
   remote_only?: boolean;
 }
 
-/** Lists branches for a repo path. When `includeRemote` is true the
- *  response includes branches that only exist on the remote (with
- *  `remote_only: true`); selecting one bases the new worktree off the
- *  remote tip. See #948. */
 export function fetchBranches(path: string, includeRemote = false): Promise<BranchInfo[] | null> {
   const params = new URLSearchParams({ path });
   if (includeRemote) params.set("include_remote", "true");
   return fetchJson<BranchInfo[]>(`/api/git/branches?${params.toString()}`);
 }
 
-/** Whether `path` is a git repository, per the same gate the session builder
- *  enforces. Returns the boolean, or null on a transient failure so callers
- *  can stay optimistic rather than misreport a repo as a non-repo. Used by the
- *  new-session wizard to disable the worktree toggle for a plain folder. */
+/** Null on a transient failure so callers stay optimistic. */
 export async function fetchIsGitRepo(path: string): Promise<boolean | null> {
   const params = new URLSearchParams({ path });
   const res = await fetchJson<{ is_git_repo: boolean }>(`/api/git/is-repo?${params.toString()}`);
   return res ? res.is_git_repo : null;
 }
 
-// --- Acp context primer ---
+// --- ACP ---
 
 export interface ContextPrimerResponse {
   primer: string;
@@ -1420,45 +961,30 @@ export interface ContextPrimerResponse {
   included_turn_count: number;
   truncated: boolean;
   max_chars: number;
-  /** When the recap was built from a session that ended in a non-
-   *  success terminal (rate-limit park or AgentStartupError), the
-   *  user's most recent UserPromptSent never reached the agent. The
-   *  backend pops it from the primer body and surfaces it here so the
-   *  recovery UI can drop it back into the composer as the user's
-   *  pending request. See #1281 / #1282. */
+  /** The last prompt that never reached the agent, popped from the primer for the composer. */
   unprocessed_prompt?: string | null;
 }
-
-// --- Acp ACP registry ---
 
 export interface AcpAgentInfo {
   name: string;
   description: string;
   command: string;
-  /** Registry lifecycle state, same contract as `/api/agents`: omitted
-   *  while Active so older daemons and existing consumers read as active.
-   *  Mirrors `AgentLifecycle` in src/agents.rs. */
+  /** Omitted while Active. Mirrors `AgentLifecycle` in src/agents.rs. */
   lifecycle?: AgentLifecycleInfo;
 }
 
-/** List ACP registry entries the acp supervisor knows about.
- *  Distinct from `/api/agents` (session-tool agents for the wizard);
- *  this is the *acp* registry used by the rate-limit recovery
- *  modal to populate the handoff target list. See #1282. */
+/** The ACP registry, distinct from the session-tool agents at `/api/agents`. */
 export async function fetchAcpAgents(): Promise<AcpAgentInfo[]> {
   return (await fetchJson<AcpAgentInfo[]>("/api/acp/agents")) ?? [];
 }
 
-/** One agent's last-observed config options, from the recall cache. */
 export interface AgentOptionEntry {
-  /** RFC 3339 timestamp of the last observation, for freshness display. */
+  /** RFC 3339 timestamp of the last observation. */
   updated_at: string;
   options: ConfigOptionDescriptor[];
 }
 
-/** Recall cache of the config options each agent last advertised, keyed by
- *  agent name. Feeds the per-agent defaults settings page dropdowns without a
- *  live session; empty until an agent has run at least once. See #2631. */
+/** Config options each agent last advertised, keyed by agent name. */
 export interface AcpOptionCatalog {
   version: number;
   agents: Record<string, AgentOptionEntry>;
@@ -1468,29 +994,17 @@ export async function fetchAcpOptionCatalog(): Promise<AcpOptionCatalog> {
   return (await fetchJson<AcpOptionCatalog>("/api/acp/option-catalog")) ?? { version: 1, agents: {} };
 }
 
-// --- Acp switch agent ---
-
 export interface SwitchAgentResponse {
   session_id: string;
   agent: string;
-  /** Highest seq BEFORE AgentSwitched was emitted. Pass to
-   *  fetchContextPrimer so the recap excludes the handoff event. */
+  /** Highest seq before AgentSwitched; pass to fetchContextPrimer to exclude the handoff. */
   before_seq: number;
-  /** Seq assigned to the AgentSwitched event. The frontend awaits the
-   *  reducer reaching this seq before prefilling so the divider and
-   *  composer prefill arrive in order. */
   switch_seq: number;
   status: string;
 }
 
-/** Hand off an acp session from its current ACP backend to
- *  `target` (registry key, e.g. "codex"). Backend stops the old
- *  worker, spawns the new one, persists the agent change, and emits
- *  an AgentSwitched event. On failure (unknown target, spawn error)
- *  the instance is left untouched. `reason` is recorded on the event
- *  and shown in the transcript divider: "rate_limited" for the
- *  recovery flow, "manual" for an explicit user switch. See #1282. */
-export async function switchAcpAgent(
+/** Hand a session off to ACP backend `target`. `reason` is shown in the transcript divider. */
+export function switchAcpAgent(
   sessionId: string,
   target: string,
   model?: string | null,
@@ -1499,46 +1013,30 @@ export async function switchAcpAgent(
   const body: { target: string; model?: string; reason?: string } = { target };
   if (model) body.model = model;
   if (reason) body.reason = reason;
-  return fetchJson<SwitchAgentResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/switch-agent`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  return fetchJson<SwitchAgentResponse>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/acp/switch-agent`,
+    jsonInit("POST", body),
+  );
 }
 
-/** Response from the view-switch endpoints. `view` is the session's view
- *  after the swap. */
 export interface ViewSwitchResponse {
   session_id: string;
   view?: "structured" | "terminal";
 }
 
-/** Switch a session into structured view (POST /acp/enable). For a claude
- *  session with a resumable transcript the conversation is carried over; other
- *  agents restart fresh. Resolves with the updated view or null on non-2xx. */
-export async function acpEnable(sessionId: string): Promise<ViewSwitchResponse | null> {
-  return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/enable`, {
-    method: "POST",
-  });
+export function acpEnable(sessionId: string): Promise<ViewSwitchResponse | null> {
+  return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/enable`, { method: "POST" });
 }
 
-/** Switch a session back to a terminal (POST /acp/disable). A claude session's
- *  conversation continues via `claude --resume`; other agents restart fresh.
- *  Resolves with the updated view or null on non-2xx. */
-export async function acpDisable(sessionId: string): Promise<ViewSwitchResponse | null> {
+export function acpDisable(sessionId: string): Promise<ViewSwitchResponse | null> {
   return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/disable`, {
     method: "POST",
   });
 }
 
-// The daemon owns the structured-view prompt queue, so a follow-up queued
-// behind a busy turn survives a client reload / closed PWA and drains
-// server-side. These wrap the /queue endpoints; the queue itself reflects to
-// the client on `SessionResponse.queued_prompts`.
+// --- Server-owned prompt queue ---
 
-/** Metadata-only view of one queued-prompt attachment. The bytes live
- *  server-side (the pending-attachment store) and are delivered on drain, so
- *  the client only receives id/kind/mime/name/size for display. */
+/** Metadata only; the bytes stay server-side until drain. */
 export interface ServerQueuedAttachmentRef {
   id: string;
   kind: "image" | "audio" | "resource";
@@ -1547,7 +1045,6 @@ export interface ServerQueuedAttachmentRef {
   size: number;
 }
 
-/** One entry of a session's server-owned queue, as the API returns it. */
 export interface ServerQueuedPrompt {
   id: string;
   seq: number;
@@ -1557,8 +1054,7 @@ export interface ServerQueuedPrompt {
   origin_device?: string | null;
 }
 
-/** Attachment upload shape for the queue enqueue, matching `/acp/prompt`'s
- *  `PromptAttachmentUpload` (base64 `data`, no `data:` prefix). */
+/** Base64 `dataB64` without a `data:` prefix. */
 export interface QueueAttachmentUpload {
   kind: "image" | "audio" | "resource";
   mimeType: string;
@@ -1566,25 +1062,11 @@ export interface QueueAttachmentUpload {
   dataB64: string;
 }
 
-async function fetchOk(url: string, init?: RequestInit): Promise<boolean> {
-  try {
-    return (await fetch(url, init)).ok;
-  } catch {
-    return false;
-  }
-}
+const queuePath = (sessionId: string, promptId?: string) =>
+  `/api/sessions/${encodeURIComponent(sessionId)}/queue${promptId === undefined ? "" : `/${encodeURIComponent(promptId)}`}`;
 
-const jsonInit = (method: string, body: unknown): RequestInit => ({
-  method,
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify(body),
-});
-
-/** Enqueue a prompt server-side (POST /queue). `id` is the client-minted stable
- *  id so an optimistic row reconciles against the returned entry; re-posting the
- *  same id updates it in place rather than duplicating. Returns the stored entry
- *  (with its assigned `seq`) or null on non-2xx. */
-export async function enqueueServerPrompt(
+/** `id` is client-minted, so re-posting it updates the entry in place. */
+export function enqueueServerPrompt(
   sessionId: string,
   prompt: {
     id: string;
@@ -1595,7 +1077,7 @@ export async function enqueueServerPrompt(
   },
 ): Promise<ServerQueuedPrompt | null> {
   return fetchJson<ServerQueuedPrompt>(
-    `/api/sessions/${encodeURIComponent(sessionId)}/queue`,
+    queuePath(sessionId),
     jsonInit("POST", {
       id: prompt.id,
       text: prompt.text,
@@ -1611,35 +1093,23 @@ export async function enqueueServerPrompt(
   );
 }
 
-/** The session's server queue, ordered by `seq` (GET /queue). Always returns an
- *  array: a non-array body (error page, unexpected shape) yields `[]` so callers
- *  can `.map` without guarding. */
+/** Always an array, ordered by `seq`. */
 export async function listServerQueue(sessionId: string): Promise<ServerQueuedPrompt[]> {
-  const rows = await fetchJson<ServerQueuedPrompt[]>(`/api/sessions/${encodeURIComponent(sessionId)}/queue`);
+  const rows = await fetchJson<ServerQueuedPrompt[]>(queuePath(sessionId));
   return Array.isArray(rows) ? rows : [];
 }
 
-/** Replace a queued prompt's text (PATCH /queue/{id}). */
-export async function editServerQueuedPrompt(sessionId: string, promptId: string, text: string): Promise<boolean> {
-  return fetchOk(
-    `/api/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(promptId)}`,
-    jsonInit("PATCH", { text }),
-  );
+export function editServerQueuedPrompt(sessionId: string, promptId: string, text: string): Promise<boolean> {
+  return fetchOk(queuePath(sessionId, promptId), jsonInit("PATCH", { text }));
 }
 
-/** Remove one queued prompt (DELETE /queue/{id}). */
-export async function removeServerQueuedPrompt(sessionId: string, promptId: string): Promise<boolean> {
-  return fetchOk(`/api/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(promptId)}`, {
-    method: "DELETE",
-  });
+export function removeServerQueuedPrompt(sessionId: string, promptId: string): Promise<boolean> {
+  return fetchOk(queuePath(sessionId, promptId), { method: "DELETE" });
 }
 
-/** Drop the whole server queue for a session (DELETE /queue). */
-export async function clearServerQueue(sessionId: string): Promise<boolean> {
-  return fetchOk(`/api/sessions/${encodeURIComponent(sessionId)}/queue`, { method: "DELETE" });
+export function clearServerQueue(sessionId: string): Promise<boolean> {
+  return fetchOk(queuePath(sessionId), { method: "DELETE" });
 }
-
-// --- Acp install agent (Tier 2 of #2109) ---
 
 export interface InstallAgentResponse {
   session_id: string;
@@ -1648,38 +1118,22 @@ export interface InstallAgentResponse {
   exit_code: number | null;
   stdout: string;
   stderr: string;
-  /** Other sessions blocked on the same adapter that were queued for an
-   *  automatic respawn (the install is global). See #2109. */
+  /** Other sessions blocked on the same adapter that were queued for respawn. */
   recovered_sessions: number;
 }
 
-/** Run `npm install -g` for the session's agent on the host. Opt-in and
- *  hardened server-side (see `install_agent` in src/server/api/acp.rs).
- *  Resolves with the parsed body on 2xx; throws with the server's error
- *  message on failure (disabled, sandboxed, not npm-installable, npm
- *  missing) so the caller can surface why. The caller respawns the worker
- *  separately via `useRespawnSession` on `success`. */
+/** Run `npm install -g` for the session's agent on the host; throws with the server's message. */
 export async function installAcpAgent(sessionId: string): Promise<InstallAgentResponse> {
-  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/install-agent`, {
+  const { ok, status, payload } = await send(`/api/sessions/${encodeURIComponent(sessionId)}/acp/install-agent`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
   });
-  const body = (await res.json().catch(() => null)) as
-    | (Partial<InstallAgentResponse> & { error?: string; message?: string })
-    | null;
-  if (!res.ok) {
-    throw new Error(body?.message || body?.error || `Server returned ${res.status}`);
-  }
-  if (!body) {
-    throw new Error("Server returned an invalid or empty response");
-  }
-  return body as InstallAgentResponse;
+  if (!ok) throw new Error(rawMessage(payload) || (payload?.error as string) || `Server returned ${status}`);
+  if (!payload) throw new Error("Server returned an invalid or empty response");
+  return payload as unknown as InstallAgentResponse;
 }
 
-/** Fetch a markdown primer built from events `seq < beforeSeq`. Used
- *  after a `session/load` failure: the agent's model context is empty
- *  but the transcript is intact in SQLite, so the user can opt in to
- *  pre-filling the composer with a compact recap. See #1004. */
+/** Markdown recap of events `seq < beforeSeq`, offered after a `session/load` failure. */
 export function fetchContextPrimer(
   sessionId: string,
   beforeSeq: number,
@@ -1694,9 +1148,7 @@ export function fetchContextPrimer(
 
 // --- Devices ---
 
-/** A persisted login session, surfaced as a connected device. Backed by
- *  the server's login-session store (#1235), so it survives a daemon
- *  restart. `current` flags the session making the request. */
+/** A persisted login session; `current` flags the requesting one. */
 export interface DeviceSession {
   session_id: string;
   user_agent: string;
@@ -1710,28 +1162,14 @@ export function fetchDevices(): Promise<DeviceSession[] | null> {
   return fetchJson<DeviceSession[]>("/api/devices");
 }
 
-/** Revoke a single device's login session. Elevation-gated: a 403
- *  elevation_required pops the global passphrase prompt (handled by the
- *  fetch interceptor) and this resolves false so the caller can ask the
- *  user to retry after confirming. */
-export async function revokeDevice(sessionId: string): Promise<boolean> {
-  try {
-    const res = await fetch(`/api/login/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
-    return res.ok;
-  } catch {
-    return false;
-  }
+/** Elevation-gated; resolves false when the interceptor pops the passphrase prompt. */
+export function revokeDevice(sessionId: string): Promise<boolean> {
+  return fetchOk(`/api/login/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
 }
 
-/** Sign every device out (the escape hatch that replaces "restart logs
- *  everyone out"). Ends this session too. Elevation-gated. */
-export async function signOutAllDevices(): Promise<boolean> {
-  try {
-    const res = await fetch("/api/login/logout-all", { method: "POST" });
-    return res.ok;
-  } catch {
-    return false;
-  }
+/** Sign every device out, including this one. Elevation-gated. */
+export function signOutAllDevices(): Promise<boolean> {
+  return fetchOk("/api/login/logout-all", { method: "POST" });
 }
 
 // --- Wizard APIs ---
@@ -1768,28 +1206,17 @@ export async function fetchGroups(): Promise<GroupInfo[]> {
   return (await fetchJson<GroupInfo[]>("/api/groups")) ?? [];
 }
 
-/** Resolve a plugin `dynamic_select` widget's options from the host (#2897).
- *  `depends` carries the current values of the widget's `depends_on` siblings
- *  in declaration order (for acp_models/acp_modes the first entry is the
- *  selected agent). Returns [] on any failure so the picker degrades to an
- *  empty list rather than throwing. */
+/** Resolve a plugin `dynamic_select` widget's options; `depends` holds sibling values in order. */
 export async function resolvePluginOptions(
   pluginId: string,
   source: string,
   depends: string[],
 ): Promise<{ value: string; label: string }[]> {
-  try {
-    const res = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/settings/options/resolve`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source, depends }),
-    });
-    if (!res.ok) return [];
-    const body = (await res.json()) as { options?: { value: string; label: string }[] };
-    return body.options ?? [];
-  } catch {
-    return [];
-  }
+  const body = await fetchJson<{ options?: { value: string; label: string }[] }>(
+    `/api/plugins/${encodeURIComponent(pluginId)}/settings/options/resolve`,
+    jsonInit("POST", { source, depends }),
+  );
+  return body?.options ?? [];
 }
 
 export async function fetchProjects(scope?: "global" | "profile"): Promise<ProjectInfo[]> {
@@ -1797,159 +1224,79 @@ export async function fetchProjects(scope?: "global" | "profile"): Promise<Proje
   return (await fetchJson<ProjectInfo[]>(url)) ?? [];
 }
 
-/** Existing Claude Code sessions on disk, newest first, for the import
- *  picker (#2276). Empty when Claude Code was never run. */
+/** Claude Code sessions on disk, newest first, for the import picker. */
 export async function listClaudeSessions(): Promise<ClaudeSessionSummary[]> {
   return (await fetchJson<ClaudeSessionSummary[]>("/api/claude-sessions")) ?? [];
 }
 
-export async function createProject(body: {
+type ProjectResult = { ok: boolean; error?: string; project?: ProjectInfo };
+
+/** Error bodies may be JSON `{message}` or plain text. */
+async function projectRequest(url: string, init: RequestInit, returnsProject = true): Promise<ProjectResult> {
+  try {
+    const res = await fetch(url, init);
+    if (!res.ok) {
+      const text = await res.text();
+      try {
+        return { ok: false, error: JSON.parse(text).message || `Server error (${res.status})` };
+      } catch {
+        return { ok: false, error: text || `Server error (${res.status})` };
+      }
+    }
+    return returnsProject ? { ok: true, project: (await res.json()) as ProjectInfo } : { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+const projectPath = (name: string, scope: "global" | "profile") =>
+  `/api/projects/${encodeURIComponent(name)}?scope=${scope}`;
+
+export function createProject(body: {
   path: string;
   name?: string;
   scope?: "global" | "profile";
   allow_override?: boolean;
   default_base_branch?: string;
-  /** Pin the project on create (show it as a sessionless sidebar header).
-   *  Defaults to false server-side: the Projects view just saves, the sidebar
-   *  "Pin project" action sends true. See #2208. */
+  /** Show it as a sessionless sidebar header. */
   pinned?: boolean;
-}): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
-  try {
-    const res = await fetch("/api/projects", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      try {
-        const data = JSON.parse(text);
-        return {
-          ok: false,
-          error: data.message || `Server error (${res.status})`,
-        };
-      } catch {
-        return { ok: false, error: text || `Server error (${res.status})` };
-      }
-    }
-    const project = (await res.json()) as ProjectInfo;
-    return { ok: true, project };
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
-  }
+}): Promise<ProjectResult> {
+  return projectRequest("/api/projects", jsonInit("POST", body));
 }
 
-export async function deleteProject(
-  name: string,
-  scope: "global" | "profile",
-): Promise<{ ok: boolean; error?: string }> {
-  try {
-    const res = await fetch(`/api/projects/${encodeURIComponent(name)}?scope=${scope}`, { method: "DELETE" });
-    if (!res.ok) {
-      const text = await res.text();
-      try {
-        const data = JSON.parse(text);
-        return {
-          ok: false,
-          error: data.message || `Server error (${res.status})`,
-        };
-      } catch {
-        return { ok: false, error: text || `Server error (${res.status})` };
-      }
-    }
-    return { ok: true };
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
-  }
+export function deleteProject(name: string, scope: "global" | "profile"): Promise<{ ok: boolean; error?: string }> {
+  return projectRequest(projectPath(name, scope), { method: "DELETE" }, false);
 }
 
-/** Update a project's default base branch. Pass `null` to clear it. */
-export async function updateProject(
+/** Pass `null` to clear the default base branch. */
+export function updateProject(
   name: string,
   scope: "global" | "profile",
   defaultBaseBranch: string | null,
-): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
-  try {
-    const res = await fetch(`/api/projects/${encodeURIComponent(name)}?scope=${scope}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ default_base_branch: defaultBaseBranch }),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      try {
-        const data = JSON.parse(text);
-        return {
-          ok: false,
-          error: data.message || `Server error (${res.status})`,
-        };
-      } catch {
-        return { ok: false, error: text || `Server error (${res.status})` };
-      }
-    }
-    const project = (await res.json()) as ProjectInfo;
-    return { ok: true, project };
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
-  }
+): Promise<ProjectResult> {
+  return projectRequest(projectPath(name, scope), jsonInit("PATCH", { default_base_branch: defaultBaseBranch }));
 }
 
-/** Pin or unpin a saved project. Unpinning (pinned=false) keeps the registry
- *  entry, so the project stays in the Projects view and the wizard; it just
- *  drops from the sidebar. See #2208. */
-export async function setProjectPinned(
-  name: string,
-  scope: "global" | "profile",
-  pinned: boolean,
-): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
-  try {
-    const res = await fetch(`/api/projects/${encodeURIComponent(name)}?scope=${scope}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pinned }),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      try {
-        const data = JSON.parse(text);
-        return {
-          ok: false,
-          error: data.message || `Server error (${res.status})`,
-        };
-      } catch {
-        return { ok: false, error: text || `Server error (${res.status})` };
-      }
-    }
-    const project = (await res.json()) as ProjectInfo;
-    return { ok: true, project };
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
-  }
+/** Unpinning keeps the registry entry; it only drops from the sidebar. */
+export function setProjectPinned(name: string, scope: "global" | "profile", pinned: boolean): Promise<ProjectResult> {
+  return projectRequest(projectPath(name, scope), jsonInit("PATCH", { pinned }));
 }
 
 export async function fetchDockerStatus(): Promise<DockerStatusResponse> {
-  return (
-    (await fetchJson<DockerStatusResponse>("/api/docker/status")) ?? {
-      available: false,
-      runtime: null,
-    }
-  );
+  return (await fetchJson<DockerStatusResponse>("/api/docker/status")) ?? { available: false, runtime: null };
 }
 
-/** The repo's hooks need approval before this session can be created
- *  (#2066). Surfaced from a `hooks_need_trust` 403 so the wizard can show
- *  the commands and resubmit with `trust_hooks: true`. */
+/** Repo hooks awaiting approval, from a `hooks_need_trust` 403; resubmit with `trust_hooks: true`. */
 export interface HooksNeedTrust {
-  /** The `on_create` commands that will run once approved. */
   onCreate: string[];
-  /** The `on_launch` commands the same approval trusts (run on every later
-   *  session start, including TUI/CLI ones). */
+  /** Also trusted: run on every later session start, including TUI/CLI ones. */
   onLaunch: string[];
-  /** The `on_destroy` commands the same approval trusts (run on delete). */
   onDestroy: string[];
-  /** Whether the repo's `.mcp.json` also needs approval at this fingerprint. */
+  /** Whether the repo's `.mcp.json` also needs approval. */
   needsMcpTrust: boolean;
 }
+
+const stringList = (value: unknown) => (Array.isArray(value) ? value : []);
 
 export async function createSession(body: CreateSessionRequest): Promise<{
   ok: boolean;
@@ -1958,45 +1305,28 @@ export async function createSession(body: CreateSessionRequest): Promise<{
   hooksNeedTrust?: HooksNeedTrust;
 }> {
   try {
-    const res = await fetch("/api/sessions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      try {
-        const data = JSON.parse(text);
-        if (data.error === "hooks_need_trust") {
-          return {
-            ok: false,
-            error: data.message || "Repository hooks require trust",
-            hooksNeedTrust: {
-              onCreate: Array.isArray(data.on_create) ? data.on_create : [],
-              onLaunch: Array.isArray(data.on_launch) ? data.on_launch : [],
-              onDestroy: Array.isArray(data.on_destroy) ? data.on_destroy : [],
-              needsMcpTrust: data.needs_mcp_trust === true,
-            },
-          };
-        }
-        return {
-          ok: false,
-          error: data.message || `Server error (${res.status})`,
-        };
-      } catch {
-        return {
-          ok: false,
-          error: `Server error (${res.status}): ${text.slice(0, 200)}`,
-        };
-      }
+    const res = await fetch("/api/sessions", jsonInit("POST", body));
+    if (res.ok) return { ok: true, session: await res.json() };
+    const text = await res.text();
+    try {
+      const data = JSON.parse(text);
+      if (data.error !== "hooks_need_trust")
+        return { ok: false, error: data.message || `Server error (${res.status})` };
+      return {
+        ok: false,
+        error: data.message || "Repository hooks require trust",
+        hooksNeedTrust: {
+          onCreate: stringList(data.on_create),
+          onLaunch: stringList(data.on_launch),
+          onDestroy: stringList(data.on_destroy),
+          needsMcpTrust: data.needs_mcp_trust === true,
+        },
+      };
+    } catch {
+      return { ok: false, error: `Server error (${res.status}): ${text.slice(0, 200)}` };
     }
-    const data = await res.json();
-    return { ok: true, session: data };
   } catch (e) {
-    return {
-      ok: false,
-      error: `Network error: ${e instanceof Error ? e.message : "connection failed"}`,
-    };
+    return { ok: false, error: networkError(e) };
   }
 }
 
@@ -2006,29 +1336,16 @@ export async function cloneRepo(
   url: string,
   opts?: { destination?: string; shallow?: boolean; bare?: boolean },
 ): Promise<{ ok: boolean; path?: string; error?: string }> {
+  const body: Record<string, unknown> = { url };
+  if (opts?.destination) body.destination = opts.destination;
+  if (opts?.shallow) body.shallow = true;
+  if (opts?.bare) body.bare = true;
   try {
-    const body: Record<string, unknown> = { url };
-    if (opts?.destination) body.destination = opts.destination;
-    if (opts?.shallow) body.shallow = true;
-    if (opts?.bare) body.bare = true;
-    const res = await fetch("/api/git/clone", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      return {
-        ok: false,
-        error: data.message || `Clone failed (${res.status})`,
-      };
-    }
-    return { ok: true, path: data.path };
+    const { ok, status, payload } = await send("/api/git/clone", jsonInit("POST", body));
+    if (!ok) return { ok: false, error: rawMessage(payload) || `Clone failed (${status})` };
+    return { ok: true, path: payload?.path as string | undefined };
   } catch (e) {
-    return {
-      ok: false,
-      error: `Network error: ${e instanceof Error ? e.message : "connection failed"}`,
-    };
+    return { ok: false, error: networkError(e) };
   }
 }
 
@@ -2037,13 +1354,8 @@ export async function cloneRepo(
 export interface LoginStatus {
   required: boolean;
   authenticated: boolean;
-  /** Whether the session currently sits inside the 15-minute step-up
-   *  window. Sensitive routes (terminal attach, acp prompt /
-   *  approval / file mutations) only execute while this is true.
-   *  See #1131. */
+  /** Inside the step-up window that sensitive routes require. */
   elevated: boolean;
-  /** Seconds remaining on the current elevation window, or null when
-   *  not elevated. */
   elevated_until_secs: number | null;
 }
 
@@ -2058,98 +1370,52 @@ export async function loginStatus(): Promise<LoginStatus> {
   );
 }
 
-/** Verify the auth token via a session-exempt endpoint (`/api/login/status`).
- *  Returning `true` means the token authenticated; the caller still has to
- *  consult `loginStatus()` to decide between the main app and LoginPage.
- *  Used by the token entry page so a valid-token-but-needs-passphrase paste
- *  is accepted instead of being misread as a token rejection. */
-export async function verifyToken(): Promise<boolean> {
-  try {
-    const res = await fetch("/api/login/status");
-    return res.ok;
-  } catch {
-    return false;
-  }
+/** True when the token authenticates; a passphrase may still be required (see `loginStatus`). */
+export function verifyToken(): Promise<boolean> {
+  return fetchOk("/api/login/status");
 }
 
-export async function login(passphrase: string): Promise<{ ok: boolean; error?: string }> {
-  let deviceBindingSecret: string;
+/** Run `request` with this browser's device-binding secret. */
+async function withBindingSecret<T extends { ok: boolean; error?: string }>(
+  unavailable: string,
+  request: (secret: string) => Promise<T>,
+): Promise<T | { ok: false; error: string }> {
+  let secret: string;
   try {
-    deviceBindingSecret = getOrCreateDeviceBindingSecret();
+    secret = getOrCreateDeviceBindingSecret();
   } catch (err) {
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : "Could not create device binding for this browser",
-    };
+    return { ok: false, error: err instanceof Error ? err.message : unavailable };
   }
   try {
-    const res = await fetch("/api/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        passphrase,
-        device_binding_secret: deviceBindingSecret,
-      }),
-    });
-    if (res.ok) return { ok: true };
-    const data = await res.json().catch(() => null);
-    return {
-      ok: false,
-      error: data?.message ?? `Login failed (${res.status})`,
-    };
+    return await request(secret);
   } catch {
     return { ok: false, error: "Network error" };
   }
 }
 
-/**
- * Re-verify the passphrase to open a fresh 15-minute elevation
- * window. Required before the acp/terminal can perform
- * SSH-equivalent actions when the prior window has lapsed. See
- * #1131.
- *
- * Attaches the device-binding header explicitly rather than relying
- * on the global fetch interceptor; auth-sensitive endpoints should
- * not depend on monkey-patching to carry their second factor.
- */
-export async function elevateLogin(
+export function login(passphrase: string): Promise<{ ok: boolean; error?: string }> {
+  return withBindingSecret("Could not create device binding for this browser", async (secret) => {
+    const { ok, status, payload } = await send(
+      "/api/login",
+      jsonInit("POST", { passphrase, device_binding_secret: secret }),
+    );
+    return ok ? { ok: true } : { ok: false, error: rawMessage(payload) ?? `Login failed (${status})` };
+  });
+}
+
+/** Re-verify the passphrase to open a fresh elevation window. Sends the binding header
+ *  explicitly so the second factor does not depend on the fetch interceptor. */
+export function elevateLogin(
   passphrase: string,
 ): Promise<{ ok: boolean; error?: string; elevated_until_secs?: number }> {
-  let bindingSecret: string;
-  try {
-    bindingSecret = getOrCreateDeviceBindingSecret();
-  } catch (err) {
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : "Could not access device binding for this browser",
-    };
-  }
-  try {
-    const res = await fetch("/api/login/elevate", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Aoe-Device-Binding": bindingSecret,
-      },
-      body: JSON.stringify({ passphrase }),
-    });
-    if (res.ok) {
-      const data = (await res.json().catch(() => null)) as {
-        elevated_until_secs?: number;
-      } | null;
-      return {
-        ok: true,
-        elevated_until_secs: data?.elevated_until_secs,
-      };
-    }
-    const data = await res.json().catch(() => null);
-    return {
-      ok: false,
-      error: data?.message ?? `Elevation failed (${res.status})`,
-    };
-  } catch {
-    return { ok: false, error: "Network error" };
-  }
+  return withBindingSecret("Could not access device binding for this browser", async (secret) => {
+    const { ok, status, payload } = await send(
+      "/api/login/elevate",
+      jsonInit("POST", { passphrase }, { "X-Aoe-Device-Binding": secret }),
+    );
+    if (ok) return { ok: true, elevated_until_secs: payload?.elevated_until_secs as number | undefined };
+    return { ok: false, error: rawMessage(payload) ?? `Elevation failed (${status})` };
+  });
 }
 
 export async function logout(): Promise<void> {
@@ -2158,19 +1424,13 @@ export async function logout(): Promise<void> {
   } catch {
     // Best effort
   } finally {
-    // Drop the per-device binding secret so a future login generates
-    // a fresh one alongside the new session cookie. Without this, an
-    // attacker who later obtains a stale localStorage snapshot still
-    // holds a valid binding for the next session created on this
-    // browser. See #1131.
+    // A fresh login gets a fresh binding secret, so a stale localStorage snapshot is useless.
     try {
       clearDeviceBindingSecret();
     } catch {
       // ignore
     }
-    // Drop the in-memory approval-sound caches so a future user on the
-    // same tab does not see the previous user's settings snapshot or
-    // hear their cached blob.
+    // Don't leak the previous user's cached approval sound to the next user of this tab.
     try {
       const { clearApprovalSoundCache } = await import("../hooks/useApprovalSound");
       clearApprovalSoundCache();
@@ -2180,419 +1440,151 @@ export async function logout(): Promise<void> {
   }
 }
 
-/**
- * Rename a session's title. When the session is a tied aoe-managed worktree
- * (session.tie_workdir_to_name), the server also moves the worktree directory
- * to match and returns 409 if the session is running, so the message is
- * surfaced to the caller. See #1927.
- */
+/** Rename a session. A tied worktree moves too, and a running session returns 409 with a message. */
 export async function renameSession(
   id: string,
   title: string,
 ): Promise<{ ok: boolean; message?: string; warnings?: string[] }> {
-  try {
-    const res = await fetch(`/api/sessions/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title }),
-    });
-    if (res.ok) {
-      const body = await res.json().catch(() => null);
-      const warnings = Array.isArray(body?.warnings)
-        ? body.warnings.filter((warning: unknown): warning is string => typeof warning === "string")
-        : [];
-      return warnings.length > 0 ? { ok: true, warnings } : { ok: true };
-    }
-    let message: string | undefined;
-    try {
-      const body = await res.json();
-      message = typeof body?.message === "string" ? body.message : undefined;
-    } catch {
-      // non-JSON error body; fall through with no message
-    }
-    return { ok: false, message };
-  } catch {
-    return { ok: false };
-  }
+  const reply = await send(`/api/sessions/${id}`, jsonInit("PATCH", { title })).catch(() => null);
+  if (!reply) return { ok: false };
+  if (!reply.ok) return { ok: false, message: stringField(reply.payload, "message") };
+  const warnings = stringList(reply.payload?.warnings).filter((w): w is string => typeof w === "string");
+  return warnings.length > 0 ? { ok: true, warnings } : { ok: true };
 }
 
-/**
- * Manually re-run smart rename ("Auto-name now") for a still-default-named
- * structured-view session whose automatic rename never landed. Best-effort and
- * async: a 202 means the one-shot was re-triggered, not that the title changed.
- * Returns the server message on failure (409 when the session already has a
- * custom name or has no prompt yet) so the caller can surface it.
- */
-export async function smartRenameSession(id: string): Promise<{ ok: boolean; message?: string }> {
-  try {
-    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/smart-rename`, {
-      method: "POST",
-    });
-    if (res.ok) return { ok: true };
-    let message: string | undefined;
-    try {
-      const body = await res.json();
-      message = typeof body?.message === "string" ? body.message : undefined;
-    } catch {
-      // non-JSON error body; fall through with no message
-    }
-    return { ok: false, message };
-  } catch {
-    return { ok: false };
-  }
+/** Re-trigger smart rename; a 202 means it started, not that the title changed. */
+export function smartRenameSession(id: string): Promise<{ ok: boolean; message?: string }> {
+  return okWithMessage(`/api/sessions/${encodeURIComponent(id)}/smart-rename`, { method: "POST" });
 }
 
-/**
- * Request an on-demand "summary of the conversation so far" for a
- * structured-view session (see #2808). Best-effort: a 202 means the summary
- * one-shot started, and the result arrives later as a ConversationSummary
- * event over the structured-view WS. Returns the server's message on a gate
- * failure (not structured, no one-shot agent, sandboxed) so the caller can
- * surface it.
- */
-export async function summarizeSession(id: string): Promise<{ ok: boolean; message?: string }> {
-  try {
-    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/summarize`, {
-      method: "POST",
-    });
-    if (res.ok) return { ok: true };
-    let message: string | undefined;
-    try {
-      const body = await res.json();
-      message = typeof body?.message === "string" ? body.message : undefined;
-    } catch {
-      // non-JSON error body; fall through with no message
-    }
-    return { ok: false, message };
-  } catch {
-    return { ok: false };
-  }
+/** Start an on-demand conversation summary; the result arrives as a ConversationSummary event. */
+export function summarizeSession(id: string): Promise<{ ok: boolean; message?: string }> {
+  return okWithMessage(`/api/sessions/${encodeURIComponent(id)}/summarize`, { method: "POST" });
 }
 
-/**
- * Edit a managed worktree session's workdir name: move the worktree
- * directory and, optionally, rename its git branch. The session must not be
- * running. Returns the server's validation message on failure so the caller
- * can surface it. See #1723.
- */
-export async function setWorktreeName(
+/** Move a stopped managed worktree and optionally rename its branch. */
+export function setWorktreeName(
   id: string,
   name: string,
   renameBranch: boolean,
 ): Promise<{ ok: boolean; message?: string }> {
-  try {
-    const res = await fetch(`/api/sessions/${id}/worktree-name`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, rename_branch: renameBranch }),
-    });
-    if (res.ok) return { ok: true };
-    let message: string | undefined;
-    try {
-      const body = await res.json();
-      message = typeof body?.message === "string" ? body.message : undefined;
-    } catch {
-      // non-JSON error body; fall through with no message
-    }
-    return { ok: false, message };
-  } catch {
-    return { ok: false };
-  }
+  return okWithMessage(`/api/sessions/${id}/worktree-name`, jsonInit("PATCH", { name, rename_branch: renameBranch }));
 }
 
-/** What happened to the session's agent after a repo was attached. */
 export type AttachProjectWorker = "restarted" | "not_running" | "restart_failed";
 
 export interface AttachProjectResult {
   ok: boolean;
-  /** Server validation message on failure, or the worker message on a failed restart. */
+  /** Validation message on failure, or the worker message on a failed restart. */
   message?: string;
   worker?: AttachProjectWorker;
   /** Directory leaf the repo was attached under. */
   name?: string;
   branch?: string;
-  /** False when aoe checked out a branch the repo already had. */
+  /** False when an existing branch was checked out. */
   branchCreated?: boolean;
-  /** New working directory when the attach converted the session into a
-   *  workspace; absent when it already was one and nothing moved. */
+  /** New working directory when the attach converted the session into a workspace. */
   movedTo?: string;
   warnings?: string[];
 }
 
-/**
- * Attach another repo to a session that already exists, so an agent that turns
- * out to need a second repo keeps its conversation instead of the session being
- * recreated. Converts the session into a multi-repo workspace, which moves its
- * working directory unless it already was one, and restarts it there. See #3103.
- *
- * `project` is a path or the name of a registered project.
- *
- * A 200 with `worker: "restart_failed"` means the repo is attached and durable
- * but the session did not come back, so the caller must surface that rather than
- * treating the call as a plain success.
- */
+/** Attach another repo (path or registered project name) to an existing session, converting it into a
+ *  workspace. `worker: "restart_failed"` means the repo is attached but the session did not come back. */
 export async function attachSessionProject(
   id: string,
   project: string,
   opts: { attachExistingBranch?: boolean } = {},
 ): Promise<AttachProjectResult> {
-  try {
-    const res = await fetch(`/api/sessions/${id}/projects`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        project,
-        attach_existing_branch: opts.attachExistingBranch ?? false,
-      }),
-    });
-    let body: Record<string, unknown> | undefined;
-    try {
-      body = await res.json();
-    } catch {
-      // non-JSON body; fall through with no detail
-    }
-    if (!res.ok) {
-      return {
-        ok: false,
-        message: typeof body?.message === "string" ? body.message : undefined,
-      };
-    }
-    const attached = body?.attached as Record<string, unknown> | undefined;
-    return {
-      ok: true,
-      worker: body?.worker as AttachProjectWorker | undefined,
-      message: typeof body?.worker_message === "string" ? body.worker_message : undefined,
-      name: typeof attached?.name === "string" ? attached.name : undefined,
-      branch: typeof attached?.branch === "string" ? attached.branch : undefined,
-      branchCreated: typeof attached?.branch_created === "boolean" ? attached.branch_created : undefined,
-      movedTo: typeof attached?.moved_to === "string" ? attached.moved_to : undefined,
-      warnings: Array.isArray(body?.warnings) ? (body.warnings as string[]) : undefined,
-    };
-  } catch {
-    return { ok: false };
-  }
+  const reply = await send(
+    `/api/sessions/${id}/projects`,
+    jsonInit("POST", { project, attach_existing_branch: opts.attachExistingBranch ?? false }),
+  ).catch(() => null);
+  if (!reply) return { ok: false };
+  const body = reply.payload;
+  if (!reply.ok) return { ok: false, message: stringField(body, "message") };
+  const attached = body?.attached as Payload | undefined;
+  return {
+    ok: true,
+    worker: body?.worker as AttachProjectWorker | undefined,
+    message: stringField(body, "worker_message"),
+    name: stringField(attached, "name"),
+    branch: stringField(attached, "branch"),
+    branchCreated: typeof attached?.branch_created === "boolean" ? attached.branch_created : undefined,
+    movedTo: stringField(attached, "moved_to"),
+    warnings: Array.isArray(body?.warnings) ? (body.warnings as string[]) : undefined,
+  };
 }
 
-/** Move an existing session to another group, create a new group by
- *  passing a path that does not exist yet, or clear the group with an
- *  empty string (the ungroup sentinel, matching session creation and the
- *  TUI). Hits the dedicated `PATCH /api/sessions/:id/group` sub-route. */
-export async function updateSessionGroup(id: string, group: string): Promise<boolean> {
-  try {
-    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/group`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ group }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+/** Move a session to a group (created if new); an empty string ungroups. */
+export function updateSessionGroup(id: string, group: string): Promise<boolean> {
+  return fetchOk(`/api/sessions/${encodeURIComponent(id)}/group`, jsonInit("PATCH", { group }));
 }
 
-/** Three-preset helper for the sidebar context menu:
- *  - "off":     set all three overrides to false (silence this session)
- *  - "default": clear all three overrides (inherit server defaults)
- *  - "all":     set all three overrides to true (notify on any event)
- *  Sends all three fields in one PATCH to avoid multi-request ordering. */
-export async function setSessionNotifications(id: string, preset: "off" | "default" | "all"): Promise<boolean> {
+/** "off"/"all" force all three notification overrides; "default" clears them. */
+export function setSessionNotifications(id: string, preset: "off" | "default" | "all"): Promise<boolean> {
   const value = preset === "off" ? false : preset === "all" ? true : null;
-  try {
-    const res = await fetch(`/api/sessions/${id}/notifications`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        notify_on_waiting: value,
-        notify_on_idle: value,
-        notify_on_error: value,
-      }),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+  return fetchOk(
+    `/api/sessions/${id}/notifications`,
+    jsonInit("PATCH", { notify_on_waiting: value, notify_on_idle: value, notify_on_error: value }),
+  );
 }
 
-/** Set the diff-base override for one repo. Pass `null` as the branch to
- *  clear it and fall back to the repo's recorded creation base, then the
- *  profile default, then auto-detection. `repo` names a workspace member;
- *  omit it for a single-repo session's own checkout, which is the only entry
- *  such a session has. See #970, #3329. */
-export async function setSessionDiffBase(
+const sessionUpdate = (id: string, action: string, init: RequestInit) =>
+  fetchJson<SessionResponse>(`/api/sessions/${id}/${action}`, init);
+
+/** Set or clear (`null`) one repo's diff base; omit `repo` for a single-repo session. */
+export function setSessionDiffBase(
   id: string,
   baseBranch: string | null,
   repo?: string | null,
 ): Promise<SessionResponse | null> {
-  try {
-    const res = await fetch(`/api/sessions/${id}/diff-base`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(repo ? { base_branch: baseBranch, repo } : { base_branch: baseBranch }),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
-  } catch {
-    return null;
-  }
+  return sessionUpdate(
+    id,
+    "diff-base",
+    jsonInit("PATCH", repo ? { base_branch: baseBranch, repo } : { base_branch: baseBranch }),
+  );
 }
 
-/** Toggle the web-only "pin" marker on a session. Pinned workspaces sink
- *  to the top of the sidebar in all sort modes (manual and lastActivity).
- *  Distinct from the TUI favorite signal. See #1581. */
-export async function setSessionPin(id: string, pinned: boolean): Promise<SessionResponse | null> {
-  try {
-    const res = await fetch(`/api/sessions/${id}/pin`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pinned }),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
-  } catch {
-    return null;
-  }
+/** Web-only pin: pinned workspaces sink to the top of the sidebar in every sort mode. */
+export function setSessionPin(id: string, pinned: boolean): Promise<SessionResponse | null> {
+  return sessionUpdate(id, "pin", jsonInit("PATCH", { pinned }));
 }
 
-/** Set (or clear, with `null`) a session's color label. Rendered as a colored
- *  status dot in the sidebar; the palette is `red` / `amber` / `green`. Also
- *  settable from the CLI via `aoe session color`. See #2383. */
-export async function setSessionColor(id: string, color: string | null): Promise<SessionResponse | null> {
-  try {
-    const res = await fetch(`/api/sessions/${id}/color`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ color }),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
-  } catch {
-    return null;
-  }
+/** Set or clear (`null`) the color label: `red` / `amber` / `green`. */
+export function setSessionColor(id: string, color: string | null): Promise<SessionResponse | null> {
+  return sessionUpdate(id, "color", jsonInit("PATCH", { color }));
 }
 
-/** Archive or unarchive a session. On archive (with `killPane` true or
- *  omitted), the server tears down all tmux sessions and shuts down the
- *  ACP worker for acp-mode sessions. Sending a message auto-unarchives.
- *  See #1581, #1868. */
-export async function setSessionArchive(
-  id: string,
-  archived: boolean,
-  killPane = true,
-): Promise<SessionResponse | null> {
-  try {
-    const res = await fetch(`/api/sessions/${id}/archive`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ archived, kill_pane: killPane }),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
-  } catch {
-    return null;
-  }
+export function setSessionArchive(id: string, archived: boolean, killPane = true): Promise<SessionResponse | null> {
+  return sessionUpdate(id, "archive", jsonInit("PATCH", { archived, kill_pane: killPane }));
 }
 
-/** Move a session to the trash (#2489): stops the live session (ACP
- *  shutdown, which preserves the transcript, plus optional tmux teardown)
- *  and hides it from the normal list while keeping every durable artifact so
- *  it can be restored. NOT a permanent delete; use `deleteWorkspace` for that. */
-export async function trashSession(id: string, killPane = true): Promise<SessionResponse | null> {
-  try {
-    const res = await fetch(`/api/sessions/${id}/trash`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kill_pane: killPane }),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
-  } catch {
-    return null;
-  }
+/** Stop the live session but keep every durable artifact so it can be restored. */
+export function trashSession(id: string, killPane = true): Promise<SessionResponse | null> {
+  return sessionUpdate(id, "trash", jsonInit("POST", { kill_pane: killPane }));
 }
 
-/** Restore a trashed session (#2489): clears `trashed_at`, returning it to
- *  its prior bucket with its transcript and metadata intact. */
-export async function restoreSession(id: string): Promise<SessionResponse | null> {
-  try {
-    const res = await fetch(`/api/sessions/${id}/restore`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
-  } catch {
-    return null;
-  }
+export function restoreSession(id: string): Promise<SessionResponse | null> {
+  return sessionUpdate(id, "restore", jsonInit("POST"));
 }
 
-/** Stop a session, matching the TUI's `x` keybind: kills the tmux pane and
- *  stops (but does not remove) the Docker container for plain sessions, or
- *  shuts down the worker for structured-view sessions. The session record is
- *  preserved with status `Stopped` and can be resumed later. NOT a delete. */
-export async function stopSession(id: string): Promise<SessionResponse | null> {
-  try {
-    const res = await fetch(`/api/sessions/${id}/stop`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
-  } catch {
-    return null;
-  }
+/** Stop the pane/worker but keep the session record (status `Stopped`). */
+export function stopSession(id: string): Promise<SessionResponse | null> {
+  return sessionUpdate(id, "stop", jsonInit("POST"));
 }
 
-/** Start (resume) a stopped session, the inverse of stopSession: restarts a
- *  plain session's pane or un-parks a structured session so its worker
- *  respawns. Returns null on failure. */
-export async function startSession(id: string): Promise<SessionResponse | null> {
-  try {
-    const res = await fetch(`/api/sessions/${id}/start`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
-  } catch {
-    return null;
-  }
+export function startSession(id: string): Promise<SessionResponse | null> {
+  return sessionUpdate(id, "start", jsonInit("POST"));
 }
 
-/** Snooze or unsnooze a session. Pass `null` to unsnooze, or a positive
- *  number of minutes between 1 and 43200 (30 days) to snooze. The server
- *  validates against the shared `validate_snooze_duration` so the bounds
- *  match the TUI dialog presets and the CLI's `aoe session snooze`. See
- *  #1581. */
-export async function setSessionSnooze(id: string, minutes: number | null): Promise<SessionResponse | null> {
-  try {
-    const res = await fetch(`/api/sessions/${id}/snooze`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ minutes }),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
-  } catch {
-    return null;
-  }
+/** `null` unsnoozes; otherwise 1..=43200 minutes, validated server-side. */
+export function setSessionSnooze(id: string, minutes: number | null): Promise<SessionResponse | null> {
+  return sessionUpdate(id, "snooze", jsonInit("PATCH", { minutes }));
 }
 
-/** Flag a session manually unread (`true`) or mark it read (`false`, clearing
- *  both auto and manual markers). Mirrors the TUI `u` toggle; the caller
- *  computes the target from the current state so an optimistic update stays in
- *  sync with the server. */
-export async function setSessionUnread(id: string, unread: boolean): Promise<SessionResponse | null> {
-  try {
-    const res = await fetch(`/api/sessions/${id}/unread`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ unread }),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as SessionResponse;
-  } catch {
-    return null;
-  }
+/** `false` clears both the auto and manual unread markers. */
+export function setSessionUnread(id: string, unread: boolean): Promise<SessionResponse | null> {
+  return sessionUpdate(id, "unread", jsonInit("PATCH", { unread }));
 }
 
 export interface DeleteSessionOptions {
@@ -2600,9 +1592,7 @@ export interface DeleteSessionOptions {
   delete_branch?: boolean;
   delete_sandbox?: boolean;
   force_delete?: boolean;
-  /** For scratch sessions, keep the scratch directory on disk instead of
-   *  removing it. The session record is still deleted. No effect on
-   *  non-scratch sessions. */
+  /** Keep a scratch session's directory on disk. */
   keep_scratch?: boolean;
 }
 
@@ -2615,57 +1605,33 @@ export interface DeleteWorkspaceResult {
   ok: boolean;
   error?: string;
   messages?: string[];
-  /** Ids the server actually deleted. */
   deleted?: string[];
-  /** Sessions that could not be deleted, with their error. */
   failed?: WorkspaceDeleteFailure[];
 }
 
-/** Atomically delete a whole multi-session workspace in one call (#2536).
- *  `sessionIds` is the workspace's full session set in display order; the
- *  server treats `sessionIds[0]` as the worktree owner (removed last) and the
- *  rest as record-only siblings. Replaces the old per-session delete fan-out,
- *  so a mid-delete disconnect can no longer half-delete the workspace. */
+/** Atomically delete a workspace. `sessionIds[0]` owns the worktree and is removed last. */
 export async function deleteWorkspace(
   sessionIds: string[],
   options: DeleteSessionOptions = {},
 ): Promise<DeleteWorkspaceResult> {
   try {
-    const res = await fetch(`/api/workspaces`, {
-      method: "DELETE",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_ids: sessionIds, ...options }),
-    });
-    const data = (await res.json().catch(() => ({}))) as {
-      message?: string;
-      messages?: string[];
-      deleted?: string[];
-      failed?: WorkspaceDeleteFailure[];
-    };
-    if (!res.ok) {
-      return {
-        ok: false,
-        error: data.message || `Server error (${res.status})`,
-        failed: data.failed,
-      };
-    }
-    // The endpoint always reports which sessions it removed. A 2xx without a
-    // `deleted` array is not a confirmed deletion, so treat it as a failure
-    // rather than dropping local state (drafts, caches) for sessions the
-    // server may not have touched.
-    if (!Array.isArray(data.deleted)) {
+    const { ok, status, payload } = await send(
+      "/api/workspaces",
+      jsonInit("DELETE", { session_ids: sessionIds, ...options }),
+    );
+    const failed = payload?.failed as WorkspaceDeleteFailure[] | undefined;
+    if (!ok) return { ok: false, error: rawMessage(payload) || `Server error (${status})`, failed };
+    // Without a `deleted` array, deletion is unconfirmed; keep local state for those sessions.
+    if (!Array.isArray(payload?.deleted)) {
       return { ok: false, error: "Server did not confirm which sessions were deleted" };
     }
-    return { ok: true, messages: data.messages, deleted: data.deleted, failed: data.failed };
+    return { ok: true, messages: payload.messages as string[] | undefined, deleted: payload.deleted, failed };
   } catch (e) {
-    return {
-      ok: false,
-      error: `Network error: ${e instanceof Error ? e.message : "connection failed"}`,
-    };
+    return { ok: false, error: networkError(e) };
   }
 }
 
-// --- MCP servers (#1996) ---
+// --- MCP servers ---
 
 export interface McpServerView {
   name: string;
@@ -2700,17 +1666,7 @@ export function fetchMcpServers(agent?: string): Promise<McpServersResponse | nu
   return fetchJson<McpServersResponse>(`/api/mcp/servers${q}`);
 }
 
-async function postMcp(url: string, body: unknown): Promise<Response | null> {
-  try {
-    return await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  } catch {
-    return null;
-  }
-}
+const mcpPath = (name: string, action: string) => `/api/mcp/servers/${encodeURIComponent(name)}/${action}`;
 
 export type McpResolveResult = "applied" | "stale" | "error";
 
@@ -2720,28 +1676,24 @@ export async function resolveMcpConflict(
   winner: "aoe" | "native",
   fingerprint: string,
 ): Promise<McpResolveResult> {
-  const res = await postMcp(`/api/mcp/servers/${encodeURIComponent(name)}/resolve`, {
-    agent,
-    winner,
-    fingerprint,
-  });
-  if (!res) return "error";
-  if (res.ok) return "applied";
-  if (res.status === 409) return "stale";
-  return "error";
+  try {
+    const res = await fetch(mcpPath(name, "resolve"), jsonInit("POST", { agent, winner, fingerprint }));
+    if (res.ok) return "applied";
+    return res.status === 409 ? "stale" : "error";
+  } catch {
+    return "error";
+  }
 }
 
-export async function keepMcpServer(name: string, agent: string): Promise<boolean> {
-  const res = await postMcp(`/api/mcp/servers/${encodeURIComponent(name)}/keep`, { agent });
-  return !!res && res.ok;
+export function keepMcpServer(name: string, agent: string): Promise<boolean> {
+  return fetchOk(mcpPath(name, "keep"), jsonInit("POST", { agent }));
 }
 
-export async function dropMcpServer(name: string, agent: string): Promise<boolean> {
-  const res = await postMcp(`/api/mcp/servers/${encodeURIComponent(name)}/drop`, { agent });
-  return !!res && res.ok;
+export function dropMcpServer(name: string, agent: string): Promise<boolean> {
+  return fetchOk(mcpPath(name, "drop"), jsonInit("POST", { agent }));
 }
 
-// --- Skills (#3050) ---
+// --- Skills ---
 
 export type SkillProvenance = { kind: "aoe-managed" } | { kind: "external"; root: string };
 
@@ -2790,31 +1742,26 @@ export function fetchSkill(source: string, directory: string): Promise<SkillDeta
   return fetchJson<SkillDetail>(`/api/skills/${encodeURIComponent(source)}/${encodeURIComponent(directory)}`);
 }
 
-async function skillMutation(url: string, method: string, body?: unknown): Promise<SkillMutationResult> {
+async function skillRequest<T extends { ok: boolean; error?: string; status?: number }>(
+  url: string,
+  init: RequestInit,
+  onOk: (payload: Payload | null) => Omit<T, "ok" | "status">,
+  failureExtra: Partial<T> = {},
+): Promise<T> {
   try {
-    const response = await fetch(url, {
-      method,
-      headers: body === undefined ? undefined : { "Content-Type": "application/json" },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-    const data = (await response.json().catch(() => ({}))) as {
-      directory?: string | null;
-      message?: string;
-    };
-    if (!response.ok) {
-      return {
-        ok: false,
-        error: data.message ?? `Server error (${response.status})`,
-        status: response.status,
-      };
-    }
-    return { ok: true, directory: data.directory ?? undefined, status: response.status };
-  } catch (error) {
-    return {
-      ok: false,
-      error: `Network error: ${error instanceof Error ? error.message : "connection failed"}`,
-    };
+    const { ok, status, payload } = await send(url, init);
+    if (!ok)
+      return { ...failureExtra, ok: false, error: rawMessage(payload) ?? `Server error (${status})`, status } as T;
+    return { ok: true, ...onOk(payload), status } as T;
+  } catch (e) {
+    return { ok: false, ...failureExtra, error: networkError(e) } as T;
   }
+}
+
+function skillMutation(url: string, method: string, body?: unknown): Promise<SkillMutationResult> {
+  return skillRequest<SkillMutationResult>(url, body === undefined ? { method } : jsonInit(method, body), (p) => ({
+    directory: (p?.directory as string | null | undefined) ?? undefined,
+  }));
 }
 
 export function createSkill(directory: string, description?: string): Promise<SkillMutationResult> {
@@ -2837,9 +1784,7 @@ export function adoptSkill(source: string, directory: string, destination?: stri
 
 export type SkillSyncStatus = "created" | "updated" | "unchanged" | "removed" | "conflict" | "error";
 
-/** One skill's sync outcome for one agent root. `message` is populated for
- *  `conflict` (the user's own skill, or an edited propagated copy, was left
- *  alone) and `error`. */
+/** `message` is set for `conflict` (a user-owned or edited copy was left alone) and `error`. */
 export interface SkillSyncOutcome {
   root: string;
   directory: string;
@@ -2854,47 +1799,18 @@ export interface SkillSyncResult {
   status?: number;
 }
 
-/** Copy AoE-managed skills into each agent's own skills directory
- *  (`POST /api/skills/sync`). Omitting `roots` (or passing an empty array)
- *  syncs every root. Never overwrites or deletes anything AoE did not itself
- *  deploy and that is not still byte-identical to what AoE deployed; such
- *  cases come back as a `conflict` outcome instead. `replace` names skills
- *  the user has explicitly asked AoE to take over, so a conflict for that
- *  directory is overwritten instead of left alone; omitting it (or passing an
- *  empty array) overwrites nothing. `directories`, when non-empty, reconciles
- *  only those skills and skips orphan removal for everything else, so a
- *  single-skill share cannot touch unrelated skills. Distinct shape from
- *  {@link skillMutation} (outcomes array, not a single directory), so this is
- *  a sibling rather than a reuse. */
-export async function syncSkills(options?: {
+/** Copy AoE-managed skills into agent skill directories, never overwriting anything AoE did not
+ *  deploy unchanged. Empty `roots` syncs every root; `replace` names conflicts to overwrite;
+ *  non-empty `directories` limits the reconcile (and orphan removal) to those skills. */
+export function syncSkills(options?: {
   roots?: string[];
   replace?: string[];
   directories?: string[];
 }): Promise<SkillSyncResult> {
-  try {
-    const response = await fetch("/api/skills/sync", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ roots: options?.roots, replace: options?.replace, directories: options?.directories }),
-    });
-    const data = (await response.json().catch(() => ({}))) as {
-      outcomes?: SkillSyncOutcome[];
-      message?: string;
-    };
-    if (!response.ok) {
-      return {
-        ok: false,
-        outcomes: [],
-        error: data.message ?? `Server error (${response.status})`,
-        status: response.status,
-      };
-    }
-    return { ok: true, outcomes: data.outcomes ?? [], status: response.status };
-  } catch (error) {
-    return {
-      ok: false,
-      outcomes: [],
-      error: `Network error: ${error instanceof Error ? error.message : "connection failed"}`,
-    };
-  }
+  return skillRequest<SkillSyncResult>(
+    "/api/skills/sync",
+    jsonInit("POST", { roots: options?.roots, replace: options?.replace, directories: options?.directories }),
+    (p) => ({ outcomes: (p?.outcomes as SkillSyncOutcome[] | undefined) ?? [] }),
+    { outcomes: [] },
+  );
 }

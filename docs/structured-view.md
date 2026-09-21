@@ -1,43 +1,42 @@
 # Structured View (Web Dashboard)
 
-The **structured view** is the default rendering for AI coding agents in the web dashboard and the native TUI. Instead of a terminal pane showing the agent's rendered screen, it renders the agent's structured state directly: plan, tool-call cards, diffs, and approvals. It is mobile-first and scales the same components into a richer multi-pane desktop layout.
+The **structured view** is the default rendering for AI coding agents in the web dashboard and the native TUI. Instead of a terminal pane showing the agent's rendered screen, it renders the agent's state directly: plan, tool-call cards, diffs, and approvals. It is mobile-first and scales into a multi-pane desktop layout.
 
-It speaks the [Agent Client Protocol](https://agentclientprotocol.com/) (ACP), a JSON-RPC standard for editor-agent communication. aoe is the *client*; the agent (Claude Code, Gemini, Codex, etc.) is the *server*. Any ACP-capable agent uses the structured view by default; a session can opt into the **terminal view** instead, per session, and you can switch at any time. Agents with no ACP adapter always run in the terminal view.
+It speaks the [Agent Client Protocol](https://agentclientprotocol.com/) (ACP), a JSON-RPC standard for editor-agent communication, with aoe as the *client* and the agent as the *server*. Any ACP-capable agent uses it by default and can opt into the terminal view per session; agents with no ACP adapter always run in the terminal view.
 
 ![The structured view rendering an agent's plan, tool-call cards, and a pending approval](assets/structured-view/overview.png)
 
-## In this section
-
-- **[Interface](structured-view/interface.md)**: the TUI and web surfaces, keybinds, composer, queued prompts, and timeline grouping.
-- **[Modes, approvals & model controls](structured-view/controls.md)**: permission modes, YOLO, approval cards, notifications, and the model / reasoning-effort selectors.
-- **[Troubleshooting](structured-view/troubleshooting.md)**: the security summary plus a field guide to each failure mode and its fix.
-
-Contributors: see [Structured View Internals](development/internals/structured-view.md) for worker lifecycle, watchdogs, persistence, and profiles.
+- **[Interface](structured-view/interface.md)**: surfaces, keybinds, composer, queued prompts, timeline grouping.
+- **[Modes, approvals & model controls](structured-view/controls.md)**: permission modes, approval cards, notifications, model selectors.
+- **[Troubleshooting](structured-view/troubleshooting.md)**: the security model and a field guide to each failure mode.
+- Contributors: [Structured View Internals](development/internals/structured-view.md).
 
 ## Supported agents
 
-aoe ships an ACP registry entry for each tool whose ACP server we've verified. For those tools the web wizard shows a per-session **Use structured view** toggle (on by default), under the wizard's **More options** disclosure. Tools not in the set, and custom agents without an ACP command, have no toggle and always run in the terminal view.
+aoe ships an ACP registry entry for each tool whose ACP server we have verified. For those the web wizard shows a per-session **Use structured view** toggle (on by default) under **More options**.
 
 | Agent | ACP adapter | Install | Auth |
 |-------|-------------|---------|------|
-| `claude` | `claude-agent-acp` (Zed, recent version required) | `npm install -g @agentclientprotocol/claude-agent-acp@latest` | `claude login`, or `ANTHROPIC_API_KEY` |
-| `codex` | `codex-acp` (ACP) | `npm install -g @agentclientprotocol/codex-acp@latest` | `OPENAI_API_KEY`, or ChatGPT login (local-only) |
+| `claude` | `claude-agent-acp` (Zed) | `npm install -g @agentclientprotocol/claude-agent-acp@latest` | `claude login`, or `ANTHROPIC_API_KEY` |
+| `codex` | `codex-acp` | `npm install -g @agentclientprotocol/codex-acp@latest` | `OPENAI_API_KEY`, or ChatGPT login (local only) |
 | `opencode` | `opencode acp` (native, ≥1.16.0 recommended) | `curl -fsSL https://opencode.ai/install \| bash` | `opencode auth` / provider env |
 | `gemini` (deprecated) | `gemini --acp` (native) | `npm install -g @google/gemini-cli` | `GEMINI_API_KEY`, OAuth, or Vertex |
 | `vibe` | `vibe-acp` (native) | see [mistral-vibe](https://github.com/mistralai/mistral-vibe) | Mistral API key |
-| `pi` | `pi-acp` (adapter) | `npm install -g pi-acp` (plus `@earendil-works/pi-coding-agent`) | `pi-acp --terminal-login`, or provider env |
-| `omp` | `omp acp` (native) | `curl -fsSL https://omp.sh/install \| sh` | provider environment or OMP login |
+| `pi` | `pi-acp` | `npm install -g pi-acp` (plus `@earendil-works/pi-coding-agent`) | `pi-acp --terminal-login`, or provider env |
+| `omp` | `omp acp` (native) | `curl -fsSL https://omp.sh/install \| sh` | OMP login or provider env |
 | `kimi` | `kimi acp` (native) | `curl -fsSL https://code.kimi.com/kimi-code/install.sh \| bash` | `kimi login`, or provider env |
 | `prime-agent` | `prime-agent --mode acp` (native) | `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh` | `/login` once, or provider env |
-| `aoe-agent` | bundled (Vercel AI SDK 7, runs on the resolved Node) | `aoe acp doctor --fix --adapter aoe-agent` installs it into the data dir; nothing to install globally | provider env vars |
+| `aoe-agent` | bundled (Vercel AI SDK 7) | `aoe acp doctor --fix --adapter aoe-agent` | provider env vars |
 
-Gemini CLI is deprecated upstream for individual accounts since 2026-06-18. Enterprise and API-key authentication remain valid; Antigravity CLI is the replacement for consumer accounts.
+Gemini CLI is deprecated upstream for individual accounts; enterprise and API-key auth remain valid, and Antigravity CLI is the consumer replacement.
 
-The `npm install -g` commands above are optional: `aoe acp doctor --fix` installs the `claude` / `codex` / `pi` adapters and `aoe-agent` into the data dir for you, one adapter at a time with `--adapter <name>`, or all of them with `--all-adapters` (see [Requirements](#requirements)). Run it, or install the npm ones globally yourself.
+The `npm install -g` lines are optional: `aoe acp doctor --fix` installs the `claude`, `codex`, and `pi` adapters and `aoe-agent` into the data dir instead (see [Requirements](#requirements)).
 
-Tools not yet wired into the registry (aider, cursor, copilot, droid, hermes, kiro) always run in the terminal view. A **custom agent** can opt in two ways. Set an explicit ACP launch command via `agent_acp_cmd` (see [Configuration](guides/configuration.md#running-a-custom-agent-in-the-structured-view)); or, if the custom agent only wraps a supported one (for example a Claude wrapper that overrides profile/oauth locations), map it to that base with `agent_detect_as` (`my-claude = "claude"`) and it inherits the base's ACP adapter automatically, with no `agent_acp_cmd` needed. An inheriting agent runs through the base adapter, so it renders exactly like the base agent; its profile/oauth overrides ride the session's `extra_env` / `environment` the same as any other agent. This also lights up the "Switch to structured view" action for an existing terminal session of that agent.
+Tools not in the registry (aider, cursor, copilot, droid, hermes, kiro) always run in the terminal view. A **custom agent** opts in either with an explicit `agent_acp_cmd`, or by mapping onto a supported base with `agent_detect_as`, which inherits that base's adapter; see [Configuration](guides/configuration.md#running-a-custom-agent-in-the-structured-view).
 
-Each built-in adapter receives only the provider variables it is known to read from the environment that runs `aoe serve`:
+### Provider credentials
+
+Each built-in adapter receives only the provider variables it is known to read, from the environment that runs `aoe serve`:
 
 | Adapter | Forwarded |
 |---|---|
@@ -46,13 +45,11 @@ Each built-in adapter receives only the provider variables it is known to read f
 | `opencode` | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_API_KEY` |
 | `gemini` | `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` |
 | `aoe-agent` | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `GOOGLE_GENERATIVE_AI_API_KEY` |
-| `prime-agent` | `PRIME_API_KEY`, `PRIME_TEAM_ID`; each provider key its model registry reads (`ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `AZURE_OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `CEREBRAS_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`, `AI_GATEWAY_API_KEY`, `ZAI_API_KEY`, `MISTRAL_API_KEY`, `MINIMAX_API_KEY`, `MINIMAX_CN_API_KEY`, `MOONSHOT_API_KEY`, `HF_TOKEN`, `FIREWORKS_API_KEY`, `OPENCODE_API_KEY`, `KIMI_API_KEY`, `CLOUDFLARE_API_KEY`, `XIAOMI_API_KEY`, `XIAOMI_TOKEN_PLAN_CN_API_KEY`, `XIAOMI_TOKEN_PLAN_AMS_API_KEY`, `XIAOMI_TOKEN_PLAN_SGP_API_KEY`, `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`); Vertex (`GOOGLE_CLOUD_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT`, `GCLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`); Bedrock and the AWS credential chain (`AWS_BEARER_TOKEN_BEDROCK`, `AWS_PROFILE`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ROLE_ARN`, `AWS_ROLE_SESSION_NAME`, `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, `AWS_CONTAINER_CREDENTIALS_FULL_URI`, `AWS_CONTAINER_AUTHORIZATION_TOKEN`, `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`) |
+| `prime-agent` | `PRIME_API_KEY`, `PRIME_TEAM_ID`, every provider key its model registry reads, and the Vertex, Bedrock, and AWS credential-chain variables (see `src/acp/agent_registry.rs`) |
 
-`vibe`, `pi`, `omp`, and `kimi` have no ambient provider allowlist yet. Custom adapters also receive no ambient provider credentials. Until their variables are verified, give them auth through the per-session `extra_env` field or `environment` in your config, or set `session.inherit_host_environment = true` to forward your whole `aoe serve` environment to non-sandboxed agents. In a sandboxed session the per-adapter provider keys above still cross the container boundary (forwarded as `docker exec -e` flags), but `inherit_host_environment` does not; give a sandboxed not-yet-verified adapter its auth through `sandbox.environment`. Ambient allowlist entries that name a file or directory are host-only and never cross: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GOOGLE_APPLICATION_CREDENTIALS`, `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, `AWS_WEB_IDENTITY_TOKEN_FILE`, and `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` name paths on your machine that do not exist inside the container, and each agent's config dir is already bind-mounted at its canonical container location. Values explicitly supplied through `provider_env` are not part of that ambient filtering.
+`vibe`, `pi`, `omp`, `kimi`, and custom adapters have no ambient allowlist yet: give them auth through the session's `extra_env`, the `environment` list, or `session.inherit_host_environment` for host sessions. In a sandboxed session the per-adapter keys above still cross the container boundary, but `inherit_host_environment` does not, so use `sandbox.environment` there. Allowlist entries naming a file or directory (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GOOGLE_APPLICATION_CREDENTIALS`, the AWS file variables) are host-only and never cross, since each agent's config dir is already bind-mounted at its canonical container location.
 
 ### Feature matrix
-
-Each feature fires for any ACP agent, only when the agent's profile opts in, or claude-only.
 
 | Feature | Claude | Codex | OpenCode | Gemini | Other ACP |
 |---------|:------:|:-----:|:--------:|:------:|:---------:|
@@ -65,17 +62,15 @@ Each feature fires for any ACP agent, only when the agent's profile opts in, or 
 | Subagent indentation | ✓ | — | unverified | — | — |
 | Session resume across `aoe serve` restart | ✓ | depends | ✓ | depends | depends |
 
-Codex/opencode/gemini support is built from adapter docs and code reading rather than hands-on walkthroughs, so some tool aliases may need adjustment; file an issue with the observed `tool.kind` + `tool.name`. opencode ≥1.16.0 is recommended: it classifies `apply_patch` as `edit` and `task` as `think`, populates `external_directory` permission context, and emits clean read-tool content. Older opencode still works but falls back to generic tool cards, verbose read text, and blind permission prompts. Mode picker, slash palette, and usage display depend on the adapter advertising the matching channels; when it doesn't, the UI stays empty rather than showing stale state. Codex currently does not advertise a Plan-mode channel, so AoE does not render a Codex Plan switch. How profiles gate these is covered in [Structured View Internals](development/internals/structured-view.md#agent-profiles).
+"Depends" means the adapter has to advertise the matching channel; when it does not, the UI stays empty rather than showing stale state. Codex does not advertise a Plan-mode channel, so no Codex Plan switch is rendered. Older opencode falls back to generic tool cards, verbose read text, and blind permission prompts. If a tool renders as a generic card, file an issue with the observed `tool.kind` and `tool.name`; how profiles gate these is covered in [Structured View Internals](development/internals/structured-view.md#agent-profiles).
 
 ## Quickstart
 
-The web new-session wizard is the primary path; no CLI needed.
-
 1. Run `aoe serve` and open the dashboard.
-2. Click **New session**, pick your project and agent, and launch. Structured view is on by default; to confirm or change it, expand **More options** and leave **Use structured view** on.
-3. Open the session: you see the structured plan and tool-call cards instead of a terminal.
+2. Click **New session**, pick your project and agent, and launch. Structured view is on by default.
+3. Open the session: you get the plan and tool-call cards instead of a terminal.
 
-The CLI is the optional path for scripting or headless launches. Unlike the wizard, `aoe add` defaults to the terminal view (matching the TUI):
+The CLI is the optional path for scripting. Unlike the wizard, `aoe add` defaults to the terminal view:
 
 ```bash
 aoe acp doctor                              # confirm prerequisites
@@ -83,87 +78,58 @@ aoe add . --cmd claude --structured-view    # structured view for an ACP tool
 aoe add . --agent codex --model gpt-5       # pick an ACP agent + model (implies structured view)
 ```
 
-`--agent` for an uninstalled adapter errors with an install hint; `--structured-view` (no `--agent`) falls back to the terminal view with a warning so the command still succeeds.
+`--agent` for an uninstalled adapter errors with an install hint; `--structured-view` without `--agent` falls back to the terminal view with a warning, so the command still succeeds.
+
 ## Requirements
 
-- Node.js 22+ on `PATH` (the structured view spawns an ACP agent subprocess); `aoe-agent` needs 22.6+ for `--experimental-strip-types` and declares `engines.node: >=22.6.0`.
+- Node.js 22+ on `PATH` (the structured view spawns the adapter as a subprocess); `aoe-agent` needs 22.6+.
 - For Claude Code, a `claude login` session.
 
 If Node is missing or too old, the session falls back to the terminal view with an actionable warning. Verify with `aoe acp doctor`:
 
 ```bash
-aoe acp doctor                                  # reports Node + each configured agent's reachability
-aoe acp doctor --fix                            # download bundled Node if missing, then install claude-agent-acp
-aoe acp doctor --fix --adapter codex-acp        # install a specific adapter instead
-aoe acp doctor --fix --all-adapters            # install every bundled adapter
+aoe acp doctor                            # Node + each configured agent's reachability
+aoe acp doctor --fix                      # bundled Node if missing, then claude-agent-acp
+aoe acp doctor --fix --adapter codex-acp  # a specific adapter
+aoe acp doctor --fix --all-adapters       # every bundled adapter
 ```
 
-`--fix` installs a pinned npm adapter under `$AOE_DATA_DIR/acp-worker/adapters/<adapter>/` with the bundled Node's own npm; no `npm install -g` and no sudo, at a version aoe pins per release. Each adapter is a separate several-hundred-MB tree (`claude-agent-acp` ~304 MB, `codex-acp` ~336 MB, `pi-acp` ~7 MB; `aoe-agent`'s sources ship inside `aoe` and its npm dependencies install the same way), so `--fix` installs only `claude-agent-acp` unless you ask for more.
-
-An adapter already on your `PATH` normally wins, so a manual global install keeps working. The exception is a `PATH` copy below the version floor aoe requires: rather than spawn a binary the agent handshake would reject, aoe uses the pinned bundled copy and logs the substitution. `doctor --fix` tells you when your `PATH` copy is the stale one.
-
-It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `--json` for machine-readable output. Install the native CLIs (opencode / gemini / vibe / omp / kimi / prime-agent) through their own channels.
+`--fix` installs a pinned npm adapter under `$AOE_DATA_DIR/acp-worker/adapters/<adapter>/` with the bundled Node's own npm: no `npm install -g`, no sudo. Each adapter is a separate several-hundred-MB tree (`pi-acp` is the exception at ~7 MB), so `--fix` installs only `claude-agent-acp` unless you ask for more. An adapter already on your `PATH` normally wins, unless it is below the version floor aoe requires, in which case aoe uses the pinned copy and logs the substitution. `doctor` exits 1 if Node is missing, 2 if some agents are unreachable, else 0; `--json` for machine-readable output. Install the native CLIs through their own channels.
 
 ## Choosing the view per session
 
-- **Web wizard:** defaults to the structured view; turn off **Use structured view** to get the terminal view.
-- **CLI / TUI:** default to the terminal view. From the CLI, opt in with `--structured-view` or `--agent`; in the TUI new-session dialog, toggle the **Structured** field (shown for ACP-capable tools).
-- Either way, an existing active session can switch views: the web sidebar's right-click menu (**Switch to terminal** / **Switch to structured view**) or the TUI's right-click context menu (needs a running `aoe serve` daemon; archived, trashed, and still-creating rows are excluded until they leave that state). Both surfaces confirm first. The worktree, open files, and commits are always preserved. For a **claude** session the conversation is kept in both directions: the terminal resumes it with `claude --resume`, and switching back to structured view reloads it via the ACP adapter. Every other agent restarts fresh on the target surface, resetting the in-memory conversation.
-
-Non-ACP tools always run in the terminal view, with no toggle.
+- **Web wizard**: structured view by default; turn off **Use structured view** for the terminal.
+- **CLI / TUI**: terminal view by default; opt in with `--structured-view` or `--agent`, or the **Structured** field in the TUI new-session dialog.
+- **An existing session** can switch either way from the web sidebar's right-click menu or the TUI context menu (which needs a running `aoe serve`). Both confirm first, and the worktree, files, and commits are always preserved. For a **claude** session the conversation is kept in both directions (`claude --resume` one way, the ACP adapter the other); every other agent restarts fresh on the target surface.
 
 ### Launch command and session naming
 
-`--cmd <tool>` resolves through `session.agent_command_override` the same as terminal sessions, so an override like `opencode = "opencode-plannotator"` makes `--cmd opencode` launch `opencode-plannotator acp` (the required ACP args are preserved). Adapter-backed agents such as Claude use `session.agent_acp_cmd` for a full command swap instead. The wizard shows the resolved launch command read-only.
+`--cmd <tool>` resolves through `session.agent_command_override` like a terminal session, so an override makes `--cmd opencode` launch `opencode-plannotator acp` with the required ACP args preserved. Adapter-backed agents such as Claude use `session.agent_acp_cmd` for a full command swap. The wizard shows the resolved command read-only.
 
-`aoe add` does not prompt for a name by default: it uses `--title`, else the worktree branch name, else a generated name. Pass `-i`/`--interactive` for the same name prompt the TUI and wizard show. Set per-agent defaults for web-created sessions under `[acp.acp_defaults.<agent>]`:
+`aoe add` names a session from `--title`, else the worktree branch, else a generated name (`-i` prompts like the TUI and wizard do). A structured session still carrying a generated name is auto-renamed once its first turn finishes, by a one-shot call to the session's own agent, so the title reflects both your prompt and the response. See `session.smart_rename` in the [configuration reference](guides/configuration.md#session).
 
-When a structured view session keeps its generated civilization name (no `--title`, no branch name), AoE auto-renames it from its first turn using the session's own agent in one-shot mode (`claude -p`, `codex exec`, `opencode run`, `gemini -p`, `omp -p`). This is on by default and controlled by `session.smart_rename`. It renames the title only, never the worktree directory (the running agent holds it), and never touches a session you named yourself. Sandboxed sessions, agents with no one-shot mode, and command-overridden agents keep the generated name. See [Configuration: Session](guides/configuration.md#session).
+If the rename never lands, right-click the session and pick **Auto-name now** (TUI: `v` or the command palette), which works even with `smart_rename` off. The sidebar shows an `Auto-name` chip while a session is still default-named and a `Naming…` chip while the call is in flight. Two more chips flag a session that parked itself but is still alive: a `⏰` countdown to a scheduled wakeup, and a `👁 monitoring` badge while an armed `Monitor` keeps re-invoking the agent, which clears when you send a new prompt.
 
-The rename waits for the first turn to finish and titles from the whole transcript, your prompt and the agent's response, so the title reflects what the turn did (and the one-shot never races the live agent for the provider API).
-
-To name with a different agent than the session's own (e.g. a cheaper or more obedient title model), set `session.smart_rename_agent` to any installed one-shot-capable agent; leave it empty to use the session's agent. The same setting also picks the agent for the conversation-summary one-shot. If the automatic rename never lands (the one-shot timed out or returned unusable output), right-click the session in the sidebar and pick "Auto-name now" to re-run it; the action is offered only while the session is still default-named. "Auto-name now" runs on demand even when `session.smart_rename` is off, so you can name a session by hand without enabling automatic renaming. The native TUI has the same on-demand action on a still-default-named session, via the `v` key or the command palette ("Auto-name now").
-
-The sidebar shows where each session stands: an `Auto-name` chip (sparkle) marks a session that is still default-named and will be renamed on its first message, and a `Naming…` chip (pulsing dot) shows while the one-shot title call is in flight. The chips disappear once the session is renamed or if it is not eligible.
-
-Two chips flag a session that has parked itself but is still alive, so an agent waiting on background work does not read as a dead idle session. A `⏰` countdown shows when the agent scheduled a wakeup (a `ScheduleWakeup` call or a `/loop` run) and ticks down to the fire time. A `👁 monitoring` badge shows when the agent armed a `Monitor` (a background watch, for example waiting for a build or `cargo clippy` to finish); it has no fixed end time, so it stays put while the monitor keeps re-invoking the agent and clears once you send the session a new prompt.
-
-```toml
-[acp.acp_defaults.opencode]
-model = "openai/gpt-5.5"
-effort = "high"           # default thinking level
-mode = "plan"             # default mode, applied when the agent advertises one
-
-# Per-model thinking: overrides `effort` when that model is the resolved model.
-[acp.acp_defaults.opencode.effort_by_model]
-"openai/gpt-5.5" = "high"
-"anthropic/opus" = "low"
-```
-
-`model` is forwarded when the worker starts. `effort` and `mode` are applied through the agent's ACP config options (`thought_level` and `mode`) once advertised; a value the agent does not advertise is skipped with a warning rather than failing the session. `effort_by_model` takes precedence over the flat `effort` when the resolved model matches a key. These defaults are also editable per agent from the web dashboard settings (Structured view tab, Structured View Defaults), where the dropdowns are populated from whatever each agent last advertised.
-
-The `[acp]` block holds the structured view's global tuning knobs (timeouts, concurrency, watchdog grace). See [Structured View Internals](development/internals/structured-view.md#global-tuning-acp) for the full list.
+Per-agent startup defaults live under `[acp.acp_defaults.<agent>]` (model, effort, mode, `effort_by_model`, `pin_model`) and are editable from the web settings; see [Configuration](guides/configuration.md#session). The rest of `[acp]` is in [Structured View Internals](development/internals/structured-view.md#global-tuning-acp).
 
 ## Agent artifacts
 
-Each session gets a managed artifact directory, exposed to the agent as `AOE_ARTIFACT_DIR` (bind-mounted at `/aoe/artifacts` inside a sandbox). A screenshot or status file the agent writes there is served over an authenticated, session-scoped route and opens in the dashboard: transcript links open the file in a new tab, and markdown images render inline. Files written elsewhere (an arbitrary `/tmp` path, for example) cannot be served and render as plain, non-clickable text. To make a generated artifact viewable, write it under `$AOE_ARTIFACT_DIR`.
+Each session gets a managed artifact directory, exposed as `AOE_ARTIFACT_DIR` (bind-mounted at `/aoe/artifacts` in a sandbox). Files the agent writes there are served over an authenticated, session-scoped route: transcript links open them in a new tab and markdown images render inline. Files written anywhere else render as plain text, so write anything you want viewable under `$AOE_ARTIFACT_DIR`.
 
 ## Cross-machine attach
 
-Set `AOE_DAEMON_URL` (and optionally `AOE_DAEMON_TOKEN`) to point at a remote `aoe serve`:
+Point `AOE_DAEMON_URL` (and optionally `AOE_DAEMON_TOKEN`) at a remote `aoe serve`:
 
 ```sh
 AOE_DAEMON_URL=https://aoe.example.com AOE_DAEMON_TOKEN=… aoe   # remote session picker
 aoe acp attach <session_id> --daemon-url https://aoe.example.com
 ```
 
-When `AOE_DAEMON_URL` is set, the TUI swaps the local home view for a remote session picker, and `aoe serve --status` / the `aoe acp *` verbs retarget to the remote. Local-only operations (tmux attach, `aoe stop`, file edit) aren't available against a remote; use the web dashboard or SSH into the host. Unset the variable to fall back to local introspection.
-
-The session list is read with a bearer token only over HTTPS or a loopback URL. With `AOE_DAEMON_TOKEN` set and a plaintext `http://` URL on another host, the picker reports that refusal instead of listing sessions. The other daemon requests do not apply this check yet (#3839), so use HTTPS or a tunnel for a remote daemon.
+With `AOE_DAEMON_URL` set, the TUI swaps its home view for a remote session picker and `aoe serve --status` and the `aoe acp *` verbs retarget to the remote. Local-only operations (tmux attach, `aoe stop`, file edit) are not available against a remote; use the dashboard or SSH. The session list is read with a bearer token only over HTTPS or a loopback URL, so a token plus a plaintext remote URL is refused; the other daemon requests do not apply that check yet, so use HTTPS or a tunnel.
 
 ## Headless CLI verbs
 
-Every structured-view operation has a matching `aoe acp <verb>` against the same daemon:
+Every structured-view operation has a matching verb against the same daemon:
 
 | Verb | What it does |
 |------|--------------|
@@ -173,8 +139,8 @@ Every structured-view operation has a matching `aoe acp <verb>` against the same
 | `aoe acp approve <id> <nonce> [--always\|--deny\|--option <id>]` | Resolve a pending approval |
 | `aoe acp cancel <id>` | Cancel the in-flight prompt |
 | `aoe acp tail <id>` | Stream broadcast frames as JSON lines |
-| `aoe acp attach <id>` | Open the TUI structured view for this session |
+| `aoe acp attach <id>` | Open the TUI structured view |
 | `aoe acp stop` / `kill` / `restart` / `logs` / `switch-agent` | Worker management |
-| `aoe ps --acp` | List workers with their ACP columns (BUILD, MODEL, CWD, SOCKET); add `--dead` to include dead and orphaned ones. Replaces the removed `aoe acp ps` |
+| `aoe ps --acp` | List workers with their ACP columns; `--dead` includes dead and orphaned ones |
 
-Every verb requires a running `aoe serve` daemon and exits with a hint if none is found. Start one with `aoe serve --daemon` (localhost) or `aoe serve --daemon --remote` (Tailscale/Cloudflare), or set `AOE_DAEMON_URL`. The CLI does not spawn a daemon on your behalf, so the localhost-vs-tunnel choice stays explicit.
+Every verb needs a running `aoe serve` and exits with a hint if none is found. The CLI never spawns a daemon on your behalf, so the localhost-versus-tunnel choice stays explicit.

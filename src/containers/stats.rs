@@ -1,21 +1,14 @@
-//! Container resource sampling for the TUI system-health table.
-//!
-//! A sandbox session's tmux pane holds a `docker exec` client, not the agent:
-//! the agent runs inside the container, off the pane's host process tree
-//! entirely (its own cgroup on Linux, a different VM on macOS). Walking the
-//! pane pid therefore measures the CLI client, so sandbox rows read the
-//! runtime's own accounting instead.
+//! Container resource sampling. A sandbox pane holds a `docker exec` client, not the agent,
+//! so sandbox rows use the runtime's own accounting.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// One container's resource usage, as the runtime reports it.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ContainerStats {
-    /// Percent of a single core, matching `docker stats`: 100.0 is one core
-    /// saturated, so a container busy on four cores reads 400.
+    /// Percent of one core, like `docker stats`: four busy cores read 400.
     pub cpu_percent: f64,
     pub mem_used_bytes: u64,
     pub pids: usize,
@@ -23,12 +16,7 @@ pub struct ContainerStats {
 
 pub type StatsMap = HashMap<String, ContainerStats>;
 
-/// `docker stats --no-stream` re-samples every running container to compute a
-/// CPU delta, which costs ~2s on a host running a dozen sandboxes. That cannot
-/// ride the 1s metrics cadence, so the refresh runs on its own thread and
-/// callers read whatever the last completed pass left behind. At 5s the
-/// command was in flight ~40% of the time; 15s keeps per-row sandbox figures
-/// live enough for a health strip.
+/// `docker stats` takes ~2s with many sandboxes, so refreshes run off-thread on this TTL.
 const STATS_TTL: Duration = Duration::from_secs(15);
 
 struct Cache {
@@ -36,10 +24,7 @@ struct Cache {
     fetched_at: Option<Instant>,
 }
 
-/// The cache guard, recovering from poisoning rather than propagating it. The
-/// data behind the lock is a plain map with no invariant a panicking writer
-/// could have half-broken, and treating a poisoned lock as fatal would strand
-/// every later sandbox row on "?" for the rest of the process.
+/// Recover from poisoning: the map has no invariant a panic could break.
 fn cache() -> std::sync::MutexGuard<'static, Cache> {
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     CACHE
@@ -53,12 +38,8 @@ fn cache() -> std::sync::MutexGuard<'static, Cache> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Set while a refresh thread is in flight, so a caller polling every second
-/// never stacks up a second `docker stats` behind a slow one.
 static REFRESHING: AtomicBool = AtomicBool::new(false);
 
-/// Clears [`REFRESHING`] on drop, so a refresh that panics does not latch the
-/// flag and silently block every later refresh.
 struct RefreshGuard;
 
 impl Drop for RefreshGuard {
@@ -67,12 +48,7 @@ impl Drop for RefreshGuard {
     }
 }
 
-/// The most recent sandbox container stats, starting a background refresh when
-/// the cached map has aged past `STATS_TTL`.
-///
-/// Never blocks. The first call after the pane opens returns an empty map and
-/// the row reads "?" until the refresh lands; that beats stalling the host
-/// CPU/memory sample behind a multi-second subprocess.
+/// Never blocks; returns the last completed map.
 pub fn cached_stats() -> Arc<StatsMap> {
     let (map, stale) = {
         let cache = cache();
@@ -98,9 +74,6 @@ pub fn cached_stats() -> Arc<StatsMap> {
     map
 }
 
-/// Parse the rows of `<runtime> stats --no-stream --format
-/// "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.PIDs}}"`, keeping only the
-/// containers named with `prefix`.
 pub(crate) fn parse_stats_output(stdout: &str, prefix: &str) -> StatsMap {
     stdout
         .lines()
@@ -109,9 +82,7 @@ pub(crate) fn parse_stats_output(stdout: &str, prefix: &str) -> StatsMap {
         .collect()
 }
 
-/// One tab-separated stats row. A container that is restarting reports `--`
-/// for the figures it has no sample for; those rows are dropped rather than
-/// read as a real zero.
+/// A restarting container reports `--`; drop the row rather than read a zero.
 fn parse_stats_line(line: &str) -> Option<(String, ContainerStats)> {
     let mut parts = line.split('\t');
     let name = parts.next()?.trim();
@@ -122,8 +93,6 @@ fn parse_stats_line(line: &str) -> Option<(String, ContainerStats)> {
         return None;
     }
     let cpu_percent = cpu.strip_suffix('%')?.trim().parse().ok()?;
-    // MemUsage is "used / limit"; the limit is the container's cap, which no
-    // health surface shows today, so only the used side is kept.
     let mem_used_bytes = parse_size(mem.split('/').next()?)?;
     Some((
         name.to_string(),
@@ -135,8 +104,7 @@ fn parse_stats_line(line: &str) -> Option<(String, ContainerStats)> {
     ))
 }
 
-/// A runtime-formatted byte size. Docker prints binary units (`3.085GiB`),
-/// podman decimal ones (`1.045MB`), so both suffix families are accepted.
+/// Docker prints binary units, podman decimal ones.
 fn parse_size(text: &str) -> Option<u64> {
     let text = text.trim();
     let unit_at = text.find(|c: char| c.is_ascii_alphabetic())?;
@@ -170,7 +138,6 @@ mod tests {
             ("450.4MiB", Some(472_278_630)),
             ("3.085GiB", Some(3_312_493_527)),
             ("20GiB", Some(20 * (1 << 30))),
-            // podman's decimal units must not be read as binary ones.
             ("1.045MB", Some(1_045_000)),
             ("16.62GB", Some(16_620_000_000)),
             ("--", None),
@@ -196,8 +163,6 @@ mod tests {
     #[test]
     fn parse_stats_line_rejects_unusable_rows() {
         let cases = [
-            // A restarting container reports no sample; a zero would read as
-            // a live, idle container.
             "aoe-sandbox-a\t--\t-- / --\t0",
             "aoe-sandbox-a\t12.0\t1MiB / 2MiB\t3", // CPU missing its percent
             "aoe-sandbox-a\t12.0%\t1MiB / 2MiB",   // truncated row

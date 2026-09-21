@@ -1,15 +1,4 @@
 //! Per-session HTTP completion callbacks for external work-queue dispatchers.
-//!
-//! A session created with `callback_url` set receives a fire-and-forget HTTP
-//! POST when it transitions into Idle, Waiting, or Error, so a headless
-//! dispatcher can react to completion without polling `GET /api/sessions`.
-//! Subscribes to the same `state.status_tx` broadcast the web-push consumer
-//! (`push.rs`) uses, but applies a short debounce instead of push's
-//! dwell+cooldown: a legitimate second Idle a minute later is real signal a
-//! dispatcher needs, not noise to suppress, so only sub-second tmux-scrape
-//! flicker gets collapsed. The debounce mirrors `status_hooks.rs`'s
-//! generation-counter pattern (the TUI's own status-command hooks), ported
-//! to async. See #3156.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -23,9 +12,7 @@ use super::push::StatusChange;
 use super::AppState;
 use crate::session::Status;
 
-/// Debounce window before firing: absorbs sub-second tmux-scrape flicker
-/// (Waiting -> Running -> Waiting) without push's 60s cooldown, since a real
-/// second Idle a minute later is signal a dispatcher needs, not noise.
+/// Debounce window before firing.
 const DEBOUNCE_MS: u64 = 500;
 
 /// Bounded concurrency for outbound callback POSTs, mirrors `push.rs`'s
@@ -36,11 +23,7 @@ const DISPATCH_CONCURRENCY: usize = 8;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Bounds hostname resolution. The reqwest timeouts above only start once the
-/// client exists, so they do not cover the pre-dispatch lookup, and the
-/// dispatch task already holds a `DISPATCH_CONCURRENCY` permit while resolving:
-/// without this, callback hosts pointing at unresponsive resolvers would pin
-/// every permit and starve callbacks for all other sessions.
+/// Bounds hostname resolution.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -51,9 +34,8 @@ struct CallbackPayload {
     old_status: &'static str,
     new_status: &'static str,
     at: String,
-    /// Per-process monotonic counter (resets on daemon restart) so a
-    /// dispatcher can discard an out-of-order delivery caused by network
-    /// jitter between two async POSTs.
+    /// Per-process monotonic counter (resets on daemon restart) so a dispatcher can discard
+    /// an out-of-order delivery caused by network jitter between two async POSTs.
     seq: u64,
 }
 
@@ -67,9 +49,7 @@ fn debounce_state() -> &'static Mutex<HashMap<String, DebounceEntry>> {
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Register a transition for `session_id` and return its generation. The
-/// newest generation is the one allowed to fire, so a burst within the
-/// debounce window collapses to its last member.
+/// Register a transition for `session_id` and return its generation.
 fn bump_debounce(session_id: &str) -> u64 {
     let mut guard = debounce_state().lock().unwrap();
     let entry = guard
@@ -79,16 +59,8 @@ fn bump_debounce(session_id: &str) -> u64 {
     entry.generation
 }
 
-/// Whether the waking debounce task still owns firing for `session_id`, and
-/// if so drop its entry: the map only needs to hold sessions with a debounce
-/// window in flight, otherwise it would retain one entry per session id for
-/// the daemon's lifetime.
-///
-/// Check and removal share one lock acquisition on purpose. Releasing between
-/// them would let a transition arriving in that gap insert a fresh entry that
-/// this call then deletes, stranding that newer task with nothing to claim.
-/// A superseded task removes nothing: the newer generation's task owns the
-/// entry and will clean it up when it fires.
+/// Whether the waking debounce task still owns firing for `session_id`, and if so drop its
+/// entry.
 fn claim_debounce(session_id: &str, generation: u64) -> bool {
     let mut guard = debounce_state().lock().unwrap();
     match guard.get(session_id) {
@@ -100,33 +72,22 @@ fn claim_debounce(session_id: &str, generation: u64) -> bool {
     }
 }
 
-/// `Url::host_str()` returns an IPv6 literal bracketed (`"[::1]"`, matching
-/// the URL's own syntax); `IpAddr::from_str` rejects the brackets, so strip
-/// them before parsing.
+/// `Url::host_str()` returns an IPv6 literal bracketed (`"[::1]"`, matching the URL's own
+/// syntax); `IpAddr::from_str` rejects the brackets, so strip them before parsing.
 fn strip_ipv6_brackets(host: &str) -> &str {
     host.strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(host)
 }
 
-/// Carrier-grade NAT (RFC 6598). Not covered by `Ipv4Addr::is_private`, but
-/// routable to other tenants on a CGNAT network, so it is not a safe callback
-/// target. `Ipv4Addr::is_shared` would say this for us but is nightly-only.
+/// Carrier-grade NAT (RFC 6598).
 fn is_cgnat_v4(v4: std::net::Ipv4Addr) -> bool {
     let o = v4.octets();
     o[0] == 100 && (64..128).contains(&o[1])
 }
 
-/// Pull an embedded IPv4 address out of the v6 forms that carry one, so it can
-/// be judged by the IPv4 rules instead of sliding past them:
-///
-/// - `::ffff:a.b.c.d` (IPv4-mapped, RFC 4291) via `to_canonical`
-/// - `64:ff9b::a.b.c.d` (NAT64 well-known prefix, RFC 6052)
-/// - `::a.b.c.d` (IPv4-compatible, deprecated but still parsed and routable)
-///
-/// Verified necessary: without this, `64:ff9b::169.254.169.254` and
-/// `::169.254.169.254` both cleared every check while still reaching the
-/// metadata service.
+/// Pull an embedded IPv4 address out of the v6 forms that carry one, so it can be judged by
+/// the IPv4 rules instead of sliding past them.
 fn embedded_v4(ip: IpAddr) -> Option<std::net::Ipv4Addr> {
     if let IpAddr::V4(v4) = ip.to_canonical() {
         return Some(v4);
@@ -162,21 +123,9 @@ fn is_forbidden_v4(v4: std::net::Ipv4Addr) -> bool {
         || is_cgnat_v4(v4)
 }
 
-/// Whether an IP is inside a range a callback must never reach: loopback,
-/// private/link-local/CGNAT space, or unspecified/multicast. Applied both at
-/// create-time (a literal-IP `callback_url`) and immediately before every
-/// dispatch (the resolved hostname), to block SSRF against cloud metadata
-/// endpoints (e.g. 169.254.169.254, link-local) and internal admin surfaces.
-///
-/// The dispatch path does not re-resolve after this check: the approved
-/// addresses are pinned onto the client (`build_pinned_client`), so a DNS
-/// rebinding answer cannot redirect the connect to a target this never
-/// approved.
+/// Whether an IP is inside a range a callback must never reach.
 fn is_forbidden_target(ip: IpAddr) -> bool {
-    // Judge any embedded IPv4 by the IPv4 rules first. `Ipv6Addr::is_loopback()`
-    // only matches `::1`, so a mapped/NAT64/compatible loopback or metadata
-    // address would otherwise clear every v6 check below while the OS still
-    // connects it to the v4 target, defeating the whole guard.
+    // Judge any embedded IPv4 by the IPv4 rules first.
     if let Some(v4) = embedded_v4(ip) {
         return is_forbidden_v4(v4);
     }
@@ -192,11 +141,7 @@ fn is_forbidden_target(ip: IpAddr) -> bool {
     }
 }
 
-/// Create-time validation: rejects a bad scheme or a literal forbidden IP.
-/// Does not resolve hostnames (that happens per-dispatch in
-/// `resolve_vetted_addrs`), so a hostname that *later* resolves to a private
-/// address isn't caught here; the pre-dispatch check is the real gate for
-/// that case.
+/// Create-time validation.
 pub fn validate_callback_url(raw: &str) -> Result<(), String> {
     let url =
         reqwest::Url::parse(raw).map_err(|e| format!("callback_url is not a valid URL: {e}"))?;
@@ -216,21 +161,11 @@ pub fn validate_callback_url(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Pre-dispatch guard: resolves the hostname and returns the vetted addresses,
-/// or `None` if resolution failed or ANY resolved address is forbidden (fails
-/// closed).
-///
-/// The caller must pin the returned addresses onto the client rather than
-/// letting `reqwest` resolve the host again. Checking and then re-resolving is
-/// a TOCTOU: hostile DNS can answer with a public address for this check and a
-/// loopback/metadata address microseconds later for the connect, so the check
-/// would approve one target and the request would reach another.
+/// Pre-dispatch guard.
 async fn resolve_vetted_addrs(url: &reqwest::Url) -> Option<Vec<std::net::SocketAddr>> {
     let host = strip_ipv6_brackets(url.host_str()?);
     let port = url.port_or_known_default().unwrap_or(80);
-    // Bounded by RESOLVE_TIMEOUT: a hung resolver would otherwise hold this
-    // task's dispatch permit indefinitely. Both the timeout and the lookup
-    // itself fail closed to `None`.
+    // Bounded by RESOLVE_TIMEOUT.
     let addrs: Vec<std::net::SocketAddr> =
         tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host, port)))
             .await
@@ -244,11 +179,8 @@ async fn resolve_vetted_addrs(url: &reqwest::Url) -> Option<Vec<std::net::Socket
 }
 
 /// Build the outbound client for one callback dispatch, with DNS pinned to the
-/// already-vetted addresses so the connect cannot land anywhere
-/// `resolve_vetted_addrs` did not approve. Per-dispatch rather than shared
-/// because `resolve_to_addrs` is a builder-level override; callbacks are
-/// debounced and per-transition, so giving up pool reuse is far cheaper than
-/// leaving the rebinding window open.
+/// already-vetted addresses so the connect cannot land anywhere `resolve_vetted_addrs` did
+/// not approve.
 fn build_pinned_client(
     host: &str,
     addrs: &[std::net::SocketAddr],
@@ -266,10 +198,7 @@ fn is_fire_worthy(status: Status) -> bool {
     matches!(status, Status::Idle | Status::Waiting | Status::Error)
 }
 
-/// Spawn the consumer task. Subscribes to `state.status_tx` and dispatches a
-/// debounced HTTP POST to any instance's `callback_url` on a fire-worthy
-/// transition. Runs for the lifetime of the server, mirroring
-/// `push::spawn_consumer`.
+/// Spawn the consumer task.
 pub fn spawn_consumer(state: Arc<AppState>) {
     tokio::spawn(async move {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(DISPATCH_CONCURRENCY));
@@ -312,8 +241,7 @@ fn handle_status_change(
 
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
-        // Superseded by a later transition within the debounce window? That
-        // later transition owns firing (or dropping).
+        // Superseded by a later transition within the debounce window?
         if !claim_debounce(&session_id, generation) {
             return;
         }
@@ -328,9 +256,7 @@ fn handle_status_change(
         let Some(callback_url) = callback_url else {
             return;
         };
-        // Re-check the CURRENT status (not the event's `new`): the debounce
-        // window may have let a further transition land, so only fire for
-        // whatever fire-worthy status the session is actually in right now.
+        // Re-check the CURRENT status (not the event's `new`).
         if !is_fire_worthy(current_status) {
             return;
         }
@@ -402,16 +328,13 @@ mod tests {
             "http://10.0.0.5/hook",                    // private
             "http://192.168.1.1/hook",                 // private
             "http://0.0.0.0/hook",                     // unspecified
-            // IPv4-mapped IPv6 forms. `Ipv6Addr::is_loopback()` only matches
-            // `::1`, so without canonicalization these cleared every check
-            // while the OS still dialed the v4 target.
+            // IPv4-mapped IPv6 forms.
             "http://[::ffff:127.0.0.1]/hook",
             "http://[::ffff:169.254.169.254]/latest/meta-data",
             "http://[::ffff:10.0.0.5]/hook",
             "http://[::ffff:192.168.1.1]/hook",
-            // Other v6 forms carrying an embedded v4 that also has to be
-            // judged by the IPv4 rules, or the metadata service stays
-            // reachable through them.
+            // Other v6 forms carrying an embedded v4 that also has to be judged by the IPv4
+            // rules, or the metadata service stays reachable through them.
             "http://[64:ff9b::169.254.169.254]/latest/meta-data", // NAT64
             "http://[64:ff9b::127.0.0.1]/hook",                   // NAT64 loopback
             "http://[::169.254.169.254]/latest/meta-data",        // IPv4-compatible
@@ -430,11 +353,9 @@ mod tests {
         let cases = [
             "https://dispatcher.example.com/hook",
             "http://203.0.113.5/hook",
-            // A mapped *public* address stays allowed: unwrapping must not
-            // over-block, only reclassify.
+            // A mapped *public* address stays allowed.
             "http://[::ffff:203.0.113.5]/hook",
-            // 100.64.0.0/10 is CGNAT, but 100.63/100.128 are ordinary public
-            // space: the mask must not swallow the neighbours.
+            // 100.64.0.0/10 is CGNAT, but 100.63/100.128 are ordinary public space.
             "http://100.63.255.255/hook",
             "http://100.128.0.1/hook",
             // A genuine global v6 address is untouched by the embedded-v4 paths.
@@ -451,9 +372,7 @@ mod tests {
         assert!(resolve_vetted_addrs(&url).await.is_none());
     }
 
-    /// A public hostname yields addresses to pin, and pinning them builds a
-    /// usable client. This is what closes the rebinding window: the connect
-    /// uses these addresses instead of resolving the name a second time.
+    /// A public hostname yields addresses to pin, and pinning them builds a usable client.
     #[tokio::test]
     async fn vetted_addrs_are_pinnable_onto_a_client() {
         let url = reqwest::Url::parse("http://203.0.113.5:8080/hook").unwrap();
@@ -479,10 +398,7 @@ mod tests {
         debounce_state().lock().unwrap().contains_key(session_id)
     }
 
-    /// A flicker inside the debounce window collapses to its last transition:
-    /// the superseded task must not fire, the newest one must, and the entry
-    /// must not outlive the window (it used to be inserted and never removed
-    /// outside tests, growing one entry per session id forever).
+    /// A flicker inside the debounce window collapses to its last transition.
     #[test]
     fn debounce_collapses_flicker_and_leaves_no_entry() {
         let session_id = "cb-debounce-flicker";

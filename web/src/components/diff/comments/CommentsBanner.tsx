@@ -3,17 +3,13 @@ import { Tooltip } from "../../Tooltip";
 interface Props {
   count: number;
   sendEnabled: boolean;
-  /** Required, and phrased as cause + remedy: this is the only place the user
-   *  ever learns why the Send button is dead. */
+  /** Cause plus remedy: the only place the user learns why Send is disabled. */
   sendDisabledReason: string;
   onSend: () => void;
   onDiscardAll: () => void;
 }
 
-/** Floating chip rendered above the right-panel diff list. Visible
- *  whenever the active session has at least one comment and supports
- *  the feature (acp-only). The send button is disabled only for a
- *  trashed session, which never resumes a worker to drain into. */
+/** Comment count chip above the diff list; Send is disabled for a trashed session. */
 export function CommentsBanner({ count, sendEnabled, sendDisabledReason, onSend, onDiscardAll }: Props) {
   if (count === 0) return null;
   return (

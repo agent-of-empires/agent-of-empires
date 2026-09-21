@@ -6,14 +6,6 @@ import type { DirEntry } from "../lib/types";
 const LAST_DIR_KEY = "aoe-last-browse-dir";
 const BROWSE_PAGE_SIZE = 100;
 
-function loadLastDir(): string | null {
-  return safeGetItem(LAST_DIR_KEY);
-}
-
-function saveLastDir(path: string) {
-  safeSetItem(LAST_DIR_KEY, path);
-}
-
 interface Props {
   initialPath?: string;
   onSelect: (path: string) => void;
@@ -85,9 +77,8 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
     [loadPath],
   );
 
-  // A toggle is a discrete action, unlike typing, so it reloads immediately
-  // instead of waiting out the filter debounce. Pass the new value explicitly:
-  // the `showHidden` state update has not propagated to `loadPath` yet.
+  // A toggle is a discrete action, unlike typing, so it reloads immediately instead of waiting out the filter
+  // debounce.
   const toggleHidden = useCallback(() => {
     const next = !showHidden;
     setShowHidden(next);
@@ -124,7 +115,7 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
 
     queueMicrotask(async () => {
       if (initialPath && (await navigate(initialPath))) return;
-      const lastDir = loadLastDir();
+      const lastDir = safeGetItem(LAST_DIR_KEY);
       if (lastDir && (await navigate(lastDir))) return;
       const home = await getHomePath();
       await navigate(home || "/");
@@ -148,7 +139,7 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
       // Save parent so reopening the picker lands one level up,
       // where this repo lives. Mirrors the TUI behavior.
       const parent = entry.path.split("/").slice(0, -1).join("/") || "/";
-      saveLastDir(parent);
+      safeSetItem(LAST_DIR_KEY, parent);
       onSelect(entry.path);
     } else {
       navigate(entry.path);
@@ -337,10 +328,7 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
         )}
       </div>
 
-      {/* Use the current folder as the working directory, even when it is not
-          itself a git repo. Lets a user point a session at a root like
-          ~/projects and let the agent discover the repos inside, instead of
-          drilling down to pick one repo by hand. See #2680. */}
+      {/* Use the current folder as the working directory, even when it is not itself a git repo. */}
       <div className="mt-3 flex items-center justify-between gap-3">
         <span className="font-mono text-xs text-text-dim truncate min-w-0" title={currentPath}>
           {currentPath || "…"}
@@ -349,7 +337,7 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
           type="button"
           onClick={() => {
             if (!currentPath) return;
-            saveLastDir(currentPath);
+            safeSetItem(LAST_DIR_KEY, currentPath);
             onSelect(currentPath);
           }}
           disabled={!currentPath || loading}

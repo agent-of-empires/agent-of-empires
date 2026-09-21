@@ -22,10 +22,7 @@ pub(crate) fn persist_omp_session_to_storage(
     )
 }
 
-/// Build a post-login routing fingerprint check without embedding any routing
-/// value in argv. The pane hashes its live environment through stdin; if no
-/// SHA-256 utility exists or startup files changed routing, capture is skipped
-/// and the original OMP command runs untouched.
+/// Build a post-login routing fingerprint check without embedding any routing value in argv.
 fn omp_routing_fingerprint_check(plan: &OmpCapturePlan) -> String {
     let keys = crate::session::capture::OMP_STORE_ENV_KEYS.join(" ");
     format!(
@@ -47,9 +44,7 @@ fn omp_routing_fingerprint_check(plan: &OmpCapturePlan) -> String {
     )
 }
 
-/// Wait briefly for the parent to publish this launch generation's hidden
-/// capture metadata. A timeout runs the uninstrumented command, so capture
-/// fails closed without preventing the agent from starting.
+/// Wait briefly for the parent to publish this launch generation's hidden capture metadata.
 pub(super) fn gate_omp_launch(
     raw_command: &str,
     marked_command: &str,
@@ -78,9 +73,7 @@ pub(super) fn gate_omp_launch(
     shell_stdin_command("sh", false, &script, "AOE_OMP_CAPTURE_GATE")
 }
 
-/// Apply profile assignments to the marker wrapper itself, not only to its
-/// eventual OMP command. The routing fingerprint must observe the same
-/// effective environment that OMP inherits.
+/// Apply profile assignments to the marker wrapper itself, not only to its eventual OMP command.
 pub(super) fn wrap_omp_host_launch(
     env_prefix: &str,
     tool_cmd: &str,
@@ -89,12 +82,8 @@ pub(super) fn wrap_omp_host_launch(
     format!("{env_prefix}{}", wrap_omp_launch(tool_cmd, plan))
 }
 
-/// Bind capture to the exact launch PTY. A valid pre-launch breadcrumb is
-/// rewritten to a lexically different but equivalent session path; the marker
-/// records that pending path so capture waits until OMP rewrites the breadcrumb.
-/// If no breadcrumb exists, install a fresh sentinel from a private directory
-/// by a no-clobber hardlink. Invalid breadcrumbs, collisions, symlinks, and
-/// write failures launch raw OMP without capture.
+/// Bind capture to the exact launch PTY. A valid pre-launch breadcrumb is rewritten to a lexically
+/// different but equivalent session path.
 pub(super) fn wrap_omp_launch(tool_cmd: &str, plan: &OmpCapturePlan) -> String {
     let breadcrumb_tmp_leaf = format!(".aoe-omp-breadcrumb-{}", plan.launch_id);
     let pending_sentinel = plan
@@ -188,9 +177,7 @@ pub(super) fn wrap_omp_launch(tool_cmd: &str, plan: &OmpCapturePlan) -> String {
 }
 
 impl Instance {
-    /// Capture is safe only for the built-in OMP command and a transparent,
-    /// parseable argv. Benign arguments remain supported; store-selecting
-    /// flags are interpreted by the capture resolver.
+    /// Capture is safe only for the built-in OMP command and a transparent, parseable argv.
     pub(super) fn omp_capture_options(&self) -> Option<OmpCliCaptureOptions> {
         if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp) {
             return None;
@@ -199,9 +186,7 @@ impl Instance {
         OmpCliCaptureOptions::parse(&args).ok()
     }
 
-    /// Resolve OMP's store, routing environment, and per-launch marker after
-    /// `on_launch`. Environment values remain transient; the marker and layout
-    /// survive in capture metadata.
+    /// Resolve OMP's store, routing environment, and per-launch marker after `on_launch`.
     pub(super) fn resolve_omp_capture_plan(
         &self,
         options: &OmpCliCaptureOptions,
@@ -265,9 +250,7 @@ impl Instance {
         })
     }
 
-    /// Reconstruct metadata only for a legacy pane which predates launch
-    /// snapshots. New launches transport their already-resolved plan directly
-    /// into `finalize_launch` and never call this method.
+    /// Reconstruct metadata only for a legacy pane which predates launch snapshots.
     fn resolve_legacy_omp_capture_metadata(
         &self,
         options: &OmpCliCaptureOptions,
@@ -292,9 +275,8 @@ impl Instance {
         })
     }
 
-    /// Load typed launch metadata directly from tmux. A pane carrying the
-    /// regular bootstrap generation is modern; if its hidden metadata is
-    /// absent, capture stays disabled instead of being legacy-migrated.
+    /// Load typed launch metadata directly from tmux. A pane carrying the regular bootstrap
+    /// generation is modern.
     pub(super) fn omp_capture_metadata(
         &self,
         session_name: &str,
@@ -443,10 +425,8 @@ impl Instance {
         if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp) {
             return true;
         }
-        // No capture plan: persist a distinct sentinel so any observation still
-        // carrying the prior generation fails the CAS. The `tombstone-` prefix
-        // marks it as never-captured in storage/logs (compared for equality,
-        // never parsed).
+        // No capture plan: persist a distinct sentinel so any observation still carrying the prior
+        // generation fails the CAS.
         let tombstone = format!("tombstone-{}", Uuid::new_v4());
         self.persist_omp_capture_generation(profile, &tombstone, expected_prior)
     }
@@ -534,11 +514,11 @@ impl Instance {
 mod tests {
     use super::*;
     use crate::session::instance::launch_command::wrap_command_ignore_suspend;
+    use crate::session::instance::test_helpers::*;
 
     #[test]
     fn omp_capture_accepts_benign_args_and_rejects_opaque_launches() {
-        let mut inst = Instance::new("test", "/tmp/test");
-        inst.tool = "omp".to_string();
+        let mut inst = tool_instance("omp", "/tmp/test");
         inst.extra_args =
             "--model sonnet --profile first --profile=work --session-dir '/tmp/omp sessions'"
                 .to_string();
@@ -624,8 +604,7 @@ mod tests {
 
     #[test]
     fn omp_launch_rejects_api_keys_in_extra_args() {
-        let mut instance = Instance::new("test", "/tmp/test");
-        instance.tool = "omp".to_string();
+        let mut instance = tool_instance("omp", "/tmp/test");
         for extra_args in [
             "--api-key secret",
             "--api-key=secret",
@@ -705,17 +684,9 @@ mod tests {
             command
                 .args(["-c", &script])
                 .env_clear()
-                // `env_clear` is here to control which OMP_STORE_ENV_KEYS the
-                // fingerprint folds in, not to pin a filesystem layout. The
-                // child still needs a PATH that resolves `sha256sum` / `tr`,
-                // so it inherits the caller's.
+                // `env_clear` is here to control which OMP_STORE_ENV_KEYS the fingerprint folds in,
+                // not to pin a filesystem layout.
                 .env("PATH", std::env::var_os("PATH").unwrap_or_default());
-            // Pin the exact routing environment a host launch installs into the
-            // pane for this HOME, so the check reproduces the fingerprint's env
-            // instead of assuming the ambient OMP_STORE_ENV_KEYS are empty. They
-            // are not on every runner, and host_launcher_environment folds them
-            // into the fingerprint, so forcing empties here would diverge from
-            // the digest on any host that exports one of those keys.
             for mutation in omp_host_routing_environment(&[format!("HOME={}", live_home.display())])
             {
                 match mutation {
@@ -885,19 +856,11 @@ mod tests {
         exercise_omp_wrapper(None);
     }
 
-    /// The shim dir, then the caller's `PATH`. Shim first, so the fake `tmux`
-    /// wins over any real one; inherited, so a host whose coreutils sit
-    /// outside the FHS layout still resolves them. `OsString` throughout: a
-    /// `PATH` entry need not be UTF-8.
-    ///
-    /// Child-scoped on purpose. Putting the shim on the process `PATH` would
-    /// hand the fake `tmux` to every test resolving a real one concurrently.
+    /// The shim dir, then the caller's `PATH`. Shim first, so the fake `tmux` wins over any real
+    /// one.
     #[cfg(unix)]
     fn test_path_with_shim(bin: &std::path::Path) -> std::ffi::OsString {
-        // An unset or empty PATH is handled separately: `split_paths("")`
-        // yields one EMPTY entry, and an empty PATH element means the current
-        // directory, so joining it would hand the child `<shim>:` and put cwd
-        // on its PATH.
+        // An unset or empty PATH is handled separately.
         let Some(inherited) = std::env::var_os("PATH").filter(|p| !p.is_empty()) else {
             return bin.as_os_str().to_os_string();
         };
@@ -944,9 +907,8 @@ mod tests {
         assert!(status.success());
         assert_eq!(std::fs::read_to_string(&output).unwrap(), "marked");
 
-        // A valid 70 KiB prompt makes the capture gate body larger than
-        // Linux's per-argument exec limit because the raw and marked branches
-        // both contain it. The launch must still execute from the descriptor.
+        // A valid 70 KiB prompt makes the capture gate body larger than Linux's per-argument exec
+        // limit because the raw and marked branches both contain it.
         let payload = "x".repeat(70 * 1024);
         let large_command = format!(
             "printf '%s' {} > {}",

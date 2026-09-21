@@ -67,12 +67,9 @@ impl HomeView {
         }
     }
 
-    /// Clear the unread marker because the user engaged with the session
-    /// (Tab into live-send, Enter to attach, or dwell on it in the list).
-    /// Runs regardless of the feature flag so a stale marker can't survive a
-    /// disable/re-enable and reappear later; only writes when the session is
-    /// actually unread, so an already-read session doesn't churn the storage
-    /// flock.
+    /// Clear the unread marker because the user engaged with the session (live-send, attach,
+    /// or dwell). Runs regardless of the feature flag so a stale marker can't survive a
+    /// disable and reappear, and writes only when the session is actually unread.
     pub(crate) fn clear_unread_on_view(&mut self, id: &str) {
         // Engaging with the row ends its manual-flag visit, so drop any hold;
         // otherwise a stale hold could later suppress an auto mark on this row.
@@ -85,19 +82,13 @@ impl HomeView {
         }
     }
 
-    /// Dwell-to-read: clear the selected session's unread marker once it has
-    /// stayed selected, with the list in the foreground, for `UNREAD_DWELL`.
-    /// This is what separates "scrolled past it" from "stopped to read it."
-    /// Driven from the app tick loop; returns true when it cleared a marker
-    /// (so the caller can request a redraw).
+    /// Dwell-to-read: clear the selected session's unread marker once it has stayed selected,
+    /// with the list in the foreground, for `UNREAD_DWELL`, separating "scrolled past it"
+    /// from "stopped to read it". Driven from the app tick loop; true when it cleared one.
     ///
-    /// The clock is suspended (and reset) whenever the feature is off, a
-    /// dialog or live-send is up (the list isn't being read then), or nothing
-    /// is selected, and it restarts whenever the selection moves to a
-    /// different row. A row the user just flagged unread by hand is held until
-    /// the cursor leaves it (`manual_unread_hold`), so flagging it and sitting
-    /// there doesn't instantly undo the mark; once you leave and come back, it
-    /// clears on dwell like any other unread row.
+    /// The clock is suspended and reset whenever the feature is off, a dialog or live-send is
+    /// up, or nothing is selected, and it restarts when the selection moves. A row the user
+    /// just flagged by hand is held until the cursor leaves it (`manual_unread_hold`).
     pub fn tick_unread_dwell(&mut self, now: std::time::Instant) -> bool {
         if !crate::session::unread_enabled() || self.has_dialog() {
             self.unread_dwell = None;
@@ -107,9 +98,8 @@ impl HomeView {
             self.unread_dwell = None;
             return false;
         };
-        // The manual hold only protects the row while it stays selected; the
-        // moment the cursor moves elsewhere, release it so a later return reads
-        // normally.
+        // The manual hold only protects the row while it stays selected, so release it once
+        // the cursor moves and a later return reads normally.
         if self
             .manual_unread_hold
             .as_deref()
@@ -128,9 +118,8 @@ impl HomeView {
         if now.duration_since(started) < UNREAD_DWELL {
             return false;
         }
-        // A row the user just flagged by hand is held for this visit, so the
-        // dwell doesn't undo the mark while they sit on it. The clock stays
-        // parked on this row either way so we don't re-evaluate every tick.
+        // A row flagged by hand is held for this visit so the dwell doesn't undo the mark.
+        // The clock stays parked on the row either way, to avoid re-evaluating every tick.
         if self.manual_unread_hold.as_deref() == Some(id.as_str()) {
             return false;
         }
@@ -209,9 +198,8 @@ impl HomeView {
         Ok(())
     }
 
-    /// Like `mutate_instance`, but for fallible operations. Clones the entry,
-    /// applies `f` to the clone, and writes back only on success; the stored
-    /// entry is left untouched on `Err`.
+    /// Like `mutate_instance` but fallible: applies `f` to a clone and writes back only on
+    /// success, leaving the stored entry untouched on `Err`.
     pub(in crate::tui) fn try_mutate_instance<T>(
         &mut self,
         id: &str,
@@ -226,16 +214,12 @@ impl HomeView {
         Ok(None)
     }
 
-    /// Like `try_mutate_instance`, but writes the mutated clone back even
-    /// when `f` returns `Err`.
+    /// Like `try_mutate_instance`, but writes the mutated clone back even on `Err`.
     ///
-    /// Required for callers of `Instance::restart_with_size_opts` /
-    /// `ensure_pane_ready`, because the resume path can mutate
-    /// `agent_session_id`, `resume_probe_failed_sid`, and
-    /// `retroactive_capture_excludes` before returning `Err`. The default
-    /// `try_mutate_instance` drops the mutated clone on `Err`, leaving live
-    /// state inconsistent with disk until a later reload. This helper keeps
-    /// the live state consistent with the attempted restart.
+    /// Required for callers of `Instance::restart_with_size_opts` / `ensure_pane_ready`,
+    /// whose resume path can mutate `agent_session_id`, `resume_probe_failed_sid` and
+    /// `retroactive_capture_excludes` before returning `Err`. Dropping the clone there would
+    /// leave live state inconsistent with disk until a later reload.
     pub(in crate::tui) fn try_mutate_instance_writeback_on_err<T>(
         &mut self,
         id: &str,

@@ -1,22 +1,16 @@
 //! Send-message, paste-image, and read-output endpoints.
+//!
+//! Send plus read-output are the minimum primitive an external orchestrator
+//! needs to drive an aoe session as a controlled subagent, without a keyboard
+//! or websocket attach.
 
 use super::*;
-
-// ============================================================================
-// Send + read-output endpoints
-//
-// Together these are the minimum primitive an external orchestrator needs to
-// run an aoe session as a controlled subagent: push a prompt in, read the
-// pane back. Mirrors what the TUI's send-message dialog and pane preview do,
-// without requiring keyboard or websocket attach.
-// ============================================================================
 
 #[derive(Deserialize)]
 pub struct SendMessageRequest {
     pub message: String,
-    /// Whether to auto-revive a dead/stopped session before sending. Defaults
-    /// to `true`; set to `false` for fail-loud behavior (parity with the
-    /// `--no-revive` CLI flag).
+    /// Auto-revive a dead/stopped session before sending. Defaults to `true`;
+    /// `false` is fail-loud, matching the `--no-revive` CLI flag.
     #[serde(default = "default_revive")]
     pub revive: bool,
 }
@@ -44,9 +38,8 @@ pub async fn send_message(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-    // Terminal keystroke injection: CityHall sessions are structured-view only
-    // (the composer drives the agent via the ACP prompt route), so close this
-    // explicitly rather than leaning on the downstream StructuredView error.
+    // Terminal keystroke injection: CityHall sessions are structured-view only,
+    // so close this explicitly rather than leaning on the downstream error.
     if let Some(resp) = crate::server::api::cityhall_block(&state) {
         return resp;
     }
@@ -63,43 +56,28 @@ pub async fn send_message(
             .into_response();
     }
 
-    // Serialize concurrent sends (and other tmux mutations) for this id.
-    // Without this, two POSTs racing against the same session would issue
-    // overlapping `tmux send-keys -l` invocations and the bytes can interleave
-    // inside the pane.
+    // Serialize concurrent sends (and other tmux mutations) for this id, or two
+    // racing POSTs interleave their bytes inside the pane.
     let inst_lock = state.instance_lock(&id).await;
     let _guard = inst_lock.lock().await;
 
-    let instances = state.instances.read().await;
-    let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "not_found"})),
-        )
-            .into_response();
+    let Some(instance) = find_instance(&state, &id).await else {
+        return bare_not_found();
     };
-    drop(instances);
 
     let sync_base = instance.clone();
     let tool = instance.tool.clone();
     let message = req.message;
     let revive = req.revive;
     let send_result = tokio::task::spawn_blocking(move || -> SendKeysResult {
-        // Revive the pane before sending. Without this, a send to a dead
-        // pane silently writes keystrokes to a corpse with no agent.
-        // Skipped when the caller opts out via `revive: false`.
+        // Revive the pane before sending, unless the caller opted out: a send
+        // to a dead pane silently writes keystrokes to a corpse.
         //
-        // The closure surfaces both `inst_owned` AND the
-        // `EnsureReadyOutcome` on the Err arm so the caller can sync
-        // post-resume-path mutations (`agent_session_id`, failure marker,
-        // and `retroactive_capture_excludes`) back to live state regardless
-        // of which failure path fires. The
-        // outcome lets the caller distinguish cascade-fired
-        // (`Respawned`/`Started`) from the no-op `AlreadyAlive` path
-        // so a sync only happens when there's actual cascade state to
-        // propagate; this avoids clobbering live `last_error` on the
-        // `revive=false + NotRunning` path where `started` is
-        // unmutated.
+        // The Err arm surfaces both `inst_owned` and the `EnsureReadyOutcome`,
+        // so the caller can sync post-resume-path mutations back to live state
+        // whichever failure path fires, and can tell a cascade-fired outcome
+        // from the no-op `AlreadyAlive` one. Without that split, the
+        // `revive=false + NotRunning` path would clobber live `last_error`.
         let mut inst_owned = instance;
         let outcome = if revive {
             match inst_owned.ensure_pane_ready() {
@@ -110,16 +88,12 @@ pub async fn send_message(
                         EnsureReadyError::StructuredView => SendKeysError::StructuredView,
                         EnsureReadyError::Tmux(e) => SendKeysError::Tmux(e),
                     };
-                    // ensure_pane_ready did not mutate user-visible
-                    // state via the outcome path. Tag as AlreadyAlive
-                    // so the outer match's `did_work` flag stays
-                    // false. `EnsureReadyError::Tmux` may be either
-                    // pre-cascade (tmux_session() / start_with_size
-                    // subprocess failure: `inst_owned` unmutated) or
-                    // post-resume-path (mutations committed).
-                    // The Tmux outer arm syncs unconditionally and
-                    // covers both shapes; the others (Transient /
-                    // StructuredView) bail before any mutation.
+                    // Tagged AlreadyAlive because ensure_pane_ready did not
+                    // mutate user-visible state here, keeping the outer
+                    // `did_work` flag false. `EnsureReadyError::Tmux` covers
+                    // both an unmutated pre-cascade failure and a committed
+                    // post-resume-path one, so its outer arm syncs
+                    // unconditionally; the others bail before any mutation.
                     return Err(Box::new((
                         inst_owned,
                         EnsureReadyOutcome::AlreadyAlive,
@@ -154,13 +128,10 @@ pub async fn send_message(
 
     match send_result {
         Ok(Ok((outcome, started))) => {
-            // ensure_pane_ready mutated `started` (status, agent_session_id,
-            // last_start_time, last_error) on the clone. Sync those back to
-            // the live entry so the next request sees a coherent view;
-            // without this, a rapid follow-up could generate a fresh
-            // `agent_session_id` and orphan the prior Claude conversation.
-            // See `apply_post_restart_sync`. Also stamp last_accessed_at so
-            // the activity column reflects API-driven interaction.
+            // ensure_pane_ready mutated `started` on the clone, so sync it back
+            // or a rapid follow-up generates a fresh `agent_session_id` and
+            // orphans the prior Claude conversation. See `apply_post_restart_sync`.
+            // Also stamps last_accessed_at for the activity column.
             let mut instances = state.instances.write().await;
             let profile = if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
                 if !matches!(outcome, EnsureReadyOutcome::AlreadyAlive) {
@@ -169,8 +140,7 @@ pub async fn send_message(
                 i.touch_last_accessed();
                 i.source_profile.clone()
             } else {
-                // Session was deleted between the send and the stamp; nothing
-                // left to persist.
+                // Deleted between the send and the stamp; nothing to persist.
                 return (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response();
             };
             drop(instances);
@@ -201,20 +171,17 @@ pub async fn send_message(
         }
         Ok(Err(boxed)) => {
             let (started, outcome, send_err) = *boxed;
-            // ensure_pane_ready did mutate state when the outcome is
-            // anything other than AlreadyAlive. `Started` and `Respawned`
-            // touch fields the live entry needs to reflect (fresh sid from
-            // acquire, last_start_time, etc.). Sync only when work happened.
+            // Anything other than AlreadyAlive means ensure_pane_ready touched
+            // fields the live entry needs (fresh sid, last_start_time), so sync
+            // only when work happened.
             let did_work = !matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
             match send_err {
                 SendKeysError::NotRunning => {
-                    // External kill or remain-on-exit-off crash can race
-                    // ensure_pane_ready's Alive decision against the
-                    // tmux_session.exists() check. Propagate resume-path
-                    // state when applicable; use the narrow sync helper to
-                    // leave status and last_error untouched (NotRunning is
-                    // recoverable; `started.status = Starting` from
-                    // finalize_launch would briefly mis-paint a broken pane).
+                    // An external kill or a remain-on-exit-off crash can race
+                    // ensure_pane_ready's Alive decision. Use the narrow sync
+                    // helper so status and last_error stay untouched: NotRunning
+                    // is recoverable, and `Starting` from finalize_launch would
+                    // briefly mis-paint a broken pane.
                     if did_work {
                         let mut instances = state.instances.write().await;
                         if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
@@ -258,15 +225,12 @@ pub async fn send_message(
                 SendKeysError::Tmux(e) => {
                     tracing::error!(target: "http.api.sessions", "send_message: tmux error for {id}: {e}");
                     let msg = e.to_string();
-                    // Sync cascade-mutated fields back to live state. Mirror
-                    // `ensure_session`'s Err arm: full sync, then override
-                    // `status` and `last_error` so observers don't see
-                    // `Status::Starting` (set by `finalize_launch`) on a
-                    // broken session. Tmux Err is the
-                    // catch-all for both pre-cascade tmux failures (where
-                    // `started` is unmutated and the sync is a no-op) and
-                    // post-resume-path failures (where durable resume state
-                    // must be copied back from the clone).
+                    // Mirror `ensure_session`'s Err arm: full sync, then
+                    // override `status` and `last_error` so observers do not see
+                    // `Status::Starting` on a broken session. Tmux Err is the
+                    // catch-all for both an unmutated pre-cascade failure and a
+                    // post-resume-path one whose durable state must be copied
+                    // back from the clone.
                     let mut instances = state.instances.write().await;
                     if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
                         if apply_post_restart_sync(i, &sync_base, &started) {
@@ -293,22 +257,20 @@ pub async fn send_message(
     }
 }
 
-/// Max decoded size of a pasted image (5 MiB). Claude Code caps image
-/// attachments around this size; the route body limit in `build_router`
-/// leaves headroom for base64's ~33% overhead plus JSON framing.
+/// Max decoded size of a pasted image (5 MiB), matching Claude Code's
+/// attachment cap. The route body limit leaves headroom for base64 overhead.
 const MAX_PASTE_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
-/// Directory, relative to the session worktree, holding images pasted into
-/// the live terminal. It lives inside the worktree so a Docker-sandboxed
-/// pane, which mounts the worktree but cannot see the host temp dir, can
-/// still read the file. A self-ignoring `.gitignore` keeps the blobs out of
-/// git. See #2678.
+/// Directory, relative to the session worktree, holding images pasted into the
+/// live terminal. Inside the worktree so a Docker-sandboxed pane, which cannot
+/// see the host temp dir, can still read the file. A self-ignoring `.gitignore`
+/// keeps the blobs out of git (#2678).
 const PASTE_IMAGE_DIR: &str = ".aoe-pasted-images";
 
 #[derive(Deserialize)]
 pub struct PasteImageRequest {
     /// Client-declared MIME. Advisory only: the extension and the
-    /// accept/reject decision come from magic-byte sniffing, never this field.
+    /// accept/reject decision come from magic-byte sniffing.
     #[serde(default)]
     pub mime_type: String,
     /// Standard-base64 image bytes.
@@ -326,8 +288,7 @@ fn paste_image_extension(mime: &str) -> &'static str {
 }
 
 /// Write the decoded blob into the worktree's paste-image dir and return the
-/// host path plus the generated file name. Sync (filesystem I/O); call from a
-/// blocking pool.
+/// host path plus the generated file name. Sync I/O; call from a blocking pool.
 fn write_paste_image(
     project_path: &str,
     bytes: &[u8],
@@ -335,7 +296,7 @@ fn write_paste_image(
 ) -> std::io::Result<(std::path::PathBuf, String)> {
     let dir = std::path::Path::new(project_path).join(PASTE_IMAGE_DIR);
     std::fs::create_dir_all(&dir)?;
-    // A `.gitignore` of `*` also ignores itself, so the whole directory stays
+    // A `.gitignore` of `*` also ignores itself, so the directory stays
     // invisible to `git add` with no git subprocess.
     let gitignore = dir.join(".gitignore");
     if !gitignore.exists() {
@@ -352,10 +313,9 @@ fn write_paste_image(
     Ok((path, file_name))
 }
 
-/// Map the host paste-image file to the path the tmux pane reads. Non-sandboxed
-/// panes share the host filesystem, so the absolute host path is correct. A
-/// sandboxed pane mounts the worktree under a container path (`/workspace/...`);
-/// reuse `compute_volume_paths` so the pasted path matches that mount.
+/// Map the host paste-image file to the path the tmux pane reads. A sandboxed
+/// pane mounts the worktree under a container path, so `compute_volume_paths`
+/// is reused to match that mount.
 fn pane_visible_paste_path(project_path: &str, is_sandboxed: bool, file_name: &str) -> String {
     if is_sandboxed {
         if let Ok((_, working_dir)) = crate::session::config::container_config::compute_volume_paths(
@@ -372,9 +332,8 @@ fn pane_visible_paste_path(project_path: &str, is_sandboxed: bool, file_name: &s
         .to_string()
 }
 
-/// Save a clipboard image pasted into the live terminal and return the path
-/// the tmux pane can read, so the CLI agent (e.g. Claude Code) attaches it.
-/// See #2678.
+/// Save a clipboard image pasted into the live terminal and return the path the
+/// tmux pane can read, so the CLI agent attaches it (#2678).
 pub async fn paste_image(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -385,9 +344,9 @@ pub async fn paste_image(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-    // Allowed for the CityHall composer, but only against a structured
-    // session: a plain/terminal target would let a locked-down client write
-    // into another session's worktree.
+    // Allowed for the CityHall composer, but only against a structured session:
+    // a terminal target would let a locked-down client write into another
+    // session's worktree.
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
@@ -396,15 +355,9 @@ pub async fn paste_image(
         Err(rej) => return rej.into_response(),
     };
 
-    let instances = state.instances.read().await;
-    let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "not_found"})),
-        )
-            .into_response();
+    let Some(instance) = find_instance(&state, &id).await else {
+        return bare_not_found();
     };
-    drop(instances);
 
     let bytes = match base64::engine::general_purpose::STANDARD.decode(req.data.as_bytes()) {
         Ok(b) => b,
@@ -465,9 +418,8 @@ pub async fn paste_image(
             }
         };
 
-    // Best-effort TTL cleanup: the file only needs to outlive the agent
-    // reading it. A detached task keeps the worktree from accumulating blobs
-    // without any teardown bookkeeping.
+    // Best-effort TTL cleanup: the file only needs to outlive the agent reading
+    // it, and a detached task avoids teardown bookkeeping.
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         let _ = tokio::fs::remove_file(&host_path).await;
@@ -507,8 +459,8 @@ pub async fn read_output(
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<OutputQuery>,
 ) -> impl IntoResponse {
-    // Raw terminal pane content: CityHall hides the terminal UI + WS relay, so
-    // this read must be closed too or the pane is reachable by session id.
+    // Raw terminal pane content: CityHall hides the terminal UI and WS relay,
+    // so this read must be closed too.
     if let Some(resp) = crate::server::api::cityhall_block(&state) {
         return resp;
     }
@@ -528,15 +480,9 @@ pub async fn read_output(
         }
     };
 
-    let instances = state.instances.read().await;
-    let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "not_found"})),
-        )
-            .into_response();
+    let Some(instance) = find_instance(&state, &id).await else {
+        return bare_not_found();
     };
-    drop(instances);
 
     let capture_result = tokio::task::spawn_blocking(move || -> Result<String, CaptureError> {
         let tmux_session = instance.tmux_session().map_err(CaptureError::Tmux)?;

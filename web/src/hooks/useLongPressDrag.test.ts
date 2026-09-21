@@ -1,14 +1,4 @@
 // @vitest-environment jsdom
-//
-// Hook tests for useLongPressDrag. The hook returns pointer handlers that
-// implement: tap-to-repeat on release (short press, vertical, no emit),
-// press-and-hold to repeat the active axis every 100ms after a 300ms delay,
-// horizontal drag past 16px to switch the emit axis (dominant axis wins),
-// and an axis-change callback for the visual hint. cancel/leave abort.
-//
-// The handlers take React pointer events but only read clientX/clientY, so
-// plain objects suffice. Timers are faked to drive the 300ms long-press
-// delay and 100ms repeat interval deterministically.
 
 import { renderHook, act } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -16,220 +6,123 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useLongPressDrag, type DragAxis } from "./useLongPressDrag";
 import type { PointerEvent as ReactPointerEvent } from "react";
 
-function ptr(clientX: number, clientY: number): ReactPointerEvent {
-  return { clientX, clientY } as ReactPointerEvent;
+const ptr = (clientX: number, clientY: number) => ({ clientX, clientY }) as ReactPointerEvent;
+
+beforeEach(() => vi.useFakeTimers());
+afterEach(() => vi.useRealTimers());
+
+function mount() {
+  const onRepeat = vi.fn();
+  const onHorizontal = vi.fn();
+  const onAxisChange = vi.fn<(axis: DragAxis) => void>();
+  const hook = renderHook(() => useLongPressDrag({ onRepeat, onHorizontal, onAxisChange }));
+  const h = () => hook.result.current;
+  const step = (fn: () => void) => act(fn);
+  const advance = (ms: number) => act(() => void vi.advanceTimersByTime(ms));
+  return { onRepeat, onHorizontal, onAxisChange, h, step, advance, unmount: hook.unmount };
 }
 
-beforeEach(() => {
-  vi.useFakeTimers();
-});
-
-afterEach(() => {
-  vi.useRealTimers();
-});
-
-describe("useLongPressDrag tap", () => {
-  it("fires a single onRepeat on a short vertical press + release", () => {
-    const onRepeat = vi.fn();
-    const onHorizontal = vi.fn();
-    const { result } = renderHook(() => useLongPressDrag({ onRepeat, onHorizontal }));
-
-    act(() => {
-      result.current.onPointerDown(ptr(10, 10));
-    });
-    // Release before the 300ms long-press delay elapses.
-    act(() => {
-      vi.advanceTimersByTime(100);
-      result.current.onPointerUp(ptr(10, 10));
-    });
-
+describe("useLongPressDrag", () => {
+  it("taps once on a short vertical press", () => {
+    const { onRepeat, onHorizontal, h, step, advance } = mount();
+    step(() => h().onPointerDown(ptr(10, 10)));
+    advance(100);
+    step(() => h().onPointerUp(ptr(10, 10)));
     expect(onRepeat).toHaveBeenCalledTimes(1);
     expect(onHorizontal).not.toHaveBeenCalled();
   });
 
-  it("does not tap if a horizontal drag changed the axis before release", () => {
-    const onRepeat = vi.fn();
-    const onHorizontal = vi.fn();
-    const { result } = renderHook(() => useLongPressDrag({ onRepeat, onHorizontal }));
-
-    act(() => {
-      result.current.onPointerDown(ptr(10, 10));
-      result.current.onPointerMove(ptr(40, 12)); // dx 30 > 16, horizontal-right
-      result.current.onPointerUp(ptr(40, 12));
-    });
-
-    expect(onRepeat).not.toHaveBeenCalled();
-    expect(onHorizontal).not.toHaveBeenCalled();
+  it.each<[string, (m: ReturnType<typeof mount>) => void]>([
+    [
+      "a horizontal drag changed the axis",
+      ({ h }) => {
+        h().onPointerDown(ptr(10, 10));
+        h().onPointerMove(ptr(40, 12));
+        h().onPointerUp(ptr(40, 12));
+      },
+    ],
+    [
+      "the press was cancelled",
+      ({ h }) => {
+        h().onPointerDown(ptr(10, 10));
+        h().onPointerCancel(ptr(10, 10));
+        h().onPointerUp(ptr(10, 10));
+      },
+    ],
+  ])("does not tap when %s", (_label, run) => {
+    const m = mount();
+    m.step(() => run(m));
+    expect(m.onRepeat).not.toHaveBeenCalled();
+    expect(m.onHorizontal).not.toHaveBeenCalled();
   });
-});
 
-describe("useLongPressDrag press-and-hold repeat", () => {
-  it("repeats onRepeat every 100ms after the 300ms delay while held vertical", () => {
-    const onRepeat = vi.fn();
-    const onHorizontal = vi.fn();
-    const { result } = renderHook(() => useLongPressDrag({ onRepeat, onHorizontal }));
-
-    act(() => {
-      result.current.onPointerDown(ptr(10, 10));
-    });
-    // Nothing yet before the delay.
-    act(() => {
-      vi.advanceTimersByTime(300);
-    });
+  it("repeats every 100ms after a 300ms hold and stops on release", () => {
+    const { onRepeat, h, step, advance } = mount();
+    step(() => h().onPointerDown(ptr(10, 10)));
+    advance(300);
     expect(onRepeat).not.toHaveBeenCalled();
-
-    act(() => {
-      vi.advanceTimersByTime(300); // 3 intervals
-    });
+    advance(300);
     expect(onRepeat).toHaveBeenCalledTimes(3);
-
-    // Release: long-press emitted, so no extra tap, and the interval stops.
-    act(() => {
-      result.current.onPointerUp(ptr(10, 10));
-      vi.advanceTimersByTime(500);
-    });
+    step(() => h().onPointerUp(ptr(10, 10)));
+    advance(500);
     expect(onRepeat).toHaveBeenCalledTimes(3);
   });
 
-  it("emits horizontal arrows on repeat once the axis is horizontal", () => {
-    const onRepeat = vi.fn();
-    const onHorizontal = vi.fn();
-    const { result } = renderHook(() => useLongPressDrag({ onRepeat, onHorizontal }));
-
-    act(() => {
-      result.current.onPointerDown(ptr(10, 10));
-      result.current.onPointerMove(ptr(-20, 12)); // dx -30, horizontal-left
+  it("repeats horizontal arrows once the axis is horizontal", () => {
+    const { onRepeat, onHorizontal, h, step, advance } = mount();
+    step(() => {
+      h().onPointerDown(ptr(10, 10));
+      h().onPointerMove(ptr(-20, 12));
     });
-    act(() => {
-      vi.advanceTimersByTime(300); // delay
-      vi.advanceTimersByTime(200); // 2 intervals
-    });
-
+    advance(500);
     expect(onHorizontal).toHaveBeenCalledTimes(2);
     expect(onHorizontal).toHaveBeenLastCalledWith("left");
     expect(onRepeat).not.toHaveBeenCalled();
   });
-});
 
-describe("useLongPressDrag axis tracking", () => {
-  it("reports axis changes via onAxisChange (dominant axis wins)", () => {
-    const onRepeat = vi.fn();
-    const onHorizontal = vi.fn();
-    const onAxisChange = vi.fn<(axis: DragAxis) => void>();
-    const { result } = renderHook(() => useLongPressDrag({ onRepeat, onHorizontal, onAxisChange }));
-
-    act(() => {
-      result.current.onPointerDown(ptr(10, 10)); // -> vertical
-    });
-    expect(onAxisChange).toHaveBeenLastCalledWith("vertical");
-
-    act(() => {
-      result.current.onPointerMove(ptr(40, 12)); // dx 30 dominant -> horizontal-right
-    });
-    expect(onAxisChange).toHaveBeenLastCalledWith("horizontal-right");
-
-    act(() => {
-      result.current.onPointerMove(ptr(11, 60)); // dy 50 dominant -> vertical
-    });
-    expect(onAxisChange).toHaveBeenLastCalledWith("vertical");
-  });
-
-  it("stays vertical when horizontal movement is under the 16px threshold", () => {
-    const onRepeat = vi.fn();
-    const onHorizontal = vi.fn();
-    const onAxisChange = vi.fn<(axis: DragAxis) => void>();
-    const { result } = renderHook(() => useLongPressDrag({ onRepeat, onHorizontal, onAxisChange }));
-
-    act(() => {
-      result.current.onPointerDown(ptr(10, 10));
-      result.current.onPointerMove(ptr(20, 11)); // dx 10 < 16 -> still vertical
-    });
-    // Only the initial "vertical" from pointerDown; no axis change emitted.
-    expect(onAxisChange).toHaveBeenCalledTimes(1);
-    expect(onAxisChange).toHaveBeenCalledWith("vertical");
-  });
-
-  it("ignores pointer moves before a press (pressed=false)", () => {
-    const onRepeat = vi.fn();
-    const onHorizontal = vi.fn();
-    const onAxisChange = vi.fn<(axis: DragAxis) => void>();
-    const { result } = renderHook(() => useLongPressDrag({ onRepeat, onHorizontal, onAxisChange }));
-
-    act(() => {
-      result.current.onPointerMove(ptr(100, 100));
-    });
+  it("reports the dominant axis past the 16px threshold, and ignores moves before a press", () => {
+    const { onAxisChange, h, step } = mount();
+    step(() => h().onPointerMove(ptr(100, 100)));
     expect(onAxisChange).not.toHaveBeenCalled();
-  });
-});
 
-describe("useLongPressDrag cancel / leave", () => {
-  it("onPointerCancel stops the interval and resets to vertical", () => {
-    const onRepeat = vi.fn();
-    const onHorizontal = vi.fn();
-    const onAxisChange = vi.fn<(axis: DragAxis) => void>();
-    const { result } = renderHook(() => useLongPressDrag({ onRepeat, onHorizontal, onAxisChange }));
-
-    act(() => {
-      result.current.onPointerDown(ptr(10, 10));
-      vi.advanceTimersByTime(400); // delay + one interval
-    });
-    expect(onRepeat).toHaveBeenCalledTimes(1);
-
-    act(() => {
-      result.current.onPointerCancel(ptr(10, 10));
-    });
-    expect(onAxisChange).toHaveBeenLastCalledWith("vertical");
-
-    act(() => {
-      vi.advanceTimersByTime(500);
-    });
-    // Interval cleared: no further repeats.
-    expect(onRepeat).toHaveBeenCalledTimes(1);
+    const seen: [number, number, DragAxis][] = [
+      [20, 11, "vertical"],
+      [40, 12, "horizontal-right"],
+      [11, 60, "vertical"],
+    ];
+    step(() => h().onPointerDown(ptr(10, 10)));
+    for (const [x, y, axis] of seen) {
+      step(() => h().onPointerMove(ptr(x, y)));
+      expect(onAxisChange).toHaveBeenLastCalledWith(axis);
+    }
+    expect(onAxisChange.mock.calls.map(([a]) => a)).toEqual(["vertical", "horizontal-right", "vertical"]);
   });
 
-  it("onPointerLeave aborts a pending long-press before it starts repeating", () => {
-    const onRepeat = vi.fn();
-    const onHorizontal = vi.fn();
-    const { result } = renderHook(() => useLongPressDrag({ onRepeat, onHorizontal }));
-
-    act(() => {
-      result.current.onPointerDown(ptr(10, 10));
-      vi.advanceTimersByTime(100); // before the 300ms delay
-      result.current.onPointerLeave(ptr(10, 10));
-      vi.advanceTimersByTime(1000);
-    });
-    expect(onRepeat).not.toHaveBeenCalled();
+  it.each<[string, (m: ReturnType<typeof mount>) => void, number]>([
+    ["pointer cancel after one repeat", ({ h, step }) => step(() => h().onPointerCancel(ptr(10, 10))), 1],
+    ["unmount", ({ unmount }) => unmount(), 1],
+  ])("%s stops the repeat", (_label, stop, calls) => {
+    const m = mount();
+    m.step(() => m.h().onPointerDown(ptr(10, 10)));
+    m.advance(400);
+    stop(m);
+    m.advance(1000);
+    expect(m.onRepeat).toHaveBeenCalledTimes(calls);
   });
 
-  it("a release after cancel does not produce a tap", () => {
-    const onRepeat = vi.fn();
-    const onHorizontal = vi.fn();
-    const { result } = renderHook(() => useLongPressDrag({ onRepeat, onHorizontal }));
-
-    act(() => {
-      result.current.onPointerDown(ptr(10, 10));
-      result.current.onPointerCancel(ptr(10, 10)); // pressed -> false
-      result.current.onPointerUp(ptr(10, 10));
+  it("pointer cancel resets the axis to vertical; leave aborts a pending hold", () => {
+    const m = mount();
+    m.step(() => {
+      m.h().onPointerDown(ptr(10, 10));
+      m.h().onPointerMove(ptr(40, 12));
+      m.h().onPointerCancel(ptr(40, 12));
     });
-    expect(onRepeat).not.toHaveBeenCalled();
-  });
-});
+    expect(m.onAxisChange).toHaveBeenLastCalledWith("vertical");
 
-describe("useLongPressDrag cleanup", () => {
-  it("clears timers on unmount", () => {
-    const onRepeat = vi.fn();
-    const onHorizontal = vi.fn();
-    const { result, unmount } = renderHook(() => useLongPressDrag({ onRepeat, onHorizontal }));
-
-    act(() => {
-      result.current.onPointerDown(ptr(10, 10));
-      vi.advanceTimersByTime(300); // arm the interval
-    });
-    unmount();
-    act(() => {
-      vi.advanceTimersByTime(1000);
-    });
-    // Unmount cleanup cleared the interval; no repeats fire post-unmount.
-    expect(onRepeat).toHaveBeenCalledTimes(0);
+    m.step(() => m.h().onPointerDown(ptr(10, 10)));
+    m.advance(100);
+    m.step(() => m.h().onPointerLeave(ptr(10, 10)));
+    m.advance(1000);
+    expect(m.onRepeat).not.toHaveBeenCalled();
   });
 });

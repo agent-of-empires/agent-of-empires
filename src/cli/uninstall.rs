@@ -45,9 +45,6 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
 
     let home_dir = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
 
-    // Collect all possible data directory locations. The home-dotfile path is
-    // always included (it is the macOS default and the pre-XDG Linux location),
-    // alongside the XDG path, so either layout is cleaned up.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let data_dirs = {
         let mut dirs = vec![home_dir.join(".agent-of-empires")];
@@ -61,7 +58,6 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
 
     let mut found_items: Vec<FoundItem> = Vec::new();
 
-    // Check for Homebrew installation (formula is named "aoe")
     let homebrew_installed = Command::new("brew")
         .args(["list", "aoe"])
         .output()
@@ -76,7 +72,6 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
         println!("Found: Homebrew installation");
     }
 
-    // Check common binary locations for both "aoe" and "agent-of-empires"
     let mut binary_locations = vec![
         home_dir.join(".local/bin/aoe"),
         PathBuf::from("/usr/local/bin/aoe"),
@@ -86,7 +81,6 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
         home_dir.join("bin/agent-of-empires"),
     ];
 
-    // Also check the currently running binary's location
     if let Ok(current_exe) = std::env::current_exe() {
         if let Ok(canonical) = current_exe.canonicalize() {
             if !binary_locations.contains(&canonical) {
@@ -105,7 +99,6 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
         }
     }
 
-    // Check for data directories
     for data_dir in &data_dirs {
         if data_dir.is_dir() {
             let mut session_count = 0;
@@ -137,7 +130,6 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
         }
     }
 
-    // Check for tmux config
     let tmux_conf = home_dir.join(".tmux.conf");
     if let Ok(content) = fs::read_to_string(&tmux_conf) {
         if content.contains("# agent-of-empires configuration") {
@@ -156,7 +148,6 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Summary
     println!("The following will be removed:");
     println!();
 
@@ -185,7 +176,6 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
 
     println!();
 
-    // Confirm
     if !args.yes && !args.dry_run {
         print!("Proceed with uninstall? [y/N] ");
         io::stdout().flush()?;
@@ -208,10 +198,8 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     println!("Uninstalling...");
     println!();
 
-    // Remove AoE hooks from agent settings files (e.g. ~/.claude/settings.json)
     crate::hooks::uninstall_all_hooks();
 
-    // Perform uninstall
     for item in &found_items {
         match item.item_type.as_str() {
             "homebrew" => {
@@ -224,7 +212,6 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
                 if fs::remove_file(&item.path).is_ok() {
                     println!("✓ Binary removed: {}", item.path.display());
                 } else {
-                    // Try with sudo
                     let _ = Command::new("sudo")
                         .args(["rm", "-f", &item.path.to_string_lossy()])
                         .status();
@@ -239,11 +226,9 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
             "tmux" if !args.keep_tmux_config => {
                 println!("Removing tmux configuration...");
                 if let Ok(content) = fs::read_to_string(&item.path) {
-                    // Backup
                     let backup_path = format!("{}.bak.aoe-uninstall", item.path.display());
                     let _ = fs::write(&backup_path, &content);
 
-                    // Remove agent-of-empires config block
                     let start_marker = "# agent-of-empires configuration";
                     let end_marker = "# End agent-of-empires configuration";
 

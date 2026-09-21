@@ -20,9 +20,6 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
 const MAX_SUCCESS_BODY_BYTES: usize = 16 * 1024 * 1024;
 
-/// Client for the daemon's session REST API.
-///
-/// Clones share the underlying reqwest connection pool.
 #[derive(Clone)]
 pub struct DaemonClient {
     http: reqwest::Client,
@@ -43,47 +40,35 @@ impl fmt::Debug for DaemonClient {
     }
 }
 
-/// Failure from constructing or calling a [`DaemonClient`].
 #[derive(Debug, Error)]
 pub enum DaemonClientError {
-    /// The supplied URL is not a usable HTTP daemon base URL.
     #[error("invalid daemon base URL: {reason}")]
     InvalidBaseUrl { reason: &'static str },
-    /// The bearer token cannot be represented as an HTTP authorization header.
     #[error("invalid daemon bearer token")]
     InvalidBearerToken,
-    /// Bearer authentication was configured for a non-loopback plaintext URL.
     #[error("daemon bearer token requires HTTPS or a loopback HTTP URL")]
     InsecureBearerTransport,
-    /// The default reqwest client could not be built.
     #[error("failed to build daemon HTTP client: {0}")]
     ClientBuild(#[source] reqwest::Error),
-    /// Sending the request or reading its response failed.
     #[error("daemon transport error: {0}")]
     Transport(#[source] reqwest::Error),
-    /// The daemon returned a non-successful HTTP status. Authenticated
-    /// responses omit the body so transformed credentials cannot be reflected.
+    /// Authenticated responses omit the body so credentials cannot be reflected.
     #[error("daemon returned HTTP {status}: {body}")]
     Status {
         status: StatusCode,
         body: String,
         truncated: bool,
     },
-    /// A successful response exceeded the bounded sessions-envelope limit.
     #[error("daemon response exceeded the {limit}-byte limit")]
     ResponseTooLarge { limit: usize },
-    /// A successful response did not match the shared wire contract.
     #[error("failed to decode daemon response: {0}")]
     Decode(#[source] serde_json::Error),
-    /// An authenticated daemon response did not match the wire contract.
     #[error("failed to decode authenticated daemon response")]
     AuthenticatedDecode,
 }
 
 impl DaemonClient {
-    /// Build a client with a 15-second timeout and redirects disabled.
-    ///
-    /// Bearer authentication requires HTTPS except for loopback HTTP endpoints.
+    /// Bearer authentication requires HTTPS except for loopback HTTP.
     pub fn new(base_url: &str, bearer_token: Option<&str>) -> Result<Self, DaemonClientError> {
         let sessions_url = sessions_url(base_url)?;
         let authorization = authorization_header(bearer_token)?;
@@ -106,7 +91,6 @@ impl DaemonClient {
         })
     }
 
-    /// Fetch the sessions endpoint, optionally filtered by session state.
     pub async fn list_sessions(
         &self,
         state: Option<crate::session::SessionScope>,

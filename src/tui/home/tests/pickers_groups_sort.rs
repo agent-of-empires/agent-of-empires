@@ -48,6 +48,45 @@ fn test_uppercase_p_picker_switch_profile() {
     assert!(view.profile_picker_dialog.is_none());
 }
 
+/// Shift+T attaches the paired terminal from either view without changing the view mode,
+/// so it stays the one-key path to the shell whatever the preview is showing.
+/// Every overlay that takes the keyboard registers with `has_dialog`, which the mouse,
+/// scroll and shortcut gates all read.
+#[test]
+#[serial]
+fn test_has_dialog_includes_overlays() {
+    use crate::tui::settings::SettingsView;
+
+    let env = create_test_env_empty();
+    let mut view = env.view;
+    assert!(!view.has_dialog());
+
+    view.info_dialog = Some(InfoDialog::new("Test", "Test message"));
+    assert!(view.has_dialog(), "info dialog");
+    view.info_dialog = None;
+
+    view.settings_view = Some(SettingsView::new("test", None).unwrap());
+    assert!(view.has_dialog(), "settings view");
+}
+
+#[test]
+#[serial]
+fn test_shift_t_attaches_terminal_from_either_view() {
+    let env = create_test_env_with_sessions(1);
+    let mut view = env.view;
+    assert_eq!(view.view_mode, ViewMode::Structured);
+
+    let action = view.handle_key(key(KeyCode::Char('T')), None);
+    assert!(matches!(action, Some(Action::AttachTerminal(_, _))));
+    assert_eq!(view.view_mode, ViewMode::Structured);
+
+    view.handle_key(key(KeyCode::Char('t')), None);
+    assert_eq!(view.view_mode, ViewMode::Terminal);
+    let action = view.handle_key(key(KeyCode::Char('T')), None);
+    assert!(matches!(action, Some(Action::AttachTerminal(_, _))));
+    assert_eq!(view.view_mode, ViewMode::Terminal);
+}
+
 #[test]
 #[serial]
 fn test_t_toggles_view_mode() {
@@ -66,12 +105,10 @@ fn test_t_toggles_view_mode() {
 #[test]
 #[serial]
 fn switching_view_retargets_capture_worker_pane() {
-    // The preview's off-thread capture worker follows the displayed pane:
-    // switching agent <-> terminal must resolve to different tmux sessions
-    // so `sync_preview_capture_worker` respawns the worker against the new
-    // pane (instead of the old agent-only behavior). Regression guard for
-    // the responsiveness fix that moved every preview's `tmux capture-pane`
-    // off the render thread.
+    // The capture worker follows the displayed pane, so switching agent to terminal must
+    // resolve to different tmux sessions and make `sync_preview_capture_worker` respawn
+    // against the new pane. Guards the fix that moved `capture-pane` off the render
+    // thread.
     let env = create_test_env_with_sessions(1);
     let mut view = env.view;
 
@@ -141,36 +178,6 @@ fn test_enter_returns_attach_terminal_in_terminal_view() {
 
 #[test]
 #[serial]
-fn test_shift_t_attaches_terminal_from_structured_view() {
-    let env = create_test_env_with_sessions(1);
-    let mut view = env.view;
-
-    // Should be in Structured view by default
-    assert_eq!(view.view_mode, ViewMode::Structured);
-
-    // Shift+T should return AttachTerminal without switching view mode
-    let action = view.handle_key(key(KeyCode::Char('T')), None);
-    assert!(matches!(action, Some(Action::AttachTerminal(_, _))));
-    assert_eq!(view.view_mode, ViewMode::Structured);
-}
-
-#[test]
-#[serial]
-fn test_shift_t_attaches_terminal_from_terminal_view() {
-    let env = create_test_env_with_sessions(1);
-    let mut view = env.view;
-
-    // Switch to Terminal view
-    view.handle_key(key(KeyCode::Char('t')), None);
-    assert_eq!(view.view_mode, ViewMode::Terminal);
-
-    // Shift+T should also work from Terminal view
-    let action = view.handle_key(key(KeyCode::Char('T')), None);
-    assert!(matches!(action, Some(Action::AttachTerminal(_, _))));
-}
-
-#[test]
-#[serial]
 fn test_shift_t_noop_with_no_sessions() {
     let env = create_test_env_empty();
     let mut view = env.view;
@@ -198,32 +205,6 @@ fn test_d_shows_info_dialog_in_terminal_view() {
 
 #[test]
 #[serial]
-fn test_has_dialog_includes_info_dialog() {
-    let env = create_test_env_empty();
-    let mut view = env.view;
-
-    assert!(!view.has_dialog());
-
-    view.info_dialog = Some(InfoDialog::new("Test", "Test message"));
-    assert!(view.has_dialog());
-}
-
-#[test]
-#[serial]
-fn test_has_dialog_includes_settings_view() {
-    use crate::tui::settings::SettingsView;
-
-    let env = create_test_env_empty();
-    let mut view = env.view;
-
-    assert!(!view.has_dialog());
-
-    view.settings_view = Some(SettingsView::new("test", None).unwrap());
-    assert!(view.has_dialog());
-}
-
-#[test]
-#[serial]
 fn test_s_opens_settings_view() {
     let mut env = create_test_env_empty();
     assert!(env.view.settings_view.is_none());
@@ -231,9 +212,8 @@ fn test_s_opens_settings_view() {
     assert!(env.view.settings_view.is_some());
 }
 
-/// Trashing and restoring a session through the view's own actions keeps the
-/// group header count in step with the rows, since both are rebuilt from the
-/// same predicate. Guards against the count and the visible rows drifting.
+/// Trashing and restoring through the view's own actions keeps the group header count in
+/// step with the rows, since both rebuild from the same predicate.
 #[test]
 #[serial]
 fn group_header_count_tracks_trash_and_restore() {
@@ -456,9 +436,8 @@ fn test_archive_selected_group_archives_all_members() {
     }
 }
 
-/// Locks #1868: bulk archive persists synchronously even though tmux
-/// teardown runs off-thread. Real tmux state asserted in
-/// `tests/e2e/archive_restore.rs`.
+/// Locks #1868: bulk archive persists synchronously even though tmux teardown runs
+/// off-thread. Real tmux state is asserted in `tests/e2e/archive_restore.rs`.
 #[test]
 #[serial]
 fn test_archive_selected_group_widened_teardown_persists_synchronously() {
@@ -501,9 +480,8 @@ fn test_archive_selected_group_widened_teardown_persists_synchronously() {
     }
 }
 
-/// In project group-by mode, archiving a project header archives every live
-/// session that maps to that repo, even though their stored `group_path`
-/// values differ from the synthetic project name.
+/// In project mode, archiving a project header archives every live session mapping to that
+/// repo, even though their stored `group_path` differs from the synthetic project name.
 #[test]
 #[serial]
 fn test_archive_selected_group_project_mode() {
@@ -561,9 +539,8 @@ fn test_archive_selected_group_project_mode() {
     }
 }
 
-/// The group-level prompt opens a confirmation carrying the `archive_group`
-/// action and counts only the active members, and no-ops without a prompt when
-/// the group has nothing left to archive.
+/// The group-level prompt opens a confirmation carrying the `archive_group` action and
+/// counts only active members, and no-ops silently when nothing is left to archive.
 #[test]
 #[serial]
 fn test_prompt_archive_selected_group() {
@@ -1069,259 +1046,143 @@ fn test_group_collapsed_state_saved_to_storage() {
     );
 }
 
-/// Project-mode folder collapse must survive a restart. Unlike group mode
-/// (persisted on the per-profile GroupTree), project folders are auto-derived
-/// and have no group record, so their collapse state is written to
-/// `app_state.project_group_collapsed`. Regression for collapsed project
-/// folders re-expanding on relaunch.
+/// Project and org folder collapse must survive a restart. Both kinds of header are
+/// auto-derived and have no group record, so their state is written to `app_state` rather
+/// than the per-profile GroupTree, and a fresh `HomeView` restores it.
 #[test]
 #[serial]
-fn test_project_group_collapsed_state_persists_to_config() {
+fn test_derived_group_collapsed_state_persists_to_config() {
     use crate::session::config::GroupByMode;
 
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Project;
-    env.view.flat_items = env.view.build_flat_items();
+    for mode in [GroupByMode::Project, GroupByMode::Org] {
+        let mut env = create_test_env_two_projects_mixed_attention();
+        env.view.group_by = mode;
+        env.view.flat_items = env.view.build_flat_items();
 
-    // Find a project folder header and confirm it starts expanded.
-    let (group_idx, group_path) = env
-        .view
-        .flat_items
-        .iter()
-        .enumerate()
-        .find_map(|(idx, item)| match item {
-            Item::Group {
-                path, collapsed, ..
-            } => {
-                assert!(!collapsed, "project folder should start expanded");
-                Some((idx, path.clone()))
-            }
-            _ => None,
-        })
-        .expect("project mode should have a folder header");
+        let (group_idx, group_path) = env
+            .view
+            .flat_items
+            .iter()
+            .enumerate()
+            .find_map(|(idx, item)| match item {
+                Item::Group {
+                    path, collapsed, ..
+                } => {
+                    assert!(!collapsed, "{mode:?} folder should start expanded");
+                    Some((idx, path.clone()))
+                }
+                _ => None,
+            })
+            .expect("a derived folder header");
 
-    // Collapse it via Enter, which routes through toggle_group_collapsed.
-    env.view.cursor = group_idx;
-    env.view.update_selected();
-    env.view.handle_key(key(KeyCode::Enter), None);
+        // Enter routes through toggle_group_collapsed, which persists.
+        env.view.cursor = group_idx;
+        env.view.update_selected();
+        env.view.handle_key(key(KeyCode::Enter), None);
 
-    // The collapsed path must be persisted to the on-disk config.
-    let config = crate::session::config::load_config()
-        .unwrap()
-        .expect("config should exist after collapse");
-    assert!(
-        config
-            .app_state
-            .project_group_collapsed
-            .contains(&group_path),
-        "collapsed project folder path should be persisted to app_state"
-    );
+        let config = crate::session::config::load_config()
+            .unwrap()
+            .expect("config should exist after collapse");
+        let saved = match mode {
+            GroupByMode::Project => &config.app_state.project_group_collapsed,
+            _ => &config.app_state.org_group_collapsed,
+        };
+        assert!(
+            saved.contains(&group_path),
+            "{mode:?}: the collapsed folder path should be persisted to app_state"
+        );
 
-    // A freshly constructed HomeView (simulating relaunch) must restore it.
-    let fresh = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    assert_eq!(
-        fresh.project_group_collapsed.get(&group_path).copied(),
-        Some(true),
-        "relaunched HomeView should restore the collapsed project folder"
-    );
+        let fresh = HomeView::new_for_test(
+            Some("test".to_string()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        let restored = match mode {
+            GroupByMode::Project => fresh.project_group_collapsed.get(&group_path),
+            _ => fresh.org_group_collapsed.get(&group_path),
+        };
+        assert_eq!(
+            restored.copied(),
+            Some(true),
+            "{mode:?}: a relaunched HomeView should restore the collapsed folder"
+        );
+    }
 }
 
-/// A collapse entry for a project that no longer exists must be pruned on save
-/// so the persisted set can't grow without bound as projects come and go. A
-/// still-live folder collapsed in the same session must survive.
+/// A collapse entry for a derived folder that no longer exists is pruned on save, so the
+/// persisted set cannot grow without bound; a still-live folder collapsed in the same
+/// session survives.
 #[test]
 #[serial]
-fn test_project_group_collapsed_prunes_stale_paths() {
+fn test_derived_group_collapsed_prunes_stale_paths() {
     use crate::session::config::GroupByMode;
 
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Project;
-    env.view.flat_items = env.view.build_flat_items();
+    for mode in [GroupByMode::Project, GroupByMode::Org] {
+        let mut env = create_test_env_two_projects_mixed_attention();
+        env.view.group_by = mode;
+        env.view.flat_items = env.view.build_flat_items();
 
-    // A real folder the user collapsed this session.
-    let live_path = env
-        .view
-        .flat_items
-        .iter()
-        .find_map(|item| match item {
-            Item::Group { path, .. } => Some(path.clone()),
-            _ => None,
-        })
-        .expect("project mode should have a folder header");
+        let live_path = env
+            .view
+            .flat_items
+            .iter()
+            .find_map(|item| match item {
+                Item::Group { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .expect("a derived folder header");
+        let collapsed = match mode {
+            GroupByMode::Project => &mut env.view.project_group_collapsed,
+            _ => &mut env.view.org_group_collapsed,
+        };
+        collapsed.insert(live_path.clone(), true);
+        collapsed.insert("/repos/deleted-ghost".to_string(), true);
 
-    env.view
-        .project_group_collapsed
-        .insert(live_path.clone(), true);
-    // A stale entry for a project that isn't part of this session at all.
-    env.view
-        .project_group_collapsed
-        .insert("/repos/deleted-ghost".to_string(), true);
+        match mode {
+            GroupByMode::Project => env.view.save_project_group_collapsed(),
+            _ => env.view.save_org_group_collapsed(),
+        }
 
-    env.view.save_project_group_collapsed();
-
-    let config = crate::session::config::load_config()
-        .unwrap()
-        .expect("config should exist after save");
-    let saved = &config.app_state.project_group_collapsed;
-    assert!(
-        saved.contains(&live_path),
-        "a live collapsed folder must be persisted"
-    );
-    assert!(
-        !saved.iter().any(|p| p == "/repos/deleted-ghost"),
-        "a collapse entry for a nonexistent project must be pruned"
-    );
+        let config = crate::session::config::load_config()
+            .unwrap()
+            .expect("config should exist after save");
+        let saved = match mode {
+            GroupByMode::Project => &config.app_state.project_group_collapsed,
+            _ => &config.app_state.org_group_collapsed,
+        };
+        assert!(
+            saved.contains(&live_path),
+            "{mode:?}: a live collapsed folder must be persisted"
+        );
+        assert!(
+            !saved.iter().any(|p| p == "/repos/deleted-ghost"),
+            "{mode:?}: a collapse entry for a nonexistent folder must be pruned"
+        );
+    }
 }
 
-/// Org-mode counterpart of `test_project_group_collapsed_state_persists_to_config`:
-/// org folder collapse state has no group record either (headers are derived
-/// from each session's resolved remote owner), so it must round-trip through
-/// `app_state.org_group_collapsed` the same way.
+/// `shrink_list` / `grow_list` step the list width by 5 from its default and clamp at the
+/// 10 / 80 bounds the keyboard `<` and `>` share.
 #[test]
 #[serial]
-fn test_org_group_collapsed_state_persists_to_config() {
-    use crate::session::config::GroupByMode;
-
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Org;
-    env.view.flat_items = env.view.build_flat_items();
-
-    // Find an org folder header and confirm it starts expanded.
-    let (group_idx, group_path) = env
-        .view
-        .flat_items
-        .iter()
-        .enumerate()
-        .find_map(|(idx, item)| match item {
-            Item::Group {
-                path, collapsed, ..
-            } => {
-                assert!(!collapsed, "org folder should start expanded");
-                Some((idx, path.clone()))
-            }
-            _ => None,
-        })
-        .expect("org mode should have a folder header");
-
-    // Collapse it via Enter, which routes through toggle_group_collapsed.
-    env.view.cursor = group_idx;
-    env.view.update_selected();
-    env.view.handle_key(key(KeyCode::Enter), None);
-
-    // The collapsed path must be persisted to the on-disk config.
-    let config = crate::session::config::load_config()
-        .unwrap()
-        .expect("config should exist after collapse");
-    assert!(
-        config.app_state.org_group_collapsed.contains(&group_path),
-        "collapsed org folder path should be persisted to app_state"
-    );
-
-    // A freshly constructed HomeView (simulating relaunch) must restore it.
-    let fresh = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    assert_eq!(
-        fresh.org_group_collapsed.get(&group_path).copied(),
-        Some(true),
-        "relaunched HomeView should restore the collapsed org folder"
-    );
-}
-
-/// Org-mode counterpart of `test_project_group_collapsed_prunes_stale_paths`.
-#[test]
-#[serial]
-fn test_org_group_collapsed_prunes_stale_paths() {
-    use crate::session::config::GroupByMode;
-
-    let mut env = create_test_env_two_projects_mixed_attention();
-    env.view.group_by = GroupByMode::Org;
-    env.view.flat_items = env.view.build_flat_items();
-
-    // A real folder the user collapsed this session.
-    let live_path = env
-        .view
-        .flat_items
-        .iter()
-        .find_map(|item| match item {
-            Item::Group { path, .. } => Some(path.clone()),
-            _ => None,
-        })
-        .expect("org mode should have a folder header");
-
-    env.view.org_group_collapsed.insert(live_path.clone(), true);
-    // A stale entry for an org that isn't part of this session at all.
-    env.view
-        .org_group_collapsed
-        .insert("stale-org".to_string(), true);
-
-    env.view.save_org_group_collapsed();
-
-    let config = crate::session::config::load_config()
-        .unwrap()
-        .expect("config should exist after save");
-    let saved = &config.app_state.org_group_collapsed;
-    assert!(
-        saved.contains(&live_path),
-        "a live collapsed folder must be persisted"
-    );
-    assert!(
-        !saved.iter().any(|p| p == "stale-org"),
-        "a collapse entry for a nonexistent org must be pruned"
-    );
-}
-
-#[test]
-#[serial]
-fn test_list_width_default() {
-    let env = create_test_env_empty();
-    assert_eq!(env.view.list_width, 35);
-}
-
-#[test]
-#[serial]
-fn test_shrink_list() {
+fn test_list_width_steps_and_clamps() {
     let mut env = create_test_env_empty();
+    assert_eq!(env.view.list_width, 35);
     env.view.shrink_list();
     assert_eq!(env.view.list_width, 30);
-}
-
-#[test]
-#[serial]
-fn test_grow_list() {
-    let mut env = create_test_env_empty();
     env.view.grow_list();
-    assert_eq!(env.view.list_width, 40);
-}
+    assert_eq!(env.view.list_width, 35);
 
-#[test]
-#[serial]
-fn test_shrink_list_clamps_at_minimum() {
-    let mut env = create_test_env_empty();
     env.view.list_width = 12;
     env.view.shrink_list();
-    assert_eq!(env.view.list_width, 10);
     env.view.shrink_list();
-    assert_eq!(env.view.list_width, 10);
-}
+    assert_eq!(env.view.list_width, 10, "shrink clamps at the minimum");
 
-#[test]
-#[serial]
-fn test_grow_list_clamps_at_maximum() {
-    let mut env = create_test_env_empty();
     env.view.list_width = 78;
     env.view.grow_list();
-    assert_eq!(env.view.list_width, 80);
     env.view.grow_list();
-    assert_eq!(env.view.list_width, 80);
+    assert_eq!(env.view.list_width, 80, "grow clamps at the maximum");
 }
 
 #[test]
@@ -1342,19 +1203,9 @@ fn test_gt_grows_list() {
     assert_eq!(env.view.list_width, 40);
 }
 
-#[test]
-#[serial]
-fn test_sort_order_defaults_to_newest() {
-    use crate::session::config::SortOrder;
-
-    let env = create_test_env_with_mixed_sessions();
-    assert_eq!(env.view.sort_order, SortOrder::Newest);
-}
-
-/// The picker must not offer a repo the session already has: the attach would
-/// be rejected as a duplicate, so offering it is offering a guaranteed failure.
-/// With no registry entries there is nothing to offer, and the dialog says so
-/// rather than rendering an empty list.
+/// The picker must not offer a repo the session already has, since the attach would be
+/// rejected as a duplicate. With no registry entries there is nothing to offer and the
+/// dialog says so rather than rendering an empty list.
 #[test]
 #[serial]
 fn add_project_picker_opens_and_excludes_repos_already_on_the_session() {
@@ -1384,10 +1235,10 @@ fn add_project_picker_opens_and_excludes_repos_already_on_the_session() {
     );
 }
 
-/// Attaching bounces the worker and creates a worktree, so the picker must
-/// refuse the same lifecycle states every sibling mutator refuses. The context
-/// menu offers the row unconditionally, so this gate is the only thing stopping
-/// an archived or mid-turn session from being attached to.
+/// Attaching bounces the worker and creates a worktree, so the picker refuses the same
+/// lifecycle states every sibling mutator refuses. The context menu offers the row
+/// unconditionally, so this gate is the only thing stopping an archived or mid-turn
+/// session.
 #[test]
 #[serial]
 fn add_project_picker_refuses_shelved_and_mid_turn_sessions() {
@@ -1395,9 +1246,9 @@ fn add_project_picker_refuses_shelved_and_mid_turn_sessions() {
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
 
-    // `Waiting` and `Starting` are turns in flight too, which is why the gate
-    // reuses `Status::blocks_worktree_edit()` rather than naming `Running` alone:
-    // SIGTERMing a `Waiting` worker throws away a pending approval.
+    // `Waiting` and `Starting` are turns in flight too, which is why the gate reuses
+    // `Status::blocks_worktree_edit()`: SIGTERMing a `Waiting` worker throws away a pending
+    // approval.
     for status in [
         crate::session::Status::Creating,
         crate::session::Status::Deleting,
@@ -1437,11 +1288,10 @@ fn add_project_picker_refuses_shelved_and_mid_turn_sessions() {
     );
 }
 
-/// The attach runs on a background poller, so the dispatch must return without
-/// touching git: `git worktree add` plus an optional fetch and submodule init on
-/// the render thread froze the UI for the whole attach. A second dispatch for the
-/// same session is refused, because it would race the first one's worktree
-/// creation and its worker bounce.
+/// The attach runs on a background poller, so dispatch must return without touching git:
+/// `git worktree add` plus a fetch and submodule init on the render thread froze the UI for
+/// the whole attach. A second dispatch for the same session is refused, since it would race
+/// the first one's worktree creation and worker bounce.
 #[test]
 #[serial]
 fn add_project_dispatches_to_the_poller_and_refuses_a_second_attach() {
@@ -1470,9 +1320,9 @@ fn add_project_dispatches_to_the_poller_and_refuses_a_second_attach() {
     assert!(format!("{:#}", second.unwrap_err()).contains("already running"));
 }
 
-/// The completion path clears the marker and replaces the progress dialog, for
-/// both outcomes. Without the clear, one failed attach would leave the session
-/// permanently unattachable.
+/// The completion path clears the marker and replaces the progress dialog for both
+/// outcomes; without the clear, one failed attach would leave the session permanently
+/// unattachable.
 #[test]
 #[serial]
 fn apply_attach_project_results_reports_and_clears_the_marker() {
@@ -1521,10 +1371,9 @@ fn apply_attach_project_results_reports_and_clears_the_marker() {
     }
 }
 
-/// A scratch session has no repo of its own, so there is nothing for an
-/// attached one to widen and deletion drops its whole directory. The picker
-/// refuses it outright rather than opening on a list where every choice would be
-/// rejected by `attach_project::plan`.
+/// A scratch session has no repo of its own, so there is nothing to widen and deletion
+/// drops its whole directory. The picker refuses it rather than opening a list where every
+/// choice would be rejected by `attach_project::plan`.
 #[test]
 #[serial]
 fn add_project_picker_refuses_a_scratch_session() {
@@ -1551,10 +1400,9 @@ fn add_project_picker_refuses_a_scratch_session() {
     assert!(env.view.attach_project_dialog.is_some());
 }
 
-/// The picker is a modal, so it has to register in the overlay predicates that
-/// gate scroll, right-click, footer clicks, drag start, and paste-burst routing.
-/// Missing from them, the wheel moved the cursor underneath the open modal and
-/// right-click stacked a second context menu on top of it.
+/// The picker is a modal, so it must register in the overlay predicates gating scroll,
+/// right-click, footer clicks, drag start and paste-burst routing; missing from them, the
+/// wheel moved the cursor underneath it and right-click stacked a second menu on top.
 #[test]
 #[serial]
 fn add_project_picker_registers_as_an_overlay() {
@@ -1616,9 +1464,8 @@ fn test_o_key_opens_sort_picker() {
 #[test]
 #[serial]
 fn test_shift_o_opens_sort_picker_in_strict_mode() {
-    // Regression guard: the SortPicker binding lists Shift+O (Char('O')) for
-    // strict mode, so it must resolve to the sort picker rather than falling
-    // through to the typing-guard (capture_letter_to_compose).
+    // The SortPicker binding lists Shift+O for strict mode, so it must resolve to the sort
+    // picker rather than falling through to the typing-guard.
     use crate::session::config::SortOrder;
 
     let mut env = create_test_env_with_mixed_sessions();
@@ -1655,15 +1502,10 @@ fn test_shift_o_opens_sort_picker_in_strict_mode() {
 #[test]
 #[serial]
 fn test_bare_lowercase_o_does_not_cycle_sort_in_strict_mode() {
-    // Regression guard (2026-04-22): in strict_hotkeys mode, plain lowercase 'o'
-    // MUST NOT cycle sort; it must fall through to the typing-guard catch-all
-    // (message dialog) per the "no destructive lowercase" rule. Only Shift+O
-    // (Char('O')) and Ctrl+O should change sort order in strict mode.
-    //
-    // The previous implementation collapsed the two sort arms into a single
-    // unguarded `Char('o') => cycle`, which fired for bare 'o' too, breaking
-    // the contract and silently changing the user's sort order whenever they
-    // tried to type 'o' as text input.
+    // In strict mode plain lowercase 'o' must not cycle sort; it falls through to the
+    // typing-guard per the "no destructive lowercase" rule, leaving Shift+O and Ctrl+O as
+    // the sort chords. A single unguarded `Char('o') => cycle` arm fired for bare 'o' too
+    // and silently changed the sort whenever the user typed it as text.
     use crate::session::config::SortOrder;
 
     let mut env = create_test_env_with_mixed_sessions();
@@ -1683,12 +1525,9 @@ fn test_bare_lowercase_o_does_not_cycle_sort_in_strict_mode() {
 #[test]
 #[serial]
 fn test_strict_mode_h_collapses_group() {
-    // Regression guard: the help overlay lists "h/←" for Collapse group in
-    // strict mode. Bare lowercase `h` must walk through the dispatch and
-    // collapse the cursor's group, mirroring `l`/Right for expand. Without
-    // the explicit `Char('h')` arm next to `KeyCode::Left`, `h` would fall
-    // into the strict-mode typing-guard catch-all and the advertised
-    // navigation hotkey would silently open the compose dialog.
+    // The help overlay lists "h/←" for Collapse group in strict mode, so bare `h` must walk
+    // through dispatch and collapse the cursor's group, mirroring `l`/Right. Without the
+    // explicit `Char('h')` arm it would fall into the typing-guard and open compose.
     let mut env = create_test_env_with_groups();
     env.view.strict_hotkeys = true;
 
@@ -1722,21 +1561,17 @@ fn test_strict_mode_h_collapses_group() {
 #[test]
 #[serial]
 fn test_non_strict_h_snoozes_only_in_attention_sort() {
-    // Snooze is Attention-mode-only: in Attention sort `h` toggles snooze on
-    // the cursor's session and the group below the cursor stays expanded;
-    // in every other sort mode the snooze arm declines, control falls
-    // through to the unconditional `Left | Char('h')` collapse handler,
-    // and the group collapses. Before the gating, snooze always caught
-    // first in non-strict mode regardless of sort, which silently mutated
-    // persisted state for users who weren't using Attention sort.
+    // Snooze is Attention-only: there `h` toggles snooze on the cursor's session and the
+    // group below stays expanded, while every other sort falls through to the unconditional
+    // `Left | Char('h')` collapse. Before the gate, snooze caught first in non-strict mode
+    // regardless of sort and silently mutated persisted state.
     use crate::session::config::SortOrder;
 
     let mut env = create_test_env_with_groups();
     env.view.strict_hotkeys = false;
 
-    // Attention sort flattens groups out, so seed a cursor-on-session
-    // scenario and assert that `h` opens the snooze duration dialog
-    // (the actual snooze fires when the user picks a duration).
+    // Attention sort flattens groups, so seed a cursor-on-session scenario and assert that
+    // `h` opens the snooze duration dialog; the snooze itself fires on the pick.
     env.view.sort_order = SortOrder::Attention;
     env.view.flat_items = env.view.build_flat_items();
     let session_idx = env
@@ -1781,11 +1616,9 @@ fn test_non_strict_h_snoozes_only_in_attention_sort() {
 #[test]
 #[serial]
 fn test_non_strict_w_jumps_to_next_waiting_in_attention_sort() {
-    // Regression for #1524: in non-strict Attention sort, `w` must jump to the
-    // next waiting/idle session (the #796 behavior) instead of snoozing the
-    // cursor's session. Snooze lives on `h`/`H`; `w` is navigation. Previously
-    // the snooze arm shadowed the jump arm in exactly the sort users triage in,
-    // so `w` never felt like a navigation key.
+    // #1524: in non-strict Attention sort, `w` must jump to the next waiting/idle session
+    // (#796) rather than snoozing the cursor's session. Snooze lives on `h`/`H`; the snooze
+    // arm used to shadow the jump arm in exactly the sort users triage in.
     use crate::session::Status;
 
     let (mut env, running, _waiting) = attention_env_running_then_waiting();
@@ -1962,9 +1795,8 @@ fn test_non_strict_w_on_collapsed_project_group_reveals_idle_in_attention_sort()
 #[test]
 #[serial]
 fn test_strict_mode_ctrl_g_opens_group_picker() {
-    // Regression guard: the GroupBy binding is Ctrl+G in strict mode. It must
-    // open the group picker, while bare 'g' continues to fall into the
-    // typing-guard catch-all (it lands in pending_paste).
+    // The GroupBy binding is Ctrl+G in strict mode and must open the group picker, while
+    // bare 'g' still falls into the typing-guard and lands in pending_paste.
     use crate::session::config::GroupByMode;
 
     let mut env = create_test_env_with_sessions(3);
@@ -2008,12 +1840,9 @@ fn test_strict_mode_ctrl_g_opens_group_picker() {
 #[test]
 #[serial]
 fn test_strict_mode_ctrl_t_and_ctrl_n_reach_secondary_actions() {
-    // Regression guard (2026-05-29): in strict_hotkeys mode, normalize_strict_key
-    // used to fold Ctrl+T -> 'T' and Ctrl+N -> 'N' (modifier stripped), which
-    // collided with the Shift+T / Shift+N primary arms (toggle view, plain new
-    // session) and left the Ctrl+T / Ctrl+N secondary arms (quick-attach
-    // terminal, new-from-selection) as unreachable dead code. Both chords must
-    // keep CTRL so the secondary arms fire.
+    // normalize_strict_key used to fold Ctrl+T -> 'T' and Ctrl+N -> 'N', colliding with the
+    // Shift+T / Shift+N primary arms and leaving the Ctrl secondary arms (quick-attach
+    // terminal, new-from-selection) unreachable. Both chords must keep CTRL.
     let mut env = create_test_env_with_sessions(1);
     env.view.strict_hotkeys = true;
     env.view.cursor = 0;
@@ -2060,9 +1889,9 @@ fn test_strict_mode_ctrl_t_and_ctrl_n_reach_secondary_actions() {
     );
     env.view.new_dialog = None;
 
-    // Ctrl+N opens the new-from-selection dialog (secondary action). It also
-    // routes through open_new_session_dialog, so assert it reaches the arm by
-    // confirming the dialog opens with CTRL intact rather than being swallowed.
+    // Ctrl+N opens the new-from-selection dialog. It also routes through
+    // open_new_session_dialog, so the dialog opening with CTRL intact is what proves the
+    // secondary arm fired.
     env.view.handle_key(
         KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
         None,
@@ -2076,12 +1905,9 @@ fn test_strict_mode_ctrl_t_and_ctrl_n_reach_secondary_actions() {
 #[test]
 #[serial]
 fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
-    // Regression guard (2026-05-29): normalize_strict_key used to fold
-    // Ctrl+D/Ctrl+R/Ctrl+P to bare 'D'/'R'/'P', which collided with the
-    // Shift+letter primary arms. In strict mode Shift+D=delete, Shift+R=rename,
-    // Shift+P=profiles, so the folds made Ctrl+D fire delete (not diff), Ctrl+R
-    // fire rename (not serve), and orphaned the diff/serve/projects arms. All
-    // three Ctrl chords must keep CTRL so their secondary arms fire.
+    // normalize_strict_key used to fold Ctrl+D/R/P to bare 'D'/'R'/'P', colliding with the
+    // Shift+letter primary arms, so Ctrl+D fired delete instead of diff, Ctrl+R rename
+    // instead of serve, and the projects arm was orphaned. All three must keep CTRL.
     let mut env = create_test_env_with_sessions(1);
     disable_delete_to_trash();
     env.view.strict_hotkeys = true;
@@ -2098,11 +1924,9 @@ fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
     );
     env.view.unified_delete_dialog = None;
 
-    // Ctrl+D routes to the diff arm, NOT delete. The test session's path is not
-    // a real git worktree so the diff view may fail to open (info dialog) or
-    // open empty; either way the regression is that Ctrl+D must never reach
-    // open_delete_for_selected. Clear any takeover the diff arm leaves behind so
-    // it doesn't swallow the next keypress.
+    // Ctrl+D routes to diff, not delete. The test session's path is not a real worktree, so
+    // the diff view may fail to open or open empty; either way Ctrl+D must never reach
+    // open_delete_for_selected. Clear any takeover it leaves so the next keypress lands.
     env.view.handle_key(
         KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
         None,
@@ -2136,9 +1960,8 @@ fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
     env.view.info_dialog = None;
     env.view.serve_view = None;
 
-    // P follows the same relocation rule as D/R/T/N: the bare-`p` (primary)
-    // action -> Shift+P, the Shift+P (secondary) action -> Ctrl+P. So in strict
-    // mode Shift+P opens projects and Ctrl+P opens profiles.
+    // P follows the same relocation rule as D/R/T/N, so in strict mode Shift+P opens
+    // projects and Ctrl+P opens profiles.
     assert!(env.view.projects_dialog.is_none());
     env.view
         .handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT), None);
@@ -2171,10 +1994,9 @@ fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
 #[test]
 #[serial]
 fn test_command_palette_diff_invokes_diff_in_strict_mode() {
-    // Regression guard for the palette half of the strict-mode bug: the palette
-    // used to synthesize a keypress, so picking "Open diff view" in strict mode
-    // routed through Shift+D and fired DELETE instead. Palette entries now carry
-    // an ActionId and run the action directly, so the mode can't matter.
+    // The palette half of the strict-mode bug: the palette used to synthesize a keypress,
+    // so picking "Open diff view" routed through Shift+D and fired delete. Entries now carry
+    // an ActionId and run the action directly.
     let mut env = create_test_env_with_sessions(1);
     env.view.strict_hotkeys = true;
     env.view.cursor = 0;
@@ -2209,10 +2031,8 @@ fn test_command_palette_diff_invokes_diff_in_strict_mode() {
 #[test]
 #[serial]
 fn test_f5_and_e_both_open_restart_dialog() {
-    // Pin the equivalence: F5 and `e`/`E` all open the restart dialog. The
-    // help overlay collapses them onto one row as "Restart session (also
-    // F5)", which is only honest if both bindings keep hitting the same
-    // dispatch (open_restart_dialog).
+    // Pin the equivalence: F5 and `e`/`E` all open the restart dialog, which is what makes
+    // the help overlay's "Restart session (also F5)" row honest.
     let mut env = create_test_env_with_sessions(1);
     env.view.cursor = 0;
     env.view.update_selected();
@@ -2238,6 +2058,58 @@ fn test_f5_and_e_both_open_restart_dialog() {
     assert!(upper_e_opened, "strict 'E' should open the restart dialog");
 }
 
+/// Titles of the sessions rendered under the "work" group header, in list order.
+fn work_group_titles(view: &HomeView) -> Vec<&str> {
+    let mut titles = Vec::new();
+    let mut in_work_group = false;
+    for item in &view.flat_items {
+        match item {
+            Item::Group { name, .. } => in_work_group = name == "work",
+            Item::Session { id, .. } => {
+                if in_work_group {
+                    if let Some(inst) = view.get_instance(id) {
+                        titles.push(inst.title.as_str());
+                    }
+                }
+            }
+        }
+    }
+    titles
+}
+
+/// Sort order reaches the sessions inside a group: the picker's AZ and ZA entries reorder
+/// the work group, and six `o` presses wrap back to Newest and its original order.
+#[test]
+#[serial]
+fn test_o_key_flat_items_follow_sort_order() {
+    use crate::session::config::SortOrder;
+
+    for (downs, order, expected) in [
+        (4, SortOrder::AZ, ["Apple", "Mango", "Zebra"]),
+        (5, SortOrder::ZA, ["Zebra", "Mango", "Apple"]),
+    ] {
+        let mut env = create_test_env_with_mixed_sessions();
+        assert_eq!(env.view.sort_order, SortOrder::Newest);
+
+        env.view.handle_key(key(KeyCode::Char('o')), None);
+        for _ in 0..downs {
+            env.view.handle_key(key(KeyCode::Down), None);
+        }
+        env.view.handle_key(key(KeyCode::Enter), None);
+
+        assert_eq!(env.view.sort_order, order);
+        assert_eq!(work_group_titles(&env.view), expected);
+    }
+
+    // Newest -> Attention -> LastActivity -> Oldest -> AZ -> ZA -> Newest.
+    let mut env = create_test_env_with_mixed_sessions();
+    for _ in 0..6 {
+        env.view.handle_key(key(KeyCode::Char('o')), None);
+    }
+    assert_eq!(env.view.sort_order, SortOrder::Newest);
+    assert_eq!(work_group_titles(&env.view), ["Apple", "Mango", "Zebra"]);
+}
+
 #[test]
 #[serial]
 fn test_ctrl_o_key_opens_sort_picker() {
@@ -2258,114 +2130,6 @@ fn test_ctrl_o_key_opens_sort_picker() {
     env.view.handle_key(key(KeyCode::Esc), None);
     assert!(env.view.sort_picker_dialog.is_none());
     assert_eq!(env.view.sort_order, SortOrder::Newest);
-}
-
-#[test]
-#[serial]
-fn test_o_key_flat_items_sorted_az() {
-    use crate::session::config::SortOrder;
-
-    let mut env = create_test_env_with_mixed_sessions();
-    assert_eq!(env.view.sort_order, SortOrder::Newest);
-
-    // Open the sort picker and pick AZ.
-    env.view.handle_key(key(KeyCode::Char('o')), None);
-    for _ in 0..4 {
-        env.view.handle_key(key(KeyCode::Down), None);
-    }
-    env.view.handle_key(key(KeyCode::Enter), None);
-    assert_eq!(env.view.sort_order, SortOrder::AZ);
-
-    let mut session_titles: Vec<_> = Vec::new();
-    let mut in_work_group = false;
-    for item in &env.view.flat_items {
-        match item {
-            Item::Group { name, .. } => {
-                in_work_group = name == "work";
-            }
-            Item::Session { id, .. } => {
-                if in_work_group {
-                    if let Some(inst) = env.view.get_instance(id) {
-                        session_titles.push(inst.title.as_str());
-                    }
-                }
-            }
-        }
-    }
-
-    assert_eq!(session_titles, vec!["Apple", "Mango", "Zebra"]);
-}
-
-#[test]
-#[serial]
-fn test_o_key_flat_items_sorted_za() {
-    use crate::session::config::SortOrder;
-
-    let mut env = create_test_env_with_mixed_sessions();
-
-    // Open the sort picker and pick ZA (5 entries down from Newest).
-    env.view.handle_key(key(KeyCode::Char('o')), None);
-    for _ in 0..5 {
-        env.view.handle_key(key(KeyCode::Down), None);
-    }
-    env.view.handle_key(key(KeyCode::Enter), None);
-    assert_eq!(env.view.sort_order, SortOrder::ZA);
-
-    let mut session_titles: Vec<_> = Vec::new();
-    let mut in_work_group = false;
-    for item in &env.view.flat_items {
-        match item {
-            Item::Group { name, .. } => {
-                in_work_group = name == "work";
-            }
-            Item::Session { id, .. } => {
-                if in_work_group {
-                    if let Some(inst) = env.view.get_instance(id) {
-                        session_titles.push(inst.title.as_str());
-                    }
-                }
-            }
-        }
-    }
-
-    assert_eq!(session_titles, vec!["Zebra", "Mango", "Apple"]);
-}
-
-#[test]
-#[serial]
-fn test_o_key_flat_items_newest_preserves_insertion_order() {
-    use crate::session::config::SortOrder;
-
-    let mut env = create_test_env_with_mixed_sessions();
-
-    // Press 'o' six times to wrap back to Newest
-    // (Newest -> Attention -> LastActivity -> Oldest -> AZ -> ZA -> Newest)
-    env.view.handle_key(key(KeyCode::Char('o')), None);
-    env.view.handle_key(key(KeyCode::Char('o')), None);
-    env.view.handle_key(key(KeyCode::Char('o')), None);
-    env.view.handle_key(key(KeyCode::Char('o')), None);
-    env.view.handle_key(key(KeyCode::Char('o')), None);
-    env.view.handle_key(key(KeyCode::Char('o')), None);
-    assert_eq!(env.view.sort_order, SortOrder::Newest);
-
-    let mut session_titles: Vec<_> = Vec::new();
-    let mut in_work_group = false;
-    for item in &env.view.flat_items {
-        match item {
-            Item::Group { name, .. } => {
-                in_work_group = name == "work";
-            }
-            Item::Session { id, .. } => {
-                if in_work_group {
-                    if let Some(inst) = env.view.get_instance(id) {
-                        session_titles.push(inst.title.as_str());
-                    }
-                }
-            }
-        }
-    }
-
-    assert_eq!(session_titles, vec!["Apple", "Mango", "Zebra"]);
 }
 
 #[test]

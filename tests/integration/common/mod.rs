@@ -1,7 +1,4 @@
-//! Shared helpers for integration tests.
-//!
-//! Declared once from `tests/integration/main.rs`; consumers import via
-//! `use crate::common::...`.
+//! Shared helpers for integration tests, declared from `main.rs`.
 
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -9,21 +6,10 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::process::Command;
 
-/// Stable per-process tmux socket for integration tests. aoe now resolves an
-/// explicit `-S <socket>` (#2608) and caches it once per process, so tests
-/// must (a) point aoe at a hermetic socket via `AOE_TMUX_SOCKET` and (b) make
-/// their own raw `tmux` calls target the same socket. The path is stable (not
-/// per-test-home) precisely because the lib caches it once; a per-home path
-/// would be dropped out from under a later test. Referencing it also sets
-/// `AOE_TMUX_SOCKET`, so any raw-tmux call site locks the lib onto the same
-/// socket before its first lib tmux call. `#[serial]` tests keep the env write
-/// single-threaded.
-///
-/// The name carries this process's pid so it is stable within one integration
-/// binary yet never collides with a concurrent integration process (a second
-/// `cargo test` run or a leftover server from a prior run). Without the pid,
-/// two processes would share one tmux server and interfere, most visibly as
-/// root where `/tmp` is shared across every same-uid run.
+/// Hermetic tmux socket shared by the lib and by raw `tmux` calls, and set on
+/// `AOE_TMUX_SOCKET` as a side effect. aoe caches the socket once per process,
+/// so the path is per-process (pid-named, never per test home) and `#[serial]`
+/// callers keep the env write single-threaded.
 pub fn tmux_socket() -> PathBuf {
     let path =
         std::env::temp_dir().join(format!("aoe-integration-tmux-{}.sock", std::process::id()));
@@ -39,11 +25,8 @@ pub fn shim_path() -> std::path::PathBuf {
         .join("shim.mjs")
 }
 
-/// Returns `Ok(())` if the structured view shim can be spawned (Node available, shim
-/// file present, shim deps installed). Otherwise returns a short reason
-/// that callers print before skipping. CI installs deps via `npm ci` in
-/// `acp-worker/test-shim/` before running the integration leg; local
-/// runs need the same one-shot setup, which the message points at.
+/// `Ok(())` when the structured view shim can be spawned; otherwise a reason
+/// callers print before skipping.
 pub fn shim_ready() -> Result<(), String> {
     shim_node()?;
     let shim = shim_path();
@@ -60,8 +43,7 @@ pub fn shim_ready() -> Result<(), String> {
 }
 
 /// Resolve the runtime behind version-manager launchers before tests isolate
-/// HOME or the product filters the child environment. Probe and spawn must use
-/// the same executable, not re-enter a launcher without its configuration.
+/// HOME: probe and spawn must use the same executable.
 pub fn shim_node() -> Result<&'static Path, String> {
     static NODE: std::sync::OnceLock<Result<PathBuf, String>> = std::sync::OnceLock::new();
     NODE.get_or_init(|| {
@@ -93,12 +75,8 @@ pub fn running_as_root() -> bool {
     nix::unistd::geteuid().is_root()
 }
 
-/// Set `HOME` (and `XDG_CONFIG_HOME` on Linux/macOS) to a fresh temp dir so
-/// tests read and write to isolated state. Returns the guard; drop it to clean
-/// up.
-///
-/// # Safety caveat
-/// `set_var` is not thread-safe. Callers must be `#[serial]`.
+/// Point `HOME` (and `XDG_CONFIG_HOME`) at a fresh temp dir; drop the guard to
+/// restore. `set_var` is not thread-safe, so callers must be `#[serial]`.
 pub fn setup_temp_home() -> TestHome {
     let temp = TempDir::new().unwrap();
     let env = set_temp_home(temp.path());
@@ -189,19 +167,11 @@ impl TestHome {
     }
 }
 
-/// A live `aoe __acp-runner` whose agent is the Node ACP shim.
+/// A live `aoe __acp-runner` whose agent is the Node ACP shim: the real runner
+/// rather than a mock, since the daemon speaks the typed control protocol.
 ///
-/// Before #2977 these tests fronted the shim with a hand-rolled byte proxy on
-/// a unix socket, which was a fair stand-in while the daemon spoke raw ACP
-/// over `<id>.sock`. That socket is gone: the daemon now speaks the typed
-/// control protocol, and a byte proxy cannot answer it. Rather than
-/// reimplement the runner side in the fixture, spawn the real runner. It
-/// costs a process and gives the attach path genuine end-to-end coverage
-/// instead of a mock of the peer it is being tested against.
-///
-/// Returns the `--socket` path (still the derivation base for the control
-/// sibling, which is what `AcpClient::attach` dials) and guards that keep the
-/// temp dir and the runner process alive for the test's duration.
+/// Returns the `--socket` path, from which `AcpClient::attach` derives the
+/// control sibling, and a guard holding the runner and its temp dir open.
 pub async fn spawn_runner_with_shim(
     session_id: &str,
     env: &[(&str, String)],
@@ -212,14 +182,8 @@ pub async fn spawn_runner_with_shim(
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&xdg).unwrap();
 
-    // `--socket` is an explicit path, so point it straight at the temp dir
-    // rather than deriving the app-dir layout (which varies by platform and
-    // by whether XDG_CONFIG_HOME is set). The runner still writes its
-    // registry record under the temp HOME; nothing here reads it.
-    //
-    // `session_id` must match what the caller passes to `AcpClient::attach`:
-    // the daemon verifies the id the runner announces in its `Hello`, so a
-    // fixture that spawned under a fixed id would be rejected.
+    // The daemon verifies the id the runner announces, so `session_id` must
+    // match what the caller later attaches with.
     let socket_path = temp.path().join(format!("{session_id}.sock"));
     let control = temp.path().join(format!("{session_id}.control.sock"));
 
@@ -334,26 +298,20 @@ pub async fn spawn_runner_with_shim(
     )
 }
 
-/// Keeps the runner process and its temp HOME alive for the test. Dropping
-/// it kills the runner (`kill_on_drop`), which takes the shim with it.
+/// Dropping this kills the runner, which takes the shim with it.
 pub struct RunnerGuard {
     _child: tokio::process::Child,
     _temp: tempfile::TempDir,
 }
 
-/// Bind ephemeral, drop, return the port. Tiny TOCTOU window before the
-/// caller binds; acceptable under `#[serial]`. Used by every integration
-/// test that spawns an `aoe serve` subprocess.
+/// Bind ephemeral, drop, return the port. The TOCTOU window before the caller
+/// binds is acceptable under `#[serial]`.
 pub fn pick_free_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     l.local_addr().expect("local_addr").port()
 }
 
-/// Poll-connect against `127.0.0.1:port` until success or `deadline`
-/// elapses. Returns `true` on success, `false` on timeout. The 100ms
-/// inner sleep matches the rest of the test harness; the connect timeout
-/// is shorter so the deadline budget is mostly spent retrying rather
-/// than blocked on a single slow connect.
+/// Poll-connect `127.0.0.1:port` until it succeeds or `deadline` elapses.
 pub fn wait_for_port(port: u16, deadline: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < deadline {

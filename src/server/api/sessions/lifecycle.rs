@@ -10,9 +10,8 @@ pub struct UpdatePinBody {
 
 #[derive(Deserialize)]
 pub struct UpdateColorBody {
-    /// A palette member (`red` / `amber` / `green`) sets the label; `null` (or
-    /// a missing field) clears it. Validated against
-    /// `crate::session::is_valid_session_color`, matching the CLI.
+    /// A palette member (`red` / `amber` / `green`) sets the label; `null`
+    /// clears it. Validated against `crate::session::is_valid_session_color`.
     #[serde(default)]
     pub color: Option<String>,
 }
@@ -22,7 +21,7 @@ pub struct UpdateArchiveBody {
     pub archived: bool,
     /// On archive, tear down every tmux session this instance owns. `false`
     /// keeps tmux state alive; structured-view supervisor shutdown is
-    /// unconditional. Ignored when `archived = false`. See #1868.
+    /// unconditional. Ignored when `archived = false` (#1868).
     #[serde(default = "default_kill_pane")]
     pub kill_pane: bool,
 }
@@ -33,16 +32,16 @@ fn default_kill_pane() -> bool {
 
 #[derive(Deserialize)]
 pub struct TrashSessionBody {
-    /// On trash, tear down every tmux session this instance owns. `false`
-    /// keeps tmux state alive; structured-view supervisor shutdown (which
-    /// preserves the transcript) is unconditional. Defaults to `true`.
+    /// On trash, tear down every tmux session this instance owns. `false` keeps
+    /// tmux state alive; structured-view supervisor shutdown, which preserves
+    /// the transcript, is unconditional. Defaults to `true`.
     #[serde(default = "default_kill_pane")]
     pub kill_pane: bool,
 }
 
 // A no-body trash request resolves through `unwrap_or_default()`, so `Default`
-// must match the serde field default (`true`). The derived `Default` would use
-// `bool::default()` (`false`) and silently leave the pane running (#2523).
+// must match the serde field default (`true`); the derived one would leave the
+// pane running (#2523).
 impl Default for TrashSessionBody {
     fn default() -> Self {
         Self {
@@ -53,22 +52,19 @@ impl Default for TrashSessionBody {
 
 #[derive(Deserialize)]
 pub struct UpdateSnoozeBody {
-    /// `Some(positive minutes)` snoozes for that duration. `None` (or a
-    /// missing field) unsnoozes. Validated against
-    /// `crate::session::validate_snooze_duration` so the same bounds the
-    /// TUI dialog and CLI use also apply here.
+    /// `Some(positive minutes)` snoozes for that duration; `None` unsnoozes.
+    /// Validated against `crate::session::validate_snooze_duration`, so the TUI
+    /// dialog and CLI bounds apply here too.
     #[serde(default)]
     pub minutes: Option<u32>,
 }
 
 #[derive(Deserialize)]
 pub struct UpdateUnreadBody {
-    /// `true` flags the session manually unread (a deliberate "flag for
-    /// later"); `false` marks it read, clearing both auto and manual markers.
-    /// The clear is the explicit one (web "Mark as read"); the auto-clear on
-    /// view is driven separately by the client, which only fires it for an
-    /// `auto` marker, so a `false` here never silently drops a manual flag the
-    /// user meant to keep.
+    /// `true` flags the session manually unread; `false` marks it read,
+    /// clearing both auto and manual markers. The auto-clear on view is driven
+    /// separately by the client, which only fires it for an `auto` marker, so a
+    /// `false` here never drops a manual flag the user meant to keep.
     pub unread: bool,
 }
 
@@ -77,9 +73,6 @@ pub async fn update_session_pin(
     Path(id): Path<String>,
     body: Result<Json<UpdatePinBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    // CityHall: only act on structured sessions this mode created; refuse a
-    // non-structured (or unknown) target so a locked-down client cannot
-    // respawn/destroy/edit an enumerated plain session. See #7.
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
@@ -97,7 +90,7 @@ pub async fn update_session_pin(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return crate::server::api::session_not_found();
+            return session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -151,9 +144,6 @@ pub async fn update_session_color(
     Path(id): Path<String>,
     body: Result<Json<UpdateColorBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    // CityHall: only act on structured sessions this mode created; refuse a
-    // non-structured (or unknown) target so a locked-down client cannot
-    // respawn/destroy/edit an enumerated plain session. See #7.
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
@@ -165,7 +155,7 @@ pub async fn update_session_color(
         Err(rej) => return rej.into_response(),
     };
 
-    // Validate up front so an unknown color never reaches disk. `None` clears
+    // Validate up front so an unknown color never reaches disk; `None` clears
     // the label. Mirrors the CLI's palette check.
     let new_color = body.color.map(|c| c.trim().to_lowercase());
     if let Some(c) = &new_color {
@@ -186,7 +176,7 @@ pub async fn update_session_color(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return crate::server::api::session_not_found();
+            return session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -232,9 +222,6 @@ pub async fn update_session_archive(
     Path(id): Path<String>,
     body: Result<Json<UpdateArchiveBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    // CityHall: only act on structured sessions this mode created; refuse a
-    // non-structured (or unknown) target so a locked-down client cannot
-    // respawn/destroy/edit an enumerated plain session. See #7.
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
@@ -246,26 +233,23 @@ pub async fn update_session_archive(
         Err(rej) => return rej.into_response(),
     };
 
-    // Worker-stopping barrier: submission guard before `instance_lock`, per
-    // `prompt_submission` (#3650).
     let Some(_submission) = state
         .session_service
         .prompt_submission_for_session(&id)
         .await
     else {
-        return crate::server::api::session_not_found();
+        return session_not_found();
     };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    // Read the profile without mutating memory yet. Persisting first means
-    // a storage failure returns 500 with disk and memory still in
-    // agreement, and the tmux/acp teardown below never fires on a write
-    // that did not land. See #1589.
+    // Read the profile without mutating yet: persisting first means a storage
+    // failure returns 500 with disk and memory in agreement, and the tmux/acp
+    // teardown never fires on a write that did not land (#1589).
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return crate::server::api::session_not_found();
+            return session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -292,9 +276,8 @@ pub async fn update_session_archive(
         return persist_failed_response();
     }
 
-    // Disk is durable; apply to memory and snapshot what the side effects
-    // need. Clone the instance once so we can call its `kill()` method
-    // outside the lock without re-borrowing.
+    // Disk is durable; apply to memory and snapshot what the side effects need.
+    // The instance is cloned once so `kill()` can run outside the lock.
     let (was_structured_view, inst_clone, kill_pane) = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
@@ -317,9 +300,9 @@ pub async fn update_session_archive(
         let inst_snap = inst.clone();
         drop(instances);
 
-        // Snapshot and drop the lock; run side effects below. Unarchive
-        // returns here; archive does NOT short-circuit on kill_pane=false
-        // because structured-view shutdown is unconditional.
+        // Snapshot and drop the lock; side effects run below. Archive does NOT
+        // short-circuit on kill_pane=false, because structured-view shutdown is
+        // unconditional.
         if !archived {
             return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
         }
@@ -329,8 +312,7 @@ pub async fn update_session_archive(
     // Best-effort tmux teardown (helper logs at debug). #1868.
     if was_structured_view {
         // Worker shutdown before ancillary kill so in-flight tool output
-        // settles (mirrors acp.rs:1304-1310). shutdown() preserves the
-        // transcript (#1710).
+        // settles. `shutdown` preserves the transcript (#1710).
         match state.acp_supervisor.shutdown(&id).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
             Err(e) => tracing::warn!(
@@ -363,17 +345,15 @@ pub async fn update_session_archive(
         }
     }
 
-    // Re-read the in-memory instance so the response reflects the
-    // archived flag (the side effects above did not mutate it, but
-    // re-reading also picks up any peer write that landed during the
-    // unlock window).
+    // Re-read so the response reflects the archived flag and picks up any peer
+    // write that landed during the unlock window.
     let instances = state.instances.read().await;
     let response = match instances.iter().find(|i| i.id == id) {
         Some(inst) => {
             SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
         }
         None => {
-            return crate::server::api::session_not_found();
+            return session_not_found();
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
@@ -394,21 +374,19 @@ pub async fn trash_session(
     }
     let body = body.map(|Json(body)| body).unwrap_or_default();
 
-    // Worker-stopping barrier: submission guard before `instance_lock`, per
-    // `prompt_submission` (#3650).
     let Some(_submission) = state
         .session_service
         .prompt_submission_for_session(&id)
         .await
     else {
-        return crate::server::api::session_not_found();
+        return session_not_found();
     };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
     let (profile, snapshot) = {
         let instances = state.instances.read().await;
         let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
-            return crate::server::api::session_not_found();
+            return session_not_found();
         };
         (instance.source_profile.clone(), instance.clone())
     };
@@ -445,14 +423,7 @@ pub async fn trash_session(
         Ok(Ok(reserved)) => reserved,
         Ok(Err(error)) => {
             tracing::warn!(target: "http.api.sessions", session = %id, "trash reservation failed: {error}");
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "lifecycle_busy",
-                    "message": error.to_string()
-                })),
-            )
-                .into_response();
+            return api_error(StatusCode::CONFLICT, "lifecycle_busy", error.to_string());
         }
         Err(error) => {
             tracing::error!(target: "http.api.sessions", session = %id, "trash reservation join failed: {error}");
@@ -550,7 +521,7 @@ pub async fn trash_session(
     }
 
     let Some(durable) = durable else {
-        return crate::server::api::session_not_found();
+        return session_not_found();
     };
     let response = {
         let mut instances = state.instances.write().await;
@@ -584,7 +555,7 @@ pub async fn restore_session(
     let profile = {
         let instances = state.instances.read().await;
         let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
-            return crate::server::api::session_not_found();
+            return session_not_found();
         };
         instance.source_profile.clone()
     };
@@ -685,28 +656,20 @@ pub async fn restore_session(
 
     let restored = match restored {
         Ok(Ok(instance)) => instance,
-        Ok(Err(RestoreTransitionError::NotFound)) => {
-            return crate::server::api::session_not_found()
-        }
+        Ok(Err(RestoreTransitionError::NotFound)) => return session_not_found(),
         Ok(Err(RestoreTransitionError::Busy(holder))) => {
-            return (
+            return api_error(
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "lifecycle_busy",
-                    "message": format!("Session is {holder}, so it was not restored")
-                })),
-            )
-                .into_response();
+                "lifecycle_busy",
+                format!("Session is {holder}, so it was not restored"),
+            );
         }
         Ok(Err(RestoreTransitionError::Worktree(reason))) => {
-            return (
+            return api_error(
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "worktree_restore_failed",
-                    "message": format!("Could not restore the worktree: {reason}")
-                })),
-            )
-                .into_response();
+                "worktree_restore_failed",
+                format!("Could not restore the worktree: {reason}"),
+            );
         }
         Ok(Err(RestoreTransitionError::Persist(error))) => {
             tracing::warn!(target: "http.api.sessions", session = %id, "restore transition failed: {error}");
@@ -733,27 +696,21 @@ pub async fn restore_session(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
-/// `POST /api/sessions/:id/smart-rename`. Manual "Auto-name now" recovery for
-/// a structured-view session whose automatic smart rename never landed (the
-/// one-shot timed out, returned unusable output, or the daemon restarted with
-/// the in-memory attempted set cleared). Clears the per-session attempted gate
-/// and re-runs the one-shot against the session's first prompt.
+/// `POST /api/sessions/:id/smart-rename`. Manual "Auto-name now" recovery for a
+/// structured session whose automatic smart rename never landed. Clears the
+/// per-session attempted gate and re-runs the one-shot against the first prompt.
 ///
-/// Only targets a still-default-named session: a session the user (or a prior
-/// rename) already named is left alone, so this never overwrites a chosen
-/// title. The actual rename runs detached and best-effort, exactly like the
-/// prompt-handler trigger; a `202` means "re-run started", not "renamed".
+/// Only targets a still-default-named session, so it never overwrites a chosen
+/// title. The rename runs detached and best-effort: a `202` means "re-run
+/// started", not "renamed".
 pub async fn force_smart_rename(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // CityHall: only act on structured sessions this mode created; refuse a
-    // non-structured (or unknown) target so a locked-down client cannot
-    // respawn/destroy/edit an enumerated plain session. See #7.
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
-    if let Some(resp) = crate::server::api::acp::read_only_block(&state) {
+    if let Some(resp) = crate::server::api::read_only_block(&state) {
         return resp;
     }
 
@@ -771,19 +728,16 @@ pub async fn force_smart_rename(
             )
         })
     }) else {
-        return crate::server::api::session_not_found();
+        return session_not_found();
     };
 
-    // Preflight the SAME gate the spawned try_smart_rename re-applies, so the
-    // action never reports success (202) for a session the gate would silently
-    // drop (a resolved rename agent with no one-shot, an overridden command, or
-    // a sandboxed session whose rename agent is not its own). Without this, the
-    // sidebar would show success while no title job runs. Resolves with the SAME repo-aware config the worker
-    // uses (resolve_config_with_repo_or_warn), so a repo-local smart_rename_agent
-    // or agent_command_override cannot make the preflight and worker disagree.
-    // Passes `setting_on = true` because this is the manual "Auto-name now"
-    // action, which runs on demand even when auto-rename-on-start is disabled
-    // (#3039); the spawned try_smart_rename gets `force = true` below to match.
+    // Preflight the SAME gate the spawned try_smart_rename re-applies, so this
+    // never reports 202 for a session the gate would silently drop. Resolves
+    // with the same repo-aware config the worker uses, so a repo-local
+    // smart_rename_agent or agent_command_override cannot make the two
+    // disagree. `setting_on = true` because the manual "Auto-name now" action
+    // runs even when auto-rename-on-start is off (#3039); the spawned job gets
+    // `force = true` to match.
     let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         &profile,
         std::path::Path::new(&project_path),
@@ -801,7 +755,7 @@ pub async fn force_smart_rename(
     ) {
         use crate::session::smart_rename::SkipReason;
         // Wording comes from the shared `user_message` so this response and the
-        // TUI's dialog cannot drift; only the status code is per-reason.
+        // TUI dialog cannot drift; only the status code is per-reason.
         let status = match reason {
             SkipReason::NotStructured => StatusCode::BAD_REQUEST,
             _ => StatusCode::CONFLICT,
@@ -814,11 +768,10 @@ pub async fn force_smart_rename(
     }
 
     // A sandboxed session's one-shot runs inside its container, so a stopped
-    // container is the one remaining way the spawned job would drop the session
-    // after the static gate passed. Probe it here too, else this would answer 202
-    // while nothing renames, which is exactly what the gate above exists to
-    // prevent. Same check and wording as the TUI's preflight; the spawned
-    // try_smart_rename re-probes and stays the authority.
+    // container is the remaining way the spawned job would drop the session
+    // after the static gate passed. Without probing here this would answer 202
+    // while nothing renames. The spawned try_smart_rename re-probes and stays
+    // the authority.
     if sandboxed {
         use crate::containers::Probe;
         let sid = id.clone();
@@ -827,33 +780,18 @@ pub async fn force_smart_rename(
         })
         .await;
         // A failed inspection is not a stopped container: telling the user to
-        // start a container that may already be running sends them the wrong
-        // way, so the runtime error is surfaced as its own state. Same split as
-        // the TUI preflight.
+        // start one that may already be running sends them the wrong way, so the
+        // runtime error is its own state. Same split as the TUI preflight.
         let unknown = match probe {
             Ok(Probe::Running) => None,
             Ok(Probe::NotRunning) => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": "container_not_running",
-                        "message": "The session's sandbox container is not running, so its agent cannot be asked for a name. Open the session to start it, then try again.",
-                    })),
-                )
-                    .into_response();
+                return api_error(StatusCode::CONFLICT, "container_not_running", "The session's sandbox container is not running, so its agent cannot be asked for a name. Open the session to start it, then try again.");
             }
             Ok(Probe::Unknown(e)) => Some(e.to_string()),
             Err(e) => Some(e.to_string()),
         };
         if let Some(err) = unknown {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "container_state_unknown",
-                    "message": format!("Couldn't check the session's sandbox container, so its agent cannot be asked for a name: {err}"),
-                })),
-            )
-                .into_response();
+            return api_error(StatusCode::SERVICE_UNAVAILABLE, "container_state_unknown", format!("Couldn't check the session's sandbox container, so its agent cannot be asked for a name: {err}"));
         }
     }
 
@@ -870,8 +808,7 @@ pub async fn force_smart_rename(
     let context = crate::session::smart_rename::render_first_turn(&first_user_prompt, &agent_prose);
 
     // Clear the attempted gate so try_smart_rename does not short-circuit on a
-    // prior failed attempt. The inflight guard inside try_smart_rename still
-    // prevents a concurrent one-shot for the same session.
+    // prior failed attempt. Its inflight guard still prevents a concurrent run.
     {
         let mut attempted = state
             .smart_rename_attempted
@@ -893,25 +830,20 @@ pub async fn force_smart_rename(
     StatusCode::ACCEPTED.into_response()
 }
 
-/// On-demand "summarize the conversation so far" for a structured-view
-/// session. Preflights the same eligibility gate the spawned task re-applies
-/// so the caller never gets a 202 for a session that would silently drop, then
-/// runs the summary one-shot detached (best-effort, like the automatic
-/// trigger). A `202` means "summary started", not "summary ready"; the result
+/// On-demand "summarize the conversation so far" for a structured-view session.
+/// Preflights the same eligibility gate the spawned task re-applies, then runs
+/// the summary one-shot detached. A `202` means "summary started"; the result
 /// arrives later as a `ConversationSummary` event over the structured-view WS.
-/// Bypasses the `conversation_summary` setting and the delta threshold: an
-/// explicit request always runs if the session is eligible. See #2808.
+/// Bypasses the `conversation_summary` setting and the delta threshold, since
+/// an explicit request always runs if the session is eligible (#2808).
 pub async fn summarize_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // CityHall: only act on structured sessions this mode created; refuse a
-    // non-structured (or unknown) target so a locked-down client cannot
-    // respawn/destroy/edit an enumerated plain session. See #7.
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
-    if let Some(resp) = crate::server::api::acp::read_only_block(&state) {
+    if let Some(resp) = crate::server::api::read_only_block(&state) {
         return resp;
     }
 
@@ -982,17 +914,14 @@ pub async fn summarize_session(
     StatusCode::ACCEPTED.into_response()
 }
 
-/// Stop a session, matching the TUI's `x` keybind: kill the tmux pane and
-/// stop (but do not remove) the Docker container for plain sessions; shut down
-/// the worker for structured-view sessions. The session record is preserved
-/// with status `Stopped` so it can be resumed later. This is NOT delete.
+/// Stop a session, matching the TUI's `x` keybind: kill the tmux pane and stop
+/// (not remove) the Docker container for plain sessions, shut the worker down
+/// for structured ones. The record is preserved with status `Stopped`. NOT a
+/// delete.
 pub async fn stop_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // CityHall: only act on structured sessions this mode created; refuse a
-    // non-structured (or unknown) target so a locked-down client cannot
-    // respawn/destroy/edit an enumerated plain session. See #7.
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
@@ -1000,30 +929,27 @@ pub async fn stop_session(
         return crate::server::api::read_only_response();
     }
 
-    // Worker-stopping barrier: submission guard before `instance_lock`, per
-    // `prompt_submission` (#3650).
     let Some(_submission) = state
         .session_service
         .prompt_submission_for_session(&id)
         .await
     else {
-        return crate::server::api::session_not_found();
+        return session_not_found();
     };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    // Snapshot profile, session type, and current status without mutating yet
-    // so a persist failure leaves disk and memory in agreement (mirrors the
-    // archive handler).
+    // Snapshot profile, session type and current status without mutating, so a
+    // persist failure leaves disk and memory in agreement.
     let (profile, is_structured, already_stopped) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return crate::server::api::session_not_found();
+            return session_not_found();
         };
 
         let structured = inst.is_structured();
-        // Mirror the TUI's `stop_selected` guard: a session that is already
-        // stopped or mid-lifecycle has nothing to stop.
+        // Mirror the TUI's `stop_selected` guard: a session already stopped or
+        // mid-lifecycle has nothing to stop.
         let already = matches!(
             inst.status,
             Status::Stopped | Status::Deleting | Status::Creating
@@ -1038,7 +964,7 @@ pub async fn stop_session(
                 SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
             }
             None => {
-                return crate::server::api::session_not_found();
+                return session_not_found();
             }
         };
         return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
@@ -1046,8 +972,7 @@ pub async fn stop_session(
 
     // Structured sessions have no tmux/container teardown transaction, so
     // persist their dormant stop before asking the supervisor to shut down.
-    // Plain sessions delegate the full reserve/teardown/commit sequence to
-    // `Instance::stop` below.
+    // Plain sessions delegate the full sequence to `Instance::stop` below.
     if is_structured {
         let persist_id = id.clone();
         if persist_session_update(
@@ -1086,9 +1011,8 @@ pub async fn stop_session(
     };
 
     if is_structured {
-        // Structured view: shut down the worker so the reconciler does not
-        // race to respawn it. `shutdown` preserves the transcript, so the
-        // session resumes the conversation when reopened.
+        // Structured view: shut down the worker so the reconciler does not race
+        // to respawn it. `shutdown` preserves the transcript.
         match state.acp_supervisor.shutdown(&id).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
             Err(e) => tracing::warn!(
@@ -1099,8 +1023,8 @@ pub async fn stop_session(
         }
     } else {
         // Plain session: kill the tmux pane and stop (not remove) the Docker
-        // container. `Instance::stop` can block ~10s on `docker stop`, so run
-        // it off the async runtime. Mirrors the TUI's StopPoller.
+        // container. `Instance::stop` can block ~10s on `docker stop`, so it
+        // runs off the async runtime.
         let inst_for_stop = inst_clone.clone();
         let stop_profile = profile.clone();
         let stop_id = id.clone();
@@ -1150,24 +1074,20 @@ pub async fn stop_session(
             SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
         }
         None => {
-            return crate::server::api::session_not_found();
+            return session_not_found();
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
 /// Start (resume) a stopped session, the inverse of [`stop_session`]. Plain
-/// sessions are restarted exactly like `ensure_session` (kill any corpse pane,
-/// then `start_with_resume_fallback`); structured sessions are un-parked by
-/// clearing the idle-dormant mark so the acp reconciler respawns the worker on
-/// its next tick (mirrors unarchive). No-op for a session that isn't stopped.
+/// sessions restart exactly like `ensure_session`; structured sessions are
+/// un-parked by clearing the idle-dormant mark so the acp reconciler respawns
+/// the worker on its next tick. No-op for a session that is not stopped.
 pub async fn start_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // CityHall: only act on structured sessions this mode created; refuse a
-    // non-structured (or unknown) target so a locked-down client cannot
-    // respawn/destroy/edit an enumerated plain session. See #7.
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
@@ -1181,7 +1101,7 @@ pub async fn start_session(
     let (profile, is_structured, is_stopped, instance) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return crate::server::api::session_not_found();
+            return session_not_found();
         };
 
         let structured = inst.is_structured();
@@ -1201,7 +1121,7 @@ pub async fn start_session(
                 SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
             }
             None => {
-                return crate::server::api::session_not_found();
+                return session_not_found();
             }
         };
         return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
@@ -1209,8 +1129,8 @@ pub async fn start_session(
 
     if is_structured {
         // Un-park: clear the dormant mark and drop the Stopped status so the
-        // reconciler's next tick treats it as a resume target and respawns the
-        // worker (the transcript was preserved by stop's shutdown).
+        // reconciler's next tick respawns the worker against the preserved
+        // transcript.
         let persist_id = id.clone();
         if persist_session_update(
             profile,
@@ -1243,15 +1163,15 @@ pub async fn start_session(
                 SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
             }
             None => {
-                return crate::server::api::session_not_found();
+                return session_not_found();
             }
         };
         return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
     }
 
     // Plain session: restart the tmux pane, mirroring ensure_session. Show
-    // Starting immediately so the status poller doesn't flip it back while the
-    // restart (which can block) is in flight.
+    // Starting immediately so the status poller does not flip it back while the
+    // restart is in flight.
     {
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
@@ -1264,10 +1184,10 @@ pub async fn start_session(
     let restart_result = tokio::task::spawn_blocking(
         move || -> Result<(Instance, crate::session::StartOutcome), Box<(Instance, anyhow::Error)>> {
             let mut inst = instance;
-            // Explicit restart endpoint (web dashboard Restart button):
-            // honor auto_resume_on_restart, same as TUI `e`/`Enter`. The
-            // instance-level cascade holds the lifecycle lock across final
-            // poller drain, exact-pane OMP capture, kill, and relaunch.
+            // Explicit restart endpoint: honor auto_resume_on_restart, same as
+            // TUI `e`/`Enter`. The instance-level cascade holds the lifecycle
+            // lock across final poller drain, exact-pane OMP capture, kill and
+            // relaunch.
             match inst.restart_with_resume_policy(
                 None,
                 false,
@@ -1296,7 +1216,7 @@ pub async fn start_session(
                     )
                 }
                 None => {
-                    return crate::server::api::session_not_found();
+                    return session_not_found();
                 }
             };
             if let Some(sid) = resume_failed_sid {
@@ -1323,11 +1243,7 @@ pub async fn start_session(
                     inst.last_error = Some(msg.clone());
                 }
             }
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "restart_failed", "message": msg})),
-            )
-                .into_response()
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "restart_failed", msg)
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "start_session panicked for {id}: {e}");
@@ -1345,9 +1261,6 @@ pub async fn update_session_snooze(
     Path(id): Path<String>,
     body: Result<Json<UpdateSnoozeBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    // CityHall: only act on structured sessions this mode created; refuse a
-    // non-structured (or unknown) target so a locked-down client cannot
-    // respawn/destroy/edit an enumerated plain session. See #7.
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
@@ -1359,30 +1272,20 @@ pub async fn update_session_snooze(
         Err(rej) => return rej.into_response(),
     };
 
-    // Validate the duration up front. The TUI dialog presets, CLI, and
-    // this endpoint all share the same bounds (1..=43200 minutes); see
+    // The TUI dialog presets, CLI and this endpoint share the same bounds; see
     // `crate::session::config::validate_snooze_duration`.
     if let Some(minutes) = body.minutes {
         if let Err(msg) = crate::session::validate_snooze_duration(minutes as u64) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "validation_failed",
-                    "message": msg,
-                })),
-            )
-                .into_response();
+            return api_error(StatusCode::BAD_REQUEST, "validation_failed", msg);
         }
     }
 
-    // Worker-stopping barrier: submission guard before `instance_lock`, per
-    // `prompt_submission` (#3650).
     let Some(_submission) = state
         .session_service
         .prompt_submission_for_session(&id)
         .await
     else {
-        return crate::server::api::session_not_found();
+        return session_not_found();
     };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
@@ -1390,7 +1293,7 @@ pub async fn update_session_snooze(
     let (was_structured_view, profile) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return crate::server::api::session_not_found();
+            return session_not_found();
         };
 
         let structured_view = inst.is_structured();
@@ -1399,8 +1302,8 @@ pub async fn update_session_snooze(
 
     let minutes = body.minutes;
 
-    // Persist first; only mutate memory once disk is durable, and only fire
-    // the structured view teardown below on a write that landed. See #1589.
+    // Persist first; only mutate memory once disk is durable, and fire the
+    // structured teardown below only on a write that landed (#1589).
     let persist_id = id.clone();
     if persist_session_update(
         profile,
@@ -1437,17 +1340,11 @@ pub async fn update_session_snooze(
         }
     }
 
-    // For structured view-mode sessions, snoozing tears down the worker the
-    // same way archive does. Snooze is a "temporary archive" in the
-    // data model and the structured view worker (claude-agent-acp subprocess)
-    // is heavy enough that keeping it idle while the row is sunk is a
-    // resource hog. The reconciler skips snoozed sessions, so the
-    // worker stays down until the snooze expires; the next reconciler
-    // tick after expiry brings it back. Unsnooze just lets the
-    // reconciler re-pick the session naturally, no explicit respawn.
-    // `shutdown` preserves the agent transcript (no session/delete), so
-    // that respawn resumes the conversation instead of resetting it
-    // (#1710).
+    // Snoozing tears a structured worker down the way archive does: snooze is
+    // a temporary archive, and the worker is too heavy to keep idle while the
+    // row is sunk. The reconciler skips snoozed sessions and re-picks them on
+    // the first tick after expiry. `shutdown` preserves the transcript, so that
+    // respawn resumes the conversation (#1710).
     if was_structured_view && minutes.is_some() {
         match state.acp_supervisor.shutdown(&id).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
@@ -1465,26 +1362,21 @@ pub async fn update_session_snooze(
             SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
         }
         None => {
-            return crate::server::api::session_not_found();
+            return session_not_found();
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
-/// `PATCH /api/sessions/{id}/unread` — flag a session unread (`{"unread":true}`)
-/// or mark it read (`{"unread":false}`). Mirrors the TUI's `u` toggle, but the
-/// client computes the target from the current state rather than toggling
-/// server-side, so an optimistic UI update can't desync. No-op when the
-/// `session.unread_indicator` feature is off (the client hides the control
-/// then, but guard here too). Persist-then-mutate, like snooze.
+/// `PATCH /api/sessions/{id}/unread`: flag a session unread or mark it read.
+/// The client computes the target from current state rather than toggling
+/// server-side, so an optimistic UI update cannot desync. No-op when
+/// `session.unread_indicator` is off. Persist-then-mutate, like snooze.
 pub async fn update_session_unread(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     body: Result<Json<UpdateUnreadBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    // CityHall: only act on structured sessions this mode created; refuse a
-    // non-structured (or unknown) target so a locked-down client cannot
-    // respawn/destroy/edit an enumerated plain session. See #7.
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
@@ -1503,7 +1395,7 @@ pub async fn update_session_unread(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return crate::server::api::session_not_found();
+            return session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -1554,7 +1446,7 @@ pub async fn update_session_unread(
             SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
         }
         None => {
-            return crate::server::api::session_not_found();
+            return session_not_found();
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()

@@ -1,37 +1,5 @@
-//! The CityHall config bundle: one document describing how a CityHall-hosted
-//! aoe workspace should be set up (#8).
-//!
-//! CityHall runs one locked-down `aoe serve --cityhall` per user, and in that
-//! mode the routes that would configure it are closed: `PATCH /api/settings`,
-//! `POST /api/projects` and `POST /api/git/clone` all sit in
-//! `CITYHALL_MUTATION_DENY`. So configuration cannot arrive over the workspace's
-//! own API; it arrives as this document, applied at boot below the HTTP layer.
-//!
-//! The round trip is:
-//!
-//! 1. An admin configures a normal aoe install, then [`export`]s a bundle
-//!    (`aoe cityhall export`, or the Settings page's CityHall tab).
-//! 2. CityHall stores that file and serves it, per user, to each workspace it
-//!    spawns, splicing in the `[git]` section (see below).
-//! 3. The workspace fetches it at boot and [`apply`]s it.
-//!
-//! Two deliberate shapes:
-//!
-//! - `settings` is a **sparse** patch keyed by section then field, the same
-//!   shape a `PATCH /api/settings` body has, so it validates through
-//!   [`validate_patch`] and merges through [`merge_json`] with no second code
-//!   path. Only leaves that differ from [`Config::default`] are exported.
-//! - `projects` carries **remotes, not paths**. A [`Project`] is a path to an
-//!   already-cloned repo, and the admin's `/Users/me/src/foo` means nothing
-//!   inside a container, so [`apply`] clones each remote into the workspace and
-//!   registers the resulting path.
-//!
-//! `[git]` is never exported and never stored by CityHall: it holds a
-//! credential, and CityHall composes it per user when it serves the document.
-//!
-//! Known limit: a bundle sets values, it cannot unset them. A field whose value
-//! is `null` (a cleared `Option`) is dropped on export, because TOML has no way
-//! to spell it. Setting a field to some other value works normally.
+//! The CityHall config bundle: one document describing how a CityHall-hosted aoe workspace should
+//! be set up.
 
 use anyhow::{anyhow, bail, Context, Result};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -52,20 +20,14 @@ use super::projects::{self, Project, ProjectScope};
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Subdirectory of the app dir bundle repos are cloned into.
-///
-/// Under the app dir on purpose: a workspace container mounts its per-user
-/// volume at the app dir and nothing else, so a clone anywhere else is lost the
-/// next time the container is recreated.
 const REPOS_DIR: &str = "repos";
 
 /// Credential store the `[git]` section writes, read by
 /// `credential.helper store --file=...`.
 const CREDENTIALS_FILE: &str = "git-credentials";
 
-/// Where the `[git]` section's SSH key and its host keys go, read by the
-/// `core.sshCommand` it configures. Under the app dir for the same reason the
-/// credential store is: in a workspace container that is the only path that
-/// survives the container being recreated.
+/// Where the `[git]` section's SSH key and its host keys go, read by the `core.sshCommand` it
+/// configures.
 const SSH_DIR: &str = "ssh";
 const SSH_KEY_FILE: &str = "id_cityhall";
 const SSH_KNOWN_HOSTS_FILE: &str = "known_hosts";
@@ -121,9 +83,7 @@ pub struct GitIdentity {
     pub credential_username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_token: Option<String>,
-    /// Private key for `git@host:...` remotes, which a token cannot
-    /// authenticate. Never passphrase-protected: nothing in a workspace can
-    /// prompt for one, so CityHall refuses to store one that is.
+    /// Private key for `git@host:...` remotes, which a token cannot authenticate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_private_key: Option<String>,
     /// `known_hosts` lines the key is used with. Goes in with the key or not at
@@ -141,9 +101,6 @@ fn is_empty_object(v: &Value) -> bool {
 }
 
 /// What [`apply`] did, so the CLI can print it and the serve path can log it.
-///
-/// Project failures are collected rather than fatal: one unreachable remote
-/// must not cost the user every other repo.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ApplyReport {
     /// Settings leaves merged into `config.toml`.
@@ -152,9 +109,7 @@ pub struct ApplyReport {
     pub cloned: Vec<String>,
     /// Projects added to the registry by this run.
     pub registered: Vec<String>,
-    /// Projects already checked out and already registered, so this run had
-    /// nothing to do. Tracked because a re-apply of an unchanged bundle
-    /// legitimately does no work, and that is not the same as doing none.
+    /// Projects already checked out and already registered, so this run had nothing to do.
     pub preserved: Vec<String>,
     /// Per-project failures, pre-formatted for display.
     pub failures: Vec<String>,
@@ -178,18 +133,13 @@ impl CityHallBundle {
 }
 
 /// Build a bundle from this install's global config and project registry.
-///
-/// The project registry read is the **global** scope only: a workspace runs the
-/// default profile, so a profile-scoped entry would not be visible there anyway.
 pub fn export() -> Result<CityHallBundle> {
     let baseline = serde_json::to_value(Config::default())?;
     let current = serde_json::to_value(Config::load()?)?;
 
     let mut settings = empty_object();
     apply_changed_leaves(&mut settings, &baseline, &current);
-    // `Config` has sections with no settings descriptors (`hooks`, `agents`,
-    // `plugins`, ...). `validate_patch` rejects those outright, so drop them
-    // here rather than shipping a document that cannot be applied.
+    // `Config` has sections with no settings descriptors (`hooks`, `agents`, `plugins`,...).
     retain_schema_fields(&mut settings);
     // Host-specific paths (node binaries, socket paths) are meaningless in a
     // container, which is exactly what `local_only` marks.
@@ -224,12 +174,8 @@ pub fn export() -> Result<CityHallBundle> {
     })
 }
 
-/// Apply a bundle to this install: merge its settings, install its git identity,
-/// then clone and register its projects.
-///
-/// Idempotent, because it runs on every workspace boot. An existing checkout is
-/// left completely alone (a user's uncommitted work must survive a restart) and
-/// an already-registered project is not re-added.
+/// Apply a bundle to this install: merge its settings, install its git identity, then clone and
+/// register its projects.
 pub fn apply(bundle: &CityHallBundle) -> Result<ApplyReport> {
     if bundle.schema_version != SCHEMA_VERSION {
         bail!(
@@ -260,18 +206,16 @@ fn apply_settings(settings: &Value) -> Result<usize> {
         return Ok(0);
     }
 
-    // Elevated: the bundle is admin-authored, so an elevation-gated field is
-    // legitimately settable. `local_only` fields are still refused by the
-    // validator itself.
+    // Elevated: the bundle is admin-authored, so an elevation-gated field is legitimately settable.
     validate_patch(settings, Scope::Global, true)
         .map_err(|e| anyhow!("bundle settings rejected: {}", e.message()))?;
 
     update_config(|config| -> Result<()> {
         let mut merged = serde_json::to_value(&*config)?;
         merge_json(&mut merged, settings);
-        // Build the new value before assigning: `update_config` writes whatever
-        // it finds in `config` even when the closure returns an error, so a
-        // failed deserialize must not leave a half-applied struct behind.
+        // Build the new value before assigning: `update_config` writes whatever it finds in
+        // `config` even when the closure returns an error, so a failed deserialize must not leave a
+        // half-applied struct behind.
         let next: Config = serde_json::from_value(merged)?;
         *config = next;
         Ok(())
@@ -280,11 +224,8 @@ fn apply_settings(settings: &Value) -> Result<usize> {
     Ok(count)
 }
 
-/// Install `user.name` / `user.email`, then whichever credentials the bundle
-/// carries: an HTTPS token, an SSH key, both, or neither.
-///
-/// Shells out to `git config --global` rather than editing `~/.gitconfig`
-/// directly: idempotent, and no config parsing to get wrong.
+/// Install `user.name` / `user.email`, then whichever credentials the bundle carries: an HTTPS
+/// token, an SSH key, both, or neither.
 fn apply_git_identity(git: &GitIdentity, app_dir: &Path) -> Result<()> {
     if let Some(name) = git.user_name.as_deref().filter(|s| !s.is_empty()) {
         git_config_global("user.name", name)?;
@@ -317,17 +258,7 @@ fn apply_https_credential(git: &GitIdentity, app_dir: &Path) -> Result<()> {
     )
 }
 
-/// When an SSH key is present, write it and its host keys owner-only and point
-/// git at both.
-///
-/// `core.sshCommand` rather than a `~/.ssh/config` entry: a workspace container
-/// mounts its volume at the app dir and nothing else, so anything written under
-/// `~` is gone the next time the container is recreated. It also keeps the key
-/// scoped to git rather than to every `ssh` the user runs.
-///
-/// Both halves or neither. A key with no host keys to check against is exactly
-/// what `StrictHostKeyChecking=yes` refuses to connect with, so installing one
-/// without the other would only produce a confusing failure at clone time.
+/// When an SSH key is present, write it and its host keys owner-only and point git at both.
 fn apply_ssh_key(git: &GitIdentity, app_dir: &Path) -> Result<()> {
     let (Some(key), Some(known_hosts)) = (
         git.ssh_private_key
@@ -343,22 +274,7 @@ fn apply_ssh_key(git: &GitIdentity, app_dir: &Path) -> Result<()> {
     let dir = app_dir.join(SSH_DIR);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
-    // Written aside and renamed into place, both of them, before either
-    // destination changes. `write_owner_only` truncates first, so writing
-    // straight to the real paths on a re-apply would leave a new key beside an
-    // old `known_hosts` if the second write failed, and an existing
-    // `core.sshCommand` already points at both. A rename over a live path is
-    // atomic, so nothing ever reads a half-written file.
-    //
-    // Two renames still are not one operation, so a failure between them leaves
-    // a new key with the old host keys. That is a far smaller window than a
-    // failure between two truncating writes, and closing it entirely would mean
-    // a generation directory plus a config rewrite to activate it, which is more
-    // machinery than a boot-time apply that retries next boot deserves.
-    //
-    // Both files end with exactly one newline: ssh rejects a private key file
-    // whose last line is unterminated, and the sender is not required to have
-    // fixed that.
+    // Written aside and renamed into place, both of them, before either destination changes.
     let key_path = dir.join(SSH_KEY_FILE);
     let known_hosts_path = dir.join(SSH_KNOWN_HOSTS_FILE);
     let staged_key = stage(&key_path, &line_terminated(key))?;
@@ -366,9 +282,7 @@ fn apply_ssh_key(git: &GitIdentity, app_dir: &Path) -> Result<()> {
     activate(&staged_key, &key_path)?;
     activate(&staged_known_hosts, &known_hosts_path)?;
 
-    // Shell-quoted because git hands this to a shell, and the app dir is a path
-    // the user chose. `IdentitiesOnly` so an agent's other keys are not offered
-    // first, which a host that limits attempts would close the connection over.
+    // Shell-quoted because git hands this to a shell, and the app dir is a path the user chose.
     git_config_global(
         "core.sshCommand",
         &format!(
@@ -400,19 +314,11 @@ fn line_terminated(s: &str) -> String {
 }
 
 /// A path as one POSIX shell word.
-///
-/// Single quotes alone are not enough: they do not protect a path that contains
-/// one, and `/home/o'connor/...` is a perfectly ordinary home directory. Ending
-/// the quoted run, escaping the apostrophe, and reopening is the standard way to
-/// spell it.
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', r#"'"'"'"#))
 }
 
 /// One `.git-credentials` line: `https://user:token@host`.
-///
-/// Both userinfo halves are percent-encoded, so a token containing `@` or `/`
-/// cannot corrupt the line (or silently authenticate against the wrong host).
 fn credential_line(host: &str, username: &str, token: &str) -> String {
     let (scheme, authority) = host
         .split_once("://")
@@ -426,11 +332,6 @@ fn credential_line(host: &str, username: &str, token: &str) -> String {
 }
 
 /// Write a secret so it is owner-only from the moment it exists.
-///
-/// A plain `fs::write` creates the file with the umask (usually 0644) and leaves
-/// the token world-readable until a follow-up chmod lands. This file is a
-/// persisted credential store, so like `login_sessions.toml` it deliberately
-/// survives shutdown rather than being swept with the `serve.*` files.
 fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -453,12 +354,6 @@ fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 /// Drop any `user[:password]@` from a remote URL.
-///
-/// A checkout's origin can embed a token (`https://u:tok@host/org/repo.git`),
-/// and the exported bundle is written to a file, served over HTTP, and stored by
-/// CityHall. Auth arrives separately in `[git]`, so the userinfo is not needed to
-/// clone. SSH shorthand (`git@host:org/repo`) is left alone: there the `git@` is
-/// the transport user, not a secret.
 fn strip_userinfo(remote: &str) -> String {
     let Some((scheme, rest)) = remote.split_once("://") else {
         return remote.to_string();
@@ -539,9 +434,7 @@ fn apply_projects(wanted: &[BundleProject], app_dir: &Path, report: &mut ApplyRe
             .iter()
             .any(|p| p.name.eq_ignore_ascii_case(&project.name) || p.path == dest_str)
         {
-            // Already in place. Recorded rather than silently skipped, so a
-            // re-apply that legitimately has nothing to do is distinguishable
-            // from one where every project failed.
+            // Already in place.
             if checkout_existed {
                 report.preserved.push(project.name.clone());
             }
@@ -614,9 +507,8 @@ fn leaf_count(patch: &Value) -> usize {
         .unwrap_or(0)
 }
 
-/// Where a fetched bundle is cached, so a later boot can tell "CityHall is
-/// unreachable and we have never been configured" from "unreachable but we
-/// already are".
+/// Where a fetched bundle is cached, so a later boot can tell "CityHall is unreachable and we have
+/// never been configured" from "unreachable but we already are".
 pub fn cache_path() -> Result<PathBuf> {
     Ok(get_app_dir()?.join("cityhall-bundle.toml"))
 }
@@ -645,16 +537,10 @@ mod tests {
         assert_eq!(CityHallBundle::from_toml(&raw).unwrap(), bundle);
     }
 
-    /// The two SSH fields are the boundary CityHall writes across, so what
-    /// matters is that they survive the round trip and that a bundle written
-    /// before they existed still deserializes rather than failing a workspace's
-    /// boot.
     #[test]
     fn ssh_fields_round_trip_and_are_optional() {
         let bundle = CityHallBundle {
             schema_version: SCHEMA_VERSION,
-            // Not `Default::default()`: that leaves `settings` as JSON null,
-            // which TOML has no representation for.
             settings: empty_object(),
             git: Some(GitIdentity {
                 user_name: Some("someone".into()),
@@ -677,10 +563,6 @@ mod tests {
         assert_eq!(git.ssh_known_hosts, None);
     }
 
-    /// `core.sshCommand` goes to a shell, so a path holding an apostrophe has to
-    /// survive it. `/home/o'connor` is an ordinary home directory, and single
-    /// quotes on their own would end the quoted run in the middle of it and break
-    /// every SSH git operation in that workspace.
     #[test]
     fn shell_quoting_survives_an_apostrophe_in_the_path() {
         assert_eq!(
@@ -692,7 +574,6 @@ mod tests {
             r#"'/home/o'"'"'connor/ssh/id'"#
         );
 
-        // What a shell actually makes of it: one word, spelled back exactly.
         let quoted = shell_quote(Path::new("/home/o'connor/a b/id"));
         let out = std::process::Command::new("sh")
             .arg("-c")
@@ -712,8 +593,6 @@ mod tests {
         assert!(err.contains("schema_version"), "{err}");
     }
 
-    /// A section with no descriptors (`hooks`, `agents`, ...) would make
-    /// `validate_patch` reject the whole document, so export must not emit one.
     #[test]
     fn unknown_sections_are_dropped() {
         let mut patch = json!({
@@ -732,8 +611,6 @@ mod tests {
         assert_eq!(patch, json!({"session": {"confirm_delete": true}}));
     }
 
-    /// Whatever export produces has to survive the validator, or a bundle from
-    /// a stock install is dead on arrival.
     #[test]
     fn an_exported_settings_patch_validates() {
         let baseline = serde_json::to_value(Config::default()).unwrap();
@@ -764,12 +641,10 @@ mod tests {
     #[test]
     fn credential_line_cases() {
         let cases = [
-            // A token with `@` or `/` must not be able to corrupt the line.
             (
                 ("https://github.com", "someone", "gh/p@ss"),
                 "https://someone:gh%2Fp%40ss@github.com\n",
             ),
-            // A bare host with no scheme still has to produce a usable line.
             (("github.com/", "u", "t"), "https://u:t@github.com\n"),
         ];
         for ((host, username, token), expected) in cases {
@@ -777,8 +652,6 @@ mod tests {
         }
     }
 
-    /// An origin can embed a token, and the bundle is stored and served, so the
-    /// userinfo must not travel with it.
     #[test]
     fn exported_remotes_carry_no_userinfo() {
         let cases = [
@@ -790,12 +663,10 @@ mod tests {
                 "https://github.com/org/repo.git",
                 "https://github.com/org/repo.git",
             ),
-            // A path is allowed to contain `@`; only the authority is stripped.
             (
                 "https://github.com/org/re@po.git",
                 "https://github.com/org/re@po.git",
             ),
-            // SSH shorthand has no scheme, and its `git@` is the transport user.
             ("git@github.com:org/repo.git", "git@github.com:org/repo.git"),
             ("https://u:p@github.com", "https://github.com"),
         ];

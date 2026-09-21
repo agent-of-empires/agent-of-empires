@@ -40,6 +40,14 @@
     {
       "path": "web/src/components/command-palette/CommandPalette.tsx",
       "reason": "Command palette covered by command-palette.spec.ts (mocked)"
+    },
+    {
+      "path": "web/src/components/icons.tsx",
+      "reason": "Pure icon set rendered by sidebar rows, headers and menus"
+    },
+    {
+      "path": "web/src/components/sidebar/SidebarModal.tsx",
+      "reason": "Shared sidebar modal shell; behavior covered through each modal that uses it"
     }
   ]
 }

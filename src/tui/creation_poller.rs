@@ -13,7 +13,6 @@ use crate::tui::dialogs::NewSessionData;
 
 pub struct CreationRequest {
     pub data: NewSessionData,
-    /// Existing instances, used for generating unique titles
     pub existing_instances: Vec<Instance>,
     /// Trusted hooks to execute after instance creation (already approved by user).
     pub hooks: Option<HooksConfig>,
@@ -24,11 +23,9 @@ pub enum CreationResult {
     Success {
         session_id: String,
         instance: Box<Instance>,
-        /// Worktree created during build, needed for cleanup if cancelled
         created_worktree: Option<CreatedWorktreeInfo>,
         /// Workspace worktrees created during build, needed for rollback.
         created_workspace_worktrees: Vec<CreatedWorktreeInfo>,
-        /// Whether on_launch hooks were already executed in the background
         on_launch_hooks_ran: bool,
         /// Non-fatal warnings from worktree creation (e.g. post-checkout hook
         /// failures). Surfaced as a transient toast in the UI.
@@ -287,7 +284,6 @@ impl CreationPoller {
         }
     }
 
-    /// Get the profile from the last creation request
     pub fn last_profile(&self) -> Option<String> {
         self.last_profile.clone()
     }

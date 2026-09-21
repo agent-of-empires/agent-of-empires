@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-//
-// Coverage for Tooltip (#2214): the popup must portal out to document.body so
-// it escapes the sidebar scroller's `overflow-x-hidden` clip, rather than
-// rendering as a nested span that gets cut off at the sidebar edge. jsdom
-// cannot measure layout, so this asserts the structural fix (portaled, fixed,
-// role=tooltip, shown/hidden on hover and focus) rather than geometry.
 
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";

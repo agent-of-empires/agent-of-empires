@@ -12,15 +12,10 @@ interface Props {
   schema: SettingsFieldDescriptor[];
   schemaLoading: boolean;
   onSearchJump: (hit: SettingsSearchHit) => void;
-  /** CityHall client mode hides the profile switcher (profile management is
-   *  not exposed to end users). See #7. */
   hideProfileSelector?: boolean;
 }
 
-// Settings header. The search box takes the flexible middle (full-width row on
-// mobile); ProfileSelector wraps onto its own row on mobile via `basis-full`
-// so the Back affordance and title keep their space; on md+ both sit on a
-// single row with the picker aligned right.
+// On mobile the search and profile picker wrap onto their own rows.
 export function SettingsHeader({
   onClose,
   saving,

@@ -1,4 +1,4 @@
-//! Terminal User Interface module
+//! Terminal user interface.
 
 mod app;
 mod approval_poller;
@@ -95,10 +95,7 @@ fn isolated_test_process(test: &str, timeout: std::time::Duration) -> bool {
     false
 }
 
-/// Entry point for the hidden `aoe __vt-pipe <socket>` helper subprocess used
-/// by the VT live-preview path (`[tmux] vt_live`, default on). Copies the
-/// pane's piped output (stdin) to the unix socket, unbuffered. Dispatched in
-/// `main` before clap so it stays off the CLI/docs surface.
+/// Hidden `aoe __vt-pipe <socket>` helper: copies the pane's piped output to the socket.
 #[cfg(unix)]
 pub fn run_vt_pipe(socket: &str) -> std::io::Result<()> {
     crate::tmux::vt::run_pipe(socket)
@@ -127,58 +124,30 @@ use ratatui::prelude::*;
 use std::io::{self, IsTerminal};
 
 use crate::migrations;
+use crate::session::get_update_settings;
+use crate::update::check_for_update;
 
-/// Whether the TUI should request mouse capture (`\e[?1000h` etc.) from the
-/// terminal. The Settings entry (Interaction > Mouse Capture, backed by
-/// `session.mouse_capture`) is the primary control; the `AOE_MOUSE_CAPTURE`
-/// env var stays as an opt-out backstop for environments where the toggle
-/// isn't reachable (e.g. iOS Mosh + Termius/Blink, which don't reliably
-/// forward mouse-tracking escapes to mobile clients). Capture is requested
-/// only when the config allows it AND the env var hasn't disabled it, so a
-/// `false` from either source wins and an existing `AOE_MOUSE_CAPTURE=0`
-/// keeps working. Default ON to preserve the preview-pane mouse-wheel scroll
-/// feature added in #795.
+/// Mouse capture needs both the `session.mouse_capture` setting and no
+/// `AOE_MOUSE_CAPTURE=0|false` opt-out.
 pub fn mouse_capture_requested(session: &crate::session::config::SessionConfig) -> bool {
-    session.mouse_capture && env_mouse_capture_allows()
+    session.mouse_capture
+        && std::env::var("AOE_MOUSE_CAPTURE")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
 }
 
-/// The legacy `AOE_MOUSE_CAPTURE` opt-out: `0`/`false` disables capture, any
-/// other value (or an unset var) leaves it enabled. Kept as a backstop to
-/// the Settings toggle.
-fn env_mouse_capture_allows() -> bool {
-    std::env::var("AOE_MOUSE_CAPTURE")
-        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-        .unwrap_or(true)
-}
-
-/// RAII guard for the TUI's terminal mode. `enter` turns on raw mode, the
-/// alternate screen, bracketed paste, the kitty keyboard protocol
-/// `DISAMBIGUATE_ESCAPE_CODES` flag (so `Shift+Enter` arrives as a distinct
-/// `KeyEvent` instead of collapsing to bare CR, #2362), and (when requested)
-/// mouse capture; the `Drop` impl reverses all of it. Because it runs on drop,
-/// the terminal is restored on EVERY exit path, including a panic mid-render,
-/// where the old inline teardown was skipped and left the terminal wedged (raw
-/// mode / mouse reporting / enhancement stack stuck on). Drop is best-effort
-/// and never panics.
-///
-/// The kitty-enhancement pop depends on Rust's default `panic = "unwind"`. A future
-/// profile that sets `panic = "abort"` would skip every Drop here and leak
-/// raw mode, alt screen, paste, mouse, and the enhancement stack into the
-/// user's shell; recovery from a leaked enhancement stack is
-/// `printf '\e[<1u'`. Same exposure as a SIGKILL/SIGSEGV mid-TUI.
+/// Restores the terminal on every exit path, including a panic mid-render.
+/// Under `panic = "abort"` nothing would be restored (recover the kitty stack
+/// with `printf '\e[<1u'`).
 struct TerminalGuard {
-    /// Whether to emit `DisableMouseCapture` on teardown. Mirrors the startup
-    /// gate: under Mosh we never enable capture, so we must not disable it
-    /// either; otherwise we always disable (a mid-session settings toggle can
-    /// turn it on after startup, so we can't gate on the startup value).
+    /// False under Mosh, where capture is never enabled. Otherwise always
+    /// disabled, since a settings toggle can enable it mid-session.
     disable_mouse: bool,
 }
 
 impl TerminalGuard {
     fn enter(enable_mouse: bool, mosh_active: bool) -> Result<Self> {
-        // Roll back any already-applied state if a later step fails, so a
-        // partial enter (e.g. raw mode on, alternate screen failed) never
-        // leaves the shell wedged before a guard exists to restore it on drop.
+        // Roll back partial state so a failed enter never wedges the shell.
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
@@ -192,28 +161,9 @@ impl TerminalGuard {
                 return Err(err.into());
             }
         }
-        // Push the kitty keyboard protocol's DISAMBIGUATE_ESCAPE_CODES flag so
-        // crossterm's parser sees `Shift+Enter` as `KeyEvent { Enter, SHIFT }`
-        // instead of a bare CR indistinguishable from plain Enter (#2362). On
-        // every kitty-protocol-capable terminal (Ghostty, Kitty, WezTerm,
-        // foot, Konsole 24+, recent Alacritty/xterm) this enables the
-        // `translate()` Shift+Enter arm in live_send. Non-supporting terminals
-        // (Apple Terminal, default iTerm2, Termius, Mosh) silently ignore the
-        // unknown `ESC[>1u` CSI; the user falls back to today's behavior.
-        //
-        // No `supports_keyboard_enhancement()` probe: it blocks for up to 2s
-        // on unresponsive terminals (slow SSH, mosh) and conflicts with the
-        // concurrent EventStream reader the TUI is about to start. Unknown
-        // CSI is a safer default than a 2s startup stall.
-        //
-        // Only `DISAMBIGUATE_ESCAPE_CODES`. NOT `REPORT_EVENT_TYPES` (would
-        // start emitting `KeyEventKind::Release` events that several input
-        // pumps would need explicit filtering for). NOT `REPORT_ALTERNATE_KEYS`
-        // (broader change in `KeyEvent` shape that would re-test every chord).
-        //
-        // Best-effort: a push failure here means we lose the Shift+Enter
-        // distinction (status quo before #2362), not anything worth aborting
-        // TUI startup for. Mirrors the Drop pop's best-effort posture.
+        // Kitty DISAMBIGUATE_ESCAPE_CODES makes Shift+Enter distinct from Enter;
+        // other terminals ignore it. No support probe: it can stall startup for
+        // 2s. Other flags would change key event shapes. Best-effort.
         #[cfg(unix)]
         if let Err(err) = execute!(
             stdout,
@@ -233,9 +183,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        // Pop the kitty enhancement stack first, before anything else, so the
-        // shell never inherits an active stack even if a later restore fails.
-        // Best-effort, ignore errors.
+        // Pop the kitty stack first so the shell never inherits it.
         #[cfg(unix)]
         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         let _ = disable_raw_mode();
@@ -253,63 +201,28 @@ impl Drop for TerminalGuard {
         }
     }
 }
-use crate::session::get_update_settings;
-use crate::update::check_for_update;
 
-/// Clear the screen and force a full redraw on the next frame, without the
-/// `ESC[6n` cursor-position round-trip that ratatui's `Terminal::clear` does.
-///
-/// ratatui 0.30's `Terminal::clear` snapshots the cursor via
-/// `get_cursor_position` before clearing. That read shares crossterm's internal
-/// event reader with our live `EventStream`; around stream lifecycle changes the
-/// reader's poll wakes early and the cursor read completes with no matching
-/// event, which surfaces as "cursor position could not be read within a normal
-/// duration" (an immediate 0 ms failure, not the 2 s timeout the message
-/// implies). Clearing the backend directly via `clear_region(ClearType::All)`
-/// (the same call ratatui's Fullscreen `clear_viewport` issues) and resetting
-/// the diff baseline repaints every cell on the next `draw` with no cursor
-/// query.
-///
-/// A free function rather than an `App` method so both the local home view and
-/// the remote home view route through one definition, keeping the "no clear
-/// path calls `get_cursor_position`" invariant true across the whole TUI.
-/// `ClearType::All` is correct for the `Viewport::Fullscreen` the TUI uses; an
-/// inline or fixed viewport would need a different clear.
+/// Clear the screen and force a full repaint without ratatui's `Terminal::clear`,
+/// whose cursor-position query races the live `EventStream` and fails.
 pub(crate) fn clear_terminal<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
     terminal
         .backend_mut()
         .clear_region(ratatui::backend::ClearType::All)?;
-    // Reset both buffers so the next draw diffs against an empty baseline and
-    // repaints the whole viewport.
     terminal.current_buffer_mut().reset();
     terminal.swap_buffers();
     Ok(())
 }
 
 pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
-    // Cross-machine entrypoint: when `AOE_DAEMON_URL` is set, swap the
-    // local home view for the remote structured view picker so the user never
-    // sees a session list that doesn't reflect the daemon they pointed
-    // us at. Tmux check + migrations are intentionally skipped here:
-    // the remote machine owns those, this side is a pure client.
+    // `AOE_DAEMON_URL` makes this a pure client of a remote daemon.
     if let Some(endpoint) = crate::acp::client::discovery::discover_env() {
-        let _ = startup_warning; // remote mode skips the local startup-warning channel
-        let _ = profile;
         return remote_home::run_standalone(endpoint).await;
     }
 
-    // Opening the local session store creates the profile directory, so an
-    // unknown name is refused first (#148); the remote client above never
-    // touches local profiles.
+    // Opening the store creates the profile directory, so refuse unknown names first.
     crate::session::require_known_profile(profile)?;
 
-    // Run pending migrations with a spinner that names the migration, its
-    // current step and the elapsed time, and keeps the notices a migration
-    // emits (what is being moved, how to defer it) on screen. Unconditional
-    // because the spinner writes nothing until a migration reports something,
-    // so the schema-current path costs nothing. This covers the startup pass
-    // only: v027's per-session store move runs from a launch, on the store
-    // move poller, and narrates itself on the home status line.
+    // The spinner writes nothing unless a migration reports progress.
     {
         let console = std::sync::Arc::new(std::sync::Mutex::new(
             migrations::progress::ConsoleProgress::default(),
@@ -348,7 +261,6 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         }
     }
 
-    // Check for tmux
     if !crate::tmux::is_tmux_available() {
         eprintln!("Error: tmux not found in PATH");
         eprintln!();
@@ -359,84 +271,47 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         std::process::exit(1);
     }
 
-    // Check for coding tools (no-agents case is handled inside the TUI)
     let available_tools = crate::tmux::AvailableTools::detect();
 
-    // If version changed, refresh the update cache before showing TUI.
-    // This ensures we have release notes for the changelog dialog.
-    if check_version_change()?.is_some() {
-        let settings = get_update_settings();
-        if settings.update_check_mode.is_enabled() {
-            let current_version = env!("CARGO_PKG_VERSION");
-            // Don't let a network issue block startup
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                check_for_update(current_version, true),
-            )
-            .await;
-        }
+    // Refresh the update cache so the changelog dialog has release notes.
+    if check_version_change()?.is_some() && get_update_settings().update_check_mode.is_enabled() {
+        // Don't let a network issue block startup.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            check_for_update(env!("CARGO_PKG_VERSION"), true),
+        )
+        .await;
     }
 
-    // Opt-in clean-only plugin auto-update sweep (off by default). Spawned
-    // non-blocking so a slow remote or git never delays the TUI. No notifier: the
-    // TUI has no plugin host, so the sweep asks a running daemon to reload.
+    // Clean-only plugin auto-update, non-blocking; asks a running daemon to reload.
     crate::plugin::auto_update::spawn_if_enabled(&crate::session::Config::load_or_warn(), None);
 
-    // Bail early if stdin is not a terminal. Running without a tty would
-    // cause the event loop to busy-loop after the parent terminal dies.
+    // Without a tty the event loop would busy-loop after the parent terminal dies.
     if !io::stdin().is_terminal() {
         anyhow::bail!("stdin is not a terminal; aoe requires an interactive TTY");
     }
 
-    // Setup terminal. Resolve the mouse/mosh policy BEFORE entering raw mode so
-    // the RAII `TerminalGuard` owns the whole enter/restore lifecycle.
-    //
-    // Mouse capture is ON by default to preserve preview-pane wheel scroll
-    // (#795); toggle it off via Settings > Interaction > Mouse Capture, or set
-    // AOE_MOUSE_CAPTURE=0 as a backstop on iOS Mosh + Termius/Blink, which
-    // can't reliably forward mouse-tracking escapes to mobile clients.
-    //
-    // Additionally: even when explicitly requested, Mosh mangles xterm
-    // mouse-tracking escapes (inverted/duplicated scroll on Termius, Blink,
-    // Mosh4iOS; broken right-click selection on desktop Mosh). MOSH_CONNECTION
-    // is set by mosh-server and propagates through the user's environment;
-    // when present, fall back to the terminal's native scroll regardless of
-    // AOE_MOUSE_CAPTURE so the user can select text without aoe eating events.
+    // Mosh mangles mouse-tracking escapes, so capture stays off under it.
+    // `App` re-resolves the config so a mid-session toggle still applies.
     let mosh_active = std::env::var_os("MOSH_CONNECTION").is_some();
-    // Resolve once for the startup enable; `App` re-resolves on its own reload
-    // cadence so a mid-session settings toggle still applies.
     let startup_session_config = crate::session::resolve_config(profile)
         .map(|c| c.session)
         .unwrap_or_default();
     let enable_mouse = mouse_capture_requested(&startup_session_config) && !mosh_active;
     let _terminal_guard = TerminalGuard::enter(enable_mouse, mosh_active)?;
 
-    // Combine the caller-supplied startup warning (e.g. debug-log file
-    // failures) with any config-parse failures we detect at startup.
-    // `tracing::warn!` events from the `_or_warn` config helpers are dropped
-    // by default in TUI mode (no subscriber attached), so we surface them
-    // through the same InfoDialog channel here.
-    //
-    // Detected before `App::new` so we can suppress the first-run welcome /
-    // changelog dialogs when there's a warning, both for UX (the warning is
-    // the more important thing for the user to see) and to avoid overwriting
-    // a malformed config.toml with defaults via `update_config`.
+    // Config warnings have no tracing subscriber in TUI mode, so they surface
+    // as a dialog. Known before `App::new` so first-run dialogs are suppressed
+    // and a malformed config.toml isn't overwritten with defaults.
     let combined_warning = match (
         startup_warning,
         crate::session::collect_startup_config_warnings(profile),
     ) {
         (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+        (a, b) => a.or(b),
     };
 
-    // The TUI process owns its own FileWatchService Arc; threaded into every
-    // consumer (HomeView, DiffView, per-profile Storage) so peer-process
-    // writes to `sessions.json` / `groups.json` propagate within the
-    // primitive's debounce window. Init failure must not abort the TUI;
-    // fall back to a noop service. The 5s heartbeat path is the sole
-    // reload signal in that case.
+    // Without file watching, the 5s heartbeat is the only reload signal.
     let file_watch = crate::file_watch::FileWatchService::new().unwrap_or_else(|e| {
         tracing::warn!(
             target: "tui.file_watch",
@@ -446,7 +321,6 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         crate::file_watch::FileWatchService::noop()
     });
 
-    // Create app and run
     let mut app = App::new(
         profile,
         available_tools,
@@ -457,17 +331,14 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     if let Some(warning) = combined_warning {
         app.show_startup_warning(&warning);
     }
-    // Built after `App` so it can share the map the renderer fills: the
-    // backend re-emits OSC 8 around whatever cells the frame marked as links.
+    // Shares the hyperlink map the renderer fills.
     let backend = crate::tui::hyperlink::HyperlinkBackend::new(io::stdout(), app.hyperlink_cells());
     let mut terminal = Terminal::new(backend)?;
     let result = app.run(&mut terminal).await;
 
     crate::session::clear_tui_heartbeat();
 
-    // Terminal restore (raw mode, alternate screen, bracketed paste, mouse
-    // capture, cursor) happens in `_terminal_guard`'s Drop, so it runs on every
-    // exit path including a panic, not just this normal return.
+    // `_terminal_guard` restores the terminal on drop.
     drop(terminal);
     result
 }
@@ -486,9 +357,7 @@ mod clear_terminal_tests {
             .all(|c| c == &Cell::default())
     }
 
-    /// `clear_terminal` must wipe the backend AND reset ratatui's diff baseline,
-    /// so a clear followed by an identical redraw repaints every cell instead of
-    /// diffing to a no-op and leaving a blank screen.
+    /// The diff baseline must reset too, or an identical redraw paints nothing.
     #[test]
     fn clears_backend_and_repaints_on_next_identical_draw() {
         let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
@@ -504,8 +373,6 @@ mod clear_terminal_tests {
             "clear_terminal should wipe the backend"
         );
 
-        // Same content again: without the diff-baseline reset the diff would be
-        // empty and the screen would stay blank after the clear.
         terminal
             .draw(|f| f.render_widget(Paragraph::new("HELLO"), f.area()))
             .unwrap();
@@ -520,40 +387,27 @@ mod mouse_capture_tests {
     use crate::session::test_support::EnvGuard;
     use serial_test::serial;
 
-    fn session_with(mouse_capture: bool) -> SessionConfig {
-        SessionConfig {
-            mouse_capture,
-            ..SessionConfig::default()
+    #[test]
+    #[serial]
+    fn config_and_env_must_both_allow_capture() {
+        // (config, AOE_MOUSE_CAPTURE, expected)
+        let cases = [
+            (true, None, true),
+            (false, None, false),
+            (true, Some("0"), false),
+            (true, Some("false"), false),
+            (false, Some("1"), false),
+        ];
+        for (mouse_capture, env, expected) in cases {
+            let _g = match env {
+                Some(value) => EnvGuard::set(&[("AOE_MOUSE_CAPTURE", value)]),
+                None => EnvGuard::unset(&["AOE_MOUSE_CAPTURE"]),
+            };
+            let session = SessionConfig {
+                mouse_capture,
+                ..SessionConfig::default()
+            };
+            assert_eq!(mouse_capture_requested(&session), expected, "{env:?}");
         }
-    }
-
-    #[test]
-    #[serial]
-    fn enabled_config_without_env_requests_capture() {
-        let _g = EnvGuard::unset(&["AOE_MOUSE_CAPTURE"]);
-        assert!(mouse_capture_requested(&session_with(true)));
-    }
-
-    #[test]
-    #[serial]
-    fn disabled_config_opts_out_even_without_env() {
-        let _g = EnvGuard::unset(&["AOE_MOUSE_CAPTURE"]);
-        assert!(!mouse_capture_requested(&session_with(false)));
-    }
-
-    #[test]
-    #[serial]
-    fn env_zero_still_wins_over_enabled_config() {
-        // The pre-existing AOE_MOUSE_CAPTURE=0 escape hatch keeps working
-        // even though the config defaults to enabled (#1346).
-        let _g = EnvGuard::set(&[("AOE_MOUSE_CAPTURE", "0")]);
-        assert!(!mouse_capture_requested(&session_with(true)));
-    }
-
-    #[test]
-    #[serial]
-    fn env_true_does_not_re_enable_disabled_config() {
-        let _g = EnvGuard::set(&[("AOE_MOUSE_CAPTURE", "1")]);
-        assert!(!mouse_capture_requested(&session_with(false)));
     }
 }

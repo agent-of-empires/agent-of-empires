@@ -1,21 +1,14 @@
 //! Provenance-based confinement for the session file-read endpoint (#3088).
 //!
-//! The web dashboard can render a Markdown (or any) file that belongs to a
-//! session. A read is allowed only when the canonicalized target is either
-//!   - under one of the session's project roots (project_path + worktree
-//!     paths), or
-//!   - a path the session's agent actually touched this session (Write / Edit /
-//!     Read / apply_patch / memory-recall), recovered from the ACP event log.
+//! A read is allowed only when the canonicalized target is under one of the
+//! session's project roots, or is a path the session's agent actually touched,
+//! recovered from the ACP event log. Provenance, not a directory allowlist, is
+//! the boundary: the dashboard can open exactly what the agent already worked
+//! with, and nothing it never touched.
 //!
-//! Provenance, not a directory allowlist, is the boundary: the dashboard can
-//! open exactly what the agent already worked with (whose content was already
-//! in the transcript), and nothing it never touched. See the debate synthesis
-//! on #3088 for why an ambient `/tmp` + agent-home allowlist was rejected.
-//!
-//! The final read opens the file beneath a `cap_std` capability directory, so a
-//! path component swapped between the containment check and the open (TOCTOU)
-//! cannot escape the intended root: `cap_std::fs::Dir::open` refuses `..` and
-//! symlinks that leave the directory.
+//! The final read opens the file beneath a `cap_std` capability directory, which
+//! refuses `..` and escaping symlinks, so a component swapped between the
+//! containment check and the open cannot escape the intended root.
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -28,14 +21,12 @@ use cap_std::fs::Dir;
 use crate::acp::state::Event;
 
 /// Keys under which the various agents stash a file path in a tool call's
-/// `args_preview` JSON. Mirrors the client's `pickStr` order in
-/// `web/src/components/acp/ToolCards.tsx`.
+/// `args_preview` JSON. Mirrors `pickStr` in `web/src/components/acp/ToolCards.tsx`.
 const PATH_KEYS: [&str; 4] = ["file_path", "path", "filePath", "filename"];
 
-/// Pull a file path out of a tool call's `args_preview` JSON blob. Returns
-/// `None` when the blob does not parse (it is capped at 16 KB at ingest, so a
-/// huge leading argument can truncate the JSON) or carries no path key; callers
-/// treat that as "path unknown", never "denied", and fall back to the
+/// Pull a file path out of a tool call's `args_preview` JSON. `None` when the
+/// blob does not parse (it is capped at 16 KB at ingest) or carries no path key;
+/// callers treat that as "path unknown", never "denied", and fall back to the
 /// structured `diffs[].path`.
 fn extract_path_from_args_preview(args_preview: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(args_preview).ok()?;
@@ -53,10 +44,9 @@ fn extract_path_from_args_preview(args_preview: &str) -> Option<String> {
 /// Build the set of paths a session's agent touched, from its ACP event log.
 ///
 /// Folds both `ToolCallStarted` and `ToolCallUpdated`: claude-agent-acp ships
-/// the initial tool call with an empty `raw_input` and fills the path in on a
-/// later update, so the update frames must be scanned too. Paths are collected
-/// exactly as the agent emitted them (absolute for Claude's Read/Write/Edit),
-/// so entries are directly usable as absolute allow-set keys.
+/// the initial call with an empty `raw_input` and fills the path in on a later
+/// update. Paths are collected exactly as the agent emitted them, so entries are
+/// directly usable as absolute allow-set keys.
 pub fn collect_touched_paths(events: &[(u64, Event)]) -> HashSet<PathBuf> {
     let mut out = HashSet::new();
     let mut add = |s: &str| {
@@ -114,8 +104,7 @@ fn has_traversal(requested: &Path) -> bool {
 
 /// A read that passed confinement: the canonical target plus the directory it
 /// must be opened beneath (a project root, or the file's own parent for a
-/// provenance hit). [`read_confined`] opens `canonical` relative to `root`
-/// through a `cap_std` capability directory.
+/// provenance hit).
 pub struct Confined {
     pub canonical: PathBuf,
     pub root: PathBuf,
@@ -123,19 +112,14 @@ pub struct Confined {
 
 /// Resolve and confine a requested path.
 ///
-/// `project_roots` must already be canonicalized. `touched` builds the raw
-/// provenance set and is invoked **only** when the target is not under a
-/// project root: recovering the set means replaying the whole session event
-/// log, which the common case (a file in the session's own workspace) never
-/// needs. Returns the canonical path plus the root to open beneath, or an HTTP
-/// error.
+/// `project_roots` must already be canonicalized. `touched` is invoked only when
+/// the target is not under a project root, because recovering the set replays
+/// the whole session event log.
 ///
-/// Security invariants (see #3088 debate): the path is canonicalized (symlinks
-/// resolved, `..` collapsed) before any containment check; containment uses
-/// `Path::starts_with` (component-aware, so `/repo-evil` is not under `/repo`).
-/// The actual open is delegated to [`read_confined`], which uses the returned
-/// `root` as a capability boundary so the open cannot escape it even if the
-/// filesystem changes between here and the read.
+/// Security invariants (#3088): the path is canonicalized before any containment
+/// check, and containment uses component-aware `Path::starts_with`, so
+/// `/repo-evil` is not under `/repo`. The open is delegated to
+/// [`read_confined`], which treats the returned `root` as a capability boundary.
 pub fn confine_path(
     project_roots: &[PathBuf],
     touched: impl FnOnce() -> HashSet<PathBuf>,
@@ -153,9 +137,8 @@ pub fn confine_path(
         if has_traversal(requested) {
             return Err((StatusCode::BAD_REQUEST, "path escapes project"));
         }
-        // A relative request is always resolved against the primary project
-        // root (the first entry). Multi-repo members are reached by their
-        // absolute worktree path via provenance / project-root containment.
+        // A relative request always resolves against the primary project root.
+        // Multi-repo members are reached by their absolute worktree path.
         let root = project_roots
             .first()
             .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "no project root"))?;
@@ -172,9 +155,9 @@ pub fn confine_path(
         });
     }
 
-    // Outside every project root, so fall back to provenance: only now is it
-    // worth replaying the event log. Compare canonical forms so a
-    // symlinked-but-touched path still matches; open it beneath its own parent.
+    // Outside every project root, so fall back to provenance. Compare canonical
+    // forms so a symlinked-but-touched path still matches, and open it beneath
+    // its own parent.
     let touched_hit = touched()
         .iter()
         .any(|t| t.canonicalize().map(|ct| ct == canonical).unwrap_or(false));
@@ -193,12 +176,10 @@ pub fn confine_path(
 /// capability directory so the open is race-safe against a component swapped
 /// after [`confine_path`] validated containment.
 ///
-/// Rejects non-regular files (directories, FIFOs, devices, `/proc` nodes)
-/// before reading, so a blocking or endless special file can't stall or OOM the
-/// server. Reads at most `cap + 1` bytes to detect truncation without
-/// allocating an unbounded buffer. Returns `(content, is_binary, truncated)`;
-/// binary content yields an empty string (the client shows a "binary file"
-/// notice), matching the diff endpoint.
+/// Rejects non-regular files before reading, so a blocking or endless special
+/// file cannot stall or OOM the server, and reads at most `cap + 1` bytes to
+/// detect truncation. Binary content yields an empty string, matching the diff
+/// endpoint.
 pub fn read_confined(
     confined: &Confined,
     cap: usize,
@@ -209,8 +190,8 @@ pub fn read_confined(
         .canonical
         .strip_prefix(&confined.root)
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "path not beneath root"))?;
-    // cap_std refuses `..` and symlinks that escape `dir`, so this open stays
-    // beneath `root` regardless of what changed since the canonicalize check.
+    // cap_std refuses `..` and escaping symlinks, so this open stays beneath
+    // `root` regardless of what changed since the canonicalize check.
     let mut file = dir
         .open(rel)
         .map_err(|_| (StatusCode::NOT_FOUND, "file not found"))?;
@@ -425,8 +406,8 @@ mod tests {
             );
         }
 
-        // A sibling dir sharing a string prefix ("<root>-evil") is NOT under
-        // the root: component-aware starts_with, not string prefix.
+        // A sibling dir sharing a string prefix is NOT under the root:
+        // component-aware starts_with, not string prefix.
         let evil = PathBuf::from(format!("{}-evil", root.display()));
         fs::create_dir_all(&evil).ok();
         let evil_file = evil.join("x.md");
@@ -464,13 +445,11 @@ mod tests {
         );
     }
 
-    /// The capability open is the TOCTOU defense, so provoke it directly rather
-    /// than only reaching it with a stable tree: hand `read_confined` a target
-    /// that escapes `root` via a symlink, the shape a component swapped after
-    /// `confine_path` validated containment would produce. `cap_std` re-checks
-    /// every component at open time and refuses it; a plain
-    /// `File::open(canonical)` would happily follow the link and leak the
-    /// outside file, so this test fails if that hardening is ever reverted.
+    /// The capability open is the TOCTOU defense, so provoke it directly: hand
+    /// `read_confined` a target that escapes `root` via a symlink, the shape a
+    /// component swapped after `confine_path` would produce. `cap_std` re-checks
+    /// every component at open time; a plain `File::open(canonical)` would
+    /// follow the link and leak the outside file.
     #[cfg(unix)]
     #[test]
     fn read_confined_refuses_symlink_escaping_root() {
@@ -497,7 +476,7 @@ mod tests {
             root: root.clone(),
         };
         // The outside file's bytes never reach the caller: the open is refused
-        // outright rather than followed.
+        // rather than followed.
         let result = read_confined(&swapped, 5_000_000);
         assert!(
             !matches!(&result, Ok((content, _, _)) if content == "KEY"),

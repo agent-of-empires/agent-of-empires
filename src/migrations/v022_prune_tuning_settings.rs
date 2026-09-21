@@ -1,20 +1,10 @@
-//! Migration v022: prune removed tuning settings from saved configs.
+//! Migration v022: prune settings that left the schema and carry over the two
+//! that were merged away.
 //!
-//! A batch of internal tuning knobs left the settings schema (their values
-//! are now fixed constants), and several overlapping settings were
-//! consolidated into one:
-//!
-//! - `session.new_session_attach_mode` merged into
-//!   `session.default_attach_mode` (one "Attach Mode" setting covering both
-//!   the post-create attach and Enter/double-click activation).
-//! - `session.conversation_summary_agent` merged into
-//!   `session.smart_rename_agent` (one utility-agent setting for every
-//!   one-shot call).
-//!
-//! Serde already ignores unknown keys on load, so this migration exists to
-//! (a) carry a user's merged-away value over to the surviving key when the
-//! surviving key was never set, and (b) tidy the dropped keys out of
-//! config.toml so they don't linger as dead weight. Removals:
+//! `session.new_session_attach_mode` moves to `session.default_attach_mode`
+//! and `session.conversation_summary_agent` to `session.smart_rename_agent`,
+//! each only when the surviving key was never set. Serde already ignores
+//! unknown keys, so the rest is tidying dead weight out of config.toml:
 //!
 //! - `[session]`: `new_session_attach_mode`, `conversation_summary_agent`,
 //!   `smart_rename_timing`
@@ -24,7 +14,7 @@
 //!   `force_end_turn_threshold_secs`, `silent_orphan_fast_grace_secs`,
 //!   `rate_limit_auto_resume_grace_secs`, `queue_drain_mode`
 //! - `[status_hooks]`: `debounce_ms`
-//! - `[sound]`: `mode` (per-state files + random fallback replace it)
+//! - `[sound]`: `mode`
 
 use anyhow::{Context, Result};
 use std::fs;
@@ -167,66 +157,46 @@ mod tests {
         fs::read_to_string(&path).unwrap().parse().unwrap()
     }
 
+    /// A merged-away key reaches its survivor only when the survivor has no
+    /// value of its own, and an empty value is dropped rather than carried.
     #[test]
-    fn attach_mode_carries_over_when_survivor_absent() {
-        let result = migrated(
-            r#"
-[session]
-new_session_attach_mode = "live_send"
-"#,
-        );
-        let session = result["session"].as_table().unwrap();
-        assert!(session.get("new_session_attach_mode").is_none());
-        assert_eq!(
-            session.get("default_attach_mode").and_then(|v| v.as_str()),
-            Some("live_send")
-        );
-    }
-
-    #[test]
-    fn attach_mode_survivor_wins_over_merged_away_key() {
-        let result = migrated(
-            r#"
-[session]
-new_session_attach_mode = "live_send"
-default_attach_mode = "tmux"
-"#,
-        );
-        let session = result["session"].as_table().unwrap();
-        assert!(session.get("new_session_attach_mode").is_none());
-        assert_eq!(
-            session.get("default_attach_mode").and_then(|v| v.as_str()),
-            Some("tmux")
-        );
-    }
-
-    #[test]
-    fn summary_agent_carries_over_when_survivor_absent() {
-        let result = migrated(
-            r#"
-[session]
-conversation_summary_agent = "opencode"
-"#,
-        );
-        let session = result["session"].as_table().unwrap();
-        assert!(session.get("conversation_summary_agent").is_none());
-        assert_eq!(
-            session.get("smart_rename_agent").and_then(|v| v.as_str()),
-            Some("opencode")
-        );
-    }
-
-    #[test]
-    fn empty_summary_agent_is_dropped_not_carried() {
-        let result = migrated(
-            r#"
-[session]
-conversation_summary_agent = ""
-"#,
-        );
-        let session = result["session"].as_table().unwrap();
-        assert!(session.get("conversation_summary_agent").is_none());
-        assert!(session.get("smart_rename_agent").is_none());
+    fn merged_keys_move_only_into_an_empty_survivor() {
+        let cases = [
+            (
+                "new_session_attach_mode = \"live_send\"",
+                "default_attach_mode",
+                Some("live_send"),
+            ),
+            (
+                "new_session_attach_mode = \"live_send\"\ndefault_attach_mode = \"tmux\"",
+                "default_attach_mode",
+                Some("tmux"),
+            ),
+            (
+                "conversation_summary_agent = \"opencode\"",
+                "smart_rename_agent",
+                Some("opencode"),
+            ),
+            (
+                "conversation_summary_agent = \"\"",
+                "smart_rename_agent",
+                None,
+            ),
+        ];
+        for (body, survivor, expected) in cases {
+            let result = migrated(&format!("[session]\n{body}\n"));
+            let session = result["session"].as_table().unwrap();
+            assert!(session.get("new_session_attach_mode").is_none(), "{body}");
+            assert!(
+                session.get("conversation_summary_agent").is_none(),
+                "{body}"
+            );
+            assert_eq!(
+                session.get(survivor).and_then(|v| v.as_str()),
+                expected,
+                "{body}"
+            );
+        }
     }
 
     #[test]

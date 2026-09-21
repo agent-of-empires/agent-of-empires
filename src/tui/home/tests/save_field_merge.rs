@@ -246,12 +246,10 @@ fn test_apply_user_action_disk_and_memory_share_one_timestamp() {
 #[test]
 #[serial]
 fn test_apply_user_action_archive_clears_peer_snooze() {
-    // The web/TUI/CLI contract treats pinned / archived / snoozed
-    // as mutually exclusive (see Instance::archive and the sidebar
-    // tier comparator in #1581). When a peer snoozes a row that
-    // the TUI then archives, archive wins because it is the
-    // indefinite sink; leaving both flags persisted would surface
-    // contradictory triage state on the next render.
+    // The web/TUI/CLI contract treats pinned / archived / snoozed as mutually exclusive (see
+    // Instance::archive and the tier comparator in #1581), so when a peer snoozes a row the
+    // TUI then archives, archive wins as the indefinite sink; both flags would surface
+    // contradictory triage state.
     let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
 
     let peer_storage = Storage::new_unwatched("test").unwrap();
@@ -279,11 +277,9 @@ fn test_apply_user_action_archive_clears_peer_snooze() {
 #[test]
 #[serial]
 fn test_apply_user_action_preserves_peer_user_action_field() {
-    // Field-level merge regression: a TUI snooze must not clobber
-    // an unrelated peer write (group_path here). Uses snooze
-    // instead of archive so the snoozed_until field IS touched on
-    // both sides and the test isolates the peer-field-survival
-    // invariant from the archive XOR rules tested above.
+    // Field-level merge regression: a TUI snooze must not clobber an unrelated peer write
+    // (group_path). Snooze rather than archive, so `snoozed_until` is touched on both sides
+    // and the peer-field-survival invariant is isolated from the XOR rules above.
     let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
 
     let peer_storage = Storage::new_unwatched("test").unwrap();
@@ -798,13 +794,10 @@ fn test_reload_honors_peer_cleared_session_id() {
     );
 }
 
-/// `stamp_last_accessed` on a sunk row must auto-clear archived_at on
-/// BOTH memory and disk, and rebuild flat_items so the row leaves the
-/// synthetic Archived section on the same frame. Regression guard for
-/// the "re-entering an archived session left it stuck in the Archived
-/// section until the user pressed `z`" bug: the old implementation used
-/// mutate_instance + save, but merge_from_tui doesn't carry archived_at
-/// so the next reload resurrected the sink from disk.
+/// `stamp_last_accessed` on a sunk row must auto-clear archived_at in memory and on disk
+/// and rebuild flat_items, so the row leaves the Archived section on the same frame. The old
+/// mutate_instance + save path left it stuck until `z`, because merge_from_tui doesn't carry
+/// archived_at and the next reload resurrected the sink.
 #[test]
 #[serial]
 fn stamp_last_accessed_on_archived_row_unsinks_persistently() {
@@ -1143,10 +1136,9 @@ fn tied_cross_profile_collision_rejects_before_worktree_effects() {
     assert_eq!(source.worktree_info.unwrap().branch, "old-name");
 }
 
-/// Snoozed siblings of the archive case: `snoozed_until` is also cleared
-/// by `touch_last_accessed` and is also excluded from `merge_from_tui`,
-/// so the same persistence bug applied to snoozed rows. Same fix path
-/// (apply_user_action), same disk-versus-memory contract.
+/// Snoozed sibling of the archive case: `snoozed_until` is also cleared by
+/// `touch_last_accessed` and also excluded from `merge_from_tui`, so the same persistence
+/// bug applied, with the same fix path.
 #[test]
 #[serial]
 fn stamp_last_accessed_on_snoozed_row_persistently_clears_snooze() {

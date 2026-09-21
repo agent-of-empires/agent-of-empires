@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { listen } from "./domEvents";
 
 const PRESENCE_INTERVAL_MS = 10_000;
 
@@ -6,11 +7,6 @@ function isForeground(): boolean {
   return document.visibilityState === "visible" && document.hasFocus();
 }
 
-/**
- * Report only genuine foreground dashboard use to the server's push
- * suppression logic. Session polling continues in a backgrounded browser,
- * but that traffic must not make a phone miss a notification.
- */
 export function useDashboardPresence(): void {
   useEffect(() => {
     const report = (active: boolean, keepalive = false) => {
@@ -19,9 +15,7 @@ export function useDashboardPresence(): void {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ active }),
         keepalive,
-      }).catch(() => {
-        // Presence is best effort. A failed heartbeat naturally expires.
-      });
+      }).catch(() => {});
     };
     const update = () => {
       const active = isForeground();
@@ -31,19 +25,13 @@ export function useDashboardPresence(): void {
 
     update();
     const interval = window.setInterval(update, PRESENCE_INTERVAL_MS);
-    document.addEventListener("visibilitychange", update);
-    window.addEventListener("focus", update);
-    window.addEventListener("blur", clear);
-    window.addEventListener("pageshow", update);
-    window.addEventListener("pagehide", clear);
+    const stopUpdate = listen(update, [document, "visibilitychange"], [window, "focus"], [window, "pageshow"]);
+    const stopClear = listen(clear, [window, "blur"], [window, "pagehide"]);
 
     return () => {
       window.clearInterval(interval);
-      document.removeEventListener("visibilitychange", update);
-      window.removeEventListener("focus", update);
-      window.removeEventListener("blur", clear);
-      window.removeEventListener("pageshow", update);
-      window.removeEventListener("pagehide", clear);
+      stopUpdate();
+      stopClear();
       clear();
     };
   }, []);

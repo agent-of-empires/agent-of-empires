@@ -1,14 +1,10 @@
-//! Centralized agent registry.
-//!
-//! All per-agent metadata lives here. Adding a new agent means adding one
-//! `AgentDef` entry to `AGENTS` and writing a status detection function.
+//! Registry of supported agent CLIs and their per-agent metadata.
 
 use crate::session::Status;
 use crate::tmux::status_detection;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Status values a hook may write to AoE's hook sidecar file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HookStatus {
@@ -35,44 +31,27 @@ impl std::fmt::Display for HookStatus {
     }
 }
 
-/// How to check whether an agent binary is installed on the host.
 pub enum DetectionMethod {
-    /// Run `which <binary>` and check exit code.
     Which(&'static str),
-    /// Run `<binary> <arg>` and check that it doesn't error (e.g. `vibe --version`).
     RunWithArg(&'static str, &'static str),
 }
 
-/// How to enable YOLO / auto-approve mode for an agent.
 pub enum YoloMode {
-    /// Append a CLI flag (e.g. `--dangerously-skip-permissions`).
     CliFlag(&'static str),
-    /// Set an environment variable (name, value).
     EnvVar(&'static str, &'static str),
-    /// Agent always runs in YOLO mode with no opt-in needed (e.g. pi).
     AlwaysYolo,
 }
 
-/// How an agent resumes an existing session from the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeStrategy {
-    /// Append a flag (e.g. `--session <id>`). For agents where new and existing
-    /// sessions use the same flag.
     Flag(&'static str),
-    /// Two different flags depending on whether conversation data already exists.
-    /// `existing` is used when there is prior conversation data (e.g. `--resume`),
-    /// `new_session` when creating/attaching unconditionally (e.g. `--session-id`).
     FlagPair {
         existing: &'static str,
         new_session: &'static str,
     },
-    /// Resume is a subcommand rather than a flag (e.g. `codex resume <id>`).
-    /// The subcommand + id are inserted right after the binary name so that
-    /// other flags land after it.
     Subcommand(&'static str),
 }
 
-/// Backend that proves which native conversation belongs to one AoE instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionCaptureBackend {
     Claude,
@@ -102,17 +81,14 @@ impl SessionCaptureBackend {
     }
 }
 
-/// Authority available in one launch environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionCaptureContext {
-    /// AoE must not discover a native identity in this environment.
     Unsupported,
     PaneScoped,
     Preassigned,
     ManagedExclusiveStore,
 }
 
-/// Capture routing and environment support paired with resume argv.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionCaptureSpec {
     pub backend: SessionCaptureBackend,
@@ -120,72 +96,37 @@ pub struct SessionCaptureSpec {
     pub sandbox: SessionCaptureContext,
 }
 
-/// Complete native-session contract. Absence means fail-closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionSupport {
     pub resume: ResumeStrategy,
     pub capture: Option<SessionCaptureSpec>,
 }
 
-/// How an agent forks an existing session from the CLI: resume the parent's
-/// conversation but write the continuation to a NEW, independent session,
-/// leaving the original transcript untouched. Distinct from
-/// [`ResumeStrategy`], which continues the SAME session in place.
 pub enum ForkStrategy {
-    /// Claude Code: `--resume <parent> --fork-session --session-id <child>`.
-    /// AoE pre-pins `<child>` so the forked id is known and durable before
-    /// launch (no async capture window). Verified to compose live.
     ClaudeFork,
-    /// Codex CLI: `codex fork <parent>` subcommand (mints a new id).
     CodexFork,
-    /// A single flag appended when forking, used alongside the agent's normal
-    /// resume flag (e.g. opencode `--session <parent> --fork`).
     Flag(&'static str),
-    /// Agent cannot fork a session.
     Unsupported,
 }
 
-/// Lifecycle state of an agent CLI in the registry. Data-only: it never
-/// gates spawning, resume, hook installs, or any other support path; every
-/// surface that lists or launches an agent renders the state alongside it
-/// (CLI listings, doctor, spawn warnings, TUI picker badge, dashboard).
-///
-/// Wire mirror: `web/src/lib/types.ts` (`AgentLifecycleInfo`, served by
-/// `/api/agents` and `/api/acp/agents`) and the static fallback mirror in
-/// `web/src/lib/agentProfiles.ts`. When adding a variant, update both TS
-/// files and give the variant an arm in [`AgentDef::lifecycle_label`] in
-/// the same change: the closed `"state"` union on the TS side and that
-/// match arm are the two places a new variant does not fail compilation.
+/// Data-only lifecycle state. A new variant needs an arm in `AgentDef::lifecycle_label`
+/// and in the TS mirrors (`web/src/lib/types.ts`, `web/src/lib/agentProfiles.ts`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum AgentLifecycle {
-    /// Fully supported upstream; nothing to surface.
     Active,
-    /// Still functional in AoE but deprecated upstream. Support (detection,
-    /// status, resume, hooks) is unchanged; the notice travels with the
-    /// agent everywhere it appears.
     Deprecated {
-        /// ISO date (`YYYY-MM-DD`) the deprecation took effect upstream.
         since: &'static str,
-        /// One-line human-facing reason.
         note: &'static str,
-        /// Canonical registry name of a suggested replacement, when one exists.
         replacement: Option<&'static str>,
     },
 }
 
 impl AgentLifecycle {
-    /// True for the plain [`AgentLifecycle::Active`] default. Used by
-    /// serializers to omit the field for active agents so the common case
-    /// keeps its wire shape.
     pub fn is_active(&self) -> bool {
         matches!(self, AgentLifecycle::Active)
     }
 
-    /// Full one-line notice for any non-active state; `None` while Active.
-    /// The single rendering entry point for CLI listings and spawn
-    /// warnings, so a future variant automatically surfaces its Display
-    /// everywhere without per-site match updates.
     pub fn notice(&self) -> Option<String> {
         if self.is_active() {
             None
@@ -221,27 +162,16 @@ pub enum HookIdentityField {
     ConversationIdOrSessionId,
 }
 
-/// A single hook event that AoE registers in an agent's settings file.
 #[derive(Debug)]
 pub struct HookEvent {
-    /// Event name as the agent expects it (e.g. `"PreToolUse"` for Claude Code).
     pub name: &'static str,
-    /// Optional matcher pattern (e.g. `"permission_prompt|elicitation_dialog"`).
     pub matcher: Option<&'static str>,
-    /// AoE status to write when this event fires.
     pub status: Option<HookStatus>,
-    /// Native identity field to extract into the per-instance sidecar.
     pub identity_field: Option<HookIdentityField>,
-    /// Tool names whose invocation blocks on the user for the tool's entire
-    /// execution (e.g. Claude's `AskUserQuestion` selection UI). When
-    /// non-empty on a status event, the generated hook command inspects the
-    /// payload's `tool_name` and writes `waiting` for these tools instead of
-    /// the event's status, so the session reads as blocked the moment the
-    /// prompt renders rather than sticking on the last `running` write.
+    /// Tools that block on the user for their whole run; the hook writes `waiting` for them.
     pub waiting_tools: &'static [&'static str],
 }
 
-/// A hook event after applying profile/global status-map overrides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedHookEvent {
     pub name: String,
@@ -251,8 +181,6 @@ pub struct ResolvedHookEvent {
     pub waiting_tools: Vec<String>,
 }
 
-/// Sidecar hook defaults for agents whose config format is not the generic
-/// JSON hook schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SidecarHookEvent {
     pub name: &'static str,
@@ -260,559 +188,213 @@ pub struct SidecarHookEvent {
     pub identity_field: Option<HookIdentityField>,
 }
 
-/// On-disk format an agent uses for its status-detection hooks. Each variant
-/// drives one install path: `JsonSettings` goes through the generic
-/// `hooks.<event>[].hooks[].command` JSON writer used by Claude-shape agents;
-/// `CodexJson` shares the same JSON payload but resolves its path through
-/// Codex's `CODEX_HOME` convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookFormat {
-    /// JSON `settings.json` with `hooks.<event>[].hooks[].command`. Used by
-    /// Claude, Cursor, Gemini, Qwen, and any future agent that adopts this
-    /// shape.
     JsonSettings,
-    /// Codex `hooks.json`. Identical JSON payload shape to `JsonSettings`,
-    /// but the path is resolved via `CODEX_HOME` → `~/.codex/hooks.json`.
-    /// Codex's `[hooks.state]` trust block lives in `config.toml` and is
-    /// untouched by this writer.
     CodexJson,
 }
 
-/// Configuration for installing status-detection hooks into an agent's settings file.
 #[derive(Debug)]
 pub struct AgentHookConfig {
-    /// Path relative to the home dir where the agent's settings live
-    /// (e.g. `.claude/settings.json`).
     pub settings_rel_path: &'static str,
-    /// Optional env var that overrides the agent's config directory
-    /// (e.g. `CLAUDE_CONFIG_DIR`). When set in the session's host environment,
-    /// or in AoE's own environment, the settings file lives directly under that
-    /// directory using the basename of `settings_rel_path`, rather than under
-    /// `~/<settings_rel_path>`. `None` for agents with a fixed home-relative path.
     pub config_dir_env_var: Option<&'static str>,
-    /// Hook events to register (status transitions and session lifecycle).
     pub events: &'static [HookEvent],
-    /// On-disk format of the settings file. Drives target-kind selection in
-    /// `crate::hooks::iter_hook_targets_in`, which feeds the v015 marker
-    /// walker and the uninstall path.
     pub format: HookFormat,
 }
 
-/// Installer for an agent whose status hooks live in a config format the
-/// generic [`AgentHookConfig`] (JSON `settings.json`) path cannot emit: settl
-/// (TOML), hermes (YAML), kiro (per-agent JSON). Bundling the host path, the
-/// sandbox path, and the install/uninstall function pointers here lets every
-/// call site (`status_hook_env_prefix`, host install, sandbox install,
-/// `uninstall_all_hooks`) dispatch through one field instead of matching agent
-/// names. An agent has at most one of `hook_config` or `sidecar_hooks`.
+/// An agent has at most one of `hook_config` or `sidecar_hooks`.
 #[derive(Debug)]
 pub struct SidecarHooks {
-    /// Config path relative to the home directory for a host session
-    /// (e.g. `.hermes/config.yaml`).
     pub host_config_subpath: &'static str,
-    /// Config path relative to the home directory for a sandboxed session
-    /// (e.g. `.hermes/sandbox/config.yaml`). The `sandbox` segment mirrors the
-    /// container staging dir. Empty (and unused) for `host_only` agents.
     pub sandbox_config_subpath: &'static str,
-    /// Write AoE status hooks into the config file at the given path. The
-    /// `target` parameter selects which `{base}` is baked into the hook
-    /// command string (`/tmp/aoe-hooks-<euid>` for host, `/tmp/aoe-hooks` for
-    /// sandbox; see `crate::hooks::HookInstallTarget`).
     pub install: fn(
         &std::path::Path,
         crate::hooks::HookInstallTarget,
         &[ResolvedHookEvent],
     ) -> anyhow::Result<()>,
-    /// Remove AoE status hooks from the config file at the given path.
-    /// Returns whether anything was changed.
     pub uninstall: fn(&std::path::Path) -> anyhow::Result<bool>,
-    /// Optional host-only follow-up run after a successful host install
-    /// (e.g. kiro promotes its `aoe-hooks` agent to the active default).
     pub post_install_host: Option<fn()>,
-    /// Set for CLIs whose hooks are scoped to a user-selectable named agent
-    /// rather than applying globally (e.g. Kiro: `--agent NAME` loads only that
-    /// agent's config, and there is no global hooks mechanism). When set and
-    /// the user selected an agent, AoE installs its hooks into that agent's own
-    /// config file instead of the standalone `host_config_subpath` agent, and
-    /// skips `post_install_host`. `None` for agents whose hooks apply
-    /// regardless of which agent is selected. See
-    /// `crate::session::Instance::install_agent_status_hooks`.
     pub selected_agent_hooks: Option<SelectedAgentHooks>,
-    /// On-disk format of the sidecar's config file. Drives marker-presence
-    /// walker dispatch in `crate::hooks::has_aoe_marker`.
     pub format: SidecarFormat,
-    /// Default hook events and statuses for this sidecar format.
     pub events: &'static [SidecarHookEvent],
 }
 
-/// How to install status hooks into a user-selected named agent, for CLIs
-/// whose hooks are scoped to the selected agent (see
-/// [`SidecarHooks::selected_agent_hooks`]). Keeps the flag and path convention
-/// as data on the agent definition rather than a per-agent string match at the
-/// install site.
 #[derive(Debug)]
 pub struct SelectedAgentHooks {
-    /// CLI flag a user passes to choose a named agent (e.g. `"--agent"`).
     pub flag: &'static str,
-    /// Absolute path, under the given agents directory, of the config file the
-    /// CLI actually loads for the selected agent name. The first argument is
-    /// the agents directory to resolve within (host: `$HOME/.kiro/agents`;
-    /// sandbox: the staged `.kiro/sandbox/agents`), the second is the validated
-    /// selected agent name. Resolves by the `name` field inside each config
-    /// rather than the filename, since generator-managed agents name files
-    /// `<prefix>-<name>.json`. See [`crate::hooks::resolve_kiro_agent_file`].
     pub resolve_config_file: fn(&std::path::Path, &str) -> std::path::PathBuf,
 }
 
-/// On-disk format of a sidecar agent's config file. Drives
-/// marker-presence walker dispatch in `crate::hooks::has_aoe_marker`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidecarFormat {
-    /// Settl `[[hooks]]` table in `.settl/config.toml`.
     SettlToml,
-    /// Hermes `hooks: { event: [...] }` map in `.hermes/config.yaml` (or
-    /// `.hermes/sandbox/config.yaml`).
     HermesYaml,
-    /// Kiro per-agent JSON with a flat `hooks.{event}: [{command, ...}]`
-    /// shape under `.kiro/...` agent files.
     KiroJson,
-    /// Kimi Code `[[hooks]]` array of tables in `.kimi-code/config.toml`,
-    /// each `{ event, command }` (matcher/timeout optional). Shares the
-    /// flat-array shape with settl but lives in Kimi's runtime config file,
-    /// which also holds provider/oauth settings, so its installer preserves
-    /// the surrounding document.
     KimiToml,
 }
 
-/// Everything we know about a single agent CLI.
 pub struct AgentDef {
-    /// Canonical name: `"claude"`, `"opencode"`, etc.
     pub name: &'static str,
-    /// Binary to invoke (usually same as name).
     pub binary: &'static str,
-    /// Subcommand token inserted immediately after `binary` when AoE builds the
-    /// default launch command (e.g. `Some("chat")` for kiro → `kiro-cli chat`).
-    /// Required for CLIs whose interactive flags (yolo, `--agent`) live
-    /// on a subcommand rather than the top-level binary: bare
-    /// `kiro-cli --trust-all-tools` is rejected with "unexpected argument",
-    /// while `kiro-cli chat --trust-all-tools` parses. `None` for agents whose
-    /// bare binary already accepts those flags. Only applied to the default
-    /// binary path, never to a user's custom command override.
-    ///
-    /// Must not be combined with [`ResumeStrategy::Subcommand`]: that strategy
-    /// inserts the resume token after the first whitespace token (the binary),
-    /// which would land it before this launch subcommand. The pairing is
-    /// rejected by `test_launch_subcommand_not_combined_with_subcommand_resume`.
+    /// Must not be combined with `ResumeStrategy::Subcommand`, which inserts after the binary.
     pub launch_subcommand: Option<&'static str>,
-    /// Alternative substrings recognised by `resolve_tool_name` (e.g. `"open-code"`).
     pub aliases: &'static [&'static str],
-    /// How to detect availability on the host.
     pub detection: DetectionMethod,
-    /// YOLO/auto-approve configuration.
     pub yolo: Option<YoloMode>,
-    /// CLI flag template for custom instruction injection.
-    /// `{}` is replaced with the shell-escaped instruction text.
     pub instruction_flag: Option<&'static str>,
-    /// Single argv token that runs this agent non-interactively (one-shot),
-    /// printing the model's response to stdout and exiting (e.g. claude `-p`,
-    /// codex `exec`, opencode `run`, gemini `-p`). It is exactly one token,
-    /// placed immediately before the prompt argument, and must NOT contain a
-    /// `{}` placeholder (the prompt is passed as its own argv element, never
-    /// interpolated). `None` means the agent has no known one-shot mode, so
-    /// smart session rename is skipped for it. See `session::smart_rename`.
+    /// One argv token placed before the prompt; never contains a `{}` placeholder.
     pub oneshot_flag: Option<&'static str>,
-    /// If true, `builder.rs` sets `instance.command = binary` for this agent.
     pub set_default_command: bool,
-    /// Status detection function pointer. Takes raw (non-lowercased) pane content.
     pub detect_status: fn(&str) -> Status,
-    /// Environment variables always injected into the container for this agent.
     pub container_env: &'static [(&'static str, &'static str)],
-    /// Hook configuration for file-based status detection. If set, AoE installs
-    /// hooks into the agent's settings file so status is written to a file instead
-    /// of being parsed from tmux pane content.
     pub hook_config: Option<AgentHookConfig>,
-    /// Sidecar hook installer for agents whose config format the generic
-    /// `hook_config` path cannot emit (settl/hermes/kiro). Mutually exclusive
-    /// with `hook_config`.
     pub sidecar_hooks: Option<SidecarHooks>,
-    /// Complete invocation and capture contract, or none when unsupported.
     pub session_support: Option<SessionSupport>,
-    /// How this agent forks a prior session into a new, independent one.
     pub fork_strategy: ForkStrategy,
-    /// If true, this agent can only run on the host (no sandbox/worktree support).
-    /// The new-session dialog hides sandbox and worktree options for these agents.
     pub host_only: bool,
-    /// Milliseconds to wait between sending literal text and the final Enter key.
-    /// Agents with paste-burst detection (e.g. Codex, 120ms window) swallow Enter
-    /// keys that arrive too quickly after a stream of characters, treating them as
-    /// newlines within a paste rather than as "submit". A delay longer than the
-    /// agent's burst window lets the suppression expire before Enter arrives.
+    /// Delay before Enter, for agents whose paste-burst detection swallows a fast Enter.
     pub send_keys_enter_delay_ms: u64,
-    /// Pane-content substring (matched case-insensitively) that indicates
-    /// this agent's TUI has finished booting and is ready to accept input,
-    /// if known. `None` means no such per-agent signal is known yet;
-    /// callers fall back to a generic content-settle heuristic
-    /// (`tmux::Session::wait_until_content_settles`), which cannot tell a
-    /// genuinely idle prompt from a still-booting pane that merely hasn't
-    /// printed anything new in the last couple of samples. Used to avoid
-    /// typing into a pane before the agent is actually listening (see `aoe
-    /// send`'s pre-send wait).
     pub ready_marker: Option<&'static str>,
-    /// One-line install command shown when the agent is missing from PATH.
     pub install_hint: &'static str,
-    /// Static keystroke sequences for answering this agent's own interactive
-    /// permission prompt from the sidebar, without attaching to the pane.
-    /// `None` for every agent whose prompt shape hasn't been mapped yet; the
-    /// respond-to-prompt action is a no-op for those agents. See
-    /// `docs/development/adding-agents.md` for how to determine these
-    /// sequences for a new agent.
     pub permission_response: Option<PermissionResponse>,
-    /// Lifecycle state (active, deprecated, ...). Data-only: rendered by the
-    /// agent-facing surfaces (`aoe agents`, `aoe acp doctor`, spawn warnings,
-    /// TUI picker badge, dashboard), never consulted by support paths.
     pub lifecycle: AgentLifecycle,
 }
 
-/// A tmux keystroke: either literal text sent verbatim (e.g. a menu digit) or
-/// a named tmux key (e.g. `"Enter"`, `"Right"`). See `TmuxSession::send_key_tokens`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyToken {
-    /// Sent as `tmux send-keys -l -- <text>` (literal, no key-name interpretation).
     Literal(&'static str),
-    /// Sent as `tmux send-keys <name>`, e.g. `"Enter"`, `"Right"`.
     Named(&'static str),
 }
 
-/// The keystroke sequences that answer an agent's own interactive
-/// permission prompt, mapped once by hand per agent and never derived from
-/// pane content. The user visually confirms a prompt is actually showing
-/// before invoking the respond-to-prompt action; the software does not detect
-/// or verify it.
 #[derive(Clone, Copy, Debug)]
 pub struct PermissionResponse {
-    /// Keystrokes that select "allow once" / "yes" for this single request.
     pub allow: &'static [KeyToken],
-    /// Keystrokes that select "allow always" / "don't ask again" for the
-    /// remainder of the session. `None` when the agent's prompt has no such
-    /// choice.
     pub allow_always: Option<&'static [KeyToken]>,
-    /// Keystrokes that select "deny" / "no".
     pub deny: &'static [KeyToken],
 }
 
-/// Claude Code `SessionStart` and `UserPromptSubmit` hooks publish the
-/// top-level `session_id` into the instance-keyed sidecar whenever Claude
-/// rotates conversations (`/clear`, `/new`, fork, resume, compact).
-/// This pane-scoped sidecar is the sole automatic identity source.
-///
-/// `idle` has two sources, not just `Stop`. `Stop` does not fire on every
-/// turn-end path: a turn killed by an API error fires `StopFailure` instead,
-/// and a user interrupt fires nothing. Newer Claude Code has a further gap: a
-/// "silent tool stop" (a tool result followed by no text) parks at the prompt
-/// firing neither `Stop` nor `idle_prompt`. Without a second idle signal the
-/// status file stays on the last `running` write and the session sticks on
-/// Running. `Notification` with matcher `idle_prompt` is Claude's explicit
-/// "done working, waiting for the user" signal and fires whenever Claude parks
-/// at the prompt regardless of why the turn ended, so it backstops `Stop`;
-/// `StopFailure` covers the API-error path deterministically. The remaining
-/// gap (silent tool stop) has no hook, so it is recovered pane-side by the
-/// parked-evidence rules in `detect/manifests/claude.toml`.
-///
-/// The `idle_prompt` backstop also introduces a write race: `Stop` and
-/// `UserPromptSubmit` hooks are awaited, but `Notification` hooks are
-/// fire-and-forget, so when a queued prompt submits the moment a turn ends,
-/// the notification's `idle` write can land after `UserPromptSubmit`'s
-/// `running`, leaving the file on `idle` while the new turn generates (no
-/// running-mapped hook fires again until its first `PreToolUse`). The pane's
-/// own running evidence outranks an `idle` write in the detection manifest,
-/// which is what recovers that race.
-///
-/// The `Notification` matchers also carry the agent-view identifiers added in
-/// Claude Code 2.1.198: `agent_needs_input` (background session blocked on the
-/// user → Waiting) rides the permission group, and `agent_completed`
-/// (background session finished/failed → Idle) rides the `idle_prompt` group.
-/// They only fire while Claude's agent view is open, so they are best-effort
-/// extra coverage for that surface, not a substitute for the pane fallback.
-///
-/// `AskUserQuestion` blocks on the user for the tool's entire execution, but
-/// emits no Waiting-mapped hook: `PreToolUse` fires (running) and nothing else
-/// happens until the user answers, so the status file would stick on `running`
-/// the whole time the question is on screen. `waiting_tools` on `PreToolUse`
-/// makes the status command write `waiting` when the payload's `tool_name` is
-/// `AskUserQuestion`, and the `PostToolUse` matcher restores `running` the
-/// moment the answer lands (the rest of the turn is ordinary generation). The
-/// pane-side detection rules stay as the backstop for hooks installed before
-/// this pair existed.
+const fn hook(name: &'static str, status: HookStatus) -> HookEvent {
+    HookEvent {
+        name,
+        matcher: None,
+        status: Some(status),
+        identity_field: None,
+        waiting_tools: &[],
+    }
+}
+
+const fn matched_hook(name: &'static str, matcher: &'static str, status: HookStatus) -> HookEvent {
+    HookEvent {
+        matcher: Some(matcher),
+        ..hook(name, status)
+    }
+}
+
+const fn sidecar(name: &'static str, status: HookStatus) -> SidecarHookEvent {
+    SidecarHookEvent {
+        name,
+        status,
+        identity_field: None,
+    }
+}
+
+/// `Notification`/`idle_prompt` and `StopFailure` backstop `Stop`, which misses API-error and
+/// interrupted turn ends. `waiting_tools` marks `AskUserQuestion` as waiting until `PostToolUse`.
 const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
-        name: "SessionStart",
-        matcher: None,
         status: None,
         identity_field: Some(HookIdentityField::SessionId),
-        waiting_tools: &[],
+        ..hook("SessionStart", HookStatus::Idle)
     },
     HookEvent {
-        name: "PreToolUse",
-        matcher: None,
-        status: Some(HookStatus::Running),
-        identity_field: None,
         waiting_tools: &["AskUserQuestion"],
+        ..hook("PreToolUse", HookStatus::Running)
     },
+    matched_hook("PostToolUse", "AskUserQuestion", HookStatus::Running),
     HookEvent {
-        name: "PostToolUse",
-        matcher: Some("AskUserQuestion"),
-        status: Some(HookStatus::Running),
-        identity_field: None,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "UserPromptSubmit",
-        matcher: None,
-        status: Some(HookStatus::Running),
         identity_field: Some(HookIdentityField::SessionId),
-        waiting_tools: &[],
+        ..hook("UserPromptSubmit", HookStatus::Running)
     },
-    HookEvent {
-        name: "Stop",
-        matcher: None,
-        status: Some(HookStatus::Idle),
-        identity_field: None,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "StopFailure",
-        matcher: None,
-        status: Some(HookStatus::Idle),
-        identity_field: None,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "Notification",
-        matcher: Some("permission_prompt|elicitation_dialog|agent_needs_input"),
-        status: Some(HookStatus::Waiting),
-        identity_field: None,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "Notification",
-        matcher: Some("idle_prompt|agent_completed"),
-        status: Some(HookStatus::Idle),
-        identity_field: None,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "ElicitationResult",
-        matcher: None,
-        status: Some(HookStatus::Running),
-        identity_field: None,
-        waiting_tools: &[],
-    },
+    hook("Stop", HookStatus::Idle),
+    hook("StopFailure", HookStatus::Idle),
+    matched_hook(
+        "Notification",
+        "permission_prompt|elicitation_dialog|agent_needs_input",
+        HookStatus::Waiting,
+    ),
+    matched_hook(
+        "Notification",
+        "idle_prompt|agent_completed",
+        HookStatus::Idle,
+    ),
+    hook("ElicitationResult", HookStatus::Running),
 ];
-/// Cursor's native beforeSubmitPrompt hook publishes the stable conversation_id.
+
 /// generation_id is turn-scoped and must never be used as resume identity.
 const CURSOR_HOOK_EVENTS: &[SidecarHookEvent] = &[
     SidecarHookEvent {
-        name: "beforeSubmitPrompt",
-        status: HookStatus::Running,
         identity_field: Some(HookIdentityField::ConversationIdOrSessionId),
+        ..sidecar("beforeSubmitPrompt", HookStatus::Running)
     },
-    SidecarHookEvent {
-        name: "stop",
-        status: HookStatus::Idle,
-        identity_field: None,
-    },
-];
-/// Qwen Code uses the Claude-style event schema. PostToolUse clears waiting
-/// after a permission prompt is approved and the tool completes.
-const QWEN_HOOK_EVENTS: &[HookEvent] = &[
-    HookEvent {
-        name: "PreToolUse",
-        matcher: None,
-        status: Some(HookStatus::Running),
-        identity_field: None,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "UserPromptSubmit",
-        matcher: None,
-        status: Some(HookStatus::Running),
-        identity_field: None,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "PostToolUse",
-        matcher: None,
-        status: Some(HookStatus::Running),
-        identity_field: None,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "Stop",
-        matcher: None,
-        status: Some(HookStatus::Idle),
-        identity_field: None,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "Notification",
-        matcher: Some("permission_prompt|elicitation_dialog"),
-        status: Some(HookStatus::Waiting),
-        identity_field: None,
-        waiting_tools: &[],
-    },
+    sidecar("stop", HookStatus::Idle),
 ];
 
-/// Codex hook events. AoE installs these into `~/.codex/hooks.json`.
+const QWEN_HOOK_EVENTS: &[HookEvent] = &[
+    hook("PreToolUse", HookStatus::Running),
+    hook("UserPromptSubmit", HookStatus::Running),
+    hook("PostToolUse", HookStatus::Running),
+    hook("Stop", HookStatus::Idle),
+    matched_hook(
+        "Notification",
+        "permission_prompt|elicitation_dialog",
+        HookStatus::Waiting,
+    ),
+];
+
 const CODEX_HOOK_EVENTS: &[HookEvent] = &[
-    HookEvent {
-        name: "SessionStart",
-        matcher: None,
-        status: Some(HookStatus::Idle),
-        identity_field: None,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "UserPromptSubmit",
-        matcher: None,
-        status: Some(HookStatus::Running),
-        identity_field: None,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "PreToolUse",
-        matcher: None,
-        status: Some(HookStatus::Running),
-        identity_field: None,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "PermissionRequest",
-        matcher: None,
-        status: Some(HookStatus::Waiting),
-        identity_field: None,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "PostToolUse",
-        matcher: None,
-        status: Some(HookStatus::Running),
-        identity_field: None,
-        waiting_tools: &[],
-    },
-    HookEvent {
-        name: "Stop",
-        matcher: None,
-        status: Some(HookStatus::Idle),
-        identity_field: None,
-        waiting_tools: &[],
-    },
+    hook("SessionStart", HookStatus::Idle),
+    hook("UserPromptSubmit", HookStatus::Running),
+    hook("PreToolUse", HookStatus::Running),
+    hook("PermissionRequest", HookStatus::Waiting),
+    hook("PostToolUse", HookStatus::Running),
+    hook("Stop", HookStatus::Idle),
+];
+
+const GEMINI_HOOK_EVENTS: &[HookEvent] = &[
+    hook("BeforeTool", HookStatus::Running),
+    hook("BeforeAgent", HookStatus::Running),
+    hook("AfterAgent", HookStatus::Idle),
+    matched_hook("Notification", "ToolPermission", HookStatus::Waiting),
 ];
 
 pub(crate) const SETTL_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
-    SidecarHookEvent {
-        name: "TurnStarted",
-        status: HookStatus::Running,
-        identity_field: None,
-    },
-    SidecarHookEvent {
-        name: "WaitingForHuman",
-        status: HookStatus::Waiting,
-        identity_field: None,
-    },
-    SidecarHookEvent {
-        name: "GameWon",
-        status: HookStatus::Idle,
-        identity_field: None,
-    },
+    sidecar("TurnStarted", HookStatus::Running),
+    sidecar("WaitingForHuman", HookStatus::Waiting),
+    sidecar("GameWon", HookStatus::Idle),
 ];
 
 pub(crate) const HERMES_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
-    SidecarHookEvent {
-        name: "pre_llm_call",
-        status: HookStatus::Running,
-        identity_field: None,
-    },
-    SidecarHookEvent {
-        name: "pre_tool_call",
-        status: HookStatus::Running,
-        identity_field: None,
-    },
-    SidecarHookEvent {
-        name: "post_llm_call",
-        status: HookStatus::Idle,
-        identity_field: None,
-    },
-    SidecarHookEvent {
-        name: "pre_approval_request",
-        status: HookStatus::Waiting,
-        identity_field: None,
-    },
-    SidecarHookEvent {
-        name: "post_approval_response",
-        status: HookStatus::Running,
-        identity_field: None,
-    },
-    SidecarHookEvent {
-        name: "on_session_end",
-        status: HookStatus::Idle,
-        identity_field: None,
-    },
+    sidecar("pre_llm_call", HookStatus::Running),
+    sidecar("pre_tool_call", HookStatus::Running),
+    sidecar("post_llm_call", HookStatus::Idle),
+    sidecar("pre_approval_request", HookStatus::Waiting),
+    sidecar("post_approval_response", HookStatus::Running),
+    sidecar("on_session_end", HookStatus::Idle),
 ];
 
 pub(crate) const KIRO_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
-    SidecarHookEvent {
-        name: "preToolUse",
-        status: HookStatus::Running,
-        identity_field: None,
-    },
-    SidecarHookEvent {
-        name: "userPromptSubmit",
-        status: HookStatus::Running,
-        identity_field: None,
-    },
-    SidecarHookEvent {
-        name: "stop",
-        status: HookStatus::Idle,
-        identity_field: None,
-    },
+    sidecar("preToolUse", HookStatus::Running),
+    sidecar("userPromptSubmit", HookStatus::Running),
+    sidecar("stop", HookStatus::Idle),
 ];
 
-/// Kimi Code hook events. AoE writes these into `~/.kimi-code/config.toml`
-/// as `[[hooks]]` entries. Kimi exposes dedicated permission events
-/// (`PermissionRequest` / `PermissionResult`), so the waiting/running
-/// transition needs no `Notification` matcher the way Claude's does.
-/// `StopFailure` backstops `Stop` for the API-error turn-end path.
 pub(crate) const KIMI_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
-    SidecarHookEvent {
-        name: "UserPromptSubmit",
-        status: HookStatus::Running,
-        identity_field: None,
-    },
-    SidecarHookEvent {
-        name: "PreToolUse",
-        status: HookStatus::Running,
-        identity_field: None,
-    },
-    SidecarHookEvent {
-        name: "PermissionRequest",
-        status: HookStatus::Waiting,
-        identity_field: None,
-    },
-    SidecarHookEvent {
-        name: "PermissionResult",
-        status: HookStatus::Running,
-        identity_field: None,
-    },
-    SidecarHookEvent {
-        name: "Stop",
-        status: HookStatus::Idle,
-        identity_field: None,
-    },
-    SidecarHookEvent {
-        name: "StopFailure",
-        status: HookStatus::Idle,
-        identity_field: None,
-    },
+    sidecar("UserPromptSubmit", HookStatus::Running),
+    sidecar("PreToolUse", HookStatus::Running),
+    sidecar("PermissionRequest", HookStatus::Waiting),
+    sidecar("PermissionResult", HookStatus::Running),
+    sidecar("Stop", HookStatus::Idle),
+    sidecar("StopFailure", HookStatus::Idle),
 ];
 
 const fn session_support(
@@ -838,17 +420,51 @@ const fn resume_only(resume: ResumeStrategy) -> Option<SessionSupport> {
     })
 }
 
-pub const AGENTS: &[AgentDef] = &[
+const fn json_hooks(
+    settings_rel_path: &'static str,
+    events: &'static [HookEvent],
+    format: HookFormat,
+) -> Option<AgentHookConfig> {
+    Some(AgentHookConfig {
+        settings_rel_path,
+        config_dir_env_var: None,
+        events,
+        format,
+    })
+}
+
+/// Defaults shared by every registry entry; each entry overrides what differs.
+const fn agent(name: &'static str, binary: &'static str, install_hint: &'static str) -> AgentDef {
     AgentDef {
-        name: "claude",
-        oneshot_flag: Some("-p"),
-        binary: "claude",
+        name,
+        binary,
         launch_subcommand: None,
         aliases: &[],
-        detection: DetectionMethod::Which("claude"),
+        detection: DetectionMethod::Which(binary),
+        yolo: None,
+        instruction_flag: None,
+        oneshot_flag: None,
+        set_default_command: false,
+        detect_status: status_detection::detect_hook_only_status,
+        container_env: &[],
+        hook_config: None,
+        sidecar_hooks: None,
+        session_support: None,
+        fork_strategy: ForkStrategy::Unsupported,
+        host_only: false,
+        send_keys_enter_delay_ms: 0,
+        ready_marker: None,
+        install_hint,
+        permission_response: None,
+        lifecycle: AgentLifecycle::Active,
+    }
+}
+
+pub const AGENTS: &[AgentDef] = &[
+    AgentDef {
+        oneshot_flag: Some("-p"),
         yolo: Some(YoloMode::CliFlag("--dangerously-skip-permissions")),
         instruction_flag: Some("--append-system-prompt {}"),
-        set_default_command: false,
         detect_status: status_detection::detect_claude_status,
         container_env: &[("CLAUDE_CONFIG_DIR", "/root/.claude")],
         hook_config: Some(AgentHookConfig {
@@ -857,49 +473,35 @@ pub const AGENTS: &[AgentDef] = &[
             events: CLAUDE_HOOK_EVENTS,
             format: HookFormat::JsonSettings,
         }),
-        sidecar_hooks: None,
         session_support: session_support(
             ResumeStrategy::FlagPair {
-            existing: "--resume",
-            new_session: "--session-id",
+                existing: "--resume",
+                new_session: "--session-id",
             },
             SessionCaptureBackend::Claude,
             SessionCaptureContext::PaneScoped,
             SessionCaptureContext::PaneScoped,
         ),
         fork_strategy: ForkStrategy::ClaudeFork,
-        host_only: false,
-        // Claude Code has paste-burst suppression like Codex. Its input handler
-        // (usePasteHandler.ts) sets PASTE_COMPLETION_TIMEOUT_MS = 100 and, while a
-        // bracketed paste is still pending, appends any incoming Enter to the paste
-        // buffer instead of submitting it. When we send the message via
-        // send_via_paste_buffer and fire Enter immediately (0ms), that Enter lands
-        // inside the 100ms window and is swallowed, leaving an unsubmitted
-        // "[Pasted text]" placeholder. 150ms > 100ms lets the window expire first.
+        // Claude's 100ms paste completion window swallows an earlier Enter.
         send_keys_enter_delay_ms: 150,
-        ready_marker: None,
-        install_hint: "npm install -g @anthropic-ai/claude-code",
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Literal("1")],
             allow_always: Some(&[KeyToken::Literal("2")]),
             deny: &[KeyToken::Literal("3")],
         }),
-        lifecycle: AgentLifecycle::Active,
+        ..agent(
+            "claude",
+            "claude",
+            "npm install -g @anthropic-ai/claude-code",
+        )
     },
     AgentDef {
-        name: "opencode",
         oneshot_flag: Some("run"),
-        binary: "opencode",
-        launch_subcommand: None,
         aliases: &["open-code"],
-        detection: DetectionMethod::Which("opencode"),
         yolo: Some(YoloMode::EnvVar("OPENCODE_PERMISSION", r#"{"*":"allow"}"#)),
-        instruction_flag: None,
         set_default_command: true,
         detect_status: status_detection::detect_opencode_status,
-        container_env: &[],
-        hook_config: None,
-        sidecar_hooks: None,
         session_support: session_support(
             ResumeStrategy::Flag("--session"),
             SessionCaptureBackend::OpenCode,
@@ -907,14 +509,7 @@ pub const AGENTS: &[AgentDef] = &[
             SessionCaptureContext::Unsupported,
         ),
         fork_strategy: ForkStrategy::Flag("--fork"),
-        host_only: false,
-        send_keys_enter_delay_ms: 0,
-        // Live-tested by an external headless-dispatch wrapper against
-        // real unattended runs: opencode's TUI shows this placeholder in
-        // its input box once it's finished booting and is ready to accept
-        // input, well before it necessarily prints anything else.
         ready_marker: Some("ask anything"),
-        install_hint: "curl -fsSL https://opencode.ai/install | bash",
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Named("Enter")],
             allow_always: Some(&[
@@ -928,54 +523,33 @@ pub const AGENTS: &[AgentDef] = &[
                 KeyToken::Named("Enter"),
             ],
         }),
-        lifecycle: AgentLifecycle::Active,
+        ..agent(
+            "opencode",
+            "opencode",
+            "curl -fsSL https://opencode.ai/install | bash",
+        )
     },
     AgentDef {
-        name: "vibe",
-        oneshot_flag: None,
-        binary: "vibe",
-        launch_subcommand: None,
         aliases: &["mistral-vibe"],
         detection: DetectionMethod::RunWithArg("vibe", "--version"),
         yolo: Some(YoloMode::CliFlag("--agent auto-approve")),
-        instruction_flag: None,
-        set_default_command: false,
         detect_status: status_detection::detect_vibe_status,
-        container_env: &[],
-        hook_config: None,
-        sidecar_hooks: None,
         session_support: resume_only(ResumeStrategy::Flag("--resume")),
-        fork_strategy: ForkStrategy::Unsupported,
-        host_only: false,
-        send_keys_enter_delay_ms: 0,
-        ready_marker: None,
-        install_hint: "pip install mistral-vibe",
-        permission_response: None,
-        lifecycle: AgentLifecycle::Active,
+        ..agent("vibe", "vibe", "pip install mistral-vibe")
     },
     AgentDef {
-        name: "codex",
         oneshot_flag: Some("exec"),
-        binary: "codex",
-        launch_subcommand: None,
-        aliases: &[],
-        detection: DetectionMethod::Which("codex"),
         yolo: Some(YoloMode::CliFlag(
             "--dangerously-bypass-approvals-and-sandbox",
         )),
         instruction_flag: Some("--config developer_instructions={}"),
         set_default_command: true,
         detect_status: status_detection::detect_codex_status,
-        container_env: &[],
-        hook_config: Some(AgentHookConfig {
-            settings_rel_path: ".codex/hooks.json",
-            // Codex's config dir resolves via `CODEX_HOME`, not a generic
-            // `config_dir_env_var`; the `CodexJson` writer handles that itself.
-            config_dir_env_var: None,
-            events: CODEX_HOOK_EVENTS,
-            format: HookFormat::CodexJson,
-        }),
-        sidecar_hooks: None,
+        hook_config: json_hooks(
+            ".codex/hooks.json",
+            CODEX_HOOK_EVENTS,
+            HookFormat::CodexJson,
+        ),
         session_support: session_support(
             ResumeStrategy::Subcommand("resume"),
             SessionCaptureBackend::Codex,
@@ -983,99 +557,42 @@ pub const AGENTS: &[AgentDef] = &[
             SessionCaptureContext::ManagedExclusiveStore,
         ),
         fork_strategy: ForkStrategy::CodexFork,
-        host_only: false,
-        // Codex has paste-burst detection with a 120ms Enter-suppression window;
-        // Enter keys arriving within that window after a character stream are
-        // swallowed as newlines instead of triggering submit. 150ms > 120ms.
+        // Codex's 120ms paste-burst window swallows an earlier Enter.
         send_keys_enter_delay_ms: 150,
-        ready_marker: None,
-        install_hint: "npm install -g @openai/codex",
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Literal("y")],
             allow_always: Some(&[KeyToken::Literal("a")]),
             deny: &[KeyToken::Literal("d")],
         }),
-        lifecycle: AgentLifecycle::Active,
+        ..agent("codex", "codex", "npm install -g @openai/codex")
     },
     AgentDef {
-        name: "gemini",
         oneshot_flag: Some("-p"),
-        binary: "gemini",
-        launch_subcommand: None,
-        aliases: &[],
-        detection: DetectionMethod::Which("gemini"),
         yolo: Some(YoloMode::CliFlag("--approval-mode yolo")),
-        instruction_flag: None,
-        set_default_command: false,
         detect_status: status_detection::detect_gemini_status,
-        container_env: &[],
-        hook_config: Some(AgentHookConfig {
-            settings_rel_path: ".gemini/settings.json",
-            config_dir_env_var: None,
-            events: &[
-                HookEvent {
-                    name: "BeforeTool",
-                    matcher: None,
-                    status: Some(HookStatus::Running),
-                    identity_field: None,
-                    waiting_tools: &[],
-                },
-                HookEvent {
-                    name: "BeforeAgent",
-                    matcher: None,
-                    status: Some(HookStatus::Running),
-                    identity_field: None,
-                    waiting_tools: &[],
-                },
-                HookEvent {
-                    name: "AfterAgent",
-                    matcher: None,
-                    status: Some(HookStatus::Idle),
-                    identity_field: None,
-                    waiting_tools: &[],
-                },
-                HookEvent {
-                    name: "Notification",
-                    matcher: Some("ToolPermission"),
-                    status: Some(HookStatus::Waiting),
-                    identity_field: None,
-                    waiting_tools: &[],
-                },
-            ],
-            format: HookFormat::JsonSettings,
-        }),
-        sidecar_hooks: None,
+        hook_config: json_hooks(
+            ".gemini/settings.json",
+            GEMINI_HOOK_EVENTS,
+            HookFormat::JsonSettings,
+        ),
         session_support: session_support(
             ResumeStrategy::Flag("--resume"),
             SessionCaptureBackend::Gemini,
             SessionCaptureContext::Unsupported,
             SessionCaptureContext::ManagedExclusiveStore,
         ),
-        fork_strategy: ForkStrategy::Unsupported,
-        host_only: false,
-        send_keys_enter_delay_ms: 0,
-        ready_marker: None,
-        install_hint: "npm install -g @google/gemini-cli",
-        permission_response: None,
         lifecycle: AgentLifecycle::Deprecated {
             since: "2026-06-18",
             note: "consumer accounts cut off by Google; enterprise/API-key remain valid",
             replacement: Some("antigravity"),
         },
+        ..agent("gemini", "gemini", "npm install -g @google/gemini-cli")
     },
     AgentDef {
-        name: "cursor",
-        oneshot_flag: None,
-        binary: "agent",
-        launch_subcommand: None,
         aliases: &["agent"],
-        detection: DetectionMethod::Which("agent"),
         yolo: Some(YoloMode::CliFlag("--yolo")),
-        instruction_flag: None,
-        set_default_command: false,
         detect_status: status_detection::detect_cursor_status,
         container_env: &[("CURSOR_CONFIG_DIR", "/root/.cursor")],
-        hook_config: None,
         sidecar_hooks: Some(SidecarHooks {
             host_config_subpath: ".cursor/hooks.json",
             sandbox_config_subpath: ".cursor/sandbox/hooks.json",
@@ -1092,114 +609,50 @@ pub const AGENTS: &[AgentDef] = &[
             SessionCaptureContext::PaneScoped,
             SessionCaptureContext::PaneScoped,
         ),
-        fork_strategy: ForkStrategy::Unsupported,
-        host_only: false,
-        send_keys_enter_delay_ms: 0,
-        ready_marker: None,
-        install_hint: "see https://docs.cursor.com/cli",
-        permission_response: None,
-        lifecycle: AgentLifecycle::Active,
+        ..agent("cursor", "agent", "see https://docs.cursor.com/cli")
     },
     AgentDef {
-        name: "copilot",
         oneshot_flag: Some("-p"),
-        binary: "copilot",
-        launch_subcommand: None,
         aliases: &["github-copilot"],
-        detection: DetectionMethod::Which("copilot"),
         yolo: Some(YoloMode::CliFlag("--yolo")),
-        instruction_flag: None,
-        set_default_command: false,
         detect_status: status_detection::detect_copilot_status,
         container_env: &[("COPILOT_CONFIG_DIR", "/root/.copilot")],
-        hook_config: None,
-        sidecar_hooks: None,
-        // Copilot exposes native resume argv but no verified pane-to-row
-        // ownership source for automatic capture.
         session_support: resume_only(ResumeStrategy::Flag("--session-id")),
-        fork_strategy: ForkStrategy::Unsupported,
-        host_only: false,
-        send_keys_enter_delay_ms: 0,
-        ready_marker: None,
-        install_hint: "see https://docs.github.com/en/copilot/github-copilot-in-the-cli",
-        permission_response: None,
-        lifecycle: AgentLifecycle::Active,
+        ..agent(
+            "copilot",
+            "copilot",
+            "see https://docs.github.com/en/copilot/github-copilot-in-the-cli",
+        )
     },
     AgentDef {
-        name: "pi",
-        oneshot_flag: None,
-        binary: "pi",
-        launch_subcommand: None,
-        aliases: &[],
-        detection: DetectionMethod::Which("pi"),
-        // Pi runs in full YOLO mode by default (no approval gates), so no flag needed.
         yolo: Some(YoloMode::AlwaysYolo),
-        instruction_flag: None,
-        set_default_command: false,
         detect_status: status_detection::detect_pi_status,
         container_env: &[("PI_CODING_AGENT_DIR", "/root/.pi/agent")],
-        hook_config: None,
-        sidecar_hooks: None,
-        // `--session-id` both creates and attaches, so it carries a pinned
-        // id; `--session` (every pi version) only resumes one already on
-        // file, and is what an unpinnable binary falls back to. See
-        // `pi_supports_session_id_flag`.
+        // `--session-id` pins a new id; `--session` only resumes an existing one.
         session_support: session_support(
             ResumeStrategy::FlagPair {
-            existing: "--session",
-            new_session: "--session-id",
+                existing: "--session",
+                new_session: "--session-id",
             },
             SessionCaptureBackend::Pi,
             SessionCaptureContext::PaneScoped,
             SessionCaptureContext::PaneScoped,
         ),
-        fork_strategy: ForkStrategy::Unsupported,
-        host_only: false,
-        send_keys_enter_delay_ms: 0,
-        ready_marker: None,
-        install_hint: "npm install -g @earendil-works/pi-coding-agent",
-        permission_response: None,
-        lifecycle: AgentLifecycle::Active,
+        ..agent(
+            "pi",
+            "pi",
+            "npm install -g @earendil-works/pi-coding-agent",
+        )
     },
     AgentDef {
-        name: "droid",
-        oneshot_flag: None,
-        binary: "droid",
-        launch_subcommand: None,
         aliases: &["factory-droid"],
-        detection: DetectionMethod::Which("droid"),
         yolo: Some(YoloMode::CliFlag("--skip-permissions-unsafe")),
-        instruction_flag: None,
-        set_default_command: false,
         detect_status: status_detection::detect_droid_status,
-        container_env: &[],
-        hook_config: None,
-        sidecar_hooks: None,
-        session_support: None,
-        fork_strategy: ForkStrategy::Unsupported,
-        host_only: false,
-        send_keys_enter_delay_ms: 0,
-        ready_marker: None,
-        install_hint: "npm install -g droid",
-        permission_response: None,
-        lifecycle: AgentLifecycle::Active,
+        ..agent("droid", "droid", "npm install -g droid")
     },
     AgentDef {
-        name: "settl",
-        oneshot_flag: None,
-        binary: "settl",
-        launch_subcommand: None,
         aliases: &["settlers", "catan"],
-        detection: DetectionMethod::Which("settl"),
         yolo: Some(YoloMode::AlwaysYolo),
-        instruction_flag: None,
-        set_default_command: false,
-        detect_status: status_detection::detect_hook_only_status,
-        container_env: &[],
-        // settl uses TOML config (`[[hooks]]` entries), not the JSON
-        // settings.json schema, so it installs via a sidecar hook. host_only,
-        // so the sandbox subpath is unused.
-        hook_config: None,
         sidecar_hooks: Some(SidecarHooks {
             host_config_subpath: ".settl/config.toml",
             sandbox_config_subpath: "",
@@ -1210,37 +663,17 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::SettlToml,
             events: SETTL_SIDECAR_EVENTS,
         }),
-        session_support: None,
-        fork_strategy: ForkStrategy::Unsupported,
         host_only: true,
-        send_keys_enter_delay_ms: 0,
-        ready_marker: None,
-        install_hint: "brew install --cask mozilla-ai/tap/settl",
-        permission_response: None,
-        lifecycle: AgentLifecycle::Active,
+        ..agent(
+            "settl",
+            "settl",
+            "brew install --cask mozilla-ai/tap/settl",
+        )
     },
     AgentDef {
-        name: "hermes",
-        oneshot_flag: None,
-        binary: "hermes",
-        launch_subcommand: None,
-        aliases: &[],
-        detection: DetectionMethod::Which("hermes"),
         yolo: Some(YoloMode::CliFlag("--yolo")),
-        instruction_flag: None,
-        set_default_command: false,
-        // Status is detected via Hermes's shell-hook system (YAML config),
-        // installed by hooks::install_hermes_hooks(); the stub here just
-        // returns Idle as a fallback before the first hook fires.
         detect_status: status_detection::detect_hermes_status,
-        // HERMES_ACCEPT_HOOKS bypasses the first-use TTY consent prompt for
-        // shell hooks. Hermes still gates each (event, command) on its
-        // allowlist file, which AoE pre-populates in install_hermes_hooks.
         container_env: &[("HERMES_ACCEPT_HOOKS", "1")],
-        // Hermes uses YAML (`hooks: { event: [...] }`) rather than the
-        // JSON settings.json schema shared by Claude/Cursor/Gemini, so it
-        // installs via a sidecar hook rather than hook_config.
-        hook_config: None,
         sidecar_hooks: Some(SidecarHooks {
             host_config_subpath: ".hermes/config.yaml",
             sandbox_config_subpath: ".hermes/sandbox/config.yaml",
@@ -1257,47 +690,23 @@ pub const AGENTS: &[AgentDef] = &[
             SessionCaptureContext::Unsupported,
             SessionCaptureContext::ManagedExclusiveStore,
         ),
-        fork_strategy: ForkStrategy::Unsupported,
-        host_only: false,
-        send_keys_enter_delay_ms: 0,
-        ready_marker: None,
-        install_hint:
+        ..agent(
+            "hermes",
+            "hermes",
             "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash",
-        permission_response: None,
-        lifecycle: AgentLifecycle::Active,
+        )
     },
     AgentDef {
-        name: "kiro",
-        oneshot_flag: None,
-        binary: "kiro-cli",
-        // Kiro's interactive flags (--trust-all-tools, --agent)
-        // are defined on the `chat` subcommand. Bare `kiro-cli --trust-all-tools`
-        // fails with "unexpected argument"; `kiro-cli chat ...` parses.
         launch_subcommand: Some("chat"),
         aliases: &["kiro-cli"],
-        detection: DetectionMethod::Which("kiro-cli"),
         yolo: Some(YoloMode::CliFlag("--trust-all-tools")),
-        instruction_flag: None,
-        set_default_command: false,
-        detect_status: status_detection::detect_hook_only_status,
         container_env: &[("KIRO_CONFIG_DIR", "/root/.kiro")],
-        // Kiro uses a per-agent JSON config (lowercase event names, flat
-        // {command} objects) rather than the JSON settings.json schema shared
-        // by Claude/Cursor/Gemini, so it installs via a sidecar hook. Status
-        // comes from the hook sidecar file written by install_kiro_hooks; the
-        // pane stub is unused. post_install_host promotes the aoe-hooks agent
-        // to Kiro's active default.
-        hook_config: None,
         sidecar_hooks: Some(SidecarHooks {
             host_config_subpath: crate::hooks::KIRO_HOOKS_AGENT_FILE,
             sandbox_config_subpath: ".kiro/sandbox/agents/aoe-hooks.json",
             install: crate::hooks::install_kiro_hooks_with_events,
             uninstall: crate::hooks::uninstall_kiro_hooks,
             post_install_host: Some(crate::hooks::set_kiro_default_agent_if_builtin),
-            // Kiro scopes hooks to the agent selected by `--agent`; when the
-            // user picks their own agent, install hooks into that agent's file
-            // (Kiro has no global hooks) instead of the standalone aoe-hooks
-            // agent, and skip the set-default promotion above.
             selected_agent_hooks: Some(SelectedAgentHooks {
                 flag: "--agent",
                 resolve_config_file: crate::hooks::resolve_kiro_agent_file,
@@ -1305,86 +714,38 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::KiroJson,
             events: KIRO_SIDECAR_EVENTS,
         }),
-        // Kiro's native identity payload shape is not verified.
-        session_support: None,
-        fork_strategy: ForkStrategy::Unsupported,
-        host_only: false,
-        send_keys_enter_delay_ms: 0,
-        ready_marker: None,
-        install_hint: "curl -fsSL https://cli.kiro.dev/install | bash",
-        permission_response: None,
-        lifecycle: AgentLifecycle::Active,
+        ..agent(
+            "kiro",
+            "kiro-cli",
+            "curl -fsSL https://cli.kiro.dev/install | bash",
+        )
     },
     AgentDef {
-        name: "qwen",
-        oneshot_flag: None,
-        binary: "qwen",
-        launch_subcommand: None,
-        aliases: &[],
-        detection: DetectionMethod::Which("qwen"),
         yolo: Some(YoloMode::CliFlag("--yolo")),
         instruction_flag: Some("--append-system-prompt {}"),
-        set_default_command: false,
         detect_status: status_detection::detect_qwen_status,
-        container_env: &[],
-        hook_config: Some(AgentHookConfig {
-            settings_rel_path: ".qwen/settings.json",
-            config_dir_env_var: None,
-            events: QWEN_HOOK_EVENTS,
-            format: HookFormat::JsonSettings,
-        }),
-        sidecar_hooks: None,
-        // Qwen's native identity payload shape is not verified.
-        session_support: None,
-        fork_strategy: ForkStrategy::Unsupported,
-        host_only: false,
-        send_keys_enter_delay_ms: 0,
-        ready_marker: None,
-        install_hint: "npm install -g @qwen-code/qwen-code",
-        permission_response: None,
-        lifecycle: AgentLifecycle::Active,
+        hook_config: json_hooks(
+            ".qwen/settings.json",
+            QWEN_HOOK_EVENTS,
+            HookFormat::JsonSettings,
+        ),
+        ..agent("qwen", "qwen", "npm install -g @qwen-code/qwen-code")
     },
     AgentDef {
-        name: "antigravity",
-        oneshot_flag: None,
-        binary: "agy",
-        launch_subcommand: None,
         aliases: &["agy"],
-        detection: DetectionMethod::Which("agy"),
         yolo: Some(YoloMode::CliFlag("--dangerously-skip-permissions")),
-        instruction_flag: None,
-        set_default_command: false,
         detect_status: status_detection::detect_antigravity_status,
-        container_env: &[],
-        hook_config: None,
-        sidecar_hooks: None,
-        session_support: None,
-        fork_strategy: ForkStrategy::Unsupported,
-        host_only: false,
-        send_keys_enter_delay_ms: 0,
-        ready_marker: None,
-        install_hint: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
-        permission_response: None,
-        lifecycle: AgentLifecycle::Active,
+        ..agent(
+            "antigravity",
+            "agy",
+            "curl -fsSL https://antigravity.google/cli/install.sh | bash",
+        )
     },
     AgentDef {
-        name: "kimi",
         oneshot_flag: Some("-p"),
-        binary: "kimi",
-        launch_subcommand: None,
         aliases: &["kimi-code"],
-        detection: DetectionMethod::Which("kimi"),
         yolo: Some(YoloMode::CliFlag("--yolo")),
-        instruction_flag: None,
-        set_default_command: false,
-        detect_status: status_detection::detect_hook_only_status,
         container_env: &[("KIMI_CODE_HOME", "/root/.kimi-code")],
-        // Kimi Code stores hooks as `[[hooks]]` entries in its runtime
-        // `config.toml` (which also holds provider/oauth settings), so it
-        // installs via a sidecar hook rather than the JSON settings.json
-        // path. Status comes from the hook sidecar file; the pane stub is
-        // unused.
-        hook_config: None,
         sidecar_hooks: Some(SidecarHooks {
             host_config_subpath: ".kimi-code/config.toml",
             sandbox_config_subpath: ".kimi-code/sandbox/config.toml",
@@ -1395,107 +756,62 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::KimiToml,
             events: KIMI_SIDECAR_EVENTS,
         }),
-        // Kimi resume is enabled only in a sandbox whose exact mounted store,
-        // container cwd, launch floor, and ownership lease are all controlled.
-        // Host store capture is unsupported.
         session_support: session_support(
             ResumeStrategy::Flag("--session"),
             SessionCaptureBackend::Kimi,
             SessionCaptureContext::Unsupported,
             SessionCaptureContext::ManagedExclusiveStore,
         ),
-        fork_strategy: ForkStrategy::Unsupported,
-        host_only: false,
-        send_keys_enter_delay_ms: 0,
-        ready_marker: None,
-        install_hint: "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
-        permission_response: None,
-        lifecycle: AgentLifecycle::Active,
+        ..agent(
+            "kimi",
+            "kimi",
+            "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
+        )
     },
     AgentDef {
-        name: "omp",
         oneshot_flag: Some("-p"),
-        binary: "omp",
-        launch_subcommand: None,
-        aliases: &[],
-        detection: DetectionMethod::Which("omp"),
         yolo: Some(YoloMode::CliFlag("--auto-approve")),
         instruction_flag: Some("--append-system-prompt {}"),
-        set_default_command: false,
         detect_status: status_detection::detect_omp_status,
         container_env: &[("PI_CODING_AGENT_DIR", "/root/.omp/agent")],
-        hook_config: None,
-        sidecar_hooks: None,
         session_support: session_support(
             ResumeStrategy::Flag("--resume"),
             SessionCaptureBackend::Omp,
             SessionCaptureContext::PaneScoped,
             SessionCaptureContext::PaneScoped,
         ),
-        fork_strategy: ForkStrategy::Unsupported,
-        host_only: false,
-        send_keys_enter_delay_ms: 0,
-        ready_marker: None,
-        install_hint: "curl -fsSL https://omp.sh/install | sh",
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Named("Enter")],
             allow_always: None,
             deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
         }),
-        lifecycle: AgentLifecycle::Active,
+        ..agent("omp", "omp", "curl -fsSL https://omp.sh/install | sh")
     },
     AgentDef {
-        name: "prime-agent",
         oneshot_flag: Some("-p"),
-        binary: "prime-agent",
-        launch_subcommand: None,
-        aliases: &[],
-        detection: DetectionMethod::Which("prime-agent"),
-        // Prime Agent executes model-generated Python and project commands
-        // with the user's permissions and has no built-in approval gate
-        // (upstream ships permission gating only as an example extension),
-        // so like its pi ancestor it runs YOLO by default and no flag is
-        // needed.
         yolo: Some(YoloMode::AlwaysYolo),
         instruction_flag: Some("--append-system-prompt {}"),
-        set_default_command: false,
-        detect_status: status_detection::detect_hook_only_status,
         container_env: &[(
             "PRIME_AGENT_CODING_AGENT_DIR",
             crate::session::config::container_config::PRIME_AGENT_DIR_IN_CONTAINER,
         )],
-        // Level 3 (hooks) is skipped by design: upstream has no hook system
-        // at all (no Claude/Codex/Kiro-style config file to write), so status
-        // stays on the stub below.
-        hook_config: None,
-        sidecar_hooks: None,
         session_support: session_support(
             ResumeStrategy::Flag("--resume"),
             SessionCaptureBackend::PrimeAgent,
             SessionCaptureContext::Unsupported,
             SessionCaptureContext::ManagedExclusiveStore,
         ),
-        // Upstream `--fork <path|id>` requires the parent id as its value,
-        // but build_fork_flags' Flag arm appends the fork flag bare after
-        // `<resume> <parent_id>`, which prime-agent's parser silently drops
-        // (an unknown valueless flag), so a fork would quietly not fork.
-        // Unsupported keeps terminal_agent_can_fork fail-closed until a
-        // value-carrying fork variant exists.
+        // `--fork` needs the parent id as its value, which `ForkStrategy::Flag` does not emit.
         fork_strategy: ForkStrategy::Unsupported,
-        host_only: false,
-        send_keys_enter_delay_ms: 0,
-        ready_marker: None,
-        install_hint:
+        ..agent(
+            "prime-agent",
+            "prime-agent",
             "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh",
-        permission_response: None,
-        lifecycle: AgentLifecycle::Active,
+        )
     },
 ];
 
-/// Look up an agent by canonical name.
 impl AgentDef {
-    /// Short lifecycle label for compact surfaces (TUI picker suffix, web
-    /// badge); `None` while Active so those surfaces stay unchanged.
     pub fn lifecycle_label(&self) -> Option<&'static str> {
         match self.lifecycle {
             AgentLifecycle::Active => None,
@@ -1503,21 +819,11 @@ impl AgentDef {
         }
     }
 
-    /// Full one-line lifecycle notice for CLI listings and spawn warnings;
-    /// `None` while Active.
     pub fn lifecycle_notice(&self) -> Option<String> {
         self.lifecycle.notice()
     }
 
-    /// Extra argv tokens inserted between the one-shot flag and the prompt for a
-    /// one-shot (smart-rename) title call. These are static, never user input,
-    /// so the no-injection contract (prompt stays the final argv element) holds.
-    ///
-    /// Codex's `exec` refuses to run outside a trusted git repo
-    /// ("Not inside a trusted directory and --skip-git-repo-check was not
-    /// specified", exit 1), so a one-shot in a scratch or other non-repo session
-    /// cwd fails. `--skip-git-repo-check` lets the title call run anywhere; the
-    /// title task does not touch the repo, so skipping the check is safe.
+    /// `codex exec` refuses to run outside a trusted git repo without `--skip-git-repo-check`.
     pub fn oneshot_extra_args(&self) -> &'static [&'static str] {
         match self.name {
             "codex" => &["--skip-git-repo-check"],
@@ -1525,15 +831,6 @@ impl AgentDef {
         }
     }
 
-    /// Static argv tokens appended *after* the prompt for a one-shot
-    /// (smart-rename) title call. Only meaningful for value-binding one-shots
-    /// (`oneshot_flag_binds_prompt()` is true, e.g. copilot `-p`, whose value
-    /// is the prompt): the CLI binds the prompt to the flag, so these trailing
-    /// flags cannot be read as the prompt, and the prompt cannot be read as one
-    /// of them. Copilot needs `-s` (print only the final answer, no stats) plus
-    /// `--allow-all-tools --no-ask-user` so the non-interactive title call
-    /// never blocks on a permission or follow-up question. These are static,
-    /// never user input, so the no-injection contract holds.
     pub fn oneshot_trailing_args(&self) -> &'static [&'static str] {
         match self.name {
             "copilot" => &["-s", "--allow-all-tools", "--no-ask-user"],
@@ -1541,12 +838,6 @@ impl AgentDef {
         }
     }
 
-    /// The argv token that selects a model for this agent's one-shot (e.g.
-    /// claude `--model`, codex `-m`), or `None` when the agent has no known
-    /// model selector. `build_oneshot_argv` emits `[flag, model_id]` when a
-    /// model is pinned (built-in cheap default or a user override); an agent
-    /// without a flag simply never pins a model, so a configured value is
-    /// ignored rather than mis-injected (fail-closed).
     pub fn oneshot_model_flag(&self) -> Option<&'static str> {
         match self.name {
             "claude" | "copilot" | "omp" | "prime-agent" => Some("--model"),
@@ -1555,56 +846,20 @@ impl AgentDef {
         }
     }
 
-    /// The built-in cheap model pinned for a throwaway smart-rename title when
-    /// the user has not configured one. A three-to-five-word title must not
-    /// bill the CLI's default frontier model. Only a STABLE, non-dated alias
-    /// may be hardcoded: AoE pins no CLI version (it detects via `which` /
-    /// `--version`), so a dated id (e.g. `claude-haiku-4-5-20250101`) would
-    /// rotate or expire. Agents with no verified stable alias return `None`,
-    /// i.e. the CLI's own default.
+    /// Stable, non-dated aliases only: AoE pins no CLI version.
     pub fn oneshot_cheap_model(&self) -> Option<&'static str> {
         match self.name {
-            // Verified 2026-07-20: `haiku` is Anthropic's stable, non-dated
-            // alias for the cheap Claude tier, accepted by `claude -p --model`.
-            // If the alias were ever unknown, claude under `-p` falls back to
-            // its default model rather than erroring, so a stale id would only
-            // lose the saving (no cost regression); pinning the never-dating
-            // alias avoids that.
             "claude" => Some("haiku"),
             _ => None,
         }
     }
 
-    /// Whether this agent's one-shot flag binds the following token as its
-    /// value (the prompt), rather than taking a positional prompt. The
-    /// `-p`/`--prompt` value-binding flags (copilot, gemini, kimi) consume the
-    /// next token as the prompt, so model args must follow the prompt (in the
-    /// trailing region); placing them before it would make the flag swallow the
-    /// model selector. Positional-prompt one-shots (claude's, omp's, and
-    /// prime-agent's boolean `-p`, codex `exec`, opencode `run`) take the
-    /// model args before the prompt.
-    ///
-    /// Verified 2026-07-21 against each CLI: gemini `-p` is yargs
-    /// `type: string, nargs: 1`; kimi `-p` is a `typer.Option(str)`; copilot
-    /// `-p <text>` takes a value; claude `-p`/`--print` is boolean. Verified
-    /// 2026-08-23 for prime-agent from `packages/coding-agent/src/cli/args.ts`:
-    /// its `-p`/`--print` sets a boolean print mode and then opportunistically
-    /// pushes the next token into `messages` only when that token is not a
-    /// flag, which is the same slot a positional prompt lands in. Classifying
-    /// it as positional is therefore correct for both argv shapes we emit:
-    /// `-p --model <m> <prompt>` leaves `--model` for its own arm, and
-    /// `-p <prompt>` (no title model configured) binds the prompt into the
-    /// same `messages` array. It is NOT a value-binding flag in the copilot /
-    /// gemini / kimi sense, where the model args must trail the prompt.
+    /// Value-binding `-p` (copilot, gemini, kimi) takes the prompt as its value, so model args
+    /// must trail the prompt.
     pub fn oneshot_flag_binds_prompt(&self) -> bool {
         matches!(self.name, "copilot" | "gemini" | "kimi")
     }
 
-    /// The base launch token(s) for the default (non-overridden) command:
-    /// the binary, plus any `launch_subcommand` (e.g. `"kiro-cli chat"`). All
-    /// subsequent flags (extra args, yolo, agent selection) are appended after this, so
-    /// subcommand-scoped flags land on the subcommand where the CLI expects
-    /// them. Agents without a `launch_subcommand` just return the binary.
     pub fn launch_base_command(&self) -> String {
         match self.launch_subcommand {
             Some(sub) => format!("{} {}", self.binary, sub),
@@ -1613,10 +868,6 @@ impl AgentDef {
     }
 }
 
-/// Whether `help` advertises `flag`, matched on the whole flag: what follows
-/// must end it (whitespace, `=`, or the `,` of an alias list such as
-/// `--extension, -e`), so `--session-id` is never read out of
-/// `--session-id-file`.
 fn help_advertises_flag(help: &str, flag: &str) -> bool {
     help.match_indices(flag).any(|(index, _)| {
         help[index + flag.len()..]
@@ -1626,8 +877,6 @@ fn help_advertises_flag(help: &str, flag: &str) -> bool {
     })
 }
 
-/// One cached `pi --help` per process: two launch decisions read it, and a
-/// launch cannot afford to re-run it.
 fn pi_help_text() -> &'static str {
     static HELP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     HELP.get_or_init(|| {
@@ -1645,24 +894,11 @@ fn pi_help_text() -> &'static str {
     })
 }
 
-/// Whether the `pi` on PATH loads an extension from the command line
-/// (`--extension`, `-e`). That is what lets AoE publish the pane's current
-/// conversation, `/new` included, instead of inferring it from a store keyed
-/// by cwd.
 pub(crate) fn pi_supports_extension_flag() -> bool {
     help_advertises_flag(pi_help_text(), "--extension")
 }
 
-/// Whether the `pi` on PATH understands `--session-id` (pi 0.76.0+), which is
-/// what lets AoE pin a conversation at launch instead of guessing which file
-/// in the shared store belongs to this pane (#3576).
-///
-/// Probed once per process from `pi --help` and cached: the answer is a
-/// property of the installed binary, and a launch cannot afford to re-run it.
-/// Any failure (binary absent, non-zero exit, timeout) reports `false`, so an
-/// unknown binary launches exactly as it did before pinning existed rather
-/// than emitting a flag it may not accept. The cache keeps a failure too, so
-/// a transient one disables pinning until the process restarts.
+/// Probed once per process; any failure reports `false`.
 pub(crate) fn pi_supports_session_id_flag() -> bool {
     help_advertises_flag(pi_help_text(), "--session-id")
 }
@@ -1673,34 +909,13 @@ pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
     AGENTS.iter().find(|a| a.name == name)
 }
 
-/// Registry lifecycle state for an ACP-registry key. Falls back to Active
-/// for registry entries with no `AGENTS` counterpart (bundled or alias-only
-/// keys). Shared by the doctor, `/api/acp/agents`, and `aoe acp agents`
-/// surfaces.
 pub(crate) fn registry_lifecycle(name: &str) -> AgentLifecycle {
     get_agent(name)
         .map(|def| def.lifecycle)
         .unwrap_or(AgentLifecycle::Active)
 }
 
-/// Whether switching a structured-view session back to a terminal can hand
-/// the live conversation to `<tool> --resume <id>` instead of starting fresh.
-///
-/// Requires BOTH sides of the swap to share one CLI-resumable transcript:
-///
-///   - `tool` is the terminal CLI that will run after the swap; it must
-///     resume an existing session (claude's `--resume`).
-///   - `acp_agent` is the *active* structured-view adapter (the resolved
-///     `pick_agent_for_tool` name, which `switch_acp_agent` can point away
-///     from the tool's default), whose captured `acp_session_id` must be an
-///     id that terminal CLI reads.
-///
-/// Today only claude qualifies: `claude-agent-acp`'s `session/new` UUID is
-/// the claude SDK session id in `~/.claude/projects/*.jsonl`, exactly what
-/// `claude --resume` reads. `claude-code` is the legacy alias for the same
-/// adapter. codex-acp and `aoe-agent` do not share a CLI-resumable store, so
-/// a claude session whose adapter was swapped to one of them does not
-/// qualify.
+/// Only claude qualifies: claude-agent-acp's session id is the id `claude --resume` reads.
 pub fn acp_transcript_cli_resumable(tool: &str, acp_agent: &str) -> bool {
     tool == "claude" && matches!(acp_agent, "claude" | "claude-code")
 }
@@ -1716,10 +931,7 @@ fn configured_status_map<'a>(
         .filter(|status_map| !status_map.is_empty())
 }
 
-// The CLI status-map query is event-name keyed, matching the config shape.
-// Duplicate built-in events with different matchers collapse to the first
-// default here; resolved_hook_events still applies an override to every
-// matcher variant with that event name.
+// Duplicate events with different matchers collapse to the first default.
 fn default_status_map_for_agent(agent: &AgentDef) -> BTreeMap<String, HookStatus> {
     let mut map = BTreeMap::new();
     if let Some(hook_cfg) = &agent.hook_config {
@@ -1854,35 +1066,12 @@ pub fn resolved_sidecar_hook_events(
     Ok(events)
 }
 
-/// Extract the agent name a user selected via `<flag> NAME` or `<flag>=NAME`
-/// in a command/extra-args string (e.g. Kiro's `--agent custom-agent`). The flag
-/// comes from [`SelectedAgentHooks::flag`] so the convention stays data on the
-/// agent definition. Returns `None` when the flag is absent, has no value, or
-/// its final occurrence carries a rejected value.
-///
-/// The **last** occurrence decides the result, matching how clap-based CLIs
-/// (Kiro included) resolve a repeated single-value flag: `--agent a --agent b`
-/// loads `b`. Crucially, a later occurrence overwrites an earlier one even when
-/// its value is rejected, so `--agent good --agent ..` returns `None` rather
-/// than `good`: the CLI itself would load `..` (and reject it / fall back to its
-/// default), so AoE must not install hooks into `good`, an agent the CLI is not
-/// running. Returning `None` makes AoE fall back to its standalone hooks agent,
-/// which is what the CLI effectively does. This also gives extra-args the final
-/// say over a command override when `crate::session::Instance::selected_agent_args`
-/// concatenates command then extra-args.
-///
-/// A value is rejected by `is_safe_agent_name` (empty, `.`/`..`, leading dash,
-/// or a path separator) so a parsed value can be safely joined to an agents
-/// directory without path traversal. Whitespace-tokenized, which matches how AoE
-/// assembles the launch string; quoted values containing spaces are not handled
-/// (agent names do not contain spaces in practice).
+/// The last occurrence wins even when its value is rejected, matching clap-based CLIs.
 pub fn parse_selected_agent(args: &str, flag: &str) -> Option<String> {
     let eq_prefix = format!("{flag}=");
     let mut tokens = args.split_whitespace();
     let mut selected = None;
     while let Some(tok) = tokens.next() {
-        // The value of this flag occurrence: the text after `=`, the next token
-        // for the space-separated form, or `None` for a dangling flag.
         let value = if let Some(rest) = tok.strip_prefix(&eq_prefix) {
             Some(rest)
         } else if tok == flag {
@@ -1890,19 +1079,11 @@ pub fn parse_selected_agent(args: &str, flag: &str) -> Option<String> {
         } else {
             continue;
         };
-        // Last occurrence wins: overwrite with this occurrence's validated
-        // value, so a trailing rejected/missing value clears an earlier valid
-        // one (mirroring the CLI's last-wins resolution).
         selected = value.filter(|&v| is_safe_agent_name(v)).map(str::to_string);
     }
     selected
 }
 
-/// Guard against path traversal and obvious misparses: a selected agent name is
-/// joined to an agents directory, so reject empty names, `.`/`..`, anything
-/// containing a path separator, and flag-shaped tokens. The leading-dash check
-/// means a value-less flag (`--agent --model`) yields `None` rather than
-/// treating the following flag as an agent name.
 fn is_safe_agent_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
@@ -1912,31 +1093,21 @@ fn is_safe_agent_name(name: &str) -> bool {
         && !name.contains('\\')
 }
 
-/// Returns the delay (in ms) to insert before the submit-Enter for this agent.
-/// Non-zero for agents with paste-burst detection that swallows fast Enters.
 pub fn send_keys_enter_delay(tool: &str) -> u64 {
     get_agent(tool)
         .map(|a| a.send_keys_enter_delay_ms)
         .unwrap_or(0)
 }
 
-/// The known-ready pane-content marker for this agent, if any. See
-/// `AgentDef::ready_marker`.
 pub fn ready_marker(tool: &str) -> Option<&'static str> {
     get_agent(tool).and_then(|a| a.ready_marker)
 }
 
-/// All canonical agent names in registry order.
 pub fn agent_names() -> Vec<&'static str> {
     AGENTS.iter().map(|a| a.name).collect()
 }
 
-/// Given a command string (e.g. `"claude --resume xyz"` or `"open-code"`),
-/// return the canonical agent name if one is recognised.
-///
-/// When several tokens match, the LONGEST one wins regardless of registry
-/// order: `prime-agent` contains cursor's `"agent"` alias, and a naive
-/// first-match scan would resolve every prime-agent command to cursor.
+/// The longest matching token wins: `prime-agent` contains cursor's `agent` alias.
 pub fn resolve_tool_name(cmd: &str) -> Option<&'static str> {
     let cmd_lower = cmd.to_lowercase();
     if cmd_lower.is_empty() {
@@ -1953,12 +1124,10 @@ pub fn resolve_tool_name(cmd: &str) -> Option<&'static str> {
     best.map(|(_, name)| name)
 }
 
-/// Return the install hint for an agent, looked up by canonical name.
 pub fn install_hint(name: &str) -> Option<&'static str> {
     get_agent(name).map(|a| a.install_hint)
 }
 
-/// Convert a tool name to a 1-based settings index (0 = Auto).
 pub fn settings_index_from_name(name: Option<&str>) -> usize {
     match name {
         Some(n) => AGENTS
@@ -1970,7 +1139,6 @@ pub fn settings_index_from_name(name: Option<&str>) -> usize {
     }
 }
 
-/// Convert a 1-based settings index back to a tool name (0 = Auto/None).
 pub fn name_from_settings_index(index: usize) -> Option<&'static str> {
     if index == 0 {
         None
@@ -1979,9 +1147,6 @@ pub fn name_from_settings_index(index: usize) -> Option<&'static str> {
     }
 }
 
-/// Names of built-in agents that can run a one-shot title call (a non-`None`
-/// `oneshot_flag`). The smart-rename agent picker lists these, since only
-/// these agents can be used for the one-shot rename.
 pub fn oneshot_capable_names() -> Vec<&'static str> {
     AGENTS
         .iter()
@@ -1996,311 +1161,120 @@ mod tests {
 
     #[test]
     fn acp_transcript_cli_resumable_only_for_claude_pairings() {
-        // Both sides must be claude: the terminal `claude --resume` and the
-        // active claude-agent-acp adapter share ~/.claude/projects/*.jsonl.
         assert!(acp_transcript_cli_resumable("claude", "claude"));
         assert!(acp_transcript_cli_resumable("claude", "claude-code"));
-        // Adapter swapped away from claude (via switch_acp_agent): the
-        // acp_session_id is not a claude-resumable id.
         assert!(!acp_transcript_cli_resumable("claude", "codex"));
         assert!(!acp_transcript_cli_resumable("claude", "aoe-agent"));
-        // Non-claude terminal tool: no `claude --resume` to hand off to.
         assert!(!acp_transcript_cli_resumable("codex", "codex"));
     }
 
     #[test]
-    fn test_oneshot_flags_are_single_tokens_without_placeholders() {
-        // The smart-rename safety contract: a non-None oneshot_flag is exactly
-        // one argv token placed before the prompt, and never interpolates the
-        // prompt. Keep future agent additions from weakening that.
+    fn registry_invariants() {
         for agent in AGENTS {
-            let Some(flag) = agent.oneshot_flag else {
-                continue;
-            };
-            assert_eq!(
-                flag,
-                flag.trim(),
-                "agent '{}' one-shot flag must not have surrounding whitespace",
-                agent.name
-            );
-            assert_eq!(
-                flag.split_whitespace().count(),
-                1,
-                "agent '{}' one-shot flag must be exactly one argv token",
-                agent.name
-            );
+            let name = agent.name;
             assert!(
-                !flag.contains("{}"),
-                "agent '{}' one-shot flag must not interpolate the prompt",
-                agent.name
+                !(agent.hook_config.is_some() && agent.sidecar_hooks.is_some()),
+                "{name} declares both hook_config and sidecar_hooks"
             );
-            // The same single-token, no-interpolation contract applies to every
-            // static one-shot token inserted around the prompt.
-            let mut statics: Vec<&str> = Vec::new();
-            statics.extend(agent.oneshot_model_flag());
-            statics.extend(agent.oneshot_cheap_model());
-            statics.extend(agent.oneshot_extra_args().iter().copied());
-            statics.extend(agent.oneshot_trailing_args().iter().copied());
-            for extra in statics {
+            if agent.launch_subcommand.is_some() {
                 assert!(
-                    !extra.contains("{}"),
-                    "agent '{}' one-shot arg '{}' must not interpolate the prompt",
-                    agent.name,
-                    extra
-                );
-                assert_eq!(
-                    extra.split_whitespace().count(),
-                    1,
-                    "agent '{}' one-shot arg '{}' must be exactly one argv token",
-                    agent.name,
-                    extra
+                    !matches!(
+                        agent.session_support.map(|support| support.resume),
+                        Some(ResumeStrategy::Subcommand(_))
+                    ),
+                    "{name}: a resume subcommand would land before the launch subcommand"
                 );
             }
-        }
-    }
 
-    #[test]
-    fn only_claude_has_a_cheap_default() {
-        // The built-in cheap default is fail-closed: exactly one agent has a
-        // cross-validated stable alias. Any future addition must be a deliberate
-        // edit here, so a stray default on another agent trips this.
-        for agent in AGENTS {
-            if agent.name == "claude" {
-                assert_eq!(agent.oneshot_cheap_model(), Some("haiku"));
-            } else {
-                assert!(
-                    agent.oneshot_cheap_model().is_none(),
-                    "agent '{}' must not carry a built-in cheap model without a verified stable alias",
-                    agent.name
-                );
+            let mut oneshot_tokens: Vec<&str> = agent.oneshot_flag.into_iter().collect();
+            oneshot_tokens.extend(agent.oneshot_model_flag());
+            oneshot_tokens.extend(agent.oneshot_cheap_model());
+            oneshot_tokens.extend(agent.oneshot_extra_args());
+            oneshot_tokens.extend(agent.oneshot_trailing_args());
+            for token in oneshot_tokens {
+                assert_eq!(token.split_whitespace().count(), 1, "{name}: {token:?}");
+                assert_eq!(token, token.trim(), "{name}: {token:?}");
+                assert!(!token.contains("{}"), "{name}: {token:?}");
             }
-        }
-    }
 
-    #[test]
-    fn oneshot_model_flag_matches_expected() {
-        // Drift guard: every one-shot-capable agent must expose a model
-        // selector (so a user override is honored, not silently dropped), and
-        // the token must match the CLI. A built-in cheap default requires a
-        // flag to emit it.
-        for agent in AGENTS {
-            let expected = match agent.name {
-                "claude" | "copilot" | "omp" | "prime-agent" => Some("--model"),
-                "codex" | "gemini" | "opencode" | "kimi" => Some("-m"),
-                _ => None,
-            };
             assert_eq!(
-                agent.oneshot_model_flag(),
-                expected,
-                "unexpected model flag for '{}'",
-                agent.name
+                agent.oneshot_flag.is_some(),
+                agent.oneshot_model_flag().is_some(),
+                "{name}: a model flag exists exactly for one-shot agents"
             );
-            if agent.oneshot_flag.is_some() {
-                assert!(
-                    agent.oneshot_model_flag().is_some(),
-                    "one-shot agent '{}' must expose a model flag",
-                    agent.name
-                );
-            }
-            if agent.oneshot_cheap_model().is_some() {
-                assert!(
-                    agent.oneshot_model_flag().is_some(),
-                    "agent '{}' has a cheap default but no flag to emit it",
-                    agent.name
-                );
-            }
-            // Reverse guard: a model flag is only reachable through a one-shot,
-            // so a flag without a one-shot mode would be dead.
-            if agent.oneshot_model_flag().is_some() {
-                assert!(
-                    agent.oneshot_flag.is_some(),
-                    "agent '{}' exposes a model flag but has no one-shot mode",
-                    agent.name
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn oneshot_flag_binds_prompt_matches_expected() {
-        // Drift guard for the value-binding classification that decides where
-        // `build_oneshot_argv` places the model selector. A wrong answer here
-        // silently mis-injects an override (a value-binding flag would swallow
-        // the model selector as its prompt), so pin the verified set exactly.
-        for agent in AGENTS {
-            let expected = matches!(agent.name, "copilot" | "gemini" | "kimi");
-            assert_eq!(
-                agent.oneshot_flag_binds_prompt(),
-                expected,
-                "unexpected value-binding classification for '{}'",
-                agent.name
-            );
-            // A value-binding classification is only meaningful for an agent
-            // that actually has a one-shot flag.
             if agent.oneshot_flag_binds_prompt() {
-                assert!(
-                    agent.oneshot_flag.is_some(),
-                    "agent '{}' is value-binding but has no one-shot flag",
-                    agent.name
-                );
-                // Placement invariant: model args (and any pre-prompt static
-                // args) are emitted before the prompt for positional agents;
-                // a value-binding flag binds the token right after it, so it
-                // must have NO pre-prompt `oneshot_extra_args` (they would be
-                // bound as the prompt). Post-prompt flags belong in
-                // `oneshot_trailing_args` instead.
-                assert!(
-                    agent.oneshot_extra_args().is_empty(),
-                    "value-binding agent '{}' must not use oneshot_extra_args (they land before the prompt); use oneshot_trailing_args",
-                    agent.name
-                );
+                assert!(agent.oneshot_extra_args().is_empty(), "{name}");
             }
-            // Semi-independent oracle (not a copy of the impl's name list):
-            // `-p` is value-binding except for claude, omp, and prime-agent,
-            // where it is the boolean `--print` flag.
-            if agent.oneshot_flag == Some("-p")
-                && !matches!(agent.name, "claude" | "omp" | "prime-agent")
+            if agent.oneshot_flag == Some("-p") && !matches!(name, "claude" | "omp" | "prime-agent")
             {
-                assert!(
-                    agent.oneshot_flag_binds_prompt(),
-                    "agent '{}' has a `-p` one-shot flag but is not classified value-binding",
-                    agent.name
-                );
+                assert!(agent.oneshot_flag_binds_prompt(), "{name}");
             }
+            assert_eq!(agent.oneshot_cheap_model().is_some(), name == "claude");
         }
     }
 
     #[test]
     fn pi_help_probe_matches_only_the_whole_flag() {
-        // The probe decides whether AoE may pin a Pi conversation at launch,
-        // so a longer flag that merely starts the same way must not pass for
-        // it, and an old help text without the flag must not either.
-        assert!(help_advertises_flag(
-            "  --session-id <id>    Use exact project session ID\n",
-            "--session-id"
-        ));
-        assert!(help_advertises_flag("--session-id=<id>", "--session-id"));
-        assert!(help_advertises_flag("--session-id", "--session-id"));
-        assert!(!help_advertises_flag(
-            "  --session-id-file <path>\n",
-            "--session-id"
-        ));
-        assert!(!help_advertises_flag(
-            "  --extensions-dir <dir>\n",
-            "--extension"
-        ));
-        assert!(!help_advertises_flag(
-            "  --session <path|id>    Use specific session file\n",
-            "--session-id"
-        ));
-        assert!(help_advertises_flag(
-            "  --extension, -e <path>   Load an extension file\n",
-            "--extension"
-        ));
-    }
-
-    #[test]
-    fn test_get_agent_known() {
-        assert_eq!(get_agent("claude").unwrap().binary, "claude");
-        assert_eq!(get_agent("opencode").unwrap().binary, "opencode");
-        assert_eq!(get_agent("vibe").unwrap().binary, "vibe");
-        assert_eq!(get_agent("codex").unwrap().binary, "codex");
-        assert_eq!(get_agent("gemini").unwrap().binary, "gemini");
-        assert_eq!(get_agent("cursor").unwrap().binary, "agent");
-        assert_eq!(get_agent("copilot").unwrap().binary, "copilot");
-        assert_eq!(get_agent("pi").unwrap().binary, "pi");
-        assert_eq!(get_agent("droid").unwrap().binary, "droid");
-        assert_eq!(get_agent("settl").unwrap().binary, "settl");
-        assert_eq!(get_agent("hermes").unwrap().binary, "hermes");
-        assert_eq!(get_agent("kiro").unwrap().binary, "kiro-cli");
-        assert_eq!(get_agent("qwen").unwrap().binary, "qwen");
-        assert_eq!(get_agent("antigravity").unwrap().binary, "agy");
-        assert_eq!(get_agent("kimi").unwrap().binary, "kimi");
-        assert_eq!(get_agent("omp").unwrap().binary, "omp");
-        assert_eq!(get_agent("prime-agent").unwrap().binary, "prime-agent");
-    }
-
-    #[test]
-    fn test_lifecycle_active_by_default_except_gemini() {
-        // Invariant across the registry: exactly one deprecated agent today
-        // (gemini); a new entry that forgets its lifecycle must fail here.
-        let cases: Vec<(&str, bool)> = AGENTS
-            .iter()
-            .map(|a| (a.name, a.lifecycle.is_active()))
-            .collect();
-        for (name, active) in cases {
-            let expect_active = name != "gemini";
-            assert_eq!(active, expect_active, "{name}");
-        }
-    }
-
-    #[test]
-    fn test_lifecycle_notice_and_label() {
-        // (agent, label, notice fragment or None). Active agents surface
-        // nothing; the deprecated one carries date, reason, and replacement.
         let cases = [
-            ("claude", None, None),
-            ("antigravity", None, None),
             (
-                "gemini",
-                Some("deprecated"),
-                Some("deprecated since 2026-06-18"),
+                "  --session-id <id>    Use exact project session ID\n",
+                "--session-id",
+                true,
+            ),
+            ("--session-id=<id>", "--session-id", true),
+            ("--session-id", "--session-id", true),
+            ("  --session-id-file <path>\n", "--session-id", false),
+            ("  --extensions-dir <dir>\n", "--extension", false),
+            (
+                "  --session <path|id>    Use specific session file\n",
+                "--session-id",
+                false,
+            ),
+            (
+                "  --extension, -e <path>   Load an extension file\n",
+                "--extension",
+                true,
             ),
         ];
-        for (name, label, notice_fragment) in cases {
-            let def = get_agent(name).unwrap();
-            assert_eq!(def.lifecycle_label(), label, "{name}");
-            match (notice_fragment, def.lifecycle_notice()) {
-                (None, None) => {}
-                (Some(fragment), Some(notice)) => {
-                    assert!(notice.contains(fragment), "{name}: {notice}");
-                    if name == "gemini" {
-                        assert!(
-                            notice.contains("consider switching to antigravity"),
-                            "{notice}"
-                        );
-                        assert!(
-                            notice.contains("enterprise/API-key remain valid"),
-                            "{notice}"
-                        );
-                    }
-                }
-                _ => panic!("{name}: label and notice must agree"),
-            }
-            // The enum-level entry point (used by the acp surfaces) must
-            // agree with the AgentDef helper for every variant, including
-            // future ones: any non-active state surfaces its Display.
-            assert_eq!(def.lifecycle.notice(), def.lifecycle_notice(), "{name}");
+        for (help, flag, expected) in cases {
+            assert_eq!(help_advertises_flag(help, flag), expected, "{help:?}");
         }
     }
 
     #[test]
-    fn test_lifecycle_notice_without_replacement() {
-        // Boundary: a Deprecated state with no suggested replacement must
-        // still render its full notice, minus the "consider switching"
-        // clause (Display's None arm).
-        let lifecycle = AgentLifecycle::Deprecated {
+    fn lifecycle_notice_label_and_wire_shape() {
+        assert!(AGENTS
+            .iter()
+            .all(|a| a.lifecycle.is_active() == (a.name != "gemini")));
+        let claude = get_agent("claude").unwrap();
+        assert_eq!(claude.lifecycle_label(), None);
+        assert_eq!(claude.lifecycle_notice(), None);
+
+        let gemini = get_agent("gemini").unwrap();
+        assert_eq!(gemini.lifecycle_label(), Some("deprecated"));
+        assert_eq!(
+            gemini.lifecycle_notice().as_deref(),
+            Some(
+                "deprecated since 2026-06-18: consumer accounts cut off by Google; \
+                 enterprise/API-key remain valid; consider switching to antigravity"
+            )
+        );
+        let no_replacement = AgentLifecycle::Deprecated {
             since: "2026-01-01",
             note: "upstream shut down",
             replacement: None,
         };
-        let notice = lifecycle.to_string();
-        assert_eq!(notice, "deprecated since 2026-01-01: upstream shut down");
-        assert!(!notice.contains("consider switching"), "{notice}");
-        assert_eq!(lifecycle.notice().as_deref(), Some(notice.as_str()));
-    }
+        assert_eq!(
+            no_replacement.notice().as_deref(),
+            Some("deprecated since 2026-01-01: upstream shut down")
+        );
 
-    #[test]
-    fn test_lifecycle_serialization_shape() {
-        // Wire contract consumed by the dashboard (`web/src/lib/types.ts`
-        // AgentLifecycleInfo). Active agents are omitted by callers via
-        // skip_serializing_if; here we pin each variant's JSON shape.
         assert_eq!(
             serde_json::to_string(&AgentLifecycle::Active).unwrap(),
             r#"{"state":"active"}"#
         );
         assert_eq!(
-            serde_json::to_string(&get_agent("gemini").unwrap().lifecycle).unwrap(),
+            serde_json::to_string(&gemini.lifecycle).unwrap(),
             concat!(
                 r#"{"state":"deprecated","since":"2026-06-18","#,
                 r#""note":"consumer accounts cut off by Google; enterprise/API-key remain valid","#,
@@ -2310,17 +1284,11 @@ mod tests {
     }
 
     #[test]
-    fn test_lifecycle_facts_stay_synced_with_ts_mirror() {
-        // The dashboard keeps a static fallback mirror of the gemini facts
-        // (web/src/lib/agentProfiles.ts). Each side has its own pinning
-        // tests, so a coordinated update of one side alone would ship a
-        // silent desync; this cross-checks the literal strings instead.
+    fn lifecycle_facts_stay_synced_with_ts_mirror() {
         let mirror_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/lib/agentProfiles.ts");
         let Ok(mirror) = std::fs::read_to_string(&mirror_path) else {
-            // Nix-filtered cargo-test sources omit web/. The TS suite still
-            // pins the mirror there; cross-check it whenever the monorepo
-            // source is available instead of failing a filtered package.
+            // Nix-filtered sources omit web/.
             eprintln!(
                 "skipping TS lifecycle mirror check: {} is absent",
                 mirror_path.display()
@@ -2338,539 +1306,144 @@ mod tests {
         for fact in [since, note, replacement] {
             assert!(
                 mirror.contains(fact),
-                "TS mirror is missing {fact:?}; update web/src/lib/agentProfiles.ts in the same change"
+                "web/src/lib/agentProfiles.ts is missing {fact:?}"
             );
         }
     }
 
-    #[test]
-    fn test_omp_agent_definition() {
-        let omp = get_agent("omp").unwrap();
-        assert!(matches!(&omp.detection, DetectionMethod::Which("omp")));
-        assert!(matches!(
-            &omp.yolo,
-            Some(YoloMode::CliFlag("--auto-approve"))
-        ));
-        assert!(matches!(
-            omp.session_support.as_ref().map(|support| support.resume),
-            Some(ResumeStrategy::Flag("--resume"))
-        ));
-        assert_eq!(omp.oneshot_flag, Some("-p"));
-        assert_eq!(omp.oneshot_model_flag(), Some("--model"));
-        assert!(!omp.oneshot_flag_binds_prompt());
-    }
-
-    #[test]
-    fn test_hermes_agent_definition() {
-        let hermes = get_agent("hermes").unwrap();
-        assert_eq!(hermes.binary, "hermes");
-        assert!(matches!(
-            &hermes.detection,
-            DetectionMethod::Which("hermes")
-        ));
-        assert!(matches!(&hermes.yolo, Some(YoloMode::CliFlag("--yolo"))));
-        assert!(!hermes.host_only);
-        assert_eq!(hermes.send_keys_enter_delay_ms, 0);
-        assert_eq!(
-            hermes.install_hint,
-            "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash"
-        );
-    }
-
-    #[test]
-    fn test_get_agent_unknown() {
-        assert!(get_agent("unknown").is_none());
-    }
-
-    #[test]
-    fn effective_status_map_merges_configured_override() {
+    fn config_with_status(
+        agent: &str,
+        event: &str,
+        status: HookStatus,
+    ) -> crate::session::config::Config {
         let mut config = crate::session::config::Config::default();
         config
             .agents
-            .entry("claude".to_string())
+            .entry(agent.to_string())
             .or_default()
             .status_map
-            .insert("Stop".to_string(), HookStatus::Error);
+            .insert(event.to_string(), status);
+        config
+    }
 
+    #[test]
+    fn status_map_overrides_merge_into_defaults() {
+        let claude = get_agent("claude").unwrap();
+        let config = config_with_status("claude", "Stop", HookStatus::Error);
         let map = effective_status_map(&config, "claude").unwrap();
         assert_eq!(map.get("PreToolUse"), Some(&HookStatus::Running));
         assert_eq!(map.get("Stop"), Some(&HookStatus::Error));
         assert_eq!(map.get("Notification"), Some(&HookStatus::Waiting));
-    }
 
-    #[test]
-    fn resolved_hook_events_apply_duplicate_event_override() {
-        let mut config = crate::session::config::Config::default();
-        config
-            .agents
-            .entry("claude".to_string())
-            .or_default()
-            .status_map
-            .insert("Notification".to_string(), HookStatus::Running);
-
-        let agent = get_agent("claude").unwrap();
-        let events = resolved_hook_events(agent, &config).unwrap();
+        let config = config_with_status("claude", "Notification", HookStatus::Running);
+        let events = resolved_hook_events(claude, &config).unwrap();
         let notification_statuses: Vec<HookStatus> = events
             .iter()
             .filter(|event| event.name == "Notification")
             .filter_map(|event| event.status)
             .collect();
-        assert_eq!(
-            notification_statuses,
-            vec![HookStatus::Running, HookStatus::Running]
-        );
-    }
+        assert_eq!(notification_statuses, vec![HookStatus::Running; 2]);
 
-    #[test]
-    fn status_map_adds_configured_event_for_known_agent() {
-        let mut config = crate::session::config::Config::default();
-        config
-            .agents
-            .entry("claude".to_string())
-            .or_default()
-            .status_map
-            .insert("PreCompact".to_string(), HookStatus::Running);
-
+        let config = config_with_status("claude", "PreCompact", HookStatus::Running);
         let map = effective_status_map(&config, "claude").unwrap();
         assert_eq!(map.get("PreCompact"), Some(&HookStatus::Running));
-
-        let agent = get_agent("claude").unwrap();
-        let events = resolved_hook_events(agent, &config).unwrap();
+        let events = resolved_hook_events(claude, &config).unwrap();
         let custom = events
             .iter()
             .find(|event| event.name == "PreCompact")
-            .expect("custom event should be appended");
+            .unwrap();
         assert_eq!(custom.status, Some(HookStatus::Running));
-        assert!(custom.matcher.is_none());
-        assert!(custom.identity_field.is_none());
-    }
+        assert!(custom.matcher.is_none() && custom.identity_field.is_none());
 
-    #[test]
-    fn configured_unknown_agent_status_map_is_queryable() {
-        let mut config = crate::session::config::Config::default();
-        config
-            .agents
-            .entry("vertex".to_string())
-            .or_default()
-            .status_map
-            .insert("session.idle".to_string(), HookStatus::Idle);
-
+        let config = config_with_status("vertex", "session.idle", HookStatus::Idle);
         let map = effective_status_map(&config, "vertex").unwrap();
         assert_eq!(map.get("session.idle"), Some(&HookStatus::Idle));
     }
 
     #[test]
-    fn test_copilot_agent_definition() {
-        let copilot = get_agent("copilot").unwrap();
-        assert_eq!(copilot.binary, "copilot");
-        assert!(matches!(
-            &copilot.detection,
-            DetectionMethod::Which("copilot")
-        ));
-        assert!(matches!(&copilot.yolo, Some(YoloMode::CliFlag("--yolo"))));
-        let support = copilot.session_support.as_ref().unwrap();
-        assert!(matches!(
-            support.resume,
-            ResumeStrategy::Flag("--session-id")
-        ));
-        assert!(support.capture.is_none());
-        // One-shot title generation runs `copilot -p <prompt> -s
-        // --allow-all-tools --no-ask-user`.
-        assert_eq!(copilot.oneshot_flag, Some("-p"));
-        assert_eq!(
-            copilot.oneshot_trailing_args(),
-            &["-s", "--allow-all-tools", "--no-ask-user"]
-        );
-        assert!(!copilot.host_only);
-    }
-
-    #[test]
-    fn test_agent_names() {
-        let names = agent_names();
-        assert_eq!(
-            names,
-            vec![
-                "claude",
-                "opencode",
-                "vibe",
-                "codex",
-                "gemini",
-                "cursor",
-                "copilot",
-                "pi",
-                "droid",
-                "settl",
-                "hermes",
-                "kiro",
-                "qwen",
-                "antigravity",
-                "kimi",
-                "omp",
-                "prime-agent"
-            ]
-        );
-    }
-
-    #[test]
     fn test_resolve_tool_name() {
-        assert_eq!(resolve_tool_name("claude"), Some("claude"));
-        assert_eq!(resolve_tool_name("open-code"), Some("opencode"));
-        assert_eq!(resolve_tool_name("mistral-vibe"), Some("vibe"));
-        assert_eq!(resolve_tool_name("codex"), Some("codex"));
-        assert_eq!(resolve_tool_name("gemini"), Some("gemini"));
-        assert_eq!(resolve_tool_name("cursor"), Some("cursor"));
-        assert_eq!(resolve_tool_name("github-copilot"), Some("copilot"));
-        assert_eq!(resolve_tool_name("copilot"), Some("copilot"));
-        assert_eq!(resolve_tool_name("pi"), Some("pi"));
-        assert_eq!(resolve_tool_name("droid"), Some("droid"));
-        assert_eq!(resolve_tool_name("factory-droid"), Some("droid"));
-        assert_eq!(resolve_tool_name("settl"), Some("settl"));
-        assert_eq!(resolve_tool_name("settlers"), Some("settl"));
-        assert_eq!(resolve_tool_name("catan"), Some("settl"));
-        assert_eq!(resolve_tool_name("hermes"), Some("hermes"));
-        assert_eq!(resolve_tool_name("kiro"), Some("kiro"));
-        assert_eq!(resolve_tool_name("kiro-cli"), Some("kiro"));
-        assert_eq!(resolve_tool_name("qwen"), Some("qwen"));
-        assert_eq!(resolve_tool_name("antigravity"), Some("antigravity"));
-        assert_eq!(resolve_tool_name("agy"), Some("antigravity"));
-        assert_eq!(resolve_tool_name("kimi"), Some("kimi"));
-        assert_eq!(resolve_tool_name("kimi-code"), Some("kimi"));
-        assert_eq!(resolve_tool_name("omp"), Some("omp"));
-        assert_eq!(resolve_tool_name(""), Some("claude"));
-        assert_eq!(resolve_tool_name("agent"), Some("cursor"));
-        // Longest token wins: prime-agent contains cursor's "agent" alias.
-        assert_eq!(resolve_tool_name("prime-agent"), Some("prime-agent"));
-        assert_eq!(
-            resolve_tool_name("prime-agent --mode acp"),
-            Some("prime-agent")
-        );
-        assert_eq!(resolve_tool_name("unknown-tool"), None);
+        let cases = [
+            ("claude", Some("claude")),
+            ("open-code", Some("opencode")),
+            ("mistral-vibe", Some("vibe")),
+            ("github-copilot", Some("copilot")),
+            ("factory-droid", Some("droid")),
+            ("catan", Some("settl")),
+            ("kiro-cli", Some("kiro")),
+            ("agy", Some("antigravity")),
+            ("kimi-code", Some("kimi")),
+            ("", Some("claude")),
+            ("agent", Some("cursor")),
+            // Longest token wins: prime-agent contains cursor's "agent" alias.
+            ("prime-agent --mode acp", Some("prime-agent")),
+            ("unknown-tool", None),
+        ];
+        for (cmd, expected) in cases {
+            assert_eq!(resolve_tool_name(cmd), expected, "{cmd:?}");
+        }
     }
 
     #[test]
     fn test_settings_index_roundtrip() {
         assert_eq!(settings_index_from_name(None), 0);
-        assert_eq!(settings_index_from_name(Some("claude")), 1);
-        assert_eq!(settings_index_from_name(Some("gemini")), 5);
-        assert_eq!(settings_index_from_name(Some("cursor")), 6);
-        assert_eq!(settings_index_from_name(Some("copilot")), 7);
-        assert_eq!(settings_index_from_name(Some("pi")), 8);
-        assert_eq!(settings_index_from_name(Some("droid")), 9);
-        assert_eq!(settings_index_from_name(Some("settl")), 10);
-        assert_eq!(settings_index_from_name(Some("hermes")), 11);
-        assert_eq!(settings_index_from_name(Some("kiro")), 12);
-        assert_eq!(settings_index_from_name(Some("qwen")), 13);
-        assert_eq!(settings_index_from_name(Some("antigravity")), 14);
-        assert_eq!(settings_index_from_name(Some("kimi")), 15);
-        assert_eq!(settings_index_from_name(Some("omp")), 16);
-        assert_eq!(settings_index_from_name(Some("prime-agent")), 17);
-
+        assert_eq!(settings_index_from_name(Some("unknown")), 0);
         assert_eq!(name_from_settings_index(0), None);
-        assert_eq!(name_from_settings_index(1), Some("claude"));
-        assert_eq!(name_from_settings_index(5), Some("gemini"));
-        assert_eq!(name_from_settings_index(6), Some("cursor"));
-        assert_eq!(name_from_settings_index(7), Some("copilot"));
-        assert_eq!(name_from_settings_index(8), Some("pi"));
-        assert_eq!(name_from_settings_index(9), Some("droid"));
-        assert_eq!(name_from_settings_index(10), Some("settl"));
-        assert_eq!(name_from_settings_index(11), Some("hermes"));
-        assert_eq!(name_from_settings_index(12), Some("kiro"));
-        assert_eq!(name_from_settings_index(13), Some("qwen"));
-        assert_eq!(name_from_settings_index(14), Some("antigravity"));
-        assert_eq!(name_from_settings_index(15), Some("kimi"));
-        assert_eq!(name_from_settings_index(16), Some("omp"));
-        assert_eq!(name_from_settings_index(17), Some("prime-agent"));
-        assert_eq!(name_from_settings_index(99), None);
-    }
-
-    #[test]
-    fn test_all_agents_have_yolo_support() {
-        for agent in AGENTS {
-            assert!(
-                agent.yolo.is_some(),
-                "Agent '{}' should have YOLO mode configured",
-                agent.name
-            );
+        assert_eq!(name_from_settings_index(AGENTS.len() + 1), None);
+        for (i, agent) in AGENTS.iter().enumerate() {
+            assert_eq!(settings_index_from_name(Some(agent.name)), i + 1);
+            assert_eq!(name_from_settings_index(i + 1), Some(agent.name));
         }
     }
 
     #[test]
-    fn test_kiro_launches_via_chat_subcommand() {
-        // Kiro's interactive flags (--trust-all-tools, --agent)
-        // are scoped to the `chat` subcommand, so the base command must include
-        // it; bare `kiro-cli --trust-all-tools` is rejected by the CLI.
-        let kiro = get_agent("kiro").unwrap();
-        assert_eq!(kiro.launch_subcommand, Some("chat"));
-        assert_eq!(kiro.launch_base_command(), "kiro-cli chat");
-    }
-
-    #[test]
-    fn test_launch_base_command_without_subcommand_is_binary() {
-        // Agents with no launch_subcommand keep their bare binary.
-        let claude = get_agent("claude").unwrap();
-        assert_eq!(claude.launch_subcommand, None);
-        assert_eq!(claude.launch_base_command(), "claude");
-    }
-
-    #[test]
-    fn test_only_kiro_uses_launch_subcommand() {
-        // Lock the surface: today only kiro needs a launch subcommand. A new
-        // agent that needs one must update this test deliberately.
-        for agent in AGENTS {
-            let expected = if agent.name == "kiro" {
-                Some("chat")
-            } else {
-                None
-            };
-            assert_eq!(
-                agent.launch_subcommand, expected,
-                "agent '{}' launch_subcommand drifted",
-                agent.name
-            );
-        }
-    }
-
-    #[test]
-    fn test_launch_subcommand_not_combined_with_subcommand_resume() {
-        // `append_resume_flags` inserts a Subcommand resume token after the
-        // first whitespace token, which for a launch_subcommand agent is the
-        // binary. That lands the resume token before the launch subcommand and
-        // produces a malformed command. Forbid the pairing until insertion is
-        // made subcommand-aware.
-        for agent in AGENTS {
-            if agent.launch_subcommand.is_some() {
-                assert!(
-                    !matches!(
-                        agent.session_support.as_ref().map(|support| support.resume),
-                        Some(ResumeStrategy::Subcommand(_))
-                    ),
-                    "agent '{}' combines launch_subcommand with ResumeStrategy::Subcommand; \
-                     resume token would be inserted before the subcommand",
-                    agent.name
-                );
-            }
-        }
+    fn test_launch_base_command() {
+        assert_eq!(
+            get_agent("kiro").unwrap().launch_base_command(),
+            "kiro-cli chat"
+        );
+        assert_eq!(get_agent("claude").unwrap().launch_base_command(), "claude");
     }
 
     #[test]
     fn test_parse_selected_agent() {
-        assert_eq!(
-            parse_selected_agent("--agent custom-agent", "--agent"),
-            Some("custom-agent".to_string())
-        );
-        assert_eq!(
-            parse_selected_agent(
+        let cases = [
+            ("--agent custom-agent", Some("custom-agent")),
+            (
                 "--trust-all-tools --agent custom-agent --model x",
-                "--agent"
+                Some("custom-agent"),
             ),
-            Some("custom-agent".to_string())
-        );
-        assert_eq!(
-            parse_selected_agent("--agent=custom-agent", "--agent"),
-            Some("custom-agent".to_string())
-        );
-        // Absent flag.
-        assert_eq!(parse_selected_agent("--trust-all-tools", "--agent"), None);
-        assert_eq!(parse_selected_agent("", "--agent"), None);
-        // Dangling flag with no value.
-        assert_eq!(parse_selected_agent("--foo --agent", "--agent"), None);
-        // A value-less flag followed by another flag must not capture the flag
-        // as the agent name.
-        assert_eq!(parse_selected_agent("--agent --model x", "--agent"), None);
-        // Repeated flag: last occurrence wins, matching clap precedence.
-        assert_eq!(
-            parse_selected_agent("--agent first --agent second", "--agent"),
-            Some("second".to_string())
-        );
-        // Last-wins is honored even when the trailing value is rejected: the CLI
-        // would load `..` (and reject / fall back), so AoE must NOT keep `good`
-        // and write hooks into an agent the CLI is not running. Returns None so
-        // AoE falls back to its standalone hooks agent.
-        assert_eq!(
-            parse_selected_agent("--agent good --agent ..", "--agent"),
-            None
-        );
-        // A trailing dangling flag likewise clears an earlier valid value.
-        assert_eq!(
-            parse_selected_agent("--agent good --agent", "--agent"),
-            None
-        );
-        // `--agent=` (empty value) is rejected.
-        assert_eq!(parse_selected_agent("--agent=", "--agent"), None);
-        // Path-traversal / unsafe names are rejected.
-        assert_eq!(
-            parse_selected_agent("--agent ../../etc/passwd", "--agent"),
-            None
-        );
-        assert_eq!(parse_selected_agent("--agent=a/b", "--agent"), None);
-        assert_eq!(parse_selected_agent("--agent .", "--agent"), None);
-        // Flag is parameterized, not hardcoded.
-        assert_eq!(
-            parse_selected_agent("--profile prod", "--profile"),
-            Some("prod".to_string())
-        );
-    }
-
-    #[test]
-    fn test_kiro_declares_selected_agent_hooks() {
-        // Kiro's hooks are scoped to the --agent-selected agent; the flag and
-        // path convention live as data on the AgentDef, not a string match at
-        // the install site.
-        let kiro = get_agent("kiro").unwrap();
-        let sel = kiro
-            .sidecar_hooks
-            .as_ref()
-            .unwrap()
-            .selected_agent_hooks
-            .as_ref()
-            .expect("kiro declares selected_agent_hooks");
-        assert_eq!(sel.flag, "--agent");
-        // With no matching agent file in the dir, the resolver falls back to
-        // `<dir>/<name>.json` (the create-path for a brand-new user agent).
-        let tmp = tempfile::TempDir::new().unwrap();
-        assert_eq!(
-            (sel.resolve_config_file)(tmp.path(), "custom-agent"),
-            tmp.path().join("custom-agent.json")
-        );
-        // The other sidecar agents do not (their hooks apply globally).
-        for name in ["settl", "hermes"] {
-            assert!(
-                get_agent(name)
-                    .unwrap()
-                    .sidecar_hooks
-                    .as_ref()
-                    .unwrap()
-                    .selected_agent_hooks
-                    .is_none(),
-                "agent '{name}' should not declare selected_agent_hooks"
+            ("--agent=custom-agent", Some("custom-agent")),
+            ("--trust-all-tools", None),
+            ("", None),
+            ("--foo --agent", None),
+            ("--agent --model x", None),
+            ("--agent first --agent second", Some("second")),
+            ("--agent good --agent ..", None),
+            ("--agent good --agent", None),
+            ("--agent=", None),
+            ("--agent ../../etc/passwd", None),
+            ("--agent=a/b", None),
+            ("--agent .", None),
+        ];
+        for (args, expected) in cases {
+            assert_eq!(
+                parse_selected_agent(args, "--agent").as_deref(),
+                expected,
+                "{args:?}"
             );
         }
+        assert_eq!(
+            parse_selected_agent("--profile prod", "--profile").as_deref(),
+            Some("prod")
+        );
     }
 
     #[test]
     fn test_send_keys_enter_delay() {
-        // Codex needs a delay to outlast its 120ms paste-burst suppression window
-        assert!(send_keys_enter_delay("codex") >= 150);
-        // Claude Code also has paste-burst suppression: usePasteHandler.ts sets
-        // PASTE_COMPLETION_TIMEOUT_MS = 100 and, while a paste is pending, routes
-        // an incoming Enter into the paste buffer instead of submitting it (the
-        // `[Pasted text]` sits unsubmitted). The Enter must arrive after that
-        // 100ms window expires, so claude needs a delay > 100ms.
+        assert!(send_keys_enter_delay("codex") > 120);
         assert!(send_keys_enter_delay("claude") > 100);
-        // Other agents have no paste-burst suppression and should not delay
         assert_eq!(send_keys_enter_delay("opencode"), 0);
-        assert_eq!(send_keys_enter_delay("hermes"), 0);
-        assert_eq!(send_keys_enter_delay("kiro"), 0);
-        assert_eq!(send_keys_enter_delay("prime-agent"), 0);
-        assert_eq!(send_keys_enter_delay("antigravity"), 0);
         assert_eq!(send_keys_enter_delay("unknown_agent"), 0);
-    }
-
-    #[test]
-    fn session_capture_context_matrix_is_explicit() {
-        use SessionCaptureBackend as Backend;
-        use SessionCaptureContext as Context;
-
-        let expected = [
-            (
-                "claude",
-                Some((Backend::Claude, Context::PaneScoped, Context::PaneScoped)),
-            ),
-            (
-                "opencode",
-                Some((
-                    Backend::OpenCode,
-                    Context::Preassigned,
-                    Context::Unsupported,
-                )),
-            ),
-            ("vibe", None),
-            (
-                "codex",
-                Some((
-                    Backend::Codex,
-                    Context::Unsupported,
-                    Context::ManagedExclusiveStore,
-                )),
-            ),
-            (
-                "gemini",
-                Some((
-                    Backend::Gemini,
-                    Context::Unsupported,
-                    Context::ManagedExclusiveStore,
-                )),
-            ),
-            (
-                "cursor",
-                Some((
-                    Backend::HookSidecar,
-                    Context::PaneScoped,
-                    Context::PaneScoped,
-                )),
-            ),
-            ("droid", None),
-            (
-                "pi",
-                Some((Backend::Pi, Context::PaneScoped, Context::PaneScoped)),
-            ),
-            ("copilot", None),
-            ("settl", None),
-            (
-                "hermes",
-                Some((
-                    Backend::Hermes,
-                    Context::Unsupported,
-                    Context::ManagedExclusiveStore,
-                )),
-            ),
-            ("qwen", None),
-            ("kiro", None),
-            ("antigravity", None),
-            (
-                "kimi",
-                Some((
-                    Backend::Kimi,
-                    Context::Unsupported,
-                    Context::ManagedExclusiveStore,
-                )),
-            ),
-            (
-                "omp",
-                Some((Backend::Omp, Context::PaneScoped, Context::PaneScoped)),
-            ),
-            (
-                "prime-agent",
-                Some((
-                    Backend::PrimeAgent,
-                    Context::Unsupported,
-                    Context::ManagedExclusiveStore,
-                )),
-            ),
-        ];
-        assert_eq!(expected.len(), AGENTS.len());
-        for (name, expected) in expected {
-            let actual = get_agent(name)
-                .unwrap()
-                .session_support
-                .as_ref()
-                .and_then(|support| support.capture.as_ref())
-                .map(|capture| (capture.backend, capture.host, capture.sandbox));
-            assert_eq!(actual, expected, "capture contract for {name}");
-        }
-    }
-
-    #[test]
-    fn cursor_stop_hook_returns_status_to_idle() {
-        let events = get_agent("cursor")
-            .unwrap()
-            .sidecar_hooks
-            .as_ref()
-            .unwrap()
-            .events;
-        let stop = events.iter().find(|event| event.name == "stop").unwrap();
-        assert_eq!(stop.status, HookStatus::Idle);
-        assert_eq!(stop.identity_field, None);
     }
 
     #[test]
@@ -2881,247 +1454,19 @@ mod tests {
                 "cursor" => Some(HookIdentityField::ConversationIdOrSessionId),
                 _ => None,
             };
-            let fields = agent
+            let hook_fields = agent
                 .hook_config
                 .iter()
-                .flat_map(|config| {
-                    config
-                        .events
-                        .iter()
-                        .filter_map(|event| event.identity_field)
-                })
-                .chain(agent.sidecar_hooks.iter().flat_map(|config| {
-                    config
-                        .events
-                        .iter()
-                        .filter_map(|event| event.identity_field)
-                }))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                !fields.is_empty(),
-                expected.is_some(),
-                "identity source for {}",
-                agent.name
-            );
+                .flat_map(|config| config.events.iter().filter_map(|e| e.identity_field));
+            let sidecar_fields = agent
+                .sidecar_hooks
+                .iter()
+                .flat_map(|config| config.events.iter().filter_map(|e| e.identity_field));
+            let fields: Vec<_> = hook_fields.chain(sidecar_fields).collect();
+            assert_eq!(!fields.is_empty(), expected.is_some(), "{}", agent.name);
             if let Some(expected) = expected {
-                assert!(
-                    fields.iter().all(|field| *field == expected),
-                    "identity field drift for {}: {fields:?}",
-                    agent.name
-                );
+                assert!(fields.iter().all(|f| *f == expected), "{}", agent.name);
             }
         }
-    }
-    #[test]
-    fn test_all_agents_have_install_hint() {
-        for agent in AGENTS {
-            assert!(
-                !agent.install_hint.is_empty(),
-                "Agent '{}' should have a non-empty install_hint",
-                agent.name
-            );
-        }
-    }
-
-    #[test]
-    fn test_install_hint_lookup() {
-        assert_eq!(
-            install_hint("claude"),
-            Some("npm install -g @anthropic-ai/claude-code")
-        );
-        assert_eq!(install_hint("codex"), Some("npm install -g @openai/codex"));
-        // Pi is distributed via npm, not pip (issue #818).
-        assert_eq!(
-            install_hint("pi"),
-            Some("npm install -g @earendil-works/pi-coding-agent")
-        );
-        // Mistral Vibe's PyPI package is `mistral-vibe`, not `vibe-tool`.
-        assert_eq!(install_hint("vibe"), Some("pip install mistral-vibe"));
-        // Factory's Droid CLI npm package is `droid`; `@anthropic-ai/droid`
-        // does not exist on the registry.
-        assert_eq!(install_hint("droid"), Some("npm install -g droid"));
-        // settl ships via the mozilla-ai Homebrew tap (settl.dev is unrelated).
-        assert_eq!(
-            install_hint("settl"),
-            Some("brew install --cask mozilla-ai/tap/settl")
-        );
-        assert_eq!(
-            install_hint("hermes"),
-            Some("curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash")
-        );
-        assert_eq!(
-            install_hint("kiro"),
-            Some("curl -fsSL https://cli.kiro.dev/install | bash")
-        );
-        assert_eq!(
-            install_hint("antigravity"),
-            Some("curl -fsSL https://antigravity.google/cli/install.sh | bash")
-        );
-        assert_eq!(
-            install_hint("omp"),
-            Some("curl -fsSL https://omp.sh/install | sh")
-        );
-        assert_eq!(
-            install_hint("kimi"),
-            Some("curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash")
-        );
-        assert_eq!(
-            install_hint("prime-agent"),
-            Some("curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh")
-        );
-        assert!(install_hint("unknown").is_none());
-    }
-
-    #[test]
-    fn test_all_hook_configs_declare_expected_format() {
-        // Adding or changing an agent's hook format requires updating both
-        // this list and the declaration in `AGENTS`. The dispatch in
-        // `crate::hooks::iter_hook_targets_in` is keyed off this field, so
-        // drift here is a behavior change.
-        let expected: &[(&str, HookFormat)] = &[
-            ("claude", HookFormat::JsonSettings),
-            ("codex", HookFormat::CodexJson),
-            ("gemini", HookFormat::JsonSettings),
-            ("qwen", HookFormat::JsonSettings),
-        ];
-        for (name, fmt) in expected {
-            let agent = get_agent(name).unwrap_or_else(|| panic!("missing agent {name}"));
-            let cfg = agent
-                .hook_config
-                .as_ref()
-                .unwrap_or_else(|| panic!("agent {name} must have hook_config"));
-            assert_eq!(cfg.format, *fmt, "agent {name} hook format must be {fmt:?}");
-        }
-        let declared: Vec<&str> = AGENTS
-            .iter()
-            .filter(|a| a.hook_config.is_some())
-            .map(|a| a.name)
-            .collect();
-        let expected_names: Vec<&str> = expected.iter().map(|(n, _)| *n).collect();
-        assert_eq!(
-            declared, expected_names,
-            "hook_config agent set drifted; update test_all_hook_configs_declare_expected_format"
-        );
-    }
-
-    #[test]
-    fn test_all_sidecar_hooks_declare_expected_format() {
-        // Mirror of `test_all_hook_configs_declare_expected_format` for the
-        // sidecar path. The dispatch in `crate::hooks::has_aoe_marker` is
-        // keyed off this field.
-        let expected: &[(&str, SidecarFormat)] = &[
-            ("cursor", SidecarFormat::KiroJson),
-            ("settl", SidecarFormat::SettlToml),
-            ("hermes", SidecarFormat::HermesYaml),
-            ("kiro", SidecarFormat::KiroJson),
-            ("kimi", SidecarFormat::KimiToml),
-        ];
-        for (name, fmt) in expected {
-            let agent = get_agent(name).unwrap_or_else(|| panic!("missing agent {name}"));
-            let sidecar = agent
-                .sidecar_hooks
-                .as_ref()
-                .unwrap_or_else(|| panic!("agent {name} must have sidecar_hooks"));
-            assert_eq!(
-                sidecar.format, *fmt,
-                "agent {name} sidecar format must be {fmt:?}"
-            );
-        }
-        let declared: Vec<&str> = AGENTS
-            .iter()
-            .filter(|a| a.sidecar_hooks.is_some())
-            .map(|a| a.name)
-            .collect();
-        let expected_names: Vec<&str> = expected.iter().map(|(n, _)| *n).collect();
-        assert_eq!(
-            declared, expected_names,
-            "sidecar_hooks agent set drifted; update test_all_sidecar_hooks_declare_expected_format"
-        );
-    }
-
-    #[test]
-    fn test_fork_strategy_is_set_for_fork_capable_agents() {
-        // Only claude, codex, and opencode can fork; every other agent is
-        // Unsupported. Iterating the full AGENTS slice makes a new agent with a
-        // stray fork_strategy fail loudly here.
-        assert!(matches!(
-            get_agent("claude").unwrap().fork_strategy,
-            ForkStrategy::ClaudeFork
-        ));
-        assert!(matches!(
-            get_agent("codex").unwrap().fork_strategy,
-            ForkStrategy::CodexFork
-        ));
-        assert!(matches!(
-            get_agent("opencode").unwrap().fork_strategy,
-            ForkStrategy::Flag("--fork")
-        ));
-        // prime-agent documents `--fork <path|id>`, but the flag needs the
-        // parent id as its value and build_fork_flags' Flag arm appends the
-        // fork flag bare, so it stays Unsupported (see its AgentDef comment).
-        assert!(matches!(
-            get_agent("prime-agent").unwrap().fork_strategy,
-            ForkStrategy::Unsupported
-        ));
-        for agent in AGENTS {
-            let fork_capable = matches!(agent.name, "claude" | "codex" | "opencode");
-            assert_eq!(
-                matches!(agent.fork_strategy, ForkStrategy::Unsupported),
-                !fork_capable,
-                "agent '{}' fork_strategy drifted; when adding an agent, update \
-                 test_fork_strategy_is_set_for_fork_capable_agents and the agent's fork_strategy",
-                agent.name
-            );
-        }
-    }
-
-    #[test]
-    fn test_hook_config_and_sidecar_hooks_are_mutually_exclusive() {
-        // `SidecarHooks` doc states the two are mutually exclusive. Lock
-        // the invariant so a future agent does not silently get hooks
-        // installed by both paths.
-        for agent in AGENTS {
-            assert!(
-                !(agent.hook_config.is_some() && agent.sidecar_hooks.is_some()),
-                "agent {} must not declare both hook_config and sidecar_hooks",
-                agent.name
-            );
-        }
-    }
-
-    #[test]
-    fn test_prime_agent_definition() {
-        let prime = get_agent("prime-agent").unwrap();
-        assert_eq!(prime.binary, "prime-agent");
-        assert!(matches!(
-            &prime.detection,
-            DetectionMethod::Which("prime-agent")
-        ));
-        // No built-in approval gate upstream, so like pi it is AlwaysYolo.
-        assert!(matches!(&prime.yolo, Some(YoloMode::AlwaysYolo)));
-        assert!(matches!(
-            prime.session_support.as_ref().map(|support| support.resume),
-            Some(ResumeStrategy::Flag("--resume"))
-        ));
-        // Fork stays Unsupported: upstream `--fork` needs the parent id as
-        // its value, which build_fork_flags does not emit (see AGENTS entry).
-        assert!(matches!(&prime.fork_strategy, ForkStrategy::Unsupported));
-        // `-p` is boolean print mode; the prompt stays positional (args.ts).
-        assert_eq!(prime.oneshot_flag, Some("-p"));
-        assert_eq!(prime.oneshot_model_flag(), Some("--model"));
-        assert!(!prime.oneshot_flag_binds_prompt());
-        assert!(!prime.host_only);
-        assert_eq!(prime.send_keys_enter_delay_ms, 0);
-        assert_eq!(prime.launch_subcommand, None);
-        assert!(prime.hook_config.is_none());
-        assert!(prime.sidecar_hooks.is_none());
-        assert_eq!(
-            prime.container_env,
-            &[("PRIME_AGENT_CODING_AGENT_DIR", "/root/.prime/agent")]
-        );
-        assert_eq!(
-            prime.install_hint,
-            "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"
-        );
     }
 }

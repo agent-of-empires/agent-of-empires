@@ -1,19 +1,12 @@
-//! Migration v019: move `acp_defaults` from `[session]` to `[acp]`.
-//!
-//! Per-agent structured-view defaults were introduced under `[session]`, but
-//! the setting is ACP/structured-view configuration and now lives on `AcpConfig`
-//! so the web dashboard renders it under the Structured View tab (which is
-//! section-routed to `[acp]`). Without this move an existing
-//! `[session.acp_defaults.*]` value would be silently ignored (the new field
-//! defaults empty), so the user would lose their configured defaults.
-//!
-//! Applies to the global config and every profile config. Idempotent: a value
-//! already under `[acp]` is preferred and the stale `[session]` copy is dropped.
+//! Migration v019: move `acp_defaults` from `[session]` to `[acp]` in the
+//! global config and every profile config; the new field would otherwise
+//! silently ignore a configured value. A value already under `[acp]` wins and
+//! the stale `[session]` copy is dropped.
 
+use super::config_file;
 use anyhow::Result;
-use std::fs;
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::info;
 
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
@@ -21,61 +14,42 @@ pub fn run() -> Result<()> {
 }
 
 pub(crate) fn run_in(app_dir: &Path) -> Result<()> {
-    migrate_config_file(&app_dir.join("config.toml"))?;
-    let profiles_dir = app_dir.join("profiles");
-    if profiles_dir.exists() {
-        for entry in fs::read_dir(&profiles_dir)? {
-            let entry = entry?;
-            if entry.path().is_dir() {
-                migrate_config_file(&entry.path().join("config.toml"))?;
-            }
-        }
+    for path in config_file::all_configs(app_dir)? {
+        migrate_config_file(&path)?;
     }
     Ok(())
 }
 
 fn migrate_config_file(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let content = fs::read_to_string(path)?;
-    let mut doc: toml::Table = match content.parse() {
-        Ok(table) => table,
-        Err(e) => {
-            debug!("failed to parse {}: {e}, skipping", path.display());
-            return Ok(());
+    config_file::rewrite(path, |doc| {
+        let Some(moved) = doc
+            .get_mut("session")
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|session| session.remove("acp_defaults"))
+        else {
+            return false;
+        };
+        // An existing `[acp].acp_defaults` (a prior run, or a manual edit)
+        // outranks the stale `[session]` copy.
+        if let Some(acp) = doc
+            .entry("acp".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+        {
+            acp.entry("acp_defaults".to_string()).or_insert(moved);
         }
-    };
-
-    // Pull `acp_defaults` out of `[session]`; nothing to do if absent.
-    let moved = doc
-        .get_mut("session")
-        .and_then(toml::Value::as_table_mut)
-        .and_then(|session| session.remove("acp_defaults"));
-    let Some(moved) = moved else {
-        return Ok(());
-    };
-
-    // Insert under `[acp]`, creating the table if needed. Prefer an existing
-    // `[acp].acp_defaults` (a prior run or manual edit) over the stale copy.
-    let acp = doc
-        .entry("acp".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-    if let Some(acp_table) = acp.as_table_mut() {
-        acp_table.entry("acp_defaults".to_string()).or_insert(moved);
-    }
-
-    crate::session::atomic_write(path, toml::to_string_pretty(&doc)?.as_bytes())?;
-    info!(
-        "v019: moved acp_defaults from [session] to [acp] in {}",
-        path.display()
-    );
-    Ok(())
+        info!(
+            "v019: moved acp_defaults from [session] to [acp] in {}",
+            path.display()
+        );
+        true
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn moves_acp_defaults_and_is_idempotent() {

@@ -1,39 +1,26 @@
-//! The periodic telemetry snapshot: what the daemon counts while it serves
-//! and how those counters are cleared once reported.
+//! The periodic telemetry snapshot.
 
 use std::sync::Arc;
 
 use super::state::AppState;
 
-/// Background task: emit an opt-in telemetry `usage_snapshot` immediately and
-/// every ~4 hours (jittered), plus a final one on graceful shutdown. The boot
-/// `process_start` is emitted separately by the caller before transport setup.
-/// All sends are best-effort and swallow errors; nothing leaves the box unless
-/// the user opted in and an endpoint is configured.
+/// Background task.
 pub(super) fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
     tokio::spawn(async move {
-        // Jittered period (4h + up to 30m) so installs that boot together don't
-        // snapshot in lockstep; the first tick is still immediate (boot
-        // snapshot). `Delay` avoids a burst of catch-up ticks after a stall.
+        // Jittered period (4h + up to 30m) so installs that boot together don't snapshot in
+        // lockstep; the first tick is still immediate (boot snapshot).
         let mut interval = tokio::time::interval(crate::telemetry::snapshot_interval());
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Sample the live session list more often than we send, folding each
-        // sample into a window aggregate so short-lived sessions' agent/model
-        // mix and the concurrency peak survive into the periodic snapshot (#1870).
-        // Both tickers share this one task, so a sample tick and a flush tick
-        // never run concurrently: the aggregate needs no locking and a plain
-        // reset after a confirmed send is race-free. `Skip` so a long suspend
-        // does not fire a run of catch-up samples on wake.
+        // Sample the live session list more often than we send, folding each sample into a
+        // window aggregate so short-lived sessions' agent/model mix and the concurrency
+        // peak survive into the periodic snapshot.
         let mut sample = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
         sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut aggregator = crate::telemetry::aggregate::UsageAggregator::default();
         loop {
             tokio::select! {
                 _ = state.shutdown.cancelled() => {
-                    // Deduped: a serve process that starts and stops between
-                    // periodic ticks would otherwise emit the initial first-tick
-                    // snapshot and an identical shutdown snapshot seconds apart.
-                    // We exit after this, so the aggregate is dropped; no reset.
+                    // Deduped.
                     if let Some(snapshot) = build_serve_snapshot(&state, &mut aggregator).await {
                         let outcome = crate::telemetry::flush_snapshot_if_changed(snapshot).await;
                         clear_reported_serve_signals(&state, outcome);
@@ -42,19 +29,16 @@ pub(super) fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
                 }
                 _ = interval.tick() => {
                     if let Some(snapshot) = build_serve_snapshot(&state, &mut aggregator).await {
-                        // Awaited (not detached) so the reported signals are
-                        // cleared only after a confirmed send. A failed send
-                        // retains the usage_seen counts / the create counter
-                        // for the next snapshot instead of dropping them.
+                        // Awaited (not detached) so the reported signals are cleared only
+                        // after a confirmed send.
                         let outcome = if crate::telemetry::send_snapshot(snapshot).await {
                             crate::telemetry::SendOutcome::Sent
                         } else {
                             crate::telemetry::SendOutcome::Failed
                         };
                         clear_reported_serve_signals(&state, outcome);
-                        // Reset the window only after a confirmed send, mirroring
-                        // the signal-clear discipline: a failed send keeps the
-                        // aggregate so the next flush re-reports the full window.
+                        // Reset the window only after a confirmed send, mirroring the
+                        // signal-clear discipline.
                         if outcome == crate::telemetry::SendOutcome::Sent {
                             aggregator = crate::telemetry::aggregate::UsageAggregator::default();
                         }
@@ -70,12 +54,6 @@ pub(super) fn spawn_serve_snapshot_loop(state: Arc<AppState>) {
 }
 
 /// Per-form-factor open counters for one web surface (dashboard or acp).
-/// A fixed, lock-free set over the closed [`crate::telemetry::WebClientFormFactor`]
-/// allowlist: the seen endpoint increments the matching class, the snapshot
-/// reads exact counts, and a confirmed send decrements by exactly what it
-/// reported (so an open landing during an in-flight send survives, mirroring
-/// the coarse `telemetry_web_seen` counter). Named fields rather than a map so
-/// no free-form string key can ever enter daemon state.
 #[derive(Default)]
 pub struct FormFactorCounters {
     desktop: std::sync::atomic::AtomicU32,
@@ -112,8 +90,7 @@ impl FormFactorCounters {
         counts
     }
 
-    /// Subtract exactly the reported counts after a confirmed send. Never zeroes,
-    /// so an open that landed mid-send rolls into the next snapshot.
+    /// Subtract exactly the reported counts after a confirmed send.
     fn decrement(&self, reported: &FormFactorCounts) {
         for ff in crate::telemetry::WebClientFormFactor::ALL {
             let n = reported.get(ff);
@@ -125,8 +102,7 @@ impl FormFactorCounters {
     }
 }
 
-/// A snapshot's reported per-class counts. Plain values (not atomics) so they
-/// can be stashed in [`ReportedServeSignals`] and replayed on confirm.
+/// A snapshot's reported per-class counts.
 #[derive(Default, Clone, Copy)]
 pub(super) struct FormFactorCounts {
     desktop: u32,
@@ -159,9 +135,7 @@ impl FormFactorCounts {
         }
     }
 
-    /// Per-class was-seen map for the snapshot wire: only classes with a
-    /// positive count appear, each as `true`. Empty (and so omitted) when no
-    /// classified client opened the surface.
+    /// Per-class was-seen map for the snapshot wire.
     fn seen_map(&self) -> std::collections::BTreeMap<String, bool> {
         let mut map = std::collections::BTreeMap::new();
         for ff in crate::telemetry::WebClientFormFactor::ALL {
@@ -173,14 +147,7 @@ impl FormFactorCounts {
     }
 }
 
-/// Daemon-side structured-interaction tallies for the next opt-in snapshot. Each
-/// is a monotonic `AtomicU32` consumed with the same decrement-by-reported
-/// discipline as `telemetry_*_seen`, so an interaction that lands during an
-/// in-flight send rolls into the next snapshot instead of being dropped.
-///
-/// `plan_mode_seen` is a counter rather than a flag for the same reason: the
-/// snapshot reports the boolean `count > 0`, but consuming it by subtracting
-/// the reported amount keeps a plan-mode entry that arrived mid-send.
+/// Daemon-side structured-interaction tallies for the next opt-in snapshot.
 #[derive(Default)]
 pub struct StructuredTelemetryCounters {
     pub approvals_allow: std::sync::atomic::AtomicU32,
@@ -191,9 +158,8 @@ pub struct StructuredTelemetryCounters {
     pub prompts_queued: std::sync::atomic::AtomicU32,
 }
 
-/// What a serve snapshot reported, so the originating signals can be cleared
-/// only after the send is confirmed. The clear is deferred (rather than reset at
-/// build time) so a failed send retains the signals for the next snapshot.
+/// What a serve snapshot reported, so the originating signals can be cleared only after the
+/// send is confirmed.
 pub(super) struct ReportedServeSignals {
     usage_seen: std::collections::BTreeMap<String, u32>,
     web_clients: FormFactorCounts,
@@ -202,10 +168,8 @@ pub(super) struct ReportedServeSignals {
     acp: ReportedAcpCounts,
 }
 
-/// The raw `AtomicU32` values a snapshot folded in, kept so each can be
-/// decremented by exactly the reported amount on a confirmed send. `plan_mode`
-/// is the raw count (not the reported boolean) so a plan-mode entry that
-/// arrived mid-send is preserved rather than wiped.
+/// The raw `AtomicU32` values a snapshot folded in, kept so each can be decremented by
+/// exactly the reported amount on a confirmed send.
 #[derive(Default, Clone, Copy)]
 pub(super) struct ReportedAcpCounts {
     approvals_allow: u32,
@@ -216,17 +180,8 @@ pub(super) struct ReportedAcpCounts {
     prompts_queued: u32,
 }
 
-/// Build a serve `usage_snapshot` from the live session list, folding in the
-/// `usage_seen` open counts and the session-create trend counter *without
-/// resetting them*. The reported counts are stashed in `AppState` so
-/// [`clear_reported_serve_signals`] can subtract exactly what was reported once
-/// the send is confirmed. Returns `None` when telemetry is not opted in.
-///
-/// The live read is also folded into `aggregator` as the flush-moment sample,
-/// then the window's peak concurrency and distinct-sessions-seen maps override
-/// the point-in-time defaults `build_usage_snapshot` produced (#1870). The
-/// point-in-time `session_total` and status/sandbox/yolo/acp counts keep
-/// their instant-of-flush meaning.
+/// Build a serve `usage_snapshot` from the live session list, folding in the `usage_seen`
+/// open counts and the session-create trend counter *without resetting them*.
 pub(super) async fn build_serve_snapshot(
     state: &AppState,
     aggregator: &mut crate::telemetry::aggregate::UsageAggregator,
@@ -264,9 +219,7 @@ pub(super) async fn build_serve_snapshot(
         Some(state.serve_mode),
         &acp,
     )?;
-    // Layer the per-form-factor was-seen maps onto the snapshot. They are serve
-    // only (the browser surfaces), so the pure builder leaves them empty and the
-    // daemon fills them here from its client counters.
+    // Layer the per-form-factor was-seen maps onto the snapshot.
     snapshot.web_clients_seen = web_clients.seen_map();
     snapshot.structured_clients_seen = structured_clients.seen_map();
     snapshot.peak_concurrent_sessions = aggregator.peak_concurrent_sessions();
@@ -282,13 +235,8 @@ pub(super) async fn build_serve_snapshot(
     Some(snapshot)
 }
 
-/// Clear the signals a serve snapshot reported, but only when the send was
-/// confirmed (`SendOutcome::Sent`). On `Deduped` the prior confirmed send
-/// already cleared them; on `Failed` they are retained so the next snapshot
-/// re-reports them. Every signal (the `usage_seen` open counts and the create
-/// counter) is decremented by exactly what was reported, not reset to 0, so an
-/// open or a create that landed during the in-flight send survives into the
-/// next snapshot instead of being cleared away.
+/// Clear the signals a serve snapshot reported, but only when the send was confirmed
+/// (`SendOutcome::Sent`).
 pub(super) fn clear_reported_serve_signals(
     state: &AppState,
     outcome: crate::telemetry::SendOutcome,
@@ -316,17 +264,6 @@ pub(super) fn clear_reported_serve_signals(
 }
 
 /// Decrement a reported telemetry counter by exactly `reported`, never by more.
-/// Subtracting the reported amount rather than `swap(0)` preserves any
-/// increments (a create, or a web/acp open, or an acp interaction) that
-/// landed between the snapshot build and the confirmed send, so they roll into
-/// the next snapshot instead of being dropped. A no-op when nothing was
-/// reported.
-///
-/// The snapshot loop is the sole consumer and runs strictly sequentially (each
-/// send is awaited, then cleared, before the next build), so the counter can
-/// never go below `reported`. The subtraction saturates anyway as cheap
-/// insurance against a future refactor that detaches sends, which would
-/// otherwise be able to underflow-wrap the `AtomicU32`.
 pub(super) fn decrement_reported_count(counter: &std::sync::atomic::AtomicU32, reported: u32) {
     if reported == 0 {
         return;
@@ -341,38 +278,23 @@ pub(super) fn decrement_reported_count(counter: &std::sync::atomic::AtomicU32, r
 mod tests {
     use super::*;
 
-    // #1874 / #1875: a confirmed snapshot clears a reported telemetry counter
-    // (the create counter and the web/acp open counts all share this path)
-    // by exactly the value it reported, so an increment that arrives during the
-    // in-flight send survives into the next snapshot instead of being reset away.
+    /// #1874 / #1875: a confirmed send clears only the increments it reported, so one
+    /// that lands mid-flight survives, and a zero report touches nothing.
     #[test]
     fn reported_count_decrement_preserves_concurrent_increments() {
         use std::sync::atomic::{AtomicU32, Ordering};
+
         let counter = AtomicU32::new(5);
-        // The snapshot reported the 5 increments seen at build time.
         let reported = counter.load(Ordering::Relaxed);
-        // One more lands while the snapshot is in flight.
         counter.fetch_add(1, Ordering::Relaxed);
-        // The confirmed send clears only what it reported.
         decrement_reported_count(&counter, reported);
-        assert_eq!(
-            counter.load(Ordering::Relaxed),
-            1,
-            "the increment that arrived during the send must be retained"
-        );
-    }
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
 
-    #[test]
-    fn reported_count_decrement_is_noop_for_zero() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        let counter = AtomicU32::new(3);
         decrement_reported_count(&counter, 0);
-        assert_eq!(counter.load(Ordering::Relaxed), 3);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
-    // #1883: the per-form-factor counters dedup repeated same-class opens to a
-    // single was-seen entry, and the confirmed-send decrement subtracts exactly
-    // what was reported so a class opened during an in-flight send survives.
+    // #1883.
     #[test]
     fn form_factor_counters_dedup_and_preserve_in_flight_opens() {
         use crate::telemetry::WebClientFormFactor::{Desktop, MobilePwa};
@@ -405,9 +327,7 @@ mod tests {
         );
     }
 
-    // #1888: the same decrement path carries the structured-interaction counters,
-    // so an interaction that lands mid-send must survive the clear (the plan
-    // mode counter shown here, which the snapshot reports as the bool count>0).
+    // #1888.
     #[test]
     fn reported_count_decrement_preserves_concurrent_structured_interaction() {
         use std::sync::atomic::{AtomicU32, Ordering};

@@ -5,12 +5,9 @@ prompt_marker = ['^\s*╭[─-]*\s+\S']
 line_regex = ['^\s*╭[─-]*\s+\S']
 
 # omp stacks live markers, so priority-960 rules compete by screen position.
-# The lowest match is current.
 
 # The loader: a frame glyph opening the line, plus either the word `working` or
-# an interrupt hint. Braille frames carry the word; ascii and symbolic frames
-# are only a loader when the hint is there, since `- foo` and `• foo` are
-# ordinary bullets.
+# an interrupt hint.
 [[rules]]
 id = "loader_braille"
 state = "running"
@@ -29,8 +26,7 @@ positional = true
 region = "bottom_non_empty_lines(3)"
 visible = true
 # An ascii spinner frame, or a symbolic one: a leading token of punctuation
-# carrying at least one non-ascii character. The reserved glyphs are omp's own
-# bullets and panel borders, which open ordinary rows.
+# carrying at least one non-ascii character.
 any = [
   { line_regex = ['^\s*[-\\|/] '] },
   { line_regex = ['^\s*[^\w\s\x{2022}\x{f111}\x{203B}\x{276F}\x{f054}\x{2502}\x{2503}\x{258F}\x{258E}]*[^\x00-\x7F][^\w\s]* '] },
@@ -41,7 +37,6 @@ contains_any = ["⟦esc⟧", "⟨esc⟩", "[esc]", "(esc to cancel)"]
 not = [{ line_regex = ['^\s*[\x{2022}\x{f111}\x{203B}\x{276F}\x{f054}\x{2502}\x{2503}\x{258F}\x{258E}]'] }]
 
 # OMP 18 renders its activity frame and whole-unit timer in the status line.
-# Pair that band with the nearby interrupt row so elapsed prose is not activity.
 [[rules]]
 id = "active_brand"
 state = "running"
@@ -88,11 +83,8 @@ not = [
   { line_regex = ['^\s*╭[─-]*\s*\p{Ll}\s+(?:0|[1-9]\d*)[smh]\s+\p{Ll}'] },
 ]
 
-# Bottom status rows pair a braille turn timer with a nearby activity hint,
-# in every composer shape that parks one at the bottom. A band the fixed
-# bottom-line windows still reach is served here whether its frame is ascii or
-# Unicode; active_composer takes over once a wrapped draft pushes the band
-# above them.
+# Bottom status rows pair a braille turn timer with a nearby activity hint, in
+# every composer shape that parks one at the bottom.
 [[rules]]
 id = "active_statusline"
 state = "running"
@@ -111,11 +103,8 @@ all = [
 ]
 not = [
   { line_regex = ['^\s*(?:(?:╭[─-]*|\+[=-]*)\s*)?(?:\x{e0b6}\s+)?(?:⏱|\x{f017}|◷|◴|⌛)\s+'] },
-  # A blocked panel keeps the composer and status row below it; the panel's
-  # own rules must win, so a genuine live dialog silences this rule.
-  # Require the panel's option/cursor structure alongside footer hints so
-  # that quoted or draft footer phrases do not suppress active status.
-  # Live approve/deny panel
+  # A blocked panel keeps the composer and status row below it; the panel's own
+  # rules must win, so a genuine live dialog silences this rule.
   { region = "bottom_non_empty_lines(12)", all = [
     { line_regex = ['(?i)^\s*[│|][^\n]*(?:up/down navigate|enter select|esc cancel)'] },
     { line_regex = ['(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?approve\s*[│|]?\s*$'] },
@@ -153,10 +142,8 @@ not = [
   { region = "bottom_non_empty_lines(3)", line_regex = ['(?i)^\s*(?:⎋|\x{f12b7}|esc)\s+working(?:…|\.\.\.)\s*$'], min_lines = 2 },
 ]
 
-# The wrapped variant: the frame line runs on and the hint lands on an
-# indented continuation. The frame line itself must carry neither the hint (or
-# the plain rule above would have caught it) nor sentence-final punctuation,
-# which is what separates a wrapped loader from prose followed by a hint.
+# The wrapped variant: the frame line runs on and the hint lands on an indented
+# continuation.
 [[rules]]
 id = "loader_wrapped"
 state = "running"
@@ -203,8 +190,7 @@ region = "bottom_non_empty_lines(6)"
 visible = true
 contains_any = ["error: retry budget exhausted", "error: retry failed after"]
 
-# A prompt panel's footer row. A composer may remain below a genuine Ask
-# panel; without its Ask border, the same hint is draft content.
+# A prompt panel's footer row.
 [[rules]]
 id = "panel_prompt"
 state = "waiting"

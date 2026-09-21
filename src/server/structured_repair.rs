@@ -201,83 +201,32 @@ mod tests {
         let temp = tempfile::TempDir::with_prefix_in("aoe-repair-", "/tmp").expect("tempdir");
         let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
 
-        let socket_path = crate::process::worker_registry::workers_dir()
-            .expect("workers dir")
-            .join("repair-live.sock");
-        crate::process::worker_registry::touch_live_socket(&socket_path);
-        let live_record = crate::process::worker_registry::WorkerRecord::new(
-            "repair-live".to_string(),
-            std::process::id(),
-            socket_path,
-            "codex-acp".to_string(),
-            "codex".to_string(),
-            std::path::PathBuf::from("/tmp/repo"),
-            Some("gpt-5".to_string()),
-            Vec::new(),
-            Vec::new(),
-            Some("acp-session-1".to_string()),
-            Some("default".to_string()),
-        );
-        crate::process::worker_registry::save(&live_record).expect("save live worker record");
-
-        let existing_socket_path = crate::process::worker_registry::workers_dir()
-            .expect("workers dir")
-            .join("repair-existing.sock");
-        crate::process::worker_registry::touch_live_socket(&existing_socket_path);
-        let existing_record = crate::process::worker_registry::WorkerRecord::new(
-            "repair-existing".to_string(),
-            std::process::id(),
-            existing_socket_path,
-            "codex-acp".to_string(),
-            "codex".to_string(),
-            std::path::PathBuf::from("/tmp/repo"),
-            Some("gpt-5".to_string()),
-            Vec::new(),
-            Vec::new(),
-            Some("acp-session-2".to_string()),
-            Some("default".to_string()),
-        );
-        crate::process::worker_registry::save(&existing_record)
-            .expect("save existing-field worker record");
-
-        let stale_socket_path = crate::process::worker_registry::workers_dir()
-            .expect("workers dir")
-            .join("repair-no-id.sock");
-        crate::process::worker_registry::touch_live_socket(&stale_socket_path);
-        let no_id_record = crate::process::worker_registry::WorkerRecord::new(
-            "repair-no-id".to_string(),
-            std::process::id(),
-            stale_socket_path,
-            "codex-acp".to_string(),
-            "codex".to_string(),
-            std::path::PathBuf::from("/tmp/repo"),
-            None,
-            Vec::new(),
-            Vec::new(),
-            None,
-            Some("default".to_string()),
-        );
-        crate::process::worker_registry::save(&no_id_record).expect("save no-id worker record");
-
-        let empty_socket_path = crate::process::worker_registry::workers_dir()
-            .expect("workers dir")
-            .join("repair-empty-id.sock");
-        crate::process::worker_registry::touch_live_socket(&empty_socket_path);
-        let empty_id_record = crate::process::worker_registry::WorkerRecord::new(
-            "repair-empty-id".to_string(),
-            std::process::id(),
-            empty_socket_path,
-            "codex-acp".to_string(),
-            "codex".to_string(),
-            std::path::PathBuf::from("/tmp/repo"),
-            None,
-            Vec::new(),
-            Vec::new(),
-            Some(String::new()),
-            Some("default".to_string()),
-        );
-        crate::process::worker_registry::save(&empty_id_record)
-            .expect("save empty-id worker record");
+        // A live worker registry record per session id, with the model and ACP session
+        // id the repair reads back.
+        let save_worker = |id: &str, model: Option<&str>, acp_session_id: Option<&str>| {
+            let socket_path = crate::process::worker_registry::workers_dir()
+                .expect("workers dir")
+                .join(format!("{id}.sock"));
+            crate::process::worker_registry::touch_live_socket(&socket_path);
+            let record = crate::process::worker_registry::WorkerRecord::new(
+                id.to_string(),
+                std::process::id(),
+                socket_path,
+                "codex-acp".to_string(),
+                "codex".to_string(),
+                std::path::PathBuf::from("/tmp/repo"),
+                model.map(str::to_string),
+                Vec::new(),
+                Vec::new(),
+                acp_session_id.map(str::to_string),
+                Some("default".to_string()),
+            );
+            crate::process::worker_registry::save(&record).expect("save worker record");
+        };
+        save_worker("repair-live", Some("gpt-5"), Some("acp-session-1"));
+        save_worker("repair-existing", Some("gpt-5"), Some("acp-session-2"));
+        save_worker("repair-no-id", None, None);
+        save_worker("repair-empty-id", None, Some(""));
 
         let mut rows = vec![
             Instance::new("repair-live", "/tmp/repo"),

@@ -1,16 +1,6 @@
 // @vitest-environment jsdom
-//
-// Behavioral coverage for the Settings "Advanced" folds (#1515):
-//   Story #2 - advanced knobs are hidden behind a default-collapsed fold while
-//              high-level controls stay visible.
-//   Story #4 - the fold collapses back to default when the user changes tabs
-//              or switches profiles (component-local state, not persisted).
-//
-// Every config-backed section is schema-driven (#1692): SchemaSection builds
-// its rows (and the advanced fold) from the descriptor list below, so this
-// mock mirrors the real worktree / sandbox / acp `#[setting(...)]` shapes. The
-// browser-level persist-after-expand path (story #3) lives in mocked
-// Playwright at web/tests/settings-advanced-fold.spec.ts.
+// Settings "Advanced" folds (#1515): collapsed by default, reset on tab or profile switch. The browser
+// persist-after-expand path lives in tests/settings-advanced-fold.spec.ts.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -22,199 +12,53 @@ const PROFILES = [
   { name: "work", is_default: false },
 ];
 
-const ALLOW = { policy: "allow" } as const;
-const ELEV = {
-  policy: "requires_elevation",
-  reason: "host filesystem",
-} as const;
-const NONE = { rule: "none" } as const;
-
-// Representative slice of the real schema: a few primary + advanced fields per
-// section, enough to exercise the fold across sections without mirroring every
-// field. Labels match the real `#[setting(label = ...)]` values.
-const RAW_SCHEMA: Array<{
-  section: string;
-  field: string;
-  label: string;
-  widget: Record<string, unknown>;
-  advanced: boolean;
-  web_write?: typeof ALLOW | typeof ELEV;
-  validation?: Record<string, unknown>;
-}> = [
-  // worktree
-  {
-    section: "worktree",
-    field: "enabled",
-    label: "Enabled by Default",
-    widget: { kind: "toggle" },
-    advanced: false,
-    web_write: ELEV,
-  },
-  {
-    section: "worktree",
-    field: "path_template",
-    label: "Path Template",
-    widget: { kind: "text" },
-    advanced: false,
-    web_write: ELEV,
-  },
-  {
-    section: "worktree",
-    field: "auto_cleanup",
-    label: "Auto Cleanup",
-    widget: { kind: "toggle" },
-    advanced: false,
-    web_write: ELEV,
-  },
-  {
-    section: "worktree",
-    field: "bare_repo_path_template",
-    label: "Bare Repo Template",
-    widget: { kind: "text" },
-    advanced: true,
-    web_write: ELEV,
-  },
-  {
-    section: "worktree",
-    field: "workspace_path_template",
-    label: "Workspace Path Template",
-    widget: { kind: "text" },
-    advanced: true,
-    web_write: ELEV,
-  },
-  {
-    section: "worktree",
-    field: "delete_branch_on_cleanup",
-    label: "Delete Branch on Cleanup",
-    widget: { kind: "toggle" },
-    advanced: true,
-    web_write: ELEV,
-  },
-  {
-    section: "worktree",
-    field: "init_submodules",
-    label: "Init Submodules",
-    widget: { kind: "toggle" },
-    advanced: true,
-    web_write: ELEV,
-  },
-  // sandbox
-  {
-    section: "sandbox",
-    field: "enabled_by_default",
-    label: "Sandbox enabled by default",
-    widget: { kind: "toggle" },
-    advanced: false,
-    web_write: ELEV,
-  },
-  {
-    section: "sandbox",
-    field: "cpu_limit",
-    label: "CPU limit",
-    widget: { kind: "optional_text" },
-    advanced: true,
-  },
-  {
-    section: "sandbox",
-    field: "memory_limit",
-    label: "Memory limit",
-    widget: { kind: "optional_text" },
-    advanced: true,
-    validation: { rule: "memory_limit" },
-  },
-  {
-    section: "sandbox",
-    field: "custom_instruction",
-    label: "Custom instruction",
-    widget: { kind: "text", multiline: true },
-    advanced: true,
-  },
-  {
-    section: "sandbox",
-    field: "environment",
-    label: "Environment variables",
-    widget: { kind: "list" },
-    advanced: true,
-    web_write: ELEV,
-    validation: { rule: "env_list" },
-  },
-  {
-    section: "sandbox",
-    field: "extra_volumes",
-    label: "Extra volumes",
-    widget: { kind: "list" },
-    advanced: true,
-    web_write: ELEV,
-    validation: { rule: "volume_list" },
-  },
-  {
-    section: "sandbox",
-    field: "port_mappings",
-    label: "Port mappings",
-    widget: { kind: "list" },
-    advanced: true,
-    web_write: ELEV,
-    validation: { rule: "port_mapping_list" },
-  },
-  {
-    section: "sandbox",
-    field: "volume_ignores",
-    label: "Volume ignores",
-    widget: { kind: "list" },
-    advanced: true,
-  },
-  // acp (structured view)
-  {
-    section: "acp",
-    field: "show_tool_durations",
-    label: "Show tool-call durations",
-    widget: { kind: "toggle" },
-    advanced: false,
-  },
-  {
-    section: "acp",
-    field: "rate_limit_auto_resume",
-    label: "Auto-resume after rate limit",
-    widget: { kind: "toggle" },
-    advanced: false,
-  },
-  {
-    section: "acp",
-    field: "replay_events",
-    label: "History cap (events)",
-    widget: { kind: "number", min: 0 },
-    advanced: false,
-  },
-  {
-    section: "acp",
-    field: "max_concurrent_workers",
-    label: "Max concurrent workers",
-    widget: { kind: "number", min: 1 },
-    advanced: true,
-  },
-  {
-    section: "acp",
-    field: "silent_orphan_grace_secs",
-    label: "Silent-orphan grace (s)",
-    widget: { kind: "number", min: 0 },
-    advanced: true,
-  },
-  {
-    section: "acp",
-    field: "auto_stop_idle_secs",
-    label: "Auto-stop idle workers (s)",
-    widget: { kind: "number", min: 0 },
-    advanced: true,
-  },
+const ELEV = { policy: "requires_elevation", reason: "host filesystem" } as const;
+type Row = [
+  section: string,
+  field: string,
+  label: string,
+  widget: Record<string, unknown>,
+  advanced: boolean,
+  elevated?: boolean,
+  rule?: string,
 ];
 
-const MOCK_SCHEMA = RAW_SCHEMA.map((d) => ({
-  category: d.section,
+// A representative slice of the real `#[setting(...)]` shapes, labels included.
+const ROWS: Row[] = [
+  ["worktree", "enabled", "Enabled by Default", { kind: "toggle" }, false, true],
+  ["worktree", "path_template", "Path Template", { kind: "text" }, false, true],
+  ["worktree", "auto_cleanup", "Auto Cleanup", { kind: "toggle" }, false, true],
+  ["worktree", "bare_repo_path_template", "Bare Repo Template", { kind: "text" }, true, true],
+  ["worktree", "workspace_path_template", "Workspace Path Template", { kind: "text" }, true, true],
+  ["worktree", "delete_branch_on_cleanup", "Delete Branch on Cleanup", { kind: "toggle" }, true, true],
+  ["worktree", "init_submodules", "Init Submodules", { kind: "toggle" }, true, true],
+  ["sandbox", "enabled_by_default", "Sandbox enabled by default", { kind: "toggle" }, false, true],
+  ["sandbox", "cpu_limit", "CPU limit", { kind: "optional_text" }, true],
+  ["sandbox", "memory_limit", "Memory limit", { kind: "optional_text" }, true, false, "memory_limit"],
+  ["sandbox", "custom_instruction", "Custom instruction", { kind: "text", multiline: true }, true],
+  ["sandbox", "environment", "Environment variables", { kind: "list" }, true, true, "env_list"],
+  ["sandbox", "extra_volumes", "Extra volumes", { kind: "list" }, true, true, "volume_list"],
+  ["sandbox", "port_mappings", "Port mappings", { kind: "list" }, true, true, "port_mapping_list"],
+  ["sandbox", "volume_ignores", "Volume ignores", { kind: "list" }, true],
+  ["acp", "show_tool_durations", "Show tool-call durations", { kind: "toggle" }, false],
+  ["acp", "rate_limit_auto_resume", "Auto-resume after rate limit", { kind: "toggle" }, false],
+  ["acp", "replay_events", "History cap (events)", { kind: "number", min: 0 }, false],
+  ["acp", "max_concurrent_workers", "Max concurrent workers", { kind: "number", min: 1 }, true],
+  ["acp", "silent_orphan_grace_secs", "Silent-orphan grace (s)", { kind: "number", min: 0 }, true],
+  ["acp", "auto_stop_idle_secs", "Auto-stop idle workers (s)", { kind: "number", min: 0 }, true],
+];
+
+const MOCK_SCHEMA = ROWS.map(([section, field, label, widget, advanced, elevated, rule]) => ({
+  section,
+  field,
+  label,
+  widget,
+  advanced,
+  category: section,
   description: "",
-  web_write: d.web_write ?? ALLOW,
+  web_write: elevated ? ELEV : { policy: "allow" },
   profile_overridable: true,
-  validation: d.validation ?? NONE,
-  ...d,
+  validation: { rule: rule ?? "none" },
 }));
 
 vi.mock("../../lib/api", () => ({
@@ -431,11 +275,7 @@ describe("Settings Advanced fold", () => {
     });
   });
 
-  // Regression: the mount-time fetchProfiles resolution flips selectedProfile
-  // from its "" seed to the default. That transition must NOT remount the
-  // content fieldset, or a fold expanded during the load window collapses out
-  // from under the user (the deterministic mirror of the flake the retired
-  // live settings-advanced-fold spec used to hit).
+  // Regression: the mount-time fetchProfiles resolution flips selectedProfile from its "" seed to the default.
   it("keeps an expanded fold open when the initial profile resolves", async () => {
     let resolveProfiles!: (p: typeof PROFILES) => void;
     vi.mocked(api.fetchProfiles).mockImplementationOnce(

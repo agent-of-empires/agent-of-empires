@@ -9,10 +9,7 @@ interface Props {
   onDelete: (id: string) => void;
 }
 
-/** Saved-comment view. Body is rendered as markdown via the existing
- *  structured view Markdown component. Switching to edit mode reuses
- *  CommentForm. Stale comments show a `[stale]` chip; they remain
- *  editable so the user can rewrite or delete them. */
+/** A saved comment; stale ones stay editable and show a `[stale]` chip. */
 export function CommentCard({ anchored, onSave, onDelete }: Props) {
   const [editing, setEditing] = useState(false);
   const { comment, status } = anchored;

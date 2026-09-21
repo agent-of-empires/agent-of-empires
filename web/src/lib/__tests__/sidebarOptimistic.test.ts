@@ -22,8 +22,6 @@ function ws(id: string, sessions: Partial<SessionResponse>[]): Workspace {
     agents: ["claude"],
     primaryAgent: "claude",
     status: "idle",
-    // serverTriageOf only reads the triage timestamps, so a partial cast is
-    // enough here and avoids restating the full SessionResponse shape.
     sessions: sessions as SessionResponse[],
   };
 }
@@ -120,7 +118,6 @@ describe("reconcileOptimistic", () => {
     const map = new Map([["w", override({ pinned: true })]]);
     const next = reconcileOptimistic(map, [ws("w", [{ pinned_at: null }])]);
     expect(next.get("w")?.pinned).toBe(true);
-    // No change means the same reference is returned.
     expect(next).toBe(map);
   });
 
@@ -146,8 +143,6 @@ describe("reconcileOptimistic", () => {
 
   it("clears only the caught-up field, keeping the rest of the entry", () => {
     const map = new Map([["w", override({ pinned: true, archived: false })]]);
-    // Server caught up to the archived=false override (no archive), but not
-    // the pin. The pin override survives; the archived override is dropped.
     const next = reconcileOptimistic(map, [ws("w", [{ pinned_at: null, archived_at: null }])]);
     expect(next.get("w")).toEqual({
       pinned: true,
@@ -164,7 +159,6 @@ describe("reconcileOptimistic", () => {
   });
 
   it("keeps a mark-unread override while the server still reports read", () => {
-    // The optimistic flag must survive until the server confirms it.
     const map = new Map([["w", override({ unread: true })]]);
     const next = reconcileOptimistic(map, [ws("w", [{ unread: false }])]);
     expect(next.get("w")?.unread).toBe(true);

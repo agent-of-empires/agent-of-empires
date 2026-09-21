@@ -18,12 +18,11 @@ fn duplicate_session_ids_are_excluded_from_home_map() {
     assert!(map.contains_key(&unique_id));
 }
 
-// #1897 / CodeRabbit follow-up: `add_instance` is the funnel for both the
-// `Creating` placeholder stub (async creation flow) and the finalized session
-// row. The opt-in create-trend counter must bump only for finalized inserts, or
-// a successful background create double-counts (stub + real) and a cancelled one
-// counts a session that never existed. Asserts deltas (not absolutes) since the
-// counter is a process-global shared with the `telemetry_creates` serial group.
+// #1897: `add_instance` funnels both the `Creating` stub and the finalized row, so the
+// opt-in create-trend counter must bump only for finalized inserts, or a successful
+// background create double-counts and a cancelled one counts a session that never existed.
+// Asserts deltas, since the counter is a process-global shared with the
+// `telemetry_creates` serial group.
 #[test]
 #[serial]
 #[serial_test::serial(telemetry_creates)]
@@ -299,10 +298,8 @@ fn test_initial_cursor_position() {
 #[test]
 #[serial]
 fn preview_info_follows_flag_and_never_auto_shows_in_live() {
-    // Info-header visibility is purely the persisted `show_preview_info` toggle
-    // (driven by `i` in the TUI). Live mode must NOT change it: if the user
-    // hid the header, it stays hidden when they go live, and a shown header
-    // stays shown. Nothing magically re-shows it.
+    // Info-header visibility is purely the persisted `show_preview_info` toggle, so live
+    // mode must not change it in either direction.
     use crate::tui::home::live_send::{LiveSendState, LiveSendTarget};
     use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
@@ -374,10 +371,9 @@ fn preview_info_follows_flag_and_never_auto_shows_in_live() {
     );
 }
 
-/// The app-level global keybindings defer Ctrl+C to live-send via this
-/// predicate (#2894). It is true only while live mode owns the keyboard: an
-/// overlay opened on top of live mode takes focus back, and Ctrl+C should
-/// then behave normally.
+/// The app-level keybindings defer Ctrl+C to live-send through this predicate (#2894),
+/// true only while live mode owns the keyboard: an overlay on top takes focus back and
+/// Ctrl+C behaves normally.
 #[test]
 #[serial]
 fn is_live_send_capturing_tracks_state_and_overlays() {
@@ -413,10 +409,9 @@ fn is_live_send_capturing_tracks_state_and_overlays() {
     );
 }
 
-/// #2894: in live mode Ctrl+C is forwarded to the agent (an interrupt), not
-/// treated as a quit, and each forward arms the footer reminder. Drives the
-/// real `handle_key` routing with the default `C-q` exit chord present so the
-/// test proves Ctrl+C is distinct from exiting.
+/// #2894: in live mode Ctrl+C is forwarded to the agent as an interrupt rather than a quit,
+/// and each forward arms the footer reminder. Drives the real `handle_key` routing with the
+/// default `C-q` exit chord present, so Ctrl+C is proven distinct from exiting.
 #[test]
 #[serial]
 fn ctrl_c_in_live_mode_forwards_to_agent_and_flashes() {
@@ -518,10 +513,9 @@ fn ctrl_c_flash_renders_in_live_footer() {
 #[serial]
 fn preview_visible_rows_equal_output_area_with_info_shown() {
     // With the info header shown, the Agent branch sizes the pane to
-    // `PreviewLayout::compute(..).output` (header + banner removed once) and the
-    // renderer paints into the same rect. `preview_visible_rows` must equal
-    // `preview_pane_area.height`; the historical bugs all came from a second,
-    // drifting derivation of this number, now consolidated into one layout.
+    // `PreviewLayout::compute(..).output` and the renderer paints into the same rect, so
+    // `preview_visible_rows` must equal `preview_pane_area.height`. The historical bugs all
+    // came from a second, drifting derivation of that number.
     use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -552,10 +546,9 @@ fn preview_visible_rows_equal_output_area_with_info_shown() {
     );
 }
 
-/// Precedence: unread paints only on resting (Idle/Unknown) rows. A live
-/// status supersedes it, keeping its own spinner — so a Running session that
-/// also carries an unread marker must NOT show the solid unread dot. See the
-/// #2088 review note about jumbled precedence.
+/// Precedence: unread paints only on resting rows. A live status supersedes it and keeps
+/// its own spinner, so a Running session carrying an unread marker must not show the dot
+/// (#2088 review).
 #[test]
 #[serial]
 fn unread_dot_yields_to_a_running_status() {
@@ -604,9 +597,8 @@ fn unread_dot_yields_to_a_running_status() {
     );
 }
 
-/// Sunk rows never paint the unread dot. Archiving or snoozing an unread
-/// row dismisses it; surfacing it as unread contradicts that. The snooze
-/// case must hold in every sort mode, not just Attention (#2571).
+/// Sunk rows never paint the unread dot: archiving or snoozing dismisses the row, and the
+/// snooze case must hold in every sort mode, not just Attention (#2571).
 #[test]
 #[serial]
 fn unread_dot_suppressed_on_archived_and_snoozed() {
@@ -677,9 +669,8 @@ fn unread_dot_suppressed_on_archived_and_snoozed() {
     );
 }
 
-/// Unread is an Agent-view concept: the dot marks agent output the user hasn't
-/// seen. The paired terminal has no such notion, so Terminal view must never
-/// paint the unread dot even when the underlying instance carries the flag.
+/// Unread marks agent output the user hasn't seen, which the paired terminal has no notion
+/// of, so Terminal view never paints the dot even when the instance carries the flag.
 #[test]
 #[serial]
 fn unread_dot_never_paints_in_terminal_view() {
@@ -730,10 +721,9 @@ fn unread_dot_never_paints_in_terminal_view() {
     );
 }
 
-/// Stop targets what the user is looking at: Agent view arms the
-/// `stop_session` confirm (agent + container stop), while Terminal and Tool
-/// views route to their respective pane-kill paths and never arm an agent
-/// stop. The routing decision lives in `stop_selected`.
+/// Stop targets what the user is looking at: Agent view arms the `stop_session` confirm
+/// while Terminal and Tool views route to their pane-kill paths and never arm an agent
+/// stop. The routing lives in `stop_selected`.
 #[test]
 #[serial]
 fn stop_in_terminal_view_does_not_target_agent_session() {
@@ -760,9 +750,8 @@ fn stop_in_terminal_view_does_not_target_agent_session() {
     env.view.confirm_dialog = None;
     env.view.pending_stop_session = None;
 
-    // Terminal view: Stop must never touch the agent session. With no live
-    // terminal in the test env the terminal-kill path no-ops, but the critical
-    // invariant is that no agent stop was armed and the stop-session confirm
+    // Terminal view: Stop must never touch the agent session. With no live terminal the
+    // kill path no-ops, but the invariant is that no agent stop was armed and the confirm
     // never opened.
     env.view.view_mode = ViewMode::Terminal;
     env.view.stop_selected();
@@ -809,9 +798,8 @@ fn unread_flag_survives_sink_round_trip() {
     assert!(inst.is_unread(), "unsnooze must keep unread");
 }
 
-/// Dwell-to-read: an unread row that stays selected past `UNREAD_DWELL`
-/// (with the list in the foreground) is cleared, distinguishing "stopped to
-/// read it" from "scrolled past."
+/// Dwell-to-read: an unread row that stays selected past `UNREAD_DWELL` with the list in
+/// the foreground is cleared, distinguishing "stopped to read it" from "scrolled past".
 #[test]
 #[serial]
 fn unread_dwell_clears_after_threshold() {
@@ -841,10 +829,8 @@ fn unread_dwell_clears_after_threshold() {
     assert!(!env.view.get_instance(&id).unwrap().is_unread());
 }
 
-/// A fresh manual flag (`u`) is held for the current visit: marking a session
-/// unread and keeping the cursor on it must not let dwell-to-read undo the
-/// mark. Regression for the bug where staying on the row past `UNREAD_DWELL`
-/// silently re-cleared it.
+/// A fresh manual flag (`u`) is held for the current visit, so marking a session unread and
+/// keeping the cursor on it must not let dwell-to-read undo the mark.
 #[test]
 #[serial]
 fn manual_unread_survives_same_visit_dwell() {
@@ -875,10 +861,8 @@ fn manual_unread_survives_same_visit_dwell() {
     );
 }
 
-/// The manual hold is per-visit: after leaving a hand-flagged row and coming
-/// back, dwelling on it clears the mark like any other unread row. This is the
-/// behavior verified by hand (select A, mark unread, move to B, move back, sit
-/// past the threshold -> it clears).
+/// The manual hold is per-visit: after leaving a hand-flagged row and coming back, dwelling
+/// clears the mark like any other unread row.
 #[test]
 #[serial]
 fn manual_unread_clears_after_leave_and_return() {
@@ -899,10 +883,8 @@ fn manual_unread_clears_after_leave_and_return() {
     env.view.toggle_unread_at_cursor().expect("manual mark A");
     assert!(env.view.get_instance(&a).unwrap().is_unread());
 
-    // Move to B with NO dwell tick in between (a quick hop, like real
-    // navigation). The hold must release purely from the selection change;
-    // otherwise returning to A would stay suppressed forever (the reported
-    // bug, which an in-between tick would have masked).
+    // Move to B with no dwell tick in between, like real navigation: the hold must release
+    // purely from the selection change, or returning to A would stay suppressed forever.
     env.view.select_session_by_id(&b);
     assert!(
         env.view.manual_unread_hold.is_none(),
@@ -923,9 +905,8 @@ fn manual_unread_clears_after_leave_and_return() {
     );
 }
 
-/// Engaging with a hand-flagged row (open/attach, which clears it) also drops
-/// the per-visit hold, so a *later* auto mark on that same still-selected row
-/// is not wrongly suppressed and clears on dwell.
+/// Engaging with a hand-flagged row (open/attach, which clears it) also drops the per-visit
+/// hold, so a later auto mark on that still-selected row clears on dwell.
 #[test]
 #[serial]
 fn manual_hold_released_on_engagement_lets_auto_clear() {
@@ -1013,9 +994,8 @@ fn test_q_returns_quit_action() {
 #[test]
 #[serial]
 fn test_ctrl_q_does_not_quit_home() {
-    // #1569: Ctrl+Q is a live-mode-exit habit; on the home view it must
-    // not quit aoe. (The app-level handler swallows it; the home view
-    // itself must also never treat it as a quit.)
+    // #1569: Ctrl+Q is a live-mode-exit habit and must not quit aoe on the home view. The
+    // app-level handler swallows it, and the home view must not treat it as a quit either.
     let mut env = create_test_env_empty();
     let action = env.view.handle_key(
         KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
@@ -1099,9 +1079,7 @@ fn test_help_closes_on_q() {
 #[test]
 #[serial]
 fn test_help_closes_on_uppercase_q_for_strict_mode() {
-    // Strict mode binds quit to uppercase Q; the help overlay must
-    // accept it too so strict-mode users can dismiss the dialog with
-    // the same key they use to quit.
+    // Strict mode binds quit to uppercase Q, so the help overlay must accept it too.
     let mut env = create_test_env_empty();
     env.view.show_help = true;
     env.view.handle_key(key(KeyCode::Char('Q')), None);
@@ -1158,9 +1136,8 @@ fn test_b_opens_project_session_picker_when_projects_exist() {
     env.view.handle_key(key(KeyCode::Char('b')), None);
     assert!(env.view.project_session_picker_dialog.is_some());
     assert!(env.view.info_dialog.is_none());
-    // The picker captures filter chars, so it must register as a modal: an
-    // unregistered picker lets the global `q` shortcut quit the app and the
-    // paste-burst detector fire mid-filter (text gets stranded in handle_paste).
+    // The picker captures filter chars, so it must register as a modal: unregistered, the
+    // global `q` shortcut quits the app and the paste-burst detector fires mid-filter.
     assert!(env.view.has_dialog());
     assert!(!env.view.wants_paste_burst());
 }

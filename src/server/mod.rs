@@ -1,7 +1,4 @@
-//! The daemon: an axum server exposing the REST/WS API that the dashboard,
-//! the TUI structured view, and ACP clients all speak. The embedded dashboard
-//! bundle it can also serve is optional; the `web` feature gates it, and
-//! `assets` holds the serving code.
+//! The daemon.
 
 pub(crate) mod access;
 pub(crate) mod acp_events;
@@ -42,10 +39,8 @@ pub mod test_support;
 pub(crate) mod token;
 pub mod tunnel;
 
-/// Re-export of the broadcast frame defined in `crate::acp::protocol`,
-/// kept under `crate::server::` so existing supervisor/WS call sites keep
-/// resolving without churn. The canonical definition lives in protocol.rs
-/// so the daemon and any client share a single source of truth.
+/// Re-export of the broadcast frame defined in `crate::acp::protocol`, kept under
+/// `crate::server::` so existing supervisor/WS call sites keep resolving without churn.
 pub use crate::acp::protocol::AcpBroadcastFrame;
 pub(crate) use access::{is_untrusted_ip_literal, is_wildcard_bind, norm_host};
 pub(crate) use acp_events::{apply_status_intent, derive_acp_status};

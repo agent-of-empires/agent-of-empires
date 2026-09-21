@@ -1,6 +1,5 @@
-/// Tests for the `default_attach_mode` setting that drives whether
-/// pressing Enter (or double-clicking) on an existing session row in
-/// Structured view attaches to tmux or enters live-send mode.
+/// Tests for `default_attach_mode`, which decides whether Enter or a double-click on an
+/// existing Structured-view row attaches to tmux or enters live-send.
 use super::*;
 use crate::session::config::{update_config, AttachMode};
 
@@ -22,9 +21,8 @@ fn write_global_default_attach_mode(mode: AttachMode) {
 #[test]
 #[serial]
 fn defaults_to_tmux_when_no_config_present() {
-    // Default Enter / double-click stays on AttachSession; flipping
-    // it to LiveSend silently changes every existing user's muscle
-    // memory on upgrade.
+    // Enter and double-click stay on AttachSession by default; flipping to LiveSend would
+    // silently change every existing user's muscle memory on upgrade.
     let mut env = create_test_env_empty();
     let id = add_session(&mut env.view, "session-one");
     let mode = env.view.default_attach_mode(&id);
@@ -63,14 +61,10 @@ fn enter_emits_enter_live_send_when_default_is_live_send() {
 #[test]
 #[serial]
 fn terminal_view_honors_default_attach_mode_live_send() {
-    // The `default_attach_mode = LiveSend` setting applies to
-    // Terminal view too: pressing Enter on a terminal-view row
-    // dispatches `Action::EnterLiveSend` against the paired
-    // terminal pane (the live-send target resolution happens in
-    // `start_live_send` based on view_mode). Without this, the
-    // user's "Enter = live mode" preference would silently flip
-    // back to a full tmux attach whenever they were previewing a
-    // terminal.
+    // `default_attach_mode = LiveSend` applies to Terminal view too: Enter dispatches
+    // `EnterLiveSend` against the paired terminal pane, with the target resolved in
+    // `start_live_send` from view_mode. Otherwise the preference would flip back to a full
+    // attach whenever the user previewed a terminal.
     let mut env = create_test_env_empty();
     write_global_default_attach_mode(AttachMode::LiveSend);
     let id = add_session(&mut env.view, "session-one");
@@ -85,10 +79,8 @@ fn terminal_view_honors_default_attach_mode_live_send() {
 #[test]
 #[serial]
 fn terminal_view_falls_back_to_attach_when_default_is_tmux() {
-    // Inverse of the LiveSend case: with the historical Tmux
-    // default, Enter on a terminal-view row keeps the historical
-    // `Action::AttachTerminal` so users who haven't opted into
-    // live mode see no change.
+    // Inverse: with the historical Tmux default, Enter on a terminal-view row keeps
+    // `AttachTerminal`, so users who haven't opted in see no change.
     let mut env = create_test_env_empty();
     let id = add_session(&mut env.view, "session-one");
     env.view.flat_items = env.view.build_flat_items();
@@ -106,10 +98,8 @@ fn terminal_view_falls_back_to_attach_when_default_is_tmux() {
 #[test]
 #[serial]
 fn tab_swaps_to_attach_session_when_default_is_live_send() {
-    // When `default_attach_mode = LiveSend`, Enter takes over the
-    // live-send slot, so Tab swaps to a full tmux attach (the
-    // escape hatch). Without this, the user would have no
-    // single-key path to the underlying tmux session.
+    // With LiveSend, Enter takes the live-send slot, so Tab swaps to a full tmux attach:
+    // without it the user has no single-key path to the underlying session.
     let mut env = create_test_env_empty();
     write_global_default_attach_mode(AttachMode::LiveSend);
     let id = add_session(&mut env.view, "session-one");
@@ -137,9 +127,8 @@ fn tab_still_enters_live_send_when_default_is_tmux() {
 #[test]
 #[serial]
 fn tab_in_terminal_view_swaps_to_attach_terminal_when_default_is_live_send() {
-    // Terminal-view counterpart of the swap: with Enter pinned to
-    // live-send, Tab in Terminal view attaches the paired terminal
-    // pane rather than the agent pane.
+    // Terminal-view counterpart of the swap: with Enter pinned to live-send, Tab attaches
+    // the paired terminal pane rather than the agent pane.
     let mut env = create_test_env_empty();
     write_global_default_attach_mode(AttachMode::LiveSend);
     let id = add_session(&mut env.view, "session-one");
@@ -158,12 +147,9 @@ fn tab_in_terminal_view_swaps_to_attach_terminal_when_default_is_live_send() {
 #[test]
 #[serial]
 fn m_in_terminal_view_targets_terminal_pane() {
-    // The 'm' bug from #1554: pressing 'm' from Terminal view used
-    // to open a compose dialog that targeted the agent pane,
-    // sending commands meant for the shell into the agent's input
-    // box. The fix: `pending_send_target` reflects view_mode at
-    // dialog open time so `execute_send_message` routes to the
-    // paired terminal pane.
+    // #1554: 'm' from Terminal view opened a compose dialog targeting the agent pane,
+    // sending shell commands into the agent's input box. `pending_send_target` now reflects
+    // view_mode at open time, so `execute_send_message` routes to the terminal pane.
     let mut env = create_test_env_empty();
     let _id = add_session(&mut env.view, "session-one");
     env.view.flat_items = env.view.build_flat_items();
@@ -186,10 +172,8 @@ fn m_in_terminal_view_targets_terminal_pane() {
 #[test]
 #[serial]
 fn start_live_send_in_terminal_view_targets_terminal_pane() {
-    // Direct check on the live-send target resolution: in Terminal
-    // view, `start_live_send` stages the host terminal as the
-    // pending target so `prepare_live_send` will dispatch
-    // keystrokes to the paired terminal tmux pane.
+    // Direct check on target resolution: in Terminal view `start_live_send` stages the host
+    // terminal, so `prepare_live_send` dispatches keystrokes to the paired pane.
     let mut env = create_test_env_empty();
     let _id = add_session(&mut env.view, "session-one");
     env.view.flat_items = env.view.build_flat_items();
@@ -206,14 +190,10 @@ fn start_live_send_in_terminal_view_targets_terminal_pane() {
 #[test]
 #[serial]
 fn refresh_tool_preview_cache_resizes_live_pane_when_targeted() {
-    // Reviewer-requested fix (CodeRabbit + Seluj78 on #2777):
-    // `refresh_tool_preview_cache_if_needed` must call
-    // `resize_live_pane_if_target` up front, the same as the
-    // Terminal/ContainerTerminal siblings, so a window resize while
-    // live-sent to a Tool pane (lazygit, yazi) reflows it instead of
-    // waiting for a live-mode re-enter. `resize_live_pane_if_target`
-    // records the dedup in `live_send_last_resize` even without a
-    // spawned worker, so that's the observable signal here.
+    // `refresh_tool_preview_cache_if_needed` must call `resize_live_pane_if_target` up
+    // front like its Terminal siblings, so a resize while live-sent to a tool pane reflows
+    // it instead of waiting for a re-enter. The dedup recorded in `live_send_last_resize`
+    // is the observable signal without a spawned worker.
     let mut env = create_test_env_empty();
     let id = add_session(&mut env.view, "session-one");
     let inst = env.view.get_instance(&id).unwrap().clone();
@@ -245,9 +225,7 @@ fn refresh_tool_preview_cache_resizes_live_pane_when_targeted() {
 #[serial]
 fn start_live_send_in_tool_view_targets_tool_pane() {
     // Tool-view counterpart of `start_live_send_in_terminal_view_targets_terminal_pane`:
-    // when previewing a named tool (lazygit, yazi, etc.), `start_live_send`
-    // must resolve to that tool's own paired pane, not fall back to the
-    // agent or bail out entirely.
+    // previewing a named tool must resolve to that tool's own pane, not the agent.
     let mut env = create_test_env_empty();
     let id = add_session(&mut env.view, "session-one");
     env.view.flat_items = env.view.build_flat_items();
@@ -273,10 +251,9 @@ fn write_live_send_on_view_switch(mode: AttachMode, on_view_switch: bool) {
 #[test]
 #[serial]
 fn toggle_view_auto_starts_live_send_when_setting_enabled_and_default_is_live_send() {
-    // With `live_send_on_view_switch` on and `default_attach_mode =
-    // LiveSend`, pressing 't' (ToggleView) from Structured view must
-    // not just flip the preview to Terminal; it must also enter
-    // live-send immediately, without a separate Enter/Tab/click.
+    // With `live_send_on_view_switch` on and `default_attach_mode = LiveSend`, 't' must not
+    // only flip the preview to Terminal but also enter live-send, with no separate
+    // Enter/Tab/click.
     let mut env = create_test_env_empty();
     write_live_send_on_view_switch(AttachMode::LiveSend, true);
     let id = add_session(&mut env.view, "session-one");
@@ -295,9 +272,8 @@ fn toggle_view_auto_starts_live_send_when_setting_enabled_and_default_is_live_se
 #[test]
 #[serial]
 fn toggle_view_does_not_auto_start_live_send_when_setting_disabled() {
-    // The setting defaults to off: even with `default_attach_mode =
-    // LiveSend`, ToggleView must leave live-send alone and only
-    // change the preview.
+    // The setting defaults to off: even with LiveSend, ToggleView leaves live-send alone
+    // and only changes the preview.
     let mut env = create_test_env_empty();
     write_live_send_on_view_switch(AttachMode::LiveSend, false);
     let _id = add_session(&mut env.view, "session-one");
@@ -316,9 +292,8 @@ fn toggle_view_does_not_auto_start_live_send_when_setting_disabled() {
 #[test]
 #[serial]
 fn toggle_view_auto_starts_live_send_regardless_of_default_attach_mode() {
-    // The setting is the only gate: with the historical Tmux
-    // default, ToggleView still auto-enters live-send when
-    // `live_send_on_view_switch` is enabled.
+    // The setting is the only gate: with the Tmux default, ToggleView still auto-enters
+    // live-send when `live_send_on_view_switch` is enabled.
     let mut env = create_test_env_empty();
     write_live_send_on_view_switch(AttachMode::Tmux, true);
     let id = add_session(&mut env.view, "session-one");
@@ -337,9 +312,8 @@ fn toggle_view_auto_starts_live_send_regardless_of_default_attach_mode() {
 #[test]
 #[serial]
 fn tool_hotkey_auto_starts_live_send_when_setting_enabled_and_default_is_live_send() {
-    // Parallel case for the other explicit view-switch entry point:
-    // opening a tool via its configured hotkey must apply the same
-    // auto-entry check as ToggleView.
+    // The other explicit view-switch entry point: opening a tool via its hotkey applies the
+    // same auto-entry check as ToggleView.
     let mut env = create_test_env_empty();
     write_live_send_on_view_switch(AttachMode::LiveSend, true);
     let id = add_session(&mut env.view, "session-one");
@@ -361,10 +335,9 @@ fn tool_hotkey_auto_starts_live_send_when_setting_enabled_and_default_is_live_se
 #[test]
 #[serial]
 fn help_live_on_enter_returns_none_when_no_session_selected() {
-    // Cursor parked off any session row: the help overlay shouldn't
-    // claim a session-attach behavior, so `help_live_on_enter`
-    // signals "no row" with None and the render path falls back to
-    // the cached profile default.
+    // With the cursor off any session row the help overlay must not claim a session-attach
+    // behavior, so `help_live_on_enter` signals "no row" with None and the render path falls
+    // back to the cached profile default.
     let env = create_test_env_empty();
     assert!(
         env.view.selected_session.is_none(),
@@ -389,9 +362,8 @@ fn help_live_on_enter_returns_some_for_selected_session() {
 #[test]
 #[serial]
 fn help_live_on_enter_reflects_live_send_setting() {
-    // Flipping the user's default to LiveSend must propagate to
-    // help_live_on_enter so the help overlay relabels Enter as
-    // live mode and Tab as tmux attach.
+    // Flipping the default to LiveSend must reach help_live_on_enter, so the overlay
+    // relabels Enter as live mode and Tab as tmux attach.
     let mut env = create_test_env_empty();
     write_global_default_attach_mode(AttachMode::LiveSend);
     let _id = add_session(&mut env.view, "session-one");
@@ -404,10 +376,9 @@ fn help_live_on_enter_reflects_live_send_setting() {
 #[test]
 #[serial]
 fn profile_default_attach_mode_cache_refreshes_with_config() {
-    // The render path falls back to `profile_default_attach_mode`
-    // when no session is selected, so it has to track the saved
-    // config without re-reading from disk per paint. Saving a new
-    // mode + calling `refresh_from_config` must update the cache.
+    // The render path falls back to `profile_default_attach_mode` with no selection, so the
+    // cache must track the saved config without re-reading from disk per paint: saving a
+    // mode plus `refresh_from_config` updates it.
     let mut env = create_test_env_empty();
     assert_eq!(
         env.view.profile_default_attach_mode,
@@ -424,11 +395,9 @@ fn profile_default_attach_mode_cache_refreshes_with_config() {
     );
 }
 
-/// Acp sessions short-circuit before the setting is consulted
-/// (the structured view branch in `activate_selected_session` returns
-/// `OpenStructuredView`/transient-status before we get to the view-mode
-/// match), so the resolver also returns None for them; the setting
-/// must not be able to misroute a structured view row into live mode.
+/// Acp sessions short-circuit before the setting is consulted (the structured branch in
+/// `activate_selected_session` returns first), so the resolver returns None for them and the
+/// setting cannot misroute a structured row into live mode.
 #[test]
 #[serial]
 fn acp_session_ignores_default_attach_mode() {
@@ -505,10 +474,9 @@ fn structured_session_preview_shows_placeholder() {
     );
 }
 
-/// The switch-view context entry offers the opposite view: terminal for
-/// a structured row, structured for a terminal row whose tool is
-/// ACP-capable (only when the structured-view opt-in is on), and nothing
-/// for rows mid-lifecycle.
+/// The switch-view context entry offers the opposite view: terminal for a structured row,
+/// structured for an ACP-capable terminal row when the opt-in is on, and nothing for rows
+/// mid-lifecycle.
 #[test]
 #[serial]
 fn switch_view_target_gates_by_view_and_state() {
@@ -531,10 +499,9 @@ fn switch_view_target_gates_by_view_and_state() {
     assert_eq!(env.view.session_switch_view_target(&id), None);
 }
 
-/// Switching a terminal session INTO the structured view is gated on the
-/// `offer_structured_in_new_session` opt-in, so with it off an ACP-capable
-/// terminal row offers no switch. A structured row can always switch back
-/// to terminal regardless, so a session is never stranded.
+/// Switching a terminal session into structured view is gated on the
+/// `offer_structured_in_new_session` opt-in, so with it off an ACP-capable row offers no
+/// switch. A structured row can always switch back, so no session is stranded.
 #[test]
 #[serial]
 fn switch_view_target_gated_on_structured_opt_in() {
@@ -571,9 +538,9 @@ fn switch_view_confirm_dispatches_action_with_stashed_id() {
     );
 }
 
-/// The `[structured]` badge marks structured rows in the Terminal home
-/// layout too (non-sandboxed rows have no container/host badge there),
-/// so Enter opening the structured view is never a surprise.
+/// The `[structured]` badge marks structured rows in the Terminal home layout too, where
+/// non-sandboxed rows have no container badge, so Enter opening the structured view is never
+/// a surprise.
 #[test]
 #[serial]
 fn structured_badge_shows_in_terminal_view_mode() {
@@ -611,10 +578,9 @@ fn render_footer(env: &mut TestEnv) -> String {
     out
 }
 
-/// Tab is Enter's complement on a session row: whichever of
-/// live-send / tmux-attach `default_attach_mode` doesn't route Enter
-/// to. The footer must surface that complement so it isn't only
-/// discoverable by reading the source or the `?` help overlay.
+/// Tab is Enter's complement on a session row: whichever of live-send and tmux-attach
+/// `default_attach_mode` doesn't route Enter to. The footer must surface it so it isn't
+/// discoverable only from the source or the `?` overlay.
 #[test]
 #[serial]
 fn footer_advertises_tab_as_live_when_default_is_tmux() {
@@ -634,10 +600,8 @@ fn footer_advertises_tab_as_live_when_default_is_tmux() {
     );
 }
 
-/// Inverse of the above: once `default_attach_mode = LiveSend` takes
-/// over Enter, the two hints swap rather than both claiming "Attach".
-/// Enter owns live-send and Tab becomes the tmux escape hatch, the
-/// same swap the `?` overlay does for this pairing.
+/// Inverse: once `default_attach_mode = LiveSend` takes over Enter, the two hints swap
+/// rather than both claiming "Attach", the same swap the `?` overlay does.
 #[test]
 #[serial]
 fn footer_advertises_tab_as_attach_when_default_is_live_send() {
@@ -658,9 +622,8 @@ fn footer_advertises_tab_as_attach_when_default_is_live_send() {
     );
 }
 
-/// Acp/structured rows ignore `default_attach_mode` entirely (Tab
-/// either mirrors Enter or no-ops), so the footer must not advertise
-/// a Tab complement that doesn't actually do anything different.
+/// Acp rows ignore `default_attach_mode` entirely (Tab mirrors Enter or no-ops), so the
+/// footer must not advertise a Tab complement that does nothing different.
 #[test]
 #[serial]
 fn footer_hides_tab_hint_for_structured_sessions() {
@@ -694,9 +657,9 @@ fn send_message_opens_structured_view() {
     );
 }
 
-/// Pressing 'm' on a structured session drains buffered paste into
-/// `pending_paste_for_structured_view` so the async open path can
-/// forward it into the composer instead of losing it.
+/// 'm' on a structured session drains buffered paste into
+/// `pending_paste_for_structured_view`, so the async open path forwards it into the composer
+/// instead of losing it.
 #[test]
 #[serial]
 fn send_message_drains_pending_paste_for_structured_view() {
@@ -714,8 +677,7 @@ fn send_message_drains_pending_paste_for_structured_view() {
     );
 }
 
-/// A second buffered paste captured for the same structured session must
-/// append to the earlier buffered text instead of silently replacing it:
+/// A second buffered paste for the same structured session appends instead of replacing:
 /// the earlier paste belongs to a failed activation still waiting to drain.
 #[test]
 #[serial]
@@ -732,9 +694,8 @@ fn send_message_merges_buffered_paste_for_same_session() {
     );
 }
 
-/// A paste captured for another structured session gets its own entry: the
-/// earlier target's unsent draft survives (returning to it still drains),
-/// and mixing the two texts would leak one session's draft into the other.
+/// A paste captured for another structured session gets its own entry, so the earlier
+/// target's unsent draft survives and neither session's draft leaks into the other.
 #[test]
 #[serial]
 fn send_message_keeps_buffered_paste_per_session() {

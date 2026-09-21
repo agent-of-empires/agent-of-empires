@@ -1,24 +1,6 @@
-//! Protocol-agnostic durable event log: the storage substrate behind the
-//! ACP transcript store and, in time, the plugin host's event bus.
-//!
-//! This module owns the SQLite mechanics that have nothing to do with any
-//! particular event payload: schema creation, the append + per-topic
-//! retention prune, keyset row scans, seq bookkeeping, attachment blob
-//! storage, and topic deletion. Events are opaque JSON strings keyed by an
-//! arbitrary `topic` (the partition key), with a caller-assigned monotonic
-//! `seq`. The consumer owns its payload type, its replay semantics, and any
-//! payload-aware queries; it holds the [`rusqlite::Connection`] and threads it plus a
-//! [`crate::events::Schema`] into these free functions. The dependency arrow runs consumer
-//! -> here, never the reverse.
-//!
-//! ## On-disk shape
-//!
-//! Two tables per [`crate::events::Schema`], named `<prefix>_events` and
-//! `<prefix>_attachments`. The partition key is physically the `session_id`
-//! column (kept under that name so an existing ACP database loads without a
-//! migration) even though the API speaks of "topics". The payload column is
-//! `event_json`. A consumer's payload-aware SQL may rely on those column
-//! names; they are part of this module's contract.
+//! Protocol-agnostic durable event log over SQLite. Payloads are opaque JSON keyed by topic
+//! and a caller-assigned `seq`. Tables are `<prefix>_events` and `<prefix>_attachments`; the
+//! topic column is named `session_id` and the payload `event_json`, which consumers may rely on.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -28,9 +10,6 @@ use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use tracing::{debug, warn};
 
-/// Names the two tables an [`EventLog`-style consumer](self) reads and
-/// writes, derived from a validated prefix. Construct once at open time and
-/// thread it into every call so table-name construction is centralized.
 #[derive(Debug, Clone)]
 pub struct Schema {
     events_table: String,
@@ -40,9 +19,7 @@ pub struct Schema {
 }
 
 impl Schema {
-    /// Build a schema from `prefix`. The prefix is validated to
-    /// `[a-z_]+` so it can be interpolated into table/index names (SQLite
-    /// cannot bind identifiers as parameters) without any injection risk.
+    /// `[a-z_]+` only: SQLite cannot bind identifiers, so the prefix is interpolated.
     pub fn new(prefix: &str) -> Result<Self> {
         if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
             anyhow::bail!("event log table prefix must be non-empty and match [a-z_]+");
@@ -63,50 +40,32 @@ impl Schema {
         &self.attachments_table
     }
 
-    /// Attachment blobs buffered for an event that has not been written yet,
-    /// keyed by a caller-supplied opaque `ref_id` (e.g. a queued prompt's id)
-    /// rather than an event `seq`. Deliberately outside the seq-keyed
-    /// retention prune: these bytes must survive until their owning action
-    /// (a queued prompt draining) fires, at which point the caller re-records
-    /// them under the real event seq and deletes the pending copy.
+    /// Keyed by an opaque `ref_id` and outside the retention prune, so blobs survive until
+    /// their owning action fires.
     pub fn pending_attachments_table(&self) -> &str {
         &self.pending_attachments_table
     }
 
-    /// Durable per-session rate-limit redelivery budget. One row per
-    /// session, deliberately outside the seq-keyed retention prune: the
-    /// redelivery cap must survive `prune_retention` at every supported
-    /// history cap (#3688), so it cannot live in the pruned transcript.
+    /// Outside the retention prune so the redelivery cap survives every history cap.
     pub fn rate_limit_budgets_table(&self) -> &str {
         &self.rate_limit_budgets_table
     }
 }
 
-/// Which side of a seq cursor a [`scan`] window sits on.
 #[derive(Debug, Clone, Copy)]
 pub enum SeqBound {
-    /// Rows with `seq > value` (forward from a replay cursor).
     After(u64),
-    /// Rows with `seq < value` (older history below a cursor).
     Before(u64),
 }
 
-/// Row ordering for a [`scan`] window.
 #[derive(Debug, Clone, Copy)]
 pub enum Order {
     Asc,
     Desc,
 }
 
-/// Build an `AND event_json NOT LIKE ?` SQL fragment (one per discriminant in
-/// `prefixes`) plus the matching bound LIKE patterns, newline-joined for
-/// readable queries. Used both to pin events against retention eviction and to
-/// exclude them from activity scans; the caller supplies the set, so this
-/// module stays payload-agnostic. The discriminant is bound as a parameter
-/// rather than interpolated into the SQL text, so a future consumer's prefix
-/// containing a quote can't break or inject into the predicate. The clause
-/// uses anonymous `?` placeholders, so callers must build their full parameter
-/// list positionally (topic / cutoff first, then these patterns in order).
+/// Uses anonymous `?` placeholders, so callers bind positionally: topic or cutoff first,
+/// then these patterns in order.
 fn not_like_clauses(prefixes: &[&str]) -> (String, Vec<String>) {
     let fragment = prefixes
         .iter()
@@ -120,9 +79,6 @@ fn not_like_clauses(prefixes: &[&str]) -> (String, Vec<String>) {
     (fragment, patterns)
 }
 
-/// Open or create the database at `db_path` and ensure `schema`'s tables
-/// and indexes exist. WAL mode is enabled so a writer (append path) and a
-/// reader (replay) don't block each other.
 pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
     if let Some(parent) = db_path.parent() {
         if !parent.exists() {
@@ -193,16 +149,6 @@ pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Ensure the `discriminant` column and its lookup index exist, backfilling
-/// historical rows on databases created before the column was added. The
-/// column lets consumers fetch the newest event of a given externally-tagged
-/// variant via an index instead of a full-topic `event_json LIKE` scan. A
-/// fresh DB already has the column from `open`'s `CREATE TABLE`, so this is a
-/// no-op there; an older DB gets the column added and populated once, keyed
-/// off the column's absence so later opens skip the backfill. The backfill
-/// derives each row's discriminant the same way [`discriminant_of`] does (the
-/// text between the first two double quotes of the externally-tagged JSON),
-/// so historical and freshly-inserted rows agree.
 fn ensure_discriminant_column(conn: &Connection, events: &str) -> Result<()> {
     let has_column: bool = conn
         .query_row(
@@ -237,12 +183,7 @@ fn ensure_discriminant_column(conn: &Connection, events: &str) -> Result<()> {
     Ok(())
 }
 
-/// The externally-tagged variant discriminant of a serialized event: the text
-/// between the first two double quotes. serde's externally-tagged encoding is
-/// `{"Variant":<payload>}` for data variants and a bare `"Variant"` for unit
-/// variants, so the variant name is the first quoted token in both shapes.
-/// Returns `""` for a payload with no quoted token (never, for a well-formed
-/// externally-tagged event).
+/// The first quoted token, which is the variant name for both data and unit variants.
 fn discriminant_of(json: &str) -> &str {
     let Some(open) = json.find('"') else {
         return "";
@@ -254,12 +195,6 @@ fn discriminant_of(json: &str) -> &str {
     }
 }
 
-/// Return the newest `(seq, event_json)` for `topic` whose event carries the
-/// given externally-tagged `discriminant`, or `None` if the topic never
-/// emitted that variant. Backed by the `(session_id, discriminant, seq)`
-/// index, so it seeks straight to the newest match instead of scanning the
-/// topic's whole history like an `event_json LIKE '{"Variant":%'` predicate
-/// would.
 pub fn latest_by_discriminant(
     conn: &Connection,
     schema: &Schema,
@@ -281,10 +216,6 @@ pub fn latest_by_discriminant(
     .flatten()
 }
 
-/// Append one opaque event payload. Idempotent on duplicate `(topic, seq)`
-/// thanks to the primary key; re-appending the same seq is a no-op.
-/// Returns the number of rows inserted (0 on a duplicate) so the caller can
-/// distinguish a fresh write from a benign retry.
 pub fn insert_event(
     conn: &Connection,
     schema: &Schema,
@@ -305,9 +236,6 @@ pub fn insert_event(
     .with_context(|| format!("insert {topic}@{seq}"))
 }
 
-/// Count events for `topic` whose `created_at` is at or after
-/// `min_created_at` (same clock as `insert_event`, unix millis). Used by the
-/// plugin automation policy's rolling-window rate limits (#2897).
 pub fn count_since(
     conn: &Connection,
     schema: &Schema,
@@ -324,12 +252,6 @@ pub fn count_since(
     Ok(count.max(0) as u64)
 }
 
-/// Prune the oldest events for `topic` beyond `max_events`, exempting any
-/// event whose payload starts with one of `pinned_prefixes` (matched on the
-/// externally-tagged JSON discriminant). Attachment blobs at or below the
-/// prune cutoff are dropped in the same pass so they stay bounded alongside
-/// the log. No-op when `max_events` is 0. Failures are logged and swallowed:
-/// the row is already recorded, we just exceed the cap until the next prune.
 pub fn prune_retention(
     conn: &Connection,
     schema: &Schema,
@@ -340,10 +262,7 @@ pub fn prune_retention(
     if max_events == 0 {
         return;
     }
-    // Compute the prune cutoff seq once so the events delete and the
-    // attachments delete agree on the same threshold. Doing the events
-    // delete first would shift the OFFSET row out from under the
-    // attachments delete and leave orphaned blobs.
+    // Compute the cutoff once so the events and attachments deletes agree.
     let events = schema.events_table();
     let attachments = schema.attachments_table();
     let cutoff: Option<i64> = conn
@@ -363,9 +282,7 @@ pub fn prune_retention(
         return;
     };
     let (clauses, patterns) = not_like_clauses(pinned_prefixes);
-    // Prune the events first. If this fails, return before touching
-    // attachments: deleting blobs while their owning events survive would
-    // leave replay events pointing at missing data.
+    // Deleting blobs whose events survive would leave replay pointing at missing data.
     let prune_sql = format!("DELETE FROM {events} WHERE session_id = ? AND seq <= ? {clauses}");
     let mut prune_params: Vec<Value> = vec![Value::Text(topic.to_owned()), Value::Integer(cutoff)];
     prune_params.extend(patterns.into_iter().map(Value::Text));
@@ -385,11 +302,7 @@ pub fn prune_retention(
             return;
         }
     }
-    // Drop blobs whose owning event was just pruned (no longer present at or
-    // below the cutoff). Tying the delete to event existence rather than a
-    // flat `seq <= cutoff` keeps a pinned event's blobs, instead of assuming
-    // pinned variants never carry attachments, so a future consumer can't
-    // strand a surviving event's blob.
+    // Tie the delete to event existence so a pinned event keeps its blobs.
     if let Err(e) = conn.execute(
         &format!(
             "DELETE FROM {attachments}
@@ -403,12 +316,6 @@ pub fn prune_retention(
     }
 }
 
-/// Fetch up to `limit` raw `(seq, json)` rows for `topic` on the given side
-/// of the cursor, in the given order. `limit` of `None` is unbounded. The
-/// caller owns deserialization, has-more probing (pass `limit + 1`), and
-/// cursor advancement; this just runs the keyset query. Rows that fail to
-/// decode at the SQLite layer are skipped (effectively never, given the NOT
-/// NULL schema).
 pub fn scan(
     conn: &Connection,
     schema: &Schema,
@@ -417,9 +324,7 @@ pub fn scan(
     order: Order,
     limit: Option<usize>,
 ) -> Vec<(u64, String)> {
-    // `seq` is a signed SQLite column; clamp before the cast so a
-    // `u64::MAX` cursor (the status probe / tail request) doesn't wrap to a
-    // negative bound and match the wrong rows.
+    // Clamp before the cast so a `u64::MAX` cursor does not wrap negative.
     let (op, value) = match bound {
         SeqBound::After(v) => (">", v),
         SeqBound::Before(v) => ("<", v),
@@ -475,7 +380,6 @@ pub fn scan(
     out
 }
 
-/// Highest seq stored for `topic`, or 0 if none.
 pub fn highest_seq(conn: &Connection, schema: &Schema, topic: &str) -> u64 {
     match conn
         .query_row(
@@ -493,7 +397,6 @@ pub fn highest_seq(conn: &Connection, schema: &Schema, topic: &str) -> u64 {
     }
 }
 
-/// Lowest seq still stored for `topic`, or `None` when empty.
 pub fn lowest_seq(conn: &Connection, schema: &Schema, topic: &str) -> Option<u64> {
     match conn
         .query_row(
@@ -511,8 +414,6 @@ pub fn lowest_seq(conn: &Connection, schema: &Schema, topic: &str) -> Option<u64
     }
 }
 
-/// Every topic with at least one event, paired with its highest seq, in one
-/// query. Used to re-seed per-topic seq counters at startup.
 pub fn all_topic_seqs(conn: &Connection, schema: &Schema) -> Vec<(String, u64)> {
     let sql = format!(
         "SELECT session_id, MAX(seq) FROM {} GROUP BY session_id",
@@ -539,9 +440,6 @@ pub fn all_topic_seqs(conn: &Connection, schema: &Schema) -> Vec<(String, u64)> 
     rows.filter_map(|r| r.ok()).collect()
 }
 
-/// Most recent `created_at` per topic among `topics`, excluding events
-/// whose payload matches one of `excluded_prefixes`. Topics with no
-/// qualifying event are absent from the map. Empty `topics` returns empty.
 pub fn last_event_at_for_topics(
     conn: &Connection,
     schema: &Schema,
@@ -570,7 +468,6 @@ pub fn last_event_at_for_topics(
             return out;
         }
     };
-    // Positional params: the IN(...) topics first, then the NOT LIKE patterns.
     let mut bind: Vec<Value> = topics.iter().map(|t| Value::Text(t.clone())).collect();
     bind.extend(patterns.into_iter().map(Value::Text));
     let rows = stmt.query_map(params_from_iter(bind), |row| {
@@ -592,9 +489,6 @@ pub fn last_event_at_for_topics(
     out
 }
 
-/// Persist one attachment blob keyed to `(topic, attachment_id)`, riding
-/// with event `seq` so retention and topic deletion drop it in lockstep.
-/// Idempotent on `(topic, attachment_id)`. Returns `true` on success.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_attachment(
     conn: &Connection,
@@ -638,8 +532,6 @@ pub fn insert_attachment(
     true
 }
 
-/// Drop all attachment blobs owned by one event seq (a rollback when the
-/// owning event could not be durably persisted).
 pub fn delete_attachments_for_seq(conn: &Connection, schema: &Schema, topic: &str, seq: u64) {
     if let Err(e) = conn.execute(
         &format!(
@@ -657,8 +549,6 @@ pub fn delete_attachments_for_seq(conn: &Connection, schema: &Schema, topic: &st
     }
 }
 
-/// Fetch one attachment's `(mime_type, data)`, scoped by `topic` so a token
-/// for one topic can't read another's blob by guessing ids.
 pub fn load_attachment(
     conn: &Connection,
     schema: &Schema,
@@ -685,11 +575,6 @@ pub fn load_attachment(
     })
 }
 
-/// Persist one attachment blob buffered for a not-yet-written event, keyed to
-/// `(topic, attachment_id)` and tagged with the opaque `ref_id` its owning
-/// action supplies (a queued prompt's id). Outside the seq-keyed retention
-/// prune, so it survives until the action fires. Idempotent on
-/// `(topic, attachment_id)`. Returns `true` on success.
 #[allow(clippy::too_many_arguments)]
 pub fn insert_pending_attachment(
     conn: &Connection,
@@ -733,10 +618,6 @@ pub fn insert_pending_attachment(
     true
 }
 
-/// Load every pending attachment buffered under `(topic, ref_id)` as
-/// `(attachment_id, kind, mime_type, name, data)`, in stable insertion order.
-/// Used at drain time to reconstitute a queued prompt's blobs before it is
-/// forwarded to the agent.
 #[allow(clippy::type_complexity)]
 pub fn load_pending_attachments_for_ref(
     conn: &Connection,
@@ -775,8 +656,6 @@ pub fn load_pending_attachments_for_ref(
     }
 }
 
-/// Drop every pending attachment buffered under `(topic, ref_id)`. Called when
-/// a queued prompt is removed, cleared, or retired after a successful drain.
 pub fn delete_pending_attachments_for_ref(
     conn: &Connection,
     schema: &Schema,
@@ -799,9 +678,6 @@ pub fn delete_pending_attachments_for_ref(
     }
 }
 
-/// Total bytes of pending attachments buffered for `topic`, for the
-/// per-session enqueue cap. Zero on error (fail open on the read; the insert
-/// still enforces the single-blob caps).
 pub fn pending_attachment_bytes_for_session(
     conn: &Connection,
     schema: &Schema,
@@ -819,9 +695,6 @@ pub fn pending_attachment_bytes_for_session(
     .unwrap_or(0)
 }
 
-/// Prune pending attachments whose `created_at` is at or before `cutoff_ms`,
-/// so a queued prompt that never drains (a session that never becomes idle
-/// again) cannot buffer bytes forever (Q5). Returns rows deleted.
 pub fn prune_pending_attachments_older_than(
     conn: &Connection,
     schema: &Schema,
@@ -842,8 +715,6 @@ pub fn prune_pending_attachments_older_than(
     }
 }
 
-/// Drop every event and attachment for `topic`. Returns the number of event
-/// rows deleted.
 pub fn delete_topic(conn: &Connection, schema: &Schema, topic: &str) -> usize {
     let deleted = match conn.execute(
         &format!(
@@ -893,8 +764,6 @@ mod tests {
     use super::*;
 
     fn mem(schema: &Schema) -> Connection {
-        // An in-memory DB that mirrors `open`'s schema by hand (it skips the
-        // session_seq / session_created_at indexes, which these tests don't need).
         let conn = Connection::open_in_memory().unwrap();
         let events = schema.events_table();
         let attachments = schema.attachments_table();
@@ -920,9 +789,6 @@ mod tests {
         assert_eq!(s.attachments_table(), "plugin_host_attachments");
     }
 
-    /// The log is genuinely topic-keyed and payload-opaque: drive it with a
-    /// non-ACP prefix and two topics, proving append/scan/seq/delete all
-    /// partition correctly. This is what makes the substrate reusable.
     #[test]
     fn topic_keyed_append_scan_and_delete() {
         let schema = Schema::new("demo").unwrap();
@@ -941,7 +807,6 @@ mod tests {
                 1
             );
         }
-        // Duplicate (topic, seq) is a no-op.
         assert_eq!(
             insert_event(&conn, &schema, "a", 2, "\"dup\"", 0).unwrap(),
             0
@@ -953,10 +818,8 @@ mod tests {
         assert_eq!(highest_seq(&conn, &schema, "missing"), 0);
         assert_eq!(lowest_seq(&conn, &schema, "missing"), None);
 
-        // Forward scan after a cursor, bounded.
         let fwd = scan(&conn, &schema, "a", SeqBound::After(0), Order::Asc, Some(2));
         assert_eq!(fwd, vec![(1, "\"e1\"".into()), (2, "\"e2\"".into())]);
-        // Backward scan below a cursor.
         let back = scan(
             &conn,
             &schema,
@@ -980,12 +843,10 @@ mod tests {
     fn retention_prunes_oldest_but_keeps_pinned() {
         let schema = Schema::new("demo").unwrap();
         let conn = mem(&schema);
-        // seq 1 is a pinned snapshot; 2..=5 are ordinary.
         insert_event(&conn, &schema, "t", 1, "{\"Pinned\":{}}", 1).unwrap();
         for seq in 2..=5u64 {
             insert_event(&conn, &schema, "t", seq, "{\"Chunk\":{}}", seq as i64).unwrap();
         }
-        // Cap of 2 with Pinned exempt: keep newest 2 (4,5) plus pinned 1.
         prune_retention(&conn, &schema, "t", 2, &["Pinned"]);
         let kept: Vec<u64> = scan(&conn, &schema, "t", SeqBound::After(0), Order::Asc, None)
             .into_iter()
@@ -994,10 +855,6 @@ mod tests {
         assert_eq!(kept, vec![1, 4, 5]);
     }
 
-    /// A pinned event's attachment must survive a prune (the prune ties the
-    /// attachment delete to the same predicate as the event delete, rather
-    /// than assuming pinned events never carry blobs). A pruned event's
-    /// attachment must be dropped.
     #[test]
     fn retention_keeps_pinned_event_attachments() {
         let schema = Schema::new("demo").unwrap();
@@ -1006,7 +863,6 @@ mod tests {
         for seq in 2..=5u64 {
             insert_event(&conn, &schema, "t", seq, "{\"Chunk\":{}}", seq as i64).unwrap();
         }
-        // Blob on the pinned event (seq 1) and on a soon-pruned event (seq 2).
         insert_attachment(
             &conn,
             &schema,
@@ -1060,7 +916,6 @@ mod tests {
         ));
         let got = load_attachment(&conn, &schema, "t", "att-1");
         assert_eq!(got, Some(("image/png".into(), b"bytes".to_vec())));
-        // Wrong topic can't read it.
         assert_eq!(load_attachment(&conn, &schema, "other", "att-1"), None);
         delete_attachments_for_seq(&conn, &schema, "t", 7);
         assert_eq!(load_attachment(&conn, &schema, "t", "att-1"), None);
@@ -1071,16 +926,11 @@ mod tests {
         let schema = Schema::new("demo").unwrap();
         let conn = mem(&schema);
         insert_event(&conn, &schema, "t", 1, "{\"Chunk\":{}}", 100).unwrap();
-        // A later, but excluded, event must not advance the activity clock.
         insert_event(&conn, &schema, "t", 2, "{\"Snapshot\":{}}", 200).unwrap();
         let map = last_event_at_for_topics(&conn, &schema, &["t".into()], &["Snapshot"]);
         assert_eq!(map.get("t"), Some(&100));
     }
 
-    /// The indexed discriminant lookup returns the newest event of a given
-    /// externally-tagged variant without scanning the whole topic. Covers
-    /// struct variants (`{"Variant":..}`), a topic that never emitted the
-    /// variant (None), unit variants (bare `"Variant"`), and topic scoping.
     #[test]
     fn latest_by_discriminant_returns_newest_match() {
         let schema = Schema::new("demo").unwrap();
@@ -1089,23 +939,19 @@ mod tests {
         insert_event(&conn, &schema, "t", 2, "{\"Chunk\":{}}", 2).unwrap();
         insert_event(&conn, &schema, "t", 3, "{\"PlanUpdated\":{\"n\":2}}", 3).unwrap();
         insert_event(&conn, &schema, "t", 4, "{\"Chunk\":{}}", 4).unwrap();
-        // Newest PlanUpdated wins.
         assert_eq!(
             latest_by_discriminant(&conn, &schema, "t", "PlanUpdated"),
             Some((3, "{\"PlanUpdated\":{\"n\":2}}".to_string()))
         );
-        // A variant the topic never emitted → None (no scan false-positive).
         assert_eq!(
             latest_by_discriminant(&conn, &schema, "t", "WakeupScheduled"),
             None
         );
-        // Unit variants serialize as a bare quoted string; still matched.
         insert_event(&conn, &schema, "t", 5, "\"ThinkingStarted\"", 5).unwrap();
         assert_eq!(
             latest_by_discriminant(&conn, &schema, "t", "ThinkingStarted"),
             Some((5, "\"ThinkingStarted\"".to_string()))
         );
-        // Scoped by topic: another topic's PlanUpdated is invisible.
         insert_event(&conn, &schema, "other", 9, "{\"PlanUpdated\":{\"n\":9}}", 9).unwrap();
         assert_eq!(
             latest_by_discriminant(&conn, &schema, "t", "PlanUpdated"),
@@ -1113,9 +959,6 @@ mod tests {
         );
     }
 
-    /// The lookup must seek via the discriminant index, not scan the topic
-    /// (the whole point of the column: a long session's per-poll sidebar
-    /// queries were full-topic `event_json LIKE` scans).
     #[test]
     fn latest_by_discriminant_uses_the_index() {
         let schema = Schema::new("demo").unwrap();
@@ -1140,17 +983,11 @@ mod tests {
         );
     }
 
-    /// A database created before the `discriminant` column existed gets the
-    /// column added and its historical rows backfilled, so the indexed lookup
-    /// works over old data. The backfill must agree with `discriminant_of`
-    /// for both struct variants and bare-string unit variants, and be
-    /// idempotent across reopens.
     #[test]
     fn ensure_discriminant_column_backfills_legacy_rows() {
         let schema = Schema::new("demo").unwrap();
         let events = schema.events_table();
         let conn = Connection::open_in_memory().unwrap();
-        // Pre-column schema: no `discriminant`.
         conn.execute_batch(&format!(
             "CREATE TABLE {events} (session_id TEXT NOT NULL, seq INTEGER NOT NULL, event_json TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, seq));"
         ))
@@ -1169,7 +1006,6 @@ mod tests {
             .unwrap();
         }
         ensure_discriminant_column(&conn, events).unwrap();
-        // Historical struct + unit variants are now indexable by discriminant.
         assert_eq!(
             latest_by_discriminant(&conn, &schema, "t", "PlanUpdated"),
             Some((1, "{\"PlanUpdated\":{\"n\":1}}".to_string()))
@@ -1178,7 +1014,6 @@ mod tests {
             latest_by_discriminant(&conn, &schema, "t", "ThinkingStarted"),
             Some((3, "\"ThinkingStarted\"".to_string()))
         );
-        // Second call is a no-op (column already present), not an error.
         ensure_discriminant_column(&conn, events).unwrap();
         assert_eq!(
             latest_by_discriminant(&conn, &schema, "t", "Chunk"),
@@ -1186,11 +1021,6 @@ mod tests {
         );
     }
 
-    /// The pending-attachment store buffers bytes keyed by an opaque ref id,
-    /// loads them back in insertion order, sums per session for the cap,
-    /// deletes per ref, and is dropped by `delete_topic`. Crucially it is NOT
-    /// touched by the seq-keyed retention prune, since a queued prompt has no
-    /// event seq yet.
     #[test]
     fn pending_attachments_store_roundtrip_survives_retention_prune() {
         let schema = Schema::new("demo").unwrap();
@@ -1213,7 +1043,6 @@ mod tests {
         put("q1", "a2", b"twotwo", 100);
         put("q2", "b1", b"three", 100);
 
-        // Load per ref in insertion order.
         let q1 = load_pending_attachments_for_ref(&conn, &schema, "t", "q1");
         assert_eq!(
             q1.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
@@ -1221,34 +1050,27 @@ mod tests {
         );
         assert_eq!(q1[0].4, b"one");
 
-        // Per-session byte sum backs the enqueue cap (3 + 6 + 5 = 14).
         assert_eq!(
             pending_attachment_bytes_for_session(&conn, &schema, "t"),
             14
         );
 
-        // Insert is idempotent on (session, attachment_id): re-inserting a1 is
-        // ignored, not a duplicate.
         put("q1", "a1", b"ignored", 100);
         assert_eq!(
             pending_attachment_bytes_for_session(&conn, &schema, "t"),
             14
         );
 
-        // A no-op event insert + retention prune must NOT drop pending rows
-        // (they have no event seq). Prune the events table hard, then re-read.
         prune_retention(&conn, &schema, "t", 0, &[]);
         assert_eq!(
             pending_attachment_bytes_for_session(&conn, &schema, "t"),
             14
         );
 
-        // Delete per ref drops only that ref's blobs.
         delete_pending_attachments_for_ref(&conn, &schema, "t", "q1");
         assert!(load_pending_attachments_for_ref(&conn, &schema, "t", "q1").is_empty());
         assert_eq!(pending_attachment_bytes_for_session(&conn, &schema, "t"), 5);
 
-        // TTL prune drops rows at/older than the cutoff; a newer row survives.
         assert!(insert_pending_attachment(
             &conn,
             &schema,
@@ -1264,7 +1086,6 @@ mod tests {
         assert_eq!(prune_pending_attachments_older_than(&conn, &schema, 100), 1);
         assert_eq!(pending_attachment_bytes_for_session(&conn, &schema, "t"), 3);
 
-        // delete_topic cascades to the pending table.
         delete_topic(&conn, &schema, "t");
         assert_eq!(pending_attachment_bytes_for_session(&conn, &schema, "t"), 0);
     }

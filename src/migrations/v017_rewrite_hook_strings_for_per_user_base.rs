@@ -1,42 +1,19 @@
-//! Migration v017: rewrite previously-installed AoE hook shell strings to the
-//! per-user-base shape (issue #1844). This is the second hook-string rewrite
-//! in the AoE history; v015 hardened the in-shell guards and v017 changes the
-//! base path baked into them from `/tmp/aoe-hooks` (world-known, multi-tenant
-//! exposed) to `/tmp/aoe-hooks-<euid>` host-side, plus a SELinux/ACL/xattr-
-//! tolerant mode pattern (`d*------|d*------.|d*------+|d*------@`) and an
-//! environment-pinning preamble (`unset IFS; umask 077; LC_ALL=C ls -ldn`).
+//! Migration v017: rewrite installed AoE hook shell strings to the per-user
+//! base shape (#1844): `/tmp/aoe-hooks-<euid>` instead of the world-known
+//! `/tmp/aoe-hooks`, a SELinux/ACL/xattr-tolerant mode pattern, and an
+//! environment-pinning preamble.
 //!
-//! ## Strategy: rewrite first, sweep last
+//! Rewrite first, sweep last. Every reachable host target is rewritten through
+//! the live `install_*` functions, and only if all of them succeeded is the
+//! legacy `/tmp/aoe-hooks` directory swept, via an `O_NOFOLLOW` open and a
+//! per-entry uid check that never recurses blindly and never touches another
+//! user's entries. Sweeping first would leave a rewrite-failed target
+//! recreating the legacy directory on every fire; this way a partial failure
+//! stays discoverable for manual cleanup.
 //!
-//! 1. **Rewrite** every reachable host hook target's bytes via the live
-//!    `install_*` functions. Per-target rewrite failures `tracing::warn!`
-//!    and continue.
-//! 2. **Sweep** the legacy `/tmp/aoe-hooks` directory ONLY if every
-//!    rewrite succeeded AND it exists owned by us. `O_NOFOLLOW` open +
-//!    per-entry `fstatat` uid check; we never `remove_dir_all` and never
-//!    touch entries owned by another user (multi-tenant safe).
-//!
-//! Reverse order (sweep first, rewrite last) was rejected: a rewrite
-//! failure between sweep and the schema bump would leave the agent
-//! recreating `/tmp/aoe-hooks` on every fire, undoing the hardening for
-//! any rewrite-failed target until the user manually runs
-//! `aoe uninstall && aoe add`. With rewrite-first, a partial-failure
-//! state keeps legacy entries discoverable for manual cleanup.
-//!
-//! ## Failure policy
-//!
-//! Per `AGENTS.md > Data Migrations`, a returned `Err` aborts boot. v017
-//! never bubbles per-target failures (matches v015): every per-target
-//! issue surfaces as `tracing::warn!`, the schema-version still bumps so
-//! the migration runs at most once, and recovery is `aoe uninstall && aoe
-//! add` exactly as documented for v015.
-//!
-//! ## Sandbox image hooks
-//!
-//! Hooks baked into a Docker / Podman / Apple-Containers sandbox image are
-//! NOT rewritten by v017 (inherits the v015 limitation). Next image rebuild
-//! picks up the current canonical bytes. Defense-in-depth bound: container
-//! isolation already gates the multi-tenant threat we are addressing.
+//! Per-target failures warn and are skipped; only a missing home directory
+//! aborts boot. Host paths only, so hooks baked into a sandbox image keep the
+//! legacy bytes until the image is rebuilt.
 
 use anyhow::Result;
 use std::fs;
@@ -475,7 +452,7 @@ fn read_environment_from_toml(path: &Path) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::test_support::EnvGuard;
+    use crate::migrations::hook_fixtures::{setup_dirs, unset_agent_home_env, write_json};
     use serde_json::Value;
     use std::fs;
     use tempfile::TempDir;
@@ -488,35 +465,6 @@ mod tests {
         mkdir -p \"/tmp/aoe-hooks/$AOE_INSTANCE_ID\" 2>/dev/null; \
         printf running > \"/tmp/aoe-hooks/$AOE_INSTANCE_ID/status\" 2>/dev/null; \
         exit 0'";
-
-    /// Clears CODEX_HOME, CLAUDE_CONFIG_DIR, etc. for the test duration so
-    /// the migration's path resolution sees only the explicit fixtures in
-    /// `home` / `app_dir`.
-    fn unset_agent_home_env() -> EnvGuard {
-        EnvGuard::unset(&[
-            "CODEX_HOME",
-            "CLAUDE_CONFIG_DIR",
-            "CURSOR_CONFIG_DIR",
-            "GEMINI_CONFIG_DIR",
-            "QWEN_CONFIG_DIR",
-        ])
-    }
-
-    fn setup_dirs() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
-        let tmp = TempDir::new().unwrap();
-        let home = tmp.path().join("home");
-        let app_dir = tmp.path().join("app");
-        fs::create_dir_all(&home).unwrap();
-        fs::create_dir_all(&app_dir).unwrap();
-        (tmp, home, app_dir)
-    }
-
-    fn write_json(path: &Path, value: &Value) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
-    }
 
     fn pre_v017_claude_settings() -> Value {
         serde_json::json!({

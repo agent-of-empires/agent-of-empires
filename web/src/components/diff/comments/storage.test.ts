@@ -1,35 +1,25 @@
+// @vitest-environment jsdom
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { clearStoredComments, EMPTY_STORAGE, isEmptyState, loadComments, saveComments, storageKey } from "./storage";
+import {
+  clearStoredComments,
+  EMPTY_STORAGE,
+  isEmptyState,
+  loadComments,
+  saveComments,
+  storageKey,
+  sweepOrphanComments,
+} from "./storage";
 import type { DiffComment, DiffCommentsStorageV1 } from "./types";
 
-// Vitest default env is node; install a minimal in-memory localStorage
-// for these tests so we can exercise the storage layer end-to-end.
-function installFakeLocalStorage() {
-  const data = new Map<string, string>();
-  const fake: Storage = {
-    get length() {
-      return data.size;
-    },
-    key(i) {
-      return Array.from(data.keys())[i] ?? null;
-    },
-    getItem(k) {
-      return data.has(k) ? data.get(k)! : null;
-    },
-    setItem(k, v) {
-      data.set(k, String(v));
-    },
-    removeItem(k) {
-      data.delete(k);
-    },
-    clear() {
-      data.clear();
-    },
-  };
-  // Use globalThis to avoid window typing in node env.
-  (globalThis as { localStorage: Storage }).localStorage = fake;
-  return data;
-}
+const keys = () => Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i)!);
+
+beforeEach(() => {
+  localStorage.clear();
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 function mkComment(overrides: Partial<DiffComment> = {}): DiffComment {
   return {
@@ -45,20 +35,11 @@ function mkComment(overrides: Partial<DiffComment> = {}): DiffComment {
   };
 }
 
-describe("storage", () => {
-  beforeEach(() => {
-    installFakeLocalStorage();
-  });
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
+const withComment = (id = "c1") => ({ ...EMPTY_STORAGE, comments: [mkComment({ id })] });
+const stored = (value: unknown) => localStorage.setItem(storageKey("sess-1"), JSON.stringify(value));
 
-  it("returns the empty envelope when key is absent", () => {
-    const state = loadComments("sess-1");
-    expect(state).toEqual(EMPTY_STORAGE);
-  });
-
-  it("round-trips a full envelope", () => {
+describe("loadComments", () => {
+  it("round-trips per session under a versioned key", () => {
     const original: DiffCommentsStorageV1 = {
       version: 1,
       comments: [mkComment({ id: "a" }), mkComment({ id: "b" })],
@@ -67,168 +48,84 @@ describe("storage", () => {
       outroDraft: "bye",
     };
     saveComments("sess-1", original);
-    const loaded = loadComments("sess-1");
-    expect(loaded).toEqual(original);
+    saveComments("sess-2", withComment("z"));
+    expect(storageKey("abc")).toBe("aoe:diff-comments:v1:abc");
+    expect(loadComments("sess-1")).toEqual(original);
+    expect(loadComments("sess-2").comments.map((c) => c.id)).toEqual(["z"]);
   });
 
-  it("scopes by sessionId", () => {
-    saveComments("sess-1", {
-      ...EMPTY_STORAGE,
-      comments: [mkComment({ id: "a" })],
-    });
-    saveComments("sess-2", {
-      ...EMPTY_STORAGE,
-      comments: [mkComment({ id: "b" })],
-    });
-    expect(loadComments("sess-1").comments.map((c) => c.id)).toEqual(["a"]);
-    expect(loadComments("sess-2").comments.map((c) => c.id)).toEqual(["b"]);
-  });
-
-  it("returns empty envelope when JSON is corrupt", () => {
-    localStorage.setItem(storageKey("sess-1"), "not json");
+  it.each([
+    ["an absent key", undefined],
+    ["corrupt JSON", "not json"],
+    ["an unknown version", JSON.stringify({ ...withComment(), version: 99 })],
+  ])("returns the empty envelope for %s", (_, raw) => {
+    if (raw !== undefined) localStorage.setItem(storageKey("sess-1"), raw);
     expect(loadComments("sess-1")).toEqual(EMPTY_STORAGE);
   });
 
-  it("returns empty envelope when version is unknown", () => {
-    localStorage.setItem(
-      storageKey("sess-1"),
-      JSON.stringify({
-        version: 99,
-        comments: [mkComment({})],
-        clearAfterSend: true,
-        introDraft: "",
-        outroDraft: "",
-      }),
-    );
-    expect(loadComments("sess-1")).toEqual(EMPTY_STORAGE);
+  it("drops malformed comments and defaults missing fields", () => {
+    stored({
+      version: 1,
+      comments: [
+        mkComment({ id: "good" }),
+        { ...mkComment({ id: "bad" }), filePath: 12 },
+        { ...mkComment(), side: "left" },
+      ],
+    });
+    expect(loadComments("sess-1")).toEqual({ ...EMPTY_STORAGE, comments: [mkComment({ id: "good" })] });
   });
+});
 
-  it("filters out malformed comment records", () => {
-    localStorage.setItem(
-      storageKey("sess-1"),
-      JSON.stringify({
-        version: 1,
-        clearAfterSend: true,
-        introDraft: "",
-        outroDraft: "",
-        comments: [
-          mkComment({ id: "good" }),
-          {
-            id: "bad",
-            filePath: 12,
-            side: "new",
-            startLine: 1,
-            endLine: 1,
-            body: "",
-            capturedSnippet: "",
-            createdAt: "x",
-          },
-          {
-            id: "no-side",
-            filePath: "x",
-            side: "left",
-            startLine: 1,
-            endLine: 1,
-            body: "",
-            capturedSnippet: "",
-            createdAt: "x",
-          },
-        ],
-      }),
-    );
-    expect(loadComments("sess-1").comments.map((c) => c.id)).toEqual(["good"]);
-  });
-
-  it("falls back to defaults for missing top-level fields", () => {
-    localStorage.setItem(
-      storageKey("sess-1"),
-      JSON.stringify({
-        version: 1,
-        comments: [],
-      }),
-    );
-    const state = loadComments("sess-1");
-    expect(state.clearAfterSend).toBe(true);
-    expect(state.introDraft).toBe("");
-    expect(state.outroDraft).toBe("");
-  });
-
-  it("survives a write that throws (quota-exceeded etc.)", () => {
-    const spy = vi.spyOn(localStorage, "setItem").mockImplementation(() => {
+describe("saveComments", () => {
+  it("survives a throwing write", () => {
+    const spy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new Error("QuotaExceeded");
     });
-    // Non-empty state still routes through setItem; should not throw despite
-    // the failing write.
-    expect(() => saveComments("sess-1", { ...EMPTY_STORAGE, comments: [mkComment({})] })).not.toThrow();
+    expect(() => saveComments("sess-1", withComment())).not.toThrow();
     expect(spy).toHaveBeenCalled();
   });
 
-  it("uses a deterministic, versioned key", () => {
-    expect(storageKey("abc")).toBe("aoe:diff-comments:v1:abc");
+  it("removes the key when state becomes empty, including a lone clearAfterSend toggle", () => {
+    saveComments("sess-1", withComment());
+    expect(keys()).toEqual([storageKey("sess-1")]);
+    saveComments("sess-1", { ...EMPTY_STORAGE, clearAfterSend: false });
+    expect(keys()).toEqual([]);
   });
 
-  describe("isEmptyState", () => {
-    it("is true for the empty envelope", () => {
-      expect(isEmptyState(EMPTY_STORAGE)).toBe(true);
-    });
+  it.each<[Partial<DiffCommentsStorageV1>, boolean]>([
+    [{}, true],
+    [{ clearAfterSend: false }, true],
+    [{ comments: [mkComment()] }, false],
+    [{ introDraft: "hi" }, false],
+    [{ outroDraft: "bye" }, false],
+  ])("isEmptyState(%j) is %s", (over, empty) => {
+    expect(isEmptyState({ ...EMPTY_STORAGE, ...over })).toBe(empty);
+  });
+});
 
-    it("ignores a non-default clearAfterSend toggle", () => {
-      expect(isEmptyState({ ...EMPTY_STORAGE, clearAfterSend: false })).toBe(true);
-    });
+it("clearStoredComments removes only that session", () => {
+  saveComments("sess-1", withComment());
+  saveComments("sess-2", withComment());
+  clearStoredComments("sess-1");
+  clearStoredComments("absent");
+  expect(keys()).toEqual([storageKey("sess-2")]);
+});
 
-    it("is false with a comment", () => {
-      expect(isEmptyState({ ...EMPTY_STORAGE, comments: [mkComment({})] })).toBe(false);
-    });
-
-    it("is false with draft text", () => {
-      expect(isEmptyState({ ...EMPTY_STORAGE, introDraft: "hi" })).toBe(false);
-      expect(isEmptyState({ ...EMPTY_STORAGE, outroDraft: "bye" })).toBe(false);
-    });
+describe("sweepOrphanComments", () => {
+  it("drops keys for sessions outside the active set and leaves unrelated keys alone", () => {
+    localStorage.setItem("acp:draft:foo", "keep me");
+    saveComments("active", withComment());
+    saveComments("orphan", withComment());
+    sweepOrphanComments(new Set(["active"]));
+    expect(localStorage.getItem("acp:draft:foo")).toBe("keep me");
+    expect(localStorage.getItem(storageKey("active"))).not.toBeNull();
+    expect(localStorage.getItem(storageKey("orphan"))).toBeNull();
   });
 
-  describe("saveComments empty-removal", () => {
-    it("removes the key instead of writing an empty record", () => {
-      const data = installFakeLocalStorage();
-      saveComments("sess-1", EMPTY_STORAGE);
-      expect(data.has(storageKey("sess-1"))).toBe(false);
-    });
-
-    it("removes an existing key when state goes back to empty", () => {
-      const data = installFakeLocalStorage();
-      saveComments("sess-1", { ...EMPTY_STORAGE, comments: [mkComment({})] });
-      expect(data.has(storageKey("sess-1"))).toBe(true);
-      saveComments("sess-1", EMPTY_STORAGE);
-      expect(data.has(storageKey("sess-1"))).toBe(false);
-    });
-
-    it("treats a lone clearAfterSend toggle as empty and removes the key", () => {
-      const data = installFakeLocalStorage();
-      saveComments("sess-1", { ...EMPTY_STORAGE, clearAfterSend: false });
-      expect(data.has(storageKey("sess-1"))).toBe(false);
-    });
-
-    it("still persists non-empty state", () => {
-      const data = installFakeLocalStorage();
-      saveComments("sess-1", { ...EMPTY_STORAGE, comments: [mkComment({})] });
-      expect(data.has(storageKey("sess-1"))).toBe(true);
-      expect(loadComments("sess-1").comments).toHaveLength(1);
-    });
-  });
-
-  describe("clearStoredComments", () => {
-    it("removes the key for a single session", () => {
-      const data = installFakeLocalStorage();
-      saveComments("sess-1", { ...EMPTY_STORAGE, comments: [mkComment({})] });
-      saveComments("sess-2", { ...EMPTY_STORAGE, comments: [mkComment({})] });
-      clearStoredComments("sess-1");
-      expect(data.has(storageKey("sess-1"))).toBe(false);
-      expect(data.has(storageKey("sess-2"))).toBe(true);
-    });
-
-    it("is a no-op for a session with no stored comments", () => {
-      const data = installFakeLocalStorage();
-      expect(() => clearStoredComments("absent")).not.toThrow();
-      expect(data.has(storageKey("absent"))).toBe(false);
-    });
+  it("is a no-op when every key is active", () => {
+    saveComments("a", withComment());
+    saveComments("b", withComment());
+    sweepOrphanComments(new Set(["a", "b"]));
+    expect(keys()).toEqual([storageKey("a"), storageKey("b")]);
   });
 });

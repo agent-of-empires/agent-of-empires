@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-//
-// Contract test for the Dock tab strip: a tab per id, only the active tab's
-// body mounted, and the activate / close / move / new-terminal controls wired
-// to their callbacks.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";

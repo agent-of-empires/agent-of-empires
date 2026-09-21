@@ -2,16 +2,9 @@
 
 use crate::acp::state::{Plan, PlanStep, PlanStepStatus};
 
-/// Parse Claude's ExitPlanMode tool input into a structured `Plan`.
-/// Claude ships the plan markdown in `raw_input.plan`; we extract its
-/// bullet- or number-prefixed lines as `PlanStep`s with status=Pending,
-/// matching the ACP `SessionUpdate::Plan` shape so the existing
-/// PlanStrip renderer can consume it.
-///
-/// Returns `None` when the input has no `plan` key, the value isn't a
-/// string, or the string has no recognisable list items; in which case
-/// the generic tool card is still rendered so the user sees the raw
-/// plan text. See #1059 for the upstream gap this works around.
+/// ExitPlanMode ships its markdown in `raw_input.plan`, which has no ACP
+/// `SessionUpdate::Plan` of its own (#1059). `None` for a missing, non-string,
+/// or bullet-less value, which still renders as a generic tool card.
 pub(super) fn extract_plan_from_switch_mode(raw_input: &serde_json::Value) -> Option<Plan> {
     let plan_text = raw_input.get("plan")?.as_str()?;
     let steps = parse_plan_steps(plan_text);
@@ -25,11 +18,8 @@ pub(super) fn extract_plan_from_switch_mode(raw_input: &serde_json::Value) -> Op
     })
 }
 
-/// Flatten plan markdown into `PlanStep`s. v1 heuristic: every line
-/// starting with `-`, `*`, or `<digit>.` becomes one step. Sub-bullets
-/// flatten into the parent list (PlanEntry has no nesting field in the
-/// ACP spec). Strips bold/italic markers from the step title so the
-/// PlanStrip doesn't render literal `**foo**`.
+/// Every line starting with `-`, `*`, or `<digit>.` becomes a step.
+/// Sub-bullets flatten in, since `PlanEntry` has no nesting field.
 pub(super) fn parse_plan_steps(text: &str) -> Vec<PlanStep> {
     use std::sync::OnceLock;
     static BULLET: OnceLock<regex::Regex> = OnceLock::new();
@@ -57,12 +47,10 @@ pub(super) fn parse_plan_steps(text: &str) -> Vec<PlanStep> {
     steps
 }
 
+/// Unwraps `**bold**`, `__bold__`, `*italic*` and `_italic_` so the PlanStrip
+/// renders no literal markers. Underscores anchor on word boundaries, leaving
+/// `snake_case` identifiers intact.
 pub(super) fn strip_markdown_emphasis(s: &str) -> String {
-    // Replace **bold**, __bold__, *italic*, _italic_ markers with their
-    // inner text. Keep it permissive; the source is Claude's planning
-    // markdown, which is usually well-formed but occasionally drops a
-    // closing marker. Underscore markers are anchored on word boundaries
-    // so `snake_case` identifiers survive intact.
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
@@ -93,10 +81,8 @@ pub(super) fn map_plan_status(
     }
 }
 
-/// Lowercase string form of a PlanEntryStatus for the synthetic
-/// TodoWrite args payload. Matches the values
-/// `web/src/components/acp/ToolCards.tsx::normaliseTodoStatus`
-/// accepts so the TodoUpdateCard renders the right glyph.
+/// For the synthetic TodoWrite args payload. Matches what
+/// `web/src/components/acp/ToolCards.tsx::normaliseTodoStatus` accepts.
 pub(super) fn plan_status_to_str(
     status: &agent_client_protocol::schema::v1::PlanEntryStatus,
 ) -> &'static str {
@@ -132,46 +118,34 @@ mod tests {
         }
     }
 
+    /// A plan needs bullets; anything else renders as a generic tool card.
     #[test]
-    fn parse_plan_steps_returns_empty_when_no_bullets() {
-        assert!(parse_plan_steps("Just a paragraph with no list.").is_empty());
-        assert!(parse_plan_steps("").is_empty());
-    }
-
-    #[test]
-    fn extract_plan_from_switch_mode_handles_missing_plan_field() {
-        let v = serde_json::json!({});
-        assert!(extract_plan_from_switch_mode(&v).is_none());
-        let v = serde_json::json!({ "plan": 42 });
-        assert!(extract_plan_from_switch_mode(&v).is_none());
-    }
-
-    #[test]
-    fn extract_plan_from_switch_mode_builds_plan_when_input_has_bullets() {
-        let v = serde_json::json!({
+    fn extract_plan_from_switch_mode_needs_a_bulleted_string() {
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({ "plan": 42 }),
+            serde_json::json!({ "plan": "Just a paragraph with no list." }),
+            serde_json::json!({ "plan": "" }),
+        ] {
+            assert!(extract_plan_from_switch_mode(&raw).is_none(), "{raw}");
+        }
+        let plan = extract_plan_from_switch_mode(&serde_json::json!({
             "plan": "- Step one\n- Step two\n- Step three"
-        });
-        let plan = extract_plan_from_switch_mode(&v).expect("plan should parse");
+        }))
+        .expect("plan should parse");
         assert_eq!(plan.steps.len(), 3);
         assert_eq!(plan.steps[0].title, "Step one");
     }
 
     #[test]
-    fn strip_markdown_emphasis_unwraps_bold_and_italic() {
-        assert_eq!(strip_markdown_emphasis("**bold**"), "bold");
-        assert_eq!(strip_markdown_emphasis("__bold__"), "bold");
-        assert_eq!(strip_markdown_emphasis("*italic*"), "italic");
-        assert_eq!(strip_markdown_emphasis("_italic_"), "italic");
-        assert_eq!(
-            strip_markdown_emphasis("mix of **bold** and *italic*"),
-            "mix of bold and italic"
-        );
-        assert_eq!(strip_markdown_emphasis("plain"), "plain");
-    }
-
-    #[test]
-    fn strip_markdown_emphasis_keeps_intraword_underscores() {
+    fn strip_markdown_emphasis_unwraps_markers_but_keeps_intraword_underscores() {
         for (input, want) in [
+            ("**bold**", "bold"),
+            ("__bold__", "bold"),
+            ("*italic*", "italic"),
+            ("_italic_", "italic"),
+            ("mix of **bold** and *italic*", "mix of bold and italic"),
+            ("plain", "plain"),
             ("rename _foo_ now", "rename foo now"),
             ("foo_bar_baz", "foo_bar_baz"),
             ("rename foo_bar_baz", "rename foo_bar_baz"),

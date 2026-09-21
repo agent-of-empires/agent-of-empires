@@ -1,15 +1,5 @@
 //! Pure decision logic for auto-stopping idle plain TUI/tmux sessions
-//! (`session.auto_stop_idle_secs`, #1690).
-//!
-//! This module owns the eligibility predicate only: no tmux calls, no storage
-//! writes, no config resolution, no process locks. Callers (the TUI main loop
-//! and the serve `status_poll_loop`) resolve the per-profile threshold, gather
-//! the live tmux attach state, then ask this predicate per session and claim
-//! the stop through `Storage::update` so concurrent reapers cannot double-stop.
-//!
-//! The structured view has its own reaper (`server::acp_reconciler`,
-//! #1689) with dormancy and seamless respawn; this is the tmux-view analog
-//! where a stop kills the pane and leaves a restartable `Stopped` row.
+//! (`session.auto_stop_idle_secs`).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -19,9 +9,8 @@ use chrono::{DateTime, Utc};
 use super::{Instance, Status, Storage};
 use crate::file_watch::FileWatchService;
 
-/// A plain session the reaper intends to auto-stop, with the inputs the
-/// caller needs to claim it (`profile` to open the right storage, the resolved
-/// `threshold_secs` for the in-lock re-check).
+/// A plain session the reaper intends to auto-stop, with the inputs the caller needs to claim it
+/// (`profile` to open the right storage, the resolved `threshold_secs` for the in-lock re-check).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdleReapCandidate {
     pub session_id: String,
@@ -30,12 +19,6 @@ pub struct IdleReapCandidate {
 }
 
 /// Select the plain (non-structured view) sessions eligible for idle auto-stop.
-///
-/// Shared by the TUI main loop and the serve `status_poll_loop` so both apply
-/// identical policy. `attached` is the set of tmux session names with a live
-/// client (from [`crate::tmux::attached_session_names`]); a session whose tmux
-/// name is in it is spared. `resolve_threshold` maps a profile name to its
-/// effective `session.auto_stop_idle_secs`; callers cache it per profile.
 pub fn idle_reap_candidates(
     instances: &[Instance],
     now: DateTime<Utc>,
@@ -74,23 +57,7 @@ pub fn idle_reap_candidates(
     candidates
 }
 
-/// Decide whether a plain (non-structured view) session should be auto-stopped for
-/// inactivity.
-///
-/// Eligible only when all hold:
-/// - `threshold_secs > 0` (the feature is opt-in; `0` disables it),
-/// - the session is currently `Idle` (a `Running`/`Waiting` session is never
-///   stopped, which `idle_entered_at` also reflects since it is cleared on any
-///   non-Idle transition),
-/// - no tmux client is attached (a session the user is reading is spared),
-/// - `idle_entered_at` is known (legacy rows that predate the field are
-///   skipped rather than inferred),
-/// - the idle anchor is at least `threshold_secs` in the past.
-///
-/// The anchor is `max(idle_entered_at, last_accessed_at)`: `last_accessed_at`
-/// is bumped on user interaction, so a session the user recently touched is
-/// spared even if the agent went idle earlier. A negative elapsed (clock skew,
-/// anchor in the future) is treated as not-yet-eligible rather than panicking.
+/// Decide whether a plain (non-structured view) session should be auto-stopped for inactivity.
 pub fn should_auto_stop_session(
     now: DateTime<Utc>,
     status: Status,
@@ -122,18 +89,9 @@ pub fn should_auto_stop_session(
     }
 }
 
-/// Atomically claim an idle session for auto-stop, under the per-profile
-/// storage file lock so concurrent reapers (a standalone TUI and an `aoe serve`
-/// daemon against the same on-disk state) cannot double-stop it.
-///
-/// Re-reads the session from disk inside the lock and re-checks eligibility
-/// (still `Idle`, still idle past `threshold_secs`); attach state is not
-/// re-queried here because it is a blocking tmux call and the caller already
-/// filtered attached sessions before claiming. On success the on-disk status
-/// is flipped to `Stopped` (the claim, mirroring the manual-stop path) and the
-/// claimed `Instance` is returned for the caller to actually kill via
-/// `perform_stop`. Returns `Ok(None)` when the session is no longer eligible
-/// (already claimed by the peer reaper, woken by the user, or gone).
+/// Atomically claim an idle session for auto-stop, under the per-profile storage file lock so
+/// concurrent reapers (a standalone TUI and an `aoe serve` daemon against the same on-disk state)
+/// cannot double-stop it.
 pub fn claim_idle_stop(
     profile: &str,
     file_watch: Arc<FileWatchService>,
@@ -146,9 +104,9 @@ pub fn claim_idle_stop(
         let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
             return Ok(None);
         };
-        // Defense in depth: never stop a structured view row through the plain-session
-        // path, even if a caller reached here without going through
-        // `idle_reap_candidates` (which already excludes structured view sessions).
+        // Defense in depth: never stop a structured view row through the plain-session path, even
+        // if a caller reached here without going through `idle_reap_candidates` (which already
+        // excludes structured view sessions).
         if inst.is_structured() {
             return Ok(None);
         }
@@ -178,142 +136,42 @@ mod tests {
     }
 
     #[test]
-    fn disabled_threshold_never_stops() {
+    fn should_auto_stop_session_cases() {
         let n = now();
-        assert!(!should_auto_stop_session(
-            n,
-            Status::Idle,
-            Some(n - Duration::hours(10)),
-            None,
-            false,
-            0,
-        ));
-    }
-
-    #[test]
-    fn non_idle_is_never_stopped() {
-        let n = now();
-        for status in [Status::Running, Status::Waiting, Status::Error] {
-            assert!(
-                !should_auto_stop_session(
-                    n,
-                    status,
-                    Some(n - Duration::hours(10)),
-                    None,
-                    false,
-                    60,
-                ),
-                "status {status:?} should survive the reap"
+        let idle = Status::Idle;
+        // (status, idle-entered secs ago, last-accessed secs ago, attached, threshold, stop?)
+        type Case = (Status, Option<i64>, Option<i64>, bool, u32, bool);
+        let cases: &[Case] = &[
+            (idle, Some(36000), None, false, 0, false),
+            (Status::Running, Some(36000), None, false, 60, false),
+            (Status::Waiting, Some(36000), None, false, 60, false),
+            (Status::Error, Some(36000), None, false, 60, false),
+            (idle, Some(36000), None, true, 60, false),
+            (idle, None, None, false, 60, false),
+            (idle, Some(120), None, false, 60, true),
+            (idle, Some(30), None, false, 60, false),
+            (idle, Some(60), None, false, 60, true),
+            // A later access re-anchors the idle window; an earlier one does not.
+            (idle, Some(7200), Some(10), false, 60, false),
+            (idle, Some(120), Some(18000), false, 60, true),
+            // Anchor in the future (clock skew).
+            (idle, Some(-60), None, false, 60, false),
+        ];
+        for &(status, entered, accessed, attached, secs, stop) in cases {
+            let ago = |s: i64| n - Duration::seconds(s);
+            let got = should_auto_stop_session(
+                n,
+                status,
+                entered.map(ago),
+                accessed.map(ago),
+                attached,
+                secs,
+            );
+            assert_eq!(
+                got, stop,
+                "{status:?} {entered:?} {accessed:?} {attached} {secs}"
             );
         }
-    }
-
-    #[test]
-    fn attached_session_is_never_stopped() {
-        let n = now();
-        assert!(!should_auto_stop_session(
-            n,
-            Status::Idle,
-            Some(n - Duration::hours(10)),
-            None,
-            true,
-            60,
-        ));
-    }
-
-    #[test]
-    fn missing_idle_entered_at_never_stops() {
-        let n = now();
-        assert!(!should_auto_stop_session(
-            n,
-            Status::Idle,
-            None,
-            None,
-            false,
-            60,
-        ));
-    }
-
-    #[test]
-    fn idle_past_threshold_stops() {
-        let n = now();
-        assert!(should_auto_stop_session(
-            n,
-            Status::Idle,
-            Some(n - Duration::seconds(120)),
-            None,
-            false,
-            60,
-        ));
-    }
-
-    #[test]
-    fn idle_within_threshold_survives() {
-        let n = now();
-        assert!(!should_auto_stop_session(
-            n,
-            Status::Idle,
-            Some(n - Duration::seconds(30)),
-            None,
-            false,
-            60,
-        ));
-    }
-
-    #[test]
-    fn exactly_at_threshold_stops() {
-        let n = now();
-        assert!(should_auto_stop_session(
-            n,
-            Status::Idle,
-            Some(n - Duration::seconds(60)),
-            None,
-            false,
-            60,
-        ));
-    }
-
-    #[test]
-    fn recent_access_after_idle_entry_spares_session() {
-        let n = now();
-        // Went idle 2h ago, but the user interacted 10s ago: anchor is the
-        // recent access, so the session is spared.
-        assert!(!should_auto_stop_session(
-            n,
-            Status::Idle,
-            Some(n - Duration::hours(2)),
-            Some(n - Duration::seconds(10)),
-            false,
-            60,
-        ));
-    }
-
-    #[test]
-    fn stale_access_does_not_extend_idle() {
-        let n = now();
-        // last_accessed_at older than idle entry: anchor stays at idle entry,
-        // which is past the threshold.
-        assert!(should_auto_stop_session(
-            n,
-            Status::Idle,
-            Some(n - Duration::seconds(120)),
-            Some(n - Duration::hours(5)),
-            false,
-            60,
-        ));
-    }
-
-    #[test]
-    fn future_anchor_clock_skew_does_not_stop() {
-        let n = now();
-        assert!(!should_auto_stop_session(
-            n,
-            Status::Idle,
-            Some(n + Duration::seconds(60)),
-            None,
-            false,
-            60,
-        ));
     }
 
     fn idle_instance(title: &str) -> Instance {
@@ -324,53 +182,36 @@ mod tests {
     }
 
     #[test]
-    fn candidates_select_idle_past_threshold() {
+    fn candidates_select_only_reapable_plain_sessions() {
         let n = now();
-        let instances = vec![idle_instance("a")];
-        let attached = HashSet::new();
-        let got = idle_reap_candidates(&instances, n, &attached, |_| 60);
+        let idle = idle_instance("a");
+        let attached = HashSet::from([idle.tmux_session().unwrap().name().to_string()]);
+        let mut running = idle.clone();
+        running.status = Status::Running;
+        let one = std::slice::from_ref(&idle);
+
+        let got = idle_reap_candidates(one, n, &HashSet::new(), |_| 60);
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].session_id, instances[0].id);
+        assert_eq!(got[0].session_id, idle.id);
         assert_eq!(got[0].threshold_secs, 60);
-    }
 
-    #[test]
-    fn candidates_skip_disabled_threshold() {
-        let n = now();
-        let instances = vec![idle_instance("a")];
-        let attached = HashSet::new();
-        assert!(idle_reap_candidates(&instances, n, &attached, |_| 0).is_empty());
-    }
-
-    #[test]
-    fn candidates_skip_running_session() {
-        let n = now();
-        let mut inst = idle_instance("a");
-        inst.status = Status::Running;
-        let attached = HashSet::new();
-        assert!(idle_reap_candidates(&[inst], n, &attached, |_| 60).is_empty());
-    }
-
-    #[test]
-    fn candidates_skip_attached_session() {
-        let n = now();
-        let inst = idle_instance("a");
-        let name = inst.tmux_session().unwrap().name().to_string();
-        let mut attached = HashSet::new();
-        attached.insert(name);
-        assert!(idle_reap_candidates(&[inst], n, &attached, |_| 60).is_empty());
+        assert!(
+            idle_reap_candidates(one, n, &HashSet::new(), |_| 0).is_empty(),
+            "threshold 0 disables the reaper"
+        );
+        assert!(
+            idle_reap_candidates(&[running], n, &HashSet::new(), |_| 60).is_empty(),
+            "a running session is never a candidate"
+        );
+        assert!(
+            idle_reap_candidates(one, n, &attached, |_| 60).is_empty(),
+            "an attached session is never a candidate"
+        );
     }
 
     #[test]
     #[serial_test::serial]
     fn claim_is_single_shot_under_storage_lock() {
-        // The double-reap guard: the first claim wins and flips the on-disk
-        // status to Stopped; a second claim (the peer reaper) sees a non-Idle
-        // session and returns None, so the session is never stopped twice.
-        //
-        // `isolate_home` points HOME/XDG_CONFIG_HOME at the tempdir, restores
-        // them on Drop, and holds the process-global env lock for the guard's
-        // lifetime so a peer test cannot leak this tempdir HOME into itself.
         let temp = tempfile::tempdir().unwrap();
         let _env = crate::session::test_support::isolate_home(temp.path());
 

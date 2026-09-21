@@ -1,212 +1,65 @@
 # Live mode
 
-Live mode is a "feels-attached" alternative to a full tmux attach. When
-you enter it, the AoE home view stays on screen (session list, preview,
-status bar) and every keystroke is relayed straight to the selected
-session's pane. You get the ambient awareness of the dashboard and the
-immediacy of typing directly to the agent, without tmux taking over the
-whole terminal.
-
-Unlike a full `tmux attach` (which replaces the screen until you detach),
-the dashboard never leaves, so you can watch other sessions' states while
-you work.
+Live mode is a "feels attached" alternative to a full tmux attach: the home view stays on screen (session list, preview, status bar) while every keystroke is relayed to the selected session's pane, so you can watch other sessions' states while you work.
 
 ## Entering and leaving
 
-* **Enter:** press `Tab` on a runnable session, or set live mode as your
-  default so that `Enter` (and clicking a row) drops you straight into
-  it. Use **New Session Mode** when new sessions should open in live mode
-  without changing the Enter behavior.
-* **Leave (fast exit):** press `Ctrl+Q`. This is a single press and is
-  always available, independent of the leader below.
+Press `Tab` on a runnable session, or set live mode as your default so `Enter` and a click drop straight into it. **New Session Mode** makes new sessions open in live mode without changing what `Enter` does. `Ctrl+Q` always leaves, in a single press, independent of the leader below. The status bar shows a `● LIVE → <session>` banner with the exit chord while you are relayed.
 
-The status bar shows a `● LIVE → <session>` banner while you are
-relayed, including a reminder of the exit chord and the leader menu.
+Control chords reach the agent: `Ctrl+C` interrupts it rather than quitting AoE, and the banner flashes a brief reminder on each press. To quit AoE, leave live mode first.
 
-Control chords reach the agent too. `Ctrl+C`, for example, interrupts
-the agent rather than quitting AoE; use it whenever you would send an
-interrupt in a normal terminal. The banner flashes a brief `Ctrl+C sent
-to agent` reminder on each press, next to the exit chord, so it is clear
-the keystroke landed on the agent and how to leave live mode. To quit
-AoE, exit live mode first (`Ctrl+Q`), then quit from the home view.
+Live send works for the Terminal and Tool views too, not just the agent pane: whichever pane is on screen is what your keystrokes reach. Turning on **Auto Live-Send On View Switch** (Interaction settings, off by default) starts the relay as soon as you switch views.
 
-Live-send also works for the Terminal view and Tool views (lazygit,
-yazi, and other embedded tools), not just the agent pane: whichever
-pane is on screen is what your keystrokes reach.
+Mouse input is forwarded when the pane on screen is a full-screen app that asked for it, so clicks, drags, and the wheel reach tools like lazygit and yazi, and an agent that tracks the pointer receives hover motion. Hold `Shift` to bypass forwarding and use AoE's own selection and copy.
 
-Turning on **Auto Live-Send On View Switch** (Interaction settings, off
-by default) skips the extra `Enter`/`Tab`/click when you switch into
-Terminal or Tool view: live-send starts as soon as the view switches,
-regardless of **Default Attach Mode**.
+Links in the preview are underlined, and a plain click opens one in your browser, ahead of that forwarding, whenever the preview is on screen. Both a marked-up hyperlink and a bare URL count. Resting the pointer on one shows its target in the status bar, which is worth a glance: a link's visible text is chosen by whatever is running in the pane. AoE also passes the link to your terminal, so hovering highlights it and your terminal's own gesture still works (and emulators that claim shifted clicks, such as WezTerm and iTerm2, take those before AoE sees them).
 
-Mouse input is forwarded too, when the pane on screen is a full-screen
-app that asked for it: clicks, drags, and the scroll wheel reach
-mouse-driven tool UIs like lazygit and yazi, and an agent that tracks
-the pointer (Claude Code highlights expandable content under your
-cursor) also receives hover motion. Hold `Shift` while clicking or
-dragging to bypass forwarding and use AoE's own text selection and
-copy instead.
-
-Links in the preview are underlined, and a plain click opens one in your
-browser, ahead of that forwarding. This works whenever the preview is on
-screen, not only in live mode. Both kinds count: a hyperlink the agent
-marked up, whose visible text can hide the address entirely, and a plain URL
-sitting in the output. AoE holds the mouse, so a plain click never reaches your
-terminal emulator; `Shift` behaves as it does elsewhere on the preview, going
-to AoE's own text selection, though emulators that claim shifted clicks for
-themselves (WezTerm, iTerm2) take it before AoE sees it.
-
-Resting the pointer on a link shows where it goes in the status bar. Worth a
-glance before clicking: a link's visible text is chosen by whatever is running
-in the pane, so it need not resemble its address.
-
-AoE also passes the link on to your terminal, so hovering highlights it and
-your terminal's own link gesture works too.
-
-When AoE cannot reach a browser you would actually see, it copies the address
-to your clipboard instead of opening it, and says so. That covers SSH, where a
-browser launched on the far end would open on a screen you are not sitting at,
-and headless hosts with no browser at all. Your terminal's own link gesture
-still opens it locally, which is usually what you want. Set `BROWSER` to
-override the check, so a script that forwards the URL somewhere useful keeps
-working. That applies on platforms whose browser launcher reads it; macOS opens
-through the system instead and ignores both `BROWSER` and `DISPLAY`.
+When AoE cannot reach a browser you would actually see (SSH, a headless host) it copies the address to your clipboard instead and says so. Set `BROWSER` to override that check, on platforms whose launcher reads it; macOS opens through the system and ignores it.
 
 ## The leader menu
 
-Almost every key you press in live mode goes to the agent, so AoE
-reserves a single **leader** chord (tmux-style prefix) to reach its own
-commands. The default is `Ctrl+B`, matching tmux and herdr.
-
-Press the leader, then a command key:
+Almost every key goes to the agent, so AoE reserves one **leader** chord, tmux-style. The default is `Ctrl+B`.
 
 | Keys | Action |
 | --- | --- |
 | `Ctrl+B` then `k` | Open the command palette |
-| `Ctrl+B` then `b` | Hide / show the sidebar (preview takes the full width) |
+| `Ctrl+B` then `b` | Hide or show the sidebar, giving the preview full width |
 | `Ctrl+B` then `q` | Exit live mode |
 | `Ctrl+B` then `Ctrl+B` | Send a literal `Ctrl+B` to the agent |
-| `Esc` (or any other key) after the leader | Cancel the menu, send nothing |
+| `Esc` or any other key | Cancel the menu, send nothing |
 
-When the leader is armed, the status bar turns into a which-key menu
-listing these commands, so you do not have to memorize them.
+While the leader is armed the status bar becomes a which-key menu. Only the leader itself is taken from the agent, and pressing it twice still delivers it downstream, so every other chord, `Ctrl+K` included, passes through untouched. The command palette layers over live mode: `Esc` drops back into the relay, while choosing a command leaves live mode first, so the preview never shows one session while your keystrokes go to another. The sidebar always reappears when you exit live mode, so hiding it cannot strand you.
 
-Only the leader itself is taken away from the agent, and pressing it
-twice still delivers it downstream (the same idea as tmux's
-`send-prefix`). Every other chord, including `Ctrl+K`, passes through to
-the agent untouched, so the agent's own keybindings keep working.
+`Shift+PageUp` and `Shift+PageDown` scroll the preview through the agent's history without leaving live mode; bare `PageUp` and `PageDown` still pass through for agents that page their own UI.
 
-Opening the command palette layers it over live mode. Cancel it with
-`Esc` to drop straight back into the relay; choosing any palette command
-leaves live mode first, so the preview never shows one session while
-your keystrokes go to another.
-
-## Collapsing the sidebar
-
-`Ctrl+B` then `b` hides the session list and hands the full terminal
-width to the agent pane, then restores it on the next toggle. This is a
-live-mode focus tool: the sidebar always reappears when you exit live
-mode, so you can never get stranded in the normal home view with the
-list hidden.
-
-## Scrolling history
-
-`Shift+PageUp` and `Shift+PageDown` scroll the preview back through the
-agent's history without leaving live mode or forwarding the keys. Bare
-`PageUp` / `PageDown` still pass through to the agent, so agents that
-page their own UI keep working.
+`Shift+Enter` inserts a newline into the agent's input box on kitty-protocol-capable terminals (Ghostty, Kitty, WezTerm, foot, Konsole 24+, Alacritty 0.13+, recent xterm). Elsewhere it submits like bare `Enter`, so use `Alt+Enter` (`Option+Enter` on macOS), which sends `ESC+CR` natively on many terminals, or configure your terminal to send `ESC+CR` for `Shift+Enter`.
 
 ## Split windows
 
-If you split the session's tmux window by hand (`Ctrl+B %`, `Ctrl+B "`), or
-an agent splits it for you (a Claude Code agent team spawns one pane per
-teammate), the preview composites every pane onto the window grid with
-borders in the gaps, so nothing is hidden.
-
-Two things change while a window is split:
-
-- **Scrolling history is unavailable.** Panes keep independent scrollbacks
-  with no coherent way to stack them, so the composite covers the visible
-  window only and `Shift+PageUp` has nothing to scroll into. Close the extra
-  pane and history comes back.
-- **Input still goes to the first pane.** Keystrokes, clicks, and the scroll
-  wheel all reach the agent's own pane regardless of which pane you split
-  off, so a wheel or click aimed at a neighbouring pane does nothing. Attach
-  to the session to interact with the other panes.
-
-## Inserting newlines
-
-`Shift+Enter` inserts a newline into the agent's input box on
-kitty-protocol-capable terminals (Ghostty, Kitty, WezTerm, foot, Konsole
-24+, Alacritty 0.13+, recent xterm). On terminals that do not speak the
-kitty keyboard protocol (Apple Terminal, default iTerm2, Termius, Mosh),
-`Shift+Enter` submits like bare `Enter`; use `Alt+Enter` (or
-`Option+Enter` on macOS), which sends `ESC+CR` natively on many
-terminals, or configure the terminal to send `ESC+CR` for `Shift+Enter`
-as a fallback.
+If the session's tmux window is split, by hand or by an agent that spawns a pane per teammate, the preview composites every pane onto the window grid with borders in the gaps, so nothing is hidden. Two things change while it is split: scrolling history is unavailable, because panes keep independent scrollbacks with no coherent way to stack them, and input still goes to the first pane, so a click or wheel aimed at a neighbouring pane does nothing. Attach to the session to interact with the other panes.
 
 ## The VT live transport
 
-The TUI's agent preview and the web dashboard's agent terminal render
-through a persistent VT channel by default: `tmux pipe-pane` streams the
-agent's raw output into an in-process terminal grid, and on tmux 3.8 or
-newer your keystrokes travel back over the same socket (older tmux crashes
-the whole server when that socket writes to a pane whose agent has just
-exited, so there keystrokes stay on `send-keys`). Compared to the polling path
-(`capture-pane` scrapes plus a `send-keys` fork per keystroke), typing
-echo and streaming output land with near-attach latency, agent copies
-(OSC 52) reach your clipboard, and a full-screen agent that brackets its
-repaints in synchronized output (DEC 2026) is shown only between brackets,
-never mid-redraw.
+The TUI's agent preview and the dashboard's agent terminal render through a persistent VT channel by default: `tmux pipe-pane` streams the agent's raw output into an in-process terminal grid, and on tmux 3.8 or newer your keystrokes travel back over the same socket (on older tmux that socket can crash the server when the agent has just exited, so keystrokes stay on `send-keys`). Compared to the polling path (`capture-pane` scrapes plus a `send-keys` fork per keystroke), echo and streaming output land with near-attach latency, agent clipboard writes (OSC 52) reach your clipboard, and a full-screen agent that brackets its repaints in synchronized output is shown only between brackets, never mid-redraw.
 
-The channel needs tmux 3.4 or newer. A pane that cannot arm one, a pane
-whose grid could not be seeded, a grid still catching up with a resize,
-an older tmux, or a non-Unix host falls back to the polling path
-automatically; everything still works, with more latency and without the
-synchronized-output hold. A split window is composited from
-`capture-pane` snapshots: the TUI preview keeps pane 0 on its VT grid
-and captures the other panes, and the web dashboard captures every pane.
-The paired host and container shells always use the polling path.
+The channel needs tmux 3.4 or newer. A pane that cannot arm one, a grid that could not be seeded or is catching up with a resize, an older tmux, or a non-Unix host falls back to polling automatically: everything still works, with more latency and no synchronized-output hold. A split window is composited from `capture-pane` snapshots, with the TUI preview keeping pane 0 on its VT grid. The paired host and container shells always poll.
 
-To rule the VT transport in or out while troubleshooting, toggle "VT
-Live Transport" under Settings (Tmux tab, Advanced) or set it in
-`config.toml`:
-
-```toml
-[tmux]
-vt_live = false   # default true
-```
-
-The TUI applies a change on the next capture cycle; web connections pick
-it up when they reconnect.
+To rule the transport in or out while troubleshooting, toggle **VT Live Transport** under Settings (Tmux tab, Advanced) or set `[tmux] vt_live = false`. The TUI applies a change on its next capture cycle; web connections pick it up when they reconnect.
 
 ## Configuration
 
-Both chords are editable under Settings, in the Interaction section, and
-in `config.toml`:
+Both chords are editable under Settings (Interaction) and in `config.toml`:
 
 ```toml
 [session]
-# Leader (prefix) chord for live-mode commands. Tmux-style spec.
-# Leave empty to disable the leader entirely (then Ctrl+B passes
-# straight through to the agent).
+# Leader (prefix) chord for live-mode commands, tmux-style.
+# Empty disables the leader, passing Ctrl+B straight to the agent.
 live_send_leader = "C-b"
 
-# One or more comma-separated chords that exit live mode. Single press,
-# independent of the leader.
+# Comma-separated chords that exit live mode, single press.
 live_send_exit_chord = "C-q"
 ```
 
-Chord specs are tmux-style: `C-b`, `C-a`, `M-x` (Alt), `F12`, and so on.
-A typo in the leader falls back to the default; an empty value disables
-it.
+Specs are tmux-style (`C-b`, `C-a`, `M-x`, `F12`). A typo in the leader falls back to the default.
 
-### Why `Ctrl+B`?
-
-A prefix steals exactly one chord from the agent, so the obvious
-single-key candidates like `Ctrl+K` (readline's kill-to-end-of-line)
-stay free for the shell and the agent. `Ctrl+B` is the chord tmux and
-herdr users already know as a leader. If you run AoE inside your own
-tmux session that also uses `Ctrl+B`, the outer tmux will claim it
-first; rebind `live_send_leader` to something free (for example `C-a` or
-`F1`), and remember that `Ctrl+Q` always exits regardless.
+`Ctrl+B` is the default because a prefix steals exactly one chord from the agent, and it is the one tmux users already know, leaving candidates like `Ctrl+K` free for the shell. If you run AoE inside your own tmux session that also uses `Ctrl+B`, the outer tmux claims it first: rebind `live_send_leader` (to `C-a` or `F1`, say), and remember that `Ctrl+Q` always exits.

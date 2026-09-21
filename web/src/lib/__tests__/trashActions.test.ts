@@ -1,7 +1,3 @@
-// Coverage for the trash/restore action loops (#2489): apply each snapshot,
-// flag failures via onError, and toast the aggregate result. The api calls
-// are mocked so the test exercises only the loop + notify branches.
-
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../api", () => ({
@@ -35,67 +31,38 @@ beforeEach(() => {
 
 afterEach(() => vi.clearAllMocks());
 
-describe("trashSessions (#2489)", () => {
-  it("applies every snapshot and toasts success when all succeed", async () => {
-    trashMock.mockImplementation(async (id: string) => snap(id));
-    const applySession = vi.fn();
-    const onError = vi.fn();
-    const notify = { info: vi.fn(), error: vi.fn() };
+describe("trash and restore loops (#2489)", () => {
+  const notifier = () => ({ info: vi.fn(), error: vi.fn() });
 
-    const ok = await trashSessions(["a", "b"], { applySession, onError, notify });
-
-    expect(ok).toBe(true);
-    expect(applySession).toHaveBeenCalledTimes(2);
-    expect(onError).not.toHaveBeenCalled();
-    expect(notify.info).toHaveBeenCalledWith("Moved to trash");
-    expect(notify.error).not.toHaveBeenCalled();
-  });
-
-  it("flags failures, toasts error, and returns false", async () => {
+  it("trashSessions applies snapshots, flags failures, and toasts the aggregate", async () => {
     trashMock.mockImplementation(async (id: string) => (id === "bad" ? null : snap(id)));
     const applySession = vi.fn();
     const onError = vi.fn();
-    const notify = { info: vi.fn(), error: vi.fn() };
-
-    const ok = await trashSessions(["good", "bad"], { applySession, onError, notify });
-
-    expect(ok).toBe(false);
-    expect(applySession).toHaveBeenCalledTimes(1);
-    expect(onError).toHaveBeenCalledWith("bad");
+    const notify = notifier();
+    expect(await trashSessions(["a", "b"], { applySession, onError, notify })).toBe(true);
+    expect(applySession).toHaveBeenCalledTimes(2);
+    expect(notify.info).toHaveBeenCalledWith("Moved to trash");
+    expect(await trashSessions(["good", "bad"], { applySession, onError, notify })).toBe(false);
+    expect(applySession).toHaveBeenCalledTimes(3);
+    expect(onError).toHaveBeenCalledExactlyOnceWith("bad");
     expect(notify.error).toHaveBeenCalledWith("Failed to move session to trash");
   });
 
-  it("tolerates a null notifier", async () => {
-    trashMock.mockResolvedValue(snap("a"));
-    await expect(trashSessions(["a"], { applySession: vi.fn(), onError: vi.fn(), notify: null })).resolves.toBe(true);
-  });
-});
-
-describe("restoreSessions (#2489)", () => {
-  it("applies every snapshot and toasts success", async () => {
-    restoreMock.mockImplementation(async (id: string) => snap(id));
+  it("restoreSessions applies snapshots and toasts the aggregate", async () => {
+    restoreMock.mockImplementation(async (id: string) => (id === "bad" ? null : snap(id)));
     const applySession = vi.fn();
-    const notify = { info: vi.fn(), error: vi.fn() };
-
-    const ok = await restoreSessions(["a", "b"], { applySession, notify });
-
-    expect(ok).toBe(true);
+    const notify = notifier();
+    expect(await restoreSessions(["a", "b"], { applySession, notify })).toBe(true);
     expect(applySession).toHaveBeenCalledTimes(2);
     expect(notify.info).toHaveBeenCalledWith("Session restored");
-  });
-
-  it("toasts error and returns false when any restore fails", async () => {
-    restoreMock.mockResolvedValue(null);
-    const notify = { info: vi.fn(), error: vi.fn() };
-
-    const ok = await restoreSessions(["a"], { applySession: vi.fn(), notify });
-
-    expect(ok).toBe(false);
+    expect(await restoreSessions(["bad"], { applySession, notify })).toBe(false);
     expect(notify.error).toHaveBeenCalledWith("Failed to restore session");
   });
 
   it("tolerates a null notifier", async () => {
+    trashMock.mockResolvedValue(snap("a"));
     restoreMock.mockResolvedValue(snap("a"));
+    await expect(trashSessions(["a"], { applySession: vi.fn(), onError: vi.fn(), notify: null })).resolves.toBe(true);
     await expect(restoreSessions(["a"], { applySession: vi.fn(), notify: null })).resolves.toBe(true);
   });
 });
@@ -138,9 +105,6 @@ describe("deleteWorkspaceSessions (#2536)", () => {
   });
 
   it("leaves a session that is neither deleted nor failed untouched (kept-restored)", async () => {
-    // Server kept sess-b (a concurrent restore won the race): it is reported
-    // in neither `deleted` nor `failed`, so we must not purge its local state
-    // or flag it Error; the next poll reconciles it.
     deleteMock.mockResolvedValue(ok({ deleted: ["a"], failed: [] }));
     const d = deps();
 
@@ -213,74 +177,34 @@ describe("deleteWorkspaceSessions (#2536)", () => {
 });
 
 describe("workspaceCleanupDefaults (#3167)", () => {
-  const s = (over: Partial<SessionResponse>): SessionResponse =>
+  const s = (over: Partial<SessionResponse>, worktree = false, branch = false, sandbox = false): SessionResponse =>
     ({
       has_cleanable_worktree: false,
       is_sandboxed: false,
-      cleanup_defaults: { delete_worktree: false, delete_branch: false, delete_sandbox: false },
+      cleanup_defaults: { delete_worktree: worktree, delete_branch: branch, delete_sandbox: sandbox },
       ...over,
     }) as unknown as SessionResponse;
+  const flags = (delete_worktree: boolean, delete_branch: boolean, delete_sandbox: boolean) => ({
+    delete_worktree,
+    delete_branch,
+    delete_sandbox,
+  });
 
-  it("derives any-session-wins flags, gating worktree/branch on has_cleanable_worktree and sandbox on is_sandboxed", () => {
-    const cases: Array<{
-      name: string;
-      sessions: SessionResponse[];
-      expected: ReturnType<typeof workspaceCleanupDefaults>;
-    }> = [
-      {
-        name: "empty",
-        sessions: [],
-        expected: { delete_worktree: false, delete_branch: false, delete_sandbox: false },
-      },
-      {
-        // cleanup_defaults ask to delete, but there is no cleanable worktree, so worktree/branch stay off.
-        name: "no cleanable worktree suppresses worktree/branch",
-        sessions: [
-          s({
-            has_cleanable_worktree: false,
-            cleanup_defaults: { delete_worktree: true, delete_branch: true, delete_sandbox: false },
-          }),
-        ],
-        expected: { delete_worktree: false, delete_branch: false, delete_sandbox: false },
-      },
-      {
-        name: "cleanable worktree honors the per-session defaults",
-        sessions: [
-          s({
-            has_cleanable_worktree: true,
-            cleanup_defaults: { delete_worktree: true, delete_branch: true, delete_sandbox: false },
-          }),
-        ],
-        expected: { delete_worktree: true, delete_branch: true, delete_sandbox: false },
-      },
-      {
-        name: "sandbox flag gates on is_sandboxed, not on the worktree",
-        sessions: [
-          s({
-            is_sandboxed: true,
-            cleanup_defaults: { delete_worktree: false, delete_branch: false, delete_sandbox: true },
-          }),
-        ],
-        expected: { delete_worktree: false, delete_branch: false, delete_sandbox: true },
-      },
-      {
-        // any-session-wins: one session opts into the worktree, another into the sandbox.
-        name: "any session opting in flips the flag",
-        sessions: [
-          s({
-            has_cleanable_worktree: true,
-            cleanup_defaults: { delete_worktree: true, delete_branch: false, delete_sandbox: false },
-          }),
-          s({
-            is_sandboxed: true,
-            cleanup_defaults: { delete_worktree: false, delete_branch: false, delete_sandbox: true },
-          }),
-        ],
-        expected: { delete_worktree: true, delete_branch: false, delete_sandbox: true },
-      },
-    ];
-    for (const c of cases) {
-      expect(workspaceCleanupDefaults(c.sessions), c.name).toEqual(c.expected);
-    }
+  it.each<[string, SessionResponse[], ReturnType<typeof flags>]>([
+    ["empty", [], flags(false, false, false)],
+    ["no cleanable worktree suppresses worktree/branch", [s({}, true, true)], flags(false, false, false)],
+    [
+      "a cleanable worktree honors the defaults",
+      [s({ has_cleanable_worktree: true }, true, true)],
+      flags(true, true, false),
+    ],
+    ["sandbox gates on is_sandboxed", [s({ is_sandboxed: true }, false, false, true)], flags(false, false, true)],
+    [
+      "any session opting in flips the flag",
+      [s({ has_cleanable_worktree: true }, true), s({ is_sandboxed: true }, false, false, true)],
+      flags(true, false, true),
+    ],
+  ])("%s", (_name, sessions, expected) => {
+    expect(workspaceCleanupDefaults(sessions)).toEqual(expected);
   });
 });

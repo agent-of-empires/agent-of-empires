@@ -34,11 +34,6 @@ fn source_label(source: &SettingSource) -> String {
 }
 
 fn run_explain(key: &str) -> Result<()> {
-    // Surface parse failures / unrecognized keys BEFORE the per-key output.
-    // On a parse failure `resolve` sees `Config::default()`, so every source
-    // legitimately reports `schema default`; without the banner that reads as
-    // "your file is honored and matches the defaults," which was the exact
-    // trap the #3207 reporter fell into (#3228).
     let probe = crate::session::probe_global_config();
     if let Some(err) = probe.load_err.as_deref() {
         eprintln!(

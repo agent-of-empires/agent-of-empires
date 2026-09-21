@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-//
-// Vitest coverage for the extracted project add/edit form (#2212), migrated
-// from the former ProjectsView test: the add form sends `default_base_branch`
-// only when filled, and edit mode PATCHes the registration (including clearing
-// the base branch to null).
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -25,15 +20,30 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+const BRANCH_PLACEHOLDER = "blank = inherit global default, then auto-detect";
+
+function branchInput() {
+  return screen.getByPlaceholderText(BRANCH_PLACEHOLDER) as HTMLInputElement;
+}
+
+function renderEdit() {
+  render(
+    <ProjectFormModal
+      initial={{ name: "extra", path: "/repo/extra", scope: "global", default_base_branch: "develop" }}
+      onClose={() => {}}
+      onSaved={() => {}}
+    />,
+  );
+  return branchInput();
+}
+
 describe("ProjectFormModal", () => {
   it("sends default_base_branch in the create payload when set", async () => {
     mockCreate.mockResolvedValue({ ok: true });
     render(<ProjectFormModal onClose={() => {}} onSaved={() => {}} />);
 
     fireEvent.change(screen.getByPlaceholderText("/path/to/repo"), { target: { value: "/repo/extra" } });
-    fireEvent.change(screen.getByPlaceholderText("blank = inherit global default, then auto-detect"), {
-      target: { value: "develop" },
-    });
+    fireEvent.change(branchInput(), { target: { value: "develop" } });
     fireEvent.click(screen.getByRole("button", { name: "Add" }));
 
     await waitFor(() =>
@@ -54,40 +64,18 @@ describe("ProjectFormModal", () => {
     expect(mockCreate.mock.calls[0]![0].default_base_branch).toBeUndefined();
   });
 
-  it("prefills and PATCHes the base branch in edit mode", async () => {
+  it.each([
+    ["release", "release"],
+    ["  ", null],
+  ] as [string, string | null][])("edit mode saves the typed base branch (%j)", async (typed, sent) => {
     mockUpdate.mockResolvedValue({ ok: true });
-    render(
-      <ProjectFormModal
-        initial={{ name: "extra", path: "/repo/extra", scope: "global", default_base_branch: "develop" }}
-        onClose={() => {}}
-        onSaved={() => {}}
-      />,
-    );
-
-    const input = screen.getByPlaceholderText("blank = inherit global default, then auto-detect") as HTMLInputElement;
+    const input = renderEdit();
     expect(input.value).toBe("develop");
-    fireEvent.change(input, { target: { value: "release" } });
+
+    fireEvent.change(input, { target: { value: typed } });
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
-    await waitFor(() => expect(mockUpdate).toHaveBeenCalledWith("extra", "global", "release"));
-  });
-
-  it("clears the base branch by saving an empty value in edit mode", async () => {
-    mockUpdate.mockResolvedValue({ ok: true });
-    render(
-      <ProjectFormModal
-        initial={{ name: "extra", path: "/repo/extra", scope: "global", default_base_branch: "develop" }}
-        onClose={() => {}}
-        onSaved={() => {}}
-      />,
-    );
-
-    fireEvent.change(screen.getByPlaceholderText("blank = inherit global default, then auto-detect"), {
-      target: { value: "  " },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save" }));
-
-    await waitFor(() => expect(mockUpdate).toHaveBeenCalledWith("extra", "global", null));
+    await waitFor(() => expect(mockUpdate).toHaveBeenCalledWith("extra", "global", sent));
   });
 
   it("invokes onSaved and onClose after a successful create", async () => {

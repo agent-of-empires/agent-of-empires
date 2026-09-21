@@ -57,17 +57,6 @@ pub struct ListArgs {
     state: StateFilter,
 }
 
-/// Simple string tag describing whether a session is live/archived/trashed,
-/// exposed alongside `trashed_at`/`archived_at` in `--json` so a consumer
-/// keying on state does not have to reason about the timestamps itself.
-/// `live` and `trashed` are the [`SessionScope`] filter vocabulary; `archived`
-/// is an output-only third value, since `--state=archived` is not a filter the
-/// API offers either (an archived row is excluded by `live` and by `trashed`,
-/// and only shows under `all`).
-///
-/// Derived from [`Instance::effective_bucket`] so the `Trashed > Archived >
-/// Active` precedence has exactly one definition: an archived row that is then
-/// trashed keeps its `archived_at` but reports `trashed`.
 pub(super) fn state_tag(inst: &Instance) -> &'static str {
     match inst.effective_bucket() {
         SessionBucket::Trashed => "trashed",
@@ -76,12 +65,6 @@ pub(super) fn state_tag(inst: &Instance) -> &'static str {
     }
 }
 
-/// Mirrors the API's snooze surfacing rule (`SessionResponse::from_instance`,
-/// `src/server/api/sessions/model.rs`): expose `snoozed_until` only while
-/// [`Instance::is_snoozed`] holds. An expired deadline stays persisted until
-/// the next mutation rewrites it, so without this gate a woken row would keep
-/// advertising a snooze that already ended. Shared by `session show --json`
-/// so both CLI projections gate identically.
 pub(super) fn active_snoozed_until(inst: &Instance) -> Option<chrono::DateTime<chrono::Utc>> {
     if inst.is_snoozed() {
         inst.snoozed_until
@@ -100,38 +83,19 @@ struct SessionJson {
     #[serde(skip_serializing_if = "String::is_empty")]
     command: String,
     profile: String,
-    /// One of `live`, `archived`, `trashed`; the natural way to distinguish a
-    /// trashed row from a failed one that #3350 was filed for.
     state: &'static str,
     created_at: chrono::DateTime<chrono::Utc>,
-    /// Set iff the session is currently in the trash. Together with
-    /// `archived_at`, lets a scripted consumer read the state without a
-    /// second `aoe session list-trash` shellout.
     #[serde(skip_serializing_if = "Option::is_none")]
     trashed_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Set iff the session is currently archived. Orthogonal to `trashed_at`
-    /// on the store: `trash()` deliberately leaves `archived_at` alone so a
-    /// restore is faithful, so both keys can be present at once and `state`
-    /// reports `trashed` in that case.
     #[serde(skip_serializing_if = "Option::is_none")]
     archived_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Set while a snooze deadline is in the future, gated on
-    /// [`Instance::is_snoozed`] exactly like the API: an expired deadline
-    /// lingers on disk but the row has woken, so the key disappears instead
-    /// of advertising a stale snooze. Orthogonal to `state`.
     #[serde(skip_serializing_if = "Option::is_none")]
     snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
-    /// Set iff the session is currently pinned for the web sidebar.
-    /// Independent of `state`; the client derives the boolean as
-    /// `pinned_at != null`, matching the API field from #1581.
     #[serde(skip_serializing_if = "Option::is_none")]
     pinned_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Empty for single-repo sessions; populated with one entry per repo
-    /// (including the primary) for sessions created with `--repo`/`--project`.
     workspace_repos: Vec<WorkspaceRepoJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     worktree: Option<WorktreeJson>,
-    /// The session this one was added under with `aoe add -P`.
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_session_id: Option<String>,
 }
@@ -182,8 +146,6 @@ fn session_json(inst: &Instance, profile: &str) -> SessionJson {
     }
 }
 
-/// Via `all_repos` so a session converted by `attach_project` (#3103) lists both
-/// repos here, exactly like one created multi-repo.
 fn workspace_repos_for(inst: &Instance) -> Vec<WorkspaceRepoJson> {
     inst.all_repos()
         .iter()
@@ -238,9 +200,6 @@ fn print_table_header(show_state: bool) {
     }
 }
 
-/// `instances` in table order with each row's nesting depth: an `aoe add -P`
-/// child follows its parent. A child whose parent is not listed stays
-/// top-level, and a parent cycle still lists every row once.
 fn nest_children<'a>(instances: &[&'a Instance]) -> Vec<(&'a Instance, usize)> {
     fn place<'a>(
         inst: &'a Instance,
@@ -273,14 +232,12 @@ fn nest_children<'a>(instances: &[&'a Instance]) -> Vec<(&'a Instance, usize)> {
             place(inst, 0, instances, &mut placed, &mut ordered);
         }
     }
-    // Rows reachable only through a parent cycle.
     for inst in instances {
         place(inst, 0, instances, &mut placed, &mut ordered);
     }
     ordered
 }
 
-/// A row's title, indented under its parent when nested.
 fn table_title(inst: &Instance, depth: usize) -> String {
     match depth {
         0 => inst.title.clone(),
@@ -320,12 +277,6 @@ fn print_table_row(inst: &Instance, depth: usize, show_state: bool) {
     }
 }
 
-/// Whether the human table should render the `STATE` column. Off for
-/// `--state=live` (every row is `live` and the column carries no
-/// information) and off when filtering to only `trashed` (same). Only
-/// meaningful under `all`, where rows are mixed and a scripted consumer
-/// or human reader benefits from distinguishing a live row from a trashed
-/// or archived one.
 fn table_shows_state(scope: SessionScope) -> bool {
     matches!(scope, SessionScope::All)
 }
@@ -344,11 +295,6 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
         .filter(|inst| SessionScope::matches(Some(scope), inst))
         .collect();
 
-    // `--json` is answered before the empty-listing message: an empty result is
-    // `[]`, never human prose on stdout, matching `aoe ps --json` and `aoe group
-    // list --json`. `--state=live` makes this reachable with sessions present
-    // (a profile whose rows are all trashed), which is precisely the scripted
-    // consumer #3350 is about.
     if args.json {
         let sessions: Vec<SessionJson> = instances
             .iter()
@@ -441,7 +387,6 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// #3472: `aoe add -P` children render under their parent in the table.
     #[test]
     fn nest_children_lists_each_child_under_its_listed_parent() {
         let row = |title: &str, parent: Option<&str>| {
@@ -491,177 +436,129 @@ mod tests {
     }
 
     #[test]
-    fn state_tag_covers_the_three_states() {
-        let live = Instance::new("live", "/repo");
-        assert_eq!(state_tag(&live), "live");
-
-        let mut archived = Instance::new("archived", "/repo");
-        archived.archive();
-        assert_eq!(state_tag(&archived), "archived");
-
-        let mut trashed = Instance::new("trashed", "/repo");
-        trashed.trash();
-        assert_eq!(state_tag(&trashed), "trashed");
-    }
-
-    /// #3350: the whole point of the JSON change. A consumer keying on
-    /// state needs the `state` string AND the timestamp to distinguish
-    /// a trashed session from a genuinely failed one without a second
-    /// `aoe session list-trash` shellout.
-    #[test]
-    fn session_json_exposes_state_and_trashed_at_for_a_trashed_row() {
-        let mut inst = Instance::new("z", "/repo");
-        inst.trash();
-        let json = session_json(&inst, "p");
-        assert_eq!(json.state, "trashed");
-        assert!(json.trashed_at.is_some());
-        assert!(json.archived_at.is_none());
-    }
-
-    /// Companion for the follow-up comment on #3350: archived sessions
-    /// need the same treatment. The two states are semantically distinct
-    /// and both must be observable from a single `aoe list --json` call.
-    #[test]
-    fn session_json_exposes_state_and_archived_at_for_an_archived_row() {
-        let mut inst = Instance::new("z", "/repo");
-        inst.archive();
-        let json = session_json(&inst, "p");
-        assert_eq!(json.state, "archived");
-        assert!(json.archived_at.is_some());
-        assert!(json.trashed_at.is_none());
-    }
-
-    /// The default `state = "live"` and both timestamp fields being
-    /// `None` must not serialize any of the state-tracking keys as
-    /// `null`: consumers depending on `serde_if_none` semantics see no
-    /// difference from the pre-#3350 output. The `state` field is a
-    /// small addition and always serialized, so a v1.14.1 consumer that
-    /// parses JSON strictly will see one new key.
-    #[test]
-    fn session_json_omits_absent_timestamps_and_keeps_state_alive() {
-        let inst = Instance::new("z", "/repo");
-        let json = session_json(&inst, "p");
+    fn session_json_reports_state_and_only_the_timestamps_that_apply() {
+        let plain = Instance::new("z", "/repo");
+        assert_eq!(state_tag(&plain), "live");
+        let json = session_json(&plain, "p");
         assert_eq!(json.state, "live");
         let serialized = serde_json::to_string(&json).unwrap();
         assert!(!serialized.contains("trashed_at"));
         assert!(!serialized.contains("archived_at"));
         assert!(serialized.contains("\"state\":\"live\""));
+
+        let mut archived = Instance::new("z", "/repo");
+        archived.archive();
+        assert_eq!(state_tag(&archived), "archived");
+        let json = session_json(&archived, "p");
+        assert_eq!(json.state, "archived");
+        assert!(json.archived_at.is_some());
+        assert!(json.trashed_at.is_none());
+
+        let mut trashed = Instance::new("z", "/repo");
+        trashed.trash();
+        assert_eq!(state_tag(&trashed), "trashed");
+        let json = session_json(&trashed, "p");
+        assert_eq!(json.state, "trashed");
+        assert!(json.trashed_at.is_some());
+        assert!(json.archived_at.is_none());
     }
 
-    /// #3415: snooze and pin complete the four-timestamp state set the API
-    /// has exposed since #1581. The table pins the whole contract: the
-    /// snooze key follows the API's `is_snoozed()` gate (surfaced while
-    /// active, dropped once expired even though the stale timestamp stays
-    /// on disk), the pin key is a plain presence mirror, a plain row
-    /// carries neither key, and neither key bends `state`, which stays the
-    /// bucket tag.
     #[test]
     fn session_json_mirrors_the_api_snooze_and_pin_keys() {
         let now = chrono::Utc::now();
         let future = now + chrono::Duration::minutes(15);
         let past = now - chrono::Duration::minutes(15);
-
-        let mut snoozed = Instance::new("z", "/repo");
-        snoozed.snoozed_until = Some(future);
-
-        let mut expired = Instance::new("z", "/repo");
-        expired.snoozed_until = Some(past);
-
-        let mut pinned = Instance::new("z", "/repo");
-        pinned.pinned_at = Some(now);
-
-        // pin() and snooze() clear each other's marker, but peer store
-        // writes bypass the mutators, so a row can carry both at once
-        // and neither key may suppress the other.
-        let mut both = Instance::new("z", "/repo");
-        both.pinned_at = Some(now);
-        both.snoozed_until = Some(future);
-
-        // archive() clears a concurrent snooze through the mutators, but
-        // snooze() leaves archived_at alone, so archiving a row and then
-        // snoozing it persists the pair through ordinary CLI commands:
-        // the keys must stay independent of the bucket tag.
-        let mut sunk = Instance::new("z", "/repo");
-        sunk.archived_at = Some(now);
-        sunk.snoozed_until = Some(future);
-
-        // snoozed then trashed through ordinary commands: trash()
-        // preserves the sibling timestamps, so a triaged row must still
-        // report its deadline from the trash.
-        let mut trashed_snoozed = Instance::new("z", "/repo");
-        trashed_snoozed.snooze(30);
-        trashed_snoozed.trash();
-
-        // pinned for the web sidebar, then trashed the same way.
-        let mut trashed_pinned = Instance::new("z", "/repo");
-        trashed_pinned.pin();
-        trashed_pinned.trash();
-
-        // pin() clears archived_at through the mutators, but peer store
-        // writes bypass them: an archived row can still carry a pin.
-        let mut archived_pinned = Instance::new("z", "/repo");
-        archived_pinned.archived_at = Some(now);
-        archived_pinned.pinned_at = Some(now);
-
-        let plain = Instance::new("z", "/repo");
-
-        let cases = [
-            ("active snooze", &snoozed, true, false, "live"),
-            ("expired snooze", &expired, false, false, "live"),
-            ("pinned", &pinned, false, true, "live"),
-            ("plain row", &plain, false, false, "live"),
-            ("snoozed and archived", &sunk, true, false, "archived"),
-            ("pinned and snoozed", &both, true, true, "live"),
-            (
-                "trashed and snoozed",
-                &trashed_snoozed,
-                true,
-                false,
-                "trashed",
-            ),
-            (
-                "trashed and pinned",
-                &trashed_pinned,
-                false,
-                true,
-                "trashed",
-            ),
-            (
-                "pinned and archived",
-                &archived_pinned,
-                false,
-                true,
-                "archived",
-            ),
-        ];
-        for (label, inst, want_snooze, want_pin, want_state) in cases {
-            let value = serde_json::to_value(session_json(inst, "p")).unwrap();
-            assert_eq!(
+        let row = |f: &dyn Fn(&mut Instance)| {
+            let mut inst = Instance::new("z", "/repo");
+            f(&mut inst);
+            inst
+        };
+        let check = |label: &str, f: &dyn Fn(&mut Instance), snooze: bool, pin: bool, state| {
+            let value = serde_json::to_value(session_json(&row(f), "p")).unwrap();
+            let seen = (
                 value.get("snoozed_until").is_some(),
-                want_snooze,
-                "{label}: {value}"
-            );
-            assert_eq!(
                 value.get("pinned_at").is_some(),
-                want_pin,
-                "{label}: {value}"
+                value["state"].as_str(),
             );
-            assert_eq!(value["state"].as_str(), Some(want_state), "{label}");
-        }
+            assert_eq!(seen, (snooze, pin, Some(state)), "{label}: {value}");
+        };
 
-        // Value fidelity on the one row whose exact deadline we set:
-        // presence alone would accept a regression emitting any instant.
-        let active = serde_json::to_value(session_json(&snoozed, "p")).unwrap();
+        check("plain row", &|_| {}, false, false, "live");
+        check(
+            "active snooze",
+            &|i| i.snoozed_until = Some(future),
+            true,
+            false,
+            "live",
+        );
+        check(
+            "expired snooze",
+            &|i| i.snoozed_until = Some(past),
+            false,
+            false,
+            "live",
+        );
+        check("pinned", &|i| i.pinned_at = Some(now), false, true, "live");
+        check(
+            "snoozed and archived",
+            &|i| {
+                i.archived_at = Some(now);
+                i.snoozed_until = Some(future);
+            },
+            true,
+            false,
+            "archived",
+        );
+        check(
+            "pinned and snoozed",
+            &|i| {
+                i.pinned_at = Some(now);
+                i.snoozed_until = Some(future);
+            },
+            true,
+            true,
+            "live",
+        );
+        check(
+            "trashed and snoozed",
+            &|i| {
+                i.snooze(30);
+                i.trash();
+            },
+            true,
+            false,
+            "trashed",
+        );
+        check(
+            "trashed and pinned",
+            &|i| {
+                i.pin();
+                i.trash();
+            },
+            false,
+            true,
+            "trashed",
+        );
+        check(
+            "pinned and archived",
+            &|i| {
+                i.archived_at = Some(now);
+                i.pinned_at = Some(now);
+            },
+            false,
+            true,
+            "archived",
+        );
+
+        let active =
+            serde_json::to_value(session_json(&row(&|i| i.snoozed_until = Some(future)), "p"))
+                .unwrap();
         assert_eq!(
             active["snoozed_until"],
             serde_json::to_value(future).unwrap()
         );
     }
 
-    /// Backward-compat: `aoe list` (no `--state`) shows what it always
-    /// showed, i.e. every persisted session. Guards against a future
-    /// well-meaning refactor flipping the default to `live` and quietly
-    /// dropping trashed rows for anyone scripted against today's output.
     #[test]
     fn default_state_is_all_for_backward_compat() {
         let default: SessionScope = StateFilter::All.into();
@@ -680,8 +577,6 @@ mod tests {
         }
     }
 
-    /// `list --all` never consumes `--profile`; the single-profile form goes
-    /// through `Storage::open_unwatched`, which refuses an unknown name (#148).
     mod profile_guard {
         use crate::cli::{Cli, Commands};
         use clap::Parser;

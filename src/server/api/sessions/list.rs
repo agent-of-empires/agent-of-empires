@@ -8,9 +8,8 @@ pub struct RecentProjectsResponse {
 }
 
 /// Persisted recent projects for the new-session wizard, newest first.
-/// Read-time pruning drops entries whose directory no longer exists; the
-/// stored file (capped at write time) is left untouched, so a GET stays
-/// side-effect free.
+/// Read-time pruning drops entries whose directory no longer exists, leaving
+/// the stored file untouched, so a GET stays side-effect free.
 pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     let projects = crate::session::load_recent_projects()
         .unwrap_or_else(|e| {
@@ -32,16 +31,13 @@ pub async fn list_sessions(
     // Snapshot the supervisor's worker lifecycle map once per request
     // rather than locking it per row. See #1088.
     let worker_states = state.acp_supervisor.worker_states_snapshot().await;
-    // Filtered once up front; every positional zip with `instances` below
-    // (ACP capability overlay, smart-rename overlay) must walk this same
-    // filtered view so indices stay aligned with `sessions`.
+    // Filtered once up front; every positional zip with `instances` below must
+    // walk this same filtered view so indices stay aligned with `sessions`.
     let scoped_instances: Vec<&Instance> = instances
         .iter()
-        // CityHall only ever creates structured sessions; a plain/terminal
-        // session (from the TUI, `aoe add`, or another client on the same
-        // daemon) must not be visible or actionable to a locked-down client, so
-        // it never appears in the list. The lifecycle routes apply the matching
-        // structured-target gate. See #7.
+        // CityHall only creates structured sessions, so a plain session from
+        // the TUI or another client must not be visible or actionable to a
+        // locked-down client. The lifecycle routes apply the matching gate (#7).
         .filter(|inst| !state.cityhall_mode || inst.is_structured())
         .filter(|inst| crate::session::SessionScope::matches(query.state, inst))
         .collect();
@@ -57,10 +53,10 @@ pub async fn list_sessions(
             } else {
                 None
             };
-            // Archived sessions are sunk and not live; their wakeup/monitor
-            // badge is meaningless, so skip the per-poll SQLite lookups for
-            // them. Unarchiving restores the queries. latest_plan stays
-            // ungated: a collapsed archived row may still show a plan summary.
+            // An archived session is sunk, so its wakeup/monitor badge is
+            // meaningless and the per-poll SQLite lookups are skipped.
+            // latest_plan stays ungated: a collapsed archived row may still
+            // show a plan summary.
             let structured_live = inst.is_structured() && !inst.is_archived() && !inst.is_trashed();
             let (next_wakeup_at, next_wakeup_reason) = if structured_live {
                 match state.acp_event_store.latest_pending_wakeup(&inst.id) {
@@ -89,12 +85,10 @@ pub async fn list_sessions(
                 active_monitor,
             );
             if structured_live && acp_worker_state == crate::daemon::AcpWorkerState::Running {
-                // Gate on a live worker: the invariant (supervisor.rs) is that
-                // a pending nonce only exists on a running worker, and
-                // `spawn`/`attach` sweep orphaned nonces out of the durable
-                // log. Projecting a non-running row would surface a phantom
-                // approval the resolver can only 404 on. Also skips the
-                // per-session SQLite scan for every non-running structured row.
+                // Gate on a live worker: a pending nonce only exists on a
+                // running worker, and spawn/attach sweep orphaned nonces out of
+                // the durable log, so projecting a non-running row would surface
+                // a phantom approval the resolver can only 404 on.
                 session.pending_approvals = state
                     .acp_event_store
                     .pending_approval_requests(&inst.id)
@@ -117,17 +111,16 @@ pub async fn list_sessions(
 
     // Share resolved config between the ACP-capability and smart-rename
     // overlays, halving disk reads when a profile/project pair repeats in the
-    // 3s sidebar poll. See #2603.
-    // Monotonic, so the delta below is this request's own count and no reset
-    // can race a concurrent request on the same state.
+    // 3s sidebar poll (#2603). Monotonic, so the delta below is this request's
+    // own count and no reset can race a concurrent request.
     let misses_before = state
         .list_sessions_resolver_misses
         .load(std::sync::atomic::Ordering::Relaxed);
     let mut session_cfg_cache = SessionCfgCache::new(&state.list_sessions_resolver_misses);
 
-    // Overlay custom-agent ACP capability (built-ins were resolved in the
-    // constructor). Distinct `(profile, project_path)` pairs each resolve
-    // once via the shared cache above.
+    // Overlay custom-agent ACP capability; built-ins were resolved in the
+    // constructor. Distinct `(profile, project_path)` pairs resolve once via
+    // the shared cache.
     for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
         if resp.acp_capable {
             continue;
@@ -172,8 +165,7 @@ pub async fn list_sessions(
     };
 
     // Overlay the per-profile tie setting (#1927) so the sidebar can collapse
-    // the standalone workdir action for tied worktree sessions. Resolved once
-    // per distinct profile, not per session.
+    // the standalone workdir action. Resolved once per distinct profile.
     {
         use std::collections::HashMap;
         let mut tie_cache: HashMap<String, bool> = HashMap::new();
@@ -190,9 +182,9 @@ pub async fn list_sessions(
         }
     }
 
-    // Inputs for the rate-limit park overlay below, snapshotted here so the
-    // blocking batch can run once the registry read lock is released. A live
-    // worker is never parked, so only workerless sessions pay for the probe.
+    // Inputs for the rate-limit park overlay, snapshotted so the blocking
+    // batch can run once the registry read lock is released. A live worker is
+    // never parked, so only workerless sessions pay for the probe.
     let park_probes: Vec<(usize, String, String, bool)> = sessions
         .iter()
         .zip(scoped_instances.iter().copied())
@@ -209,10 +201,8 @@ pub async fn list_sessions(
         .collect();
 
     // Overlay the smart-rename indicator. `Running` comes from the live
-    // in-flight set; `Pending` from the shared eligibility predicate, so the
-    // indicator cannot drift from the runtime gate. Config is projected from
-    // the shared `session_cfg_cache` above so a repo-local override resolves
-    // once per unique `(profile, project_path)` across both overlays.
+    // in-flight set, `Pending` from the shared eligibility predicate, so the
+    // indicator cannot drift from the runtime gate.
     {
         use crate::session::smart_rename::{
             check_eligible_resolved, resolve_smart_rename_config, SmartRenameState,
@@ -234,8 +224,8 @@ pub async fn list_sessions(
                 resp.smart_rename = SmartRenameState::Running;
                 continue;
             }
-            // A session whose one-shot already ran (and failed, since the name
-            // is still default) will not retry, so it is not pending either.
+            // A session whose one-shot already ran, and failed since the name
+            // is still default, will not retry, so it is not pending either.
             if attempted.contains(&inst.id) {
                 continue;
             }
@@ -270,8 +260,8 @@ pub async fn list_sessions(
         "list_sessions resolved session config once per unique profile/project pair"
     );
 
-    // The park probe touches config files and SQLite; run it with the
-    // session registry unlocked so writers are not held behind it.
+    // The park probe touches config files and SQLite, so it runs with the
+    // session registry unlocked rather than holding writers behind it.
     drop(scoped_instances);
     drop(instances);
     if !park_probes.is_empty() {
@@ -372,11 +362,10 @@ pub async fn list_sessions(
         workspace_ordering,
     })
 }
-// Workspace id derivation. Mirrors the client logic in `useWorkspaces.ts`:
-// a session with a branch collapses to `${repoPath}::${branch}`; a
-// branchless session gets its own workspace at `${repoPath}::__session__::${id}`.
-// `repoPath` strips trailing slashes so the server and client compute the
-// same string for the same session row.
+// Workspace id derivation, mirroring `useWorkspaces.ts`: a session with a
+// branch collapses to `${repoPath}::${branch}`, a branchless one gets
+// `${repoPath}::__session__::${id}`. `repoPath` strips trailing slashes so
+// server and client compute the same string.
 fn workspace_id_for_session(s: &SessionResponse) -> String {
     let raw = s.main_repo_path.as_deref().unwrap_or(&s.project_path);
     let repo_path = raw.trim_end_matches('/');
@@ -386,18 +375,12 @@ fn workspace_id_for_session(s: &SessionResponse) -> String {
     }
 }
 
-// Prepend any workspace id we haven't seen before to the persisted
-// ordering and return the merged list. Done server-side so concurrent
-// clients (multiple tabs, multiple devices) converge on a single
-// ordering without each racing to PUT their own prepend. In read-only
-// mode we still compute the merge for the response, but we skip the
-// disk write.
-// Pure helper: merges newly observed workspace ids on top of the
-// existing ordering, deduplicating and putting unknowns first
-// (newest-first). Extracted so the merge math can run from both the
-// read-only path (no lock) and the locked closure (where it operates
-// on `ord.order` directly to avoid the read-modify-write race that
-// `merge_workspace_ordering` originally had on a pre-lock snapshot).
+// Merge newly observed workspace ids on top of the existing ordering,
+// deduplicating and putting unknowns first (newest-first). Done server-side so
+// concurrent clients converge without each racing to PUT its own prepend. In
+// read-only mode the merge is still computed for the response but not written.
+// Extracted so it runs from both the read-only path and the locked closure,
+// where it operates on `ord.order` directly rather than a pre-lock snapshot.
 fn compute_merged_ordering(sessions: &[SessionResponse], current_order: &[String]) -> Vec<String> {
     let known: std::collections::HashSet<&str> = current_order.iter().map(String::as_str).collect();
     let mut seen_unknown: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -436,22 +419,16 @@ fn merge_workspace_ordering(
     })
 }
 
-// --- Workspace ordering ---
+// `PUT /api/workspace-ordering` overwrites the persisted workspace order with a
+// client-supplied list. Workspaces are a client construct, so the entries are
+// opaque strings. New workspaces are folded in by `merge_workspace_ordering` on
+// every `GET /api/sessions`, so this PUT only reorders existing entries.
+// Persisted globally, not per-profile, because the sidebar spans profiles (#1169).
 //
-// `PUT /api/workspace-ordering` overwrites the persisted workspace order
-// with a fresh client-supplied list. Workspaces are a client construct
-// (a group of sessions keyed on `repoPath::branch`), so the server
-// treats the entries as opaque strings. New workspaces are folded in
-// server-side by `merge_workspace_ordering` on every `GET /api/sessions`,
-// so the file always covers every observed workspace; this PUT just
-// reorders existing entries. Persisted globally (not per-profile)
-// because the sidebar shows sessions across all profiles. See #1169.
 
-// Caps on the inbound body. The order list is one entry per workspace
-// row and workspaces map 1:1 to sessions in the worst case, so 4096 is
-// comfortably above any realistic ceiling. Per-entry cap covers a
-// long repo path plus a long branch name; ids longer than this can't
-// come from the client's workspace id derivation in any sane setup.
+// Caps on the inbound body. Workspaces map 1:1 to sessions in the worst case,
+// so 4096 is far above any realistic ceiling; the per-entry cap covers a long
+// repo path plus a long branch name.
 const MAX_ORDER_ENTRIES: usize = 4096;
 const MAX_ORDER_ENTRY_LEN: usize = 1024;
 
@@ -669,8 +646,8 @@ mod workspace_ordering_tests {
 
     #[test]
     fn id_strips_trailing_slash() {
-        // The client's `useWorkspaces.normalizePath` strips trailing
-        // slashes. Server must match so the merged ordering keys line up.
+        // The client's `normalizePath` strips trailing slashes; the server
+        // must match so the merged ordering keys line up.
         let r = mock_response("s1", "/tmp/repo/", Some("main"));
         assert_eq!(workspace_id_for_session(&r), "/tmp/repo::main");
     }
@@ -688,9 +665,9 @@ mod workspace_ordering_tests {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
 
-        // Persisted ordering already contains `b`. Sessions come in
-        // creation order (oldest first) `[b, a, c]`; `a` and `c` are
-        // unseen and should land at the top in newest-first order: `[c, a, b]`.
+        // Persisted ordering already contains `b`. Sessions arrive oldest
+        // first as `[b, a, c]`; the unseen `a` and `c` land on top in
+        // newest-first order.
         crate::session::update_workspace_ordering(|ord| {
             ord.order = vec!["/tmp/repo::b".to_string()];
             Ok(())
@@ -725,8 +702,8 @@ mod workspace_ordering_tests {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
 
-        // Two sessions on the same workspace (rare but legal: multiple
-        // agents in one worktree). The workspace id appears once.
+        // Two sessions on one workspace (legal: multiple agents in one
+        // worktree). The workspace id appears once.
         let sessions = vec![
             mock_response("sa1", "/tmp/repo", Some("main")),
             mock_response("sa2", "/tmp/repo", Some("main")),
@@ -767,8 +744,8 @@ mod workspace_ordering_tests {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
 
-        // Empty starting state. Read-only request observes a new
-        // workspace; the response includes it but disk is untouched.
+        // Empty starting state: a read-only request observes a new workspace,
+        // so the response includes it but disk is untouched.
         let sessions = vec![mock_response("sa", "/tmp/repo", Some("a"))];
 
         let merged = merge_workspace_ordering(&sessions, /* read_only */ true)?;

@@ -791,7 +791,9 @@ mod tests {
             ] {
                 if let Some(color) = utility.strip_prefix(prefix) {
                     let color = color.split('/').next().unwrap_or(color);
-                    if semantic_color_name(color) {
+                    // A trailing dash is a class built by interpolation
+                    // (`bg-status-${suffix}`), not a token to look up.
+                    if !color.ends_with('-') && semantic_color_name(color) {
                         vars.insert(format!("--color-{color}"));
                     }
                 }

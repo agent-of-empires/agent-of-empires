@@ -16,13 +16,12 @@ import {
   setPendingTerminalFocus,
   type FocusTerminalDetail,
 } from "../lib/terminalFocus";
+import { StrokeIcon } from "./icons";
 
 interface Props {
   session: SessionResponse;
   active?: boolean;
-  /** Which tmux surface this view renders. The agent pane is the
-   *  default; the paired host/container shells reuse the same chrome
-   *  with their own WS route, ensure call, and focus target. */
+  /** Which tmux surface this view renders. */
   surface?: "agent" | "paired-host" | "paired-container";
   /** Paired-terminal instance index for the tabbed terminal groups (#2437).
    *  Ignored for the agent surface; 0 is the primary paired shell. */
@@ -39,26 +38,15 @@ const SURFACES = {
   },
 };
 
-/**
- * Touch-device agent terminal: chrome around the capture-snapshot live
- * pane (MobileLiveTerminal). Deliberately carries NONE of the xterm-era
- * keyboard machinery: there is no PTY to protect from SIGWINCH storms,
- * so the soft keyboard is handled by letting the layout shrink naturally
- * (`100dvh` shrinks with the keyboard on iOS PWA / iOS 26 / Android; the
- * App root pin is dropped for live sessions) plus a visualViewport-based
- * bottom inset for iOS regular Safari, where the layout viewport does
- * not shrink. The pane re-pins itself to the bottom when its container
- * resizes, which is all a bottom-anchored chat-style surface needs.
- */
+/** Touch-device agent terminal: chrome around the capture-snapshot live pane (MobileLiveTerminal). */
 export function LiveTerminalView({ session, active = true, surface = "agent", terminalIndex = 0 }: Props) {
   const base = SURFACES[surface];
   const { focusTarget, dataTerm } = base;
   // Paired terminals carry their instance index as a query param so the
   // server attaches the right tmux session; the agent surface ignores it.
   const wsPath = surface === "agent" ? base.wsPath : `${base.wsPath}?index=${terminalIndex}`;
-  // Touch-only chrome (the soft-keyboard toolbar and its toggle FAB) is
-  // pointless with a physical keyboard, so it stays off fine-pointer devices
-  // now that this view also renders on desktop.
+  // Touch-only chrome (the soft-keyboard toolbar and its toggle FAB) is pointless with a physical keyboard, so it
+  // stays off fine-pointer devices now that this view also renders on desktop.
   const coarse = useIsCoarsePointer();
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">("pending");
   const [ensureError, setEnsureError] = useState<string | null>(null);
@@ -80,11 +68,8 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     [],
   );
   const live = useLiveTerminal(ensureState === "ready" ? session.id : null, wsPath, receiveAgentClipboard);
-  // The viewport hook supplies the iOS-regular-Safari bottom inset and
-  // the occlusion-based keyboardOpen used to gate the pane's sizing
-  // latch (occlusion is what shrinks the container, whichever element is
-  // focused). The CHROME's open/closed state still comes from input
-  // focus below, which is exact where occlusion heuristics misread.
+  // The viewport hook supplies the iOS-regular-Safari bottom inset and the occlusion-based keyboardOpen used to
+  // gate the pane's sizing latch (occlusion is what shrinks the container, whichever element is focused).
   const { keyboardHeight, keyboardOpen } = useMobileKeyboard();
   const [inputFocused, setInputFocused] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -214,10 +199,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     );
   }
 
-  // Keyboard-open lift only. The pane root deliberately carries no inset while
-  // the keyboard is closed (#1432): home-indicator clearance is reserved by an
-  // ancestor (see the terminal wrapper in MobileMainPane), not here, so the
-  // mobile-keyboard specs can read a bare `${keyboardHeight}px` off this node.
+  // Keyboard-open lift only.
   const rootStyle = keyboardHeight > 0 ? { paddingBottom: keyboardHeight } : undefined;
 
   return (
@@ -227,13 +209,9 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       data-term={dataTerm}
       data-pane-focused={inputFocused || undefined}
     >
-      {/* Frame the pane like the TUI does: a faint always-on border marks the
-          box edges and brightens to the teal `terminal-active` color when this
-          pane is selected (its input has focus), so on a multi-pane desktop it
-          is obvious which box keystrokes go to. This is a pointer-events-none
-          overlay (not a ring on the container) because the terminal scroller is
-          an `absolute inset-0` element with an opaque background that would
-          paint over an inset ring on any ancestor. */}
+      {/* Frame the pane like the TUI does: a faint always-on border marks the box edges and brightens to the teal
+         `terminal-active` color when this pane is selected (its input has focus), so on a multi-pane desktop it
+         is obvious which box keystrokes go to. */}
       <div
         aria-hidden="true"
         className={`pointer-events-none absolute inset-0 z-10 ring-inset transition-shadow ${
@@ -258,19 +236,9 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
             data-live-takeover
             className="flex items-center gap-1.5 text-xs font-semibold text-white bg-brand-600 hover:bg-brand-500 active:bg-brand-700 border border-brand-400/50 rounded-full px-4 py-2 shadow-lg cursor-pointer animate-fade-in"
           >
-            <svg
-              width="13"
-              height="13"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
-            >
+            <StrokeIcon size={13} strokeWidth="2.5" hidden>
               <path d="M9 18l6-6-6-6" />
-            </svg>
+            </StrokeIcon>
             Live on another device. Take over
           </button>
         </div>
@@ -278,12 +246,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
 
       <div
         className="flex-1 overflow-hidden bg-[var(--term-bg)] relative"
-        // Click-to-type, like every terminal. The rendered pane is plain
-        // (non-focusable) DOM text, so clicking it blurs the hidden input to
-        // <body> and the session reads as view-only. On a fine pointer, a
-        // plain click refocuses the input; a click that ends a text selection
-        // is left alone so select-to-copy still works. Touch devices focus via
-        // the keyboard toggle, not taps (which scroll).
+        // Click-to-type, like every terminal.
         onClick={() => {
           if (coarse) return;
           const sel = window.getSelection();

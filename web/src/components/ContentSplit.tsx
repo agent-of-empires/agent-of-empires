@@ -25,9 +25,8 @@ function loadSavedWidth(): number {
 
 export function ContentSplit({ left, right, collapsed, onToggleCollapse }: Props) {
   const [diffWidth, setDiffWidth] = useState(loadSavedWidth);
-  // Publish the live width so the TopBar's right zone can size itself to match
-  // the panel column and extend the divider up through the header, mirroring
-  // the sidebar. A CSS var write, no React re-render, so drag stays cheap.
+  // Publish the live width so the TopBar's right zone can size itself to match the panel column and extend the
+  // divider up through the header, mirroring the sidebar.
   useEffect(() => {
     document.documentElement.style.setProperty("--aoe-right-panel-width", `${diffWidth}px`);
   }, [diffWidth]);
@@ -95,9 +94,7 @@ export function ContentSplit({ left, right, collapsed, onToggleCollapse }: Props
             className="hidden md:block w-1 cursor-col-resize shrink-0 hover:bg-brand-600/50 transition-colors duration-75"
           />
 
-          {/* Right pane (inline). ContentSplit only renders at the md
-              breakpoint and up; below md the mobile picker promotes the
-              chosen view into the single full-viewport pane instead (#1452). */}
+          {/* Right pane (inline). */}
           <div style={{ width: diffWidth }} className="flex shrink-0 flex-col min-h-0 overflow-hidden">
             {right}
           </div>

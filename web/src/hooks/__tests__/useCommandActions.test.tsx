@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-//
-// Contract test for the command-palette action list (#1643). Asserts the
-// "New scratch session" command is present with the right shape and dispatches
-// onNewScratch, and that both creation commands are hidden in read-only mode
-// (matching the sidebar / dashboard, which hide their "new" buttons rather than
-// offering a command that opens a wizard the server 403s on submit).
 
 import { describe, expect, it, vi } from "vitest";
 import { renderHook } from "@testing-library/react";
@@ -12,6 +6,9 @@ import { useCommandActions, buildConversationActions } from "../useCommandAction
 import type { SessionResponse } from "../../lib/types";
 
 type Args = Parameters<typeof useCommandActions>[0];
+
+const actionsFor = (over: Partial<Args> = {}) => renderHook(() => useCommandActions(baseArgs(over))).result.current;
+const find = (actions: ReturnType<typeof useCommandActions>, id: string) => actions.find((a) => a.id === id);
 
 function baseArgs(overrides: Partial<Args> = {}): Args {
   return {
@@ -38,57 +35,32 @@ function baseArgs(overrides: Partial<Args> = {}): Args {
   };
 }
 
-describe("useCommandActions: scratch command", () => {
-  it("exposes a 'New scratch session' command", () => {
-    const { result } = renderHook(() => useCommandActions(baseArgs()));
-    const scratch = result.current.find((a) => a.id === "action:new-scratch-session");
-    expect(scratch).toBeDefined();
-    expect(scratch?.title).toBe("New scratch session");
-    expect(scratch?.group).toBe("Actions");
-    expect(scratch?.keywords).toContain("scratch");
-    expect(scratch?.shortcut).toMatch(/N$/);
-  });
-
-  it("renders the scratch command right after 'New session'", () => {
-    const { result } = renderHook(() => useCommandActions(baseArgs()));
-    const ids = result.current.map((a) => a.id);
-    const newSession = ids.indexOf("action:new-session");
-    const scratch = ids.indexOf("action:new-scratch-session");
-    expect(newSession).toBeGreaterThanOrEqual(0);
-    expect(scratch).toBe(newSession + 1);
-  });
-
-  it("perform dispatches onNewScratch", () => {
+describe("useCommandActions creation and attention commands", () => {
+  it("offers New scratch session right after New session, dispatching onNewScratch", () => {
     const onNewScratch = vi.fn();
-    const { result } = renderHook(() => useCommandActions(baseArgs({ onNewScratch })));
-    const scratch = result.current.find((a) => a.id === "action:new-scratch-session");
-    scratch?.perform();
+    const actions = actionsFor({ onNewScratch });
+    const ids = actions.map((a) => a.id);
+    expect(ids.indexOf("action:new-scratch-session")).toBe(ids.indexOf("action:new-session") + 1);
+    const scratch = find(actions, "action:new-scratch-session")!;
+    expect(scratch).toMatchObject({ title: "New scratch session", group: "Actions" });
+    expect(scratch.keywords).toContain("scratch");
+    expect(scratch.shortcut).toMatch(/N$/);
+    scratch.perform();
     expect(onNewScratch).toHaveBeenCalledTimes(1);
   });
 
   it("hides both creation commands in read-only mode", () => {
-    const { result } = renderHook(() => useCommandActions(baseArgs({ readOnly: true })));
-    const ids = result.current.map((a) => a.id);
+    const ids = actionsFor({ readOnly: true }).map((a) => a.id);
     expect(ids).not.toContain("action:new-session");
     expect(ids).not.toContain("action:new-scratch-session");
   });
-});
 
-describe("useCommandActions: jump-to-attention command", () => {
-  it("is absent when nothing needs attention", () => {
-    const { result } = renderHook(() => useCommandActions(baseArgs({ hasAttentionSession: false })));
-    expect(result.current.find((a) => a.id === "action:jump-attention")).toBeUndefined();
-  });
-
-  it("appears with the right shape and dispatches onJumpToAttention", () => {
+  it("offers jump-to-attention only when something needs attention", () => {
+    expect(find(actionsFor(), "action:jump-attention")).toBeUndefined();
     const onJumpToAttention = vi.fn();
-    const { result } = renderHook(() => useCommandActions(baseArgs({ hasAttentionSession: true, onJumpToAttention })));
-    const jump = result.current.find((a) => a.id === "action:jump-attention");
-    expect(jump).toBeDefined();
-    expect(jump?.title).toBe("Go to next attention session");
-    expect(jump?.group).toBe("Actions");
-    expect(jump?.shortcut).toBe("a");
-    jump?.perform();
+    const jump = find(actionsFor({ hasAttentionSession: true, onJumpToAttention }), "action:jump-attention")!;
+    expect(jump).toMatchObject({ title: "Go to next attention session", group: "Actions", shortcut: "a" });
+    jump.perform();
     expect(onJumpToAttention).toHaveBeenCalledTimes(1);
   });
 });
@@ -138,60 +110,38 @@ describe("buildConversationActions", () => {
 describe("useCommandActions: active-session triage toggles", () => {
   const active = (over: Partial<SessionResponse> = {}) =>
     ({ id: "act", title: "Alpha", status: "idle", created_at: "2026-01-01T00:00:00Z", ...over }) as SessionResponse;
-  const ids = (actions: ReturnType<typeof useCommandActions>) => actions.map((a) => a.id);
+  const stateIds = (over: Partial<SessionResponse>, args: Partial<Args> = {}) =>
+    actionsFor({ activeSession: active(over), hasActiveSession: true, ...args })
+      .map((a) => a.id)
+      .filter((id) => id.startsWith("session-state:"));
 
-  it("offers the forward toggles when the session is in no sunk state", () => {
-    const { result } = renderHook(() =>
-      useCommandActions(baseArgs({ activeSession: active(), hasActiveSession: true })),
-    );
-    const got = ids(result.current);
-    expect(got).toContain("session-state:pin:act");
-    expect(got).toContain("session-state:archive:act");
-    expect(got).toContain("session-state:snooze:act");
-    expect(got).toContain("session-state:trash:act");
-    expect(got).not.toContain("session-state:unpin:act");
-    expect(got).not.toContain("session-state:unarchive:act");
-    const pin = result.current.find((a) => a.id === "session-state:pin:act");
-    expect(pin?.title).toBe("Pin Alpha");
-    expect(pin?.group).toBe("Actions");
+  it.each<[string, Partial<SessionResponse>, string[]]>([
+    ["no sunk state", {}, ["pin", "archive", "snooze", "trash"]],
+    [
+      "every sunk state",
+      {
+        pinned_at: "2026-01-02T00:00:00Z",
+        archived_at: "2026-01-02T00:00:00Z",
+        snoozed_until: "2099-01-01T00:00:00Z",
+        trashed_at: "2026-01-02T00:00:00Z",
+      },
+      ["unpin", "unarchive", "unsnooze", "untrash"],
+    ],
+  ])("offers the toggles for %s", (_label, over, expected) => {
+    expect(stateIds(over).sort()).toEqual(expected.map((a) => `session-state:${a}:act`).sort());
   });
 
-  it("flips each toggle to its restore direction per state", () => {
-    const { result } = renderHook(() =>
-      useCommandActions(
-        baseArgs({
-          hasActiveSession: true,
-          activeSession: active({
-            pinned_at: "2026-01-02T00:00:00Z",
-            archived_at: "2026-01-02T00:00:00Z",
-            snoozed_until: "2099-01-01T00:00:00Z",
-            trashed_at: "2026-01-02T00:00:00Z",
-          }),
-        }),
-      ),
-    );
-    const got = ids(result.current);
-    expect(got).toContain("session-state:unpin:act");
-    expect(got).toContain("session-state:unarchive:act");
-    expect(got).toContain("session-state:unsnooze:act");
-    expect(got).toContain("session-state:untrash:act");
-    expect(got).not.toContain("session-state:pin:act");
-    expect(result.current.find((a) => a.id === "session-state:untrash:act")?.title).toBe("Untrash Alpha");
-  });
-
-  it("routes a toggle's perform to onSessionStateAction with the session id and action", () => {
+  it("titles toggles and routes perform to onSessionStateAction", () => {
     const onSessionStateAction = vi.fn();
-    const { result } = renderHook(() =>
-      useCommandActions(baseArgs({ activeSession: active(), hasActiveSession: true, onSessionStateAction })),
-    );
-    result.current.find((a) => a.id === "session-state:archive:act")!.perform();
+    const actions = actionsFor({ activeSession: active(), hasActiveSession: true, onSessionStateAction });
+    expect(find(actions, "session-state:pin:act")).toMatchObject({ title: "Pin Alpha", group: "Actions" });
+    find(actions, "session-state:archive:act")!.perform();
     expect(onSessionStateAction).toHaveBeenCalledWith("act", "archive");
+    const trashed = actionsFor({ activeSession: active({ trashed_at: "t" }), hasActiveSession: true });
+    expect(find(trashed, "session-state:untrash:act")?.title).toBe("Untrash Alpha");
   });
 
   it("omits the toggles in read-only mode", () => {
-    const { result } = renderHook(() =>
-      useCommandActions(baseArgs({ activeSession: active(), hasActiveSession: true, readOnly: true })),
-    );
-    expect(ids(result.current).some((id) => id.startsWith("session-state:"))).toBe(false);
+    expect(stateIds({}, { readOnly: true })).toEqual([]);
   });
 });

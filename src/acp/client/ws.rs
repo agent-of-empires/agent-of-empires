@@ -1,25 +1,11 @@
 //! WebSocket client for the structured view broadcast stream.
 //!
-//! Subscribes to `/sessions/{id}/acp/ws?since=N` and yields a
-//! stream of decoded events. The daemon may push these shapes:
+//! Subscribes to `/sessions/{id}/acp/ws?since=N` and yields decoded events.
+//! `parse_text` documents the frame shapes the daemon pushes.
 //!
-//! - An `AcpBroadcastFrame` (`session_id`, `seq`, `event`, no `kind`):
-//!   the next replayed or live event.
-//! - `{"kind":"lagged"}`: the in-memory ring buffer evicted events
-//!   the client hadn't acked yet. The consumer must drop its local
-//!   state and rehydrate via [`super::http::HttpClient::replay`].
-//! - `{"kind":"heartbeat"}`: the app-level keepalive the daemon emits
-//!   on every ping tick (`PING_INTERVAL` in `src/server/acp_ws.rs`).
-//!   Carries no state, so the reader loop drops it without waking the
-//!   consumer. A `kind` this build does not recognise is a control
-//!   frame from a newer daemon and is dropped the same way, never
-//!   parsed as an event frame (#3560). See `parse_text`.
-//!
-//! Auth: the bearer token is sent as a `?token=<>` query string on the
-//! WebSocket URL. Most WS clients do not surface custom headers cleanly,
-//! and the daemon's auth middleware already accepts the query-param
-//! form (see `src/server/auth.rs`). The token is *not* logged anywhere
-//! the URL string is exposed (we log only the base URL).
+//! The bearer token rides a `?token=` query param rather than a header, which
+//! most WS clients do not surface cleanly; the daemon's auth middleware accepts
+//! both. Only the redacted URL is ever logged.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,9 +35,8 @@ pub enum WsError {
     InvalidUrl(String),
     #[error("websocket closed unexpectedly (code {0:?})")]
     UnexpectedClose(Option<CloseCode>),
-    /// A daemon frame failed to deserialise. Surfaced to the caller so
-    /// a toast like "ws: parse error" carries the real reason instead
-    /// of a fabricated transport error.
+    /// Surfaced so a toast carries the real reason, not a fabricated
+    /// transport error.
     #[error("failed to parse websocket frame: {0}")]
     Parse(String),
 }
@@ -59,34 +44,30 @@ pub enum WsError {
 /// One message off the structured view WebSocket.
 #[derive(Debug, Clone)]
 pub enum WsMessage {
-    /// A normal structured view event frame. Consumed by `aoe acp tail`,
-    /// which dumps the raw stream; the structured view reads the two folded
-    /// projections below instead (control state and transcript rows).
+    /// A raw event frame, consumed by `aoe acp tail`. The structured view
+    /// reads the two folded projections below instead.
     Frame(Arc<AcpBroadcastFrame>),
-    /// The server-folded CONTROL state (turn flags, approvals, elicitations,
+    /// Server-folded control state (turn flags, approvals, elicitations,
     /// usage, modes, commands, plan), sent on connect and after every event.
-    /// Boxed because `AcpState` dwarfs the other variants. Tier 1.3.
+    /// Boxed because `AcpState` dwarfs the other variants.
     ///
     /// `unchanged` names the cold fields the server omitted because this
-    /// connection already has them (see `COLD_STATE_FIELDS` in
-    /// `src/server/acp_ws.rs`). They deserialize to their empty defaults, so a
-    /// consumer must keep what it holds for those rather than adopt the blank.
+    /// connection already holds them (`COLD_STATE_FIELDS` in
+    /// `src/server/acp_ws.rs`). They deserialize to empty defaults, so a
+    /// consumer must keep what it has rather than adopt the blank.
     ReducedState {
         seq: u64,
         state: Box<AcpState>,
         unchanged: Vec<String>,
     },
-    /// Daemon's in-memory ring evicted events the client missed.
-    /// Consumer should drop local reducer state and call
-    /// `HttpClient::replay(since=last_seq)` to rehydrate.
+    /// The daemon's ring evicted events this client missed. The consumer must
+    /// drop its reducer state and `HttpClient::replay(since=last_seq)`.
     Lagged,
-    /// Connect (and reconnect) snapshot of the server-folded transcript
-    /// rows. The consumer reconciles these into its row buffer by id, so an
-    /// overlap with an initial `?view=rows` replay is idempotent.
+    /// Connect snapshot of the folded transcript rows, reconciled by id so an
+    /// overlap with a `?view=rows` replay is idempotent.
     TranscriptSnapshot(Vec<TranscriptRow>),
-    /// One incremental row change the server folded from a live event.
-    /// Boxed: a `Patch` carries a full `TranscriptRow`, which would otherwise
-    /// bloat every `WsMessage` (and the `EmbeddedEvent` that wraps it).
+    /// One folded row change. Boxed: a `Patch` carries a whole
+    /// `TranscriptRow`, which would bloat every `WsMessage`.
     TranscriptDelta(Box<TranscriptDelta>),
 }
 
@@ -95,26 +76,15 @@ pub enum WsMessage {
 pub struct WsHandle {
     rx: mpsc::Receiver<Result<WsMessage, WsError>>,
     task: JoinHandle<()>,
-    /// Cancellation signal observed by `reader_loop`. The previous
-    /// shape used `mpsc::channel(1)` for a single shot signal; a
-    /// `CancellationToken` is the same shape with the rest of the
-    /// codebase (`state.shutdown`, tunnel watchdog) and avoids the
-    /// `Option<Sender>` dance because cancellation is idempotent.
     shutdown: tokio_util::sync::CancellationToken,
-    /// Drop-cancel: restores the prior `mpsc::Sender`-drop semantics
-    /// from before #1295. Without this, dropping a `WsHandle` without
-    /// an explicit `shutdown().await` would leave `reader_loop` parked
-    /// on `stream.next()` instead of sending a Close frame and
-    /// exiting. The guard cancels the same token on drop; the
-    /// explicit `shutdown()` path's earlier `cancel()` is idempotent
-    /// so there is no double-cancel hazard.
+    /// Cancels the same token, so dropping the handle without an explicit
+    /// `shutdown().await` still closes the socket instead of leaving
+    /// `reader_loop` parked on `stream.next()`. Cancellation is idempotent.
     _drop_guard: tokio_util::sync::DropGuard,
 }
 
-/// Wait this long for the reader task to send its close frame and
-/// exit cleanly before falling back to `abort()`. Picked so a healthy
-/// loopback round-trip lands well inside the budget while a stuck
-/// task still doesn't block our caller's teardown.
+/// Long enough for a healthy loopback close round-trip, short enough that a
+/// stuck reader task cannot block our caller's teardown.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(200);
 
 impl WsHandle {
@@ -122,23 +92,20 @@ impl WsHandle {
         self.rx.recv().await
     }
 
-    /// Ask the reader task to send a Close frame and finish cleanly.
-    /// Falls back to `abort()` if the task doesn't finish within
-    /// `SHUTDOWN_GRACE` so a stuck or already-aborted task can't
-    /// block teardown.
+    /// Close cleanly, falling back to `abort()` past `SHUTDOWN_GRACE`.
     pub async fn shutdown(self) {
         self.shutdown.cancel();
         let mut task = self.task;
-        match tokio::time::timeout(SHUTDOWN_GRACE, &mut task).await {
-            Ok(_) => {}
-            Err(_) => task.abort(),
+        if tokio::time::timeout(SHUTDOWN_GRACE, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
         }
     }
 }
 
-/// Connect to the structured view broadcast stream for `session_id` starting
-/// after `since` (use `0` for full replay). Returns a handle whose
-/// `recv()` yields decoded messages until the stream ends or errors.
+/// Stream `session_id`'s events after `since` (`0` for a full replay).
 pub async fn connect(
     endpoint: &DaemonEndpoint,
     session_id: &str,
@@ -147,11 +114,9 @@ pub async fn connect(
     connect_with(endpoint, session_id, since, true).await
 }
 
-/// [`connect`], with control over whether the server forwards the raw event
-/// frames. A consumer that renders only the folded projections (the native
-/// structured view since Tier 1.3) passes `forward_frames: false` so a long
-/// session's whole event history is not shipped on every open; the server
-/// still folds it to build the connect snapshots.
+/// [`connect`], but a consumer that renders only the folded projections passes
+/// `forward_frames: false` so a long session's history is not shipped on every
+/// open. The server still folds it to build the connect snapshots.
 pub async fn connect_with(
     endpoint: &DaemonEndpoint,
     session_id: &str,
@@ -201,29 +166,25 @@ async fn reader_loop(
             next = stream.next() => {
                 match next {
                     Some(Ok(Message::Text(text))) => {
-                        match parse_text(&text) {
-                            // Keepalive: no consumer-visible state, so
-                            // don't wake the consumer at all.
-                            Ok(None) => {}
-                            Ok(Some(msg)) => {
-                                if tx.send(Ok(msg)).await.is_err() {
-                                    return; // consumer dropped
-                                }
-                            }
-                            Err(e) => {
-                                if tx.send(Err(e)).await.is_err() {
-                                    return; // consumer dropped
-                                }
+                        // `Ok(None)` is a keepalive: nothing to wake the consumer for.
+                        let delivery = match parse_text(&text) {
+                            Ok(None) => None,
+                            Ok(Some(msg)) => Some(Ok(msg)),
+                            Err(e) => Some(Err(e)),
+                        };
+                        if let Some(delivery) = delivery {
+                            if tx.send(delivery).await.is_err() {
+                                return; // consumer dropped
                             }
                         }
-                    }
-                    Some(Ok(Message::Binary(_))) => {
-                        // Daemon never sends binary; ignore defensively.
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         let _ = stream.send(Message::Pong(payload)).await;
                     }
-                    Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+                    // The daemon never sends binary; ignore defensively.
+                    Some(Ok(
+                        Message::Binary(_) | Message::Pong(_) | Message::Frame(_),
+                    )) => {}
                     Some(Ok(Message::Close(frame))) => {
                         let code = frame.as_ref().map(|f| f.code);
                         let _ = tx.send(Err(WsError::UnexpectedClose(code))).await;
@@ -243,17 +204,14 @@ async fn reader_loop(
     }
 }
 
-/// Decode one text frame. `Ok(None)` means the frame was a sentinel with
-/// nothing for the consumer to act on (the daemon's keepalive), which is
-/// distinct from `Err` because consumers escalate a parse error to a
+/// Decode one text frame: either an `AcpBroadcastFrame` event or a
+/// `{"kind": ...}` control frame. `Ok(None)` is a frame with nothing for the
+/// consumer to act on, distinct from `Err`, which consumers escalate to a
 /// socket teardown and reconnect.
 fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
-    // The daemon sends an `AcpBroadcastFrame` JSON object or a
-    // `{ "kind": ... }` control frame. A real frame never carries `kind`
-    // (its serializer emits only session_id/seq/event), so the key's
-    // presence alone marks a control frame, whatever its value.
-    // `Option<Option<_>>` with the helper below tells an absent `kind` apart
-    // from a present-but-null one: only absence means "event frame".
+    // An event frame serializes only session_id/seq/event, so the presence of
+    // `kind` alone marks a control frame. `Option<Option<_>>` tells an absent
+    // `kind` apart from a present-but-null one.
     #[derive(serde::Deserialize)]
     struct KindProbe {
         #[serde(default, deserialize_with = "present")]
@@ -283,12 +241,8 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
         let kind = kind.unwrap_or(serde_json::Value::Null);
         match kind.as_str() {
             Some("lagged") => return Ok(Some(WsMessage::Lagged)),
-            // App-level keepalive (#2287). A real frame always carries
-            // `session_id`/`seq`/`event` and never a `kind`, so this
-            // cannot shadow one.
+            // App-level keepalive (#2287).
             Some("heartbeat") => return Ok(None),
-            // Server-folded transcript rows (Tier 4). The connect snapshot
-            // carries every row; each live event carries its row delta.
             Some("transcript_snapshot") => {
                 let frame: TranscriptSnapshotFrame =
                     serde_json::from_str(raw).map_err(|e| WsError::Parse(e.to_string()))?;
@@ -299,8 +253,6 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
                     serde_json::from_str(raw).map_err(|e| WsError::Parse(e.to_string()))?;
                 return Ok(Some(WsMessage::TranscriptDelta(Box::new(frame.delta))));
             }
-            // Server-folded control state (Tier 1.3), sent on connect and
-            // after every event.
             Some("reduced_state") => {
                 let frame: ReducedStateFrame =
                     serde_json::from_str(raw).map_err(|e| WsError::Parse(e.to_string()))?;
@@ -310,10 +262,8 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
                     unchanged: frame.unchanged,
                 }));
             }
-            // A control frame this build does not consume, typically a
-            // sentinel a newer daemon grew. Dropping it is safe: the
-            // projections above are re-sent on every event and on connect
-            // (#3560).
+            // A sentinel a newer daemon grew. Dropping it is safe: every
+            // projection above is re-sent on connect and on each event (#3560).
             _ => {
                 debug!(
                     target: "acp.client.ws",
@@ -324,9 +274,8 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
             }
         }
     }
-    // No `kind` key (or not a JSON object): parse as a raw event frame. A
-    // genuinely malformed frame fails here and surfaces as WsError::Parse,
-    // which the consumer treats as a dropped socket.
+    // No `kind` key, or not a JSON object: an event frame. A malformed one
+    // surfaces as `WsError::Parse`, which the consumer treats as a dead socket.
     let frame: AcpBroadcastFrame = serde_json::from_str(raw).map_err(|e| {
         warn!(target: "acp.client.ws", error = %e, "ws frame parse failed");
         WsError::Parse(e.to_string())
@@ -355,16 +304,12 @@ fn ws_url(endpoint: &DaemonEndpoint, session_id: &str, since: u64, forward_frame
 }
 
 fn sanitize_for_log(url: &str) -> String {
-    match url.split_once("token=") {
-        Some((head, tail)) => {
-            let rest = tail.split_once('&').map(|(_, r)| r).unwrap_or("");
-            if rest.is_empty() {
-                format!("{head}token=<redacted>")
-            } else {
-                format!("{head}token=<redacted>&{rest}")
-            }
-        }
-        None => url.to_string(),
+    let Some((head, tail)) = url.split_once("token=") else {
+        return url.to_string();
+    };
+    match tail.split_once('&') {
+        Some((_, rest)) => format!("{head}token=<redacted>&{rest}"),
+        None => format!("{head}token=<redacted>"),
     }
 }
 
@@ -378,18 +323,33 @@ mod tests {
         DaemonEndpoint::new(base.to_string(), token.map(str::to_string), Source::Env)
     }
 
+    /// `since=0` is omitted, `frames=0` marks a projections-only consumer, and
+    /// an https endpoint upgrades to `wss`.
     #[test]
-    fn ws_url_appends_since_and_token() {
+    fn ws_url_query_shape() {
         let e = endpoint("http://127.0.0.1:8080", Some("abc"));
-        let url = ws_url(&e, "s-1", 42, true);
+        for (since, frames, want) in [
+            (
+                42,
+                true,
+                "ws://127.0.0.1:8080/sessions/s-1/acp/ws?since=42&token=abc",
+            ),
+            (
+                42,
+                false,
+                "ws://127.0.0.1:8080/sessions/s-1/acp/ws?since=42&frames=0&token=abc",
+            ),
+            (0, true, "ws://127.0.0.1:8080/sessions/s-1/acp/ws?token=abc"),
+        ] {
+            assert_eq!(ws_url(&e, "s-1", since, frames), want);
+        }
         assert_eq!(
-            url,
-            "ws://127.0.0.1:8080/sessions/s-1/acp/ws?since=42&token=abc"
+            ws_url(&endpoint("http://127.0.0.1:8080", None), "s-1", 0, true),
+            "ws://127.0.0.1:8080/sessions/s-1/acp/ws"
         );
-        // A projections-only consumer asks the daemon to skip the raw frames.
-        assert_eq!(
-            ws_url(&e, "s-1", 42, false),
-            "ws://127.0.0.1:8080/sessions/s-1/acp/ws?since=42&frames=0&token=abc"
+        assert!(
+            ws_url(&endpoint("https://remote.test", Some("t")), "s-1", 0, true)
+                .starts_with("wss://")
         );
     }
 
@@ -412,37 +372,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ws_url_omits_since_when_zero() {
-        let e = endpoint("http://127.0.0.1:8080", None);
-        assert_eq!(
-            ws_url(&e, "s-1", 0, true),
-            "ws://127.0.0.1:8080/sessions/s-1/acp/ws"
-        );
-    }
-
-    #[test]
-    fn ws_url_uses_wss_for_https_endpoint() {
-        let e = endpoint("https://remote.example.com", Some("t"));
-        assert!(ws_url(&e, "s-1", 0, true).starts_with("wss://"));
-    }
-
-    /// How each `{"kind":...}` frame the daemon can send must classify, and
-    /// how a `kind`-less object must classify.
-    ///
-    /// The heartbeat row is the #3171 regression: the daemon emits
-    /// `{"kind":"heartbeat"}` every `PING_INTERVAL` (30s); before it was
-    /// handled it fell through to the `AcpBroadcastFrame` parse, failed on a
-    /// missing field, and surfaced as `WsError::Parse`, which
-    /// `tui::structured_view` treats as a dropped socket: an error toast plus
-    /// a full reconnect every 30 seconds on any quiet session.
-    ///
-    /// The `something_new` rows are the general case: a `frames=0` client
-    /// receives only `kind`-tagged control frames, so any `kind` this build
-    /// does not recognize (a newer daemon's sentinel) must be ignored rather
-    /// than fall through to the event-frame parse. That fall-through failed
-    /// with "missing field `event`" and drove acp.tui.ws into a tight
-    /// reconnect loop against the connect-snapshot control frame.
+    /// Any present `kind` marks a control frame, whatever its JSON type, and
+    /// one this build does not know must be dropped rather than fall through
+    /// to the event parse. That fall-through failed on a missing `event`
+    /// field and drove a reconnect loop against the heartbeat (#3171) and
+    /// against the connect snapshot of a `frames=0` client (#3560).
     #[derive(Debug)]
     enum Expect {
         Lagged,
@@ -452,28 +386,19 @@ mod tests {
 
     #[test]
     fn parse_text_classifies_kind_sentinels() {
-        let cases = [
-            // Ring buffer evicted events; consumer must rehydrate.
+        for (raw, expect) in [
             (r#"{"kind":"lagged"}"#, Expect::Lagged),
-            // Keepalive: no consumer-visible state, must not wake the
-            // consumer and must not read as a dropped socket.
             (r#"{"kind":"heartbeat"}"#, Expect::Ignored),
-            // A sentinel this build does not know is dropped, not escalated
-            // to a reconnect (#3560); the daemon re-sends every projection.
             (r#"{"kind":"something_new"}"#, Expect::Ignored),
             (
                 r#"{"kind":"something_new","session_id":"s-1","seq":9}"#,
                 Expect::Ignored,
             ),
             (r#"{"kind":null}"#, Expect::Ignored),
-            // A present `kind` of a non-string JSON type still marks a
-            // control frame: it must be ignored, never routed to the
-            // event parse.
             (r#"{"kind":42}"#, Expect::Ignored),
             // No `kind` and no event shape: genuinely malformed.
             (r#"{"session_id":"s-1","seq":9}"#, Expect::ParseError),
-        ];
-        for (raw, expect) in cases {
+        ] {
             let got = parse_text(raw);
             match expect {
                 Expect::Lagged => assert!(
@@ -512,9 +437,6 @@ mod tests {
 
     #[test]
     fn parse_text_transcript_snapshot_and_delta() {
-        // The connect snapshot yields the row buffer; a live delta yields
-        // one row change. Both are keyed by id so the consumer reconciles
-        // idempotently against a `?view=rows` replay overlap.
         let snapshot = serde_json::json!({
             "kind": "transcript_snapshot",
             "session_id": "s-1",
@@ -555,9 +477,7 @@ mod tests {
 
     #[test]
     fn parse_text_reads_the_reduced_state_frame() {
-        // The whole control state rides on this frame, and the fields the
-        // sender omits must default rather than fail the parse: a parse error
-        // reads as a dead socket to the consumer.
+        // An omitted field must default: a parse error reads as a dead socket.
         let raw = serde_json::json!({
             "kind": "reduced_state",
             "session_id": "s-1",

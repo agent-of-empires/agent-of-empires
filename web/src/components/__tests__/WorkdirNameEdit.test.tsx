@@ -1,266 +1,104 @@
 // @vitest-environment jsdom
-//
-// RTL coverage for the sidebar "Edit workdir name" flow (#1723): the
-// context-menu gating (managed worktree + not running), and the modal's
-// request payload (name + rename_branch) plus its error surface. Mirrors
-// SessionRowTriage.test.tsx for the SessionRow + DragSuppressContext setup.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { useRef, type ReactNode } from "react";
+import { cleanup, fireEvent, screen } from "@testing-library/react";
 
 import { reportError, reportInfo } from "../../lib/toastBus";
-import { DragSuppressContext, SessionRow, type RowBulkApi } from "../WorkspaceSidebar";
+import type { SessionResponse } from "../../lib/types";
+import { firstRequest, jsonResponse, makeSession, makeWorkspace, openRowMenu, stubFetch } from "./fixtures";
 
-// Single-row stub for the bulk-triage bridge; this harness mounts one
-// unselected row, so the menu is always single-scope. See #2312.
-const SINGLE_BULK_API: RowBulkApi = {
-  prepareScope: () => ({ kind: "single" }),
-  pin: () => {},
-  archive: () => {},
-  snooze: () => {},
-};
+vi.mock("../../lib/toastBus", () => ({ reportError: vi.fn(), reportInfo: vi.fn() }));
 
-vi.mock("../../lib/toastBus", () => ({
-  reportError: vi.fn(),
-  reportInfo: vi.fn(),
-}));
-import { EMPTY_OPTIMISTIC } from "../../lib/sidebarOptimistic";
-import type { SessionResponse, Workspace } from "../../lib/types";
-
-function session(over: Partial<SessionResponse> = {}): SessionResponse {
-  return {
-    id: "s1",
-    title: "row title",
-    project_path: "/p/old-name",
-    group_path: "/p",
-    tool: "claude",
-    status: "Idle",
-    yolo_mode: false,
-    created_at: "2025-01-01T00:00:00Z",
-    last_accessed_at: null,
-    idle_entered_at: null,
-    last_error: null,
+const managed = (over: Partial<SessionResponse> = {}) =>
+  makeWorkspace("w", [makeSession({ branch: "old-name", has_managed_worktree: true, ...over })], {
     branch: "old-name",
-    main_repo_path: "/p",
-    is_sandboxed: false,
-    favorited: false,
-    has_managed_worktree: true,
-    has_terminal: true,
-    profile: "default",
-    cleanup_defaults: {
-      delete_worktree: false,
-      delete_branch: false,
-      delete_sandbox: false,
-    },
-    remote_owner: null,
-    notify_on_waiting: null,
-    notify_on_idle: null,
-    notify_on_error: null,
-    claude_fullscreen: false,
-    workspace_repos: [],
-    ...over,
-  };
-}
+  });
 
-function workspace(id: string, sessions: SessionResponse[]): Workspace {
-  return {
-    id,
-    branch: "old-name",
-    projectPath: "/p",
-    displayName: id,
-    agents: ["claude"],
-    primaryAgent: "claude",
-    status: "idle",
-    sessions,
-  };
-}
-
-function Wrap({ children }: { children: ReactNode }) {
-  const ref = useRef(0);
-  return <DragSuppressContext.Provider value={ref}>{children}</DragSuppressContext.Provider>;
-}
-
-const fetchSpy = vi.fn<typeof fetch>();
-
+let fetchSpy: ReturnType<typeof stubFetch>;
 beforeEach(() => {
-  fetchSpy.mockReset();
   vi.mocked(reportError).mockClear();
   vi.mocked(reportInfo).mockClear();
-  vi.stubGlobal("fetch", fetchSpy);
-  fetchSpy.mockImplementation(
-    async () =>
-      new Response(JSON.stringify({ id: "s1" }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      }),
-  );
+  fetchSpy = stubFetch();
 });
-
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
 
-function openMenu(ws: Workspace) {
-  render(
-    <Wrap>
-      <SessionRow
-        workspace={ws}
-        isActive={false}
-        isSelected={false}
-        onActivate={() => {}}
-        optimistic={EMPTY_OPTIMISTIC}
-        onPinToggle={() => {}}
-        onArchiveToggle={() => {}}
-        onSnooze={() => {}}
-        bulkApi={SINGLE_BULK_API}
-      />
-    </Wrap>,
-  );
-  fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+function rename(title: string, over: Partial<SessionResponse> = {}) {
+  openRowMenu(managed(over));
+  fireEvent.click(screen.getByTestId("sidebar-context-menu-rename"));
+  const input = screen.getByTestId("sidebar-rename-input");
+  fireEvent.change(input, { target: { value: title } });
+  fireEvent.keyDown(input, { key: "Enter" });
+}
+
+function editWorkdir(name: string, renameBranch = false) {
+  openRowMenu(managed());
+  fireEvent.click(screen.getByTestId("sidebar-context-menu-edit-workdir"));
+  fireEvent.change(screen.getByTestId("workdir-modal-name"), { target: { value: name } });
+  if (renameBranch) fireEvent.click(screen.getByTestId("workdir-modal-rename-branch"));
+  fireEvent.click(screen.getByTestId("workdir-modal-save"));
 }
 
 describe("sidebar Edit workdir name", () => {
-  it("offers the action for a managed, idle worktree session", () => {
-    openMenu(workspace("w", [session()]));
-    expect(screen.queryByTestId("sidebar-context-menu-edit-workdir")).not.toBeNull();
-  });
-
-  it("hides the action for a non-managed worktree", () => {
-    openMenu(workspace("w", [session({ has_managed_worktree: false })]));
-    expect(screen.queryByTestId("sidebar-context-menu-edit-workdir")).toBeNull();
-  });
-
-  it("hides the action while the session is running", () => {
-    openMenu(workspace("w", [session({ status: "Running" })]));
-    expect(screen.queryByTestId("sidebar-context-menu-edit-workdir")).toBeNull();
-  });
-
-  it("hides the action when the session is tied (#1927)", () => {
-    // Tied mode collapses naming into the rename action, so the standalone
-    // workdir edit is not offered.
-    openMenu(workspace("w", [session({ tie_workdir_to_name: true })]));
-    expect(screen.queryByTestId("sidebar-context-menu-edit-workdir")).toBeNull();
+  it.each([
+    ["a managed, idle worktree", {}, true],
+    ["a non-managed worktree", { has_managed_worktree: false }, false],
+    ["a running session", { status: "Running" }, false],
+    // Tied mode folds naming into Rename (#1927).
+    ["a tied session", { tie_workdir_to_name: true }, false],
+  ] as [string, Partial<SessionResponse>, boolean][])("on %s: offered=%s", (_n, over, offered) => {
+    openRowMenu(managed(over));
+    expect(screen.queryByTestId("sidebar-context-menu-edit-workdir") != null).toBe(offered);
   });
 
   it("PATCHes the worktree-name endpoint with name and rename_branch", async () => {
-    openMenu(workspace("w", [session()]));
-    fireEvent.click(screen.getByTestId("sidebar-context-menu-edit-workdir"));
-
-    fireEvent.change(screen.getByTestId("workdir-modal-name"), {
-      target: { value: "fresh-name" },
-    });
-    fireEvent.click(screen.getByTestId("workdir-modal-rename-branch"));
-    fireEvent.click(screen.getByTestId("workdir-modal-save"));
-
+    editWorkdir("fresh-name", true);
     await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
-    const [url, init] = fetchSpy.mock.calls[0];
-    expect(url).toBe("/api/sessions/s1/worktree-name");
-    expect(init?.method).toBe("PATCH");
-    expect(JSON.parse(init?.body as string)).toEqual({
-      name: "fresh-name",
-      rename_branch: true,
+    expect(firstRequest(fetchSpy)).toEqual({
+      url: "/api/sessions/s1/worktree-name",
+      method: "PATCH",
+      body: { name: "fresh-name", rename_branch: true },
     });
-  });
-
-  it("inline rename PATCHes the title endpoint", async () => {
-    openMenu(workspace("w", [session()]));
-    fireEvent.click(screen.getByTestId("sidebar-context-menu-rename"));
-    fireEvent.change(screen.getByTestId("sidebar-rename-input"), {
-      target: { value: "new title" },
-    });
-    fireEvent.keyDown(screen.getByTestId("sidebar-rename-input"), {
-      key: "Enter",
-    });
-
-    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
-    const [url, init] = fetchSpy.mock.calls[0];
-    expect(url).toBe("/api/sessions/s1");
-    expect(init?.method).toBe("PATCH");
-    expect(JSON.parse(init?.body as string)).toEqual({ title: "new title" });
-  });
-
-  it("surfaces warnings returned by a successful inline rename", async () => {
-    fetchSpy.mockResolvedValueOnce(
-      new Response(
-        JSON.stringify({
-          id: "s1",
-          warnings: ["Session was saved, but its live tmux session could not be rekeyed"],
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      ),
-    );
-    openMenu(workspace("w", [session()]));
-    fireEvent.click(screen.getByTestId("sidebar-context-menu-rename"));
-    fireEvent.change(screen.getByTestId("sidebar-rename-input"), {
-      target: { value: "new title" },
-    });
-    fireEvent.keyDown(screen.getByTestId("sidebar-rename-input"), {
-      key: "Enter",
-    });
-
-    await vi.waitFor(() =>
-      expect(reportInfo).toHaveBeenCalledWith("Session was saved, but its live tmux session could not be rekeyed"),
-    );
-    // Non-fatal: the rename itself succeeded, so it must not surface as an error.
-    expect(reportError).not.toHaveBeenCalled();
-  });
-
-  it("surfaces the server message when a tied rename is rejected (#1927)", async () => {
-    fetchSpy.mockImplementation(
-      async () =>
-        new Response(
-          JSON.stringify({
-            error: "session_running",
-            message: "Stop the session before renaming it.",
-          }),
-          { status: 409, headers: { "content-type": "application/json" } },
-        ),
-    );
-    openMenu(workspace("w", [session({ tie_workdir_to_name: true })]));
-    fireEvent.click(screen.getByTestId("sidebar-context-menu-rename"));
-    fireEvent.change(screen.getByTestId("sidebar-rename-input"), {
-      target: { value: "blocked" },
-    });
-    fireEvent.keyDown(screen.getByTestId("sidebar-rename-input"), {
-      key: "Enter",
-    });
-
-    await vi.waitFor(() => expect(reportError).toHaveBeenCalledWith("Stop the session before renaming it."));
-  });
-
-  it("surfaces a fallback when inline rename has no server message", async () => {
-    fetchSpy.mockRejectedValueOnce(new Error("network unavailable"));
-    openMenu(workspace("w", [session()]));
-    fireEvent.click(screen.getByTestId("sidebar-context-menu-rename"));
-    fireEvent.change(screen.getByTestId("sidebar-rename-input"), {
-      target: { value: "new title" },
-    });
-    fireEvent.keyDown(screen.getByTestId("sidebar-rename-input"), {
-      key: "Enter",
-    });
-
-    await vi.waitFor(() =>
-      expect(reportError).toHaveBeenCalledWith("Could not rename this session. Please try again."),
-    );
   });
 
   it("surfaces the server validation message on failure", async () => {
-    fetchSpy.mockImplementation(
-      async () =>
-        new Response(JSON.stringify({ message: "Branch 'x' already exists" }), {
-          status: 409,
-          headers: { "content-type": "application/json" },
-        }),
-    );
-    openMenu(workspace("w", [session()]));
-    fireEvent.click(screen.getByTestId("sidebar-context-menu-edit-workdir"));
-    fireEvent.change(screen.getByTestId("workdir-modal-name"), {
-      target: { value: "x" },
-    });
-    fireEvent.click(screen.getByTestId("workdir-modal-save"));
-
+    fetchSpy.mockImplementation(async () => jsonResponse({ message: "Branch 'x' already exists" }, 409));
+    editWorkdir("x");
     await vi.waitFor(() => expect(screen.getByTestId("workdir-modal-error").textContent).toContain("already exists"));
+  });
+});
+
+describe("sidebar inline rename", () => {
+  it("PATCHes the title endpoint", async () => {
+    rename("new title");
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    expect(firstRequest(fetchSpy)).toEqual({ url: "/api/sessions/s1", method: "PATCH", body: { title: "new title" } });
+  });
+
+  it("reports warnings from a successful rename as info, not errors", async () => {
+    const warning = "Session was saved, but its live tmux session could not be rekeyed";
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ id: "s1", warnings: [warning] }));
+    rename("new title");
+    await vi.waitFor(() => expect(reportInfo).toHaveBeenCalledWith(warning));
+    expect(reportError).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "the server message for a rejected tied rename (#1927)",
+      () => jsonResponse({ error: "session_running", message: "Stop the session before renaming it." }, 409),
+      "Stop the session before renaming it.",
+    ],
+    [
+      "a fallback without a server message",
+      () => Promise.reject(new Error("network unavailable")),
+      "Could not rename this session. Please try again.",
+    ],
+  ] as [string, () => Response | Promise<Response>, string][])("reports %s", async (_n, respond, message) => {
+    fetchSpy.mockImplementation(async () => respond());
+    rename("blocked", { tie_workdir_to_name: true });
+    await vi.waitFor(() => expect(reportError).toHaveBeenCalledWith(message));
   });
 });

@@ -1,7 +1,6 @@
-//! A hyperlink in the preview keeps its OSC 8 target. Neither the vt100 grid
-//! the live path renders from nor a ratatui cell can carry one, so the targets
-//! ride alongside the text and are re-anchored to the row that shows them; a
-//! plain click on that row then opens the target (#3735).
+//! A hyperlink in the preview keeps its OSC 8 target. Neither the vt100 grid nor a ratatui
+//! cell can carry one, so targets ride alongside the text and are re-anchored to the row
+//! that shows them; a plain click on that row opens the target (#3735).
 
 use super::*;
 use crate::tmux::osc8::PaneLink;
@@ -170,9 +169,8 @@ fn status_flash_shows_then_expires_without_acknowledgement() {
 #[test]
 #[serial]
 fn hovering_a_link_reveals_its_target_before_the_click() {
-    // The click opens with no confirmation and the pane controls both the
-    // visible text and the target, so hover is the user's only look at where a
-    // link actually goes.
+    // The click opens with no confirmation and the pane controls both the visible text and
+    // the target, so hover is the user's only look at where a link goes.
     let mut env = create_test_env_empty();
     stage(
         &mut env,
@@ -199,12 +197,10 @@ fn hovering_a_link_reveals_its_target_before_the_click() {
 #[test]
 #[serial]
 fn a_generation_change_re_collects_targets_for_an_unchanged_grid() {
-    // vt100 strips both sequences, so a pane that reprints the same label
-    // against a new target leaves the rendered grid byte-identical. Keying only
-    // on the rendered text would keep serving the old target, and the backend
-    // would faithfully re-emit it. Driven through `ensure_parsed` and
-    // `collect_links` rather than by assigning the answer, so the branch under
-    // test is the one that runs in production.
+    // vt100 strips both sequences, so a pane that reprints the same label against a new
+    // target leaves the grid byte-identical: keying on the rendered text would keep serving
+    // the old target. Driven through `ensure_parsed` and `collect_links` so the branch under
+    // test is the production one.
     let mut env = create_test_env_empty();
     let advertised = "see \x1b]8;;https://example.com/a\x1b\\the docs\x1b]8;;\x1b\\ now\n";
     env.view.preview_cache.store_capture(
@@ -230,9 +226,8 @@ fn a_generation_change_re_collects_targets_for_an_unchanged_grid() {
         Some("https://example.com/a")
     );
 
-    // The pane repoints the label. The visible cells do not move, so
-    // `parsed_text` stays valid; only the advertised target changed, which the
-    // generation is what reports.
+    // The pane repoints the label. The visible cells do not move, so `parsed_text` stays
+    // valid and only the advertised target changed, which the generation reports.
     env.view.preview_cache.content =
         "see \x1b]8;;https://example.com/b\x1b\\the docs\x1b]8;;\x1b\\ now\n".to_string();
     env.view.preview_cache.links_generation = 99;

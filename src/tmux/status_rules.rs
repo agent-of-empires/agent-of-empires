@@ -1,28 +1,9 @@
-//! Declarative pane status rules for custom agents.
+//! Declarative `[[agents.<name>.status_rules]]` (ordered `contains`/`regex`, first
+//! match wins, else Idle) and `[session.agent_detect_as]` aliases.
 //!
-//! `[[agents.<name>.status_rules]]` config entries give an agent without a
-//! built-in pane detector, typically a `[session.custom_agents]` harness
-//! that is *similar to but not the same binary as* a built-in agent, basic
-//! status detection: ordered `contains`/`regex` rules evaluated against the
-//! ANSI-stripped pane snapshot, first match wins, no match reports Idle.
-//!
-//! The compiled rules live in a process-global registry rather than on each
-//! `Instance` because the status poll hot path deliberately never loads
-//! config (see `Instance::detect_as`, resolved once at build for the same
-//! reason). The registry is keyed by `(profile, agent)`: `resolve_config`
-//! runs per profile many times per process, so an install must replace only
-//! the calling profile's entries and leave every other profile's rules
-//! standing (a bare `gjc` in profile A and a `gjc` in profile B are distinct
-//! keys with independent rules). Consumers pass their session's profile so a
-//! poll consults exactly that profile's rules. The registry is (re)installed
-//! by `profile_config::resolve_config`, which every status-polling surface
-//! (TUI boot, `aoe serve`, the session CLI) passes through, so editing the
-//! rules takes effect on the next config resolve instead of requiring the
-//! session to be re-created.
-//!
-//! The same registry carries `[session.agent_detect_as]`, for the same reason
-//! and with the same freshness guarantee: see [`effective_detect_as`] for why
-//! the copy persisted on each `Instance` cannot be the authority.
+//! Both live in process-global registries keyed by `(profile, agent)` because
+//! the poll hot path never loads config; `resolve_config` reinstalls a profile's
+//! entries on every resolve, so edits apply without recreating sessions.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -32,8 +13,6 @@ use crate::agents::HookStatus;
 use crate::session::config::StatusRule;
 use crate::session::Status;
 
-/// A rule compiled for the poll loop: the matcher is pre-lowered /
-/// pre-compiled so per-tick evaluation is substring or regex work only.
 #[cfg_attr(test, derive(Clone))]
 struct CompiledRule {
     status: Status,
@@ -42,15 +21,11 @@ struct CompiledRule {
 
 #[cfg_attr(test, derive(Clone))]
 enum Matcher {
-    /// Case-insensitive substring: stored lowercased, tested against the
-    /// lowercased pane text.
+    /// Stored lowercased, tested against the lowercased pane text.
     Contains(String),
-    /// Compiled regex, tested against the pane text as written.
     Regex(regex::Regex),
 }
 
-/// Compiled rules keyed by `(profile, agent)`, so each profile's rules are
-/// installed and consulted independently.
 type Registry = HashMap<(String, String), Vec<CompiledRule>>;
 
 fn registry() -> &'static RwLock<Registry> {
@@ -58,8 +33,6 @@ fn registry() -> &'static RwLock<Registry> {
     REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// `[session.agent_detect_as]` keyed the same way, so [`effective_detect_as`]
-/// can answer from the live config without the poll loop loading it.
 type Aliases = HashMap<(String, String), String>;
 
 fn aliases() -> &'static RwLock<Aliases> {
@@ -76,8 +49,6 @@ fn hook_status_to_status(status: HookStatus) -> Status {
     }
 }
 
-/// Compile one agent's rules, skipping (with a warning) any rule that has
-/// neither or both of `contains`/`regex`, or a regex that fails to compile.
 fn compile_rules(agent: &str, rules: &[StatusRule]) -> Vec<CompiledRule> {
     let mut compiled = Vec::with_capacity(rules.len());
     for (i, rule) in rules.iter().enumerate() {
@@ -110,28 +81,16 @@ fn compile_rules(agent: &str, rules: &[StatusRule]) -> Vec<CompiledRule> {
     compiled
 }
 
-/// Install `profile`'s rules and `agent_detect_as` aliases from `config`,
-/// replacing only that profile's entries and leaving every other profile's
-/// standing. Called on every config resolve, once per profile; an agent whose
-/// rules all fail to compile ends up with no entry (falling back to the
-/// built-in detector or Idle), matching the behavior of not configuring rules
-/// at all.
+/// Replace `profile`'s rules and aliases, leaving other profiles standing.
+/// Rules that all fail to compile leave no entry.
 pub fn install_from_config(profile: &str, config: &crate::session::Config) {
-    // Normalize so an empty `source_profile` keys the same slot as the resolved
-    // default profile; the lookup side (`detect` / `has_rules`) normalizes the
-    // same way, so an unpopulated field degrades to the default profile's rules
-    // instead of silently missing.
+    // An empty `source_profile` keys the resolved default profile, as lookups do.
     let profile = crate::session::config::effective_profile(profile);
 
-    // Held in its own scope: `install_from_config` is the only place that
-    // writes both registries, and taking them one at a time keeps it that way.
     {
         let mut map = aliases().write().unwrap_or_else(|p| p.into_inner());
         map.retain(|(p, _), _| p != &profile);
         for (agent, target) in &config.session.agent_detect_as {
-            // Malformed entries are reported by `Config::validate`; skipping
-            // them here leaves the tool unaliased, which is what an absent
-            // entry would have done.
             if agent.is_empty() || target.is_empty() {
                 continue;
             }
@@ -140,7 +99,6 @@ pub fn install_from_config(profile: &str, config: &crate::session::Config) {
     }
 
     let mut map = registry().write().unwrap_or_else(|p| p.into_inner());
-    // Drop this profile's previous entries; other profiles' keys are untouched.
     map.retain(|(p, _), _| p != &profile);
     for (agent, runtime) in &config.agents {
         if runtime.status_rules.is_empty() {
@@ -150,10 +108,7 @@ pub fn install_from_config(profile: &str, config: &crate::session::Config) {
         if compiled.is_empty() {
             continue;
         }
-        // Rules for a name that also has a built-in detector fully replace it:
-        // a pane matching no rule reports Idle instead of falling through to the
-        // built-in, so a single narrow rule on a built-in name silently loses
-        // that agent's detection everywhere it doesn't match.
+        // Rules on a built-in name replace its detector entirely.
         if crate::agents::get_agent(agent).is_some() {
             tracing::warn!(target: "tmux.status",
                 "agents.{agent}.status_rules shadow the built-in '{agent}' detector; \
@@ -163,9 +118,7 @@ pub fn install_from_config(profile: &str, config: &crate::session::Config) {
     }
 }
 
-/// Whether `tool` has configured rules under `profile`. Used by the status
-/// poller to let an agent's own rules take precedence over its
-/// `agent_detect_as` alias.
+/// Lets an agent's own rules outrank its `agent_detect_as` alias.
 pub fn has_rules(profile: &str, tool: &str) -> bool {
     let profile = crate::session::config::effective_profile(profile);
     registry()
@@ -174,10 +127,7 @@ pub fn has_rules(profile: &str, tool: &str) -> bool {
         .contains_key(&(profile, tool.to_string()))
 }
 
-/// Evaluate `tool`'s rules under `profile` against ANSI-stripped pane text.
-/// Returns `None` when the tool has no rules for that profile (caller falls
-/// back to the built-in detector), `Some(Idle)` when rules exist but none
-/// match.
+/// `None` when `tool` has no rules under `profile`, `Some(Idle)` when none match.
 pub fn detect(profile: &str, tool: &str, clean_content: &str) -> Option<Status> {
     let profile = crate::session::config::effective_profile(profile);
     let reg = registry().read().unwrap_or_else(|p| p.into_inner());
@@ -198,25 +148,9 @@ pub fn detect(profile: &str, tool: &str, clean_content: &str) -> Option<Status> 
     Some(Status::Idle)
 }
 
-/// The `agent_detect_as` alias in force for `tool` under `profile`, or `""`
-/// when the tool is not aliased.
-///
-/// `Instance::detect_as` is resolved once at session build and persisted, so a
-/// session outlives the config that produced it: a `[session.agent_detect_as]`
-/// entry added, renamed, or removed after the session was created leaves the
-/// stored field stale, and an empty one is indistinguishable from "never had an
-/// alias". A session created in that window loses its detector entirely, since
-/// `detect_status_from_content_in` falls through to `Status::Idle` for a tool
-/// with neither rules nor a built-in, so its status freezes at Idle forever.
-///
-/// So the stored value is a cache, not the authority: when it is empty this
-/// consults the registry the config resolve installed. A non-empty stored value
-/// still wins outright, keeping the hot path allocation-free for the sessions
-/// that have one and preserving the per-session pin for anything that rewrites
-/// the field directly. That precedence bounds what this heals: a session whose
-/// stored alias is empty tracks the config live (an entry added, retargeted, or
-/// removed later all take effect on the next resolve), while a session that
-/// already has one is pinned to it until something rewrites the field.
+/// The `agent_detect_as` alias for `tool`, or `""`. A non-empty persisted
+/// `detect_as` wins; an empty one is only a cache miss, so it falls back to the
+/// live config (else a session created before the alias would stay Idle).
 pub fn effective_detect_as<'a>(profile: &str, tool: &str, detect_as: &'a str) -> Cow<'a, str> {
     if !detect_as.is_empty() {
         return Cow::Borrowed(detect_as);
@@ -230,13 +164,8 @@ pub fn effective_detect_as<'a>(profile: &str, tool: &str, detect_as: &'a str) ->
         .unwrap_or(Cow::Borrowed(""))
 }
 
-/// The tool whose *pane* detection heuristics apply to a session: the
-/// session's own tool when it has configured rules, else the
-/// `agent_detect_as` alias when set, else the tool itself. Hook
-/// reconciliation deliberately does not use this helper: hooks are
-/// installed for the alias, so their reconcilers keep the alias identity
-/// (see `Instance::update_status_with_metadata`), though they resolve that
-/// identity through [`effective_detect_as`] for the same staleness reason.
+/// The tool whose pane heuristics apply: `tool` if it has rules, else its alias,
+/// else `tool`. Hook reconciliation keeps the alias identity instead.
 pub fn detection_tool<'a>(profile: &str, tool: &'a str, detect_as: &'a str) -> Cow<'a, str> {
     if has_rules(profile, tool) {
         return Cow::Borrowed(tool);
@@ -249,13 +178,9 @@ pub fn detection_tool<'a>(profile: &str, tool: &'a str, detect_as: &'a str) -> C
     }
 }
 
-/// Test-only restoration guard over one profile's entries in both
-/// registries. `install_from_config` replaces the whole profile's state and
-/// the registries are process-globals that outlive any single test, so a
-/// test that installs must hand the prior entries back: [`Self::take`]
-/// snapshots what `profile` currently has, and dropping the guard removes
-/// everything the test installed (and reinstates anything it clobbered),
-/// including through an unwinding assertion.
+/// Test guard that snapshots one profile's entries in both registries and
+/// restores them on drop. Take it before the first mutation. It is rollback,
+/// not mutual exclusion: concurrent writers to the same profile must be held off.
 #[cfg(test)]
 pub(crate) struct ProfileRegistryGuard {
     profile: String,
@@ -265,23 +190,6 @@ pub(crate) struct ProfileRegistryGuard {
 
 #[cfg(test)]
 impl ProfileRegistryGuard {
-    /// Snapshot `profile`'s current entries. Take the snapshot BEFORE the
-    /// first mutation, or the restore replays the test's own writes. Pass
-    /// the same literal profile the guarded section will install under: an
-    /// empty name resolves against config state at call time, and a later
-    /// resolve would normalize to whatever is configured then, not to this
-    /// snapshot's frozen key.
-    ///
-    /// The aliases and rules phases each lock their own map, so this guard is
-    /// rollback, not mutual exclusion: a writer touching the same profile
-    /// between the phases can leave a half-swapped pair standing. Guarding a
-    /// profile nothing else writes therefore needs nothing more, since the
-    /// keys never overlap; guarding a profile other tests write needs those
-    /// writers held off, and a config resolve counts as a write.
-    /// Audit the writers of the profile you guard rather than assuming a group
-    /// already covers them. The guard covers exactly these two registries and
-    /// only its caller's writes; a future process-global needs its own restore
-    /// mechanism.
     pub(crate) fn take(profile: &str) -> Self {
         let profile = crate::session::config::effective_profile(profile);
         let aliases = aliases()
@@ -305,7 +213,6 @@ impl ProfileRegistryGuard {
         }
     }
 
-    /// Drop this profile's current entries and reinstall the snapshot.
     fn restore(&mut self) {
         let mut map = aliases().write().unwrap_or_else(|p| p.into_inner());
         map.retain(|(p, _), _| p != &self.profile);
@@ -379,7 +286,6 @@ mod tests {
                 ],
             ),
         );
-        // Both substrings present: the earlier rule wins.
         assert_eq!(
             detect("default", "rules-agent", "approve? (y/n)\nesc to interrupt"),
             Some(Status::Waiting)
@@ -417,7 +323,6 @@ mod tests {
             detect("default", "rules-agent", "waiting for 2 approvals"),
             Some(Status::Waiting)
         );
-        // Regex is case-sensitive unless the pattern opts in.
         assert_eq!(
             detect("default", "rules-agent", "WAITING FOR 2 APPROVALS"),
             Some(Status::Idle)
@@ -440,11 +345,9 @@ mod tests {
                 ],
             ),
         );
-        // Every rule was invalid: the agent has no entry at all.
         assert!(!has_rules("default", "rules-agent"));
         assert_eq!(detect("default", "rules-agent", "x"), None);
 
-        // A valid rule survives alongside a skipped one.
         install_from_config(
             "default",
             &config_with_rules(
@@ -486,8 +389,6 @@ mod tests {
     fn install_is_scoped_to_its_profile() {
         let _registry_p1 = ProfileRegistryGuard::take("p1");
         let _registry_p2 = ProfileRegistryGuard::take("p2");
-        // p1's `gjc` maps a marker to Running; p2's `gjc` maps the same marker
-        // to Error. Distinct keys, so neither install touches the other.
         install_from_config(
             "p1",
             &config_with_rules(
@@ -513,7 +414,6 @@ mod tests {
             "p2 rules are independent of p1's"
         );
 
-        // Reinstalling p2 with no rules clears only p2; p1 still detects.
         install_from_config("p2", &crate::session::Config::default());
         assert!(!has_rules("p2", "gjc"));
         assert_eq!(detect("p1", "gjc", "busy marker"), Some(Status::Running));
@@ -533,34 +433,23 @@ mod tests {
                 vec![rule(HookStatus::Running, Some("spin"), None)],
             ),
         );
-        // Rules configured: the alias is ignored.
         assert_eq!(
             detection_tool("default", "rules-agent", "claude"),
             "rules-agent"
         );
-        // No rules: alias applies, and no alias means the tool itself.
         assert_eq!(detection_tool("default", "other-agent", "claude"), "claude");
         assert_eq!(detection_tool("default", "other-agent", ""), "other-agent");
     }
 
-    /// A session built before its tool was added to `[session.agent_detect_as]`
-    /// persists an empty alias, which used to strand it on the `Status::Idle`
-    /// fallback forever. The stored value is a cache, so an empty one defers to
-    /// the config the resolve installed.
     #[serial]
     #[test]
     fn effective_detect_as_falls_back_to_installed_config() {
         let _registry = ProfileRegistryGuard::take("default");
         install_from_config("default", &config_with_alias("claude-personal", "claude"));
 
-        // (tool, stored detect_as, expected alias, expected detection tool)
         let cases = [
-            // The bug: empty stored alias now resolves from config.
             ("claude-personal", "", "claude", "claude"),
-            // A stored alias still wins, so a hand-pinned session is not
-            // retargeted by an unrelated config edit.
             ("claude-personal", "codex", "codex", "codex"),
-            // A tool with no entry stays unaliased and detects as itself.
             ("unmapped-agent", "", "", "unmapped-agent"),
         ];
         for (tool, stored, want_alias, want_detection) in cases {
@@ -576,20 +465,15 @@ mod tests {
             );
         }
 
-        // The fallback is scoped per profile like the rules are.
         assert_eq!(
             effective_detect_as("other-profile", "claude-personal", ""),
             ""
         );
 
         install_from_config("default", &crate::session::Config::default());
-        // Cleared with its profile's install, so a removed entry stops applying.
         assert_eq!(effective_detect_as("default", "claude-personal", ""), "");
     }
 
-    /// Own rules outrank the alias whether the alias came from the stored field
-    /// or from the config fallback, so the fallback cannot silently take over an
-    /// agent the user wrote rules for.
     #[serial]
     #[test]
     fn own_rules_outrank_the_config_fallback() {
@@ -617,7 +501,6 @@ mod tests {
                 vec![rule(HookStatus::Running, Some("esc to interrupt"), None)],
             ),
         );
-        // ANSI codes are stripped by the dispatcher before rules run.
         assert_eq!(
             super::super::status_detection::detect_status_from_content_in(
                 "default",
@@ -626,7 +509,6 @@ mod tests {
             ),
             Status::Running
         );
-        // An unknown tool without rules still reports Idle.
         assert_eq!(
             super::super::status_detection::detect_status_from_content_in(
                 "default", "anything", "no-rules"
@@ -639,7 +521,6 @@ mod tests {
     #[test]
     fn rules_override_builtin_detector() {
         let _registry = ProfileRegistryGuard::take("default");
-        // "claude" has a built-in pane detector; configured rules outrank it.
         install_from_config(
             "default",
             &config_with_rules(
@@ -656,7 +537,6 @@ mod tests {
             Status::Error
         );
         install_from_config("default", &crate::session::Config::default());
-        // Registry cleared: the built-in detector is back in charge.
         assert_eq!(
             super::super::status_detection::detect_status_from_content_in(
                 "default",
@@ -667,17 +547,9 @@ mod tests {
         );
     }
 
-    /// The guard must hand back exactly the snapshotted entries: prior
-    /// aliases and rules clobbered by a guarded install come back with
-    /// their original matchers, a rules-only or alias-only prior is
-    /// restored on its own, and a profile that had nothing keeps nothing.
-    /// The outer guard returns each case's profile to the pre-test state
-    /// so the seeded priors themselves do not leak.
     #[serial]
     #[test]
     fn profile_registry_guard_restores_the_snapshotted_entries_on_drop() {
-        // (case label, prior config under the case's profile, alias the
-        // sentinel resolves to afterwards, "spin" detected afterwards)
         let cases = [
             ("empty", None, "", None),
             (

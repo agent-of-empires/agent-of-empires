@@ -1,15 +1,8 @@
-// Inline display of session artifacts served by the authenticated artifact
-// route. The dashboard's global `fetch` is patched to inject the auth token
-// (see fetchInterceptor.ts), so a plain `fetch(url)` carries credentials; a
-// bare <img src> would not. We therefore fetch the bytes into a blob object
-// URL and render that. Opening artifacts in a new tab lives in
-// lib/artifacts.ts. See #2587.
+// Artifact images load through the auth-patched global fetch into a blob URL;
+// a bare <img src> would carry no token.
 
 import { useEffect, useState } from "react";
 
-/** Fetch `url` (through the authed global fetch) into a blob object URL.
- *  Returns the object URL once loaded, or `null` while loading or on error.
- *  Revokes the URL on unmount / url change. */
 function useArtifactObjectUrl(url: string): string | null {
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
 
@@ -36,9 +29,7 @@ function useArtifactObjectUrl(url: string): string | null {
   return objectUrl;
 }
 
-/** Inline image for an artifact route URL. Shows the alt text as a muted
- *  placeholder until the bytes load, and keeps it if the fetch fails, so a
- *  failed artifact never renders as a broken image icon. */
+/** Alt text stands in while loading and on failure, never a broken image. */
 export function ArtifactImage({ url, alt }: { url: string; alt?: string }) {
   const objectUrl = useArtifactObjectUrl(url);
   if (!objectUrl) {

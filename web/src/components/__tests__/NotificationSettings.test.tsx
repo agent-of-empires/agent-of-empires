@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-//
-// Contract test for the NotificationSettings panel. The real Web Push
-// flow is non-trivial to run in jsdom (no ServiceWorker, no PushManager,
-// no Notification.requestPermission), so this suite mocks the
-// usePushSubscription hook entirely and asserts the rendered UI matches
-// the hook state plus that user actions invoke the corresponding hook
-// primitives. Part of #1217.
 
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render } from "@testing-library/react";
@@ -41,6 +34,11 @@ function setState(s: PushState) {
   refresh.mockClear();
 }
 
+function renderFor(state: PushState) {
+  setState(state);
+  return render(<NotificationSettings />).container;
+}
+
 function buttonByText(container: HTMLElement, match: string): HTMLButtonElement | null {
   const buttons = container.querySelectorAll("button");
   for (const b of buttons) {
@@ -53,23 +51,20 @@ function buttonByText(container: HTMLElement, match: string): HTMLButtonElement 
 
 describe("NotificationSettings", () => {
   it("renders an Enable button when state is 'off'", () => {
-    setState({ kind: "off" });
-    const { container } = render(<NotificationSettings />);
+    const container = renderFor({ kind: "off" });
     expect(buttonByText(container, "Enable notifications")).not.toBeNull();
     expect(buttonByText(container, "Send test notification")).toBeNull();
   });
 
   it("clicking Enable calls hook.enable()", () => {
-    setState({ kind: "off" });
-    const { container } = render(<NotificationSettings />);
+    const container = renderFor({ kind: "off" });
     const btn = buttonByText(container, "Enable notifications")!;
     fireEvent.click(btn);
     expect(enable).toHaveBeenCalledTimes(1);
   });
 
   it("when 'enabled', shows Send test, Re-subscribe, Turn off; hides Enable", () => {
-    setState({ kind: "enabled" });
-    const { container } = render(<NotificationSettings />);
+    const container = renderFor({ kind: "enabled" });
     expect(buttonByText(container, "Send test notification")).not.toBeNull();
     expect(buttonByText(container, "Re-subscribe")).not.toBeNull();
     expect(buttonByText(container, "Turn off")).not.toBeNull();
@@ -77,8 +72,7 @@ describe("NotificationSettings", () => {
   });
 
   it("clicking Send test, Re-subscribe, Turn off invokes the right primitives", () => {
-    setState({ kind: "enabled" });
-    const { container } = render(<NotificationSettings />);
+    const container = renderFor({ kind: "enabled" });
     fireEvent.click(buttonByText(container, "Send test notification")!);
     fireEvent.click(buttonByText(container, "Re-subscribe")!);
     fireEvent.click(buttonByText(container, "Turn off")!);
@@ -87,37 +81,31 @@ describe("NotificationSettings", () => {
     expect(disable).toHaveBeenCalledTimes(1);
   });
 
-  it("'denied' state still renders the Enable button", () => {
-    setState({ kind: "denied" });
-    const { container } = render(<NotificationSettings />);
-    expect(buttonByText(container, "Enable notifications")).not.toBeNull();
-  });
-
-  it("'error' state renders the message and the Enable button", () => {
-    setState({ kind: "error", message: "boom" });
-    const { container } = render(<NotificationSettings />);
-    expect(container.textContent).toContain("boom");
-    expect(buttonByText(container, "Enable notifications")).not.toBeNull();
-  });
-
-  it("'unsupported / ios-not-standalone' renders the install help block", () => {
-    setState({ kind: "unsupported", reason: "ios-not-standalone" });
-    const { container } = render(<NotificationSettings />);
-    expect(container.textContent).toContain("How to install on iPhone");
-    expect(buttonByText(container, "Enable notifications")).toBeNull();
-  });
-
-  it("'unsupported / insecure-origin' surfaces the HTTPS hint", () => {
-    setState({ kind: "unsupported", reason: "insecure-origin" });
-    const { container } = render(<NotificationSettings />);
-    expect(container.textContent).toContain("require HTTPS");
-  });
-
-  it("'disabled-by-server' surfaces the server-disabled hint", () => {
-    setState({ kind: "disabled-by-server" });
-    const { container } = render(<NotificationSettings />);
-    expect(container.textContent).toContain("turned off by the server");
-    expect(buttonByText(container, "Enable notifications")).toBeNull();
+  it.each([
+    ["'denied' keeps the Enable button", { kind: "denied" }, null, true],
+    ["'error' renders its message", { kind: "error", message: "boom" }, "boom", true],
+    [
+      "'unsupported / ios-not-standalone' renders the install help",
+      { kind: "unsupported", reason: "ios-not-standalone" },
+      "How to install on iPhone",
+      false,
+    ],
+    [
+      "'unsupported / insecure-origin' surfaces the HTTPS hint",
+      { kind: "unsupported", reason: "insecure-origin" },
+      "require HTTPS",
+      false,
+    ],
+    [
+      "'disabled-by-server' surfaces the server hint",
+      { kind: "disabled-by-server" },
+      "turned off by the server",
+      false,
+    ],
+  ] as [string, PushState, string | null, boolean][])("%s", (_name, state, text, enableShown) => {
+    const container = renderFor(state);
+    if (text) expect(container.textContent).toContain(text);
+    expect(buttonByText(container, "Enable notifications") !== null).toBe(enableShown);
   });
 
   it("disables the Enable button while a transition is in flight", () => {

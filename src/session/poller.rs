@@ -8,20 +8,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Default ceiling on concurrent session-id poller threads.
-///
-/// Each session that loses its poller stops refreshing the agent session id
-/// shown in its TUI row, so this cap doubles as a "how many concurrent
-/// sessions can keep their identity live" budget. A fleet that registers
-/// more live sessions than this raises it through
-/// `[session] session_id_poller_max_threads`.
 pub const DEFAULT_SESSION_ID_POLLER_MAX_THREADS: u32 = 50;
 
-/// A budget of session-id poller threads: how many are running and the
-/// ceiling they may not exceed.
-///
-/// One instance serves the whole process (`PROCESS_BUDGET`); tests that
-/// assert exact counts pin a private one (`test_support::IsolatedBudget`)
-/// so they neither observe nor disturb pollers started elsewhere.
+/// A budget of session-id poller threads: how many are running and the ceiling they may not exceed.
 #[derive(Debug)]
 pub struct PollerBudget {
     active: AtomicU32,
@@ -79,9 +68,7 @@ impl PollerBudget {
     }
 }
 
-/// The process-wide budget. Seeded with the default ceiling; the configured
-/// value is applied once at startup by
-/// [`configure_session_id_poller_max_threads`].
+/// The process-wide budget.
 static PROCESS_BUDGET: LazyLock<Arc<PollerBudget>> =
     LazyLock::new(|| Arc::new(PollerBudget::new(DEFAULT_SESSION_ID_POLLER_MAX_THREADS)));
 
@@ -96,9 +83,6 @@ fn current_budget() -> Arc<PollerBudget> {
 }
 
 /// Apply the configured poller-thread ceiling for this process.
-///
-/// A value of 0 is treated as "unset" and keeps the default, so an empty or
-/// zeroed config key can never freeze every session id.
 pub fn configure_session_id_poller_max_threads(max: u32) {
     current_budget().set_max(max);
 }
@@ -108,13 +92,9 @@ pub fn session_id_poller_max_threads() -> u32 {
     current_budget().max()
 }
 
-/// The configured ceiling for a process launched under `profile`: the
-/// global `[session] session_id_poller_max_threads` with that profile's
-/// override applied, the way every other global-only session field is
-/// consumed. The dashboard writes global-only core fields through
-/// `PATCH /api/profiles/<name>/settings`, so a value saved from Settings
-/// lives in the profile's `config.toml` and a global-file-only read would
-/// miss it. The value is applied once at startup; a change needs a restart.
+/// The configured ceiling for a process launched under `profile`: the global `[session]
+/// session_id_poller_max_threads` with that profile's override applied, the way every other
+/// global-only session field is consumed.
 pub fn configured_session_id_poller_max_threads(profile: &str) -> u32 {
     crate::session::resolve_config_or_warn(profile)
         .session
@@ -135,16 +115,8 @@ const POLLER_REPAIR_MAX_DELAY: Duration = Duration::from_secs(60);
 /// (60 s × 10 = one line per ten minutes per session).
 const POLLER_REPAIR_REMIND_EVERY: u32 = 10;
 
-/// Retry schedule for one session whose session-id poller could not be
-/// (re)started — typically because the process-wide thread budget is spent.
-///
-/// The daemon and the TUI both walk every registered session on a ~2 s
-/// tick and ask `Instance::repair_session_id_poller_if_needed`
-/// to replace a missing poller. Without a schedule, a fleet over budget
-/// retries and warns for every over-budget session on every tick — the
-/// 2026-09-04 fleet logged ~2.5 warning lines per second from two sessions.
-/// This state lives on the instance (`#[serde(skip)]`) and is carried across
-/// reloads like the poller handle itself.
+/// Retry schedule for one session whose session-id poller could not be (re)started — typically
+/// because the process-wide thread budget is spent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PollerRepairBackoff {
     next_attempt: Option<Instant>,
@@ -161,12 +133,8 @@ impl PollerRepairBackoff {
         }
     }
 
-    /// Record a failed (or skipped-for-budget) attempt at `now` and schedule
-    /// the next one: 5 s, then doubling to a 60 s ceiling.
-    ///
-    /// Returns the new delay when the caller should log — on the first
-    /// deferral, on every escalation, and as a periodic reminder once the
-    /// delay is capped — and `None` for the quiet in-between deferrals.
+    /// Record a failed (or skipped-for-budget) attempt at `now` and schedule the next one: 5 s,
+    /// then doubling to a 60 s ceiling.
     pub fn defer(&mut self, now: Instant) -> Option<Duration> {
         let previous = self.delay;
         let delay = match previous {
@@ -208,9 +176,6 @@ impl PollerRepairBackoff {
 }
 
 /// RAII guard that returns its slot to the budget on drop.
-///
-/// Ensures the count is always decremented even if the poller thread panics,
-/// preventing permanent budget exhaustion.
 struct PollerCountGuard {
     budget: Arc<PollerBudget>,
 }
@@ -221,14 +186,7 @@ impl Drop for PollerCountGuard {
     }
 }
 
-/// Whether a poller could be spawned right now. Advisory: the real acquire
-/// still happens in [`SessionPoller::start_observations`], and a racing spawn
-/// can consume the last slot between the two. Callers use it to skip the
-/// expensive spawn *setup* (a `sessions.json` load plus a `canonicalize` per
-/// stored peer, in `retroactive_capture_exclusion_set`) when the acquire is
-/// going to fail anyway. The TUI attempts a repair pass over every instance
-/// twice a second, so once the budget is full that setup was stalling the
-/// thread that also serves keystrokes for ~100ms per instance.
+/// Whether a poller could be spawned right now.
 pub(crate) fn session_id_poller_budget_available() -> bool {
     let budget = current_budget();
     budget.active() < budget.max()
@@ -240,10 +198,6 @@ const POLL_BACKOFF_FACTOR: f64 = 1.5;
 const POLL_STABLE_THRESHOLD: u32 = 3;
 
 /// Outcome of [`SessionPoller::start`].
-///
-/// Only [`Spawned`](Self::Spawned) leaves a thread running. The other
-/// variants are distinct so a caller can tell a spent budget (retry later)
-/// from an OS spawn failure (warn) and from a duplicate start (ignore).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollerSpawn {
     /// The polling thread is running.
@@ -285,9 +239,6 @@ impl AdaptiveInterval {
     }
 
     /// Record that no changes were detected; increases backoff if threshold is reached.
-    ///
-    /// Uses `Duration::from_secs_f64` for sub-second precision in the backoff calculation
-    /// (e.g., 2.0s * 1.5 = 3.0s, 3.0s * 1.5 = 4.5s).
     fn record_no_change(&mut self) {
         self.stable_count += 1;
         if self.stable_count >= self.stable_threshold {
@@ -308,18 +259,12 @@ impl AdaptiveInterval {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SessionIdGuard {
     Unguarded,
-    /// Pre-launch-marker compat path: OMP sessions captured before the launch
-    /// marker generation existed carry no generation to CAS against, so they
-    /// persist unguarded. Kept so panes launched by an older aoe stay
-    /// attributable across an upgrade; new launches always emit
-    /// `OmpGeneration`. Removable once no unmarked OMP pane can outlive an
-    /// upgrade.
+    /// Pre-launch-marker compat path: OMP sessions captured before the launch marker generation
+    /// existed carry no generation to CAS against, so they persist unguarded.
     OmpLegacy,
     OmpGeneration(String),
-    /// Read from a per-instance sidecar the agent itself wrote (Pi's
-    /// extension), so the observation names this pane rather than being
-    /// inferred from a store. Sources that cannot do that are refused for Pi;
-    /// see `session::sync`.
+    /// Read from a per-instance sidecar the agent itself wrote (Pi's extension), so the observation
+    /// names this pane rather than being inferred from a store.
     InstanceSidecar,
 }
 
@@ -371,35 +316,11 @@ enum PollCommand {
     RetryLast,
 }
 
-/// How long a poller tolerates a target tmux cannot resolve before treating it
-/// as gone, when it has never seen the pane alive. A poller is started
-/// alongside the tmux session, so the first probes can legitimately race the
-/// session's registration; a target that is still unresolvable after this
-/// window is a session that is never going to appear.
+/// How long a poller tolerates a target tmux cannot resolve before treating it as gone, when it has
+/// never seen the pane alive.
 const MISSING_TARGET_GRACE: Duration = Duration::from_secs(60);
 
 /// Tracks whether a poll target has become terminal for the poller.
-///
-/// A missing session must be terminal. `is_pane_dead` reports `false` for one
-/// (tmux answers a `display-message` it cannot resolve with exit 0 and an
-/// empty stdout), so a poller whose tmux session was killed never saw a stop
-/// condition and polled forever, holding one of the 50 budget slots for the
-/// life of the process. A daemon up for three days accumulated 32 such orphans
-/// and starved every live session of a poller.
-///
-/// Two guards keep that from tearing down a poller that should live:
-/// - a target only counts as terminal after it has held that state for two
-///   consecutive ticks, so a tmux rename between resolution and probe (which
-///   makes the old name look absent for one tick) is retried under the new
-///   name;
-/// - a *missing* target is only terminal once the pane has been seen alive, or
-///   once [`MISSING_TARGET_GRACE`] has passed, so a poller started microseconds
-///   before its tmux session registers is not reaped during that race.
-///
-/// Stopping is otherwise the safe direction: both the TUI and the daemon run a
-/// repair pass that restarts a poller for any instance with a live tmux pane,
-/// so a poller stopped in error comes back within a refresh cycle, while a
-/// leaked budget slot never comes back.
 struct TargetLiveness {
     seen_alive: bool,
     started_at: Instant,
@@ -415,9 +336,7 @@ impl TargetLiveness {
         }
     }
 
-    /// Fold one probe in, returning `(target_is_gone, should_stop)`. A gone
-    /// target skips observation even on the debounce tick: there is nothing
-    /// behind the name to read.
+    /// Fold one probe in, returning `(target_is_gone, should_stop)`.
     fn record(
         &mut self,
         target: &str,
@@ -450,9 +369,7 @@ impl TargetLiveness {
     }
 }
 
-/// Resolve and observe one poll target, returning
-/// `(target, should_stop, observation)`. Termination policy lives in
-/// [`TargetLiveness`].
+/// Resolve and observe one poll target, returning `(target, should_stop, observation)`.
 fn poll_resolved_target<T>(
     instance_id: &str,
     initial_session_name: &str,
@@ -473,18 +390,6 @@ fn poll_resolved_target<T>(
 }
 
 /// Manages polling thread lifecycle and inter-thread communication via mpsc channels.
-///
-/// # Cleanup
-///
-/// Cleanup is performed explicitly via `stop()` rather than `Drop` because
-/// `Drop` alone cannot guarantee prompt shutdown. The poller thread holds
-/// the `cmd_rx` receiver; when `SessionPoller` drops, the corresponding
-/// `cmd_tx` sender is dropped too and `recv_timeout` returns `Disconnected`
-/// immediately; so in the common case the thread exits promptly.
-///
-/// `stop()` sends an explicit `PollCommand::Stop` and joins the thread,
-/// providing a deterministic shutdown path for callers like `Instance::kill`
-/// and `Instance::restart_with_size`.
 pub struct SessionPoller {
     session_name: String,
     /// The budget this poller's thread is counted against, fixed at
@@ -525,10 +430,6 @@ impl SessionPoller {
     }
 
     /// Start the polling thread with the given callbacks.
-    ///
-    /// Returns [`PollerSpawn::Spawned`] when the thread is running; the other
-    /// variants say why it is not (duplicate start, budget spent, or the OS
-    /// refused the thread).
     pub fn start(
         &mut self,
         instance_id: String,
@@ -587,10 +488,8 @@ impl SessionPoller {
             .name(thread_label.clone())
             .stack_size(128 * 1024)
             .spawn(move || {
-                // Rebind so the closure captures `_guard` and the counter only
-                // decrements when the thread exits (including via panic). Without
-                // this, `move` would not capture an unreferenced binding and the
-                // counter would decrement as soon as `start()` returned.
+                // Rebind so the closure captures `_guard` and the counter only decrements when the
+                // thread exits (including via panic).
                 let _guard = _guard;
 
                 let mut last_known = initial_known;
@@ -639,10 +538,8 @@ impl SessionPoller {
                 loop {
                     match cmd_rx.recv_timeout(interval.current()) {
                         Ok(PollCommand::Stop) => {
-                            // Capture the pane's final observable state before
-                            // the owner joins and drains this poller. Restart
-                            // relies on this boundary to preserve a session
-                            // switch that landed just before teardown.
+                            // Capture the pane's final observable state before the owner joins and
+                            // drains this poller.
                             let (_, should_stop, observation) = poll_tick();
                             if !should_stop {
                                 report(observation, &mut last_known, &mut interval);
@@ -691,10 +588,8 @@ impl SessionPoller {
         self.result_rx.as_ref()?.try_recv().ok()
     }
 
-    /// Drain newly queued observations into a sticky one-slot mailbox and
-    /// lease the newest value without consuming it. The value remains
-    /// available to a concurrent stop/final flush until a terminal outcome
-    /// acknowledges it.
+    /// Drain newly queued observations into a sticky one-slot mailbox and lease the newest value
+    /// without consuming it.
     pub(crate) fn latest_observation(&mut self) -> Option<(String, SessionIdObservation)> {
         while let Some(observation) = self.try_recv_observation() {
             self.pending_observation = Some(observation);
@@ -791,13 +686,6 @@ impl Default for SessionPoller {
 }
 
 /// Test-only budget isolation.
-///
-/// `#[serial]` only coordinates tests that take the same lock; an
-/// unannotated test that starts a real poller still shares the process
-/// budget, so pinning that budget's counters would race it. A test that
-/// needs exact counts pins a private [`PollerBudget`] for its own thread
-/// instead: pollers it constructs draw from that budget, every other thread
-/// keeps using the process one.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
@@ -898,7 +786,6 @@ mod tests {
         drop(guard);
         assert!(!budget.exhausted_now());
 
-        // Raising the ceiling at runtime admits the waiting session.
         budget.set_active(50);
         configure_session_id_poller_max_threads(400);
         assert!(!budget.exhausted_now());
@@ -915,12 +802,6 @@ mod tests {
         );
     }
 
-    /// The ceiling a process applies is the effective one for its launch
-    /// profile — global `[session]` plus that profile's override — the way
-    /// every other global-only session field is consumed. The dashboard
-    /// writes global-only core fields through
-    /// `PATCH /api/profiles/<name>/settings`, so a read of the global file
-    /// alone would miss a value saved from Settings.
     #[test]
     #[serial]
     fn configured_ceiling_is_the_launch_profiles_effective_value() {
@@ -948,10 +829,6 @@ mod tests {
         );
     }
 
-    /// A test pins a budget of its own: pollers created on its thread draw
-    /// from it, pollers on any other thread keep drawing from the process
-    /// budget, so exact-count assertions hold without a serial lock and a
-    /// pinned ceiling never starves an unrelated test.
     #[test]
     fn isolated_budget_does_not_share_slots_with_the_process_budget() {
         let budget = test_support::IsolatedBudget::with_ceiling(1);
@@ -982,8 +859,6 @@ mod tests {
             "the isolated ceiling is the one this thread's pollers see"
         );
 
-        // Another thread (an unannotated test, in practice) is unaffected by
-        // this thread's pinned, exhausted budget.
         let elsewhere = std::thread::spawn(|| {
             let mut poller = SessionPoller::new("process".to_string());
             let outcome = poller.start(
@@ -1043,7 +918,6 @@ mod tests {
     fn repair_backoff_reminds_every_tenth_deferral_at_the_cap() {
         let mut b = PollerRepairBackoff::default();
         let now = Instant::now();
-        // Walk to the cap: deferrals 1..=5 log (5,10,20,40,60).
         for _ in 0..5 {
             b.defer(now);
         }
@@ -1070,112 +944,53 @@ mod tests {
     }
 
     #[test]
-    fn test_adaptive_interval_initial() {
-        let interval =
-            AdaptiveInterval::new(Duration::from_secs(2), Duration::from_secs(60), 1.5, 3);
-        assert_eq!(interval.current(), Duration::from_secs(2));
-    }
-
-    #[test]
-    fn test_adaptive_interval_record_no_change_increments_count() {
-        let mut interval =
-            AdaptiveInterval::new(Duration::from_secs(2), Duration::from_secs(60), 1.5, 3);
-        assert_eq!(interval.stable_count, 0);
-        interval.record_no_change();
-        assert_eq!(interval.stable_count, 1);
-        interval.record_no_change();
-        assert_eq!(interval.stable_count, 2);
-    }
-
-    #[test]
-    fn test_adaptive_interval_backoff_at_threshold() {
-        let mut interval =
-            AdaptiveInterval::new(Duration::from_secs(2), Duration::from_secs(60), 1.5, 3);
-        interval.record_no_change();
-        interval.record_no_change();
-        interval.record_no_change();
-        // After 3 calls: 2 * 1.5 = 3 seconds
-        assert_eq!(interval.current(), Duration::from_secs(3));
-        assert_eq!(interval.stable_count, 0);
-    }
-
-    #[test]
-    fn test_adaptive_interval_multiple_backoffs() {
-        let mut interval =
-            AdaptiveInterval::new(Duration::from_secs(2), Duration::from_secs(60), 1.5, 3);
-        // First backoff: 2 -> 3
-        for _ in 0..3 {
-            interval.record_no_change();
-        }
-        assert_eq!(interval.current(), Duration::from_secs(3));
-
-        // Second backoff: 3 -> 4.5 (with sub-second precision)
-        for _ in 0..3 {
-            interval.record_no_change();
-        }
-        let expected_secs = 3.0 * 1.5;
-        assert_eq!(interval.current(), Duration::from_secs_f64(expected_secs));
-    }
-
-    #[test]
-    fn test_adaptive_interval_respects_max() {
+    fn adaptive_interval_backs_off_to_the_cap_and_resets_on_change() {
         let mut interval = AdaptiveInterval::new(
-            Duration::from_secs(2),
-            Duration::from_secs(60),
-            1.5,
-            1, // threshold of 1 for faster test
+            POLL_INITIAL_INTERVAL,
+            POLL_MAX_INTERVAL,
+            POLL_BACKOFF_FACTOR,
+            POLL_STABLE_THRESHOLD,
         );
-        interval.record_no_change(); // 2 * 1.5 = 3.0
-        interval.record_no_change(); // 3.0 * 1.5 = 4.5
-        interval.record_no_change(); // 4.5 * 1.5 = 6.75
-        interval.record_no_change(); // 6.75 * 1.5 = 10.125
-        interval.record_no_change(); // 10.125 * 1.5 = 15.1875
-        interval.record_no_change(); // 15.1875 * 1.5 = 22.78125
-        interval.record_no_change(); // 22.78125 * 1.5 = 34.171875
-        interval.record_no_change(); // 34.171875 * 1.5 = 51.2578125
-        interval.record_no_change(); // 51.2578125 * 1.5 = 76.88671875 > 60, capped at 60
-        assert!(interval.current() <= Duration::from_secs(60));
-    }
-
-    #[test]
-    fn test_adaptive_interval_record_change_resets() {
-        let mut interval =
-            AdaptiveInterval::new(Duration::from_secs(2), Duration::from_secs(60), 1.5, 3);
-        for _ in 0..3 {
+        assert_eq!(interval.current(), Duration::from_secs(2));
+        for _ in 1..POLL_STABLE_THRESHOLD {
             interval.record_no_change();
         }
-        assert_eq!(interval.current(), Duration::from_secs(3));
+        assert_eq!(
+            interval.current(),
+            Duration::from_secs(2),
+            "below the threshold"
+        );
+        interval.record_no_change();
+        assert_eq!(
+            (interval.current(), interval.stable_count),
+            (Duration::from_secs(3), 0)
+        );
+        for _ in 0..POLL_STABLE_THRESHOLD {
+            interval.record_no_change();
+        }
+        assert_eq!(interval.current(), Duration::from_secs_f64(4.5));
 
+        interval.record_no_change();
         interval.record_change();
-        assert_eq!(interval.current(), Duration::from_secs(2));
-        assert_eq!(interval.stable_count, 0);
+        assert_eq!(
+            (interval.current(), interval.stable_count),
+            (Duration::from_secs(2), 0)
+        );
+
+        for _ in 0..1000 {
+            interval.record_no_change();
+            assert!(interval.current() <= POLL_MAX_INTERVAL);
+        }
+        assert_eq!(interval.current(), POLL_MAX_INTERVAL);
     }
 
     #[test]
-    fn test_session_poller_new() {
-        let poller = SessionPoller::new("test-session".to_string());
-        assert!(!poller.is_running());
-    }
-
-    #[test]
-    fn test_session_poller_stop_when_no_thread() {
+    fn stopping_an_unstarted_poller_is_a_no_op() {
         let mut poller = SessionPoller::new("test-session".to_string());
-        poller.stop(); // Should not panic
         assert!(!poller.is_running());
-    }
-
-    #[test]
-    fn test_session_poller_double_stop_safe() {
-        let mut poller = SessionPoller::new("test-session".to_string());
         poller.stop();
-        poller.stop(); // Should not panic
+        poller.stop();
         assert!(!poller.is_running());
-    }
-
-    #[test]
-    fn test_session_poller_drop_is_clean() {
-        let poller = SessionPoller::new("test-session".to_string());
-        drop(poller); // Should not panic
     }
 
     #[test]
@@ -1235,11 +1050,6 @@ mod tests {
         assert!(liveness.gone_candidate.is_none());
     }
 
-    /// The orphan case: once the pane has been seen alive, a target
-    /// tmux can no longer resolve terminates the poller, so its budget slot is
-    /// released instead of being held for the life of the process. Before the
-    /// startup grace expires, the same probe is tolerated: a poller can be
-    /// started microseconds before its tmux session registers.
     #[test]
     fn missing_target_is_terminal_only_after_the_pane_was_seen_or_the_grace_passed() {
         use crate::tmux::utils::PaneProbe;
@@ -1247,12 +1057,9 @@ mod tests {
         let t0 = Instant::now();
         let after_grace = t0 + MISSING_TARGET_GRACE;
 
-        // Never seen alive, inside the grace: keep polling.
         let mut fresh = TargetLiveness::new(t0);
         assert_eq!(fresh.record(name, PaneProbe::Missing, t0), (false, false));
 
-        // Never seen alive, past the grace: the session is never going to
-        // appear. Two consecutive ticks to stop.
         let mut stale = TargetLiveness::new(t0);
         assert_eq!(
             stale.record(name, PaneProbe::Missing, after_grace),
@@ -1263,14 +1070,11 @@ mod tests {
             (true, true)
         );
 
-        // Seen alive, then killed: terminal immediately (still debounced).
         let mut killed = TargetLiveness::new(t0);
         assert_eq!(killed.record(name, PaneProbe::Alive, t0), (false, false));
         assert_eq!(killed.record(name, PaneProbe::Missing, t0), (true, false));
         assert_eq!(killed.record(name, PaneProbe::Missing, t0), (true, true));
 
-        // A probe that could not run says nothing about the pane, and must not
-        // reap a poller for a session that is alive.
         let mut unknown = TargetLiveness::new(t0);
         assert_eq!(unknown.record(name, PaneProbe::Alive, t0), (false, false));
         assert_eq!(
@@ -1278,28 +1082,11 @@ mod tests {
             (false, false)
         );
 
-        // A recovered tick resets the debounce rather than carrying it, so an
-        // intermittently unresolvable target never accumulates toward a stop.
         let mut flaky = TargetLiveness::new(t0);
         assert_eq!(flaky.record(name, PaneProbe::Alive, t0), (false, false));
         assert_eq!(flaky.record(name, PaneProbe::Missing, t0), (true, false));
         assert_eq!(flaky.record(name, PaneProbe::Alive, t0), (false, false));
         assert_eq!(flaky.record(name, PaneProbe::Missing, t0), (true, false));
-    }
-
-    #[test]
-    fn test_adaptive_interval_with_constants() {
-        let mut interval = AdaptiveInterval::new(
-            POLL_INITIAL_INTERVAL,
-            POLL_MAX_INTERVAL,
-            POLL_BACKOFF_FACTOR,
-            POLL_STABLE_THRESHOLD,
-        );
-        assert_eq!(interval.current(), Duration::from_secs(2));
-        for _ in 0..POLL_STABLE_THRESHOLD {
-            interval.record_no_change();
-        }
-        assert_eq!(interval.current(), Duration::from_secs(3));
     }
 
     #[test]
@@ -1343,7 +1130,6 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the changed observation must be published before retrying it");
         poller.retry_last_observation();
-        // Stop follows RetryLast on the same FIFO and joins every callback.
         poller.stop();
 
         let ids = lock_unpoisoned(&changed_ids);
@@ -1379,9 +1165,6 @@ mod tests {
             poller.cmd_rx.is_some(),
             "cmd_rx should be returned when budget exhausted"
         );
-        // The advisory pre-check callers use to skip spawn setup must agree
-        // with the acquire that just failed; a disagreement puts the ~100ms
-        // exclusion-set build back on the TUI's repair pass.
         assert!(
             !session_id_poller_budget_available(),
             "pre-check must report the exhausted budget the acquire rejected"
@@ -1394,9 +1177,6 @@ mod tests {
         );
     }
 
-    /// The repair path (`defer_poller_repair`) owns the exhausted-budget
-    /// warning and throttles it; `start` itself must stay below WARN or
-    /// every deferred attempt at the cap warns again.
     #[traced_test]
     #[test]
     fn test_budget_exhaustion_leaves_the_warning_to_the_repair_path() {
@@ -1479,7 +1259,6 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let mut poller = SessionPoller::new("test-session".to_string());
-        // Stop is already queued, so no periodic tick can publish the final ID.
         poller.cmd_tx.send(PollCommand::Stop).expect("queue stop");
         assert_eq!(
             poller.start(
@@ -1514,71 +1293,9 @@ mod tests {
     }
 
     #[test]
-    fn test_interval_exact_at_threshold() {
-        let mut interval = AdaptiveInterval::new(
-            Duration::from_secs(2),
-            Duration::from_secs(60),
-            1.5,
-            POLL_STABLE_THRESHOLD,
-        );
-
-        for _ in 0..POLL_STABLE_THRESHOLD {
-            interval.record_no_change();
-        }
-        // 2 * 1.5 = 3
-        assert_eq!(interval.current(), Duration::from_secs(3));
-        assert_eq!(interval.stable_count, 0);
-
-        interval.record_no_change();
-        assert_eq!(interval.current(), Duration::from_secs(3));
-        assert_eq!(interval.stable_count, 1);
-    }
-
-    #[test]
-    fn test_interval_max_clamping_precision() {
-        let mut interval = AdaptiveInterval::new(
-            Duration::from_secs(2),
-            POLL_MAX_INTERVAL,
-            POLL_BACKOFF_FACTOR,
-            POLL_STABLE_THRESHOLD,
-        );
-
-        for _ in 0..1000 {
-            interval.record_no_change();
-            assert!(
-                interval.current() <= POLL_MAX_INTERVAL,
-                "interval {} exceeded max {}",
-                interval.current().as_secs(),
-                POLL_MAX_INTERVAL.as_secs()
-            );
-        }
-        assert_eq!(interval.current(), POLL_MAX_INTERVAL);
-    }
-
-    #[test]
-    fn test_interval_change_mid_backoff() {
-        let mut interval = AdaptiveInterval::new(
-            Duration::from_secs(2),
-            Duration::from_secs(60),
-            1.5,
-            POLL_STABLE_THRESHOLD,
-        );
-
-        interval.record_no_change();
-        interval.record_no_change();
-        assert_eq!(interval.stable_count, 2);
-        assert_eq!(interval.current(), Duration::from_secs(2));
-
-        interval.record_change();
-        assert_eq!(interval.current(), Duration::from_secs(2));
-        assert_eq!(interval.stable_count, 0);
-    }
-
-    #[test]
     #[serial]
     fn test_poller_publishes_before_waiting_for_commands() {
         let mut poller = SessionPoller::new("test-session".to_string());
-        // Disconnection prevents either a periodic tick or Stop's final poll.
         let (cmd_tx, cmd_rx) = mpsc::channel();
         drop(cmd_tx);
         poller.cmd_rx = Some(cmd_rx);

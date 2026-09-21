@@ -1,24 +1,10 @@
-//! Plugin-adoption census for `usage_snapshot` (#2367).
-//!
-//! Two maps, both fed straight from the loaded [`crate::plugin::PluginRegistry`]:
-//! - `plugins_by_source`: installed count per source bucket
-//!   (`builtin` / `featured` / `community` / `local`). A count by category,
-//!   never an identity, so it is safe for every source.
-//! - `plugins_active`: active state for the plugins whose identity is safe to
-//!   name, builtin (compiled in) and featured (in the curated index). An
-//!   unfeatured GitHub install (possibly a private repo) or a local-directory
-//!   install is counted in `plugins_by_source` but never named here.
-//!
-//! The named-id allowlist rests on [`ValidationState`]: `Featured` is
-//! re-derived live from the embedded index and the on-disk tree hash, so a
-//! community plugin cannot reach the `Featured` arm by reusing a featured id.
+//! Plugin census: installed count per source, and active state for builtin and featured
+//! ids only. `Featured` is re-derived from the embedded index, so an id collision cannot reach it.
 
 use std::collections::BTreeMap;
 
 use crate::plugin::registry::{LoadedPlugin, ValidationState};
 
-/// Build the `(plugins_by_source, plugins_active)` census from the loaded
-/// plugins. Pure over the slice, no disk reads.
 pub fn census(plugins: &[LoadedPlugin]) -> (BTreeMap<String, u32>, BTreeMap<String, bool>) {
     let mut by_source: BTreeMap<String, u32> = BTreeMap::new();
     let mut active: BTreeMap<String, bool> = BTreeMap::new();
@@ -77,7 +63,6 @@ mod tests {
         assert_eq!(by_source.get("community"), Some(&1));
         assert_eq!(by_source.get("local"), Some(&1));
 
-        // Only builtin + featured ids are named; community / local never are.
         assert_eq!(active.get("aoe.web"), Some(&true));
         assert_eq!(active.get("acme.featured"), Some(&true));
         assert_eq!(active.get("acme.community"), None);
@@ -99,8 +84,6 @@ mod tests {
 
     #[test]
     fn community_plugin_reusing_a_featured_id_is_not_named() {
-        // A community install cannot reach the Featured arm, so even an id
-        // collision with a real featured plugin stays anonymous.
         let plugins = vec![plugin(
             "acme.featured",
             ValidationState::Community,

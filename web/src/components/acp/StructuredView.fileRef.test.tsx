@@ -14,9 +14,6 @@ import { useAcpFileRef } from "./AcpFileRefContext";
 import type { FileRefSession } from "../../lib/fileRef";
 
 vi.mock("./AcpRuntime", () => ({
-  SUBAGENT_TASK_NAME: "Task",
-  TODO_GROUP_NAME: "Todos",
-  TOOL_GROUP_NAME: "Tools",
   AcpRuntime: () => {
     const { fileRefSession } = useAcpFileRef();
     return <div data-testid="probe">{fileRefSession?.project_path ?? "none"}</div>;

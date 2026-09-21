@@ -1,335 +1,213 @@
-//! In-module tests for `HomeView` file-watch wiring, exercising
-//! `HomeView::new` and `HomeView::rewire_disk_subscriptions` directly.
-//! The integration-level tests under `tests/filewatch_tui_*.rs`
-//! exercise the same wiring against the public `file_watch` API in
-//! isolation.
-//!
-//! Async TUI tests are segregated to this module so the much larger
-//! synchronous `tests.rs` file is not forced to mix sync `#[test]`
-//! with `#[tokio::test]` runtime infrastructure.
+//! `HomeView` file-watch wiring tests against a live `FileWatchService`.
 
 #![cfg(test)]
 
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serial_test::serial;
 use tempfile::TempDir;
 
+use super::tests::live_send_state;
+use super::watchers::{ConfigWatchKey, ReloadFailureState, WatcherInitError, WatcherInitErrorKind};
 use super::HomeView;
-use crate::file_watch::FileWatchService;
-use crate::session::test_support::{isolate_home, EnvGuard};
-use crate::session::{Instance, Storage};
+use crate::file_watch::{FileWatchService, WatchErrorKind};
+use crate::session::test_support::{isolate_home, EnvGuard, HomeGuard};
+use crate::session::{Instance, Item, Storage};
 
-fn watcher_err(profile: Option<&str>, message: &str) -> super::watchers::WatcherInitError {
-    super::watchers::WatcherInitError {
+fn init_err(profile: Option<&str>, kind: WatcherInitErrorKind, message: &str) -> WatcherInitError {
+    WatcherInitError {
         profile: profile.map(str::to_owned),
-        kind: super::watchers::WatcherInitErrorKind::Watch(
-            crate::file_watch::WatchErrorKind::Other,
-        ),
+        kind,
         message: message.to_owned(),
     }
 }
 
-/// Poll `pred` every 25ms up to `deadline`. Avoids a fixed sleep that
-/// would either flake on slow CI or pad the test runtime on fast paths.
-async fn wait_until<F>(deadline: Duration, mut pred: F) -> bool
-where
-    F: FnMut() -> bool,
-{
-    let start = std::time::Instant::now();
-    while start.elapsed() < deadline {
-        if pred() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    false
+fn watcher_err(profile: Option<&str>, message: &str) -> WatcherInitError {
+    init_err(
+        profile,
+        WatcherInitErrorKind::Watch(WatchErrorKind::Other),
+        message,
+    )
 }
 
-/// Locks the adapter-spawn contract: real watcher events must flip
-/// `disk_watch.dirty` through the `HomeView::new` wiring.
-#[tokio::test]
-#[serial]
-async fn home_view_new_spawns_adapter_that_flips_disk_dirty() {
+struct Env {
+    view: HomeView,
+    live: Arc<FileWatchService>,
+    temp: TempDir,
+    _home: HomeGuard,
+}
+
+/// Isolated home with `seed_dirs` created, and a live-watch view on `profile`.
+fn env(profile: &str, seed_dirs: &[&str]) -> Env {
+    env_seeded(profile, seed_dirs, |_| {})
+}
+
+/// Like [`env`], running `seed` before the view loads.
+fn env_seeded(profile: &str, seed_dirs: &[&str], seed: impl FnOnce(&Arc<FileWatchService>)) -> Env {
     let temp = TempDir::new().expect("tempdir");
     let _home = isolate_home(temp.path());
-
     let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("hv-adapter").expect("seed dir");
-
+    for dir in seed_dirs {
+        crate::session::get_profile_dir(dir).expect("seed dir");
+    }
+    seed(&live);
     let view = HomeView::new_for_test(
-        Some("hv-adapter".to_string()),
+        Some(profile.to_string()),
         crate::tmux::AvailableTools::with_tools(&["claude"]),
         live.clone(),
     )
     .expect("HomeView::new");
+    Env {
+        view,
+        live,
+        temp,
+        _home,
+    }
+}
 
-    // Install a watcher subscription via the real rewire path so the
-    // dispatcher routes peer writes through the adapter task that
-    // HomeView::new just spawned.
-    let mut view = view;
-    view.rewire_disk_subscriptions(&["hv-adapter".to_string()]);
+fn names(names: &[&str]) -> Vec<String> {
+    names.iter().map(|n| n.to_string()).collect()
+}
 
-    let writer = Storage::new("hv-adapter", live.clone()).expect("writer");
-    writer
+fn has_config_watch(view: &HomeView, profile: &str) -> bool {
+    view.config_watch
+        .handles
+        .contains_key(&ConfigWatchKey::profile(profile))
+}
+
+fn session_row(view: &HomeView, session_id: &str) -> Option<usize> {
+    view.flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { id, .. } if id == session_id))
+}
+
+#[tokio::test]
+#[serial]
+async fn peer_write_flips_disk_dirty() {
+    let mut e = env("hv-adapter", &["hv-adapter"]);
+    e.view.rewire_disk_subscriptions(&names(&["hv-adapter"]));
+
+    Storage::new("hv-adapter", e.live.clone())
+        .expect("writer")
         .update(|i, _g| {
             *i = vec![Instance::new("peer-write", "/tmp/peer")];
             Ok(())
         })
         .expect("peer write");
 
-    let flipped = wait_until(Duration::from_secs(2), || {
-        view.disk_watch.dirty.load(Ordering::Acquire)
-    })
-    .await;
-    assert!(
-        flipped,
-        "HomeView::new must spawn the adapter task that flips disk_dirty on dispatcher events"
-    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !e.view.disk_watch.dirty.load(Ordering::Acquire) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "peer write must flip disk_dirty"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
-/// Locks the canonical remove path in `rewire_disk_subscriptions`:
-/// removing a profile must leave no stale `disk_watch.handles` entry
-/// behind.
 #[tokio::test]
 #[serial]
 async fn rewire_disk_subscriptions_drops_removed_profile_entry() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
+    let mut e = env("hv-keep", &["hv-keep", "hv-drop"]);
+    e.view
+        .rewire_disk_subscriptions(&names(&["hv-keep", "hv-drop"]));
+    assert!(e.view.disk_watch.handles.contains_key("hv-drop"));
 
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("hv-keep").expect("dir");
-    crate::session::get_profile_dir("hv-drop").expect("dir");
+    e.view.rewire_disk_subscriptions(&names(&["hv-keep"]));
 
-    let mut view = HomeView::new_for_test(
-        Some("hv-keep".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    view.rewire_disk_subscriptions(&["hv-keep".to_string(), "hv-drop".to_string()]);
-    assert!(
-        view.disk_watch.handles.contains_key("hv-keep"),
-        "precondition: hv-keep installed"
-    );
-    assert!(
-        view.disk_watch.handles.contains_key("hv-drop"),
-        "precondition: hv-drop installed"
-    );
-
-    view.rewire_disk_subscriptions(&["hv-keep".to_string()]);
-
-    assert!(
-        view.disk_watch.handles.contains_key("hv-keep"),
-        "rewire must keep entries for profiles still in the current set"
-    );
-    assert!(
-        !view.disk_watch.handles.contains_key("hv-drop"),
-        "rewire must drop+abort the entry for a removed profile"
-    );
-    assert_eq!(
-        view.disk_watch.handles.len(),
-        1,
-        "exactly the surviving profile's disk_watch_handles entry remains; live `subscriber_count()` also includes config-watch subscriptions wired by `rewire_config_subscriptions` and is not the right invariant for the disk-only path"
-    );
+    let keys: Vec<_> = e.view.disk_watch.handles.keys().collect();
+    assert_eq!(keys, ["hv-keep"]);
 }
 
-/// Locks the config-watch remove/recreate path: deleting a profile must
-/// clear its typed key, and recreating it must restore the subscription
-/// count back to baseline without leaking an extra entry.
 #[tokio::test]
 #[serial]
 async fn config_subscriptions_remove_then_recreate_does_not_leak_or_double_subscribe() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
+    let mut e = env("cfg-leak", &["cfg-leak"]);
+    e.view.rewire_config_subscriptions(&names(&["cfg-leak"]));
+    let baseline = e.live.subscriber_count();
+    assert!(has_config_watch(&e.view, "cfg-leak"));
 
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("cfg-leak").expect("seed dir");
+    e.view.rewire_config_subscriptions(&[]);
+    assert!(!has_config_watch(&e.view, "cfg-leak"));
 
-    let mut view = HomeView::new_for_test(
-        Some("cfg-leak".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    use super::watchers::ConfigWatchKey;
-
-    view.rewire_config_subscriptions(&["cfg-leak".to_string()]);
-    let baseline = live.subscriber_count();
-    assert!(
-        view.config_watch
-            .handles
-            .contains_key(&ConfigWatchKey::profile("cfg-leak")),
-        "precondition: profile config sub installed"
-    );
-
-    view.rewire_config_subscriptions(&[]);
-    assert!(
-        !view
-            .config_watch
-            .handles
-            .contains_key(&ConfigWatchKey::profile("cfg-leak")),
-        "remove must drop the per-profile entry"
-    );
-
-    view.rewire_config_subscriptions(&["cfg-leak".to_string()]);
-    assert!(
-        view.config_watch
-            .handles
-            .contains_key(&ConfigWatchKey::profile("cfg-leak")),
-        "recreate must reinstall the per-profile entry"
-    );
-    assert_eq!(
-        live.subscriber_count(),
-        baseline,
-        "remove-then-recreate must converge to the same live subscription count, not double up"
-    );
+    e.view.rewire_config_subscriptions(&names(&["cfg-leak"]));
+    assert!(has_config_watch(&e.view, "cfg-leak"));
+    assert_eq!(e.live.subscriber_count(), baseline);
 }
 
-/// Locks the resurrection-prevention invariant for
-/// `rewire_config_subscriptions`: the inode-invalidation pre-pass
-/// resolves profile paths through the non-creating
-/// `get_profile_dir_path`, so a deleted profile directory stays
-/// deleted when a subsequent rewire iterates it in `prior_profiles`.
+/// Rewires resolve profile dirs without creating them, in both the invalidation pass and install loop.
 #[tokio::test]
 #[serial]
-async fn rewire_config_subscriptions_does_not_resurrect_deleted_profile_dir() {
-    use super::watchers::ConfigWatchKey;
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
+async fn rewire_never_resurrects_missing_profile_dirs() {
+    let mut e = env("ghost", &["ghost"]);
+    let ghost_dir = crate::session::get_profile_dir_path("ghost").unwrap();
+    e.view.rewire_config_subscriptions(&names(&["ghost"]));
+    assert!(has_config_watch(&e.view, "ghost"));
+    std::fs::remove_dir_all(&ghost_dir).expect("delete profile dir");
+    e.view.rewire_config_subscriptions(&[]);
+    assert!(!ghost_dir.exists());
 
-    let live = FileWatchService::new().expect("live svc");
-    let profile_dir = crate::session::get_profile_dir("ghost").expect("seed dir");
-
-    let mut view = HomeView::new_for_test(
-        Some("ghost".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    view.rewire_config_subscriptions(&["ghost".to_string()]);
-    assert!(
-        view.config_watch
-            .handles
-            .contains_key(&ConfigWatchKey::profile("ghost")),
-        "precondition: profile config sub installed"
-    );
-
-    std::fs::remove_dir_all(&profile_dir).expect("delete profile dir");
-    assert!(
-        !profile_dir.exists(),
-        "precondition: profile dir is gone before the rewire pre-pass runs"
-    );
-
-    view.rewire_config_subscriptions(&[]);
-
-    assert!(
-        !profile_dir.exists(),
-        "the inode-invalidation pre-pass must use a non-creating resolver; \
-         a deleted profile directory stays deleted across rewire"
-    );
+    // A stale snapshot listing a deleted profile is skipped by both install loops.
+    let stale = "stale-deleted";
+    let stale_dir = crate::session::get_profile_dir_path(stale).unwrap();
+    crate::session::get_profile_dir("active").unwrap();
+    e.view
+        .rewire_config_subscriptions(&names(&["active", stale]));
+    e.view.rewire_disk_subscriptions(&names(&["active", stale]));
+    assert!(!stale_dir.exists());
+    assert!(!has_config_watch(&e.view, stale));
+    assert!(has_config_watch(&e.view, "active"));
+    assert!(!e.view.disk_watch.handles.contains_key(stale));
+    assert!(e.view.disk_watch.handles.contains_key("active"));
 }
 
-/// In single-profile mode, `reload_storage_only` keeps disk
-/// subscriptions scoped to `self.storages.keys()` (just the active
-/// profile) while config subscriptions cover the full on-disk
-/// profile set. Widening disk wiring to `current_profiles` would
-/// watch peer profiles' sessions.json/groups.json that the user
-/// explicitly opted out of by passing `--profile X`.
+/// `--profile X` scopes disk watches to X; config watches cover every profile on disk.
 #[tokio::test]
 #[serial]
-async fn reload_storage_only_keeps_disk_watch_scoped_in_single_profile_mode() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("active-only").expect("seed active dir");
-    crate::session::get_profile_dir("peer-one").expect("seed peer 1 dir");
-    crate::session::get_profile_dir("peer-two").expect("seed peer 2 dir");
-
-    let mut view = HomeView::new_for_test(
-        Some("active-only".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    view.reload_storage_only().expect("reload");
-
-    use super::watchers::ConfigWatchKey;
-    assert_eq!(
-        view.disk_watch.handles.len(),
-        1,
-        "single-profile mode must keep disk watches scoped to the active profile only; \
-         got {} entries: {:?}",
-        view.disk_watch.handles.len(),
-        view.disk_watch.handles.keys().collect::<Vec<_>>()
+async fn single_profile_mode_scopes_disk_watch_but_not_config_watch() {
+    let mut e = env(
+        "active-only",
+        &["active-only", "peer-one", "peer-two", "peer-deleted"],
     );
-    assert!(
-        view.disk_watch.handles.contains_key("active-only"),
-        "the active profile's disk watch must be present after reload"
-    );
-    assert!(
-        view.config_watch
-            .handles
-            .contains_key(&ConfigWatchKey::profile("peer-one")),
-        "peer profiles' CONFIG watches must be wired (asymmetric design): \
-         peer config edits propagate to picker UI / status-hook cache"
-    );
-    assert!(
-        view.config_watch
-            .handles
-            .contains_key(&ConfigWatchKey::profile("peer-two")),
-        "all on-disk profiles must have config watches in single-profile mode"
-    );
+    e.view.reload_storage_only().expect("reload");
+    let keys: Vec<_> = e.view.disk_watch.handles.keys().collect();
+    assert_eq!(keys, ["active-only"]);
+    assert!(has_config_watch(&e.view, "peer-one"));
+    assert!(has_config_watch(&e.view, "peer-two"));
+
+    let deleted_dir = crate::session::get_profile_dir_path("peer-deleted").unwrap();
+    std::fs::remove_dir_all(&deleted_dir).expect("remove peer-deleted");
+    e.view.rewire_after_profile_delete("peer-deleted");
+    let keys: Vec<_> = e.view.disk_watch.handles.keys().collect();
+    assert_eq!(keys, ["active-only"]);
+    assert!(has_config_watch(&e.view, "peer-one"));
+    assert!(!has_config_watch(&e.view, "peer-deleted"));
 }
 
 #[tokio::test]
 #[serial]
 async fn reload_storage_only_preserves_live_send_state_while_adding_peer_row() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    let writer = Storage::new("live-refresh", live.clone()).expect("writer");
     let mut active = Instance::new("active-live", "/tmp/active-live");
     active.source_profile = "live-refresh".to_string();
     let active_id = active.id.clone();
-    writer
-        .update(|instances, _groups| {
-            instances.push(active);
-            Ok(())
-        })
-        .expect("seed active row");
-
-    let mut view = HomeView::new_for_test(
-        Some("live-refresh".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-    view.cursor = view
-        .flat_items
-        .iter()
-        .position(
-            |item| matches!(item, crate::session::Item::Session { id, .. } if id == &active_id),
-        )
-        .expect("active row in flat items");
+    let mut e = env_seeded("live-refresh", &[], |live| {
+        Storage::new("live-refresh", live.clone())
+            .expect("writer")
+            .update(|instances, _groups| {
+                instances.push(active);
+                Ok(())
+            })
+            .expect("seed active row");
+    });
+    let writer = Storage::new("live-refresh", e.live.clone()).expect("writer");
+    let view = &mut e.view;
+    view.cursor = session_row(view, &active_id).expect("active row in flat items");
     view.update_selected();
 
     let tmux_name = crate::tmux::Session::resolve_name(&active_id, "active-live");
-    view.live_send = Some(super::live_send::LiveSendState {
-        session_id: active_id.clone(),
-        title: "active-live".to_string(),
-        tmux_name: tmux_name.clone(),
-        target: super::live_send::LiveSendTarget::Agent,
-        exit_chords: super::live_send::parse_chord_list(super::live_send::DEFAULT_EXIT_CHORD),
-        leader: None,
-    });
+    view.live_send = Some(live_send_state(&active_id, "active-live", &tmux_name));
     view.pending_paste = Some("queued paste".to_string());
     view.preview_capture_target = Some(tmux_name.clone());
     view.live_send_last_resize = Some((100, 30));
@@ -354,18 +232,10 @@ async fn reload_storage_only_preserves_live_send_state_while_adding_peer_row() {
     view.reload_storage_only().expect("storage-only reload");
 
     assert!(view
-        .instances
-        .values()
-        .any(|inst| inst.title == "peer-added"));
+        .get_instance(&active_id)
+        .is_some_and(Instance::is_trashed));
     assert!(
-        view.get_instance(&active_id)
-            .is_some_and(Instance::is_trashed),
-        "storage mirror must consume the active row mutation"
-    );
-    assert!(
-        !view.flat_items.iter().any(
-            |item| matches!(item, crate::session::Item::Session { id, .. } if id == &active_id)
-        ),
+        session_row(view, &active_id).is_none(),
         "precondition: the active row moved under the collapsed trash shelf"
     );
     assert_eq!(view.selected_session.as_deref(), Some(active_id.as_str()));
@@ -384,66 +254,52 @@ async fn reload_storage_only_preserves_live_send_state_while_adding_peer_row() {
         .flat_items
         .iter()
         .position(|item| {
-            matches!(item, crate::session::Item::Session { id, .. }
+            matches!(item, Item::Session { id, .. }
                 if view.get_instance(id).is_some_and(|inst| inst.title == "peer-added"))
         })
         .expect("peer row remains visible");
-    assert!(
-        view.search_matches.contains(&peer_index),
-        "reload must still refresh search matches without moving live selection"
-    );
+    assert!(view.search_matches.contains(&peer_index));
     assert!(
         !view.is_sidebar_item_selected(&view.flat_items[peer_index], peer_index),
         "cursor fallback must not visibly retarget selection during live-send"
     );
     let state = view.live_send.as_ref().expect("live-send remains active");
-    assert_eq!(state.session_id, active_id);
-    assert_eq!(state.title, "active-live");
-    assert_eq!(state.tmux_name, tmux_name);
+    assert_eq!(
+        (
+            state.session_id.as_str(),
+            state.title.as_str(),
+            state.tmux_name.as_str()
+        ),
+        (active_id.as_str(), "active-live", tmux_name.as_str())
+    );
     assert_eq!(state.target, super::live_send::LiveSendTarget::Agent);
 }
 
 #[tokio::test]
 #[serial]
 async fn reload_storage_only_ends_live_send_when_active_row_is_removed() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    let writer = Storage::new("live-refresh", live.clone()).expect("writer");
     let active = Instance::new("active-live", "/tmp/active-live");
     let active_id = active.id.clone();
     let peer = Instance::new("peer", "/tmp/peer");
     let peer_id = peer.id.clone();
-    writer
-        .update(|instances, _groups| {
-            instances.extend([active, peer]);
-            Ok(())
-        })
-        .expect("seed rows");
-
-    let mut view = HomeView::new_for_test(
-        Some("live-refresh".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live,
-    )
-    .expect("HomeView::new");
-    view.cursor = view
-        .flat_items
-        .iter()
-        .position(
-            |item| matches!(item, crate::session::Item::Session { id, .. } if id == &active_id),
-        )
-        .expect("active row in flat items");
-    view.update_selected();
-    view.live_send = Some(super::live_send::LiveSendState {
-        session_id: active_id.clone(),
-        title: "active-live".to_string(),
-        tmux_name: "aoe_test_removed_live_refresh".to_string(),
-        target: super::live_send::LiveSendTarget::Agent,
-        exit_chords: super::live_send::parse_chord_list(super::live_send::DEFAULT_EXIT_CHORD),
-        leader: None,
+    let mut e = env_seeded("live-refresh", &[], |live| {
+        Storage::new("live-refresh", live.clone())
+            .expect("writer")
+            .update(|instances, _groups| {
+                instances.extend([active, peer]);
+                Ok(())
+            })
+            .expect("seed rows");
     });
+    let writer = Storage::new("live-refresh", e.live.clone()).expect("writer");
+    let view = &mut e.view;
+    view.cursor = session_row(view, &active_id).expect("active row in flat items");
+    view.update_selected();
+    view.live_send = Some(live_send_state(
+        &active_id,
+        "active-live",
+        "aoe_test_removed_live_refresh",
+    ));
 
     writer
         .update(|instances, _groups| {
@@ -451,7 +307,6 @@ async fn reload_storage_only_ends_live_send_when_active_row_is_removed() {
             Ok(())
         })
         .expect("remove active row");
-
     view.reload_storage_only().expect("storage-only reload");
 
     assert!(view.get_instance(&active_id).is_none());
@@ -469,26 +324,11 @@ async fn reload_storage_only_ends_live_send_when_active_row_is_removed() {
 #[tokio::test]
 #[serial]
 async fn reload_failure_dialog_waits_until_live_send_exits() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    let mut view = HomeView::new_for_test(
-        Some("live-failure".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live,
-    )
-    .expect("HomeView::new");
-    view.live_send = Some(super::live_send::LiveSendState {
-        session_id: "active".to_string(),
-        title: "active".to_string(),
-        tmux_name: "aoe_test_live_failure".to_string(),
-        target: super::live_send::LiveSendTarget::Agent,
-        exit_chords: super::live_send::parse_chord_list(super::live_send::DEFAULT_EXIT_CHORD),
-        leader: None,
-    });
+    let mut e = env("live-failure", &[]);
+    let view = &mut e.view;
+    view.live_send = Some(live_send_state("active", "active", "aoe_test_live_failure"));
     view.reload_failure_state
-        .record_storage(&Err::<(), _>(anyhow::anyhow!("disk unreadable")));
+        .record_storage(&Err(anyhow::anyhow!("disk unreadable")));
 
     assert!(!view.try_present_reload_failure_dialog());
     assert!(view.info_dialog.is_none());
@@ -502,129 +342,47 @@ async fn reload_failure_dialog_waits_until_live_send_exits() {
     );
 }
 
-/// Locks the single-profile-mode scoping invariant for
-/// `rewire_after_profile_delete`. In `aoe --profile X` mode
-/// `can_delete_selected` requires `!p.is_active`, so the deleted
-/// profile is always a peer; the post-delete `list_profiles()`
-/// snapshot must not be passed verbatim to
-/// `rewire_disk_subscriptions` because peer-profile disk watches
-/// violate the single-profile-mode contract that the user opted
-/// into with `--profile X`. Disk targets are scoped to
-/// `self.storages.keys()` (the active profile), using the same
-/// shape `reload_storage_only` uses. Config watches stay full-set
-/// because peer config edits must propagate to the picker UI even
-/// in single-profile mode.
+/// A `list_profiles` failure after a profile delete raises a Watcher Warning that sits outside
+/// `reload_failure_state`, survives the recovery-edge cleanup, and never replaces another dialog.
 #[tokio::test]
 #[serial]
-async fn rewire_after_profile_delete_keeps_disk_watch_scoped_in_single_profile_mode() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("active-scoped").expect("seed active");
-    crate::session::get_profile_dir("peer-stays").expect("seed peer that stays");
-    crate::session::get_profile_dir("peer-deleted").expect("seed peer to delete");
-
-    let mut view = HomeView::new_for_test(
-        Some("active-scoped".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    let deleted_dir =
-        crate::session::get_profile_dir_path("peer-deleted").expect("peer-deleted path");
-    std::fs::remove_dir_all(&deleted_dir).expect("remove peer-deleted");
-
-    view.rewire_after_profile_delete("peer-deleted");
-
-    use super::watchers::ConfigWatchKey;
-    assert_eq!(
-        view.disk_watch.handles.len(),
-        1,
-        "single-profile mode must keep disk watches scoped to the active profile after a peer delete; \
-         got {} entries: {:?}",
-        view.disk_watch.handles.len(),
-        view.disk_watch.handles.keys().collect::<Vec<_>>()
-    );
-    assert!(
-        view.disk_watch.handles.contains_key("active-scoped"),
-        "the active profile's disk watch must remain installed"
-    );
-    assert!(
-        view.config_watch
-            .handles
-            .contains_key(&ConfigWatchKey::profile("peer-stays")),
-        "remaining peer profiles' CONFIG watches must stay wired (asymmetric design)"
-    );
-    assert!(
-        !view
-            .config_watch
-            .handles
-            .contains_key(&ConfigWatchKey::profile("peer-deleted")),
-        "the deleted peer's config watch must be torn down"
-    );
-}
-
-/// When `list_profiles()` fails after a successful create or delete,
-/// `rewire_after_profile_delete` must surface a Watcher Warning to
-/// the user via `info_dialog` (in addition to logging a structured
-/// warn). The test seam in `crate::session` injects the failure
-/// without requiring a platform-fragile permission denial.
-#[tokio::test]
-#[serial]
-async fn rewire_after_profile_delete_surfaces_dialog_when_list_profiles_fails() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("seam-test").expect("seed dir");
-
-    let mut view = HomeView::new_for_test(
-        Some("seam-test".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    assert!(
-        view.info_dialog.is_none(),
-        "precondition: no dialog before the failure"
-    );
-
+async fn rewire_after_profile_delete_warns_when_list_profiles_fails() {
+    let mut e = env("seam-test", &["seam-test"]);
     let _fail_guard = crate::session::FailNextListProfilesGuard::new();
-    view.rewire_after_profile_delete("seam-test");
-
-    assert!(
-        view.info_dialog.is_some(),
-        "list_profiles failure must surface a Watcher Warning dialog to the user; \
-         silently swallowing the error would leave info_dialog None"
-    );
-
+    e.view.rewire_after_profile_delete("seam-test");
     assert!(
         crate::session::list_profiles().is_ok(),
         "seam must auto-clear after firing once"
+    );
+    assert_eq!(
+        e.view.info_dialog.as_ref().map(|d| d.title()),
+        Some("Watcher Warning")
+    );
+    assert!(!e.view.reload_failure_state.has_any_failure());
+    assert!(!e.view.try_clear_recovered_reload_dialog());
+    assert_eq!(
+        e.view.info_dialog.as_ref().map(|d| d.title()),
+        Some("Watcher Warning")
+    );
+
+    e.view.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+        "Existing dialog",
+        "keep me",
+    ));
+    let _fail_guard = crate::session::FailNextListProfilesGuard::new();
+    e.view.rewire_after_profile_delete("seam-test");
+    assert_eq!(
+        e.view.info_dialog.as_ref().map(|d| d.title()),
+        Some("Existing dialog")
     );
 }
 
 #[tokio::test]
 #[serial]
 async fn reload_storage_only_survives_list_profiles_failure() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("reload-fallback").expect("seed dir");
-
-    let mut view = HomeView::new_for_test(
-        Some("reload-fallback".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    let writer = Storage::new("reload-fallback", live.clone()).expect("writer");
-    writer
+    let mut e = env("reload-fallback", &["reload-fallback"]);
+    Storage::new("reload-fallback", e.live.clone())
+        .expect("writer")
         .update(|instances, _groups| {
             *instances = vec![Instance::new("fallback-row", "/tmp/fallback")];
             Ok(())
@@ -632,1014 +390,391 @@ async fn reload_storage_only_survives_list_profiles_failure() {
         .expect("peer write");
 
     let _fail_guard = crate::session::FailNextListProfilesGuard::new();
-    view.reload_storage_only()
+    e.view
+        .reload_storage_only()
         .expect("reload should degrade, not fail");
 
-    assert!(
-        view.instances
-            .values()
-            .any(|inst| inst.title == "fallback-row"),
-        "reload must still refresh storage-backed instances when list_profiles fails"
-    );
-    assert!(
-        crate::session::list_profiles().is_ok(),
-        "seam must auto-clear after firing once"
-    );
+    assert!(e
+        .view
+        .instances
+        .values()
+        .any(|inst| inst.title == "fallback-row"));
+    assert!(crate::session::list_profiles().is_ok());
 }
 
+/// The rewire fast path keeps a latched init failure only while its profile is still current.
 #[tokio::test]
 #[serial]
-async fn rewire_after_profile_delete_preserves_existing_info_dialog() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
+async fn rewire_fast_path_preserves_relevant_latch_and_clears_stale_one() {
+    let mut e = env("hv-noop", &["hv-noop"]);
+    let current = names(&["hv-noop"]);
+    e.view.rewire_disk_subscriptions(&current);
+    assert!(e.view.disk_watch.handles.contains_key("hv-noop"));
 
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("dialog-guard").expect("seed dir");
+    let state = &mut e.view.reload_failure_state;
+    state.apply_disk_watcher_init_pass(Some(watcher_err(Some("hv-noop"), "prior failure")));
+    e.view.rewire_disk_subscriptions(&current);
+    assert!(e
+        .view
+        .reload_failure_state
+        .disk_watcher_init_error
+        .is_some());
 
-    let mut view = HomeView::new_for_test(
-        Some("dialog-guard".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
+    // A config latch is an independent slot: a disk rewire never clears it.
+    e.view
+        .reload_failure_state
+        .apply_config_watcher_init_pass(Some(watcher_err(None, "config init failed")));
+    e.view
+        .reload_failure_state
+        .apply_disk_watcher_init_pass(Some(watcher_err(Some("ghost"), "stale")));
+    e.view.rewire_disk_subscriptions(&current);
+    assert!(e
+        .view
+        .reload_failure_state
+        .disk_watcher_init_error
+        .is_none());
+    assert!(e
+        .view
+        .reload_failure_state
+        .config_watcher_init_error
+        .is_some());
 
-    view.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-        "Existing dialog",
-        "keep me",
-    ));
-
-    let _fail_guard = crate::session::FailNextListProfilesGuard::new();
-    view.rewire_after_profile_delete("dialog-guard");
-
-    assert!(
-        crate::session::list_profiles().is_ok(),
-        "seam must auto-clear after firing once"
-    );
-
-    let mut dialog = view.info_dialog.expect("existing dialog should survive");
-    let theme = crate::tui::styles::load_theme("empire");
-    let backend = ratatui::backend::TestBackend::new(60, 12);
-    let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
-    terminal
-        .draw(|frame| dialog.render(frame, frame.area(), &theme))
-        .expect("render dialog");
-    let buf = terminal.backend().buffer().clone();
-    let rendered: String = buf.content.iter().map(|cell| cell.symbol()).collect();
-    assert!(
-        rendered.contains("Existing dialog"),
-        "rewire failure must not overwrite a pre-existing info dialog"
-    );
+    e.view
+        .reload_failure_state
+        .apply_config_watcher_init_pass(Some(watcher_err(Some("ghost"), "stale")));
+    e.view.rewire_config_subscriptions(&current);
+    assert!(e
+        .view
+        .reload_failure_state
+        .config_watcher_init_error
+        .is_none());
 }
 
-/// The Watcher Warning dialog raised by `rewire_after_profile_delete`
-/// is intentionally outside `reload_failure_state`, so `has_any_failure()`
-/// stays false. The recovery-edge cleanup keys off both the failure
-/// state and the dialog title, and must not match `Watcher Warning`;
-/// the dialog stays visible until the user dismisses it.
-#[tokio::test]
-#[serial]
-async fn rewire_after_profile_delete_watcher_warning_survives_recovery_edge() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("watcher-warning-edge").expect("seed dir");
-
-    let mut view = HomeView::new_for_test(
-        Some("watcher-warning-edge".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    let _fail_guard = crate::session::FailNextListProfilesGuard::new();
-    view.rewire_after_profile_delete("watcher-warning-edge");
-
-    let dialog = view.info_dialog.as_ref().expect("watcher warning raised");
-    assert_eq!(
-        dialog.title(),
-        "Watcher Warning",
-        "rewire failure must raise the Watcher Warning dialog"
-    );
-    assert!(
-        !view.reload_failure_state.has_any_failure(),
-        "rewire_after_profile_delete does not record into reload_failure_state; \
-         the recovery-edge cleanup keys off has_any_failure() to protect tracked \
-         failures, and the Watcher Warning relies on its title to stay visible"
-    );
-
-    let cleared = view.try_clear_recovered_reload_dialog();
-    assert!(
-        !cleared,
-        "try_clear_recovered_reload_dialog must not match Watcher Warning"
-    );
-    let dialog = view
-        .info_dialog
-        .as_ref()
-        .expect("watcher warning must persist past the recovery-edge check");
-    assert_eq!(
-        dialog.title(),
-        "Watcher Warning",
-        "the dialog promises the next reload will repair watcher state and \
-         stays visible for the user to read and dismiss"
-    );
+#[derive(Clone, Copy)]
+enum Slot {
+    Storage,
+    Config,
+    DiskInit,
+    ConfigInit,
 }
 
-/// Locks the no-op fast-path invariant: when `rewire_disk_subscriptions`
-/// is called with an unchanged profile set and no inode invalidation, the
-/// fast-path returns without running the install loop, and a previously
-/// latched `disk_watcher_init_error` must be preserved (the install loop
-/// is the only path that re-latches via `apply_disk_watcher_init_pass`).
-#[tokio::test]
-#[serial]
-async fn rewire_no_op_preserves_latched_disk_watcher_init_failure() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("hv-noop").expect("seed dir");
-
-    let mut view = HomeView::new_for_test(
-        Some("hv-noop".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    view.rewire_disk_subscriptions(&["hv-noop".to_string()]);
-    assert!(
-        view.disk_watch.handles.contains_key("hv-noop"),
-        "precondition: hv-noop installed"
-    );
-
-    view.reload_failure_state
-        .apply_disk_watcher_init_pass(Some(watcher_err(
-            Some("hv-noop"),
-            "simulated prior failure",
-        )));
-    assert!(
-        view.reload_failure_state.has_any_failure(),
-        "precondition: latch is set"
-    );
-
-    view.rewire_disk_subscriptions(&["hv-noop".to_string()]);
-
-    assert!(
-        view.reload_failure_state.has_any_failure(),
-        "no-op rewire (unchanged set, no inode change) must preserve the disk_watcher_init_error latch"
-    );
+enum Step {
+    Fail(Slot),
+    Heal(Slot),
+    InitErr(Slot, WatcherInitError),
+    Ack,
+    /// `(unacknowledged, any failure)` expected at this point.
+    Expect(bool, bool),
 }
 
-/// Locks the stale-latch detection invariant for
-/// `rewire_disk_subscriptions`: when the latch records a failure for
-/// profile X but X is no longer in `current` (subscribe_channel Err
-/// for X then user deletes X), the rewire pass clears the latch
-/// even when the installed-profile set is otherwise unchanged.
-/// Companion to `rewire_no_op_preserves_latched_disk_watcher_init_failure`:
-/// no-op preserves the latch only when the latch is still relevant.
-#[tokio::test]
-#[serial]
-async fn rewire_disk_clears_stale_latch_when_failing_profile_is_removed() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("active-stale").expect("seed active");
-
-    let mut view = HomeView::new_for_test(
-        Some("active-stale".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    view.reload_failure_state
-        .apply_disk_watcher_init_pass(Some(watcher_err(
-            Some("ghost"),
-            "simulated subscribe failure",
-        )));
-    assert!(
-        view.reload_failure_state.has_any_failure(),
-        "precondition: latch is set, references the now-deleted profile"
-    );
-
-    view.rewire_disk_subscriptions(&["active-stale".to_string()]);
-
-    assert!(
-        view.reload_failure_state.disk_watcher_init_error.is_none(),
-        "stale latch must clear when its referenced profile is no longer in current; \
-         the early-return fast-path must consider latch staleness"
-    );
-}
-
-/// Locks the stale-latch detection invariant for
-/// `rewire_config_subscriptions`. Sibling to
-/// `rewire_disk_clears_stale_latch_when_failing_profile_is_removed`;
-/// the per-profile config error format is `"profile {name} config: ..."`.
-#[tokio::test]
-#[serial]
-async fn rewire_config_clears_stale_latch_when_failing_profile_is_removed() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("active-stale-cfg").expect("seed active");
-
-    let mut view = HomeView::new_for_test(
-        Some("active-stale-cfg".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    view.reload_failure_state
-        .apply_config_watcher_init_pass(Some(watcher_err(
-            Some("ghost"),
-            "simulated subscribe failure",
-        )));
-    assert!(
-        view.reload_failure_state.has_any_failure(),
-        "precondition: latch is set, references the now-deleted profile"
-    );
-
-    view.rewire_config_subscriptions(&["active-stale-cfg".to_string()]);
-
-    assert!(
-        view.reload_failure_state
-            .config_watcher_init_error
-            .is_none(),
-        "stale latch must clear when its referenced profile is no longer in current; \
-         the early-return fast-path must consider latch staleness"
-    );
-}
-
-/// Locks the per-source independence invariant: a config init failure
-/// recorded in `config_watcher_init_error` must survive a concurrent disk
-/// rewire that clears `disk_watcher_init_error` (and vice-versa). The two
-/// fields are independent slots; clearing one never touches the other.
-#[tokio::test]
-#[serial]
-async fn config_init_failure_survives_concurrent_disk_rewire_clear() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("hv-iso").expect("seed dir");
-
-    let mut view = HomeView::new_for_test(
-        Some("hv-iso".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    view.reload_failure_state
-        .apply_config_watcher_init_pass(Some(watcher_err(None, "seed: config init failed")));
-    assert!(
-        view.reload_failure_state.has_any_failure(),
-        "precondition: config latch is set"
-    );
-
-    view.rewire_disk_subscriptions(&["hv-iso".to_string()]);
-
-    assert!(
-        view.reload_failure_state.has_any_failure(),
-        "disk rewire install must not clear the independent config_watcher_init_error latch"
-    );
+fn run_steps(name: &str, steps: Vec<Step>) -> ReloadFailureState {
+    let mut s = ReloadFailureState::default();
+    for (i, step) in steps.into_iter().enumerate() {
+        match step {
+            Step::Fail(Slot::Storage) => {
+                assert!(!s.record_storage(&Err(anyhow::anyhow!("storage err"))));
+            }
+            Step::Fail(Slot::Config) => {
+                assert!(!s.record_config(&Err(anyhow::anyhow!("config err"))));
+            }
+            Step::Heal(Slot::Storage) => {
+                s.record_storage(&Ok(()));
+            }
+            Step::Heal(Slot::Config) => {
+                s.record_config(&Ok(()));
+            }
+            Step::Heal(Slot::DiskInit) => s.apply_disk_watcher_init_pass(None),
+            Step::Heal(Slot::ConfigInit) => s.apply_config_watcher_init_pass(None),
+            Step::InitErr(Slot::DiskInit, e) => s.apply_disk_watcher_init_pass(Some(e)),
+            Step::InitErr(Slot::ConfigInit, e) => s.apply_config_watcher_init_pass(Some(e)),
+            Step::Fail(_) | Step::InitErr(..) => unreachable!("invalid step"),
+            Step::Ack => s.acknowledge_dialog(),
+            Step::Expect(unacked, any) => assert_eq!(
+                (s.has_unacknowledged_failure(), s.has_any_failure()),
+                (unacked, any),
+                "{name}: step {i}"
+            ),
+        }
+    }
+    s
 }
 
 #[test]
-fn reload_failure_state_record_storage_recovery_returns_true_and_clears_ack_latch() {
-    let mut state = super::ReloadFailureState::default();
-    let err: anyhow::Result<()> = Err(anyhow::anyhow!("disk unreadable"));
-    let ok: anyhow::Result<()> = Ok(());
+fn reload_failure_ack_latch() {
+    use Slot::*;
+    use Step::*;
+    let resource = WatcherInitErrorKind::Watch(WatchErrorKind::ResourceExhausted);
+    let cases: Vec<(&str, Vec<Step>)> = vec![
+        (
+            "recovery clears the failure and the ack latch",
+            vec![
+                Fail(Storage),
+                Ack,
+                Expect(false, true),
+                Heal(Storage),
+                Expect(false, false),
+            ],
+        ),
+        (
+            "a new source failing in an acked burst re-arms",
+            vec![Fail(Storage), Ack, Fail(Config), Expect(true, true)],
+        ),
+        (
+            "init slots clear independently",
+            vec![
+                InitErr(DiskInit, watcher_err(Some("d"), "disk")),
+                Expect(true, true),
+                InitErr(ConfigInit, watcher_err(None, "config")),
+                Ack,
+                Heal(DiskInit),
+                Expect(false, true),
+                Heal(ConfigInit),
+                Expect(false, false),
+            ],
+        ),
+        (
+            "identical failure across passes stays acked (#2112)",
+            vec![
+                InitErr(DiskInit, watcher_err(Some("p"), "denied")),
+                Ack,
+                InitErr(DiskInit, watcher_err(Some("p"), "denied")),
+                Expect(false, true),
+            ],
+        ),
+        (
+            "message drift with a stable kind stays acked",
+            vec![
+                InitErr(
+                    DiskInit,
+                    init_err(Some("p"), resource, "Too many open files"),
+                ),
+                Ack,
+                InitErr(
+                    DiskInit,
+                    init_err(Some("p"), resource, "EMFILE: descriptor 8192"),
+                ),
+                Expect(false, true),
+            ],
+        ),
+        (
+            "a changed kind re-arms",
+            vec![
+                InitErr(DiskInit, init_err(Some("p"), resource, "EMFILE")),
+                Ack,
+                InitErr(
+                    DiskInit,
+                    init_err(
+                        Some("p"),
+                        WatcherInitErrorKind::Watch(WatchErrorKind::Permission),
+                        "EACCES",
+                    ),
+                ),
+                Expect(true, true),
+            ],
+        ),
+        (
+            "crossing Watch and Resolution re-arms",
+            vec![
+                InitErr(
+                    ConfigInit,
+                    init_err(
+                        None,
+                        WatcherInitErrorKind::Watch(WatchErrorKind::Backend),
+                        "x",
+                    ),
+                ),
+                Ack,
+                InitErr(
+                    ConfigInit,
+                    init_err(None, WatcherInitErrorKind::Resolution, "x"),
+                ),
+                Expect(true, true),
+            ],
+        ),
+        (
+            "a changed profile re-arms",
+            vec![
+                InitErr(DiskInit, watcher_err(Some("a"), "denied")),
+                Ack,
+                InitErr(DiskInit, watcher_err(Some("b"), "denied")),
+                Expect(true, true),
+            ],
+        ),
+        (
+            "a new init source joining an acked burst re-arms",
+            vec![
+                InitErr(DiskInit, watcher_err(Some("p"), "denied")),
+                Ack,
+                InitErr(ConfigInit, watcher_err(None, "denied")),
+                Expect(true, true),
+            ],
+        ),
+        (
+            "an unchanged pass on the other slot stays acked",
+            vec![
+                InitErr(DiskInit, watcher_err(Some("p"), "disk denied")),
+                InitErr(ConfigInit, watcher_err(None, "config denied")),
+                Ack,
+                InitErr(ConfigInit, watcher_err(None, "config denied")),
+                Expect(false, true),
+            ],
+        ),
+        (
+            "a failure that fully cleared and returned re-arms",
+            vec![
+                InitErr(DiskInit, watcher_err(Some("p"), "EMFILE")),
+                Ack,
+                Heal(DiskInit),
+                Expect(false, false),
+                InitErr(DiskInit, watcher_err(Some("p"), "EMFILE")),
+                Expect(true, true),
+            ],
+        ),
+    ];
+    for (name, steps) in cases {
+        run_steps(name, steps);
+    }
 
-    assert!(
-        !state.record_storage(&err),
-        "first failure does not return true"
-    );
-    state.acknowledge_dialog();
-    assert!(!state.has_unacknowledged_failure());
-
-    assert!(
-        state.record_storage(&ok),
-        "failed-to-ok edge must return true so callers can emit an info log on recovery"
-    );
-    assert!(
-        !state.has_any_failure(),
-        "successful recovery clears the failure flag"
-    );
-    assert!(
-        !state.has_unacknowledged_failure(),
-        "recovery clears the ack latch so a fresh failure burst will surface a fresh dialog"
-    );
-}
-
-#[test]
-fn reload_failure_state_new_failure_during_acked_burst_re_arms_dialog() {
-    let mut state = super::ReloadFailureState::default();
-    let err1: anyhow::Result<()> = Err(anyhow::anyhow!("storage broken"));
-    let err2: anyhow::Result<()> = Err(anyhow::anyhow!("config broken"));
-
-    state.record_storage(&err1);
-    state.acknowledge_dialog();
-    assert!(
-        !state.has_unacknowledged_failure(),
-        "first failure acknowledged"
-    );
-
-    state.record_config(&err2);
-    assert!(
-        state.has_unacknowledged_failure(),
-        "a NEW source failing during an already-acknowledged burst re-arms the dialog so the user is notified about the additional failure"
-    );
+    let mut s = ReloadFailureState::default();
+    assert!(!s.record_storage(&Err(anyhow::anyhow!("x"))));
+    assert!(s.record_storage(&Ok(())), "failed-to-ok edge returns true");
 }
 
 #[test]
 fn reload_failure_state_dialog_body_aggregates_all_four_sources() {
-    let mut state = super::ReloadFailureState::default();
-    state.record_storage(&Err::<(), _>(anyhow::anyhow!("storage err")));
-    state.record_config(&Err::<(), _>(anyhow::anyhow!("config err")));
-    state
-        .apply_disk_watcher_init_pass(Some(watcher_err(Some("agg-disk"), "disk subscribe denied")));
-    state.apply_config_watcher_init_pass(Some(watcher_err(None, "config subscribe denied")));
-
+    use Slot::*;
+    use Step::*;
+    let state = run_steps(
+        "aggregate",
+        vec![
+            Fail(Storage),
+            Fail(Config),
+            InitErr(
+                DiskInit,
+                watcher_err(Some("agg-disk"), "disk subscribe denied"),
+            ),
+            InitErr(ConfigInit, watcher_err(None, "config subscribe denied")),
+        ],
+    );
     let body = state.build_dialog_body();
-    assert!(
-        body.contains("- Storage: storage err"),
-        "missing storage line: {body}"
-    );
-    assert!(
-        body.contains("- Config: config err"),
-        "missing config line: {body}"
-    );
-    assert!(
-        body.contains("- Disk watcher init: agg-disk: disk subscribe denied"),
-        "missing disk watcher-init line: {body}"
-    );
-    assert!(
-        body.contains("- Config watcher init: global config: config subscribe denied"),
-        "missing config watcher-init line: {body}"
-    );
+    for line in [
+        "- Storage: storage err",
+        "- Config: config err",
+        "- Disk watcher init: agg-disk: disk subscribe denied",
+        "- Config watcher init: global config: config subscribe denied",
+    ] {
+        assert!(body.contains(line), "missing {line:?}: {body}");
+    }
 }
 
-#[test]
-fn reload_failure_state_watcher_init_failure_lifecycle_is_per_source() {
-    let mut state = super::ReloadFailureState::default();
-
-    state.apply_disk_watcher_init_pass(Some(watcher_err(
-        Some("life-disk"),
-        "first disk install failed",
-    )));
-    assert!(
-        state.has_unacknowledged_failure(),
-        "disk_watcher_init_error contributes to has_any_failure"
-    );
-
-    state.apply_config_watcher_init_pass(Some(watcher_err(None, "first config install failed")));
-    state.acknowledge_dialog();
-
-    state.apply_disk_watcher_init_pass(None);
-    assert!(
-        state.has_any_failure(),
-        "clearing only the disk slot leaves the config slot latched"
-    );
-
-    state.apply_config_watcher_init_pass(None);
-    assert!(
-        !state.has_any_failure(),
-        "clearing the last failing source removes all latches"
-    );
-    assert!(
-        !state.has_unacknowledged_failure(),
-        "clearing the last failing source resets the ack latch"
-    );
-}
-
-/// Regression test for #2112: identical disk-watcher-init failures
-/// across rewire passes must not re-arm the ack latch.
-#[test]
-fn reload_failure_ack_persists_across_identical_rewire_failures() {
-    let mut state = super::ReloadFailureState::default();
-
-    state.apply_disk_watcher_init_pass(Some(watcher_err(Some("p"), "permission denied")));
-    state.acknowledge_dialog();
-    assert!(!state.has_unacknowledged_failure());
-
-    state.apply_disk_watcher_init_pass(Some(watcher_err(Some("p"), "permission denied")));
-    assert!(
-        !state.has_unacknowledged_failure(),
-        "identical failure across rewire passes must not re-arm the ack latch (#2112)"
-    );
-}
-
-/// A different classified error kind (new root cause with different
-/// remediation) is treated as a fresh failure and re-arms the dialog
-/// even when the source slot is unchanged.
-#[test]
-fn reload_failure_re_arms_when_error_kind_changes() {
-    use crate::file_watch::WatchErrorKind;
-    let mut state = super::ReloadFailureState::default();
-
-    state.apply_disk_watcher_init_pass(Some(super::watchers::WatcherInitError {
-        profile: Some("p".to_string()),
-        kind: super::watchers::WatcherInitErrorKind::Watch(WatchErrorKind::ResourceExhausted),
-        message: "EMFILE".to_string(),
-    }));
-    state.acknowledge_dialog();
-
-    state.apply_disk_watcher_init_pass(Some(super::watchers::WatcherInitError {
-        profile: Some("p".to_string()),
-        kind: super::watchers::WatcherInitErrorKind::Watch(WatchErrorKind::Permission),
-        message: "EACCES".to_string(),
-    }));
-    assert!(
-        state.has_unacknowledged_failure(),
-        "a changed error kind surfaces a fresh notification"
-    );
-}
-
-/// Defense-in-depth against `notify`-rs Display drift: the same
-/// classified failure on the same profile is ack-equal even when the
-/// formatted message string differs. Without this, a future
-/// `notify::Error` Display change (e.g. an added watch descriptor)
-/// would re-arm the dialog on the same persistent failure and the
-/// #2112 fix would silently regress.
-#[test]
-fn reload_failure_ack_persists_when_message_drifts_but_kind_is_stable() {
-    use crate::file_watch::WatchErrorKind;
-    let mut state = super::ReloadFailureState::default();
-
-    state.apply_disk_watcher_init_pass(Some(super::watchers::WatcherInitError {
-        profile: Some("p".to_string()),
-        kind: super::watchers::WatcherInitErrorKind::Watch(WatchErrorKind::ResourceExhausted),
-        message: "Too many open files (os error 24)".to_string(),
-    }));
-    state.acknowledge_dialog();
-
-    state.apply_disk_watcher_init_pass(Some(super::watchers::WatcherInitError {
-        profile: Some("p".to_string()),
-        kind: super::watchers::WatcherInitErrorKind::Watch(WatchErrorKind::ResourceExhausted),
-        message: "EMFILE: watch descriptor 8192 exhausted on /tmp/p".to_string(),
-    }));
-    assert!(
-        !state.has_unacknowledged_failure(),
-        "a drifted message with stable kind must not re-arm the ack latch"
-    );
-}
-
-/// A failure crossing the `Watch` <-> `Resolution` variant boundary
-/// is a genuine root-cause change (kernel-backend failure vs app-dir
-/// resolution failure have disjoint remediations) and re-arms the
-/// dialog. Locks the cross-variant arm of the ack-equality contract.
-#[test]
-fn reload_failure_re_arms_when_kind_crosses_watch_resolution_boundary() {
-    use crate::file_watch::WatchErrorKind;
-    let mut state = super::ReloadFailureState::default();
-
-    state.apply_config_watcher_init_pass(Some(super::watchers::WatcherInitError {
-        profile: None,
-        kind: super::watchers::WatcherInitErrorKind::Watch(WatchErrorKind::Backend),
-        message: "subscribe failed".to_string(),
-    }));
-    state.acknowledge_dialog();
-
-    state.apply_config_watcher_init_pass(Some(super::watchers::WatcherInitError {
-        profile: None,
-        kind: super::watchers::WatcherInitErrorKind::Resolution,
-        message: "app dir resolution failed".to_string(),
-    }));
-    assert!(
-        state.has_unacknowledged_failure(),
-        "a kind transition between Watch and Resolution surfaces a fresh notification"
-    );
-}
-
-/// Profile name is part of the failure's ack-identity, so a relocation
-/// re-arms the dialog under stable error content.
-#[test]
-fn reload_failure_re_arms_when_profile_changes() {
-    let mut state = super::ReloadFailureState::default();
-
-    state.apply_disk_watcher_init_pass(Some(watcher_err(Some("a"), "denied")));
-    state.acknowledge_dialog();
-
-    state.apply_disk_watcher_init_pass(Some(watcher_err(Some("b"), "denied")));
-    assert!(
-        state.has_unacknowledged_failure(),
-        "a failure relocating to a different profile re-arms the dialog"
-    );
-}
-
-/// A new failing source appearing during an already-acknowledged
-/// burst re-arms the dialog so the additional failure is surfaced.
-#[test]
-fn reload_failure_re_arms_when_new_source_joins_burst() {
-    let mut state = super::ReloadFailureState::default();
-
-    state.apply_disk_watcher_init_pass(Some(watcher_err(Some("p"), "denied")));
-    state.acknowledge_dialog();
-    assert!(!state.has_unacknowledged_failure());
-
-    state.apply_config_watcher_init_pass(Some(watcher_err(None, "denied")));
-    assert!(
-        state.has_unacknowledged_failure(),
-        "a NEW failing source during an acked burst surfaces a fresh notification"
-    );
-}
-
-/// When two sources are failing and the user has acknowledged, a
-/// same-content `apply_*_init_pass` on the unrelated slot must not
-/// re-arm the dialog. Locks per-source isolation of the ack semantics.
-#[test]
-fn reload_failure_ack_persists_when_only_other_source_clears_and_rerecords() {
-    let mut state = super::ReloadFailureState::default();
-
-    state.apply_disk_watcher_init_pass(Some(watcher_err(Some("p"), "disk denied")));
-    state.apply_config_watcher_init_pass(Some(watcher_err(None, "config denied")));
-    state.acknowledge_dialog();
-    assert!(!state.has_unacknowledged_failure());
-
-    state.apply_config_watcher_init_pass(Some(watcher_err(None, "config denied")));
-    assert!(
-        !state.has_unacknowledged_failure(),
-        "an unchanged adjacent-source rewire pass must not re-arm the ack latch"
-    );
-}
-
-/// A failure that fully clears and then later returns produces a fresh
-/// dialog even if its content is byte-identical to the previously
-/// acknowledged failure. Locks the recovery-then-refailure UX.
-#[test]
-fn reload_failure_re_arms_when_failure_fully_clears_then_returns() {
-    let mut state = super::ReloadFailureState::default();
-
-    state.apply_disk_watcher_init_pass(Some(watcher_err(Some("p"), "EMFILE")));
-    state.acknowledge_dialog();
-    assert!(!state.has_unacknowledged_failure());
-
-    state.apply_disk_watcher_init_pass(None);
-    assert!(!state.has_any_failure(), "all sources cleared");
-
-    state.apply_disk_watcher_init_pass(Some(watcher_err(Some("p"), "EMFILE")));
-    assert!(
-        state.has_unacknowledged_failure(),
-        "a failure that fully cleared and then returned must surface a fresh dialog"
-    );
-}
-
-/// Locks the body-refresh invariant: a `Reload Failed` dialog already
-/// on screen must rebuild its body when a new failure source is
-/// recorded, so the user sees every failed source without dismissing
-/// and reopening the dialog.
+/// An on-screen Reload Failed dialog rebuilds its body as failing sources come and go.
 #[tokio::test]
 #[serial]
-async fn try_present_reload_failure_dialog_refreshes_body_for_new_source() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
+async fn reload_failure_dialog_body_tracks_failing_sources() {
+    let mut e = env("body-refresh", &["body-refresh"]);
+    let view = &mut e.view;
+    let message = |view: &HomeView| {
+        view.info_dialog
+            .as_ref()
+            .expect("dialog presented")
+            .message()
+            .to_string()
+    };
 
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("body-refresh").expect("seed dir");
+    view.reload_failure_state
+        .record_storage(&Err(anyhow::anyhow!("storage broken")));
+    assert!(view.try_present_reload_failure_dialog());
+    assert_eq!(view.info_dialog.as_ref().unwrap().title(), "Reload Failed");
 
-    let mut view = HomeView::new_for_test(
-        Some("body-refresh".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
+    view.reload_failure_state
+        .record_config(&Err(anyhow::anyhow!("config broken")));
+    assert!(view.reload_failure_state.has_unacknowledged_failure());
+    assert!(view.try_present_reload_failure_dialog());
+    let body = message(view);
+    assert!(body.contains("storage broken") && body.contains("config broken"));
+    assert!(!view.reload_failure_state.has_unacknowledged_failure());
 
-    let storage_err: anyhow::Result<()> = Err(anyhow::anyhow!("first source"));
-    view.reload_failure_state.record_storage(&storage_err);
-
-    assert!(
-        view.try_present_reload_failure_dialog(),
-        "first call presents the dialog"
-    );
-    let dialog = view.info_dialog.as_ref().expect("dialog presented");
-    assert_eq!(dialog.title(), "Reload Failed");
-
-    let config_err: anyhow::Result<()> = Err(anyhow::anyhow!("second source"));
-    view.reload_failure_state.record_config(&config_err);
-    assert!(
-        view.reload_failure_state.has_unacknowledged_failure(),
-        "recording a new source while a dialog is acked re-arms the latch"
-    );
-
-    assert!(
-        view.try_present_reload_failure_dialog(),
-        "second call refreshes the body and re-acknowledges"
-    );
-
-    let body = view.reload_failure_state.build_dialog_body();
-    assert!(
-        body.contains("first source"),
-        "refreshed body must keep the original failure source: {body}"
-    );
-    assert!(
-        body.contains("second source"),
-        "refreshed body must include the newly recorded source: {body}"
-    );
+    view.reload_failure_state.record_storage(&Ok(()));
+    assert!(view.reload_failure_state.has_any_failure());
+    assert!(!view.reload_failure_state.has_unacknowledged_failure());
+    assert!(view.try_present_reload_failure_dialog());
+    let body = message(view);
+    assert!(body.contains("config broken") && !body.contains("storage broken"));
 }
 
-/// Locks the foreign-dialog skip invariant: when an unrelated dialog
-/// (a `Watcher Warning` from `rewire_after_profile_delete`, or an
-/// `Error` from a profile create/delete failure) occupies the slot,
-/// `try_present_reload_failure_dialog` returns `false` and leaves the
-/// ack latch untouched, so the next tick can present once the
-/// foreign dialog is dismissed.
 #[tokio::test]
 #[serial]
 async fn try_present_reload_failure_dialog_skips_while_foreign_dialog_occupies_slot() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("foreign-skip").expect("seed dir");
-
-    let mut view = HomeView::new_for_test(
-        Some("foreign-skip".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    let storage_err: anyhow::Result<()> = Err(anyhow::anyhow!("storage broken"));
-    view.reload_failure_state.record_storage(&storage_err);
+    let mut e = env("foreign-skip", &["foreign-skip"]);
+    let view = &mut e.view;
+    view.reload_failure_state
+        .record_storage(&Err(anyhow::anyhow!("storage broken")));
     view.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
         "Watcher Warning",
         "unrelated message",
     ));
 
-    assert!(
-        !view.try_present_reload_failure_dialog(),
-        "presentation must skip while a foreign dialog occupies the slot"
-    );
+    assert!(!view.try_present_reload_failure_dialog());
     assert_eq!(
-        view.info_dialog
-            .as_ref()
-            .expect("foreign dialog still up")
-            .title(),
-        "Watcher Warning",
-        "the foreign dialog stays in place untouched"
+        view.info_dialog.as_ref().unwrap().title(),
+        "Watcher Warning"
     );
-    assert!(
-        view.reload_failure_state.has_unacknowledged_failure(),
-        "the ack latch stays armed so the next tick re-tries presentation \
-         after the foreign dialog is dismissed"
-    );
+    assert!(view.reload_failure_state.has_unacknowledged_failure());
 
     view.info_dialog = None;
-    assert!(
-        view.try_present_reload_failure_dialog(),
-        "after the foreign dialog is dismissed the next call presents"
-    );
-    assert_eq!(
-        view.info_dialog.as_ref().expect("dialog presented").title(),
-        "Reload Failed"
-    );
+    assert!(view.try_present_reload_failure_dialog());
+    assert_eq!(view.info_dialog.as_ref().unwrap().title(), "Reload Failed");
 }
 
-/// Locks the install-loop resurrection-prevention invariant for
-/// `rewire_config_subscriptions`: the install loop resolves each
-/// `to_add` profile through the non-creating `get_profile_dir_path`
-/// and skips when the directory is absent, so a peer-process delete
-/// that races the `list_profiles()` snapshot does not recreate the
-/// profile directory as an empty stub via the install path.
-#[tokio::test]
-#[serial]
-async fn rewire_config_subscriptions_install_loop_skips_missing_profile_dir() {
-    use super::watchers::ConfigWatchKey;
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("active").expect("seed active");
-
-    let mut view = HomeView::new_for_test(
-        Some("active".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    let stale_name = "stale-deleted";
-    let stale_path = crate::session::get_profile_dir_path(stale_name).expect("path");
-    assert!(
-        !stale_path.exists(),
-        "precondition: stale profile dir is absent (peer delete raced the snapshot)"
-    );
-
-    view.rewire_config_subscriptions(&["active".to_string(), stale_name.to_string()]);
-
-    assert!(
-        !stale_path.exists(),
-        "the install loop must not recreate a deleted profile dir; \
-         a stale snapshot listing a missing profile is skipped, not resurrected"
-    );
-    assert!(
-        !view
-            .config_watch
-            .handles
-            .contains_key(&ConfigWatchKey::profile(stale_name)),
-        "no config-watch handle is installed for a missing profile dir"
-    );
-    assert!(
-        view.config_watch
-            .handles
-            .contains_key(&ConfigWatchKey::profile("active")),
-        "the active profile (which exists) is still subscribed"
-    );
-}
-
-/// Locks the install-loop resurrection-prevention invariant for
-/// `rewire_disk_subscriptions`: same shape as the config-watch
-/// sibling. A stale snapshot that lists a missing profile is
-/// skipped, not resurrected via `fs::create_dir_all`.
-#[tokio::test]
-#[serial]
-async fn rewire_disk_subscriptions_install_loop_skips_missing_profile_dir() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("disk-active").expect("seed active");
-
-    let mut view = HomeView::new_for_test(
-        Some("disk-active".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    let stale_name = "disk-stale-deleted";
-    let stale_path = crate::session::get_profile_dir_path(stale_name).expect("path");
-    assert!(
-        !stale_path.exists(),
-        "precondition: stale profile dir is absent"
-    );
-
-    view.rewire_disk_subscriptions(&["disk-active".to_string(), stale_name.to_string()]);
-
-    assert!(
-        !stale_path.exists(),
-        "the disk-watch install loop must not recreate a deleted profile dir"
-    );
-    assert!(
-        !view.disk_watch.handles.contains_key(stale_name),
-        "no disk-watch handle is installed for a missing profile dir"
-    );
-    assert!(
-        view.disk_watch.handles.contains_key("disk-active"),
-        "the active profile (which exists) is still subscribed"
-    );
-}
-
-/// Locks the partial-recovery body-refresh invariant: when one
-/// failing source recovers while another stays failed, the
-/// `Reload Failed` dialog body rebuilds in place to drop the
-/// recovered source's line. The ack latch stays in place so the
-/// user is not re-notified for the same ongoing burst.
-#[tokio::test]
-#[serial]
-async fn try_present_reload_failure_dialog_refreshes_body_on_partial_recovery() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("partial-recovery").expect("seed dir");
-
-    let mut view = HomeView::new_for_test(
-        Some("partial-recovery".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    let storage_err: anyhow::Result<()> = Err(anyhow::anyhow!("storage broken"));
-    let config_err: anyhow::Result<()> = Err(anyhow::anyhow!("config broken"));
-    view.reload_failure_state.record_storage(&storage_err);
-    view.reload_failure_state.record_config(&config_err);
-
-    assert!(
-        view.try_present_reload_failure_dialog(),
-        "first call presents the dialog"
-    );
-    let initial_body = view
-        .info_dialog
-        .as_ref()
-        .expect("dialog presented")
-        .message()
-        .to_string();
-    assert!(
-        initial_body.contains("storage broken") && initial_body.contains("config broken"),
-        "initial body lists both failing sources: {initial_body}"
-    );
-    assert!(
-        !view.reload_failure_state.has_unacknowledged_failure(),
-        "presentation consumed the ack latch"
-    );
-
-    let storage_ok: anyhow::Result<()> = Ok(());
-    view.reload_failure_state.record_storage(&storage_ok);
-    assert!(
-        view.reload_failure_state.has_any_failure(),
-        "config still failing keeps has_any_failure true"
-    );
-    assert!(
-        !view.reload_failure_state.has_unacknowledged_failure(),
-        "partial recovery does not re-arm the ack latch"
-    );
-
-    assert!(
-        view.try_present_reload_failure_dialog(),
-        "the body-refresh path must update an on-screen dialog when the failing-source set shifts"
-    );
-
-    let refreshed_body = view
-        .info_dialog
-        .as_ref()
-        .expect("dialog still on screen")
-        .message();
-    assert!(
-        refreshed_body.contains("config broken"),
-        "refreshed body keeps the still-failing source: {refreshed_body}"
-    );
-    assert!(
-        !refreshed_body.contains("storage broken"),
-        "refreshed body drops the recovered source's line: {refreshed_body}"
-    );
-}
-
-/// Locks the e2e debug-counter export contract:
-/// `try_refresh_from_config_watcher` increments
-/// `watcher_config_refresh_count` on every invocation and, when
-/// `AOE_E2E_DEBUG=1` is set on the process, writes the new count to
-/// `<app_dir>/.aoe_e2e_refresh_count` so the e2e harness polls a
-/// deterministic completion signal for the watcher path.
 #[tokio::test]
 #[serial]
 async fn watcher_config_refresh_count_exports_to_e2e_debug_file() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
     let _debug_absent = EnvGuard::unset(&["AOE_E2E_DEBUG"]);
+    let mut e = env("e2e-debug", &["e2e-debug"]);
+    let counter_path = crate::session::get_app_dir()
+        .unwrap()
+        .join(".aoe_e2e_refresh_count");
 
-    let live = FileWatchService::new().expect("live svc");
-    crate::session::get_profile_dir("e2e-debug").expect("seed dir");
-
-    let mut view = HomeView::new_for_test(
-        Some("e2e-debug".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    let app_dir = crate::session::get_app_dir().expect("app_dir");
-    let counter_path = app_dir.join(".aoe_e2e_refresh_count");
-
-    assert!(
-        !counter_path.exists(),
-        "precondition: counter file does not exist on a fresh test app dir"
-    );
-    let _ = view.try_refresh_from_config_watcher();
+    let _ = e.view.try_refresh_from_config_watcher();
     assert_eq!(
-        view.watcher_config_refresh_count
-            .load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "the counter increments on every watcher refresh attempt"
+        e.view.watcher_config_refresh_count.load(Ordering::Relaxed),
+        1
     );
-    assert!(
-        !counter_path.exists(),
-        "AOE_E2E_DEBUG unset keeps the export file absent so production \
-         builds and unrelated test runs leave the disk untouched"
-    );
+    assert!(!counter_path.exists(), "no export without AOE_E2E_DEBUG=1");
 
     let _debug_enabled = EnvGuard::set(&[("AOE_E2E_DEBUG", "1")]);
-
-    let _ = view.try_refresh_from_config_watcher();
-    let exported = std::fs::read_to_string(&counter_path)
-        .expect("counter file is written once AOE_E2E_DEBUG=1");
-    assert_eq!(
-        exported.trim(),
-        "2",
-        "exported value matches the post-increment counter"
-    );
-
-    let _ = view.try_refresh_from_config_watcher();
-    let exported = std::fs::read_to_string(&counter_path)
-        .expect("counter file refreshes on subsequent attempts");
-    assert_eq!(
-        exported.trim(),
-        "3",
-        "subsequent attempts re-export the latest counter value"
-    );
+    for expected in ["2", "3"] {
+        let _ = e.view.try_refresh_from_config_watcher();
+        let exported = std::fs::read_to_string(&counter_path).expect("counter file");
+        assert_eq!(exported.trim(), expected);
+    }
 }
 
-/// Locks consumer-side identity invalidation for the config rewire:
-/// when a peer recreates a profile dir between heartbeats, the
-/// canonical path string is unchanged but the inode is fresh, and
-/// `rewire_config_subscriptions` MUST rebuild the entry; the
-/// early-return fast path on an unchanged name set must not skip
-/// the install loop in this case.
+/// A same-path dir recreated with a new inode forces both rewires to rebuild the entry.
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
-async fn rewire_config_invalidates_on_inode_change_with_same_canonical_path() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
+async fn rewire_invalidates_on_inode_change_with_same_canonical_path() {
+    let profile = "inode-drift";
+    let mut e = env(profile, &[profile]);
+    let config_key = ConfigWatchKey::profile(profile);
+    let identities = |view: &HomeView| {
+        (
+            view.config_watch.handles[&config_key].installed_identity,
+            view.disk_watch.handles[profile].installed_identity,
+        )
+    };
+    let (config_before, disk_before) = identities(&e.view);
 
-    let live = FileWatchService::new().expect("live svc");
-    let _seed = crate::session::get_profile_dir("inode-drift-cfg").expect("seed dir");
+    let profile_dir = crate::session::get_profile_dir_path(profile).unwrap();
+    // Keep the old inode alive so the replacement cannot reuse its identity.
+    std::fs::rename(&profile_dir, e.temp.path().join("retired-profile")).unwrap();
+    std::fs::create_dir_all(&profile_dir).unwrap();
+    let replacement = crate::file_watch::capture_watch_identity(&profile_dir).unwrap();
+    assert_ne!(config_before, replacement);
+    assert_ne!(disk_before, replacement);
 
-    let mut view = HomeView::new_for_test(
-        Some("inode-drift-cfg".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    use super::watchers::ConfigWatchKey;
-    let identity_before = view
-        .config_watch
-        .handles
-        .get(&ConfigWatchKey::profile("inode-drift-cfg"))
-        .expect("initial install populated config entry")
-        .installed_identity;
-
-    let profile_dir =
-        crate::session::get_profile_dir_path("inode-drift-cfg").expect("resolve profile dir");
-    // Retain the old inode so the replacement cannot reuse its identity.
-    std::fs::rename(&profile_dir, temp.path().join("retired-profile")).unwrap();
-    std::fs::create_dir_all(&profile_dir).expect("recreate same-name dir");
-    let replacement_identity = crate::file_watch::capture_watch_identity(&profile_dir).unwrap();
-    assert_ne!(
-        identity_before, replacement_identity,
-        "distinct native identity"
-    );
-
-    view.rewire_config_subscriptions(&["inode-drift-cfg".to_string()]);
-
-    let identity_after = view
-        .config_watch
-        .handles
-        .get(&ConfigWatchKey::profile("inode-drift-cfg"))
-        .expect("entry rebuilt after inode drift")
-        .installed_identity;
-
-    assert_eq!(
-        identity_after, replacement_identity,
-        "rewire must install the replacement directory at the unchanged canonical path"
-    );
-}
-
-/// Disk-side mirror of the config invalidation test. The disk
-/// rewire path shares the same identity-tracking field on
-/// `DiskWatchEntry`, so the regression locks both consumers.
-#[cfg(unix)]
-#[tokio::test]
-#[serial]
-async fn rewire_disk_invalidates_on_inode_change_with_same_canonical_path() {
-    let temp = TempDir::new().expect("tempdir");
-    let _home = isolate_home(temp.path());
-
-    let live = FileWatchService::new().expect("live svc");
-    let _seed = crate::session::get_profile_dir("inode-drift-disk").expect("seed dir");
-
-    let mut view = HomeView::new_for_test(
-        Some("inode-drift-disk".to_string()),
-        crate::tmux::AvailableTools::with_tools(&["claude"]),
-        live.clone(),
-    )
-    .expect("HomeView::new");
-
-    let identity_before = view
-        .disk_watch
-        .handles
-        .get("inode-drift-disk")
-        .expect("initial install populated disk entry")
-        .installed_identity;
-
-    let profile_dir =
-        crate::session::get_profile_dir_path("inode-drift-disk").expect("resolve profile dir");
-    // Retain the old inode so the replacement cannot reuse its identity.
-    std::fs::rename(&profile_dir, temp.path().join("retired-profile")).unwrap();
-    std::fs::create_dir_all(&profile_dir).expect("recreate same-name dir");
-    let replacement_identity = crate::file_watch::capture_watch_identity(&profile_dir).unwrap();
-    assert_ne!(
-        identity_before, replacement_identity,
-        "distinct native identity"
-    );
-
-    view.rewire_disk_subscriptions(&["inode-drift-disk".to_string()]);
-
-    let identity_after = view
-        .disk_watch
-        .handles
-        .get("inode-drift-disk")
-        .expect("entry rebuilt after inode drift")
-        .installed_identity;
-
-    assert_eq!(
-        identity_after, replacement_identity,
-        "rewire must install the replacement directory at the unchanged canonical path"
-    );
+    e.view.rewire_config_subscriptions(&names(&[profile]));
+    e.view.rewire_disk_subscriptions(&names(&[profile]));
+    assert_eq!(identities(&e.view), (replacement, replacement));
 }

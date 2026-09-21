@@ -1,7 +1,4 @@
 //! Plugin manifest types for the Agent of Empires plugin system.
-//!
-//! Defines `aoe-plugin.toml`, capabilities, session RPC payloads, and manifest
-//! validation without depending on the host crate.
 
 pub mod acp;
 mod capability;
@@ -18,6 +15,4 @@ pub use manifest::{
     ThemeContribution, UiContribution, UiSlot, MAX_SCREENSHOTS,
 };
 
-/// Current manifest schema and host API version. The host rejects newer
-/// manifests. Version history is documented in `docs/plugin-api.md`.
 pub const API_VERSION: u32 = 13;

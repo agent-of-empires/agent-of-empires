@@ -402,18 +402,8 @@ impl RestartDialog {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         // Wide enough that the Tool row's "(configured)  Ctrl+P: edit" suffix
         // isn't clipped (the cycler + suffix run past the old 54-col width).
-        let dialog_area = super::centered_rect(area, 64, 14);
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(" Restart Session ")
-            .title_style(Style::default().fg(theme.title).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = super::dialog_block(" Restart Session ", theme);
+        let (_, inner) = super::render_dialog_frame(frame, area, 64, 14, block);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -547,440 +537,247 @@ impl RestartDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::empty())
-    }
-
-    fn shift_key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::SHIFT)
-    }
-
-    fn ctrl_key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::CONTROL)
-    }
+    use crate::tui::dialogs::test_keys::{ctrl_key, key, shift_key};
 
     fn profiles() -> Vec<String> {
-        vec![
-            "default".to_string(),
-            "work".to_string(),
-            "personal".to_string(),
-        ]
+        ["default", "work", "personal"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     fn tools() -> Vec<String> {
-        vec![
-            "claude".to_string(),
-            "codex".to_string(),
-            "settl".to_string(),
-        ]
+        ["claude", "codex", "settl"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
-    /// Build a dialog with no pre-existing command override or extra args,
-    /// matching the common "fresh restart" case.
-    fn dialog(current_profile: &str, current_tool: &str) -> RestartDialog {
+    /// A dialog with no pre-existing command override or extra args.
+    fn dialog() -> RestartDialog {
+        RestartDialog::new("S", "default", "claude", "", "", profiles(), tools())
+    }
+
+    /// A dialog seeded with live overrides on its current tool.
+    fn configured() -> RestartDialog {
         RestartDialog::new(
             "S",
-            current_profile,
-            current_tool,
-            "",
-            "",
+            "default",
+            "claude",
+            "claude-wrapper",
+            "--foo",
             profiles(),
             tools(),
         )
     }
 
+    /// Open the tool-config overlay, which only Ctrl+P on the tool field does.
+    fn with_overlay() -> RestartDialog {
+        let mut d = dialog();
+        d.focused_field = 1;
+        d.handle_key(ctrl_key(KeyCode::Char('p')));
+        assert!(d.tool_config_mode);
+        d
+    }
+
+    fn submitted(result: DialogResult<RestartData>) -> RestartData {
+        match result {
+            DialogResult::Submit(data) => data,
+            _ => panic!("expected Submit"),
+        }
+    }
+
     #[test]
-    fn test_new_seeds_indices_from_current() {
+    fn new_seeds_from_the_current_session() {
         let d = RestartDialog::new("My Sess", "work", "codex", "", "", profiles(), tools());
-        assert_eq!(d.profile_index, 1);
-        assert_eq!(d.tool_index, 1);
-        assert_eq!(d.focused_field, 0);
-    }
+        assert_eq!((d.profile_index, d.tool_index, d.focused_field), (1, 1, 0));
 
-    #[test]
-    fn test_new_falls_back_when_current_not_in_list() {
+        // A profile or tool that is no longer listed falls back to the first.
         let d = RestartDialog::new("S", "ghost", "ghost-tool", "", "", profiles(), tools());
-        assert_eq!(d.profile_index, 0);
-        assert_eq!(d.tool_index, 0);
-    }
+        assert_eq!((d.profile_index, d.tool_index), (0, 0));
 
-    #[test]
-    fn test_new_seeds_command_and_args_inputs() {
-        let d = RestartDialog::new(
-            "S",
-            "default",
-            "claude",
-            "claude-wrapper",
-            "--foo bar",
-            profiles(),
-            tools(),
-        );
+        let d = configured();
         assert_eq!(d.command_override.value(), "claude-wrapper");
-        assert_eq!(d.extra_args.value(), "--foo bar");
+        assert_eq!(d.extra_args.value(), "--foo");
         assert!(!d.tool_config_mode);
     }
 
     #[test]
-    fn test_esc_cancels() {
-        let mut d = dialog("default", "claude");
+    fn submits_only_what_changed() {
+        let unchanged = submitted(dialog().handle_key(key(KeyCode::Enter)));
+        assert_eq!(unchanged.profile, None);
+        assert_eq!(unchanged.tool, None);
+        assert_eq!(unchanged.extra_args, None);
+        assert_eq!(unchanged.command_override, None);
+
+        // Seeded overrides that were never edited also submit as None.
+        let untouched = submitted(configured().handle_key(key(KeyCode::Enter)));
+        assert_eq!(untouched.command_override, None);
+        assert_eq!(untouched.extra_args, None);
+
+        let mut d = dialog();
+        d.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            submitted(d.handle_key(key(KeyCode::Enter))).profile,
+            Some("work".to_string())
+        );
+
         assert!(matches!(
-            d.handle_key(key(KeyCode::Esc)),
+            dialog().handle_key(key(KeyCode::Esc)),
             DialogResult::Cancel
         ));
-    }
-
-    #[test]
-    fn test_enter_with_no_changes_returns_none_for_all() {
-        let mut d = dialog("default", "claude");
-        match d.handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.profile, None);
-                assert_eq!(data.tool, None);
-                assert_eq!(data.extra_args, None);
-                assert_eq!(data.command_override, None);
-            }
-            _ => panic!("Expected Submit"),
-        }
-    }
-
-    #[test]
-    fn test_tab_cycles_focus() {
-        let mut d = dialog("default", "claude");
-        assert_eq!(d.focused_field, 0);
-        d.handle_key(key(KeyCode::Tab));
-        assert_eq!(d.focused_field, 1);
-        d.handle_key(key(KeyCode::Tab));
-        assert_eq!(d.focused_field, 0);
-    }
-
-    #[test]
-    fn test_shift_tab_cycles_focus_backwards() {
-        let mut d = dialog("default", "claude");
-        d.handle_key(shift_key(KeyCode::Tab));
-        assert_eq!(d.focused_field, 1);
-        d.handle_key(shift_key(KeyCode::Tab));
-        assert_eq!(d.focused_field, 0);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_right_cycles_profile_when_profile_focused() {
-        let mut d = dialog("default", "claude");
-        d.handle_key(key(KeyCode::Right));
-        assert_eq!(d.profile_index, 1);
-        d.handle_key(key(KeyCode::Right));
-        assert_eq!(d.profile_index, 2);
-        d.handle_key(key(KeyCode::Right));
-        assert_eq!(d.profile_index, 0); // wrap
-    }
-
-    #[test]
-    fn test_left_cycles_profile_backwards_when_profile_focused() {
-        let mut d = dialog("default", "claude");
-        d.handle_key(key(KeyCode::Left));
-        assert_eq!(d.profile_index, 2); // wrap to end
-        d.handle_key(key(KeyCode::Left));
-        assert_eq!(d.profile_index, 1);
-    }
-
-    #[test]
-    fn test_space_also_cycles_profile_forward() {
-        let mut d = dialog("default", "claude");
-        d.handle_key(key(KeyCode::Char(' ')));
-        assert_eq!(d.profile_index, 1);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_arrows_cycle_tool_when_tool_focused() {
-        let mut d = dialog("default", "claude");
-        d.focused_field = 1;
-        d.handle_key(key(KeyCode::Right));
-        assert_eq!(d.tool_index, 1);
-        d.handle_key(key(KeyCode::Left));
-        assert_eq!(d.tool_index, 0);
-        d.handle_key(key(KeyCode::Left));
-        assert_eq!(d.tool_index, 2); // wrap
-    }
-
-    #[test]
-    fn test_profile_change_submits_some() {
-        let mut d = dialog("default", "claude");
-        d.handle_key(key(KeyCode::Right)); // profile -> work
-        match d.handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.profile, Some("work".to_string()));
-            }
-            _ => panic!("Expected Submit"),
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_tool_only_change_submits_tool_some_profile_none() {
-        let mut d = dialog("default", "claude");
-        d.focused_field = 1;
-        d.handle_key(key(KeyCode::Right)); // tool -> codex
-        match d.handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.profile, None);
-                assert_eq!(data.tool, Some("codex".to_string()));
-            }
-            _ => panic!("Expected Submit"),
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_tool_override_does_not_snap_profile() {
-        let mut d = dialog("default", "claude");
-        d.focused_field = 1;
-        d.handle_key(key(KeyCode::Right));
-        assert_eq!(d.profile_index, 0); // profile unchanged
-    }
-
-    #[test]
-    fn test_unknown_key_is_continue() {
-        let mut d = dialog("default", "claude");
         assert!(matches!(
-            d.handle_key(key(KeyCode::Char('x'))),
+            dialog().handle_key(key(KeyCode::Char('x'))),
+            DialogResult::Continue
+        ));
+
+        // A pathological empty profile list must not index-panic; the dialog
+        // refuses to submit and leaves the decision to the caller.
+        let mut empty = RestartDialog::new("S", "default", "claude", "", "", vec![], tools());
+        assert!(matches!(
+            empty.handle_key(key(KeyCode::Enter)),
             DialogResult::Continue
         ));
     }
 
     #[test]
-    fn hover_highlights_selector_without_moving_focus() {
-        // Stage selector rects manually; the real ones come from render().
-        let mut d = dialog("default", "claude");
-        d.profile_selector_area = Rect::new(2, 4, 50, 1);
-        d.tool_selector_area = Rect::new(2, 5, 50, 1);
-        assert_eq!(d.focused_field, 0);
-
-        // Over the tool row: highlight it, focus unchanged.
-        assert!(d.handle_hover(5, 5));
-        assert_eq!(d.hover.current(), Some(d.tool_selector_area));
-        assert_eq!(d.focused_field, 0, "hover must not move the focused field");
-
-        // Off both rows clears the highlight.
-        assert!(d.handle_hover(99, 99));
-        assert_eq!(d.hover.current(), None);
-    }
-
-    #[test]
-    fn test_enter_with_empty_profiles_does_not_panic() {
-        // Pathological config (empty profiles list); Enter must not
-        // index-panic. Dialog refuses to submit so the caller decides
-        // what to do.
-        let mut d = RestartDialog::new("S", "default", "claude", "", "", vec![], tools());
-        let result = d.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Continue));
-    }
-
-    #[test]
-    fn test_ctrl_p_on_tool_field_opens_tool_config() {
-        let mut d = dialog("default", "claude");
-        d.focused_field = 1; // tool field
-        d.handle_key(ctrl_key(KeyCode::Char('p')));
-        assert!(d.tool_config_mode);
-        assert_eq!(d.tool_config_focused_field, 0);
-    }
-
-    #[test]
-    fn test_ctrl_p_on_profile_field_does_nothing() {
-        let mut d = dialog("default", "claude");
-        assert_eq!(d.focused_field, 0); // profile field
-        d.handle_key(ctrl_key(KeyCode::Char('p')));
-        assert!(!d.tool_config_mode);
-    }
-
-    #[test]
-    fn test_tool_config_click_focuses_field() {
-        // Clicking a field in the open overlay focuses it (mouse parity with
-        // the New dialog), while keyboard focus stays usable.
-        let mut d = dialog("default", "claude");
-        d.focused_field = 1;
-        d.handle_key(ctrl_key(KeyCode::Char('p')));
-        assert!(d.tool_config_mode);
-        assert_eq!(d.tool_config_focused_field, 0);
-        // Stage overlay field rects manually; the real ones come from render().
-        d.tool_config_rects = vec![(0, Rect::new(2, 4, 60, 1)), (1, Rect::new(2, 6, 60, 1))];
-        // Click within the extra-args field rect.
-        d.handle_click(4, 6);
-        assert_eq!(d.tool_config_focused_field, 1);
-        // Click within the command-override field rect.
-        d.handle_click(4, 4);
-        assert_eq!(d.tool_config_focused_field, 0);
-    }
-
-    #[test]
-    fn test_tool_config_click_outside_fields_keeps_focus() {
-        // A click that misses every field rect is swallowed and must not move
-        // focus or cycle the selectors hidden beneath the overlay.
-        let mut d = dialog("default", "claude");
-        d.focused_field = 1;
-        d.handle_key(ctrl_key(KeyCode::Char('p')));
-        d.tool_config_rects = vec![(0, Rect::new(2, 4, 60, 1)), (1, Rect::new(2, 6, 60, 1))];
-        let tool_index_before = d.tool_index;
-        d.handle_click(0, 0);
-        assert_eq!(d.tool_config_focused_field, 0);
-        assert_eq!(d.tool_index, tool_index_before);
-    }
-
-    #[test]
-    fn test_tool_config_typing_updates_extra_args() {
-        let mut d = dialog("default", "claude");
-        d.focused_field = 1;
-        d.handle_key(ctrl_key(KeyCode::Char('p')));
-        // field 0 is command; move to extra args (field 1).
-        d.handle_key(key(KeyCode::Tab));
-        assert_eq!(d.tool_config_focused_field, 1);
-        d.handle_key(key(KeyCode::Char('-')));
-        d.handle_key(key(KeyCode::Char('x')));
-        assert_eq!(d.extra_args.value(), "-x");
-    }
-
-    #[test]
-    fn test_tool_config_typing_updates_command_override() {
-        let mut d = dialog("default", "claude");
-        d.focused_field = 1;
-        d.handle_key(ctrl_key(KeyCode::Char('p')));
-        assert_eq!(d.tool_config_focused_field, 0); // command field
-        d.handle_key(key(KeyCode::Char('z')));
-        assert_eq!(d.command_override.value(), "z");
-    }
-
-    #[test]
-    fn test_tool_config_tab_wraps_fields() {
-        let mut d = dialog("default", "claude");
-        d.focused_field = 1;
-        d.handle_key(ctrl_key(KeyCode::Char('p')));
-        assert_eq!(d.tool_config_focused_field, 0);
-        d.handle_key(key(KeyCode::Tab));
-        assert_eq!(d.tool_config_focused_field, 1);
-        d.handle_key(key(KeyCode::Tab));
-        assert_eq!(d.tool_config_focused_field, 0); // wrap
-    }
-
-    #[test]
-    fn test_tool_config_esc_exits_overlay_without_cancelling() {
-        let mut d = dialog("default", "claude");
-        d.focused_field = 1;
-        d.handle_key(ctrl_key(KeyCode::Char('p')));
-        assert!(d.tool_config_mode);
-        let result = d.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DialogResult::Continue));
-        assert!(!d.tool_config_mode);
-    }
-
-    #[test]
-    fn test_tool_config_enter_exits_overlay_without_submitting() {
-        let mut d = dialog("default", "claude");
-        d.focused_field = 1;
-        d.handle_key(ctrl_key(KeyCode::Char('p')));
-        let result = d.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Continue));
-        assert!(!d.tool_config_mode);
-    }
-
-    #[test]
-    fn test_submit_returns_changed_extra_args() {
-        let mut d = dialog("default", "claude");
-        d.focused_field = 1;
-        d.handle_key(ctrl_key(KeyCode::Char('p')));
-        d.handle_key(key(KeyCode::Tab)); // -> extra args
-        d.handle_key(key(KeyCode::Char('-')));
-        d.handle_key(key(KeyCode::Char('v')));
-        d.handle_key(key(KeyCode::Enter)); // exit overlay
-        match d.handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.extra_args, Some("-v".to_string()));
-                assert_eq!(data.command_override, None);
-            }
-            _ => panic!("Expected Submit"),
+    fn tab_and_arrows_move_focus_and_cycle_the_profile() {
+        let mut d = dialog();
+        for expected in [1, 0] {
+            d.handle_key(key(KeyCode::Tab));
+            assert_eq!(d.focused_field, expected);
         }
-    }
+        for expected in [1, 0] {
+            d.handle_key(shift_key(KeyCode::Tab));
+            assert_eq!(d.focused_field, expected);
+        }
 
-    #[test]
-    fn test_submit_returns_changed_command_override() {
-        let mut d = dialog("default", "claude");
-        d.focused_field = 1;
-        d.handle_key(ctrl_key(KeyCode::Char('p')));
-        d.handle_key(key(KeyCode::Char('w'))); // command field
-        d.handle_key(key(KeyCode::Enter)); // exit overlay
-        match d.handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.command_override, Some("w".to_string()));
-                assert_eq!(data.extra_args, None);
+        // Right and Space cycle forward, Left backward, both wrapping.
+        for code in [KeyCode::Right, KeyCode::Char(' ')] {
+            let mut d = dialog();
+            for expected in [1, 2, 0] {
+                d.handle_key(key(code));
+                assert_eq!(d.profile_index, expected);
             }
-            _ => panic!("Expected Submit"),
+        }
+        let mut d = dialog();
+        for expected in [2, 1] {
+            d.handle_key(key(KeyCode::Left));
+            assert_eq!(d.profile_index, expected);
         }
     }
 
     #[test]
     #[serial_test::serial]
-    fn test_tool_round_trip_preserves_live_overrides() {
-        // Session has custom overrides on its original tool. Cycling the tool
-        // away and back must restore the live values (not config defaults),
-        // so a no-op round-trip submits None for both. Regression for the
-        // #2041 review: reload_tool_config used to clobber them.
-        let mut d = RestartDialog::new(
-            "S",
-            "default",
-            "claude",
-            "claude-wrapper",
-            "--foo",
-            profiles(),
-            tools(),
-        );
-        d.focused_field = 1; // tool field
-        d.handle_key(key(KeyCode::Right)); // claude -> codex (reseeds defaults)
-        d.handle_key(key(KeyCode::Left)); // codex -> claude (must restore live)
+    fn cycling_the_tool_leaves_the_profile_and_live_overrides_intact() {
+        let mut d = dialog();
+        d.focused_field = 1;
+        for (code, expected) in [(KeyCode::Right, 1), (KeyCode::Left, 0), (KeyCode::Left, 2)] {
+            d.handle_key(key(code));
+            assert_eq!(d.tool_index, expected);
+        }
+        assert_eq!(d.profile_index, 0, "a tool override must not snap profile");
+
+        let mut d = dialog();
+        d.focused_field = 1;
+        d.handle_key(key(KeyCode::Right));
+        let data = submitted(d.handle_key(key(KeyCode::Enter)));
+        assert_eq!(data.profile, None);
+        assert_eq!(data.tool, Some("codex".to_string()));
+
+        // Cycling away and back restores the session's live overrides rather
+        // than the new tool's config defaults, so the round trip is a no-op.
+        let mut d = configured();
+        d.focused_field = 1;
+        d.handle_key(key(KeyCode::Right));
+        d.handle_key(key(KeyCode::Left));
         assert_eq!(d.tool_index, 0);
         assert_eq!(d.command_override.value(), "claude-wrapper");
         assert_eq!(d.extra_args.value(), "--foo");
-        match d.handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.tool, None);
-                assert_eq!(data.command_override, None);
-                assert_eq!(data.extra_args, None);
+        let data = submitted(d.handle_key(key(KeyCode::Enter)));
+        assert_eq!(data.tool, None);
+        assert_eq!(data.command_override, None);
+        assert_eq!(data.extra_args, None);
+    }
+
+    #[test]
+    fn tool_config_overlay_opens_only_from_the_tool_field() {
+        let mut d = dialog();
+        d.handle_key(ctrl_key(KeyCode::Char('p')));
+        assert!(!d.tool_config_mode, "profile field has no overlay");
+        assert_eq!(with_overlay().tool_config_focused_field, 0);
+    }
+
+    #[test]
+    fn tool_config_edits_both_fields_and_submits_them() {
+        let mut d = with_overlay();
+        d.handle_key(key(KeyCode::Char('z')));
+        assert_eq!(d.command_override.value(), "z");
+        for expected in [1, 0] {
+            d.handle_key(key(KeyCode::Tab));
+            assert_eq!(d.tool_config_focused_field, expected);
+        }
+
+        for (tabs, arg, command) in [(1, Some("-v"), None), (0, None, Some("w"))] {
+            let mut d = with_overlay();
+            for _ in 0..tabs {
+                d.handle_key(key(KeyCode::Tab));
             }
-            _ => panic!("Expected Submit"),
+            for c in arg.or(command).expect("one field edited").chars() {
+                d.handle_key(key(KeyCode::Char(c)));
+            }
+            d.handle_key(key(KeyCode::Enter));
+            let data = submitted(d.handle_key(key(KeyCode::Enter)));
+            assert_eq!(data.extra_args.as_deref(), arg);
+            assert_eq!(data.command_override.as_deref(), command);
+        }
+
+        // Esc and Enter both leave the overlay without deciding the dialog.
+        for code in [KeyCode::Esc, KeyCode::Enter] {
+            let mut d = with_overlay();
+            assert!(matches!(d.handle_key(key(code)), DialogResult::Continue));
+            assert!(!d.tool_config_mode);
         }
     }
 
     #[test]
-    fn test_submit_unchanged_command_and_args_returns_none() {
-        // Seed with existing values; submitting without editing them yields
-        // None so the caller leaves the instance untouched.
-        let mut d = RestartDialog::new(
-            "S",
-            "default",
-            "claude",
-            "claude-wrapper",
-            "--foo",
-            profiles(),
-            tools(),
-        );
-        match d.handle_key(key(KeyCode::Enter)) {
-            DialogResult::Submit(data) => {
-                assert_eq!(data.command_override, None);
-                assert_eq!(data.extra_args, None);
-            }
-            _ => panic!("Expected Submit"),
+    fn clicks_in_the_overlay_focus_a_field_and_a_miss_changes_nothing() {
+        let mut d = with_overlay();
+        // Staged manually; the real rects come from render().
+        d.tool_config_rects = vec![(0, Rect::new(2, 4, 60, 1)), (1, Rect::new(2, 6, 60, 1))];
+        for (row, expected) in [(6, 1), (4, 0)] {
+            d.handle_click(4, row);
+            assert_eq!(d.tool_config_focused_field, expected);
         }
+
+        // A click that misses every rect is swallowed: it must not move focus
+        // or cycle the selectors hidden beneath the overlay.
+        let tool_index = d.tool_index;
+        d.handle_click(0, 0);
+        assert_eq!(d.tool_config_focused_field, 0);
+        assert_eq!(d.tool_index, tool_index);
     }
 
     #[test]
-    fn deprecated_tool_badge_renders_on_constrained_configured_restart_row() {
-        // Real dialog geometry: 64 columns leaves a 60-column inner row. With
-        // three tools, a configured command, and extra args, this fails if the
-        // lifecycle suffix moves behind the trailing configuration metadata.
+    fn hover_highlights_a_selector_without_moving_focus() {
+        let mut d = dialog();
+        d.profile_selector_area = Rect::new(2, 4, 50, 1);
+        d.tool_selector_area = Rect::new(2, 5, 50, 1);
+        assert!(d.handle_hover(5, 5));
+        assert_eq!(d.hover.current(), Some(d.tool_selector_area));
+        assert_eq!(d.focused_field, 0, "hover must not move the focused field");
+        assert!(d.handle_hover(99, 99));
+        assert_eq!(d.hover.current(), None);
+    }
+
+    #[test]
+    fn deprecated_tool_badge_survives_a_constrained_configured_row() {
+        // Real geometry: 64 columns leaves a 60-column inner row. With three
+        // tools, a command override and extra args, the lifecycle suffix has
+        // to survive the trailing configuration metadata.
         use ratatui::{backend::TestBackend, Terminal};
 
-        let cases = [("gemini", true), ("claude", false)];
-        for (tool, deprecated) in cases {
+        for (tool, deprecated) in [("gemini", true), ("claude", false)] {
             let mut dialog = RestartDialog::new(
                 "fix bug",
                 "default",
@@ -988,11 +785,10 @@ mod tests {
                 "custom-wrapper",
                 "--model long --verbose",
                 vec!["default".to_string()],
-                vec![
-                    "claude".to_string(),
-                    "codex".to_string(),
-                    "gemini".to_string(),
-                ],
+                ["claude", "codex", "gemini"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
             );
             dialog.focused_field = 1;
             let mut terminal = Terminal::new(TestBackend::new(64, 14)).expect("terminal");

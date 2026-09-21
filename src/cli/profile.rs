@@ -77,8 +77,6 @@ pub async fn run(profile: &str, command: Option<ProfileCommands>) -> Result<()> 
 }
 
 async fn list_profiles() -> Result<()> {
-    // Picker order (`default` last); resolution below stays on the plain
-    // enumeration.
     let profiles = session::list_profiles_for_display()?;
 
     if profiles.is_empty() {
@@ -144,7 +142,6 @@ async fn show_default_profile() -> Result<()> {
 }
 
 async fn set_default_profile(name: &str) -> Result<()> {
-    // Verify profile exists
     let profiles = session::list_profiles()?;
     if !profiles.contains(&name.to_string()) {
         bail!("Profile '{}' does not exist", name);

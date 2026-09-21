@@ -1,0 +1,247 @@
+// Settings persist through the real server: REST round-trips, the schema UI, and the theme picker.
+
+import type { Locator, Page } from "@playwright/test";
+import { test, expect, authHeaders, bootDashboard, type ServeHandle } from "../helpers/liveTest";
+import { loginWithPassphrase, spawnAoeServe } from "../helpers/aoeServe";
+
+// #1189: the theme resolver once deadlocked per request, which mocked specs cannot see.
+test.describe("theme API", () => {
+  let handle: ServeHandle;
+  test.beforeAll(async ({}, workerInfo) => {
+    handle = await spawnAoeServe({ workerIndex: workerInfo.workerIndex, parallelIndex: workerInfo.parallelIndex });
+  });
+  test.afterAll(async () => {
+    await handle?.stop();
+  });
+
+  const fetchTheme = async (name: string) => {
+    const res = await fetch(`${handle.baseUrl}/api/themes/${name}`, { signal: AbortSignal.timeout(2_000) });
+    expect(res.ok, `${name} did not return`).toBe(true);
+    return res.json();
+  };
+
+  test("GET /api/themes/:name returns within 2s and is not stuck in resolve", async () => {
+    const body = await fetchTheme("dracula");
+    expect(body.name).toBe("dracula");
+    expect(body.source).toBe("builtin");
+    expect(body.appearance).toBe("dark");
+    expect(body.web.cssVars["--color-surface-900"]).toBe(DRACULA_SURFACE);
+    expect(body.terminal.cssVars["--term-bg"]).toBe(DRACULA_SURFACE);
+    expect(body.syntax.shikiTheme).toBe("dracula");
+  });
+
+  test("GET /api/themes/:name handles all 6 builtins sequentially without hanging", async () => {
+    for (const name of ["empire", "phosphor", "tokyo-night-storm", "catppuccin-latte", "dracula", "rose-pine"]) {
+      const body = await fetchTheme(name);
+      expect(body.name).toBe(name);
+      expect(body.web.cssVars).toBeTruthy();
+    }
+  });
+
+  test("dashboard chrome repaints when theme switches via API", async ({ page }) => {
+    const surface = () =>
+      page.evaluate(() => document.documentElement.style.getPropertyValue("--color-surface-900").trim());
+    await page.goto(`${handle.baseUrl}/`);
+    await expect
+      .poll(async () => (await surface()).length > 0, { timeout: 10_000, intervals: [100, 250, 500] })
+      .toBe(true);
+    const patch = await page.request.patch(`${handle.baseUrl}/api/theme`, { data: { name: "dracula" } });
+    expect(patch.ok()).toBe(true);
+    await page.evaluate((name) => {
+      window.dispatchEvent(new CustomEvent("aoe:theme-picker-changed", { detail: { name } }));
+    }, "dracula");
+    await expectRepaint(page);
+    expect(await page.evaluate(() => getComputedStyle(document.body).backgroundColor)).toMatch(/40,\s*42,\s*54/);
+  });
+});
+
+const DRACULA_SURFACE = "#282a36";
+const labelledSelect = (page: Page, label: RegExp) =>
+  page.locator("label", { hasText: label }).locator("..").locator("select");
+const getJson = (url: string, handle?: ServeHandle) =>
+  fetch(url, { headers: handle ? authHeaders(handle) : {} }).then((r) => r.json());
+const readInPage = (page: Page, url: string) => page.evaluate(async (u) => (await fetch(u)).json(), url);
+const confirmPassphraseDialog = (page: Page) =>
+  page.locator('[role="dialog"]').filter({ hasText: /Confirm passphrase/i });
+
+async function defaultProfile(handle: ServeHandle): Promise<string> {
+  const profiles: Array<{ name: string; is_default?: boolean }> = await getJson(
+    `${handle.baseUrl}/api/profiles`,
+    handle,
+  );
+  return profiles.find((p) => p.is_default)?.name ?? profiles[0]?.name ?? "main";
+}
+
+async function pickDracula(select: Locator) {
+  await expect(select).toBeVisible({ timeout: 10_000 });
+  await expect
+    .poll(
+      () => select.evaluate((sel: HTMLSelectElement) => Array.from(sel.options).some((o) => o.value === "dracula")),
+      { timeout: 5_000 },
+    )
+    .toBe(true);
+  await select.selectOption("dracula");
+}
+
+async function expectRepaint(page: Page) {
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.style.getPropertyValue("--color-surface-900").trim()), {
+      timeout: 5_000,
+      intervals: [100, 200, 400],
+    })
+    .toBe(DRACULA_SURFACE);
+}
+
+test("theme setting persists through PATCH + reload", async ({ serve, page }) => {
+  // #1217
+  const settingsUrl = `${serve.baseUrl}/api/settings`;
+  const before = await getJson(settingsUrl);
+  const newTheme = before?.theme?.name === "modus-vivendi" ? "default" : "modus-vivendi";
+  const patchRes = await fetch(settingsUrl, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ theme: { ...(before?.theme ?? {}), name: newTheme } }),
+  });
+  expect(patchRes.ok).toBeTruthy();
+  expect((await getJson(settingsUrl))?.theme?.name).toBe(newTheme);
+
+  await page.goto(serve.baseUrl);
+  expect((await readInPage(page, settingsUrl))?.theme?.name).toBe(newTheme);
+});
+
+test("structured view settings persist through PATCH + reload, node_path is stripped", async ({ serve, page }) => {
+  // #1689: the section was missing from the allowlist. node_path is a local-only RCE surface.
+  const settingsUrl = `${serve.baseUrl}/api/settings`;
+  const baselineAcp = ((await getJson(settingsUrl))?.acp ?? {}) as Record<string, unknown>;
+  const baselineNodePath = typeof baselineAcp.node_path === "string" ? baselineAcp.node_path : "";
+  const newIdle = baselineAcp.auto_stop_idle_secs === 28800 ? 14400 : 28800;
+
+  const patchRes = await fetch(settingsUrl, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ acp: { ...baselineAcp, auto_stop_idle_secs: newIdle, node_path: "/tmp/evil-node" } }),
+  });
+  expect(patchRes.ok).toBeTruthy();
+  const after = await getJson(settingsUrl);
+  expect(after?.acp?.auto_stop_idle_secs).toBe(newIdle);
+  expect(after?.acp?.node_path).toBe(baselineNodePath);
+  expect(after?.acp?.node_path).not.toBe("/tmp/evil-node");
+
+  await page.goto(serve.baseUrl);
+  const fetched = await readInPage(page, settingsUrl);
+  expect(fetched?.acp?.auto_stop_idle_secs).toBe(newIdle);
+  expect(fetched?.acp?.node_path).not.toBe("/tmp/evil-node");
+});
+
+test("a schema-driven select persists through the UI and a reload", async ({ serve, page }) => {
+  // #1792: tmux is a non-elevated, profile-overridable schema section.
+  const profileUrl = `${serve.baseUrl}/api/profiles/${encodeURIComponent(await defaultProfile(serve))}/settings`;
+  const baseline = ((await getJson(profileUrl))?.tmux?.status_bar as string | undefined) ?? "auto";
+  const next = baseline === "enabled" ? "disabled" : "enabled";
+
+  await page.goto(`${serve.baseUrl}/settings/tmux`);
+  const statusBar = labelledSelect(page, /^Status Bar$/);
+  await expect(statusBar).toBeVisible({ timeout: 10_000 });
+  await statusBar.selectOption(next);
+  await expect(async () => {
+    expect((await getJson(profileUrl))?.tmux?.status_bar).toBe(next);
+  }).toPass({ timeout: 5_000 });
+
+  await page.reload();
+  await expect(labelledSelect(page, /^Status Bar$/)).toHaveValue(next, { timeout: 10_000 });
+});
+
+test("theme picker repaints, persists across reload and serve restart (#1510)", async ({ serve, page }) => {
+  // The picker writes the global /api/theme endpoint and must dispatch its repaint only after the write.
+  const settingsUrl = `${serve.baseUrl}/api/settings`;
+  await page.goto(`${serve.baseUrl}/settings/theme`);
+  await pickDracula(labelledSelect(page, /^Theme$/));
+  await expect(async () => {
+    expect((await getJson(settingsUrl))?.theme?.name).toBe("dracula");
+  }).toPass({ timeout: 5_000 });
+  await expectRepaint(page);
+  await expect(confirmPassphraseDialog(page)).toHaveCount(0);
+
+  await page.reload();
+  expect((await readInPage(page, settingsUrl))?.theme?.name).toBe("dracula");
+  await serve.restart();
+  expect((await getJson(settingsUrl))?.theme?.name).toBe("dracula");
+});
+
+// #1510: a passphrase session is authenticated but not elevated.
+test.describe("passphrase mode", () => {
+  test("theme picker persists across reload + restart without passphrase prompt", async ({ servePreauthed, page }) => {
+    const settingsUrl = `${servePreauthed.baseUrl}/api/settings`;
+    await bootDashboard(page, servePreauthed, "/settings/theme");
+    await page.evaluate(() => {
+      const w = window as unknown as { __elevationFired?: boolean };
+      w.__elevationFired = false;
+      window.addEventListener("aoe:elevation-required", () => {
+        w.__elevationFired = true;
+      });
+    });
+
+    await pickDracula(labelledSelect(page, /^Theme$/));
+    await expect(async () => {
+      expect((await getJson(settingsUrl, servePreauthed))?.theme?.name).toBe("dracula");
+    }).toPass({ timeout: 5_000 });
+    await expect(confirmPassphraseDialog(page)).toHaveCount(0);
+    expect(
+      await page.evaluate(() => (window as unknown as { __elevationFired?: boolean }).__elevationFired ?? false),
+    ).toBe(false);
+    await expectRepaint(page);
+
+    await Promise.all([
+      page.waitForResponse((res) => res.url().endsWith("/api/about") && res.status() === 200, { timeout: 10_000 }),
+      page.reload(),
+    ]);
+    expect((await getJson(settingsUrl, servePreauthed))?.theme?.name).toBe("dracula");
+
+    await servePreauthed.restart();
+    const { cookie } = await loginWithPassphrase(
+      servePreauthed.baseUrl,
+      servePreauthed.passphrase!,
+      servePreauthed.deviceBindingSecret!,
+    );
+    servePreauthed.sessionCookie = cookie;
+    expect((await getJson(settingsUrl, servePreauthed))?.theme?.name).toBe("dracula");
+  });
+
+  test("sandbox image change requires elevation for remote callers, not loopback", async ({ servePreauthed, page }) => {
+    const profile = await defaultProfile(servePreauthed);
+    await bootDashboard(page, servePreauthed);
+    // From the page, so the SPA's interceptor sees a 403 and opens the prompt. A TEST-NET-3
+    // X-Forwarded-For from a loopback socket resolves as a remote caller.
+    const patchImage = (image: string, xff?: string) =>
+      page.evaluate(
+        async ({ profile, image, xff }) =>
+          (
+            await fetch(`/api/profiles/${encodeURIComponent(profile)}/settings`, {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json", ...(xff ? { "X-Forwarded-For": xff } : {}) },
+              body: JSON.stringify({ sandbox: { default_image: image } }),
+            })
+          ).status,
+        { profile, image, xff },
+      );
+    const savedImage = async () =>
+      (await getJson(`${servePreauthed.baseUrl}/api/profiles/${encodeURIComponent(profile)}/settings`, servePreauthed))
+        ?.sandbox?.default_image;
+
+    // #2610: loopback is trusted and must not loop the prompt.
+    expect(await patchImage("ghcr.io/example/img:local-trusted")).toBe(200);
+    await expect(confirmPassphraseDialog(page)).toHaveCount(0);
+
+    expect(await patchImage("ghcr.io/example/img:tampered", "203.0.113.10")).toBe(403);
+    const dialog = confirmPassphraseDialog(page);
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
+    expect((await savedImage()) ?? "").not.toBe("ghcr.io/example/img:tampered");
+
+    // Elevation is per session, so the remote retry succeeds.
+    await dialog.locator('input[type="password"]').fill(servePreauthed.passphrase!);
+    await dialog.getByRole("button", { name: /Confirm/i }).click();
+    await expect(dialog).toHaveCount(0, { timeout: 5_000 });
+    expect(await patchImage("ghcr.io/example/img:elevated", "203.0.113.10")).toBe(200);
+    expect(await savedImage()).toBe("ghcr.io/example/img:elevated");
+  });
+});
