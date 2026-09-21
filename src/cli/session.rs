@@ -3089,6 +3089,11 @@ mod session_mutation_tests {
     async fn set_session_id_replaces_intent_and_clears_the_resume_probe_marker() {
         let temp = tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
 
         let mut inst = Instance::new("marked_session", "/tmp/x");
         inst.agent_session_id = Some(SID_A.to_string());
