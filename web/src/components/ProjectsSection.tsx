@@ -1,10 +1,11 @@
-import { memo } from "react";
+import { memo, useRef } from "react";
 import type { ProjectInfo, RepoGroup } from "../lib/types";
 import { repoColorStyle } from "../lib/repoAppearance";
 import { useSidebarCompact } from "../lib/sidebarCompact";
 import { ContextMenu, MenuItem, MenuSeparator } from "./ContextMenu";
 import { FoldChevron, PlusIcon } from "./icons";
 import { useContextMenu } from "./useContextMenu";
+import { useLongPress } from "./sidebar/useLongPress";
 import { usePersistedFlag } from "./usePersistedFlag";
 
 interface ProjectsSectionProps {
@@ -105,9 +106,14 @@ const ProjectRow = memo(function ProjectRow({
   onEditProject: (project: ProjectInfo) => void;
   onRemoveProject: (group: RepoGroup) => void;
 }) {
-  const { menu, menuRef, openMenu, closeMenu } = useContextMenu<{ x: number; y: number }>();
+  const openedAtRef = useRef(0);
+  const { menu, menuRef, openMenu, closeMenu } = useContextMenu<{ x: number; y: number }>(openedAtRef);
   const baseBranch = project.registeredProjects[0]?.default_base_branch;
   const canModify = !readOnly && !offline;
+  const longPress = useLongPress(canModify, (x, y) => {
+    openedAtRef.current = Date.now();
+    openMenu({ x, y });
+  });
 
   return (
     <>
@@ -125,6 +131,7 @@ const ProjectRow = memo(function ProjectRow({
               }
             : undefined
         }
+        {...longPress.handlers}
         onKeyDown={
           canModify
             ? (e) => {
@@ -137,7 +144,7 @@ const ProjectRow = memo(function ProjectRow({
               }
             : undefined
         }
-        className="group flex items-center gap-2 px-3 py-1.5 text-text-secondary hover:bg-surface-800/50 transition-colors focus:outline-none focus:ring-2 focus:ring-brand-600"
+        className="group flex items-center gap-2 px-3 py-1.5 text-text-secondary hover:bg-surface-800/50 transition-colors focus:outline-none focus:ring-2 focus:ring-brand-600 select-none [-webkit-touch-callout:none]"
         style={repoColorStyle(project.color)}
       >
         <span className="shrink-0 text-[10px] leading-none text-text-dim" title="Saved project" aria-hidden>
@@ -180,7 +187,7 @@ const ProjectRow = memo(function ProjectRow({
               }}
               testId="sidebar-project-context-menu-edit"
             >
-              {project.registeredProjects.length > 1 ? `Edit base branch (${reg.scope})` : "Edit base branch"}
+              {project.registeredProjects.length > 1 ? `Project settings (${reg.scope})` : "Project settings"}
             </MenuItem>
           ))}
           <MenuSeparator />

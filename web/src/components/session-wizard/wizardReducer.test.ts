@@ -61,14 +61,18 @@ describe("APPLY_PROFILE_DEFAULTS", () => {
     expect(reducer(state, defaults({ worktreeEnabled: true })).data.useWorktree).toBe(expected);
   });
 
-  it.each([
-    ["yoloMode", true],
-    ["useWorktree", true],
-  ])("a %s edit before the mount fetch marks dirty so the late skipIfDirty apply is a no-op", (field, value) => {
-    const edited = reducer(makeState(), set(field, value));
-    expect(edited.data.profile).toBe("");
+  it("a late skipIfDirty apply keeps a dirty yoloMode edit but still records the worktree default", () => {
+    const edited = reducer(makeState(), set("yoloMode", true));
     expect(edited.data.profileDirty).toBe(true);
-    expect(reducer(edited, defaults({ yoloMode: false, worktreeEnabled: false }))).toBe(edited);
+    const late = reducer(edited, defaults({ yoloMode: false, worktreeEnabled: true }));
+    expect(late.data).toMatchObject({ yoloMode: true, profileWorktreeDefault: true, useWorktree: true });
+  });
+
+  it("a late skipIfDirty apply keeps a manual worktree toggle", () => {
+    const edited = reducer(makeState(), set("useWorktree", true));
+    expect(edited.data).toMatchObject({ profileDirty: true, worktreeDirty: true });
+    const late = reducer(edited, defaults({ worktreeEnabled: false }));
+    expect(late.data).toMatchObject({ useWorktree: true, profileWorktreeDefault: false });
   });
 
   it("applies over dirty edits for the confirmed picker path", () => {
@@ -144,4 +148,45 @@ it("SUBMIT_CANCEL re-enables submit without an error", () => {
   const cancelled = run(makeState(), { type: "SUBMIT_START" }, { type: "SUBMIT_CANCEL" });
   expect(cancelled.isSubmitting).toBe(false);
   expect(cancelled.error).toBeNull();
+});
+
+describe("SEED_PROJECT_WORKTREE_OVERRIDE", () => {
+  const seed = (override: boolean | undefined): Action => ({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override });
+
+  it("applies an override and reverts to the profile default without one", () => {
+    const overridden = run(makeState(), defaults({ worktreeEnabled: false }), seed(true));
+    expect(overridden.data.useWorktree).toBe(true);
+    expect(reducer(overridden, seed(undefined)).data.useWorktree).toBe(false);
+  });
+
+  it("outranks a late profile-defaults response", () => {
+    const late = run(makeState(), seed(true), defaults({ worktreeEnabled: false }));
+    expect(late.data).toMatchObject({ useWorktree: true, profileWorktreeDefault: false });
+  });
+
+  it("never enables worktree for a scratch session or a non-repo path", () => {
+    expect(reducer(makeState({ scratch: true }), seed(true)).data.useWorktree).toBe(false);
+    expect(reducer(makeState({ pathIsGitRepo: false }), seed(true)).data.useWorktree).toBe(false);
+  });
+
+  it("does not clobber a manual worktree toggle, but does apply after an unrelated edit", () => {
+    expect(run(makeState(), set("useWorktree", true), seed(undefined)).data.useWorktree).toBe(true);
+    const toolChanged = reducer(makeState(), set("tool", "codex"));
+    expect(toolChanged.data.worktreeDirty).toBe(false);
+    expect(reducer(toolChanged, seed(true)).data.useWorktree).toBe(true);
+  });
+
+  it("drops a path-scoped seed once the selected path has changed", () => {
+    const state = makeState({ path: "/repo/b" });
+    const seedFor = (path: string): Action => ({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override: true, path });
+    expect(reducer(state, seedFor("/repo/a"))).toBe(state);
+    expect(reducer(state, seedFor("/repo/b")).data.useWorktree).toBe(true);
+  });
+
+  it("tracks the latest project while dirty, so a profile switch resolves from it", () => {
+    const withB = run(makeState(), seed(true), set("useWorktree", false), seed(false));
+    expect(withB.data).toMatchObject({ useWorktree: false, projectWorktreeOverride: false });
+    const switched = reducer(withB, defaults({ worktreeEnabled: true, skipIfDirty: false }));
+    expect(switched.data).toMatchObject({ useWorktree: false, worktreeDirty: false });
+  });
 });

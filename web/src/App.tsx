@@ -1285,6 +1285,10 @@ function AppContent({
         .sort((a, b) => (b.last_accessed_at ?? "").localeCompare(a.last_accessed_at ?? ""));
       const latest = projectSessions[0];
 
+      // Quick-create skips ProjectStep's selection, which is what normally reports the override.
+      const key = normalizeProjectPathKey(repoPath);
+      const registered = projects.find((p) => normalizeProjectPathKey(p.path) === key);
+
       setWizardPrefill({
         path: repoPath,
         tool: latest?.tool ?? "claude",
@@ -1292,10 +1296,11 @@ function AppContent({
         sandboxEnabled: latest?.is_sandboxed ?? false,
         profile: latest?.profile || undefined,
         group: latest?.group_path || undefined,
+        worktreeEnabled: registered?.overrides?.worktree_enabled,
       });
       setShowSessionWizard(true);
     },
-    [sessions],
+    [sessions, projects],
   );
 
   // Pin a repo so its header persists with zero sessions. If the repo is
@@ -1346,6 +1351,25 @@ function AppContent({
   const [projectForm, setProjectForm] = useState<{ editProject: ProjectInfo | null } | null>(null);
   const handleAddProject = useCallback(() => setProjectForm({ editProject: null }), []);
   const handleEditProject = useCallback((project: ProjectInfo) => setProjectForm({ editProject: project }), []);
+
+  // A group with live sessions may be unregistered; register it globally before editing.
+  const handleEditProjectSettings = useCallback(
+    async (group: SidebarGroup) => {
+      if (group.registeredProjects.length > 0) {
+        setProjectForm({ editProject: group.registeredProjects[0]! });
+        return;
+      }
+      if (!group.repoPath) return;
+      const res = await createProject({ path: group.repoPath, scope: "global" });
+      if (!res.ok || !res.project) {
+        toastBus.handler?.error(res.error ?? "Failed to register project");
+        return;
+      }
+      await refreshProjects();
+      setProjectForm({ editProject: res.project });
+    },
+    [refreshProjects],
+  );
 
   // Remove a saved project: delete every registration for its path, then
   // refresh. Confirms first since it is not undoable. See #2212.
@@ -2270,6 +2294,7 @@ function AppContent({
               onCreateSession={handleCreateSession}
               onPinProject={handlePinProject}
               onUnpinProject={handleUnpinProject}
+              onEditProjectSettings={handleEditProjectSettings}
               savedProjects={savedProjects}
               onAddProject={handleAddProject}
               onEditProject={handleEditProject}

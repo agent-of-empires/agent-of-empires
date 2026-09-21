@@ -175,9 +175,9 @@ test.describe("row chips and naming actions", () => {
     await expect(page.getByLabel("Naming")).toBeVisible();
   });
 
-  // #2347 Auto-name now needs a default name; #2808 Summarize is offered for any structured session.
+  // #2347 Auto-name now and #2808 Summarize are offered for any structured session, named or not.
   for (const c of [
-    { item: "auto-name", endpoint: "smart-rename", title: "Vikings", defaultName: true },
+    { item: "auto-name", endpoint: "smart-rename", title: "Fix login bug", defaultName: false },
     { item: "summarize", endpoint: "summarize", title: "Fix login bug", defaultName: false },
   ]) {
     test(`context menu ${c.item} POSTs /${c.endpoint}`, async ({ page }) => {
@@ -193,11 +193,4 @@ test.describe("row chips and naming actions", () => {
       await expect.poll(() => posted[0]).toContain(`/api/sessions/sess-1/${c.endpoint}`);
     });
   }
-
-  test("hides Auto-name now for an already-named session", async ({ page }) => {
-    await openSidebar(page, [structured("sess-named", "Fix login bug", false)]);
-    await openMenu(page, "Fix login bug");
-    await expect(page.getByTestId("sidebar-context-menu-switch-agent")).toBeVisible();
-    await expect(page.getByTestId("sidebar-context-menu-auto-name")).toHaveCount(0);
-  });
 });

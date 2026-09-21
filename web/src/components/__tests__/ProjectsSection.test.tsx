@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { ProjectsSection } from "../ProjectsSection";
 import type { ProjectInfo, RepoGroup } from "../../lib/types";
@@ -87,6 +87,70 @@ describe("ProjectsSection", () => {
     fireEvent.contextMenu(screen.getByTestId("sidebar-project-row"));
     fireEvent.click(screen.getByTestId("sidebar-project-context-menu-remove"));
     expect(h.onRemoveProject).toHaveBeenCalledWith(expect.objectContaining({ repoPath: "/work/alpha" }));
+  });
+
+  it("opens the context menu on a long-press (#3460-style touch support)", () => {
+    vi.useFakeTimers();
+    try {
+      renderSection();
+      const row = screen.getByTestId("sidebar-project-row");
+      fireEvent.touchStart(row, { touches: [{ clientX: 10, clientY: 10 }] });
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(screen.getByTestId("sidebar-project-context-menu")).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels the pending long-press once the finger moves past the touch slop", () => {
+    vi.useFakeTimers();
+    try {
+      renderSection();
+      const row = screen.getByTestId("sidebar-project-row");
+      fireEvent.touchStart(row, { touches: [{ clientX: 10, clientY: 10 }] });
+      // Well past LONG_PRESS_SLOP_PX (8px): a deliberate drag, not a jittery hold.
+      fireEvent.touchMove(row, { touches: [{ clientX: 100, clientY: 100 }] });
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(screen.queryByTestId("sidebar-project-context-menu")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels the pending long-press on touchend before the timer fires", () => {
+    vi.useFakeTimers();
+    try {
+      renderSection();
+      const row = screen.getByTestId("sidebar-project-row");
+      fireEvent.touchStart(row, { touches: [{ clientX: 10, clientY: 10 }] });
+      fireEvent.touchEnd(row, { touches: [] });
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(screen.queryByTestId("sidebar-project-context-menu")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels the pending long-press on touchcancel (an OS-interrupted gesture)", () => {
+    vi.useFakeTimers();
+    try {
+      renderSection();
+      const row = screen.getByTestId("sidebar-project-row");
+      fireEvent.touchStart(row, { touches: [{ clientX: 10, clientY: 10 }] });
+      fireEvent.touchCancel(row);
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(screen.queryByTestId("sidebar-project-context-menu")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("caps the context menu with the dynamic viewport so its tail scrolls on iOS (#2870)", () => {

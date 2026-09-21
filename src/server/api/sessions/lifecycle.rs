@@ -696,13 +696,10 @@ pub async fn restore_session(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
-/// `POST /api/sessions/:id/smart-rename`. Manual "Auto-name now" recovery for a
-/// structured session whose automatic smart rename never landed. Clears the
-/// per-session attempted gate and re-runs the one-shot against the first prompt.
-///
-/// Only targets a still-default-named session, so it never overwrites a chosen
-/// title. The rename runs detached and best-effort: a `202` means "re-run
-/// started", not "renamed".
+/// `POST /api/sessions/:id/smart-rename`. Manual "Auto-name now" for a
+/// structured session: clears the per-session attempted gate and regenerates the
+/// title from the first prompt, even over one already chosen. The rename runs
+/// detached and best-effort: a `202` means "re-run started", not "renamed".
 pub async fn force_smart_rename(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -735,9 +732,9 @@ pub async fn force_smart_rename(
     // never reports 202 for a session the gate would silently drop. Resolves
     // with the same repo-aware config the worker uses, so a repo-local
     // smart_rename_agent or agent_command_override cannot make the two
-    // disagree. `setting_on = true` because the manual "Auto-name now" action
-    // runs even when auto-rename-on-start is off (#3039); the spawned job gets
-    // `force = true` to match.
+    // disagree. `setting_on` and `force` are true because the manual
+    // "Auto-name now" action runs even when auto-rename-on-start is off (#3039)
+    // and regenerates over any title; the spawned job gets `force = true` too.
     let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         &profile,
         std::path::Path::new(&project_path),
@@ -745,6 +742,7 @@ pub async fn force_smart_rename(
     let config = &resolved.session;
     if let Err(reason) = crate::session::smart_rename::check_eligible_resolved(
         structured,
+        true,
         true,
         &title,
         &tool,

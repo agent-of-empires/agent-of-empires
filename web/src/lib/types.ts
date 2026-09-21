@@ -67,7 +67,7 @@ export interface SessionResponse {
   rate_limit?: RateLimitInfo;
   rate_limit_auto_resume?: boolean;
   smart_rename?: "inactive" | "pending" | "running";
-  /** Still carries its auto-generated name; gates "Auto-name now" (more reliable than `smart_rename`). */
+  /** Still carries its auto-generated name (more reliable than `smart_rename`). */
   default_name?: boolean;
   acp_capable?: boolean;
   /** Captured ACP session id; required for a structured fork. */
@@ -325,11 +325,18 @@ export interface GroupInfo {
   session_count: number;
 }
 
+export interface ProjectOverrides {
+  worktree_enabled?: boolean;
+  smart_rename?: boolean;
+}
+
 export interface ProjectInfo {
   name: string;
   path: string;
   scope: "global" | "profile";
   default_base_branch?: string;
+  /** Absent keys inherit the configured default. */
+  overrides?: ProjectOverrides;
   /** Shown as a sessionless sidebar header. */
   pinned: boolean;
 }

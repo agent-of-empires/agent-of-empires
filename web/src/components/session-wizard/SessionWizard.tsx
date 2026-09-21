@@ -5,6 +5,7 @@ import {
   fetchGroups,
   fetchDockerStatus,
   fetchProfiles,
+  fetchProjects,
   fetchSettings,
   createSession,
   fetchVolumeIgnoresPreview,
@@ -18,6 +19,7 @@ import { HooksTrustDialog } from "./HooksTrustDialog";
 import { ACP_CAPABLE_TOOLS, isAcpEligible } from "../../lib/acpCapableTools";
 import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
+import { normalizeProjectPathKey } from "../../lib/registeredProjects";
 import { ProjectStep } from "./steps/ProjectStep";
 import { SessionStep } from "./steps/SessionStep";
 import { AgentPickerEssentials } from "./steps/AgentPickerEssentials";
@@ -52,6 +54,8 @@ export interface WizardPrefill {
   group?: string;
   initialTab?: "recent" | "browse" | "clone";
   scratch?: boolean;
+  /** The registered project's worktree override for `path`; `undefined` means none. */
+  worktreeEnabled?: boolean;
 }
 
 function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean): WizardData {
@@ -73,7 +77,9 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
     profile: prefill.profile || "",
     group: prefill.group || "",
     scratch: prefill.scratch ?? false,
-    useWorktree: prefill.scratch ? false : base.useWorktree,
+    useWorktree: prefill.scratch ? false : (prefill.worktreeEnabled ?? base.useWorktree),
+    // Seeded here rather than dispatched so APPLY_PROFILE_DEFAULTS cannot clobber it.
+    projectWorktreeOverride: prefill.scratch ? undefined : prefill.worktreeEnabled,
     extraRepoPaths: prefill.scratch ? [] : base.extraRepoPaths,
   };
 }
@@ -126,8 +132,21 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
     fetchGroups().then((g) => dispatch({ type: "SET_GROUPS", groups: g }));
     fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
+    // A remembered or prefilled path is never selected in ProjectStep, so seed its override here.
+    const initialPath = state.data.path;
+    const projectSeed = initialPath
+      ? fetchProjects()
+          .then((projects) => {
+            const key = normalizeProjectPathKey(initialPath);
+            const override = projects.find((p) => normalizeProjectPathKey(p.path) === key)?.overrides?.worktree_enabled;
+            if (override !== undefined) {
+              dispatch({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override, path: initialPath });
+            }
+          })
+          .catch(() => {})
+      : Promise.resolve();
     // Seed resolved profile defaults: the profile picker is hidden for single-profile users.
-    fetchProfiles()
+    const settingsSeed = fetchProfiles()
       // A failed profiles fetch must not skip settings: an explicit prefill
       // profile, or the unresolved global config, still applies.
       .catch(() => [] as Awaited<ReturnType<typeof fetchProfiles>>)
@@ -151,8 +170,8 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
           skipIfDirty: true,
         });
       })
-      .catch(() => {})
-      .finally(() => setDefaultsReady(true));
+      .catch(() => {});
+    void Promise.all([settingsSeed, projectSeed]).then(() => setDefaultsReady(true));
     // Seed once; a re-render with a new prefill object must not stomp user edits.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -265,6 +284,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
               onChange={handleChange}
               initialTab={prefill?.initialTab}
               agents={state.agents}
+              onSelectSavedProject={(override) => dispatch({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override })}
             />
           )}
 

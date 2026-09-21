@@ -30,6 +30,8 @@ interface Props {
   /** Registers the repo so it persists with zero sessions; omitted hides it. */
   onPin?: (repoPath: string) => void;
   onUnpin?: (group: SidebarGroup) => void;
+  /** Opens project settings, registering the repo first if needed; omitted hides it. */
+  onEditProject?: (group: SidebarGroup) => void;
   offline: boolean;
   dragHandle?: DragHandleProps;
 }
@@ -56,7 +58,8 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
   const archivableCount = props.onArchiveAll ? archivableWorkspaces(group).length : 0;
   const canPin = !!props.onPin && group.capabilities.create === "repo" && !!group.repoPath && !group.pinned;
   const canUnpin = !!props.onUnpin && group.kind === "repo" && group.pinned;
-  const hasMenu = canAppearance || archivableCount > 0 || canPin || canUnpin;
+  const canEditProject = !!props.onEditProject && group.capabilities.create === "repo" && !!group.repoPath;
+  const hasMenu = canAppearance || archivableCount > 0 || canPin || canUnpin || canEditProject;
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(group.alias ?? group.displayName);
   const renameRef = useRef<HTMLInputElement>(null);
@@ -223,6 +226,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props)
             archivableCount={archivableCount}
             canPin={canPin}
             canUnpin={canUnpin}
+            canEditProject={canEditProject}
             close={closeMenu}
             startRename={() => {
               setRenameValue(group.alias ?? group.defaultDisplayName);
@@ -242,15 +246,18 @@ function GroupMenuItems({
   onArchiveAll,
   onPin,
   onUnpin,
+  onEditProject,
   archivableCount,
   canPin,
   canUnpin,
+  canEditProject,
   close,
   startRename,
 }: Props & {
   archivableCount: number;
   canPin: boolean;
   canUnpin: boolean;
+  canEditProject: boolean;
   close: () => void;
   startRename: () => void;
 }) {
@@ -274,7 +281,12 @@ function GroupMenuItems({
           Unpin project
         </MenuItem>
       )}
-      {(canPin || canUnpin) && (archivableCount > 0 || canAppearance) && <MenuSeparator />}
+      {canEditProject && (
+        <MenuItem onClick={act(() => onEditProject?.(group))} testId="sidebar-group-context-menu-settings">
+          Project settings
+        </MenuItem>
+      )}
+      {(canPin || canUnpin || canEditProject) && (archivableCount > 0 || canAppearance) && <MenuSeparator />}
       {archivableCount > 0 && (
         <MenuItem onClick={act(() => onArchiveAll?.())} testId="sidebar-group-context-menu-archive-all">
           {`Archive all (${archivableCount})`}
