@@ -2162,6 +2162,39 @@ async fn smart_rename_rejects_only_trusted_command_overrides() {
     assert_eq!(rejection_code(repo.path()).await, "command_overridden");
 }
 
+// Manual regeneration bypasses the current-title gate but still requires a prompt.
+#[tokio::test]
+#[serial_test::serial]
+async fn force_smart_rename_ignores_a_custom_name() {
+    use axum::body::to_bytes;
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+
+    let mut inst = Instance::new("Vikings", "/tmp/custom-name-regen");
+    inst.title = "Fix login bug".to_string();
+    inst.tool = "claude".to_string();
+    inst.source_profile = "default".to_string();
+    inst.view = crate::session::View::Structured;
+    let id = inst.id.clone();
+
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let resp = force_smart_rename(axum::extract::State(state), axum::extract::Path(id))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+    let msg = String::from_utf8_lossy(&body);
+    assert!(
+        !msg.contains("custom name"),
+        "manual regenerate must not refuse a custom-named session; got: {msg}"
+    );
+    assert!(
+        msg.contains("No prompt to name this session from yet"),
+        "must fall through to the next gate instead; got: {msg}"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn list_sessions_shares_config_resolution_across_overlays() {

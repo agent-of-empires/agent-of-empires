@@ -585,16 +585,10 @@ pub async fn restore_session(
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
 
-/// `POST /api/sessions/:id/smart-rename`. Manual "Auto-name now" recovery for
-/// a structured-view session whose automatic smart rename never landed (the
-/// one-shot timed out, returned unusable output, or the daemon restarted with
-/// the in-memory attempted set cleared). Clears the per-session attempted gate
-/// and re-runs the one-shot against the session's first prompt.
-///
-/// Only targets a still-default-named session: a session the user (or a prior
-/// rename) already named is left alone, so this never overwrites a chosen
-/// title. The actual rename runs detached and best-effort, exactly like the
-/// prompt-handler trigger; a `202` means "re-run started", not "renamed".
+/// `POST /api/sessions/:id/smart-rename`. Regenerates a structured session's
+/// title from its first prompt, including over a title already chosen. The rename
+/// runs detached and best-effort; a `202` means the attempt started, not that
+/// the title changed.
 pub async fn force_smart_rename(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -624,13 +618,14 @@ pub async fn force_smart_rename(
         return crate::server::api::session_not_found();
     };
 
-    // Manual requests bypass only the setting; the worker revalidates eligibility.
+    // Manual requests bypass the setting and current-title gates; the worker revalidates all others.
     let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         &profile,
         std::path::Path::new(&project_path),
     );
     let config = &resolved.session;
     if let Err(reason) = crate::session::smart_rename::check_eligible_resolved(
+        true,
         true,
         true,
         &title,

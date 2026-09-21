@@ -162,7 +162,7 @@ export function SingleRowMenuItems({
           Fork session
         </MenuItem>
       )}
-      {write && acp?.default_name && (
+      {write && acp && (
         <MenuItem onClick={a.autoName} testId="sidebar-context-menu-auto-name" icon={icon(Sparkles)}>
           Auto-name now
         </MenuItem>

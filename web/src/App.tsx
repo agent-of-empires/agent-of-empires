@@ -778,6 +778,12 @@ function AppContent({
     ...(activeSession?.view === "structured" ? ["agents"] : []),
     ...(caps.cityhall ? [] : pluginPanes.map((p) => p.id)),
   ];
+  // The mobile picker/single-pane view reuses this exact list (minus
+  // "terminal", desktop's multi-instance extra-terminal dock, which has no
+  // single-pane mobile equivalent) so its available views can't drift from
+  // desktop's capability/session gating the way the sub-agents and Files
+  // panes previously did.
+  const mobilePaneIds = allPaneIds.filter((id) => id !== "terminal");
 
   // Fetch the diff when the panel is actually showing: on desktop when the
   // split is expanded, on mobile when the diff view is the active pane.
@@ -863,11 +869,14 @@ function AppContent({
     setPairedMounted(true);
   }
 
-  // A plugin pane promoted into the mobile main pane can vanish (plugin
-  // unloaded, or the new session has no such pane). Fall back to the agent
-  // view so the user is never stranded on a blank pane. Mirrors the diff /
-  // paired guards above; render-phase derivation per the block at the top.
-  if (isPluginPaneId(rightPanelView) && !pluginPanes.some((p) => p.id === rightPanelView)) {
+  // A gated mobile view (a builtin pane like diff/files/agents, or a plugin
+  // pane) can vanish out from under the current selection: plugin unloaded,
+  // capability change, or the session's structured-view state changed. Fall
+  // back to the agent view so the user is never stranded on a blank pane.
+  // Mirrors the paired guard above; render-phase derivation per the block at
+  // the top.
+  const isGatedBuiltinView = rightPanelView === "diff" || rightPanelView === "files" || rightPanelView === "agents";
+  if ((isGatedBuiltinView || isPluginPaneId(rightPanelView)) && !mobilePaneIds.includes(rightPanelView)) {
     setRightPanelView("agent");
   }
 
@@ -1824,6 +1833,7 @@ function AppContent({
           view={rightPanelView}
           pluginPanes={pluginPanes}
           onBackToAgent={() => handlePickView("agent")}
+          onOpenAgentsPane={() => handlePickView("agents")}
           pairedMounted={pairedMounted}
           activeSession={activeSession ?? null}
           activeSessionId={activeSessionId}
@@ -2423,6 +2433,7 @@ function AppContent({
             open={pickerOpen && singlePane}
             active={rightPanelView}
             pluginPanes={pluginPanes}
+            availablePanes={mobilePaneIds}
             onSelect={handlePickView}
             onClose={() => setPickerOpen(false)}
           />

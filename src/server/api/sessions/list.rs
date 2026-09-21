@@ -232,6 +232,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
             let eligible = check_eligible_resolved(
                 inst.is_structured(),
                 cfg.setting_on,
+                false,
                 &inst.title,
                 &inst.tool,
                 cfg.rename_agent,

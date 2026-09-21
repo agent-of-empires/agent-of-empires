@@ -72,9 +72,3 @@ pub(super) fn test_sandbox(name: &str, workdir: Option<&str>) -> SandboxInfo {
         container_workdir: workdir.map(str::to_string),
     }
 }
-
-pub(super) fn tool_instance(tool: &str, path: &str) -> Instance {
-    let mut inst = Instance::new(tool, path);
-    inst.tool = tool.to_string();
-    inst
-}
