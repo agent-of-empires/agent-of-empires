@@ -76,13 +76,24 @@ pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
     if project_path.as_os_str().is_empty() {
         return Ok(None);
     }
-    let (config_path, is_legacy) = [(REPO_CONFIG_PATH, false), (LEGACY_REPO_CONFIG_PATH, true)]
-        .into_iter()
-        .map(|(rel, legacy)| (project_path.join(rel), legacy))
-        .find(|(path, _)| path.exists())
-        .unzip();
-    let (Some(config_path), Some(is_legacy)) = (config_path, is_legacy) else {
-        return Ok(None);
+    let config_path = project_path.join(REPO_CONFIG_PATH);
+    let (config_path, is_legacy) = match fs::symlink_metadata(&config_path) {
+        Ok(_) => (config_path, false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let legacy_path = project_path.join(LEGACY_REPO_CONFIG_PATH);
+            match fs::symlink_metadata(&legacy_path) {
+                Ok(_) => (legacy_path, true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to inspect {}", legacy_path.display()))
+                }
+            }
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to inspect {}", config_path.display()))
+        }
     };
 
     if resolves_to_global_config(&config_path) {
