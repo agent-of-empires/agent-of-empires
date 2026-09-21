@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 //
-// The sidebar's "+" quick-create opens the wizard with `prefill.path` set, bypassing ProjectStep's
-// selection, so the override must arrive through `prefill.worktreeEnabled`.
+// Paths the wizard opens on without a ProjectStep selection: the sidebar's "+" quick-create
+// (`prefill.worktreeEnabled`) and the remembered last-used project.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
@@ -16,6 +16,7 @@ async function clickLaunch(getByText: (m: RegExp) => HTMLElement) {
 
 const createSession = vi.fn();
 const fetchSettings = vi.fn();
+const fetchProjects = vi.fn();
 
 vi.mock("../../../lib/api", () => ({
   fetchSettings: (...args: unknown[]) => fetchSettings(...args),
@@ -28,7 +29,7 @@ vi.mock("../../../lib/api", () => ({
   markVolumeIgnoresGlobsAcknowledged: vi.fn().mockResolvedValue(undefined),
   fetchSessions: vi.fn().mockResolvedValue({ sessions: [] }),
   fetchRecentProjects: vi.fn().mockResolvedValue({ projects: [] }),
-  fetchProjects: vi.fn().mockResolvedValue([]),
+  fetchProjects: (...args: unknown[]) => fetchProjects(...args),
   createSession: (...args: unknown[]) => createSession(...args),
 }));
 
@@ -46,6 +47,7 @@ describe("SessionWizard prefill.worktreeEnabled (project override on quick-creat
     vi.clearAllMocks();
     localStorage.clear();
     createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
+    fetchProjects.mockResolvedValue([]);
   });
 
   it("applies the project's override even against a conflicting global default", async () => {
@@ -73,5 +75,30 @@ describe("SessionWizard prefill.worktreeEnabled (project override on quick-creat
 
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     expect(createSession.mock.calls[0][0]).toMatchObject({ path: "/repo/beta", worktree_enabled: true });
+  });
+
+  it.each([
+    ["settings before projects", true],
+    ["projects before settings", false],
+  ])("applies the override to a remembered last-used path (%s)", async (_, settingsFirst) => {
+    localStorage.setItem("aoe-new-session-last-project", "/repo/alpha");
+    let resolveSettings!: (settings: unknown) => void;
+    let resolveProjects!: (projects: unknown) => void;
+    fetchSettings.mockReturnValue(new Promise((resolve) => (resolveSettings = resolve)));
+    fetchProjects.mockReturnValue(new Promise((resolve) => (resolveProjects = resolve)));
+    const { getByText } = renderWizard();
+
+    const projects = [
+      { name: "alpha", path: "/repo/alpha", scope: "global", pinned: false, overrides: { worktree_enabled: false } },
+    ];
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalled());
+    const settings = () => resolveSettings({ worktree: { enabled: true } });
+    await act(async () => (settingsFirst ? settings() : resolveProjects(projects)));
+    await act(async () => (settingsFirst ? resolveProjects(projects) : settings()));
+    await clickLaunch(getByText);
+
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(createSession.mock.calls[0][0]).toMatchObject({ path: "/repo/alpha", worktree_enabled: false });
   });
 });

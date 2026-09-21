@@ -176,6 +176,13 @@ describe("SEED_PROJECT_WORKTREE_OVERRIDE", () => {
     expect(reducer(toolChanged, seed(true)).data.useWorktree).toBe(true);
   });
 
+  it("drops a path-scoped seed once the selected path has changed", () => {
+    const state = makeState({ path: "/repo/b" });
+    const seedFor = (path: string): Action => ({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override: true, path });
+    expect(reducer(state, seedFor("/repo/a"))).toBe(state);
+    expect(reducer(state, seedFor("/repo/b")).data.useWorktree).toBe(true);
+  });
+
   it("tracks the latest project while dirty, so a profile switch resolves from it", () => {
     const withB = run(makeState(), seed(true), set("useWorktree", false), seed(false));
     expect(withB.data).toMatchObject({ useWorktree: false, projectWorktreeOverride: false });

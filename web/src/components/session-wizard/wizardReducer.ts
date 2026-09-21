@@ -78,7 +78,8 @@ export type Action =
       /** Mount-time seeding sets this so a late settings response cannot clobber user edits. */
       skipIfDirty?: boolean;
     }
-  | { type: "SEED_PROJECT_WORKTREE_OVERRIDE"; override: boolean | undefined };
+  /** `path`, when set, drops the seed if the selected path has since changed. */
+  | { type: "SEED_PROJECT_WORKTREE_OVERRIDE"; override: boolean | undefined; path?: string };
 
 export const initialData: WizardData = {
   path: "",
@@ -154,6 +155,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
       return { ...state, data: setField(state.data, action.field, action.value), error: null };
     case "SEED_PROJECT_WORKTREE_OVERRIDE": {
       // A manual worktree toggle wins; still record the override for a later profile reset.
+      if (action.path !== undefined && action.path !== state.data.path) return state;
       const projectWorktreeOverride = action.override;
       if (state.data.worktreeDirty) {
         return { ...state, data: { ...state.data, projectWorktreeOverride } };
