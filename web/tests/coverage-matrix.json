@@ -3793,6 +3793,13 @@
         "src/components/acp/Composer.pluginComposerActions.test.tsx"
       ],
       "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/Composer.tsx"]
+    },
+    {
+      "id": "session.terminal-agent-switch",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/SwitchTerminalAgentModal.test.tsx"],
+      "components": ["web/src/components/SwitchTerminalAgentModal.tsx"]
     }
   ]
 }

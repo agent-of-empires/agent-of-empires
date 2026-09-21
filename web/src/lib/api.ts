@@ -2558,6 +2558,29 @@ export async function startSession(id: string): Promise<SessionResponse | null> 
   }
 }
 
+export interface SwitchTerminalAgentResponse {
+  session_id: string;
+  tool: string;
+  status: string;
+  context_handoff: "sent" | "unavailable" | string;
+}
+
+/** Switch a terminal/tmux session to another agent CLI while preserving the
+ * AoE session, project path, and worktree. */
+export async function switchTerminalAgent(id: string, target: string): Promise<SwitchTerminalAgentResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/switch-agent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SwitchTerminalAgentResponse;
+  } catch {
+    return null;
+  }
+}
+
 /** Snooze or unsnooze a session. Pass `null` to unsnooze, or a positive
  *  number of minutes between 1 and 43200 (30 days) to snooze. The server
  *  validates against the shared `validate_snooze_duration` so the bounds

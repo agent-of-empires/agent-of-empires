@@ -143,6 +143,7 @@ import { SessionGroupModal } from "./SessionGroupModal";
 import { SidebarSortPicker } from "./SidebarSortPicker";
 import { Tooltip } from "./Tooltip";
 import { PluginRowLine } from "./plugin/PluginSlots";
+import { SwitchTerminalAgentModal } from "./SwitchTerminalAgentModal";
 
 const SIDEBAR_WIDTH_KEY = "aoe-sidebar-width";
 const SUNK_EXPANDED_KEY = "aoe-sidebar-sunk-expanded";
@@ -1087,10 +1088,9 @@ export const SessionRow = memo(function SessionRow({
   // Repo path used to prefill a "New Session" launched from this row, matching
   // the per-project "+" button (handleCreateSession keys off this same path).
   const newSessionRepoPath = firstSession?.main_repo_path || firstSession?.project_path || null;
-  // The structured view session backing this row, if any. Drives the "Switch
-  // agent" context-menu item, which only makes sense for an ACP structured view
-  // session (tmux rows have no agent to hand off). Multi-session rows are
-  // rare; pick the first structured view session in the workspace.
+  // Structured and terminal sessions have separate switch-agent actions. Multi-
+  // session rows are rare; use the first session of each view as the target.
+  const terminalSession = workspace.sessions.find((s) => s.view === "terminal");
   const acpSession = workspace.sessions.find((s) => s.view === "structured");
   const runningSession = workspace.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
   const navigationSession = runningSession ?? firstSession;
@@ -1225,6 +1225,7 @@ export const SessionRow = memo(function SessionRow({
   // otherwise pull the registry for a menu item most rows never open.
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const [addProjectOptions, setAddProjectOptions] = useState<{ name: string; path: string }[]>([]);
+  const [terminalSwitchOpen, setTerminalSwitchOpen] = useState(false);
 
   const togglePin = () => {
     setContextMenu(null);
@@ -1268,6 +1269,11 @@ export const SessionRow = memo(function SessionRow({
     if (!acpSession) return;
     requestOpenSession(acpSession.id);
     requestSwitchAgent(acpSession.id);
+  };
+
+  const handleSwitchTerminalAgent = () => {
+    setContextMenu(null);
+    if (terminalSession) setTerminalSwitchOpen(true);
   };
 
   // Switch the row's session between structured view and terminal. The parent
@@ -1883,6 +1889,16 @@ export const SessionRow = memo(function SessionRow({
                     Switch agent
                   </button>
                 )}
+                {!readOnly && terminalSession && (
+                  <button
+                    onClick={handleSwitchTerminalAgent}
+                    data-testid="sidebar-context-menu-switch-terminal-agent"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <ArrowLeftRight className="h-3.5 w-3.5 shrink-0" />
+                    Switch terminal agent
+                  </button>
+                )}
                 {!readOnly && acpSession?.acp_session_id && acpSession.acp_can_fork && (
                   <button
                     onClick={() => void handleFork()}
@@ -2125,6 +2141,16 @@ export const SessionRow = memo(function SessionRow({
               if (res.ok) setWorkdirModalOpen(false);
               return res;
             }}
+          />,
+          document.body,
+        )}
+      {terminalSwitchOpen &&
+        createPortal(
+          <SwitchTerminalAgentModal
+            open
+            sessionId={terminalSession?.id ?? null}
+            currentTool={terminalSession?.tool ?? null}
+            onClose={() => setTerminalSwitchOpen(false)}
           />,
           document.body,
         )}

@@ -213,14 +213,20 @@ matters when you handed a session off (say, claude to codex during a rate limit)
 and later want to return to the original agent.
 
 - **Web dashboard:** right-click a structured view session in the sidebar and
-  pick "Switch agent". It opens the same picker and switches on confirm. The
-  composer is pre-filled with a recap; review and send manually. The picker
-  lists built-in agents only.
+  pick "Switch agent", or type `/switch-agent` in the structured composer. It
+  opens the picker and switches on confirm. The composer is pre-filled with a
+  recap; review and send manually. The picker lists built-in agents only.
 - **CLI:** `aoe acp switch-agent <session> <target>` (run `aoe acp agents` to
   list the built-in target keys). Pass `--model <name>` to override the model
   the new agent starts with. A custom agent with an `agent_acp_cmd` entry is
   also a valid target even though neither surface lists it, so switching to one
   means naming it here.
+
+- **Terminal/tmux sessions:** right-click a terminal session in the web sidebar
+  and pick "Switch terminal agent", or run `aoe session switch-agent <session> <target>`.
+  The project, worktree, and AoE session stay the same. The new CLI starts a
+  fresh native session and receives a bounded handoff prompt from the outgoing
+  terminal capture when available; it never receives the old tool's resume id.
 
 The transcript divider reads `Switched structured view agent from <from> to <to>
 (manual)`, distinct from the `(rate_limited)` divider the recovery flow emits.

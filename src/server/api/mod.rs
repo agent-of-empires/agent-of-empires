@@ -55,8 +55,8 @@ pub use sessions::{
     get_recent_projects, kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs,
     read_output, rename_session, restore_session, search_sessions, send_message,
     serve_session_artifact, session_diff_file, session_diff_files, session_file, set_worktree_name,
-    start_session, stop_session, summarize_session, trash_session, update_session_archive,
-    update_session_color, update_session_diff_base, update_session_group,
+    start_session, stop_session, summarize_session, switch_terminal_agent, trash_session,
+    update_session_archive, update_session_color, update_session_diff_base, update_session_group,
     update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
     update_workspace_ordering, OutputQuery, SendMessageRequest,
 };
@@ -356,6 +356,7 @@ mod tests {
                     "stop_session",
                     "force_smart_rename",
                     "start_session",
+                    "switch_terminal_agent",
                 ],
             ),
             (

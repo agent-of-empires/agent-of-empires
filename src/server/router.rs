@@ -308,6 +308,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             post(api::switch_acp_agent),
         )
         .route(
+            "/api/sessions/{id}/switch-agent",
+            post(api::switch_terminal_agent),
+        )
+        .route(
             "/api/sessions/{id}/acp/prompt",
             // Prompt bodies carry inline base64 attachments, which blow
             // past the global 1 MiB cap. Raise the limit on this route

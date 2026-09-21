@@ -5,6 +5,7 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::collections::HashSet;
 
+use crate::acp::client::{require_daemon, HttpClient};
 use crate::session::{
     acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, GroupTree,
     Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
@@ -17,10 +18,12 @@ pub enum SessionCommands {
 
     /// Stop session process
     Stop(SessionIdArgs),
-
     /// Restart session (or all sessions with `--all`)
     Restart(RestartArgs),
 
+    /// Switch a terminal/tmux session to another installed agent CLI while
+    /// preserving its AoE session and worktree identity.
+    SwitchAgent(SwitchAgentArgs),
     /// Attach to session interactively
     Attach(SessionIdArgs),
 
@@ -188,6 +191,15 @@ pub struct RestartArgs {
     /// intentionally modest. Ignored when `--all` is not set.
     #[arg(long, default_value_t = 3)]
     pub parallel: usize,
+}
+
+#[derive(Args)]
+pub struct SwitchAgentArgs {
+    /// Session ID or title
+    pub identifier: String,
+
+    /// Installed built-in agent or configured custom tool name
+    pub target: String,
 }
 
 #[derive(Args)]
@@ -393,6 +405,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Start(args) => start_session(profile, args).await,
         SessionCommands::Stop(args) => stop_session(profile, args).await,
         SessionCommands::Restart(args) => restart_session_dispatch(profile, args).await,
+        SessionCommands::SwitchAgent(args) => switch_agent(args).await,
         SessionCommands::Attach(args) => attach_session(profile, args).await,
         SessionCommands::Show(args) => show_session(profile, args).await,
         SessionCommands::Capture(args) => capture_session(profile, args).await,
@@ -414,6 +427,19 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::ListTrash => list_trash(profile).await,
         SessionCommands::EmptyTrash => empty_trash(profile).await,
     }
+}
+
+async fn switch_agent(args: SwitchAgentArgs) -> Result<()> {
+    let endpoint = require_daemon().await?;
+    let client = HttpClient::new(endpoint)?;
+    let response = client
+        .switch_terminal_agent(&args.identifier, &args.target)
+        .await?;
+    println!(
+        "switched terminal agent for {} -> {} (context handoff: {})",
+        response.session_id, response.tool, response.context_handoff
+    );
+    Ok(())
 }
 
 async fn favorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {

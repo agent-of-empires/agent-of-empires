@@ -29,6 +29,7 @@ import { SwitchAgentModal } from "./SwitchAgentModal";
 import {
   clearPendingSwitchAgent,
   getPendingSwitchAgent,
+  requestSwitchAgent,
   subscribePendingSwitchAgent,
 } from "../../lib/switchAgentTrigger";
 import type {
@@ -506,6 +507,13 @@ export function Composer({
       items.push(item);
       advertised.add(name);
     }
+    items.unshift({
+      id: "aoe-switch-agent",
+      type: "command",
+      label: "/switch-agent",
+      description: "switch the session to another agent CLI",
+      acceptsInput: false,
+    } as Unstable_TriggerItem);
     return items;
   }, [availableCommands, clearAliases]);
   const slashAdapter: Unstable_TriggerAdapter = useMemo(
@@ -963,7 +971,13 @@ export function Composer({
               className="absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 shadow-xl"
             >
               <ComposerPrimitive.Unstable_TriggerPopover.Action
-                onExecute={(item) => insertSlashCommand(taRef, item)}
+                onExecute={(item) => {
+                  if (item.id === "aoe-switch-agent") {
+                    requestSwitchAgent(sessionId);
+                    return;
+                  }
+                  insertSlashCommand(taRef, item);
+                }}
                 removeOnExecute
               />
               <PopoverItems trigger="/" skillIndex={skillIndex} />
