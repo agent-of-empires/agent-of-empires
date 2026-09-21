@@ -163,6 +163,8 @@ pub struct Supervisor<S: BroadcastSink> {
     force_respawn: SharedSet,
     /// Sessions whose worker failed before establishing a session.
     startup_failures: SharedSet,
+    /// Sessions whose isolated native identity is not durable yet.
+    pending_context_resets: SharedSet,
     max_concurrent_workers: u32,
 }
 
@@ -250,6 +252,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             incompatible_binaries: Arc::default(),
             force_respawn: Arc::default(),
             startup_failures: Arc::default(),
+            pending_context_resets: Arc::default(),
             max_concurrent_workers,
         }
     }

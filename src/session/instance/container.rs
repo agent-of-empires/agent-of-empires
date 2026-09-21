@@ -135,8 +135,6 @@ impl Instance {
             self.reconcile_from_disk();
         }
         self.warn_legacy_agent_config_mounts();
-        let _transition_lock =
-            crate::migrations::v031_isolate_sandbox_content::admit_fresh_instance(self)?;
 
         // A container built for another agent mounts that agent's config.
         // Decide on the disk row and a resolved profile: a stale in-memory copy
@@ -166,6 +164,10 @@ impl Instance {
         }
         // After every reload above, which may have replaced the tool.
         let detect_as = self.effective_detect_as().into_owned();
+        // Admit the reconciled tool: reconciliation above may have replaced it,
+        // and the isolated store is seeded for the agent the launch will run.
+        let _transition_lock =
+            crate::migrations::v031_isolate_sandbox_content::admit_fresh_instance(self)?;
 
         // Direct is_running()? / exists()? here rather than probe_running():
         // this function already returns Result, so `?` correctly propagates
@@ -783,6 +785,8 @@ claude-personal = "~/.claude-global"
 
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
         let bin = temp.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let calls_path = temp.path().join("runtime-calls");
@@ -796,6 +800,7 @@ claude-personal = "~/.claude-global"
              if [ \"$1\" = rm ]; then touch '{removed}'; exit 0; fi\n\
              if [ \"$1\" = container ] && [ \"$2\" = inspect ]; then\n\
              if [ -e '{removed}' ]; then echo 'Error: No such container: c' >&2; exit 1; fi\n\
+             if [ \"$#\" -eq 3 ]; then echo '[{{\"Id\":\"fake\",\"State\":{{\"Running\":false}},\"Mounts\":[]}}]'; exit 0; fi\n\
              case \"$*\" in\n\
              *agent-tool*) cat '{label}' ;;\n\
              *sandbox-store-generation*) echo 2 ;;\n\
@@ -834,9 +839,9 @@ claude-personal = "~/.claude-global"
             /// A persisted row whose profile config cannot be parsed.
             RowBrokenProfile(&'static str, &'static str),
         }
-        // `store` is the agent config root the reuse path refreshed, if any.
+        // The expected store is the reconciled agent config root admitted before launch.
         let cases = [
-            (("codex", ""), "claude", Disk::Absent, 1, None),
+            (("codex", ""), "claude", Disk::Absent, 1, Some(".codex")),
             (
                 ("codex", ""),
                 "claude",
@@ -848,7 +853,13 @@ claude-personal = "~/.claude-global"
             (("codex", ""), "", Disk::Absent, 0, Some(".codex")),
             (("codex", ""), "claude", Disk::Corrupt, 0, None),
             (("codex", ""), "codex", Disk::Corrupt, 0, Some(".codex")),
-            (("claude", ""), "claude", Disk::Row("codex", ""), 1, None),
+            (
+                ("claude", ""),
+                "claude",
+                Disk::Row("codex", ""),
+                1,
+                Some(".codex"),
+            ),
             (
                 ("alias-a", "claude"),
                 "alias-b:codex",
@@ -856,7 +867,13 @@ claude-personal = "~/.claude-global"
                 0,
                 Some(".codex"),
             ),
-            (("alias-a", "codex"), "alias-a", Disk::Absent, 1, None),
+            (
+                ("alias-a", "codex"),
+                "alias-a",
+                Disk::Absent,
+                1,
+                Some(".codex"),
+            ),
             (
                 ("alias-c", ""),
                 "alias-c:claude",
@@ -876,7 +893,7 @@ claude-personal = "~/.claude-global"
             let _ = std::fs::remove_file(&calls_path);
             let _ = std::fs::remove_file(&removed_path);
             std::fs::write(&label_path, built_for).unwrap();
-            let mut instance = Instance::new("tool label", temp.path().to_str().unwrap());
+            let mut instance = Instance::new("tool label", project.to_str().unwrap());
             instance.tool = tool.to_string();
             instance.detect_as = detect_as.to_string();
             instance.source_profile = profile.to_string();
@@ -952,7 +969,7 @@ claude-personal = "~/.claude-global"
 
         // The label written at create is the identity the check compares.
         for (tool, detect_as) in [("codex", ""), ("alias-b", "codex")] {
-            let mut instance = Instance::new("tool label", temp.path().to_str().unwrap());
+            let mut instance = Instance::new("tool label", project.to_str().unwrap());
             instance.tool = tool.to_string();
             instance.detect_as = detect_as.to_string();
             instance.source_profile = profile.to_string();

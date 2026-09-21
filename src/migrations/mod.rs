@@ -213,8 +213,8 @@ pub fn has_pending_migrations() -> bool {
 /// forwards it to its status line from a worker thread. Callers without one
 /// pass [`progress::tracing_reporter`], which leaves a trail in the log.
 ///
-/// A failure here is reported by the caller and does not block the launch:
-/// a row that did not move stays on its shared store and is retried.
+/// Unproven native content is never a launch fallback: errors leave the store
+/// pending, and admission refuses it until a stopped-store transition succeeds.
 pub fn migrate_sandbox_store_for_with(
     id: &str,
     reporter: Option<progress::Reporter>,
@@ -223,7 +223,8 @@ pub fn migrate_sandbox_store_for_with(
         return Ok(());
     }
     let _installed = progress::install(reporter);
-    v027_isolate_sandbox_stores::migrate_instance(id)
+    v027_isolate_sandbox_stores::migrate_instance(id)?;
+    v031_isolate_sandbox_content::migrate_instance(id)
 }
 
 /// [`migrate_sandbox_store_for_with`] with the container probes injected, for

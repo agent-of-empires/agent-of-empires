@@ -407,6 +407,7 @@ mod tests {
 
         let mut inst = tool_instance("pi", "/tmp/pi-reload");
         inst.sandbox_info = Some(test_sandbox("aoe-pi-reload", None));
+        admit_sandbox_fixture(&inst);
         inst.mark_pi_extension_launched_for_test();
 
         let reloaded: Instance =
@@ -456,6 +457,7 @@ mod tests {
         let _home = crate::session::test_support::isolate_home(temp.path());
         let mut inst = tool_instance("pi", "/tmp/pi-bounded");
         inst.sandbox_info = Some(test_sandbox("aoe-pi-bounded", None));
+        admit_sandbox_fixture(&inst);
         let SessionSidecarSource::SandboxDir(dir) = inst.pi_sidecar_source().unwrap() else {
             panic!("sandboxed Pi must publish into its config bind");
         };
@@ -505,6 +507,7 @@ mod tests {
         };
 
         let inst = sandboxed_pi("piownconfig01");
+        admit_sandbox_fixture(&inst);
         let SessionSidecarSource::SandboxDir(stale_sidecar) = inst.pi_sidecar_source().unwrap()
         else {
             panic!("sandboxed Pi must publish into its config bind");
@@ -521,6 +524,7 @@ pi = "~/.pi-personal"
         .unwrap();
 
         let mut declared = sandboxed_pi("piownconfig01");
+        admit_sandbox_fixture(&declared);
         let (_, env_prefix) = declared
             .identity_extension_launch()
             .expect("declared sandbox config supports the pane extension");
@@ -541,8 +545,10 @@ pi = "~/.pi-personal"
     #[test]
     #[serial_test::serial]
     fn sandbox_transcript_paths_validate_in_the_host_namespace() {
+        let _app = crate::session::test_support::isolate_app_dir();
         let mut inst = tool_instance("pi", "/tmp/pi-ns");
         inst.sandbox_info = Some(test_sandbox("aoe-pi-ns", None));
+        admit_sandbox_fixture(&inst);
 
         let published = "/root/.pi/sessions/--proj--/2026-01-01T00-00-00-000Z_x.jsonl";
         let host = inst
@@ -575,6 +581,7 @@ pi = "~/.pi-personal"
         inst.agent_session_id = Some(id.to_string());
         inst.sandbox_info = Some(test_sandbox("aoe-pi-store", None));
         inst.pi_session_path = Some(format!("/root/.pi/agent/sessions/--proj--/{leaf}"));
+        admit_sandbox_fixture(&inst);
 
         assert!(
             !inst.pi_recorded_transcript_missing(),

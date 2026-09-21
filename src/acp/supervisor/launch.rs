@@ -392,6 +392,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             self.detach_orphaned_background_agents(session_id);
             Vec::new()
         };
+        if context_reset.is_some() {
+            lock_recover(&self.pending_context_resets).insert(session_id.to_string());
+        }
         let drain_task = self.start_drain_task(
             session_id.to_string(),
             lease.clone(),

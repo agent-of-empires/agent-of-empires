@@ -2007,6 +2007,20 @@ pub(crate) fn reconcile_pending(move_stores: bool) -> Result<()> {
     )
 }
 
+pub(crate) fn migrate_instance(id: &str) -> Result<()> {
+    let app = crate::session::get_app_dir()?;
+    let home = dirs::home_dir().context("home directory unavailable for content isolation")?;
+    reconcile_in(
+        &app,
+        &home,
+        Some(id),
+        true,
+        &layout::batched_running_probe(false),
+        &layout::reap_migrated_container,
+        &live_bind_sources,
+    )
+}
+
 /// Fresh builders may certify only absent roots or already certified roots.
 /// Existing unproven data requires the stopped, registry-backed migration.
 pub(crate) fn ensure_fresh_content(

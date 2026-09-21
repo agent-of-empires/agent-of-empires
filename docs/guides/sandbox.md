@@ -121,9 +121,31 @@ For a custom agent whose wrapper points the CLI at another directory, name that 
 
 ## Per-session agent stores
 
-Each sandboxed session gets its own copy of the agent's config and history under `sandbox-v2/<instance-id>` in the agent's config directory (for example `~/.claude/sandbox-v2/<id>`), mounted at the agent's usual config path, so credentials, hooks and conversation history belong to one session.
+Each sandboxed session gets its own agent store on the host, under
+`sandbox-v2/<instance-id>` inside the agent's config directory (for example
+`~/.claude/sandbox-v2/<id>`). AoE builds that store from the configuration it
+declares for the agent: its config files, credentials and authored resources.
+The host's native history is never imported, so a session's transcripts,
+caches and logs start empty and belong to it alone. A host file AoE does not
+declare for that agent, such as one you wrote yourself, stays on the host
+instead of being copied. The container mounts the
+store at the agent's usual config path, so credentials, hooks and conversation
+history belong to one session and `aoe` can resume the right conversation.
 
-Sessions created under the older shared-store layout move to a private store the next time they start, which makes that first start slower; the TUI shows the progress. `aoe migrate` moves every eligible session at once, and `AOE_DEFER_SANDBOX_MIGRATION=1` skips the move for one launch (a session whose container is stopped then cannot start until its store has moved). Trashed and archived sessions keep the shared store until they are started again.
+A session keeps the store it was given for as long as AoE can still prove it
+wrote that store. When it cannot, each of its content roots is moved intact
+under `.aoe-sandbox-recovery/<transaction>/<index>/original` beside the agent's
+config directory and a fresh store is seeded in its place, with the session's
+original left alone. AoE copies back native resume state that was already
+sandbox-only (Claude `projects/` and OpenCode `opencode.db*`) and keeps those
+agents' session IDs. Native history that could have been imported from the host
+stays in recovery. When an agent's native resume is isolated, its next start
+shows a notice naming the retained originals; that isolated history is not
+replayed automatically.
+
+Sessions created under the older shared-store layout move to a private store the next time they start. Once every session that used the shared store has moved, AoE preserves that store intact under `.aoe-sandbox-recovery/v027-<transaction>/original` instead of deleting it. A session that already had a private store receives only the shared store's top-level configuration and credentials, not its directories of caches, logs, plugins, or unrelated conversation history. If a live sandbox can see the recovery directory, preservation is deferred until that mount is gone.
+
+The first start can therefore be slower; the TUI shows progress. `aoe migrate` moves every eligible session at once, and `AOE_DEFER_SANDBOX_MIGRATION=1` skips the move for one launch (a stopped session then cannot start until its store has moved). Trashed and archived sessions keep the shared store until they are started again.
 
 ### Shared credentials
 
@@ -133,7 +155,12 @@ A file holding no credential is seeded at the next start from the freshest of th
 
 ### Reclaiming stores
 
-Permanently deleting a sandboxed session removes its store with its container. Stores stranded otherwise (a delete that kept the container, or one that failed part-way) are found by their instance id resolving in no profile:
+Permanently deleting a sandboxed session removes its store along with its
+container, unless AoE cannot prove it wrote that store: an unproven original is
+preserved rather than deleted, so a delete cannot destroy content nothing could
+restore. Stores stranded before that, by a delete that kept the container, or
+by a delete that failed part-way and kept the session, are found by their
+instance id resolving in no profile:
 
 ```bash
 aoe sandbox reclaim            # report what would go, and how much it frees

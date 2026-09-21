@@ -46,6 +46,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             launcher: Arc::clone(&self.launcher),
             notify: Arc::clone(&self.worker_notify),
             startup_failures: Arc::clone(&self.startup_failures),
+            pending_context_resets: Arc::clone(&self.pending_context_resets),
             context_reset,
         };
         crate::task_util::spawn_supervised(
@@ -67,6 +68,7 @@ struct Drain<S> {
     launcher: Launcher,
     notify: Arc<tokio::sync::Notify>,
     startup_failures: SharedSet,
+    pending_context_resets: SharedSet,
     context_reset: Option<PendingContextReset>,
 }
 
@@ -210,6 +212,9 @@ impl<S: BroadcastSink> Drain<S> {
                             continue;
                         }
                     }
+                    if self.clear_pending_context_reset() {
+                        self.notify.notify_waiters();
+                    }
                     established = true;
                     self.with_cached_config(|config| {
                         info!(
@@ -255,13 +260,17 @@ impl<S: BroadcastSink> Drain<S> {
         }
     }
 
+    fn clear_pending_context_reset(&self) -> bool {
+        lock_recover(&self.pending_context_resets).remove(&self.session_id)
+    }
+
     /// Remove this epoch's handle; a no-op once a newer epoch replaced it.
     /// Every caller is a terminal arm with no respawn behind it, so this
     /// worker's background-agent tailers die here and nothing will report
     /// their outcome: detach them, or a park leaves the panel showing them
     /// running and holds the sidebar dot lit for its length (#4001). Gated on
     /// the release so a newer epoch's sub-agents, which that epoch's own sweep
-    /// owns, are left alone; the detach runs off the `workers` guard because
+    /// owns, are left alone; the detach runs off the workers guard because
     /// it reads the store.
     async fn drop_handle(&self, lease: &Lease) {
         let dropped = {
@@ -273,6 +282,9 @@ impl<S: BroadcastSink> Drain<S> {
             dropped
         };
         if dropped {
+            if self.clear_pending_context_reset() {
+                self.notify.notify_waiters();
+            }
             super::publish::detach_orphaned_background_agents_on(
                 &*self.sink,
                 &self.next_seqs,

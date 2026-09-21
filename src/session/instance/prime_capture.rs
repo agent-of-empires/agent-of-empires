@@ -369,6 +369,7 @@ mod tests {
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
         let mut inst = tool_instance("prime-agent", "/tmp/test");
         inst.sandbox_info = Some(test_sandbox("test", Some("/workspace/test")));
+        admit_sandbox_fixture(&inst);
 
         assert_eq!(inst.try_retroactive_capture(), None);
         std::fs::create_dir_all(inst.sandbox_capture_store_dir().unwrap()).unwrap();
@@ -387,6 +388,7 @@ mod tests {
         std::fs::create_dir_all(project.join(".prime/agent")).unwrap();
         let mut inst = tool_instance("prime-agent", project.to_str().unwrap());
         inst.sandbox_info = Some(test_sandbox("prime-plan", Some("/workspace/project")));
+        admit_sandbox_fixture(&inst);
         let store = inst.sandbox_capture_store_dir().unwrap();
         std::fs::create_dir_all(&store).unwrap();
         let mut config = inst.build_container_config().unwrap();
@@ -602,6 +604,7 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let mut inst = tool_instance("prime-agent", project.to_str().unwrap());
         inst.sandbox_info = Some(test_sandbox("prime-empty", Some("/workspace/project")));
+        admit_sandbox_fixture(&inst);
         inst.build_launch_command().unwrap();
         let plan = inst
             .prime_agent_capture_plan(inst.prime_agent_capture_options().unwrap())
@@ -737,6 +740,7 @@ await publish({}, { sessionManager: {
         let mut inst = tool_instance("prime-agent", project.to_str().unwrap());
         inst.extra_args = "--session-dir /root/.prime/agent/custom-sessions".to_string();
         inst.sandbox_info = Some(test_sandbox("prime-root-only", Some("/workspace/project")));
+        admit_sandbox_fixture(&inst);
 
         inst.build_launch_command().unwrap();
         let store = inst.sandbox_capture_store_dir().unwrap();
