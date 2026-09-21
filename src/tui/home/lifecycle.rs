@@ -232,8 +232,10 @@ impl HomeView {
             remote_live_size: (0, 0),
             remote_create: crate::tui::remote_create::RemoteCreate::new(),
             remote_delete: crate::tui::remote_delete::RemoteDelete::new(),
+            remote_mutate: crate::tui::remote_mutate::RemoteMutate::new(),
             remote_rename: crate::tui::remote_rename::RemoteRename::new(),
             pending_remote_select: None,
+            pending_remote_snooze: None,
             row_tag_mode: resolved.session.row_tag,
             agent_clipboard_forward: resolved.tmux.clipboard
                 != crate::session::config::TmuxSettingMode::Disabled,

@@ -1426,13 +1426,7 @@ impl HomeView {
         if let Some(dialog) = &self.snooze_duration_dialog {
             if let Some(DialogResult::Submit(minutes)) = dialog.handle_click(col, row) {
                 self.snooze_duration_dialog = None;
-                let sid = self.pending_snooze_session.take();
-                if let Some(id) = sid {
-                    if let Err(e) = self.snooze_session_for(&id, minutes) {
-                        self.info_dialog =
-                            Some(InfoDialog::new("Snooze not changed", &e.to_string()));
-                    }
-                }
+                self.resolve_snooze_duration(minutes);
             }
             return true;
         }
@@ -1954,16 +1948,11 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.snooze_duration_dialog = None;
                     self.pending_snooze_session = None;
+                    self.pending_remote_snooze = None;
                 }
                 DialogResult::Submit(minutes) => {
                     self.snooze_duration_dialog = None;
-                    let sid = self.pending_snooze_session.take();
-                    if let Some(id) = sid {
-                        if let Err(e) = self.snooze_session_for(&id, minutes) {
-                            self.info_dialog =
-                                Some(InfoDialog::new("Snooze not changed", &e.to_string()));
-                        }
-                    }
+                    self.resolve_snooze_duration(minutes);
                 }
             }
             return None;
@@ -3337,6 +3326,12 @@ impl HomeView {
     }
 
     pub(super) fn stop_selected(&mut self) {
+        // A remote row has no local view mode to disambiguate; the key stops
+        // the session on the machine that owns it.
+        if self.selected_remote.is_some() {
+            self.stop_remote_at_cursor();
+            return;
+        }
         // Stop targets what the user is looking at. In Terminal view that is
         // the paired terminal, and in Tool view the tool session; killing the
         // agent (docker stop + status flip) from either would be surprising.
@@ -4768,11 +4763,22 @@ impl HomeView {
                     return true;
                 }
                 super::Item::RemoteSession { remote, id, .. } => {
-                    let can_rename = self
-                        .remote_row(remote, id)
-                        .is_some_and(crate::tui::remote_rename::can_rename);
-                    self.context_menu =
-                        Some(ContextMenuDialog::for_remote_session(anchor, can_rename));
+                    let row = self.remote_row(remote, id);
+                    let can_rename = row.is_some_and(crate::tui::remote_rename::can_rename);
+                    let settled = row.is_some_and(crate::tui::remote_mutate::can_mutate);
+                    let archive = settled.then(|| row.is_some_and(|r| r.archived_at.is_some()));
+                    // Same two gates the local menu applies, so the row a user
+                    // right-clicks offers the same entries whichever machine it
+                    // lives on: snooze only in Attention sort, unread only when
+                    // the feature is on.
+                    let snooze = (settled
+                        && self.sort_order == crate::session::config::SortOrder::Attention)
+                        .then(|| row.is_some_and(crate::tui::remote_mutate::is_snoozed));
+                    let unread = (settled && crate::session::unread_enabled())
+                        .then(|| row.is_some_and(|r| r.unread));
+                    self.context_menu = Some(ContextMenuDialog::for_remote_session(
+                        anchor, can_rename, archive, snooze, unread,
+                    ));
                     return true;
                 }
                 _ => {}
@@ -6064,6 +6070,13 @@ impl HomeView {
     /// and/or swapping the AI engine. No-op if no session is selected or the
     /// selected session is mid-transition.
     fn open_restart_dialog(&mut self) {
+        // The dialog's pickers are filled from this machine's agents, so a
+        // remote row relaunches with the settings that machine already holds
+        // rather than opening a chooser that cannot describe it.
+        if self.selected_remote.is_some() {
+            self.restart_remote_at_cursor();
+            return;
+        }
         // Match the new-session paths: bail with the no-agents modal if no
         // tool is installed, instead of opening a picker with an empty
         // tool list the user would have to submit blank.

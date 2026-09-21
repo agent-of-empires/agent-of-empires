@@ -603,9 +603,13 @@ pub struct HomeView {
     pub(super) remote_live_size: (u16, u16),
     pub(super) remote_create: super::remote_create::RemoteCreate,
     pub(super) remote_delete: super::remote_delete::RemoteDelete,
+    pub(super) remote_mutate: super::remote_mutate::RemoteMutate,
     pub(super) remote_rename: super::remote_rename::RemoteRename,
     /// A session just created on a remote, selected once the feed lists it.
     pub(super) pending_remote_select: Option<(String, String)>,
+    /// Remote row awaiting a snooze duration, the way
+    /// `pending_snooze_session` holds a local one.
+    pub(super) pending_remote_snooze: Option<(String, String)>,
     pub(super) sidebar_source: super::session_feed::SidebarSource,
     // Structured (ACP) rows also surface their pending approval nonces from
     // the daemon; the home permission dialog resolves them. See

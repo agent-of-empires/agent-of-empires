@@ -22,6 +22,7 @@ mod reconcile_poller;
 pub(crate) mod remote_create;
 pub(crate) mod remote_delete;
 pub(crate) mod remote_feed;
+pub(crate) mod remote_mutate;
 pub(crate) mod remote_preview;
 pub(crate) mod remote_rename;
 pub(crate) mod responsive;

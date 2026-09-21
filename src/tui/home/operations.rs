@@ -1453,6 +1453,10 @@ impl HomeView {
 
     /// Open the duration picker, or queue an unsnooze for an already snoozed row.
     pub(super) fn toggle_snooze_at_cursor(&mut self) -> anyhow::Result<()> {
+        if self.selected_remote.is_some() {
+            self.toggle_remote_snooze_at_cursor();
+            return Ok(());
+        }
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
@@ -1472,6 +1476,25 @@ impl HomeView {
         ));
         self.pending_snooze_session = Some(id);
         Ok(())
+    }
+
+    /// Apply a duration the snooze dialog returned, to whichever row opened
+    /// it. The remote pending slot is checked first because a remote row sets
+    /// both `selected_remote` and no `selected_session`.
+    pub(super) fn resolve_snooze_duration(&mut self, minutes: u32) {
+        if self.pending_remote_snooze.take().is_some() {
+            self.snooze_remote_for(minutes);
+            return;
+        }
+        let Some(id) = self.pending_snooze_session.take() else {
+            return;
+        };
+        if let Err(e) = self.snooze_session_for(&id, minutes) {
+            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                "Snooze not changed",
+                &e.to_string(),
+            ));
+        }
     }
 
     pub(super) fn snooze_session_for(&mut self, id: &str, minutes: u32) -> anyhow::Result<()> {
@@ -1543,6 +1566,10 @@ impl HomeView {
         if !crate::session::unread_enabled() {
             return Ok(());
         }
+        if self.selected_remote.is_some() {
+            self.toggle_remote_unread_at_cursor();
+            return Ok(());
+        }
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
@@ -1567,6 +1594,10 @@ impl HomeView {
     /// preserved. Unarchive does NOT respawn; press `e` to restart, or send
     /// a message to auto-unarchive. See #1868.
     pub(super) fn toggle_archive_at_cursor(&mut self) -> anyhow::Result<()> {
+        if self.selected_remote.is_some() {
+            self.toggle_remote_archive_at_cursor();
+            return Ok(());
+        }
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };

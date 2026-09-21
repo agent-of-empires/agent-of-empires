@@ -490,16 +490,44 @@ impl DaemonClient {
         mutation: &SessionMutation,
         epoch: &str,
     ) -> Result<RuntimeCursor, DaemonClientError> {
+        let request = self.mutation_request(session_id, mutation)?;
+        self.request_mutation(request, epoch).await
+    }
+
+    /// Apply a mutation on a daemon whose runtime this client does not track.
+    ///
+    /// The epoch header fences a mutation against a runtime that restarted
+    /// under the client. A polled remote never had an epoch to pin, so the
+    /// request goes without one and the next poll reports what happened. That
+    /// is weaker than the local path on purpose: the alternative is refusing
+    /// every remote mutation until the runtime stream reaches remotes, which
+    /// `docs/development/internals/client-transports.md` explains is blocked.
+    pub async fn mutate_session_unpinned(
+        &self,
+        session_id: &str,
+        mutation: &SessionMutation,
+    ) -> Result<(), DaemonClientError> {
+        let request = self.mutation_request(session_id, mutation)?;
+        let mut response = self.request_response(request).await?;
+        discard_bounded_body(&mut response).await
+    }
+
+    /// The route and verb one mutation is sent as. Shared so a mutation added
+    /// to the enum reaches the pinned and unpinned paths together.
+    fn mutation_request(
+        &self,
+        session_id: &str,
+        mutation: &SessionMutation,
+    ) -> Result<reqwest::RequestBuilder, DaemonClientError> {
         let url = self.session_route(session_id, mutation.route())?;
-        let request = match mutation {
+        Ok(match mutation {
             SessionMutation::Start(body) => self.http.post(url).json(body),
             SessionMutation::Restart(body) => self.http.post(url).json(body),
             SessionMutation::AbandonPurge(body) => self.http.post(url).json(body),
             SessionMutation::StopAuxiliary(target) => self.http.post(url).json(target),
             SessionMutation::Stop | SessionMutation::Restore => self.http.post(url),
             _ => self.http.patch(url).json(mutation),
-        };
-        self.request_mutation(request, epoch).await
+        })
     }
 
     pub async fn trash_session(

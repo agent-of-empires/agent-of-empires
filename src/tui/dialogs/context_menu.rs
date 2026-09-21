@@ -231,10 +231,39 @@ impl ContextMenuDialog {
     /// this machine can actually carry out over the wire: everything else the
     /// session menu offers reads or writes local state. `can_rename` is false
     /// for a row mid-create or mid-delete, which has no title to edit.
-    pub fn for_remote_session(anchor: (u16, u16), can_rename: bool) -> Self {
+    /// Menu for a session on another machine. Same entries as
+    /// [`Self::for_session`] minus the three that would answer from this
+    /// machine's state: "Add project" would add the remote's path to this
+    /// machine's project list, and fork and view switching both resolve agent
+    /// config locally.
+    pub fn for_remote_session(
+        anchor: (u16, u16),
+        can_rename: bool,
+        archive: Option<bool>,
+        snooze: Option<bool>,
+        unread: Option<bool>,
+    ) -> Self {
         let mut items = vec![(ContextMenuAction::NewFromSelection, "New Session")];
         if can_rename {
             items.push((ContextMenuAction::Rename, "Rename"));
+        }
+        // A row mid-create or mid-delete has no settled state to toggle, so
+        // these three are absent rather than present and refused.
+        if let Some(is_archived) = archive {
+            let archive_label = if is_archived { "Unarchive" } else { "Archive" };
+            items.push((ContextMenuAction::ToggleArchive, archive_label));
+        }
+        if let Some(is_snoozed) = snooze {
+            let snooze_label = if is_snoozed { "Unsnooze" } else { "Snooze" };
+            items.push((ContextMenuAction::ToggleSnooze, snooze_label));
+        }
+        if let Some(is_unread) = unread {
+            let unread_label = if is_unread {
+                "Mark read"
+            } else {
+                "Mark unread"
+            };
+            items.push((ContextMenuAction::ToggleUnread, unread_label));
         }
         items.push((ContextMenuAction::Delete, "Delete"));
         Self::new(anchor, items)

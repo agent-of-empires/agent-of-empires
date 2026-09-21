@@ -106,15 +106,31 @@ header with the reason.
   connection drops, live-send ends with a status message.
 * **Structured sessions** open full screen against the remote daemon on
   `Enter`; `Ctrl+Q` returns to the home view.
-* **Archived or trashed rows** have to be restored on their own machine.
+* **Trashed rows** have to be restored on their own machine.
 
-Right-clicking a remote row opens the same context menu a local row does,
-carrying the actions that work over the wire: New Session on that machine,
-Rename, and Delete. `r` and `d` do the same from the keyboard. A rename edits
-the title alone, since the machine that owns the row decides whether its
-worktree directory follows. Delete reads the remote's own cleanup defaults to
-decide whether it trashes first or deletes outright. Right-clicking a machine
-header offers New Session there and the collapse toggle.
+Right-clicking a remote row opens the same context menu a local row does: New
+Session on that machine, Rename, Archive or Unarchive, Snooze, Mark read or
+unread, and Delete. Snooze and the unread toggle appear under the same
+conditions as on a local row, so the two menus match. The keyboard reaches all
+of them through the same keys, and `x` stops a remote session while `e`
+restarts it.
+
+Three local entries have no remote counterpart, because each would answer from
+this machine rather than the one that owns the row: Add project would file
+another machine's path in this one's project list, and Fork and the view
+switch both resolve agent configuration locally. The restart also carries no
+overrides for the same reason; it relaunches with the settings that machine
+already holds, rather than offering pickers filled from this one's agents.
+
+A rename edits the title alone, since the machine that owns the row decides
+whether its worktree directory follows. Delete reads the remote's own cleanup
+defaults to decide whether it trashes first or deletes outright.
+Right-clicking a machine header offers New Session there and the collapse
+toggle.
+
+A state change is sent and then waited on: the row keeps showing what the
+remote last reported until the next poll confirms the change, so a failure
+surfaces as a status line rather than a row that silently reverts.
 
 ## Creating a session on a remote
 

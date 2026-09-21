@@ -266,6 +266,132 @@ impl HomeView {
         self.flash_status(format!("Renaming on {remote}…"));
     }
 
+    /// Hand a remote state change (archive, snooze, unread, stop, restart) to
+    /// its worker. The row is not touched here: the next poll is what reports
+    /// the daemon's answer, the same way a local row waits for its snapshot.
+    pub(super) fn start_remote_mutation(
+        &mut self,
+        mutation: crate::daemon::SessionMutation,
+        verb: &'static str,
+    ) {
+        let Some((remote, session_id)) = self.selected_remote.clone() else {
+            return;
+        };
+        let Some(row) = self.remote_row(&remote, &session_id) else {
+            return;
+        };
+        let title = row.title.clone();
+        let Some(client) = self.remote_client_or_flash(&remote) else {
+            return;
+        };
+        self.remote_mutate
+            .request(crate::tui::remote_mutate::MutateRequest {
+                remote,
+                client,
+                session_id,
+                mutation,
+                verb,
+                title,
+            });
+    }
+
+    /// The remote halves of the three state toggles. Each reads the row the
+    /// cursor is on, so the request matches what the sidebar drew.
+    pub(super) fn toggle_remote_archive_at_cursor(&mut self) {
+        let Some(row) = self.selected_remote_row() else {
+            return;
+        };
+        let (mutation, verb) = crate::tui::remote_mutate::archive(&row);
+        self.start_remote_mutation(mutation, verb);
+    }
+
+    pub(super) fn toggle_remote_unread_at_cursor(&mut self) {
+        let Some(row) = self.selected_remote_row() else {
+            return;
+        };
+        let (mutation, verb) = crate::tui::remote_mutate::unread(&row);
+        self.start_remote_mutation(mutation, verb);
+    }
+
+    /// Unsnoozing is one request; snoozing asks for a duration first, the way
+    /// a local row does, and resumes in [`Self::snooze_remote_for`].
+    pub(super) fn toggle_remote_snooze_at_cursor(&mut self) {
+        let Some(row) = self.selected_remote_row() else {
+            return;
+        };
+        if crate::tui::remote_mutate::is_snoozed(&row) {
+            let (mutation, verb) = crate::tui::remote_mutate::unsnooze();
+            self.start_remote_mutation(mutation, verb);
+            return;
+        }
+        self.snooze_duration_dialog =
+            Some(crate::tui::dialogs::SnoozeDurationDialog::new(&row.title));
+        self.pending_remote_snooze = self.selected_remote.clone();
+    }
+
+    pub(super) fn snooze_remote_for(&mut self, minutes: u32) {
+        let (mutation, verb) = crate::tui::remote_mutate::snooze_for(minutes);
+        self.start_remote_mutation(mutation, verb);
+    }
+
+    /// Stop or restart the selected remote row. The restart carries no launch
+    /// overrides: picking a profile or tool needs that machine's agent list,
+    /// so the dialog behind `'e'` stays local and this relaunches as
+    /// configured there.
+    pub(super) fn stop_remote_at_cursor(&mut self) {
+        let Some(row) = self.selected_remote_row() else {
+            return;
+        };
+        match crate::tui::remote_mutate::is_down(&row) {
+            Some(false) => {
+                self.start_remote_mutation(crate::daemon::SessionMutation::Stop, "Stopped")
+            }
+            Some(true) => self.flash_status(format!("'{}' is already stopped", row.title)),
+            None => self.flash_status(format!("'{}' is still settling", row.title)),
+        }
+    }
+
+    pub(super) fn restart_remote_at_cursor(&mut self) {
+        let Some(row) = self.selected_remote_row() else {
+            return;
+        };
+        if crate::tui::remote_mutate::is_down(&row).is_none() {
+            self.flash_status(format!("'{}' is still settling", row.title));
+            return;
+        }
+        self.start_remote_mutation(
+            crate::daemon::SessionMutation::Restart(crate::daemon::RestartSessionBody::default()),
+            "Restarted",
+        );
+    }
+
+    /// The row under the cursor, when the cursor is on a remote one.
+    fn selected_remote_row(&self) -> Option<crate::daemon::SessionResponse> {
+        let (remote, id) = self.selected_remote.clone()?;
+        let row = self.remote_row(&remote, &id)?;
+        crate::tui::remote_mutate::can_mutate(row).then(|| row.clone())
+    }
+
+    /// Land finished remote state changes. Returns whether anything changed.
+    pub fn apply_remote_mutation(&mut self) -> bool {
+        use crate::tui::remote_mutate::MutateResult;
+        let mut changed = false;
+        while let Ok(result) = self.remote_mutate.try_recv() {
+            match result {
+                MutateResult::Done(message) => {
+                    self.flash_status(message);
+                    // Archive moves the row between sections and stop changes
+                    // its status, so re-read rather than showing the old state
+                    // until the next scheduled poll.
+                    self.request_remote_feed_refresh();
+                }
+                MutateResult::Failed(message) => self.flash_status(message),
+            }
+            changed = true;
+        }
+        changed
+    }
+
     /// Land finished remote renames. Returns whether anything changed.
     pub fn apply_remote_rename(&mut self) -> bool {
         use crate::tui::remote_rename::RenameResult;

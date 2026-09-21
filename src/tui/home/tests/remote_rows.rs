@@ -671,9 +671,15 @@ fn right_clicking_a_remote_row_offers_what_the_wire_can_do() {
     env.view
         .dispatch_context_menu_action(ContextMenuAction::ToggleSectionCollapse);
 
-    // A live row renames and deletes; the mid-create one has no title yet.
+    // The indicator is process-global, so pin it rather than reading whatever
+    // an earlier test left, and put it back at the end.
+    let unread_was = crate::session::unread_enabled();
+    crate::session::set_unread_enabled(false);
+
+    // A live row carries the state toggles too; the mid-create one has no
+    // title to edit and no settled state to flip.
     for (id, expected) in [
-        ("r1", vec!["New Session", "Rename", "Delete"]),
+        ("r1", vec!["New Session", "Rename", "Archive", "Delete"]),
         ("r2", vec!["New Session", "Delete"]),
     ] {
         env.view.context_menu = None;
@@ -693,6 +699,41 @@ fn right_clicking_a_remote_row_offers_what_the_wire_can_do() {
             .collect();
         assert_eq!(labels, expected, "{id}");
     }
+
+    // The two entries the local menu gates the same way: snooze only in
+    // Attention sort, unread only when the indicator is on. With both on, a
+    // remote row offers what a local one does, minus the three that would
+    // answer from this machine (add project, fork, view switch).
+    crate::session::set_unread_enabled(true);
+    env.view.sort_order = crate::session::config::SortOrder::Attention;
+    env.view.context_menu = None;
+    let live = row_of(
+        &env,
+        &|item| matches!(item, Item::RemoteSession { id, .. } if id == "r1"),
+    );
+    assert!(env.view.handle_right_click(5, live));
+    let labels: Vec<&str> = env
+        .view
+        .context_menu
+        .as_ref()
+        .expect("menu")
+        .items_for_test()
+        .iter()
+        .map(|(_, label)| *label)
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "New Session",
+            "Rename",
+            "Archive",
+            "Snooze",
+            "Mark unread",
+            "Delete"
+        ]
+    );
+    crate::session::set_unread_enabled(unread_was);
+    env.view.sort_order = crate::session::config::SortOrder::default();
 
     // Rename opens the remote dialog, which offers the title alone.
     env.view.context_menu = None;
