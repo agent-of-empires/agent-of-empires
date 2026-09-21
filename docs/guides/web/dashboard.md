@@ -76,6 +76,6 @@ The profile picker scopes which profile you are editing; global settings apply w
 
 ## On mobile
 
-Below the `md` breakpoint the dashboard shows one full-viewport pane. The right-panel button swaps the main pane between **Agent terminal**, **Diff**, and **Paired terminal**, with a back chip returning to the agent terminal. Both terminals stay alive in the background, preserving scrollback and focus.
+Below the `md` breakpoint the dashboard shows one full-viewport pane. The right-panel button swaps the main pane between **Agent terminal**, **Paired terminal**, and whichever panes the session allows: **Sub agents** in structured-view sessions, **Diff** and **Files** (hidden in CityHall mode), and plugin panes. A back chip returns to the agent terminal. Both terminals stay alive in the background, preserving scrollback and focus.
 
 In a structured-view conversation, a tab at the top right and another just above the composer fold away the top bar and the composer independently, giving the transcript their height back; both tabs stay on screen while collapsed. Leaving the conversation shows the top bar again, since it is the only navigation the other views have.
