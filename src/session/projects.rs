@@ -184,12 +184,6 @@ fn read_file(path: &Path, scope: ProjectScope) -> Result<Vec<Project>> {
     parse_projects(&content, scope)
 }
 
-fn write_file(path: &Path, projects: &[Project]) -> Result<()> {
-    let content = serde_json::to_string_pretty(projects)?;
-    super::atomic_write(path, content.as_bytes())?;
-    Ok(())
-}
-
 /// Load global registry only.
 pub fn load_global() -> Result<Vec<Project>> {
     read_file(&global_path()?, ProjectScope::Global)
@@ -286,11 +280,6 @@ pub fn unpopulated_projects(
         });
     }
     out
-}
-
-/// Replace the contents of one scope's registry file.
-pub fn save_scope(profile: &str, scope: ProjectScope, projects: &[Project]) -> Result<()> {
-    write_file(&registry_path(profile, scope)?, projects)
 }
 
 /// Read-modify-write one scope's registry under the file's sidecar lock, so two concurrent mutators
@@ -425,6 +414,33 @@ pub fn remove(
     })
 }
 
+/// Edit the entry matching `name_or_path` in the given scope under the registry lock.
+fn update_entry(
+    profile: &str,
+    scope: ProjectScope,
+    name_or_path: &str,
+    mutate: impl FnOnce(&mut Project),
+) -> std::result::Result<Project, RegistryError> {
+    let canonical_target = canonical_key(name_or_path);
+    locked_update_scope(profile, scope, |existing| {
+        let entry = existing
+            .iter_mut()
+            .find(|p| {
+                p.name.eq_ignore_ascii_case(name_or_path)
+                    || canonical_key(&p.path) == canonical_target
+            })
+            .ok_or_else(|| {
+                RegistryError::NotFound(format!(
+                    "No project '{}' in {} scope",
+                    name_or_path,
+                    scope.as_str()
+                ))
+            })?;
+        mutate(entry);
+        Ok(entry.clone())
+    })
+}
+
 /// Set or clear the default base branch on the entry matching `name_or_path` in the given scope.
 pub fn update_base_branch(
     profile: &str,
@@ -432,29 +448,9 @@ pub fn update_base_branch(
     name_or_path: &str,
     base: Option<String>,
 ) -> std::result::Result<Project, RegistryError> {
-    let mut existing = match scope {
-        ProjectScope::Global => load_global().map_err(RegistryError::Other)?,
-        ProjectScope::Profile => load_profile(profile).map_err(RegistryError::Other)?,
-    };
-
-    let canonical_target = canonical_key(name_or_path);
-    let idx = existing
-        .iter()
-        .position(|p| {
-            p.name.eq_ignore_ascii_case(name_or_path) || canonical_key(&p.path) == canonical_target
-        })
-        .ok_or_else(|| {
-            RegistryError::NotFound(format!(
-                "No project '{}' in {} scope",
-                name_or_path,
-                scope.as_str()
-            ))
-        })?;
-
-    existing[idx] = existing[idx].clone().with_base_branch(base);
-    let updated = existing[idx].clone();
-    save_scope(profile, scope, &existing).map_err(RegistryError::Other)?;
-    Ok(updated)
+    update_entry(profile, scope, name_or_path, |p| {
+        *p = p.clone().with_base_branch(base)
+    })
 }
 
 /// Set the pin flag on the entry matching `name_or_path` in the given scope.
@@ -464,29 +460,7 @@ pub fn set_pinned(
     name_or_path: &str,
     pinned: bool,
 ) -> std::result::Result<Project, RegistryError> {
-    let mut existing = match scope {
-        ProjectScope::Global => load_global().map_err(RegistryError::Other)?,
-        ProjectScope::Profile => load_profile(profile).map_err(RegistryError::Other)?,
-    };
-
-    let canonical_target = canonical_key(name_or_path);
-    let idx = existing
-        .iter()
-        .position(|p| {
-            p.name.eq_ignore_ascii_case(name_or_path) || canonical_key(&p.path) == canonical_target
-        })
-        .ok_or_else(|| {
-            RegistryError::NotFound(format!(
-                "No project '{}' in {} scope",
-                name_or_path,
-                scope.as_str()
-            ))
-        })?;
-
-    existing[idx].pinned = pinned;
-    let updated = existing[idx].clone();
-    save_scope(profile, scope, &existing).map_err(RegistryError::Other)?;
-    Ok(updated)
+    update_entry(profile, scope, name_or_path, |p| p.pinned = pinned)
 }
 
 /// Look up the merged-registry entry (profile shadows global) whose path
@@ -509,24 +483,7 @@ pub fn update_overrides(
     name_or_path: &str,
     mutate: impl FnOnce(&mut ProjectOverrides),
 ) -> std::result::Result<Project, RegistryError> {
-    let canonical_target = canonical_key(name_or_path);
-    locked_update_scope(profile, scope, |existing| {
-        let entry = existing
-            .iter_mut()
-            .find(|p| {
-                p.name.eq_ignore_ascii_case(name_or_path)
-                    || canonical_key(&p.path) == canonical_target
-            })
-            .ok_or_else(|| {
-                RegistryError::NotFound(format!(
-                    "No project '{}' in {} scope",
-                    name_or_path,
-                    scope.as_str()
-                ))
-            })?;
-        mutate(&mut entry.overrides);
-        Ok(entry.clone())
-    })
+    update_entry(profile, scope, name_or_path, |p| mutate(&mut p.overrides))
 }
 
 /// Resolve a list of project names against the merged registry. Errors on the

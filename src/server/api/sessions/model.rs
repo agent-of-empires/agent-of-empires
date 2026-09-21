@@ -330,12 +330,11 @@ impl<'a> SessionCfgCache<'a> {
     }
 }
 
-/// Per-request cache of each profile's merged project registry, so a
-/// per-project override lookup (e.g. `smart_rename`) reads the registry
-/// files once per profile per request rather than once per session row.
-/// Mirrors `SessionCfgCache`'s once-per-unique-key approach.
+/// Per-request cache of each profile's merged project registry, keyed by canonical path, so a
+/// per-project override lookup (e.g. `smart_rename`) reads and canonicalizes the registry once per
+/// profile per request rather than once per session row.
 pub(super) struct ProjectRegistryCache {
-    by_profile: HashMap<String, Vec<crate::session::Project>>,
+    by_profile: HashMap<String, Vec<(String, crate::session::Project)>>,
 }
 
 impl ProjectRegistryCache {
@@ -345,18 +344,23 @@ impl ProjectRegistryCache {
         }
     }
 
-    /// The registered project (if any) whose canonical path matches
-    /// `project_path`, loading `profile`'s merged registry from disk on
-    /// first use only.
     fn find(&mut self, profile: &str, project_path: &str) -> Option<&crate::session::Project> {
+        use crate::session::projects::{canonical_key, load_merged};
         let projects = self
             .by_profile
             .entry(profile.to_string())
-            .or_insert_with(|| crate::session::projects::load_merged(profile).unwrap_or_default());
-        let target = crate::session::projects::canonical_key(project_path);
+            .or_insert_with(|| {
+                load_merged(profile)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| (canonical_key(&p.path), p))
+                    .collect()
+            });
+        let target = canonical_key(project_path);
         projects
             .iter()
-            .find(|p| crate::session::projects::canonical_key(&p.path) == target)
+            .find(|(key, _)| *key == target)
+            .map(|(_, p)| p)
     }
 
     pub(super) fn smart_rename_override(

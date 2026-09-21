@@ -1144,4 +1144,27 @@ fn test_reload_config_defaults_uses_project_worktree_override() {
     assert!(!dialog.dir_picker.is_active());
     assert!(dialog.worktree_enabled);
     assert_eq!((dialog.tool_index, dialog.yolo_mode), (1, true));
+
+    let pick = |dialog: &mut NewSessionDialog, path: &std::path::Path| {
+        dialog.focused_field = 0;
+        dialog.path = Input::new(path.to_string_lossy().to_string());
+        dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+        dialog.handle_key(key(KeyCode::Enter));
+    };
+    // Leaving the project drops its override; a direct toggle then survives picks.
+    let unregistered = tempfile::tempdir().expect("unregistered dir");
+    pick(&mut dialog, unregistered.path());
+    assert!(!dialog.worktree_enabled);
+    dialog.focused_field = 4;
+    dialog.handle_key(key(KeyCode::Char(' ')));
+    assert!(dialog.worktree_enabled);
+    pick(&mut dialog, unregistered.path());
+    assert!(dialog.worktree_enabled);
+
+    // A typed path applies the override once focus leaves the field.
+    let mut dialog = single_tool_dialog();
+    dialog.path = Input::default();
+    type_str(&mut dialog, &repo.path().to_string_lossy());
+    dialog.handle_key(key(KeyCode::Tab));
+    assert!(dialog.worktree_enabled);
 }
