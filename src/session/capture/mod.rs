@@ -10,8 +10,17 @@ pub(crate) use crate::session::path_identity::canonicalize_or_raw;
 use anyhow::{Context, Result};
 use uuid::Uuid;
 mod omp;
+mod pi;
 
 pub(crate) use omp::*;
+#[cfg(test)]
+pub(crate) use pi::extract_pi_uuid_from_filename;
+pub(crate) use pi::pi_sidecar_poll_fn;
+
+#[cfg(test)]
+pub(crate) fn extract_pi_cwd_from_header(path: &Path) -> Option<String> {
+    pi::extract_pi_header_fields(path).and_then(|(_, cwd)| cwd)
+}
 
 /// Resolve an agent's home directory, checking an optional env var first.
 fn resolve_agent_home(env_var: Option<&str>, default_subdir: &str) -> Result<PathBuf> {
@@ -144,124 +153,6 @@ pub(crate) fn claude_host_transcript_confirmed_absent(
         .join(dir_name)
         .join(format!("{session_id}.jsonl"));
     !transcript.is_file()
-}
-
-/// Number of leading lines and bytes scanned when locating a pi-family
-/// session header. The byte cap matters because `BufRead::lines` otherwise
-/// allocates without bound for one hostile or corrupt line.
-const PI_HEADER_SCAN_LINES: usize = 8;
-const PI_HEADER_SCAN_BYTES: usize = 64 * 1024;
-
-fn extract_pi_header_fields(path: &Path) -> Option<(Option<String>, Option<String>)> {
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    #[cfg(not(unix))]
-    if std::fs::symlink_metadata(path)
-        .ok()?
-        .file_type()
-        .is_symlink()
-    {
-        return None;
-    }
-    let file = options.open(path).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
-    let mut reader = std::io::BufReader::new(file);
-    let mut consumed = 0usize;
-    for _ in 0..PI_HEADER_SCAN_LINES {
-        let mut line = String::new();
-        let mut limited =
-            (&mut reader).take((PI_HEADER_SCAN_BYTES.saturating_sub(consumed) + 1) as u64);
-        let read = std::io::BufRead::read_line(&mut limited, &mut line).ok()?;
-        if read == 0 {
-            return None;
-        }
-        consumed = consumed.saturating_add(read);
-        if consumed > PI_HEADER_SCAN_BYTES {
-            return None;
-        }
-        if let Some(header) = parse_pi_header_json(&line) {
-            return Some(header);
-        }
-    }
-    None
-}
-
-/// Parse a single already-in-memory `.jsonl` line into a pi-family session
-/// header's `(id, cwd)`, returning `None` unless the record's `"type"` is
-/// `"session"`.
-///
-/// Non-session and malformed lines yield `None`, so bounded scanners can keep
-/// the first matching record.
-fn parse_pi_header_json(line: &str) -> Option<(Option<String>, Option<String>)> {
-    let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
-    if parsed.get("type")?.as_str()? != "session" {
-        return None;
-    }
-    let session_id = parsed.get("id").and_then(|v| v.as_str()).map(String::from);
-    let cwd = parsed
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from);
-    Some((session_id, cwd))
-}
-
-pub(crate) fn extract_pi_uuid_from_filename(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
-    let uuid_part = stem.rsplit('_').next()?;
-    Uuid::parse_str(uuid_part).ok()?;
-    Some(uuid_part.to_string())
-}
-
-#[cfg(test)]
-pub(crate) fn extract_pi_cwd_from_header(path: &Path) -> Option<String> {
-    extract_pi_header_fields(path).and_then(|(_, cwd)| cwd)
-}
-
-/// Polling closure over the sidecar Pi's AoE extension writes: the pane's own
-/// conversation, `/new` included, with no store scan involved.
-///
-/// The source says where the pane publishes: a container's bind-backed
-/// directory or the per-instance hook dir. Getting it wrong is silent, the
-/// poller simply never observing anything, so it is passed in rather than
-/// re-derived here.
-pub(crate) fn pi_sidecar_poll_fn(
-    instance_id: String,
-    source: crate::session::instance::SessionSidecarSource,
-) -> impl Fn() -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
-    move || {
-        use crate::session::instance::SessionSidecarSource;
-        let id = match source {
-            SessionSidecarSource::SandboxDir(ref dir) => dir
-                .parent()
-                .and_then(Path::parent)
-                .filter(|root| root.join("aoe-session").join(&instance_id) == *dir)
-                .and_then(|root| crate::session::AnchoredDir::open(root).ok())
-                .and_then(|root| {
-                    root.read_regular(
-                        &Path::new("aoe-session")
-                            .join(&instance_id)
-                            .join("session_id"),
-                        4096,
-                    )
-                    .ok()
-                    .flatten()
-                })
-                .and_then(|raw| String::from_utf8(raw).ok())
-                .map(|raw| raw.trim().to_string())
-                .filter(|id| Uuid::parse_str(id).is_ok()),
-            SessionSidecarSource::HostHooks => crate::hooks::read_hook_session_id(&instance_id),
-        };
-        id.and_then(validated_session_id)
-            .map(crate::session::poller::SessionIdObservation::instance_sidecar)
-    }
 }
 
 pub(crate) const MAX_SESSION_ID_LEN: usize = 256;

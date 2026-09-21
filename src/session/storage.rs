@@ -437,6 +437,48 @@ pub(crate) fn resolve_symlink_chain(path: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Serialized read-modify-write of a small standalone data file.
+pub(crate) fn locked_update<T, R, E>(
+    path: &Path,
+    parse: impl FnOnce(&str) -> Result<T>,
+    serialize: impl FnOnce(&T) -> Result<String>,
+    mutate: impl FnOnce(&mut T) -> std::result::Result<R, E>,
+) -> Result<std::result::Result<R, E>>
+where
+    T: Default,
+{
+    let path = &resolve_symlink_chain(path)?;
+    let dir = path.parent().ok_or_else(|| {
+        anyhow!(
+            "locked_update needs a path with a parent: {}",
+            path.display()
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("locked_update needs a file path: {}", path.display()))?;
+    let lock_name = format!(".{}.lock", file_name.to_string_lossy());
+    let _flock = acquire_storage_flock(dir, &lock_name)?;
+
+    let mut value = match fs::read_to_string(path) {
+        Ok(content) if content.trim().is_empty() => T::default(),
+        Ok(content) => parse(&content)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => T::default(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+
+    let result = mutate(&mut value);
+    if result.is_ok() {
+        atomic_write(path, serialize(&value)?.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+    }
+    Ok(result)
+}
+
 /// A resolved data file protected by its sidecar flock.
 /// The sidecar survives atomic replacement; aliases lock the same target.
 pub(crate) struct LockedDataFile {

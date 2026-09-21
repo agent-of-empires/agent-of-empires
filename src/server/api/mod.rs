@@ -77,6 +77,28 @@ pub use telemetry::{
     set_telemetry_consent,
 };
 
+pub(crate) async fn find_instance(
+    state: &std::sync::Arc<AppState>,
+    id: &str,
+) -> Option<crate::session::Instance> {
+    state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|instance| instance.id == id)
+        .cloned()
+}
+
+pub(crate) async fn instance_exists(state: &std::sync::Arc<AppState>, id: &str) -> bool {
+    state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|instance| instance.id == id)
+}
+
 pub(crate) fn api_error(
     status: axum::http::StatusCode,
     code: &str,
@@ -89,6 +111,7 @@ pub(crate) fn api_error(
     )
         .into_response()
 }
+
 pub(crate) fn read_only_block(state: &AppState) -> Option<axum::response::Response> {
     state.read_only.then(read_only_response)
 }
