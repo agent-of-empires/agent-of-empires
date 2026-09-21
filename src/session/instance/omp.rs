@@ -154,9 +154,9 @@ pub(super) fn wrap_omp_launch(tool_cmd: &str, plan: &OmpCapturePlan) -> String {
              *) pending=\"./$crumb_path\" ;; \
            esac; \
            write_rewritten() {{ \
-             printf '%s\\n%s\\n' \"$crumb_cwd\" \"$pending\"; \
-             [ \"$crumb_lines\" -lt 3 ] || printf '%s\\n' \"$crumb_extra_1\"; \
-             [ \"$crumb_lines\" -lt 4 ] || printf '%s\\n' \"$crumb_extra_2\"; \
+             printf '%s\\n%s\\n' \"$crumb_cwd\" \"$pending\" || return 1; \
+             [ \"$crumb_lines\" -lt 3 ] || printf '%s\\n' \"$crumb_extra_1\" || return 1; \
+             [ \"$crumb_lines\" -lt 4 ] || printf '%s\\n' \"$crumb_extra_2\" || return 1; \
            }}; \
            rewritten_bytes=$(write_rewritten | LC_ALL=C wc -c | tr -d '[:space:]'); \
            case \"$rewritten_bytes\" in ''|*[!0-9]*) rewritten_bytes=16385 ;; esac; \
@@ -942,6 +942,36 @@ mod tests {
         let tty = bin.join("tty");
         std::fs::write(&tty, "#!/bin/sh\nprintf '/dev/pts/omp-extra-test\\n'\n").unwrap();
         std::fs::set_permissions(&tty, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let real_sh = which::which("sh").unwrap();
+        let sh = bin.join("sh");
+        // Fail a selected write to the actual temporary breadcrumb, not its size probe.
+        let injected_shell = r#"printf() {
+  if [ -n "${AOE_TEST_FAIL_WRITE-}" ] && [ -n "${breadcrumb_tmp-}" ] \
+    && [ /dev/fd/1 -ef "$breadcrumb_tmp" ]; then
+    write_count=$(( ${write_count:-0} + 1 ))
+    if [ "$write_count" -eq "$AOE_TEST_FAIL_WRITE" ]; then
+      command printf partial
+      command printf injected > "$AOE_TEST_WRITE_FAILURE"
+      command printf '%s' "$@" >&-
+      return $?
+    fi
+  fi
+  command printf "$@"
+}
+. /dev/fd/3"#;
+        let injected_script = root.join("inject-write-failure.sh");
+        std::fs::write(&injected_script, injected_shell).unwrap();
+        std::fs::write(
+            &sh,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = /dev/fd/3 ]; then exec {} {}; fi\nexec {} \"$@\"\n",
+                shell_escape(&real_sh.to_string_lossy()),
+                shell_escape(&injected_script.to_string_lossy()),
+                shell_escape(&real_sh.to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let routing = vec![format!("HOME={}", home.display())];
         let (layout, fingerprint) = resolve_omp_store_layout_with_environment(
@@ -960,6 +990,7 @@ mod tests {
         };
         let breadcrumb = plan.layout.terminal_sessions.join("pts-omp-extra-test");
         let launched = root.join("launched");
+        let write_failure = root.join("write-failure");
         let raw = format!(
             "printf launched > {}",
             shell_escape(&launched.to_string_lossy())
@@ -980,8 +1011,34 @@ mod tests {
             ),
         ];
 
-        for (content, accepted) in cases {
+        let failed_writes = [
+            ("/work\n/session.jsonl\n", false, Some(1)),
+            ("/work\n/session.jsonl\nfresh\n", false, Some(2)),
+            ("/work\n/session.jsonl\ncwdstat 12 34\n", false, Some(2)),
+            (
+                "/work\n/session.jsonl\nfresh\ncwdstat 12 34\n",
+                false,
+                Some(1),
+            ),
+            (
+                "/work\n/session.jsonl\nfresh\ncwdstat 12 34\n",
+                false,
+                Some(2),
+            ),
+            (
+                "/work\n/session.jsonl\nfresh\ncwdstat 12 34\n",
+                false,
+                Some(3),
+            ),
+        ];
+        for (content, accepted, failed_write) in cases
+            .into_iter()
+            .map(|(content, accepted)| (content, accepted, None))
+            .chain(failed_writes)
+        {
             let _ = std::fs::remove_file(&plan.launch_marker);
+            let _ = std::fs::remove_file(&launched);
+            let _ = std::fs::remove_file(&write_failure);
             std::fs::write(&breadcrumb, content).unwrap();
             let wrapped = wrap_omp_launch(&raw, &plan);
             let mut command = std::process::Command::new("sh");
@@ -989,6 +1046,12 @@ mod tests {
                 .arg("-c")
                 .arg(wrapped)
                 .env("PATH", test_path_with_shim(&bin));
+            command.env_remove("AOE_TEST_FAIL_WRITE");
+            if let Some(index) = failed_write {
+                command
+                    .env("AOE_TEST_FAIL_WRITE", index.to_string())
+                    .env("AOE_TEST_WRITE_FAILURE", &write_failure);
+            }
             for mutation in omp_host_routing_environment(&routing) {
                 match mutation {
                     tmux::PaneEnvMutation::Set { key, value } => {
@@ -1002,6 +1065,9 @@ mod tests {
             let status = command.status().unwrap();
             assert!(status.success(), "{content:?}");
             assert_eq!(std::fs::read_to_string(&launched).unwrap(), "launched");
+            if failed_write.is_some() {
+                assert_eq!(std::fs::read_to_string(&write_failure).unwrap(), "injected");
+            }
 
             if accepted {
                 let marker = std::fs::read_to_string(&plan.launch_marker)
@@ -1012,6 +1078,7 @@ mod tests {
                 let rewritten_fields: Vec<_> = rewritten.lines().collect();
                 assert_eq!(rewritten_fields[0], "/work", "{content:?}");
                 assert_eq!(rewritten_fields[1], marker_fields[2], "{content:?}");
+                assert_ne!(rewritten_fields[1], "/session.jsonl", "{content:?}");
                 assert_eq!(
                     &rewritten_fields[2..],
                     &content.lines().collect::<Vec<_>>()[2..],
@@ -1020,7 +1087,7 @@ mod tests {
             } else {
                 assert!(
                     !std::path::Path::new(&plan.launch_marker).exists(),
-                    "invalid breadcrumb published a marker: {content:?}"
+                    "rejected breadcrumb published a marker: {content:?}, write {failed_write:?}"
                 );
                 assert_eq!(std::fs::read_to_string(&breadcrumb).unwrap(), content);
             }
