@@ -964,6 +964,32 @@
       ]
     },
     {
+      "id": "wizard.acp-default-view",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/wizard.spec.ts"],
+      "components": [
+        "web/src/components/session-wizard/profileDefaults.ts",
+        "web/src/components/session-wizard/steps/AgentOptions.tsx",
+        "web/src/components/session-wizard/wizardReducer.ts"
+      ]
+    },
+    {
+      "id": "wizard.acp-default-view.unit",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/session-wizard/wizardReducer.test.ts",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/session-wizard/__tests__/AgentOptions.test.tsx"
+      ],
+      "components": [
+        "web/src/components/session-wizard/profileDefaults.ts",
+        "web/src/components/session-wizard/steps/AgentOptions.tsx",
+        "web/src/components/session-wizard/wizardReducer.ts"
+      ]
+    },
+    {
       "id": "wizard.agent-allowlist",
       "kind": "vitest",
       "risk": "high",

@@ -35,7 +35,7 @@ export function FullFileViewer({ content, filePath }: Props) {
 
   const file = useMemo<FileContents>(() => ({ name: filePath, contents: content }), [filePath, content]);
 
-  const options = useMemo<FileOptions<undefined>>(() => ({ theme, disableFileHeader: true }), [theme]);
+  const options = useMemo<FileOptions<undefined, undefined>>(() => ({ theme, disableFileHeader: true }), [theme]);
 
   // Keyed on the path plus a content hash, standing in for DiffFileViewer's
   // revision (the /file read carries no revision or etag to key on): the same
