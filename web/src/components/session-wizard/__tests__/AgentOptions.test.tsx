@@ -151,18 +151,25 @@ describe("AgentOptions workflow presets", () => {
     expect(onChange).toHaveBeenCalledWith("profile", "work");
   });
 
-  it("marks edited presets and confirms before switching away", () => {
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
-    try {
-      const { onChange } = renderOptions({ profile: "default", profileDirty: true }, { profiles: PROFILES });
-      expect(screen.getByText(/\(Custom\) Settings differ from preset defaults/)).toBeTruthy();
-      fireEvent.click(screen.getByRole("radio", { name: /work/ }));
-      expect(confirmSpy).toHaveBeenCalled();
-      expect(onChange).not.toHaveBeenCalledWith("profile", "work");
-    } finally {
-      confirmSpy.mockRestore();
-    }
+  it("marks edited presets", () => {
+    renderOptions({ profile: "default", profileDirty: true }, { profiles: PROFILES });
+    expect(screen.getByText(/\(Custom\) Settings differ from preset defaults/)).toBeTruthy();
   });
+
+  it.each([{ profileDirty: true }, { structuredViewDirty: true }])(
+    "confirms before switching away from edits: %o",
+    (dirty) => {
+      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+      try {
+        const { onChange } = renderOptions({ profile: "default", ...dirty }, { profiles: PROFILES });
+        fireEvent.click(screen.getByRole("radio", { name: /work/ }));
+        expect(confirmSpy).toHaveBeenCalled();
+        expect(onChange).not.toHaveBeenCalledWith("profile", "work");
+      } finally {
+        confirmSpy.mockRestore();
+      }
+    },
+  );
 
   it("hides the picker with a single profile", () => {
     renderOptions({}, { profiles: [PROFILES[0]!] });

@@ -57,6 +57,19 @@ test.describe("essentials", () => {
     await expect(group).toHaveValue("backend");
   });
 
+  test("default_new_session_view = terminal opens the switch unticked and creates a terminal (#3517)", async ({
+    page,
+  }) => {
+    const created = await startWizard(page, { settings: { acp: { default_new_session_view: "terminal" } } });
+    await expandMoreOptions(page);
+    await expect(wizard(page).getByRole("switch", { name: "Use structured view" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    await launch(page);
+    await expect.poll(() => created[0]?.view).toBe("terminal");
+  });
+
   test("Launch button shows the submitting state while the create POST is in flight", async ({ page }) => {
     let release!: () => void;
     const held = new Promise<void>((resolve) => (release = resolve));

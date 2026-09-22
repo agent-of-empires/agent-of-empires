@@ -109,7 +109,8 @@ export function AgentOptions({
 
   const handleProfileChange = useCallback(
     async (profileName: string) => {
-      if (data.profileDirty && profileName) {
+      // A hand-set view is not in `profileDirty`, but the profile's view default would replace it.
+      if ((data.profileDirty || data.structuredViewDirty) && profileName) {
         const ok = window.confirm("Selecting a profile will reset your settings to that profile's defaults. Continue?");
         if (!ok) return;
       }
@@ -123,6 +124,7 @@ export function AgentOptions({
         if (settings) {
           onApplyProfileDefaults({
             ...profileDefaults(settings, "", data.tool),
+            resetStructuredViewDirty: true,
             commandMaps: commandMapsFromSettings(settings),
           });
         }
@@ -130,7 +132,7 @@ export function AgentOptions({
         // Keep just the profile name.
       }
     },
-    [data.profileDirty, data.tool, onChange, onApplyProfileDefaults],
+    [data.profileDirty, data.structuredViewDirty, data.tool, onChange, onApplyProfileDefaults],
   );
 
   return (

@@ -106,9 +106,9 @@ It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `-
 
 ## Choosing the view per session
 
-- **Web wizard:** defaults to the structured view; turn off **Use structured view** to get the terminal view.
-- **CLI / TUI:** default to the terminal view. From the CLI, opt in with `--structured-view` or `--agent`; in the TUI new-session dialog, toggle the **Structured** field (shown for ACP-capable tools).
-- Either way, an existing active session can switch views: the web sidebar's right-click menu (**Switch to terminal** / **Switch to structured view**) or the TUI's right-click context menu (needs a running `aoe serve` daemon; archived, trashed, and still-creating rows are excluded until they leave that state). Both surfaces confirm first. The worktree, open files, and commits are always preserved. For a **claude** session the conversation is kept in both directions: the terminal resumes it with `claude --resume`, and switching back to structured view reloads it via the ACP adapter. Every other agent restarts fresh on the target surface, resetting the in-memory conversation.
+- **Web wizard**: structured view by default (set [`acp.default_new_session_view`](guides/configuration.md) to change it); turn off **Use structured view** for the terminal.
+- **CLI / TUI**: terminal view by default; opt in with `--structured-view` or `--agent`, or the **Structured** field in the TUI new-session dialog.
+- **An existing session** can switch either way from the web sidebar's right-click menu or the TUI context menu (which needs a running `aoe serve`). Both confirm first, and the worktree, files, and commits are always preserved. For a **claude** session the conversation is kept in both directions (`claude --resume` one way, the ACP adapter the other); every other agent restarts fresh on the target surface.
 
 Non-ACP tools always run in the terminal view, with no toggle.
 

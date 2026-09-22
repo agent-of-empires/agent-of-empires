@@ -195,7 +195,7 @@ export function DiffFileViewer({
     [commentsActive, oldContent, newContent],
   );
 
-  const options = useMemo<FileDiffOptions<AnnotationMeta>>(
+  const options = useMemo<FileDiffOptions<AnnotationMeta, undefined>>(
     () => ({
       diffStyle: splitActive ? "split" : "unified",
       theme,
