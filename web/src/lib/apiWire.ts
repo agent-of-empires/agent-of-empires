@@ -62,17 +62,16 @@ acp_command?: string,
 acp_args?: Array<string>, 
 /**
  * Registry lifecycle state. Omitted while Active so the common wire
- * shape is unchanged; the dashboard mirrors the shape in
- * `web/src/lib/types.ts` (`AgentLifecycleInfo`) and renders a
- * deprecated badge in the wizard picker and switch-agent modal.
+ * shape is unchanged; the dashboard renders a deprecated badge in the
+ * wizard picker and switch-agent modal.
  */
 lifecycle?: AgentLifecycle, };
 
 export type AgentKind = "builtin" | "custom";
 
 /**
- * Data-only lifecycle state. A new variant needs an arm in `AgentDef::lifecycle_label`
- * and in the TS mirrors (`web/src/lib/types.ts`, `web/src/lib/agentProfiles.ts`).
+ * Data-only lifecycle state. A new variant needs an arm in `AgentDef::lifecycle_label`;
+ * the dashboard's copy is generated.
  */
 export type AgentLifecycle = { "state": "active" } | { "state": "deprecated", since: string, note: string, replacement: string | null, };
 
