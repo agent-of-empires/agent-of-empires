@@ -279,7 +279,9 @@ pub fn get_pane_pid(session_name: &str) -> Option<u32> {
             "-t",
             &pane,
             "-p",
-            "#{pane_dead}\t#{pane_pid}",
+            // Not a tab: tmux renders control characters in an expanded
+            // format as `_`, so the pane pid never parsed on tmux 3.6.
+            "#{pane_dead}|#{pane_pid}",
         ])
         .output()
         .ok()?;
@@ -300,7 +302,7 @@ pub fn get_pane_pid(session_name: &str) -> Option<u32> {
 
     let pid = std::str::from_utf8(&output.stdout)
         .ok()
-        .and_then(|value| value.trim().strip_prefix("0\t"))
+        .and_then(|value| value.trim().strip_prefix("0|"))
         .and_then(|pid| pid.parse::<u32>().ok())
         .filter(|pid| *pid > 0 && i32::try_from(*pid).is_ok());
     if tracing::enabled!(target: "process.ppid", tracing::Level::TRACE) {

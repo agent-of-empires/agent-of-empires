@@ -434,7 +434,7 @@ mod tests {
                 ui.name(),
                 "-P",
                 "-F",
-                "#{socket_path},#{pid},#{session_id}\t#{pane_id}",
+                "#{socket_path},#{pid},#{session_id}|#{pane_id}",
                 "sleep 30",
             ])
             .output()
@@ -445,7 +445,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let context = String::from_utf8(output.stdout).unwrap();
-        let (context, pane) = context.trim().split_once('\t').unwrap();
+        let (context, pane) = context.trim().rsplit_once('|').unwrap();
         let context = context.replace(",$", ",");
         let guard =
             TmuxTestSession::from_name(ToolSession::generate_name(ID, ui.name(), "context"));
