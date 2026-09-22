@@ -3177,6 +3177,8 @@ mod tests {
                 vec![],
                 crate::server::state::StatusSource::DiskOnly,
                 read_epoch,
+                state.canonical_metadata.read().await.clone(),
+                Default::default(),
             )
             .await;
 

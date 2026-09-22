@@ -190,9 +190,7 @@ describe("MobileLiveTerminal wheel forwarding", () => {
 
     // A top/bottom split retains the composite's full row count in `rows`,
     // but touch input stays in pane 0 and must use that pane's smaller extent.
-    const split = term(
-      frame({ rows: 8, altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 80, rows: 2 } }),
-    );
+    const split = term(frame({ rows: 8, altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 80, rows: 2 } }));
     fireEvent.touchStart(split.scroller, { touches: [{ clientX: 100, clientY: 300 } as Touch] });
     fireEvent.touchMove(split.scroller, { touches: [{ clientX: 100, clientY: 266 } as Touch] });
     expect(split.wheel.mock.calls[0]![2]).toBe(1);
