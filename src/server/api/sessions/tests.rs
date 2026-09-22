@@ -4968,6 +4968,7 @@ fn resolve_hook_plan_refuses_untrusted_repo_hooks() {
 
     let err = resolve_create_hook_plan(
         &crate::session::resolve_config("default").unwrap().hooks,
+        "default",
         project.path(),
         false,
         None,
@@ -4998,18 +4999,23 @@ fn resolve_hook_plan_distinguishes_approval_from_skip() {
     let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
     let _app_dir = crate::session::get_app_dir().expect("isolated app dir");
     let project = project_with_on_create_hooks(&["echo hi"]);
-    let base = crate::session::HooksConfig {
-        on_create: vec!["echo global".into()],
-        ..Default::default()
-    };
+    // The plan resolves the global layer from disk, so the fallback has to be
+    // declared there rather than handed in.
+    std::fs::write(
+        crate::session::get_app_dir().unwrap().join("config.toml"),
+        "[hooks]\non_create = [\"echo global\"]\n",
+    )
+    .unwrap();
+    let base = crate::session::resolve_config("default").unwrap().hooks;
     let skipped =
-        resolve_create_hook_plan(&base, project.path(), false, Some(false), None).unwrap();
-    assert_eq!(skipped.on_create, vec!["echo global"]);
+        resolve_create_hook_plan(&base, "default", project.path(), false, Some(false), None)
+            .unwrap();
+    assert_eq!(skipped.on_create(), vec!["echo global"]);
     assert!(skipped.trust_write.is_none());
 
-    let plan = resolve_create_hook_plan(&base, project.path(), false, Some(true), None)
+    let plan = resolve_create_hook_plan(&base, "default", project.path(), false, Some(true), None)
         .expect("trust_hooks: true must approve");
-    assert_eq!(plan.on_create, vec!["echo hi".to_string()]);
+    assert_eq!(plan.on_create(), vec!["echo hi".to_string()]);
     let (hooks_hash, mcp_hash) = plan
         .trust_write
         .expect("a newly-approved repo must record trust");
@@ -5022,9 +5028,10 @@ fn resolve_hook_plan_distinguishes_approval_from_skip() {
         mcp_hash.as_deref(),
     )
     .unwrap();
-    let plan2 = resolve_create_hook_plan(&base, project.path(), false, Some(false), None)
-        .expect("already-trusted hooks must run without trust_hooks");
-    assert_eq!(plan2.on_create, vec!["echo hi".to_string()]);
+    let plan2 =
+        resolve_create_hook_plan(&base, "default", project.path(), false, Some(false), None)
+            .expect("already-trusted hooks must run without trust_hooks");
+    assert_eq!(plan2.on_create(), vec!["echo hi".to_string()]);
     assert!(
         plan2.trust_write.is_none(),
         "already-trusted repo needs no new trust record"
@@ -5035,8 +5042,9 @@ fn resolve_hook_plan_distinguishes_approval_from_skip() {
     )
     .unwrap();
     let changed =
-        resolve_create_hook_plan(&base, project.path(), false, Some(false), None).unwrap();
-    assert_eq!(changed.on_create, vec!["echo global"]);
+        resolve_create_hook_plan(&base, "default", project.path(), false, Some(false), None)
+            .unwrap();
+    assert_eq!(changed.on_create(), vec!["echo global"]);
     assert!(changed.trust_write.is_none());
 }
 
@@ -5051,13 +5059,14 @@ fn resolve_hook_plan_absent_hooks_is_ok() {
 
     let plan = resolve_create_hook_plan(
         &crate::session::resolve_config("default").unwrap().hooks,
+        "default",
         project.path(),
         false,
         None,
         None,
     )
     .expect("no hooks means no trust needed");
-    assert!(plan.on_create.is_empty());
+    assert!(plan.on_create().is_empty());
     assert!(plan.trust_write.is_none());
 }
 
@@ -5073,6 +5082,7 @@ fn resolve_hook_plan_scratch_skips_repo_trust() {
 
     let plan = resolve_create_hook_plan(
         &crate::session::resolve_config("default").unwrap().hooks,
+        "default",
         project.path(),
         true,
         None,
@@ -5080,7 +5090,7 @@ fn resolve_hook_plan_scratch_skips_repo_trust() {
     )
     .expect("scratch must skip the repo trust check");
     assert!(
-        plan.on_create.is_empty(),
+        plan.on_create().is_empty(),
         "no global hooks, so scratch resolves to nothing"
     );
     assert!(plan.trust_write.is_none());
@@ -5104,13 +5114,14 @@ fn resolve_hook_plan_does_not_block_on_untrusted_mcp_without_hooks() {
 
     let plan = resolve_create_hook_plan(
         &crate::session::resolve_config("default").unwrap().hooks,
+        "default",
         project.path(),
         false,
         None,
         None,
     )
     .expect("untrusted MCP without hooks must not block creation");
-    assert!(plan.on_create.is_empty());
+    assert!(plan.on_create().is_empty());
     assert!(
         plan.trust_write.is_none(),
         "MCP is left untrusted when the caller did not opt in"
@@ -5169,13 +5180,14 @@ fn resolve_hook_plan_inherits_trust_across_worktrees() {
 
     let plan = resolve_create_hook_plan(
         &crate::session::resolve_config("default").unwrap().hooks,
+        "default",
         &wt_path,
         false,
         None,
         None,
     )
     .expect("worktree must inherit the main repo's hook trust");
-    assert_eq!(plan.on_create, vec!["echo wt".to_string()]);
+    assert_eq!(plan.on_create(), vec!["echo wt".to_string()]);
     assert!(
         plan.trust_write.is_none(),
         "inherited trust needs no new record"

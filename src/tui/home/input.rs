@@ -6975,15 +6975,16 @@ impl HomeView {
         // Hooks to run if approved (repo hooks, else global) vs skipped
         // (already-trusted repo hooks still run; newly-prompted hooks fall back
         // to the global set, matching the prior TUI skip behavior).
+        let repo_root = std::path::Path::new(&trust.project_path);
         let hooks_on_trust = match &repo_hooks {
-            Some(h) => repo_config::merge_hooks_with_config(&data.profile, h.clone()),
-            None => repo_config::resolve_global_profile_hooks(&data.profile),
+            Some(h) => repo_config::ResolvedHooks::with_repo(&data.profile, repo_root, h.clone()),
+            None => repo_config::ResolvedHooks::global(&data.profile),
         };
         let hooks_on_skip = match &trust.hooks {
             TrustSurface::Trusted(h) => {
-                repo_config::merge_hooks_with_config(&data.profile, h.clone())
+                repo_config::ResolvedHooks::with_repo(&data.profile, repo_root, h.clone())
             }
-            _ => repo_config::resolve_global_profile_hooks(&data.profile),
+            _ => repo_config::ResolvedHooks::global(&data.profile),
         };
 
         if !trust.needs_prompt() {

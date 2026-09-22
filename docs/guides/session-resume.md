@@ -62,6 +62,10 @@ The carry applies only when the new tool resolves to the same built-in agent, th
 
 The outgoing account keeps its own copy, so swapping accounts back and forth stays continuous: the account you swap away from is the one that was just running, so on the way back its transcript replaces the older copy the earlier swap left behind. A copy the incoming account wrote more recently than the outgoing one is left alone.
 
+## Picking up an upgraded agent CLI
+
+Upgrading the agent binary from inside a session does not replace the process in the pane. Restart the session instead of creating a new one: press `e` (`E` with strict hotkeys) or `F5`, or run `aoe session restart <session>` (`--all` for every session in the profile). A restart runs only `on_launch`, whose failures are warnings, and resumes the conversation while `session.auto_resume_on_restart` is on (the default). A new session runs `on_create`, whose failure [aborts creation](repo-config.md#hooks).
+
 ## Importing an existing Claude conversation
 
 Conversations started outside AoE can be pulled into a structured-view session from the web wizard's **Import from Claude** tab, which appears only when both Claude Code and `claude-agent-acp` are installed, since the import resumes through that adapter. It lists the Claude Code sessions on disk (under `$CLAUDE_CONFIG_DIR` or `~/.claude/projects`), newest first, with each one's first prompt, working directory, and last-used time.

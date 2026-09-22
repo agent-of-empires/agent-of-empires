@@ -161,6 +161,7 @@ pub(crate) async fn spawn_structured_session(
         let original_path = path.clone();
         let hook_plan = crate::server::api::sessions::resolve_create_hook_plan(
             &config.hooks,
+            &profile,
             std::path::Path::new(&original_path),
             scratch,
             trust_hooks,
@@ -458,7 +459,16 @@ pub(crate) async fn spawn_structured_session(
                         store,
                         Some(&creation_progress),
                     )
-                    .map_err(|error| anyhow::anyhow!("on_create hook failed: {error:#}"))
+                    .map_err(|error| {
+                        // #4063: name the config file the commands came from.
+                        let hint = hook_plan
+                            .hooks
+                            .as_ref()
+                            .and_then(|hooks| hooks.origin_hint("on_create"))
+                            .map(|hint| format!("\n{hint}"))
+                            .unwrap_or_default();
+                        anyhow::anyhow!("on_create hook failed: {error:#}{hint}")
+                    })
                 })
                 .and_then(|()| creation_guard.check().map_err(anyhow::Error::from)),
         };

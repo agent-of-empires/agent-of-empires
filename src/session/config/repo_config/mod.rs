@@ -69,32 +69,28 @@ fn resolves_to_global_config(candidate: &Path) -> bool {
             .is_some_and(|dir| normalize_path(dir) == normalize_path(&app_dir))
 }
 
+/// The file [`load_repo_config`] reads: `.agent-of-empires/config.toml`, else
+/// the legacy `.aoe/config.toml`. `None` when neither exists or for the empty
+/// (scratch) path, which would resolve relative to the launch directory.
+fn resolved_repo_config_path(project_path: &Path) -> Option<PathBuf> {
+    if project_path.as_os_str().is_empty() {
+        return None;
+    }
+    [REPO_CONFIG_PATH, LEGACY_REPO_CONFIG_PATH]
+        .into_iter()
+        .map(|rel| project_path.join(rel))
+        // Not `exists`: a dangling symlink is a config the user meant to have,
+        // so the read must report it rather than fall through to defaults.
+        .find(|path| fs::symlink_metadata(path).is_ok())
+}
+
 /// Loads `.agent-of-empires/config.toml`, falling back to the legacy
 /// `.aoe/config.toml`. `None` when absent, empty, or for the empty (scratch) path.
 pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
-    // An empty path would resolve relative to the launch directory.
-    if project_path.as_os_str().is_empty() {
+    let Some(config_path) = resolved_repo_config_path(project_path) else {
         return Ok(None);
-    }
-    let config_path = project_path.join(REPO_CONFIG_PATH);
-    let (config_path, is_legacy) = match fs::symlink_metadata(&config_path) {
-        Ok(_) => (config_path, false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let legacy_path = project_path.join(LEGACY_REPO_CONFIG_PATH);
-            match fs::symlink_metadata(&legacy_path) {
-                Ok(_) => (legacy_path, true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("Failed to inspect {}", legacy_path.display()))
-                }
-            }
-        }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("Failed to inspect {}", config_path.display()))
-        }
     };
+    let is_legacy = config_path.ends_with(LEGACY_REPO_CONFIG_PATH);
 
     if resolves_to_global_config(&config_path) {
         tracing::debug!(target: "session.store",

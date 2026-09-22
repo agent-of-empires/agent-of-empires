@@ -355,15 +355,23 @@ pub async fn review_creation_trust(
 /// Creation hooks captured before worktree provisioning.
 #[derive(Debug)]
 pub(crate) struct CreateHookPlan {
-    /// Commands to run, already merged (repo overrides global/profile per type).
-    pub(crate) on_create: Vec<String>,
+    /// Already merged (repo overrides global/profile per type), keeping the
+    /// layer each command came from so a failure can name its config file.
+    pub(crate) hooks: Option<crate::session::config::repo_config::ResolvedHooks>,
     /// Approved hashes to persist before provisioning; absent when no new trust is needed.
     pub(crate) trust_write: Option<(Option<String>, Option<String>)>,
+}
+
+impl CreateHookPlan {
+    pub(crate) fn on_create(&self) -> &[String] {
+        self.hooks.as_ref().map_or(&[], |h| &h.hooks().on_create)
+    }
 }
 
 /// Resolve hooks under the caller’s explicit approval or skip decision.
 pub(crate) fn resolve_create_hook_plan(
     base: &crate::session::HooksConfig,
+    profile: &str,
     project_path: &std::path::Path,
     scratch: bool,
     trust_hooks_requested: Option<bool>,
@@ -418,15 +426,15 @@ pub(crate) fn resolve_create_hook_plan(
     } else {
         None
     };
-    let on_create = repo_hooks
-        .map(|hooks| &hooks.on_create)
-        .filter(|hooks| !hooks.is_empty())
-        .unwrap_or(&base.on_create)
-        .clone();
-    Ok(CreateHookPlan {
-        on_create,
-        trust_write,
-    })
+    let hooks = match repo_hooks {
+        Some(h) => repo_config::ResolvedHooks::with_repo(
+            profile,
+            std::path::Path::new(&trust.project_path),
+            h.clone(),
+        ),
+        None => repo_config::ResolvedHooks::global(profile),
+    };
+    Ok(CreateHookPlan { hooks, trust_write })
 }
 
 /// Run captured creation hooks with streamed error-tail capture. `progress`,
@@ -440,7 +448,7 @@ pub(crate) fn run_create_hooks(
 ) -> anyhow::Result<()> {
     use crate::session::config::repo_config;
 
-    if plan.on_create.is_empty() {
+    if plan.on_create().is_empty() {
         return Ok(());
     }
 
@@ -451,7 +459,7 @@ pub(crate) fn run_create_hooks(
         let workdir = instance.container_workdir();
         if let Some(sandbox) = instance.sandbox_info.as_ref() {
             repo_config::execute_hooks_in_container_streamed(
-                &plan.on_create,
+                plan.on_create(),
                 &sandbox.container_name,
                 &workdir,
                 progress,
@@ -460,7 +468,7 @@ pub(crate) fn run_create_hooks(
         }
     } else {
         repo_config::execute_hooks_streamed(
-            &plan.on_create,
+            plan.on_create(),
             std::path::Path::new(&instance.project_path),
             progress,
             &hook_env,
