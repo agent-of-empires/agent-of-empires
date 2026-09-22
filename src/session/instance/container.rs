@@ -207,19 +207,7 @@ impl Instance {
                 std::path::Path::new(&self.container_workdir()),
             );
             let config = self.build_container_config_with(fold)?;
-            self.identity_publisher_launched = config.identity_publisher_installed
-                && identity_publisher_mount_matches(&container, &config)?
-                && identity_publisher_dependencies_available(&container)
-                && self.hook_session_publisher_allowed_by_argv();
-            self.backfill_container_workdir(&container);
-            container_config::ensure_folder_trust_config_for_active_agent(
-                &self.tool,
-                Some(detect_as.as_str()),
-                &self.source_profile,
-                &self.id,
-                &self.container_workdir(),
-                self.is_yolo_mode(),
-            );
+            self.finish_container_reuse(&container, &config, detect_as.as_str())?;
             return Ok(container);
         }
 
@@ -256,19 +244,7 @@ impl Instance {
                 } else {
                     container_config::place_shadowed_credential_mountpoints(&config);
                     container.start()?;
-                    self.identity_publisher_launched = config.identity_publisher_installed
-                        && identity_publisher_mount_matches(&container, &config)?
-                        && identity_publisher_dependencies_available(&container)
-                        && self.hook_session_publisher_allowed_by_argv();
-                    self.backfill_container_workdir(&container);
-                    container_config::ensure_folder_trust_config_for_active_agent(
-                        &self.tool,
-                        Some(detect_as.as_str()),
-                        &self.source_profile,
-                        &self.id,
-                        &self.container_workdir(),
-                        self.is_yolo_mode(),
-                    );
+                    self.finish_container_reuse(&container, &config, detect_as.as_str())?;
                     return Ok(container);
                 }
             }
@@ -309,6 +285,28 @@ impl Instance {
         }
 
         Ok(container)
+    }
+
+    fn finish_container_reuse(
+        &mut self,
+        container: &containers::DockerContainer,
+        config: &crate::containers::ContainerConfig,
+        detect_as: &str,
+    ) -> Result<()> {
+        self.identity_publisher_launched = config.identity_publisher_installed
+            && identity_publisher_mount_matches(container, config)?
+            && identity_publisher_dependencies_available(container)
+            && self.hook_session_publisher_allowed_by_argv();
+        self.backfill_container_workdir(container);
+        container_config::ensure_folder_trust_config_for_active_agent(
+            &self.tool,
+            Some(detect_as),
+            &self.source_profile,
+            &self.id,
+            &self.container_workdir(),
+            self.is_yolo_mode(),
+        );
+        Ok(())
     }
 
     fn container_agent_identity(&self) -> Result<String> {
@@ -383,7 +381,7 @@ impl Instance {
     /// container is up that linkage can break on the host (e.g. the worktree's
     /// admin entry under `<main>/.git/worktrees/<name>` is pruned). When it
     /// can't resolve, `compute_volume_paths` silently collapses to
-    /// `/workspace/<basename>` -- a path the container never mounted -- and the
+    /// `/workspace/<basename>` (a path the container never mounted), and the
     /// exec dies with `chdir to cwd ("/workspace/<name>") ... no such file or
     /// directory`. The live computation survives only as a fallback for a
     /// session whose container has not been created yet, where there is nothing
@@ -610,7 +608,7 @@ mod tests {
     /// When the worktree's admin entry under `<main>/.git/worktrees/<name>` is
     /// pruned, the `.git` file's gitdir no longer resolves, `compute_volume_paths`
     /// can't find the main repo, and it silently collapses to
-    /// `/workspace/<basename>` -- a path the container never mounted -- so a
+    /// `/workspace/<basename>` (a path the container never mounted), so a
     /// `docker exec -w` dies with `chdir to cwd ... no such file or directory`.
     /// The create-time-pinned `SandboxInfo::container_workdir` defends against
     /// that drift.

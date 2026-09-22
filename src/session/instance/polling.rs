@@ -10,9 +10,9 @@ const MANAGED_CAPTURE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::
 ///
 /// Only the last two variants are failures a caller should retry with
 /// backoff or warn about. A session can legitimately have nothing to poll
-/// right now — its capture metadata is not resolvable yet, its sandbox
-/// store is not mounted, another process holds the store lease — and
-/// treating those as failed spawns misreports a healthy fleet as over
+/// right now: its capture metadata is not resolvable yet, its sandbox
+/// store is not mounted, or another process holds the store lease.
+/// Treating those as failed spawns misreports a healthy fleet as over
 /// budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollerStart {
@@ -548,7 +548,7 @@ impl Instance {
         }
         let now = std::time::Instant::now();
         // A failed attempt schedules the next one (5 s doubling to 60 s), so
-        // an over-budget fleet is not re-probed — and re-warned — for every
+        // an over-budget fleet is not re-probed (and re-warned) for every
         // session on every 2 s tick.
         if !self.poller_repair.due(now) {
             return false;
@@ -660,7 +660,7 @@ mod tests {
     /// store, and an unadmitted sandboxed instance resolves no store (nor
     /// passes the poller gate). That call also holds a launch transition lock,
     /// which a fixture must not carry into the paths these tests exercise, so
-    /// this certifies exactly the roots `instance_roots` names — the same
+    /// this certifies exactly the roots `instance_roots` names, the same
     /// roots admission proves.
     fn admit_fixture_content(inst: &Instance) {
         let app = crate::session::get_app_dir().unwrap();

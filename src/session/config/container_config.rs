@@ -1655,7 +1655,7 @@ pub(crate) fn compute_volume_paths_with_resolve(
     // Only look for a main repo if the project path itself has a .git entry (file or
     // directory). This prevents git2::Repository::discover from walking up the directory
     // tree and finding an unrelated ancestor repo (e.g., a dotfile-managed home directory),
-    // which would cause aoe to mount that ancestor -- potentially the user's entire $HOME --
+    // which would cause aoe to mount that ancestor (potentially the user's entire $HOME)
     // into the container.
     //
     // Legitimate git repos have a .git directory; worktrees have a .git file containing a
@@ -3948,7 +3948,7 @@ mod tests {
         let host = setup_host_dir(&dir);
         let sandbox = dir.path().join("sandbox");
 
-        // Seed has the same name as a host file -- host copy wins.
+        // Seed has the same name as a host file: host copy wins.
         let seeds = [("auth.json", "seed-content")];
         sync_fixture(&host, &sandbox, &["auth.json"], &seeds, &[], &[]).unwrap();
 
