@@ -160,6 +160,7 @@ pub(crate) async fn spawn_structured_session(
         // Persist approval against the source repository before provisioning can run Git hooks.
         let original_path = path.clone();
         let hook_plan = crate::server::api::sessions::resolve_create_hook_plan(
+            &profile,
             &config.hooks,
             std::path::Path::new(&original_path),
             scratch,
@@ -458,7 +459,15 @@ pub(crate) async fn spawn_structured_session(
                         store,
                         Some(&creation_progress),
                     )
-                    .map_err(|error| anyhow::anyhow!("on_create hook failed: {error:#}"))
+                    .map_err(|error| {
+                        let hint = hook_plan
+                            .hooks
+                            .as_ref()
+                            .and_then(|hooks| hooks.origin_hint("on_create"))
+                            .map(|hint| format!("\n{hint}"))
+                            .unwrap_or_default();
+                        anyhow::anyhow!("on_create hook failed: {error:#}{hint}")
+                    })
                 })
                 .and_then(|()| creation_guard.check().map_err(anyhow::Error::from)),
         };

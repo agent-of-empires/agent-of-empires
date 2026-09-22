@@ -69,6 +69,19 @@ fn resolves_to_global_config(candidate: &Path) -> bool {
             .is_some_and(|dir| normalize_path(dir) == normalize_path(&app_dir))
 }
 
+/// The file [`load_repo_config`] reads: `.agent-of-empires/config.toml`, else
+/// the legacy `.aoe/config.toml`. `None` when neither exists or for the empty
+/// (scratch) path, which would resolve relative to the launch directory.
+fn resolved_repo_config_path(project_path: &Path) -> Option<PathBuf> {
+    if project_path.as_os_str().is_empty() {
+        return None;
+    }
+    [REPO_CONFIG_PATH, LEGACY_REPO_CONFIG_PATH]
+        .into_iter()
+        .map(|rel| project_path.join(rel))
+        .find(|path| path.exists())
+}
+
 /// Loads `.agent-of-empires/config.toml`, falling back to the legacy
 /// `.aoe/config.toml`. `None` when absent, empty, or for the empty (scratch) path.
 pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {

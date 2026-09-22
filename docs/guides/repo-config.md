@@ -47,7 +47,14 @@ Native starts release their API locks while pre-launch hooks run, so hooks can c
 
 **`on_destroy`** runs when a session is deleted, before worktree and sandbox cleanup. This lets teardown commands access resources that are still available (e.g. running containers). Failures are logged as warnings but never prevent deletion. Use this for cleanup like stopping Docker services or removing temporary resources.
 
-For sandboxed sessions, hooks run inside the Docker container.
+Hooks run inside the container for a sandboxed session and in your host shell otherwise, so a path can resolve in one mode and not the other. An absolute host path fails in the container unless `sandbox.extra_volumes` mounts it, and a repo cannot set that key. Guard optional scripts on their presence only, so a real failure still aborts creation:
+
+```toml
+[hooks]
+on_create = ["sh -c '[ -x /opt/setup.sh ] || exit 0; exec /opt/setup.sh'"]
+```
+
+Keep environment-specific hooks out of global config. A global `on_create` applies to every repo that does not declare its own, so one unresolvable path there blocks session creation in projects that never mention it. When `on_create` fails, the TUI and `aoe add` name the config file that declared it; the web dashboard shows a generic error and logs the file to the `aoe serve` log.
 
 #### Available environment variables
 

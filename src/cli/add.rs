@@ -780,12 +780,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
 
     let hook_result: Result<()> = (|| {
-        let resolved_hooks: Option<crate::session::HooksConfig> = if args.scratch {
-            repo_config::resolve_global_profile_hooks(profile)
+        let resolved_hooks: Option<repo_config::ResolvedHooks> = if args.scratch {
+            repo_config::ResolvedHooks::global(profile)
         } else {
             use repo_config::TrustSurface;
             match repo_config::check_repo_trust(&original_project_path) {
                 Ok(trust) => {
+                    let repo_root = std::path::Path::new(&trust.project_path);
                     let repo_hooks: Option<crate::session::HooksConfig> = match &trust.hooks {
                         TrustSurface::Trusted(h) => Some(h.clone()),
                         TrustSurface::NeedsTrust { config, .. } => Some(config.clone()),
@@ -850,8 +851,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                             }
                         }
                         match repo_hooks {
-                            Some(h) => repo_config::merge_hooks_with_config(profile, h),
-                            None => repo_config::resolve_global_profile_hooks(profile),
+                            Some(h) => repo_config::ResolvedHooks::with_repo(profile, repo_root, h),
+                            None => repo_config::ResolvedHooks::global(profile),
                         }
                     } else {
                         println!(
@@ -859,42 +860,46 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                         );
                         match &trust.hooks {
                             TrustSurface::Trusted(h) => {
-                                repo_config::merge_hooks_with_config(profile, h.clone())
+                                repo_config::ResolvedHooks::with_repo(profile, repo_root, h.clone())
                             }
                             TrustSurface::NeedsTrust { .. } => None,
-                            TrustSurface::Absent => {
-                                repo_config::resolve_global_profile_hooks(profile)
-                            }
+                            TrustSurface::Absent => repo_config::ResolvedHooks::global(profile),
                         }
                     }
                 }
                 Err(e) => {
                     tracing::warn!(target: "cli.add", "Failed to check repo trust: {}", e);
-                    repo_config::resolve_global_profile_hooks(profile)
+                    repo_config::ResolvedHooks::global(profile)
                 }
             }
         };
 
-        if let Some(hooks) = resolved_hooks {
-            if !hooks.on_create.is_empty() {
+        if let Some(resolved) = resolved_hooks {
+            let commands = &resolved.hooks().on_create;
+            if !commands.is_empty() {
                 println!("Running on_create hooks:");
-                for cmd in &hooks.on_create {
+                for cmd in commands {
                     println!("  {}", cmd);
                 }
                 let hook_env = repo_config::lifecycle_env_vars(&instance);
                 if instance.sandbox_info.is_some() {
                     instance.get_container_for_instance()?;
-                    let workdir = instance.container_workdir();
-                    if let Some(ref sandbox) = instance.sandbox_info {
-                        repo_config::execute_hooks_in_container(
-                            &hooks.on_create,
-                            &sandbox.container_name,
-                            &workdir,
-                            &hook_env,
-                        )?;
-                    }
-                } else {
-                    repo_config::execute_hooks(&hooks.on_create, &path, &hook_env)?;
+                }
+                let ran = match instance.sandbox_info {
+                    Some(ref sandbox) => repo_config::execute_hooks_in_container(
+                        commands,
+                        &sandbox.container_name,
+                        &instance.container_workdir(),
+                        &hook_env,
+                    ),
+                    None => repo_config::execute_hooks(commands, &path, &hook_env),
+                };
+                if let Err(e) = ran {
+                    let hint = resolved
+                        .origin_hint("on_create")
+                        .map(|hint| format!("\n{hint}"))
+                        .unwrap_or_default();
+                    anyhow::bail!("on_create hook failed: {e:#}{hint}");
                 }
                 println!("✓ on_create hooks completed");
             }
