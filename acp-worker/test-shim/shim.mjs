@@ -191,8 +191,12 @@ async function handleNewSession(params) {
   if (recordFile) await writeFile(recordFile, JSON.stringify(params?.mcpServers ?? []));
   const sessionId = "shim-" + crypto.randomUUID();
   sessions.set(sessionId, {});
-  // A fresh session starts on the default model, as real adapters do.
+  // A fresh session starts on the default model and the default option ids, as
+  // real adapters do. Both are process-wide here, so without the reset a second
+  // session in the same shim would inherit the first one's renamed id and the
+  // suite would depend on test order.
   model = "default";
+  thoughtLevelId = "thought_level";
   return withConfigOptions({ sessionId });
 }
 
