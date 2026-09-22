@@ -196,6 +196,7 @@ async function handleNewSession(params) {
   // session in the same shim would inherit the first one's renamed id and the
   // suite would depend on test order.
   model = "default";
+  thoughtLevel = "medium";
   thoughtLevelId = "thought_level";
   return withConfigOptions({ sessionId });
 }
