@@ -187,6 +187,9 @@ pub async fn reconcile_acp_workers(
     for id in supervisor.take_startup_failures() {
         attempted.remove(&id);
     }
+    for id in supervisor.take_respawned_in_place() {
+        resume::requeue_interrupted_monitor(state, &id).await;
+    }
 
     // The idle reap runs before the snapshot so a newly dormant session is not
     // respawned, and before terminal repair so it keeps its own terminal.

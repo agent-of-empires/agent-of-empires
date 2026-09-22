@@ -156,6 +156,8 @@ pub struct Supervisor<S: BroadcastSink> {
     force_respawn: SharedSet,
     /// Sessions whose worker failed before establishing a session.
     startup_failures: SharedSet,
+    /// Sessions whose crashed worker the drain task relaunched in place.
+    respawned_in_place: SharedSet,
     max_concurrent_workers: u32,
 }
 
@@ -243,6 +245,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             incompatible_binaries: Arc::default(),
             force_respawn: Arc::default(),
             startup_failures: Arc::default(),
+            respawned_in_place: Arc::default(),
             max_concurrent_workers,
         }
     }
@@ -291,6 +294,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.startup_failures).drain().collect()
     }
 
+    pub fn take_respawned_in_place(&self) -> Vec<String> {
+        lock_recover(&self.respawned_in_place).drain().collect()
+    }
+
     /// Sessions parked on a compatibility rejection for `binary` with no live worker.
     pub async fn incompatible_sessions_for_binary(&self, binary: &str) -> Vec<String> {
         let candidates: Vec<String> = lock_recover(&self.incompatible_binaries)
@@ -326,6 +333,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         lock_recover(&self.lifecycle).forget(session_id);
         lock_recover(&self.startup_failures).remove(session_id);
+        lock_recover(&self.respawned_in_place).remove(session_id);
     }
 
     /// Seed seq counters from the event store's stored maxima.
