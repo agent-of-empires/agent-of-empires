@@ -31,7 +31,7 @@ fn migrate_file(path: &Path) -> Result<()> {
     let mut value: Value = match serde_json::from_str(&fs::read_to_string(path)?) {
         Ok(value) => value,
         Err(error) => {
-            tracing::debug!("v030: cannot parse {}: {error}; skipping", path.display());
+            tracing::debug!("v031: cannot parse {}: {error}; skipping", path.display());
             return Ok(());
         }
     };
@@ -56,7 +56,7 @@ fn migrate_file(path: &Path) -> Result<()> {
     if changed {
         crate::session::atomic_write(path, serde_json::to_string_pretty(&value)?.as_bytes())?;
         tracing::info!(
-            "v030: bound legacy capture exclusions in {}",
+            "v031: bound legacy capture exclusions in {}",
             path.display()
         );
     }
