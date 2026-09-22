@@ -5,8 +5,10 @@ use std::time::{Duration, Instant};
 
 use tracing::info;
 
-use super::launch::apply_mode;
-use super::{lock_recover, BroadcastSink, Supervisor, SupervisorError, WORKER_READY_TIMEOUT};
+use super::launch::{apply_mode, set_spawn_model};
+use super::{
+    lock_recover, BroadcastSink, Supervisor, SupervisorError, WorkerKind, WORKER_READY_TIMEOUT,
+};
 use crate::acp::acp_client::{AcpClient, AcpError, ResetSessionOutcome};
 use crate::acp::approvals::{ApprovalDecision, Nonce};
 use crate::acp::elicitations::ElicitationResolution;
@@ -169,6 +171,20 @@ impl<S: BroadcastSink> Supervisor<S> {
         let client = self.ready_client(session_id).await?;
         client.set_config_option(config_id, value).await?;
         Ok(())
+    }
+
+    /// A watchdog respawn clones the cached spawn config, which the daemon's
+    /// persisted model pick never reaches.
+    pub async fn refresh_cached_model(&self, session_id: &str, model: &str) {
+        if let Some(WorkerKind::Runner { spawn_config }) = self
+            .workers
+            .lock()
+            .await
+            .get_mut(session_id)
+            .map(|h| &mut h.kind)
+        {
+            set_spawn_model(spawn_config, Some(model.to_string()));
+        }
     }
 
     pub async fn resolve_permission(

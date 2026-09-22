@@ -3,6 +3,7 @@ import { MessagePrimitive, useAuiState } from "@assistant-ui/react";
 import { isElicitationAnswersPayload, type ActivityRow, type ToolCall } from "../../lib/acpTypes";
 import { parseJsonObject } from "../../lib/acpArgs";
 import { pickMemoryRecall } from "../../lib/memoryRecall";
+import { ArtifactImage } from "./artifactMedia";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
 import { isDiffCommentsCardPayload, parseDiffCommentsSentinel } from "../diff/comments/buildPrompt";
 import { SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME } from "./activityMessages";
@@ -15,9 +16,16 @@ import { ToolCard } from "./ToolCards";
 export function UserMessage() {
   return (
     <MessagePrimitive.Root className="group mt-4 flex flex-col items-end gap-1">
-      <MessagePrimitive.Parts components={{ Text: UserText }} />
+      <MessagePrimitive.Parts components={{ Text: UserText, Image: UserImage }} />
     </MessagePrimitive.Root>
   );
+}
+
+// A bare <img src> can't carry the auth headers the attachment route requires
+// (e.g. the passphrase device-binding header), so route it through the same
+// authenticated-fetch-to-blob-URL path artifacts already use.
+function UserImage({ image }: { image: string }) {
+  return <ArtifactImage url={image} alt="attachment" />;
 }
 
 function UserText({ text }: { text: string }) {

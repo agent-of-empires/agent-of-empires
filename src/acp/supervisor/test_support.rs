@@ -259,6 +259,7 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
         default_effort: None,
         default_effort_explicit: false,
         default_mode: None,
+        default_model: None,
         socket_path: Some(socket_path),
         stored_acp_session_id: None,
         fork_from: None,

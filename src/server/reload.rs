@@ -593,7 +593,7 @@ pub(super) async fn reload_state_instances_from_disk(
     let _publication = state.publication.write().await;
     let mut current = state.instances.write().await;
 
-    // Reject reads predating a committed membership or view change.
+    // Reject reads that predate an in-memory row change.
     let current_epoch = state
         .mutation_epoch
         .load(std::sync::atomic::Ordering::SeqCst);
@@ -602,7 +602,7 @@ pub(super) async fn reload_state_instances_from_disk(
             target: "server.file_watch",
             read_epoch,
             current_epoch,
-            "dropping a disk reload whose snapshot predates a session lifecycle mutation"
+            "dropping a disk reload whose snapshot predates an in-memory session mutation"
         );
         return Vec::new();
     }

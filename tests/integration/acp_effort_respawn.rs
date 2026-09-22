@@ -43,6 +43,7 @@ fn spawn_config(
         default_effort_explicit: default_effort.is_some(),
         default_effort,
         default_mode: None,
+        default_model: None,
         socket_path: None,
         stored_acp_session_id,
         fork_from: None,

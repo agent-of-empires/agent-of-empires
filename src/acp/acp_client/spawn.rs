@@ -35,6 +35,10 @@ pub struct SpawnConfig {
     pub default_effort_explicit: bool,
     /// Applied strictly through a `category:"mode"` option on fresh sessions.
     pub default_mode: Option<String>,
+    /// `Instance.agent_model`, re-asserted through a `category:"model"` option
+    /// after every establish and reset, for adapters that ignore
+    /// `AOE_AGENT_MODEL`. Skipped when already current.
+    pub default_model: Option<String>,
     /// Runner socket; `None` spawns the agent over in-proc stdio.
     pub socket_path: Option<PathBuf>,
     /// Loaded via `session/load` when the agent supports it.

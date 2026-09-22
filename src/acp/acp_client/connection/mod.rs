@@ -79,6 +79,7 @@ pub(super) struct ConnectionParams {
     pub(super) source_profile: Option<String>,
     pub(super) default_effort: Option<String>,
     pub(super) default_mode: Option<String>,
+    pub(super) default_model: Option<String>,
     pub(super) mcp_servers: Vec<McpServer>,
     pub(super) runner: Option<RunnerLink>,
 }
@@ -144,6 +145,7 @@ pub(super) async fn run_connection_task<W, R>(
         source_profile,
         default_effort,
         default_mode,
+        default_model,
         mcp_servers,
         runner,
     } = params;
@@ -337,6 +339,7 @@ pub(super) async fn run_connection_task<W, R>(
         mcp_servers,
         default_effort,
         default_mode,
+        default_model,
         source_profile,
         agent_cwd: resources.agent_cwd(),
         cmd_rx,

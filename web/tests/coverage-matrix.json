@@ -2038,12 +2038,18 @@
       "id": "acp.attachments",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": ["tests/live/acp-transcript.spec.ts", "src/components/acp/Composer.test.tsx"],
+      "specs": [
+        "tests/live/acp-transcript.spec.ts",
+        "src/components/acp/Composer.test.tsx",
+        "src/components/acp/ThreadMessages.test.tsx"
+      ],
       "components": [
         "web/src/components/acp/Composer.tsx",
         "web/src/components/acp/AcpRuntime.tsx",
         "web/src/components/acp/StructuredView.tsx",
-        "web/src/components/acp/ComposerControls.tsx"
+        "web/src/components/acp/ComposerControls.tsx",
+        "web/src/components/acp/ThreadMessages.tsx",
+        "web/src/components/acp/artifactMedia.tsx"
       ]
     },
     {
