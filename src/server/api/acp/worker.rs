@@ -263,8 +263,10 @@ async fn check_switch_target(
     Ok(from_agent)
 }
 
-/// Record the new backend in memory and on disk. The old ACP session id,
-/// pending import, and effort pick do not carry across agents.
+/// Record the new backend in memory and on disk from one mutation, so the two
+/// cannot drift. Nothing adapter-specific survives the change: the ACP session
+/// id, the pending import, the effort pick and the model are the new agent's to
+/// resolve, which is the rule `Instance::swap_tool` already applies.
 async fn persist_agent_switch(
     state: &AppState,
     profile: &str,
@@ -272,26 +274,24 @@ async fn persist_agent_switch(
     target: &str,
     model: Option<&str>,
 ) {
-    let reset = |inst: &mut crate::session::Instance| {
+    let switch = |inst: &mut crate::session::Instance| {
         inst.agent_name = Some(target.to_string());
         inst.acp_session_id = None;
         inst.import_pending = None;
         inst.acp_effort = None;
+        inst.agent_model = model.map(str::to_string);
     };
     {
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            reset(inst);
-            if let Some(m) = model {
-                inst.agent_model = Some(m.to_string());
-            }
+            switch(inst);
         }
     }
     match crate::session::Storage::new(profile, state.file_watch.clone()) {
         Ok(storage) => {
             if let Err(e) = storage.update(|instances, _groups| {
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                    reset(inst);
+                    switch(inst);
                 }
                 Ok(())
             }) {
@@ -382,7 +382,7 @@ pub async fn switch_acp_agent(
         }
     };
 
-    let model = req.model.clone().or(instance.agent_model.clone());
+    let model = req.model.clone();
     state.acp_supervisor.forget_stale_cancel(&id);
     // A new backend starts a fresh session. Effort vocabularies are
     // adapter-specific, so the old pick is dropped too.
@@ -438,6 +438,49 @@ mod tests {
     use super::*;
     use crate::acp::agent_policy::AgentPolicy;
     use crate::acp::state::RateLimitInfo;
+
+    /// Both stores get the switch, and nothing adapter-specific survives it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_agent_switch_persists_its_model_to_both_stores() {
+        use crate::session::test_support::isolate_app_dir;
+        let profile = "default";
+
+        // (requested model, what both stores must hold afterwards)
+        for (requested, expected) in [(Some("gpt-5.6-sol"), Some("gpt-5.6-sol")), (None, None)] {
+            let _tmp = isolate_app_dir();
+            let mut inst = crate::session::Instance::new("claude", "/tmp/aoe-switch-model");
+            inst.view = crate::session::View::Structured;
+            inst.agent_name = Some("claude".to_string());
+            inst.agent_model = Some("claude-fable-5-1".to_string());
+            inst.acp_effort = Some("high".to_string());
+            inst.acp_session_id = Some("acp-old".to_string());
+            let id = inst.id.clone();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                profile,
+                vec![inst.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+            persist_agent_switch(&state, profile, &id, "codex", requested).await;
+
+            let on_disk = crate::server::test_support::load_instances_from_disk_for_test(profile);
+            let stored = on_disk.iter().find(|i| i.id == id).expect("seeded row");
+            assert_eq!(stored.agent_name.as_deref(), Some("codex"));
+            assert_eq!(
+                stored.agent_model.as_deref(),
+                expected,
+                "requested {requested:?}: the disk row is what a restart reads"
+            );
+            assert_eq!(stored.acp_session_id, None);
+            assert_eq!(stored.acp_effort, None);
+
+            let memory = state.instances.read().await;
+            let live = memory.iter().find(|i| i.id == id).expect("instance");
+            assert_eq!(live.agent_model.as_deref(), expected);
+            assert_eq!(live.agent_name.as_deref(), Some("codex"));
+        }
+    }
 
     #[test]
     fn acp_agent_entries_follow_policy_and_wire_shape() {
