@@ -918,10 +918,9 @@ mod tests {
         std::fs::set_permissions(&tty, std::fs::Permissions::from_mode(0o700)).unwrap();
         let real_sh = which::which("sh").unwrap();
         let sh = bin.join("sh");
-        // Fail a selected write to the actual temporary breadcrumb, not its size probe.
+        // breadcrumb_tmp is unset during the size probe and assigned only for the atomic write.
         let injected_shell = r#"printf() {
-  if [ -n "${AOE_TEST_FAIL_WRITE-}" ] && [ -n "${breadcrumb_tmp-}" ] \
-    && [ /dev/fd/1 -ef "$breadcrumb_tmp" ]; then
+  if [ -n "${AOE_TEST_FAIL_WRITE-}" ] && [ -n "${breadcrumb_tmp-}" ]; then
     write_count=$(( ${write_count:-0} + 1 ))
     if [ "$write_count" -eq "$AOE_TEST_FAIL_WRITE" ]; then
       command printf partial
