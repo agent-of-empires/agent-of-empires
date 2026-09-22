@@ -123,10 +123,9 @@ pub struct SessionService {
     pub file_watch: Arc<crate::file_watch::FileWatchService>,
     /// Opt-in telemetry create counter, shared with `AppState.telemetry_session_creates`.
     pub telemetry_session_creates: Arc<std::sync::atomic::AtomicU32>,
-    /// Session-set membership epoch, shared with `AppState.mutation_epoch`. Bumped under
-    /// the `instances` write lock once a create is in both `sessions.json` and `instances`,
-    /// so a disk reload still carrying a snapshot from before the create drops itself
-    /// instead of replacing `instances` with a `fresh` that never had the new row.
+    /// Shared with `AppState.mutation_epoch`. Bumped under the `instances` write lock by
+    /// any change a disk snapshot read earlier would not carry, so that reload drops
+    /// itself instead of overwriting the change.
     pub mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Owns the per-session ACP agent subprocesses, shared with `AppState.acp_supervisor`.
     pub acp_supervisor:
@@ -412,6 +411,7 @@ impl SessionService {
             let was_idle_dormant = inst.is_idle_dormant();
             let wake = inst.is_archived() || inst.is_snoozed() || was_idle_dormant;
             inst.touch_last_accessed();
+            self.invalidate_disk_snapshots();
             if was_idle_dormant {
                 tracing::info!(
                     target: "acp.supervisor",
@@ -633,6 +633,7 @@ impl SessionService {
             let mut instances = self.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
                 inst.pending_initial_turn = None;
+                self.invalidate_disk_snapshots();
             }
         }
         match crate::session::Storage::new(&profile, self.file_watch.clone()) {
@@ -684,6 +685,7 @@ impl SessionService {
             match instances.iter_mut().find(|i| i.id == id) {
                 Some(inst) if inst.pending_initial_turn.is_none() => {
                     inst.pending_initial_turn = Some(turn.clone());
+                    self.invalidate_disk_snapshots();
                     inst.source_profile.clone()
                 }
                 _ => return,
@@ -727,6 +729,7 @@ impl SessionService {
             match instances.iter_mut().find(|i| i.id == id) {
                 Some(inst) if inst.pending_initial_turn.is_some() => {
                     inst.pending_initial_turn = None;
+                    self.invalidate_disk_snapshots();
                     inst.source_profile.clone()
                 }
                 _ => return,
@@ -762,6 +765,13 @@ impl SessionService {
         }
     }
 
+    /// Drop any disk reload that read `sessions.json` before this in-memory change. Call
+    /// under the `instances` write lock; the persist that follows schedules a fresh reload.
+    fn invalidate_disk_snapshots(&self) {
+        self.mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Apply `mutate` to a session's in-memory `Instance`, then mirror the resulting state
     /// to disk.
     async fn mutate_instance_persisted<T, F>(self: &Arc<Self>, id: &str, mutate: F) -> Option<T>
@@ -775,6 +785,7 @@ impl SessionService {
             let mut instances = self.instances.write().await;
             let inst = instances.iter_mut().find(|i| i.id == id)?;
             let r = mutate(inst);
+            self.invalidate_disk_snapshots();
             (
                 inst.source_profile.clone(),
                 r,
@@ -2272,6 +2283,87 @@ mod tests {
         disk_seqs.sort_unstable();
         disk_seqs.dedup();
         assert_eq!(disk_seqs.len(), 32, "no two persisted rows share a seq");
+    }
+
+    /// A disk reload whose snapshot predates an in-memory row change must not
+    /// replace that change with the stale disk row.
+    #[tokio::test]
+    async fn a_stale_disk_reload_keeps_in_memory_row_changes() {
+        use crate::session::PendingInitialTurn;
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let pending = || PendingInitialTurn {
+            text: "resume".into(),
+            attachments: vec![],
+            synthesized: true,
+        };
+        type Mutate = fn(Arc<SessionService>) -> futures_util::future::BoxFuture<'static, ()>;
+        type Check = fn(&Instance) -> bool;
+        let cases: [(&str, Option<PendingInitialTurn>, bool, Mutate, Check); 4] = [
+            (
+                "enqueue",
+                None,
+                false,
+                |s| {
+                    Box::pin(async move {
+                        s.enqueue_prompt("s", "p".into(), "t".into(), vec![], None, "t0".into())
+                            .await;
+                    })
+                },
+                |i| i.queued_prompts.len() == 1,
+            ),
+            (
+                "set pending turn",
+                None,
+                false,
+                |s| {
+                    Box::pin(
+                        async move { s.set_pending_initial_turn("s", "r".into(), vec![]).await },
+                    )
+                },
+                |i| i.pending_initial_turn.is_some(),
+            ),
+            (
+                "clear pending turn",
+                Some(pending()),
+                false,
+                |s| Box::pin(async move { s.clear_pending_initial_turn("s").await }),
+                |i| i.pending_initial_turn.is_none(),
+            ),
+            (
+                "prompt wakes a dormant session",
+                None,
+                true,
+                |s| {
+                    Box::pin(async move {
+                        s.touch_and_wake_on_prompt("s").await;
+                    })
+                },
+                |i| !i.is_idle_dormant(),
+            ),
+        ];
+        for (name, pending_turn, dormant, mutate, check) in cases {
+            let mut inst = Instance::new("race", "/tmp/aoe-reload-race");
+            inst.id = "s".to_string();
+            inst.view = crate::session::View::Structured;
+            inst.pending_initial_turn = pending_turn;
+            inst.idle_dormant_since = dormant.then(chrono::Utc::now);
+            let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+            let read_epoch = state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst);
+
+            mutate(Arc::clone(&state.session_service)).await;
+            crate::server::reload::reload_state_instances_from_disk(
+                &state,
+                vec![inst],
+                vec![],
+                crate::server::state::StatusSource::DiskOnly,
+                read_epoch,
+            )
+            .await;
+
+            assert!(check(&state.instances.read().await[0]), "{name}");
+        }
     }
 
     #[tokio::test]
