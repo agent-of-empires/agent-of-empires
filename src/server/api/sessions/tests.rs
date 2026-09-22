@@ -3334,7 +3334,7 @@ fn resolve_hook_plan_trusts_and_runs_with_trust_hooks() {
 
     let plan = resolve_create_hook_plan("default", project.path(), false, true)
         .expect("trust_hooks: true must approve");
-    assert_eq!(plan.on_create, vec!["echo hi".to_string()]);
+    assert_eq!(plan.on_create(), vec!["echo hi".to_string()]);
     let (hooks_hash, mcp_hash) = plan
         .trust_write
         .expect("a newly-approved repo must record trust");
@@ -3350,7 +3350,7 @@ fn resolve_hook_plan_trusts_and_runs_with_trust_hooks() {
     .unwrap();
     let plan2 = resolve_create_hook_plan("default", project.path(), false, false)
         .expect("already-trusted hooks must run without trust_hooks");
-    assert_eq!(plan2.on_create, vec!["echo hi".to_string()]);
+    assert_eq!(plan2.on_create(), vec!["echo hi".to_string()]);
     assert!(
         plan2.trust_write.is_none(),
         "already-trusted repo needs no new trust record"
@@ -3393,7 +3393,7 @@ fn resolve_hook_plan_refuses_nothing_without_untrusted_repo_hooks() {
 
         let plan = resolve_create_hook_plan("default", project, scratch, false)
             .unwrap_or_else(|e| panic!("{label} must not refuse: {e:#}"));
-        assert!(plan.on_create.is_empty(), "{label}");
+        assert!(plan.on_create().is_empty(), "{label}");
         assert!(plan.trust_write.is_none(), "{label}");
     }
 }
@@ -3449,7 +3449,7 @@ fn resolve_hook_plan_inherits_trust_across_worktrees() {
 
     let plan = resolve_create_hook_plan("default", &wt_path, false, false)
         .expect("worktree must inherit the main repo's hook trust");
-    assert_eq!(plan.on_create, vec!["echo wt".to_string()]);
+    assert_eq!(plan.on_create(), vec!["echo wt".to_string()]);
     assert!(
         plan.trust_write.is_none(),
         "inherited trust needs no new record"

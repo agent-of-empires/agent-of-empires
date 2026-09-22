@@ -69,6 +69,18 @@ describe("SessionWizard structured view payload", () => {
     expect(payload()).toMatchObject({ tool: "claude", view });
   });
 
+  it.each([
+    ["terminal", "terminal"],
+    ["auto", "structured"],
+    ["structured", "structured"],
+  ])("opens on and sends the configured default view %s (#3517)", async (setting, view) => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ acp: { default_new_session_view: setting } } as never);
+    renderWizard();
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(payload()).toMatchObject({ tool: "claude", view });
+  });
+
   it("sends profile-resolved agent model and effort defaults", async () => {
     vi.mocked(fetchSettings).mockResolvedValueOnce({
       session: { default_tool: "opencode", acp_defaults: { opencode: { model: "openai/gpt-5.5", effort: "high" } } },

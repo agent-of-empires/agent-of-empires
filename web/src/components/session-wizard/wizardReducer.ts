@@ -37,8 +37,11 @@ export interface WizardData {
   scratch: boolean;
   /** Optimistically true until the wizard's probe says otherwise; false forces `useWorktree` off. */
   pathIsGitRepo: boolean;
-  /** Per-session structured view opt-in; deliberately not persisted or tracked in `profileDirty`. */
+  /** Per-session structured view choice, seeded from `acp.default_new_session_view`; deliberately
+   *  not persisted or tracked in `profileDirty`. */
   useStructuredView: boolean;
+  /** Set by a direct `useStructuredView` edit so mount-time seeding keeps it. */
+  structuredViewDirty: boolean;
   agentModel: string;
   agentEffort: string;
   /** Existing Claude session id to import and resume. */
@@ -75,6 +78,9 @@ export type Action =
       extraEnv: string[];
       agentModel?: string;
       agentEffort?: string;
+      useStructuredView?: boolean;
+      /** Set by the profile picker, whose overwrite the user has confirmed. */
+      resetStructuredViewDirty?: boolean;
       /** Mount-time seeding sets this so a late settings response cannot clobber user edits. */
       skipIfDirty?: boolean;
     }
@@ -109,6 +115,7 @@ export const initialData: WizardData = {
   scratch: false,
   pathIsGitRepo: true,
   useStructuredView: true,
+  structuredViewDirty: false,
   agentModel: "",
   agentEffort: "",
   importAcpSessionId: "",
@@ -146,7 +153,19 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
   if (field === "pathIsGitRepo" && value === false) next.useWorktree = false;
   if (PROFILE_FIELDS.includes(field)) next.profileDirty = true;
   if (field === "useWorktree") next.worktreeDirty = true;
+  if (field === "useStructuredView") next.structuredViewDirty = true;
   return next;
+}
+
+/** An import (structured on disk) and a hand-set view outrank the seeded view, except that a
+ *  confirmed profile change resets the latter. */
+function seededStructuredView(
+  data: WizardData,
+  action: { useStructuredView?: boolean; resetStructuredViewDirty?: boolean },
+): boolean {
+  if (data.importAcpSessionId) return data.useStructuredView;
+  if (data.structuredViewDirty && !action.resetStructuredViewDirty) return data.useStructuredView;
+  return action.useStructuredView ?? data.useStructuredView;
 }
 
 export function reducer(state: WizardState, action: Action): WizardState {
@@ -192,12 +211,15 @@ export function reducer(state: WizardState, action: Action): WizardState {
         state.data.scratch || state.data.pathIsGitRepo === false
           ? false
           : (state.data.projectWorktreeOverride ?? action.worktreeEnabled);
+      const useStructuredView = seededStructuredView(state.data, action);
       if (action.skipIfDirty && state.data.profileDirty) {
         // Still record the real default, or a later project with no override falls back to `false`.
+        // The view is not a profile-tracked field, so it seeds past other edits.
         return {
           ...state,
           data: {
             ...state.data,
+            useStructuredView,
             profileWorktreeDefault: action.worktreeEnabled,
             useWorktree: state.data.worktreeDirty ? state.data.useWorktree : resolvedUseWorktree(),
           },
@@ -215,6 +237,8 @@ export function reducer(state: WizardState, action: Action): WizardState {
           extraEnv: action.extraEnv,
           agentModel: action.agentModel ?? "",
           agentEffort: action.agentEffort ?? "",
+          useStructuredView,
+          structuredViewDirty: action.resetStructuredViewDirty ? false : state.data.structuredViewDirty,
           profileDirty: false,
           worktreeDirty: false,
         },

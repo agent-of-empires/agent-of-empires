@@ -91,6 +91,24 @@ describe("APPLY_PROFILE_DEFAULTS", () => {
     expect(reducer(toggled, defaults({ yoloMode: true })).data.yoloMode).toBe(true);
     expect(reducer(toggled, set("tool", "opencode")).data.useStructuredView).toBe(false);
   });
+
+  // #3517: the configured view seeds past other dirty fields; a hand-set view survives mount-time
+  // seeding but not a confirmed profile change; an import stays structured.
+  it.each([
+    ["clean", {}, [], defaults({ useStructuredView: false }), false],
+    ["dirty yoloMode", {}, [set("yoloMode", true)], defaults({ useStructuredView: false }), false],
+    ["hand-set view", {}, [set("useStructuredView", true)], defaults({ useStructuredView: false }), true],
+    [
+      "confirmed profile change",
+      {},
+      [set("useStructuredView", true)],
+      defaults({ useStructuredView: false, resetStructuredViewDirty: true, skipIfDirty: undefined }),
+      false,
+    ],
+    ["import", { importAcpSessionId: "abc" }, [], defaults({ useStructuredView: false }), true],
+  ] as const)("seeds the configured view: %s", (_, data, edits, seed, view) => {
+    expect(run(makeState(data), ...edits, seed).data.useStructuredView).toBe(view);
+  });
 });
 
 describe("SET_FIELD mutual exclusion", () => {

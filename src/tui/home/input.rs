@@ -6362,7 +6362,7 @@ impl HomeView {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(target: "tui.input", "Failed to check repo trust: {}", e);
-                let fallback = repo_config::resolve_global_profile_hooks(&data.profile);
+                let fallback = repo_config::ResolvedHooks::global(&data.profile);
                 return self.create_session_with_hooks(data, fallback);
             }
         };
@@ -6388,15 +6388,16 @@ impl HomeView {
 
         // Hooks to run if approved (repo hooks, else global) vs skipped: already-trusted
         // repo hooks still run, while newly-prompted ones fall back to the global set.
+        let repo_root = std::path::Path::new(&trust.project_path);
         let hooks_on_trust = match &repo_hooks {
-            Some(h) => repo_config::merge_hooks_with_config(&data.profile, h.clone()),
-            None => repo_config::resolve_global_profile_hooks(&data.profile),
+            Some(h) => repo_config::ResolvedHooks::with_repo(&data.profile, repo_root, h.clone()),
+            None => repo_config::ResolvedHooks::global(&data.profile),
         };
         let hooks_on_skip = match &trust.hooks {
             TrustSurface::Trusted(h) => {
-                repo_config::merge_hooks_with_config(&data.profile, h.clone())
+                repo_config::ResolvedHooks::with_repo(&data.profile, repo_root, h.clone())
             }
-            _ => repo_config::resolve_global_profile_hooks(&data.profile),
+            _ => repo_config::ResolvedHooks::global(&data.profile),
         };
 
         if !trust.needs_prompt() {
@@ -6428,11 +6429,11 @@ impl HomeView {
     pub(super) fn create_session_with_hooks(
         &mut self,
         data: NewSessionData,
-        hooks: Option<crate::session::HooksConfig>,
+        hooks: Option<repo_config::ResolvedHooks>,
     ) -> Option<Action> {
         let has_hooks = hooks
             .as_ref()
-            .is_some_and(|h| !h.on_create.is_empty() || !h.on_launch.is_empty());
+            .is_some_and(|h| !h.hooks().on_create.is_empty() || !h.hooks().on_launch.is_empty());
         let has_worktree = data.worktree_enabled;
 
         if data.sandbox || has_hooks || has_worktree {

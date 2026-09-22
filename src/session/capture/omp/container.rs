@@ -57,7 +57,31 @@ breadcrumb_bytes=$(head -c 16385 "$f" 2>/dev/null | wc -c) || exit 0
 # A CRLF breadcrumb keeps its CR here and fails closed below.
 cwd=$(head -c 16385 "$f" 2>/dev/null | sed -n '1p')
 session_path=$(head -c 16385 "$f" 2>/dev/null | sed -n '2p')
-marker=$(head -c 16385 "$f" 2>/dev/null | sed -n '3p')
+extra_1=$(head -c 16385 "$f" 2>/dev/null | sed -n '3p')
+extra_2=$(head -c 16385 "$f" 2>/dev/null | sed -n '4p')
+breadcrumb_lines=$(head -c 16385 "$f" 2>/dev/null | sed -n '$=') || exit 0
+case "$breadcrumb_lines" in 2|3|4) ;; *) exit 0 ;; esac
+[ -n "$cwd" ] && [ -n "$session_path" ] || exit 0
+marker=
+cwdstat_seen=
+validate_extra() {
+  case "$1" in
+    fresh) [ -z "$marker" ] || exit 0; marker=fresh ;;
+    'cwdstat '*)
+      [ -z "$cwdstat_seen" ] || exit 0
+      cwdstat_values=${1#cwdstat }
+      cwdstat_dev=${cwdstat_values%% *}
+      cwdstat_ino=${cwdstat_values#* }
+      [ "$cwdstat_ino" != "$cwdstat_values" ]         && [ -n "$cwdstat_dev" ] && [ -n "$cwdstat_ino" ] || exit 0
+      case "$cwdstat_dev$cwdstat_ino" in *[!0-9]*) exit 0 ;; esac
+      case "$cwdstat_ino" in *' '*) exit 0 ;; esac
+      cwdstat_seen=1
+      ;;
+    *) exit 0 ;;
+  esac
+}
+[ "$breadcrumb_lines" -lt 3 ] || validate_extra "$extra_1"
+[ "$breadcrumb_lines" -lt 4 ] || validate_extra "$extra_2"
 [ "$session_path" != "$marker_pending" ] || exit 0
 full_path=$session_path
 case "$full_path" in /*) ;; *) full_path="$cwd/$full_path" ;; esac
@@ -311,6 +335,86 @@ mod tests {
         )
         .unwrap();
 
+        let output = run_container_script(&meta, &marker);
+        assert_eq!(
+            select_omp_session_in_container(&output, &meta, &HashSet::new()).unwrap(),
+            ID
+        );
+        for (extras, accepted) in [
+            ("", true),
+            (
+                "fresh
+", true,
+            ),
+            (
+                "cwdstat 12 34
+",
+                true,
+            ),
+            (
+                "fresh
+cwdstat 12 34
+",
+                true,
+            ),
+            (
+                "cwdstat 12 34
+fresh
+",
+                true,
+            ),
+            (
+                "unknown
+", false,
+            ),
+            (
+                "cwdstat 12
+",
+                false,
+            ),
+            (
+                "cwdstat 12 34 56
+",
+                false,
+            ),
+            (
+                "fresh
+fresh
+",
+                false,
+            ),
+            (
+                "cwdstat 12 34
+cwdstat 12 34
+",
+                false,
+            ),
+        ] {
+            std::fs::write(
+                &breadcrumb,
+                format!(
+                    "{cwd}
+{}
+{extras}",
+                    session.display()
+                ),
+            )
+            .unwrap();
+            set_mtime_ms(&breadcrumb, 4_000_000_000_000);
+            let output = run_container_script(&meta, &marker);
+            assert_eq!(!output.is_empty(), accepted, "{extras:?}");
+        }
+        std::fs::write(
+            &breadcrumb,
+            format!(
+                "{cwd}
+{}
+",
+                session.display()
+            ),
+        )
+        .unwrap();
+        set_mtime_ms(&breadcrumb, 4_000_000_000_000);
         let output = run_container_script(&meta, &marker);
         assert_eq!(
             select_omp_session_in_container(&output, &meta, &HashSet::new()).unwrap(),

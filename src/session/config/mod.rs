@@ -417,17 +417,26 @@ fn default_show_spans() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
 #[setting_section(name = "acp", category = "Acp")]
 pub struct AcpConfig {
-    /// Show the "Structured view" toggle in the new-session dialog, and
-    /// offer switching an existing terminal session into the structured
-    /// view. The structured view is still maturing, so both are hidden by
-    /// default; turn this on to opt in. Opening already-structured sessions,
-    /// and switching a structured session back to a terminal, are unaffected.
+    /// Show the "Structured view" toggle in the TUI's new-session dialog, and
+    /// offer switching an existing terminal session into the structured view
+    /// there. Hidden by default while the view matures; the web dashboard
+    /// always offers it. Opening already-structured sessions, and switching a
+    /// structured session back to a terminal, are unaffected.
+    #[serde(default)]
+    #[setting(label = "Offer structured view in the TUI", widget = "toggle")]
+    pub offer_structured_in_new_session: bool,
+    /// Which view the new-session dialog starts on when the chosen agent can
+    /// back a structured session. Auto keeps each surface's own default: the
+    /// web dashboard starts on the structured view, the TUI on a terminal. The
+    /// TUI still offers the structured view only when the toggle above is on,
+    /// and the dialog's own toggle wins for that one session.
     #[serde(default)]
     #[setting(
-        label = "Offer structured view when creating a session",
-        widget = "toggle"
+        label = "Default view for new sessions",
+        widget = "select",
+        options = "auto:Auto,structured:Structured view,terminal:Terminal view"
     )]
-    pub offer_structured_in_new_session: bool,
+    pub default_new_session_view: NewSessionView,
     /// Acp agent used when --agent is not specified (e.g. claude-code,
     /// codex). Must name an agent that can start: `aoe-agent` is not
     /// packaged yet (#3553).
@@ -634,6 +643,7 @@ impl Default for AcpConfig {
     fn default() -> Self {
         Self {
             offer_structured_in_new_session: false,
+            default_new_session_view: NewSessionView::Auto,
             default_agent: default_agent(),
             restrict_agents: false,
             allowed_agents: Vec::new(),
@@ -1684,6 +1694,16 @@ pub enum NewSessionMode {
     MatchDefault,
     Tmux,
     LiveSend,
+}
+
+/// See `AcpConfig::default_new_session_view`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NewSessionView {
+    #[default]
+    Auto,
+    Structured,
+    Terminal,
 }
 
 /// How the TUI activates an existing terminal-mode session. See
