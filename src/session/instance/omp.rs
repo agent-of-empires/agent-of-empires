@@ -132,7 +132,6 @@ pub(super) fn wrap_omp_launch(tool_cmd: &str, plan: &OmpCapturePlan) -> String {
                  [ \"$cwdstat_ino\" != \"$cwdstat_values\" ] \
                    && [ -n \"$cwdstat_dev\" ] && [ -n \"$cwdstat_ino\" ] || launch_raw; \
                  case \"$cwdstat_dev$cwdstat_ino\" in *[!0-9]*) launch_raw ;; esac; \
-                 case \"$cwdstat_ino\" in *' '*) launch_raw ;; esac; \
                  crumb_cwdstat=1 ;; \
                *) launch_raw ;; \
              esac; \
