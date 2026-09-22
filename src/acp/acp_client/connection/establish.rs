@@ -23,8 +23,8 @@ use super::notifications::{now_ms, Shared};
 use super::ReadyTx;
 use crate::acp::acp_client::commands::{ClientCmd, ConnectMode};
 use crate::acp::acp_client::config_options::{
-    apply_config_default, config_options_event, mode_config_id, modes_available_event,
-    SessionChannels,
+    apply_config_default, config_option_failure_event, config_options_event, mode_config_id,
+    modes_available_event, thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
 };
 use crate::acp::acp_client::control::{establish_session_v3, DaemonControlClient};
 use crate::acp::acp_client::errors::{acp_internal_error, AcpError, IncompatibleAgentError};
@@ -56,6 +56,7 @@ pub(super) struct EstablishCtx {
     pub(super) mcp_servers: Vec<McpServer>,
     pub(super) default_effort: Option<String>,
     pub(super) default_mode: Option<String>,
+    pub(super) default_model: Option<String>,
     pub(super) source_profile: Option<String>,
     pub(super) agent_cwd: PathBuf,
     pub(super) cmd_rx: mpsc::Receiver<ClientCmd>,
@@ -166,6 +167,7 @@ pub(super) async fn establish(
         source_profile: ctx.source_profile,
         default_effort: ctx.default_effort,
         default_mode: ctx.default_mode,
+        default_model: ctx.default_model,
         agent_cwd: ctx.agent_cwd,
         mcp_servers: mcp_servers.clone(),
         cmd_rx: ctx.cmd_rx,
@@ -192,6 +194,7 @@ pub(super) async fn establish(
                 .await?
         }
     };
+    session.apply_default_model().await;
     session.apply_default_effort().await;
     if arm_resume_watchdog {
         spawn_resume_idle_watchdog(shared);
@@ -504,7 +507,7 @@ impl Session {
         ) {
             match mode_config_id(options) {
                 Some(config_id) => {
-                    apply_config_default(
+                    let _ = apply_config_default(
                         &self.connection,
                         &self.shared.event_tx,
                         id.clone(),
@@ -512,7 +515,7 @@ impl Session {
                         mode,
                         &label,
                     )
-                    .await
+                    .await;
                 }
                 None => debug!(
                     target: "acp.protocol",
@@ -524,6 +527,58 @@ impl Session {
         Ok(id)
     }
 
+    /// The persisted model pick, re-asserted after any establish path because
+    /// claude-agent-acp ignores `AOE_AGENT_MODEL` and re-applies its settings
+    /// pin inside `session/load`. Runs before the effort: a model switch
+    /// rebuilds the option set, so the effort's option id is re-read.
+    async fn apply_default_model(&mut self) {
+        let Some(model) = self.default_model.as_deref() else {
+            return;
+        };
+        let label = &self.shared.session_label;
+        let Some(option) = &self.channels.model_option else {
+            debug!(
+                target: "acp.protocol",
+                session = %label,
+                "structured view model skipped; no model option"
+            );
+            return;
+        };
+        if option.is_current(model) {
+            debug!(
+                target: "acp.protocol",
+                session = %label,
+                model,
+                "structured view model already current"
+            );
+            return;
+        }
+        let result = apply_config_default(
+            &self.connection,
+            &self.shared.event_tx,
+            self.acp_session_id.clone(),
+            SessionConfigId::new(option.id.clone()),
+            model,
+            label,
+        )
+        .await;
+        match result {
+            Ok(options) => {
+                self.channels.thought_level_config_option_id =
+                    thought_level_config_id(&options).map(|id| id.0.to_string());
+            }
+            Err(reason) => {
+                let event = config_option_failure_event(
+                    option.id.clone(),
+                    model.to_string(),
+                    reason,
+                    ConfigOptionDispatchPurpose::Generic,
+                );
+                self.shared.emit(event).await;
+            }
+        }
+    }
+
     /// Effort is a pin carried across respawns, which resume via load or fork,
     /// so it applies after any establish path. Resume captures no option id.
     async fn apply_default_effort(&self) {
@@ -532,7 +587,7 @@ impl Session {
         };
         match self.channels.thought_level_config_option_id.as_deref() {
             Some(config_id) => {
-                apply_config_default(
+                let _ = apply_config_default(
                     &self.connection,
                     &self.shared.event_tx,
                     self.acp_session_id.clone(),
@@ -540,7 +595,7 @@ impl Session {
                     effort,
                     &self.shared.session_label,
                 )
-                .await
+                .await;
             }
             None => debug!(
                 target: "acp.protocol",

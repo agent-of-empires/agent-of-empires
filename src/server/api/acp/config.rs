@@ -185,6 +185,12 @@ pub async fn acp_set_config_option(
         }
     };
     if let Some(selector) = selector {
+        if selector == PersistedSelector::Model {
+            state
+                .acp_supervisor
+                .refresh_cached_model(&id, &req.value)
+                .await;
+        }
         persist_selector(&state, &id, selector, &req.value).await;
     }
     StatusCode::ACCEPTED.into_response()

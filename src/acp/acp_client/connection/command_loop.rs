@@ -4,7 +4,8 @@
 use crate::acp::state::Event;
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, McpServer, NewSessionRequest, NewSessionResponse,
-    SessionConfigValueId, SessionId, SetSessionConfigOptionRequest,
+    SessionConfigId, SessionConfigOption, SessionConfigValueId, SessionId,
+    SetSessionConfigOptionRequest,
 };
 use agent_client_protocol::{Agent, ConnectionTo};
 use std::collections::VecDeque;
@@ -20,8 +21,9 @@ use crate::acp::acp_client::between_prompt::{
 };
 use crate::acp::acp_client::commands::ClientCmd;
 use crate::acp::acp_client::config_options::{
-    config_options_event, dispatch_set_config_option, dispatch_set_mode, mode_config_id,
-    modes_available_event, thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
+    config_option_failure_event, config_options_event, dispatch_set_config_option,
+    dispatch_set_mode, mode_config_id, model_option, modes_available_event,
+    thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
 };
 use crate::acp::acp_client::control::DaemonControlClient;
 use crate::acp::acp_client::delete::handle_delete_session_cmd;
@@ -47,6 +49,7 @@ pub(super) struct Session {
     pub(super) source_profile: Option<String>,
     pub(super) default_effort: Option<String>,
     pub(super) default_mode: Option<String>,
+    pub(super) default_model: Option<String>,
     pub(super) agent_cwd: PathBuf,
     /// Capability-filtered servers, forwarded again by a driven reset.
     pub(super) mcp_servers: Vec<McpServer>,
@@ -70,7 +73,16 @@ impl Session {
         }
     }
 
-    pub(super) fn dispatch_config_option(&self, config_id: String, value: String) {
+    pub(super) fn dispatch_config_option(&mut self, config_id: String, value: String) {
+        // A reset re-applies `default_model`, so it follows the live pick.
+        if self
+            .channels
+            .model_option
+            .as_ref()
+            .is_some_and(|option| option.id == config_id)
+        {
+            self.default_model = Some(value.clone());
+        }
         dispatch_set_config_option(
             &self.connection,
             &self.acp_session_id,
@@ -353,20 +365,43 @@ impl Session {
         Ok(())
     }
 
-    /// The fresh session starts on adapter defaults, so configured effort and
-    /// mode are re-sent, best-effort, within the reset deadline.
+    /// The fresh session starts on adapter defaults, so the model, effort and
+    /// mode are re-sent, best-effort, within the reset deadline. The model
+    /// goes first because a switch rebuilds the option set the effort is
+    /// resolved from.
     async fn reapply_defaults(
         &self,
         new_id: &SessionId,
-        options: Option<&[agent_client_protocol::schema::v1::SessionConfigOption]>,
+        options: Option<&[SessionConfigOption]>,
         deadline: tokio::time::Instant,
     ) {
-        let label = &self.shared.session_label;
+        let mut effort_id = options.and_then(thought_level_config_id);
+        if let (Some(model), Some(option)) = (
+            self.default_model.as_deref(),
+            options.and_then(model_option),
+        ) {
+            if !option.is_current(model) {
+                let config_id = SessionConfigId::new(option.id.clone());
+                match self
+                    .reset_set_option(new_id, config_id, model, deadline)
+                    .await
+                {
+                    Some(Ok(options)) => effort_id = thought_level_config_id(&options),
+                    Some(Err(reason)) => {
+                        let event = config_option_failure_event(
+                            option.id,
+                            model.to_string(),
+                            reason,
+                            ConfigOptionDispatchPurpose::Generic,
+                        );
+                        self.shared.emit(event).await;
+                    }
+                    None => return,
+                }
+            }
+        }
         for (value, config_id) in [
-            (
-                self.default_effort.as_deref(),
-                options.and_then(thought_level_config_id),
-            ),
+            (self.default_effort.as_deref(), effort_id),
             (
                 self.default_mode.as_deref(),
                 options.and_then(mode_config_id),
@@ -378,37 +413,60 @@ impl Session {
                 );
                 continue;
             };
-            let request = || {
-                self.connection
-                    .send_request(SetSessionConfigOptionRequest::new(
-                        new_id.clone(),
-                        config_id,
-                        SessionConfigValueId::new(value.to_string()),
-                    ))
-                    .block_task()
-            };
-            match await_reset_request(deadline, request).await {
-                Ok(resp) => {
-                    if let Some(event) = config_options_event(Some(resp.config_options)) {
-                        self.shared.emit(event).await;
-                    }
+            if self
+                .reset_set_option(new_id, config_id, value, deadline)
+                .await
+                .is_none()
+            {
+                return;
+            }
+        }
+    }
+
+    /// The agent's option list or rejection reason; `None` once the reset
+    /// deadline passes, which skips the remaining defaults.
+    async fn reset_set_option(
+        &self,
+        new_id: &SessionId,
+        config_id: SessionConfigId,
+        value: &str,
+        deadline: tokio::time::Instant,
+    ) -> Option<Result<Vec<SessionConfigOption>, String>> {
+        let label = &self.shared.session_label;
+        let request = || {
+            self.connection
+                .send_request(SetSessionConfigOptionRequest::new(
+                    new_id.clone(),
+                    config_id,
+                    SessionConfigValueId::new(value.to_string()),
+                ))
+                .block_task()
+        };
+        match await_reset_request(deadline, request).await {
+            Ok(resp) => {
+                if let Some(event) = config_options_event(Some(resp.config_options.clone())) {
+                    self.shared.emit(event).await;
                 }
-                Err(ResetRequestError::Acp(e)) => warn!(
+                Some(Ok(resp.config_options))
+            }
+            Err(ResetRequestError::Acp(e)) => {
+                warn!(
                     target: "acp.protocol",
                     session = %label,
                     value,
                     "re-applying structured view default after reset failed: {e}"
-                ),
-                Err(ResetRequestError::TimedOut) => {
-                    warn!(
-                        target: "acp.protocol",
-                        session = %label,
-                        value,
-                        timeout_secs = SESSION_RESET_IN_TASK_TIMEOUT.as_secs(),
-                        "post-reset config re-application timed out; skipping remaining defaults"
-                    );
-                    break;
-                }
+                );
+                Some(Err(e.to_string()))
+            }
+            Err(ResetRequestError::TimedOut) => {
+                warn!(
+                    target: "acp.protocol",
+                    session = %label,
+                    value,
+                    timeout_secs = SESSION_RESET_IN_TASK_TIMEOUT.as_secs(),
+                    "post-reset config re-application timed out; skipping remaining defaults"
+                );
+                None
             }
         }
     }

@@ -192,13 +192,8 @@ pub struct AppState {
     /// transitions to `Status::Error` for up to 8 seconds while the agent
     /// is still settling. Periodically GC'd by a background task.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
-    /// Bumped after a committed session membership or view transition is on
-    /// disk and mirrored in `instances`. Reloaders capture the epoch before
-    /// reading disk and drop snapshots whose epoch no longer matches under the
-    /// `instances` write lock. This prevents stale snapshots from resurrecting
-    /// rows, dropping rows, or restoring the previous execution backend.
-    /// Other field edits do not bump because their per-id merge may converge on
-    /// the next reload. See invariant 8 on `reload_state_instances_from_disk`.
+    /// Bumped under the `instances` write lock by any change an earlier disk snapshot
+    /// would not carry, so a reload holding that snapshot drops itself.
     pub mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Ids whose startup-recovery cascade is scheduled but not yet complete.
     /// Phase A seeds it; each Phase B worker drains its id on completion. The

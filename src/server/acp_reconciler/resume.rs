@@ -96,6 +96,25 @@ fn publish_orphaned_turn_stop<S: BroadcastSink>(
     supervisor.synthesize_stopped_for_orphan(session_id, reason);
 }
 
+/// A `Monitor` watch lives inside the agent process, so a replacement process
+/// has lost it; the reminder gives the agent a turn to re-arm it.
+const MONITOR_RESTART_REMINDER: &str = "Note: this session's agent process restarted, so any background Monitor watch that was armed is no longer running. Re-arm it if it's still needed.";
+
+/// Queues the re-arm reminder once a fresh process replaces the session's worker.
+pub(super) async fn requeue_interrupted_monitor(state: &AppState, session_id: &str) {
+    if state
+        .acp_event_store
+        .latest_active_monitor(session_id)
+        .is_none()
+    {
+        return;
+    }
+    state
+        .session_service
+        .set_pending_initial_turn(session_id, MONITOR_RESTART_REMINDER.to_string(), vec![])
+        .await;
+}
+
 async fn admit(
     state: &AppState,
     id: &str,
@@ -235,6 +254,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
     }
 
     publish_orphaned_turn_stop(&state.acp_supervisor, &id, decision, in_flight_turn);
+    requeue_interrupted_monitor(&state, &id).await;
     let Ok(req) = build_spawn_request(&state.session_service, &target).await else {
         return ResumeOutcome::SpawnFinished;
     };
@@ -636,5 +656,28 @@ mod tests {
             crate::daemon::AcpWorkerState::Absent
         );
         assert!(state.acp_event_store.replay_from(id, 0).is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn requeue_interrupted_monitor_queues_only_over_an_armed_monitor() {
+        for armed in [true, false] {
+            let id = "sess-monitor";
+            let (_home, state, _project) = test_state(id);
+            if armed {
+                let event = crate::acp::state::Event::MonitorArmed {
+                    description: Some("watch for X".to_string()),
+                };
+                state.acp_event_store.record(id, 1, &event).unwrap();
+            }
+
+            requeue_interrupted_monitor(&state, id).await;
+
+            let synthesized = state.instances.read().await[0]
+                .pending_initial_turn
+                .as_ref()
+                .map(|t| t.synthesized);
+            assert_eq!(synthesized, armed.then_some(true), "armed={armed}");
+        }
     }
 }
