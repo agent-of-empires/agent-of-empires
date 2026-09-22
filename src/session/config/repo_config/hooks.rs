@@ -167,6 +167,51 @@ pub fn hook_display_groups(
         .collect()
 }
 
+/// Names the config file that declared the `commands` that just ran, so a
+/// failure says which file to edit. Matches each layer's own declaration, most
+/// specific first, instead of predicting the merge winner: declining repo trust
+/// runs the global/profile set even when the repo declares the same type.
+/// `None` when no layer's declaration matches.
+pub fn hook_origin_hint(
+    profile: &str,
+    project_path: &Path,
+    hook_type: &str,
+    commands: &[String],
+) -> Option<String> {
+    let of_type = |h: HooksConfig| match hook_type {
+        "on_create" => Some(h.on_create),
+        "on_launch" => Some(h.on_launch),
+        "on_destroy" => Some(h.on_destroy),
+        _ => None,
+    };
+    if commands.is_empty() || of_type(HooksConfig::default()).is_none() {
+        return None;
+    }
+
+    let repo_root = super::repo_config_source_path(project_path);
+    let repo = super::load_repo_config(&repo_root)
+        .ok()
+        .flatten()
+        .and_then(|rc| rc.hooks())
+        .zip(super::resolved_repo_config_path(&repo_root));
+    // Profile overrides are sparse: no `hooks` section means global supplied them.
+    let profile_layer = profile_config::load_profile_config(profile)
+        .ok()
+        .and_then(|pc| pc.overrides.get("hooks").cloned())
+        .and_then(|v| serde_json::from_value::<HooksConfig>(v).ok())
+        .zip(profile_config::get_profile_config_path(profile).ok());
+    let global = crate::session::Config::load()
+        .ok()
+        .map(|c| c.hooks)
+        .zip(crate::session::config::config_path().ok());
+
+    [repo, profile_layer, global]
+        .into_iter()
+        .flatten()
+        .find(|(hooks, _)| of_type(hooks.clone()).as_deref() == Some(commands))
+        .map(|(_, path)| format!("declared in {} ([hooks] {hook_type})", path.display()))
+}
+
 enum HookTarget<'a> {
     Local {
         project_path: &'a Path,
@@ -832,6 +877,83 @@ mod tests {
         let many: HostHooksConfig = toml::from_str("before_start = [\"a\", \"b\"]").unwrap();
         assert_eq!(many.before_start, vec!["a", "b"]);
         assert!(!many.is_empty() && HostHooksConfig::default().is_empty());
+    }
+
+    #[test]
+    fn hook_origin_hint_names_the_layer_the_commands_came_from() {
+        use super::super::{LEGACY_REPO_CONFIG_PATH, REPO_CONFIG_PATH};
+        let _app = crate::session::test_support::isolate_app_dir();
+        let write = |path: &Path, body: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        let repo = tempfile::TempDir::new().unwrap();
+        write(
+            &repo.path().join(REPO_CONFIG_PATH),
+            "[hooks]\non_create = [\"repo-cmd\"]\n",
+        );
+        let legacy = tempfile::TempDir::new().unwrap();
+        write(
+            &legacy.path().join(LEGACY_REPO_CONFIG_PATH),
+            "[hooks]\non_create = [\"legacy-cmd\"]\n",
+        );
+        let global = crate::session::config::config_path().unwrap();
+        write(&global, "[hooks]\non_create = [\"global-cmd\"]\n");
+        let profile = profile_config::get_profile_config_path("work").unwrap();
+        write(&profile, "[hooks]\non_create = [\"profile-cmd\"]\n");
+
+        let hint = |profile: &str, root: &Path, hook_type: &str, commands: &[&str]| {
+            hook_origin_hint(profile, root, hook_type, &cmds(commands))
+        };
+        let expect = |path: &Path| {
+            Some(format!(
+                "declared in {} ([hooks] on_create)",
+                path.display()
+            ))
+        };
+
+        // (profile, project, hook type, commands that ran, expected file)
+        let cases: [(&str, &Path, &str, &[&str], Option<String>); 7] = [
+            (
+                "default",
+                repo.path(),
+                "on_create",
+                &["repo-cmd"],
+                expect(&repo.path().join(REPO_CONFIG_PATH)),
+            ),
+            // Declined repo trust runs the global set although the repo declares on_create.
+            (
+                "default",
+                repo.path(),
+                "on_create",
+                &["global-cmd"],
+                expect(&global),
+            ),
+            (
+                "work",
+                repo.path(),
+                "on_create",
+                &["profile-cmd"],
+                expect(&profile),
+            ),
+            (
+                "default",
+                legacy.path(),
+                "on_create",
+                &["legacy-cmd"],
+                expect(&legacy.path().join(LEGACY_REPO_CONFIG_PATH)),
+            ),
+            ("default", repo.path(), "on_create", &["ghost"], None),
+            ("default", repo.path(), "on_explode", &["repo-cmd"], None),
+            ("default", repo.path(), "on_create", &[], None),
+        ];
+        for (profile, root, hook_type, commands, expected) in cases {
+            assert_eq!(
+                hint(profile, root, hook_type, commands),
+                expected,
+                "{commands:?}"
+            );
+        }
     }
 
     #[test]

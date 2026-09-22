@@ -69,21 +69,26 @@ fn resolves_to_global_config(candidate: &Path) -> bool {
             .is_some_and(|dir| normalize_path(dir) == normalize_path(&app_dir))
 }
 
+/// The file [`load_repo_config`] reads: `.agent-of-empires/config.toml`, else
+/// the legacy `.aoe/config.toml`. `None` when neither exists or for the empty
+/// (scratch) path, which would resolve relative to the launch directory.
+fn resolved_repo_config_path(project_path: &Path) -> Option<PathBuf> {
+    if project_path.as_os_str().is_empty() {
+        return None;
+    }
+    [REPO_CONFIG_PATH, LEGACY_REPO_CONFIG_PATH]
+        .into_iter()
+        .map(|rel| project_path.join(rel))
+        .find(|path| path.exists())
+}
+
 /// Loads `.agent-of-empires/config.toml`, falling back to the legacy
 /// `.aoe/config.toml`. `None` when absent, empty, or for the empty (scratch) path.
 pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
-    // An empty path would resolve relative to the launch directory.
-    if project_path.as_os_str().is_empty() {
-        return Ok(None);
-    }
-    let (config_path, is_legacy) = [(REPO_CONFIG_PATH, false), (LEGACY_REPO_CONFIG_PATH, true)]
-        .into_iter()
-        .map(|(rel, legacy)| (project_path.join(rel), legacy))
-        .find(|(path, _)| path.exists())
-        .unzip();
-    let (Some(config_path), Some(is_legacy)) = (config_path, is_legacy) else {
+    let Some(config_path) = resolved_repo_config_path(project_path) else {
         return Ok(None);
     };
+    let is_legacy = config_path.ends_with(LEGACY_REPO_CONFIG_PATH);
 
     if resolves_to_global_config(&config_path) {
         tracing::debug!(target: "session.store",

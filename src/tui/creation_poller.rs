@@ -3,6 +3,7 @@
 //! This handles the potentially slow Docker operations (image pull, container creation)
 //! in a background thread so the UI remains responsive.
 
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 
@@ -71,6 +72,20 @@ pub struct CreationPoller {
     pending: bool,
     /// Profile from the last creation request (for cross-profile saves)
     last_profile: Option<String>,
+}
+
+/// Appends which config file declared the failing `on_create` commands.
+fn on_create_error(
+    e: &anyhow::Error,
+    profile: &str,
+    project_path: &str,
+    commands: &[String],
+) -> String {
+    let msg = format!("on_create hook failed: {e:#}");
+    match repo_config::hook_origin_hint(profile, Path::new(project_path), "on_create", commands) {
+        Some(hint) => format!("{msg}\n{hint}"),
+        None => msg,
+    }
 }
 
 impl CreationPoller {
@@ -183,7 +198,12 @@ impl CreationPoller {
                             &created_workspace_worktrees,
                             None,
                         );
-                        return CreationResult::Error(format!("on_create hook failed: {:#}", e));
+                        return CreationResult::Error(on_create_error(
+                            &e,
+                            &profile,
+                            &instance.project_path,
+                            &hooks.on_create,
+                        ));
                     }
                 }
             } else if let Err(e) = repo_config::execute_hooks_streamed(
@@ -198,7 +218,12 @@ impl CreationPoller {
                     &created_workspace_worktrees,
                     None,
                 );
-                return CreationResult::Error(format!("on_create hook failed: {:#}", e));
+                return CreationResult::Error(on_create_error(
+                    &e,
+                    &profile,
+                    &instance.project_path,
+                    &hooks.on_create,
+                ));
             }
         }
 
