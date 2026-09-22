@@ -43,7 +43,7 @@ impl HomeView {
     pub fn request_creation(
         &mut self,
         mut data: NewSessionData,
-        hooks: Option<crate::session::HooksConfig>,
+        hooks: Option<crate::session::config::repo_config::ResolvedHooks>,
     ) {
         // Pre-resolve the title with the logic the builder will run, so the stub, the
         // background creation and the final instance agree; otherwise an empty title shows

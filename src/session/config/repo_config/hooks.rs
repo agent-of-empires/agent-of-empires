@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use crate::session::config::profile_config;
@@ -93,7 +93,7 @@ pub fn resolve_global_profile_hooks(profile: &str) -> Option<HooksConfig> {
 }
 
 /// Trusted repo hooks replace global ones per type (not append).
-pub fn merge_hooks_with_config(profile: &str, repo_hooks: HooksConfig) -> Option<HooksConfig> {
+fn merge_hooks_with_config(profile: &str, repo_hooks: HooksConfig) -> Option<HooksConfig> {
     let mut base = profile_config::resolve_config_or_warn(profile).hooks;
     if !repo_hooks.on_create.is_empty() {
         base.on_create = repo_hooks.on_create;
@@ -167,49 +167,86 @@ pub fn hook_display_groups(
         .collect()
 }
 
-/// Names the config file that declared the `commands` that just ran, so a
-/// failure says which file to edit. Matches each layer's own declaration, most
-/// specific first, instead of predicting the merge winner: declining repo trust
-/// runs the global/profile set even when the repo declares the same type.
-/// `None` when no layer's declaration matches.
-pub fn hook_origin_hint(
-    profile: &str,
-    project_path: &Path,
-    hook_type: &str,
-    commands: &[String],
-) -> Option<String> {
-    let of_type = |h: HooksConfig| match hook_type {
-        "on_create" => Some(h.on_create),
-        "on_launch" => Some(h.on_launch),
-        "on_destroy" => Some(h.on_destroy),
-        _ => None,
-    };
-    if commands.is_empty() || of_type(HooksConfig::default()).is_none() {
-        return None;
+/// A merged hook set plus the repo it drew on, so a failure can name the file
+/// that declared the failing commands.
+#[derive(Debug, Clone)]
+pub struct ResolvedHooks {
+    hooks: HooksConfig,
+    /// Set only when trusted repo hooks were merged in.
+    repo_root: Option<PathBuf>,
+}
+
+impl std::ops::Deref for ResolvedHooks {
+    type Target = HooksConfig;
+    fn deref(&self) -> &HooksConfig {
+        &self.hooks
+    }
+}
+
+impl ResolvedHooks {
+    /// Global and profile hooks only; `None` without `on_create`/`on_launch`.
+    pub fn global(profile: &str) -> Option<Self> {
+        resolve_global_profile_hooks(profile).map(|hooks| Self {
+            hooks,
+            repo_root: None,
+        })
     }
 
-    let repo_root = super::repo_config_source_path(project_path);
-    let repo = super::load_repo_config(&repo_root)
-        .ok()
-        .flatten()
-        .and_then(|rc| rc.hooks())
-        .zip(super::resolved_repo_config_path(&repo_root));
-    // Profile overrides are sparse: no `hooks` section means global supplied them.
-    let profile_layer = profile_config::load_profile_config(profile)
-        .ok()
-        .and_then(|pc| pc.overrides.get("hooks").cloned())
-        .and_then(|v| serde_json::from_value::<HooksConfig>(v).ok())
-        .zip(profile_config::get_profile_config_path(profile).ok());
-    let global = crate::session::Config::load()
-        .ok()
-        .map(|c| c.hooks)
-        .zip(crate::session::config::config_path().ok());
+    /// Trusted hooks read from `repo_root` (a [`RepoTrust::project_path`](super::RepoTrust))
+    /// over global and profile.
+    pub fn with_repo(profile: &str, repo_root: &Path, repo_hooks: HooksConfig) -> Option<Self> {
+        merge_hooks_with_config(profile, repo_hooks).map(|hooks| Self {
+            hooks,
+            repo_root: Some(repo_root.to_path_buf()),
+        })
+    }
 
-    [repo, profile_layer, global]
-        .into_iter()
-        .flatten()
-        .find(|(hooks, _)| of_type(hooks.clone()).as_deref() == Some(commands))
-        .map(|(_, path)| format!("declared in {} ([hooks] {hook_type})", path.display()))
+    /// Names the config file that declared this set's `hook_type` commands.
+    /// Each layer's own declaration is matched against the commands, most
+    /// specific first; `None` when none matches.
+    pub fn origin_hint(&self, profile: &str, hook_type: &str) -> Option<String> {
+        let of_type = |h: HooksConfig| match hook_type {
+            "on_create" => Some(h.on_create),
+            "on_launch" => Some(h.on_launch),
+            "on_destroy" => Some(h.on_destroy),
+            _ => None,
+        };
+        let commands = of_type(self.hooks.clone()).filter(|c| !c.is_empty())?;
+        let file_hooks = |path: PathBuf| -> Option<(HooksConfig, PathBuf)> {
+            let content = std::fs::read_to_string(&path).ok()?;
+            let hooks = toml::from_str::<super::RepoConfig>(&content)
+                .ok()?
+                .hooks()?;
+            Some((hooks, path))
+        };
+
+        let repo = self
+            .repo_root
+            .as_deref()
+            .and_then(super::resolved_repo_config_path)
+            .and_then(file_hooks);
+        // Profile overrides are sparse: no `hooks` section means global supplied them.
+        let profile_layer = profile_config::load_profile_config(profile)
+            .ok()
+            .and_then(|pc| pc.overrides.get("hooks").cloned())
+            .and_then(|v| serde_json::from_value::<HooksConfig>(v).ok())
+            .zip(
+                crate::session::get_profile_dir_path(profile)
+                    .ok()
+                    .map(|dir| dir.join("config.toml")),
+            );
+        let global = crate::session::Config::load().ok().map(|c| c.hooks).zip(
+            crate::session::get_app_dir_path()
+                .ok()
+                .map(|dir| dir.join("config.toml")),
+        );
+
+        [repo, profile_layer, global]
+            .into_iter()
+            .flatten()
+            .find(|(hooks, _)| of_type(hooks.clone()).as_ref() == Some(&commands))
+            .map(|(_, path)| format!("declared in {} ([hooks] {hook_type})", path.display()))
+    }
 }
 
 enum HookTarget<'a> {
@@ -880,80 +917,108 @@ mod tests {
     }
 
     #[test]
-    fn hook_origin_hint_names_the_layer_the_commands_came_from() {
+    fn origin_hint_names_the_layer_the_commands_came_from() {
         use super::super::{LEGACY_REPO_CONFIG_PATH, REPO_CONFIG_PATH};
         let _app = crate::session::test_support::isolate_app_dir();
         let write = |path: &Path, body: &str| {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, body).unwrap();
         };
-        let repo = tempfile::TempDir::new().unwrap();
-        write(
-            &repo.path().join(REPO_CONFIG_PATH),
-            "[hooks]\non_create = [\"repo-cmd\"]\n",
-        );
-        let legacy = tempfile::TempDir::new().unwrap();
-        write(
-            &legacy.path().join(LEGACY_REPO_CONFIG_PATH),
+        let repo_with = |rel: &str, body: &str| {
+            let dir = tempfile::TempDir::new().unwrap();
+            write(&dir.path().join(rel), body);
+            let file = dir.path().join(rel);
+            (dir, file)
+        };
+        let (repo, repo_file) =
+            repo_with(REPO_CONFIG_PATH, "[hooks]\non_create = [\"repo-cmd\"]\n");
+        let (legacy, legacy_file) = repo_with(
+            LEGACY_REPO_CONFIG_PATH,
             "[hooks]\non_create = [\"legacy-cmd\"]\n",
         );
-        let global = crate::session::config::config_path().unwrap();
+        let (launch_only, _) = repo_with(REPO_CONFIG_PATH, "[hooks]\non_launch = [\"x\"]\n");
+        let (same_as_global, same_file) =
+            repo_with(REPO_CONFIG_PATH, "[hooks]\non_create = [\"global-cmd\"]\n");
+        let global = crate::session::get_app_dir_path()
+            .unwrap()
+            .join("config.toml");
         write(&global, "[hooks]\non_create = [\"global-cmd\"]\n");
-        let profile = profile_config::get_profile_config_path("work").unwrap();
+        let profile = crate::session::get_profile_dir_path("work")
+            .unwrap()
+            .join("config.toml");
         write(&profile, "[hooks]\non_create = [\"profile-cmd\"]\n");
 
-        let hint = |profile: &str, root: &Path, hook_type: &str, commands: &[&str]| {
-            hook_origin_hint(profile, root, hook_type, &cmds(commands))
+        let repo_run = |root: &Path| {
+            let hooks = super::super::load_repo_config(root)
+                .unwrap()
+                .unwrap()
+                .hooks()
+                .unwrap();
+            ResolvedHooks::with_repo("default", root, hooks).unwrap()
         };
-        let expect = |path: &Path| {
+        let named = |path: &Path| {
             Some(format!(
                 "declared in {} ([hooks] on_create)",
                 path.display()
             ))
         };
-
-        // (profile, project, hook type, commands that ran, expected file)
-        let cases: [(&str, &Path, &str, &[&str], Option<String>); 7] = [
+        let cases: Vec<(&str, ResolvedHooks, &str, Option<String>)> = vec![
             (
-                "default",
-                repo.path(),
+                "trusted repo",
+                repo_run(repo.path()),
                 "on_create",
-                &["repo-cmd"],
-                expect(&repo.path().join(REPO_CONFIG_PATH)),
-            ),
-            // Declined repo trust runs the global set although the repo declares on_create.
-            (
-                "default",
-                repo.path(),
-                "on_create",
-                &["global-cmd"],
-                expect(&global),
+                named(&repo_file),
             ),
             (
-                "work",
-                repo.path(),
+                "legacy layout",
+                repo_run(legacy.path()),
                 "on_create",
-                &["profile-cmd"],
-                expect(&profile),
+                named(&legacy_file),
             ),
             (
-                "default",
-                legacy.path(),
+                "repo merged, type inherited",
+                repo_run(launch_only.path()),
                 "on_create",
-                &["legacy-cmd"],
-                expect(&legacy.path().join(LEGACY_REPO_CONFIG_PATH)),
+                named(&global),
             ),
-            ("default", repo.path(), "on_create", &["ghost"], None),
-            ("default", repo.path(), "on_explode", &["repo-cmd"], None),
-            ("default", repo.path(), "on_create", &[], None),
+            (
+                "repo repeats global",
+                repo_run(same_as_global.path()),
+                "on_create",
+                named(&same_file),
+            ),
+            // Declined trust: global ran, although a repo on disk declares the same commands.
+            (
+                "repo not merged",
+                ResolvedHooks::global("default").unwrap(),
+                "on_create",
+                named(&global),
+            ),
+            ("unknown type", repo_run(repo.path()), "on_explode", None),
+            ("empty type", repo_run(repo.path()), "on_destroy", None),
+            (
+                "matches no layer",
+                ResolvedHooks {
+                    hooks: HooksConfig {
+                        on_create: cmds(&["ghost"]),
+                        ..Default::default()
+                    },
+                    repo_root: None,
+                },
+                "on_create",
+                None,
+            ),
         ];
-        for (profile, root, hook_type, commands, expected) in cases {
-            assert_eq!(
-                hint(profile, root, hook_type, commands),
-                expected,
-                "{commands:?}"
-            );
+        for (label, run, hook_type, expected) in cases {
+            assert_eq!(run.origin_hint("default", hook_type), expected, "{label}");
         }
+
+        let work = ResolvedHooks::global("work").unwrap();
+        assert_eq!(work.origin_hint("work", "on_create"), named(&profile));
+
+        let unseen = crate::session::get_profile_dir_path("unseen").unwrap();
+        assert_eq!(work.origin_hint("unseen", "on_create"), None);
+        assert!(!unseen.exists(), "the hint must not create a profile dir");
     }
 
     #[test]

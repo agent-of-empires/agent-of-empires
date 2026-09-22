@@ -780,12 +780,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
 
     let hook_result: Result<()> = (|| {
-        let resolved_hooks: Option<crate::session::HooksConfig> = if args.scratch {
-            repo_config::resolve_global_profile_hooks(profile)
+        let resolved_hooks: Option<repo_config::ResolvedHooks> = if args.scratch {
+            repo_config::ResolvedHooks::global(profile)
         } else {
             use repo_config::TrustSurface;
             match repo_config::check_repo_trust(&original_project_path) {
                 Ok(trust) => {
+                    let repo_root = std::path::Path::new(&trust.project_path);
                     let repo_hooks: Option<crate::session::HooksConfig> = match &trust.hooks {
                         TrustSurface::Trusted(h) => Some(h.clone()),
                         TrustSurface::NeedsTrust { config, .. } => Some(config.clone()),
@@ -850,8 +851,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                             }
                         }
                         match repo_hooks {
-                            Some(h) => repo_config::merge_hooks_with_config(profile, h),
-                            None => repo_config::resolve_global_profile_hooks(profile),
+                            Some(h) => repo_config::ResolvedHooks::with_repo(profile, repo_root, h),
+                            None => repo_config::ResolvedHooks::global(profile),
                         }
                     } else {
                         println!(
@@ -859,18 +860,16 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                         );
                         match &trust.hooks {
                             TrustSurface::Trusted(h) => {
-                                repo_config::merge_hooks_with_config(profile, h.clone())
+                                repo_config::ResolvedHooks::with_repo(profile, repo_root, h.clone())
                             }
                             TrustSurface::NeedsTrust { .. } => None,
-                            TrustSurface::Absent => {
-                                repo_config::resolve_global_profile_hooks(profile)
-                            }
+                            TrustSurface::Absent => repo_config::ResolvedHooks::global(profile),
                         }
                     }
                 }
                 Err(e) => {
                     tracing::warn!(target: "cli.add", "Failed to check repo trust: {}", e);
-                    repo_config::resolve_global_profile_hooks(profile)
+                    repo_config::ResolvedHooks::global(profile)
                 }
             }
         };
@@ -884,18 +883,20 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 let hook_env = repo_config::lifecycle_env_vars(&instance);
                 if instance.sandbox_info.is_some() {
                     instance.get_container_for_instance()?;
-                    let workdir = instance.container_workdir();
-                    if let Some(ref sandbox) = instance.sandbox_info {
-                        repo_config::execute_hooks_in_container(
-                            &hooks.on_create,
-                            &sandbox.container_name,
-                            &workdir,
-                            &hook_env,
-                        )?;
-                    }
-                } else {
-                    repo_config::execute_hooks(&hooks.on_create, &path, &hook_env)?;
                 }
+                let ran = match instance.sandbox_info {
+                    Some(ref sandbox) => repo_config::execute_hooks_in_container(
+                        &hooks.on_create,
+                        &sandbox.container_name,
+                        &instance.container_workdir(),
+                        &hook_env,
+                    ),
+                    None => repo_config::execute_hooks(&hooks.on_create, &path, &hook_env),
+                };
+                ran.map_err(|e| match hooks.origin_hint(profile, "on_create") {
+                    Some(hint) => e.context(format!("on_create hook failed; {hint}")),
+                    None => e,
+                })?;
                 println!("✓ on_create hooks completed");
             }
         }

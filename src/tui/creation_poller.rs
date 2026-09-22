@@ -3,12 +3,11 @@
 //! This handles the potentially slow Docker operations (image pull, container creation)
 //! in a background thread so the UI remains responsive.
 
-use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 
 use crate::session::builder::{self, CreatedWorktree, InstanceParams};
-use crate::session::config::repo_config::{self, HookProgress, HooksConfig};
+use crate::session::config::repo_config::{self, HookProgress, ResolvedHooks};
 use crate::session::Instance;
 use crate::tui::dialogs::NewSessionData;
 
@@ -16,7 +15,7 @@ pub struct CreationRequest {
     pub data: NewSessionData,
     pub existing_instances: Vec<Instance>,
     /// Trusted hooks to execute after instance creation (already approved by user).
-    pub hooks: Option<HooksConfig>,
+    pub hooks: Option<ResolvedHooks>,
 }
 
 #[derive(Debug)]
@@ -75,14 +74,9 @@ pub struct CreationPoller {
 }
 
 /// Appends which config file declared the failing `on_create` commands.
-fn on_create_error(
-    e: &anyhow::Error,
-    profile: &str,
-    project_path: &str,
-    commands: &[String],
-) -> String {
+fn on_create_error(e: &anyhow::Error, hooks: &ResolvedHooks, profile: &str) -> String {
     let msg = format!("on_create hook failed: {e:#}");
-    match repo_config::hook_origin_hint(profile, Path::new(project_path), "on_create", commands) {
+    match hooks.origin_hint(profile, "on_create") {
         Some(hint) => format!("{msg}\n{hint}"),
         None => msg,
     }
@@ -198,12 +192,7 @@ impl CreationPoller {
                             &created_workspace_worktrees,
                             None,
                         );
-                        return CreationResult::Error(on_create_error(
-                            &e,
-                            &profile,
-                            &instance.project_path,
-                            &hooks.on_create,
-                        ));
+                        return CreationResult::Error(on_create_error(&e, hooks, &profile));
                     }
                 }
             } else if let Err(e) = repo_config::execute_hooks_streamed(
@@ -218,12 +207,7 @@ impl CreationPoller {
                     &created_workspace_worktrees,
                     None,
                 );
-                return CreationResult::Error(on_create_error(
-                    &e,
-                    &profile,
-                    &instance.project_path,
-                    &hooks.on_create,
-                ));
+                return CreationResult::Error(on_create_error(&e, hooks, &profile));
             }
         }
 
