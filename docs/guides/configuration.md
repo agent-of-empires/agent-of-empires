@@ -105,6 +105,8 @@ Per-agent structured view defaults live under `[acp]`, not `[session]`:
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `acp.offer_structured_in_new_session` | `false` | Offer the structured view in the TUI: the Structured toggle in the new-session dialog, and switching a terminal session into it. Off, every TUI-created session is a terminal. The web dashboard always offers it. |
+| `acp.default_new_session_view` | `auto` | View the new-session dialog starts on when the agent supports the structured view: `auto`, `structured`, or `terminal`. `auto` keeps each surface's default, structured on the web dashboard and terminal in the TUI. The dialog's toggle still wins per session. |
 | `acp.acp_defaults.<agent>` | `{}` | `model`, `effort` (thinking level), `mode`, and an `effort_by_model` map applied when a worker starts. `effort` and `mode` go through the agent's ACP config options when advertised and are skipped with a warning otherwise. A model chosen at creation wins over `model`, unless `pin_model = true` makes it a pin: creation then refuses any other model (`kind = "model_pinned"`) and the dashboard's picker collapses to it. The entry is keyed by the agent the session spawns as, so a custom agent reads its `agent_detect_as` base's entry. |
 | `acp.restrict_agents` | `false` | Restrict structured view sessions to `acp.allowed_agents`. Read from the global config only, so a profile cannot widen it; changing it from the web needs the passphrase step-up. |
 | `acp.allowed_agents` | `[]` | Registry keys allowed while the restriction is on, e.g. `["claude", "codex"]`. Each alias counts separately, and an empty list denies every agent. A worker on a now-disallowed agent is terminated at its next respawn. |

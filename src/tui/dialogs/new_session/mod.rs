@@ -178,6 +178,12 @@ pub struct NewSessionDialog {
     pub(super) yolo_mode: bool,
     pub(super) yolo_mode_default: bool,
     pub(super) structured_enabled: bool,
+    /// Configured opening state (`acp.default_new_session_view`), re-applied
+    /// when a tool change makes the structured view available again.
+    pub(super) structured_default: bool,
+    /// The user's own toggle choice, restored instead of the configured
+    /// default after passing through a tool that cannot back a structured session.
+    pub(super) structured_choice: Option<bool>,
     /// Whether the selected tool can back a structured session, recomputed on
     /// every tool or profile change. Gates the Structured field's visibility
     /// like `has_yolo` / `has_sandbox`.
@@ -446,6 +452,8 @@ impl NewSessionDialog {
             .unwrap_or_default();
         let command_override_value = config.session.resolve_tool_command(selected_tool);
         let structured_capable = compute_structured_capable(selected_tool, &config);
+        let structured_default = config.acp.default_new_session_view
+            == crate::session::config::NewSessionView::Structured;
 
         let (extra_env, inherited_settings) = if sandbox_enabled {
             let inherited = build_inherited_settings(&config.sandbox);
@@ -506,7 +514,9 @@ impl NewSessionDialog {
             docker_available,
             yolo_mode,
             yolo_mode_default: yolo_mode,
-            structured_enabled: false,
+            structured_enabled: structured_capable && structured_default,
+            structured_default,
+            structured_choice: None,
             structured_capable,
             extra_env,
             extra_env_overridden: false,
@@ -598,6 +608,14 @@ impl NewSessionDialog {
     #[cfg(test)]
     pub fn fork_seed(&self) -> Option<&crate::session::ForkSeed> {
         self.fork_seed.as_ref()
+    }
+
+    /// Re-seed the Structured toggle after the selected tool changes: an
+    /// incapable tool forces it off, and a capable one restores the user's
+    /// choice or else the configured default.
+    fn apply_structured_default(&mut self) {
+        self.structured_enabled =
+            self.structured_capable && self.structured_choice.unwrap_or(self.structured_default);
     }
 
     /// The test constructors skip config resolution, so capability is opted
@@ -779,6 +797,8 @@ impl NewSessionDialog {
 
         self.yolo_mode_default = config.session.yolo_mode_default;
         self.yolo_mode = self.yolo_mode_default;
+        self.structured_default = config.acp.default_new_session_view
+            == crate::session::config::NewSessionView::Structured;
         self.sandbox_enabled = self.docker_available
             && config.sandbox.enabled_by_default
             && !self.selected_tool_host_only();
@@ -814,9 +834,7 @@ impl NewSessionDialog {
         );
         self.command_override = Input::new(config.session.resolve_tool_command(selected_tool));
         self.structured_capable = compute_structured_capable(selected_tool, &config);
-        if !self.structured_capable {
-            self.structured_enabled = false;
-        }
+        self.apply_structured_default();
         self.tool_config_mode = false;
         self.tool_config_focused_field = 0;
 
@@ -874,6 +892,8 @@ impl NewSessionDialog {
             yolo_mode: false,
             yolo_mode_default: false,
             structured_enabled: false,
+            structured_default: false,
+            structured_choice: None,
             structured_capable: false,
             extra_env: Vec::new(),
             extra_env_overridden: false,
@@ -948,6 +968,8 @@ impl NewSessionDialog {
             yolo_mode: false,
             yolo_mode_default: false,
             structured_enabled: false,
+            structured_default: false,
+            structured_choice: None,
             structured_capable: false,
             extra_env: Vec::new(),
             extra_env_overridden: false,
@@ -1143,6 +1165,7 @@ impl NewSessionDialog {
             }
         } else if self.focused_field == fields.structured {
             self.structured_enabled = !self.structured_enabled;
+            self.structured_choice = Some(self.structured_enabled);
         } else if self.focused_field == fields.yolo {
             self.yolo_mode = !self.yolo_mode;
         } else if self.focused_field == fields.worktree {
@@ -1463,6 +1486,7 @@ impl NewSessionDialog {
                 if self.focused_field == fields.structured =>
             {
                 self.structured_enabled = !self.structured_enabled;
+                self.structured_choice = Some(self.structured_enabled);
                 DialogResult::Continue
             }
             _ => {
@@ -1885,9 +1909,7 @@ impl NewSessionDialog {
         );
         self.command_override = Input::new(config.session.resolve_tool_command(tool));
         self.structured_capable = compute_structured_capable(tool, &config);
-        if !self.structured_capable {
-            self.structured_enabled = false;
-        }
+        self.apply_structured_default();
     }
 
     fn current_input_mut(&mut self) -> &mut Input {

@@ -923,6 +923,39 @@ fn help_content_fits_in_dialog() {
     }
 }
 
+#[test]
+fn structured_default_reseeds_only_until_the_user_decides() {
+    let cases = [
+        // (configured default, user toggled first, expected after regain)
+        (true, false, true),
+        (false, false, false),
+        // A chosen value survives a trip through an incapable tool, in both
+        // directions: the choice is restored, not the configured default.
+        (true, true, false),
+        (false, true, true),
+    ];
+    for (structured_default, user_toggled, expected) in cases {
+        let mut dialog = single_tool_dialog();
+        dialog.structured_default = structured_default;
+        dialog.set_structured_capable(true);
+        dialog.structured_enabled = structured_default;
+        if user_toggled {
+            dialog.focused_field = 2;
+            dialog.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        }
+        // A tool change away from and back to an ACP-capable agent.
+        dialog.structured_capable = false;
+        dialog.apply_structured_default();
+        assert!(!dialog.structured_enabled);
+        dialog.structured_capable = true;
+        dialog.apply_structured_default();
+        assert_eq!(
+            dialog.structured_enabled, expected,
+            "default={structured_default} toggled={user_toggled}"
+        );
+    }
+}
+
 /// Init a repo with one commit so it has a branch to list.
 fn branch_picker_repo_in(parent: &std::path::Path) -> std::path::PathBuf {
     let dir = parent.join("repo");

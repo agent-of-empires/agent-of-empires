@@ -29,5 +29,7 @@ export function profileDefaults(settings: Settings, preferredTool: string, curre
       : [],
     agentModel: typeof acp?.model === "string" ? acp.model : "",
     agentEffort: typeof acp?.effort === "string" ? acp.effort : "",
+    // `auto` (or unset) keeps the dashboard's own default, the structured view.
+    useStructuredView: (settings.acp as Obj)?.default_new_session_view !== "terminal",
   };
 }
