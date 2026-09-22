@@ -567,6 +567,19 @@ impl NewSessionDialog {
 
     pub fn set_fork_from(&mut self, seed: crate::session::ForkSeed) {
         self.fork_seed = Some(seed);
+        if self.terminal_fork() {
+            self.structured_capable = false;
+            self.apply_structured_default();
+        }
+    }
+
+    /// A terminal fork resumes through the agent CLI; a structured child would
+    /// ignore the seed and start empty, so the Structured field is hidden.
+    fn terminal_fork(&self) -> bool {
+        matches!(
+            self.fork_seed,
+            Some(crate::session::ForkSeed::Terminal { .. })
+        )
     }
 
     /// Preselect a tool by name, applying the same per-tool side effects as
@@ -833,7 +846,8 @@ impl NewSessionDialog {
                 .unwrap_or_default(),
         );
         self.command_override = Input::new(config.session.resolve_tool_command(selected_tool));
-        self.structured_capable = compute_structured_capable(selected_tool, &config);
+        self.structured_capable =
+            !self.terminal_fork() && compute_structured_capable(selected_tool, &config);
         self.apply_structured_default();
         self.tool_config_mode = false;
         self.tool_config_focused_field = 0;
@@ -1908,7 +1922,8 @@ impl NewSessionDialog {
                 .unwrap_or_default(),
         );
         self.command_override = Input::new(config.session.resolve_tool_command(tool));
-        self.structured_capable = compute_structured_capable(tool, &config);
+        self.structured_capable =
+            !self.terminal_fork() && compute_structured_capable(tool, &config);
         self.apply_structured_default();
     }
 

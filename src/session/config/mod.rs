@@ -423,10 +423,7 @@ pub struct AcpConfig {
     /// always offers it. Opening already-structured sessions, and switching a
     /// structured session back to a terminal, are unaffected.
     #[serde(default)]
-    #[setting(
-        label = "Offer structured view when creating a session",
-        widget = "toggle"
-    )]
+    #[setting(label = "Offer structured view in the TUI", widget = "toggle")]
     pub offer_structured_in_new_session: bool,
     /// Which view the new-session dialog starts on when the chosen agent can
     /// back a structured session. Auto keeps each surface's own default: the

@@ -1207,3 +1207,18 @@ fn test_reload_config_defaults_uses_project_worktree_override() {
     type_str(&mut dialog, &repo.path().to_string_lossy());
     assert!(submitted(dialog.handle_key(key(KeyCode::Enter))).worktree_enabled);
 }
+
+#[test]
+fn terminal_fork_hides_structured_despite_structured_default() {
+    let mut dialog = single_tool_dialog();
+    dialog.structured_default = true;
+    dialog.set_structured_capable(true);
+    dialog.apply_structured_default();
+    assert!(dialog.structured_enabled);
+    dialog.set_fork_from(crate::session::ForkSeed::Terminal {
+        parent_agent_session_id: "parent".into(),
+        child_session_id: "child".into(),
+    });
+    assert!(!dialog.structured_capable);
+    assert!(!dialog.structured_enabled);
+}
