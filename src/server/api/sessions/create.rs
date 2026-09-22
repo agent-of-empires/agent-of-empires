@@ -299,7 +299,7 @@ pub(crate) struct CreateHookPlan {
 
 impl CreateHookPlan {
     pub(crate) fn on_create(&self) -> &[String] {
-        self.hooks.as_ref().map_or(&[], |h| &h.on_create)
+        self.hooks.as_ref().map_or(&[], |h| &h.hooks().on_create)
     }
 }
 

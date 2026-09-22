@@ -6433,7 +6433,7 @@ impl HomeView {
     ) -> Option<Action> {
         let has_hooks = hooks
             .as_ref()
-            .is_some_and(|h| !h.on_create.is_empty() || !h.on_launch.is_empty());
+            .is_some_and(|h| !h.hooks().on_create.is_empty() || !h.hooks().on_launch.is_empty());
         let has_worktree = data.worktree_enabled;
 
         if data.sandbox || has_hooks || has_worktree {

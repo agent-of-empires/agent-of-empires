@@ -874,10 +874,11 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             }
         };
 
-        if let Some(hooks) = resolved_hooks {
-            if !hooks.on_create.is_empty() {
+        if let Some(resolved) = resolved_hooks {
+            let commands = &resolved.hooks().on_create;
+            if !commands.is_empty() {
                 println!("Running on_create hooks:");
-                for cmd in &hooks.on_create {
+                for cmd in commands {
                     println!("  {}", cmd);
                 }
                 let hook_env = repo_config::lifecycle_env_vars(&instance);
@@ -886,17 +887,20 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
                 let ran = match instance.sandbox_info {
                     Some(ref sandbox) => repo_config::execute_hooks_in_container(
-                        &hooks.on_create,
+                        commands,
                         &sandbox.container_name,
                         &instance.container_workdir(),
                         &hook_env,
                     ),
-                    None => repo_config::execute_hooks(&hooks.on_create, &path, &hook_env),
+                    None => repo_config::execute_hooks(commands, &path, &hook_env),
                 };
-                ran.map_err(|e| match hooks.origin_hint("on_create") {
-                    Some(hint) => e.context(format!("on_create hook failed; {hint}")),
-                    None => e,
-                })?;
+                if let Err(e) = ran {
+                    let hint = resolved
+                        .origin_hint("on_create")
+                        .map(|hint| format!("\n{hint}"))
+                        .unwrap_or_default();
+                    anyhow::bail!("on_create hook failed: {e:#}{hint}");
+                }
                 println!("✓ on_create hooks completed");
             }
         }

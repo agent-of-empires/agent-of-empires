@@ -177,14 +177,11 @@ pub struct ResolvedHooks {
     repo_root: Option<PathBuf>,
 }
 
-impl std::ops::Deref for ResolvedHooks {
-    type Target = HooksConfig;
-    fn deref(&self) -> &HooksConfig {
+impl ResolvedHooks {
+    pub fn hooks(&self) -> &HooksConfig {
         &self.hooks
     }
-}
 
-impl ResolvedHooks {
     /// Global and profile hooks only; `None` without `on_create`/`on_launch`.
     pub fn global(profile: &str) -> Option<Self> {
         resolve_global_profile_hooks(profile).map(|hooks| Self {

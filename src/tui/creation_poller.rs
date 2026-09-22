@@ -154,8 +154,12 @@ impl CreationPoller {
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
         let warnings = build_result.warnings;
 
-        let has_on_create = hooks.as_ref().is_some_and(|h| !h.on_create.is_empty());
-        let has_on_launch = hooks.as_ref().is_some_and(|h| !h.on_launch.is_empty());
+        let has_on_create = hooks
+            .as_ref()
+            .is_some_and(|h| !h.hooks().on_create.is_empty());
+        let has_on_launch = hooks
+            .as_ref()
+            .is_some_and(|h| !h.hooks().on_launch.is_empty());
         let mut container_started = false;
         let hook_env = repo_config::lifecycle_env_vars(&instance);
 
@@ -179,7 +183,7 @@ impl CreationPoller {
                 if let Some(ref sandbox) = instance.sandbox_info {
                     let workdir = instance.container_workdir();
                     if let Err(e) = repo_config::execute_hooks_in_container_streamed(
-                        &hooks.on_create,
+                        &hooks.hooks().on_create,
                         &sandbox.container_name,
                         &workdir,
                         progress_tx,
@@ -196,7 +200,7 @@ impl CreationPoller {
                     }
                 }
             } else if let Err(e) = repo_config::execute_hooks_streamed(
-                &hooks.on_create,
+                &hooks.hooks().on_create,
                 std::path::Path::new(&instance.project_path),
                 progress_tx,
                 &hook_env,
@@ -229,7 +233,7 @@ impl CreationPoller {
                     if let Some(ref sandbox) = instance.sandbox_info {
                         let workdir = instance.container_workdir();
                         if let Err(e) = repo_config::execute_hooks_in_container_streamed(
-                            &hooks.on_launch,
+                            &hooks.hooks().on_launch,
                             &sandbox.container_name,
                             &workdir,
                             progress_tx,
@@ -240,7 +244,7 @@ impl CreationPoller {
                     }
                 }
             } else if let Err(e) = repo_config::execute_hooks_streamed(
-                &hooks.on_launch,
+                &hooks.hooks().on_launch,
                 std::path::Path::new(&instance.project_path),
                 progress_tx,
                 &hook_env,
