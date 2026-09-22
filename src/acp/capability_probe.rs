@@ -50,6 +50,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         default_effort: None,
         default_effort_explicit: false,
         default_mode: None,
+        default_model: None,
         // In-process stdio: no detached runner, no persistent worker entry.
         socket_path: None,
         stored_acp_session_id: None,

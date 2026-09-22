@@ -151,6 +151,7 @@ struct Launch {
     source_profile: Option<String>,
     default_effort: Option<String>,
     default_mode: Option<String>,
+    default_model: Option<String>,
     mcp_servers: Vec<McpServer>,
 }
 
@@ -190,6 +191,7 @@ impl Launch {
             source_profile: self.source_profile,
             default_effort: self.default_effort,
             default_mode: self.default_mode,
+            default_model: self.default_model,
             mcp_servers: self.mcp_servers,
             runner,
         };
@@ -397,6 +399,7 @@ impl AcpClient {
             source_profile: config.source_profile.clone(),
             default_effort: config.default_effort.clone(),
             default_mode: config.default_mode.clone(),
+            default_model: config.default_model.clone(),
             mcp_servers: config.mcp_servers.clone(),
         };
 
@@ -528,6 +531,7 @@ impl AcpClient {
             // were applied on first connect.
             default_effort: None,
             default_mode: None,
+            default_model: None,
             mcp_servers: Vec::new(),
         };
         Self::connect_via_socket(socket_path, launch).await
