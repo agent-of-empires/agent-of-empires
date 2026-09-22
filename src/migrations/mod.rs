@@ -37,6 +37,7 @@ mod v029_fold_pending_initial_turn;
 mod v030_global_only_profile_settings;
 mod v031_conversation_provenance;
 mod v032_bound_capture_exclusions;
+mod v033_reconcile_global_only_profile_settings;
 
 /// Fixtures shared by the migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -82,7 +83,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 32;
+const CURRENT_VERSION: u32 = 33;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -200,6 +201,11 @@ const MIGRATIONS: &[Migration] = &[
         32,
         "bound_capture_exclusions",
         v032_bound_capture_exclusions::run,
+    ),
+    (
+        33,
+        "reconcile_global_only_profile_settings",
+        v033_reconcile_global_only_profile_settings::run,
     ),
 ];
 
