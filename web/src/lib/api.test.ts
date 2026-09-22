@@ -297,8 +297,11 @@ const requestCases: RequestCase[] = [
   ],
   [
     "POST /api/projects",
-    () => api.createProject({ path: "/p", overrides: { worktree_enabled: true } }),
-    { body: { path: "/p", overrides: { worktree_enabled: true } }, respond: json({}) },
+    () => api.createProject({ path: "/p", scope: "global", profile: "default", overrides: { worktree_enabled: true } }),
+    {
+      body: { path: "/p", scope: "global", profile: "default", overrides: { worktree_enabled: true } },
+      respond: json({}),
+    },
   ],
   [
     "PATCH /api/projects/a%20b?scope=profile&profile=default",
