@@ -3517,3 +3517,63 @@ async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
         }]
     );
 }
+
+// A worktree session's project_path is its checkout, so the override must be keyed by the main repo.
+#[tokio::test]
+#[serial_test::serial]
+async fn list_sessions_applies_project_smart_rename_override_to_worktree_sessions() {
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let repo = tempfile::tempdir().expect("repo");
+    let checkout = tempfile::tempdir().expect("worktree checkout");
+    crate::session::projects::add(
+        "default",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new(
+            "demo",
+            repo.path().to_string_lossy(),
+            crate::session::ProjectScope::Global,
+        )
+        .with_overrides(crate::session::ProjectOverrides {
+            smart_rename: Some(false),
+            ..Default::default()
+        }),
+        false,
+    )
+    .unwrap();
+
+    let mk = |path: &std::path::Path| {
+        let mut inst = Instance::new("Vikings", path.to_str().unwrap());
+        inst.tool = "claude".to_string();
+        inst.source_profile = "default".to_string();
+        inst.view = crate::session::View::Structured;
+        inst
+    };
+    let mut in_worktree = mk(checkout.path());
+    in_worktree.worktree_info = Some(worktree("feat", repo.path().to_string_lossy(), None));
+    // Same checkout without the worktree link: unregistered, so it stays eligible.
+    let unregistered = mk(checkout.path());
+
+    let state = crate::server::test_support::build_test_app_state(vec![
+        mk(repo.path()),
+        in_worktree,
+        unregistered,
+    ]);
+    let resp = list_sessions(
+        axum::extract::State(state),
+        axum::extract::Query(ListSessionsQuery { state: None }),
+    )
+    .await
+    .into_response();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let states: Vec<&str> = envelope["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["smart_rename"].as_str().unwrap())
+        .collect();
+    assert_eq!(states, ["inactive", "inactive", "pending"]);
+}

@@ -122,6 +122,7 @@ async fn cancel_under_flood() {
         source_profile: None,
         default_effort: None,
         default_mode: None,
+        default_model: None,
         mcp_servers: Vec::new(),
         runner: None,
     };

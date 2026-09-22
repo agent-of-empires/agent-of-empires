@@ -90,4 +90,134 @@ describe("ProjectFormModal", () => {
     await waitFor(() => expect(onSaved).toHaveBeenCalled());
     expect(onClose).toHaveBeenCalled();
   });
+
+  it("sends overrides in the create payload when a tri-state select is set to On", async () => {
+    mockCreate.mockResolvedValue({ ok: true });
+    render(<ProjectFormModal onClose={() => {}} onSaved={() => {}} />);
+
+    fireEvent.change(screen.getByPlaceholderText("/path/to/repo"), { target: { value: "/repo/extra" } });
+    const worktreeSelect = screen.getByText("Worktree by default").nextElementSibling as HTMLSelectElement;
+    fireEvent.change(worktreeSelect, { target: { value: "on" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+
+    await waitFor(() =>
+      expect(mockCreate).toHaveBeenCalledWith(
+        expect.objectContaining({ overrides: expect.objectContaining({ worktree_enabled: true }) }),
+      ),
+    );
+  });
+
+  it("PATCHes with exactly 3 arguments when overrides are left at 'Use global default' in edit mode", async () => {
+    mockUpdate.mockResolvedValue({ ok: true });
+    render(
+      <ProjectFormModal
+        initial={{ name: "extra", path: "/repo/extra", scope: "global", default_base_branch: "develop", pinned: false }}
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => expect(mockUpdate).toHaveBeenCalledWith("extra", "global", "develop"));
+    expect(mockUpdate.mock.calls[0]!.length).toBe(3);
+  });
+
+  it("PATCHes overrides when worktree-by-default is switched to Off in edit mode", async () => {
+    mockUpdate.mockResolvedValue({ ok: true });
+    render(
+      <ProjectFormModal
+        initial={{ name: "extra", path: "/repo/extra", scope: "global", default_base_branch: "develop", pinned: false }}
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+
+    const worktreeSelect = screen.getByText("Worktree by default").nextElementSibling as HTMLSelectElement;
+    fireEvent.change(worktreeSelect, { target: { value: "off" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(mockUpdate).toHaveBeenCalledWith("extra", "global", "develop", {
+        worktree_enabled: false,
+        smart_rename: null,
+      }),
+    );
+  });
+
+  it("sends overrides in the create payload when smart-rename select is set to Off", async () => {
+    mockCreate.mockResolvedValue({ ok: true });
+    render(<ProjectFormModal onClose={() => {}} onSaved={() => {}} />);
+
+    fireEvent.change(screen.getByPlaceholderText("/path/to/repo"), { target: { value: "/repo/extra" } });
+    const smartRenameSelect = screen.getByText("Smart session rename").nextElementSibling as HTMLSelectElement;
+    fireEvent.change(smartRenameSelect, { target: { value: "off" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+
+    await waitFor(() =>
+      expect(mockCreate).toHaveBeenCalledWith(
+        expect.objectContaining({ overrides: expect.objectContaining({ smart_rename: false }) }),
+      ),
+    );
+  });
+
+  it("PATCHes overrides when smart-rename is switched to On in edit mode", async () => {
+    mockUpdate.mockResolvedValue({ ok: true });
+    render(
+      <ProjectFormModal
+        initial={{ name: "extra", path: "/repo/extra", scope: "global", default_base_branch: "develop", pinned: false }}
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+
+    const smartRenameSelect = screen.getByText("Smart session rename").nextElementSibling as HTMLSelectElement;
+    fireEvent.change(smartRenameSelect, { target: { value: "on" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(mockUpdate).toHaveBeenCalledWith("extra", "global", "develop", {
+        worktree_enabled: null,
+        smart_rename: true,
+      }),
+    );
+  });
+
+  it("pre-selects 'Off' for smart-rename when the project has that override set", () => {
+    render(
+      <ProjectFormModal
+        initial={{
+          name: "extra",
+          path: "/repo/extra",
+          scope: "global",
+          pinned: false,
+          overrides: { smart_rename: false },
+        }}
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+
+    const smartRenameSelect = screen.getByText("Smart session rename").nextElementSibling as HTMLSelectElement;
+    expect(smartRenameSelect.value).toBe("off");
+  });
+
+  it("pre-selects 'On' for worktree-by-default when the project has that override set", () => {
+    render(
+      <ProjectFormModal
+        initial={{
+          name: "extra",
+          path: "/repo/extra",
+          scope: "global",
+          pinned: false,
+          overrides: { worktree_enabled: true },
+        }}
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+
+    const worktreeSelect = screen.getByText("Worktree by default").nextElementSibling as HTMLSelectElement;
+    expect(worktreeSelect.value).toBe("on");
+  });
 });

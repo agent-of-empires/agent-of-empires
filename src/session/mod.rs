@@ -135,7 +135,7 @@ pub use config::repo_config::{
     resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HookTimeout, HooksConfig,
     RepoConfig, RepoTrust, TrustSurface,
 };
-pub use projects::{Project, ProjectScope};
+pub use projects::{Project, ProjectOverrides, ProjectScope};
 pub use recovery::HookTimeoutScope;
 pub use scope::SessionScope;
 pub(crate) use storage::{

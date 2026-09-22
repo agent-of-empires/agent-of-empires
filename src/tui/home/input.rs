@@ -3370,7 +3370,8 @@ impl HomeView {
             &profile,
             std::path::Path::new(&project_path),
         );
-        let cfg = crate::session::smart_rename::resolve_smart_rename_config(&resolved.session);
+        let cfg =
+            crate::session::smart_rename::resolve_smart_rename_config(&resolved.session, None);
         if let Err(reason) = crate::session::smart_rename::check_eligible_resolved(
             true,
             true,

@@ -29,7 +29,11 @@ pub struct ProjectsDialog {
     add_scope: ProjectScope,
     /// Allow registering even if path is already in the other scope.
     add_allow_override: bool,
-    /// 0=path, 1=base-branch, 2=scope, 3=allow-override.
+    /// Cycles None -> Some(true) -> Some(false) -> None; `None` inherits the configured default.
+    add_worktree_override: Option<bool>,
+    add_smart_rename_override: Option<bool>,
+    /// 0=path, 1=base-branch, 2=scope, 3=allow-override, 4=worktree-override,
+    /// 5=smart-rename-override.
     add_focused: usize,
     error: Option<String>,
     info: Option<String>,
@@ -51,6 +55,8 @@ impl ProjectsDialog {
             add_base_branch: Input::default(),
             add_scope: ProjectScope::Global,
             add_allow_override: false,
+            add_worktree_override: None,
+            add_smart_rename_override: None,
             add_focused: 0,
             error: None,
             info: None,
@@ -73,6 +79,8 @@ impl ProjectsDialog {
         self.add_base_branch = Input::default();
         self.add_scope = ProjectScope::Global;
         self.add_allow_override = false;
+        self.add_worktree_override = None;
+        self.add_smart_rename_override = None;
         self.add_focused = 0;
         self.error = None;
         self.close_on_add_cancel = close_on_cancel;
@@ -153,11 +161,11 @@ impl ProjectsDialog {
                 DialogResult::Continue
             }
             KeyCode::Tab => {
-                self.add_focused = (self.add_focused + 1) % 4;
+                self.add_focused = (self.add_focused + 1) % 6;
                 DialogResult::Continue
             }
             KeyCode::BackTab => {
-                self.add_focused = (self.add_focused + 3) % 4;
+                self.add_focused = (self.add_focused + 5) % 6;
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.add_focused == 2 => {
@@ -169,6 +177,38 @@ impl ProjectsDialog {
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.add_focused == 3 => {
                 self.add_allow_override = !self.add_allow_override;
+                DialogResult::Continue
+            }
+            KeyCode::Right | KeyCode::Char(' ') if self.add_focused == 4 => {
+                self.add_worktree_override = match self.add_worktree_override {
+                    None => Some(true),
+                    Some(true) => Some(false),
+                    Some(false) => None,
+                };
+                DialogResult::Continue
+            }
+            KeyCode::Left if self.add_focused == 4 => {
+                self.add_worktree_override = match self.add_worktree_override {
+                    None => Some(false),
+                    Some(false) => Some(true),
+                    Some(true) => None,
+                };
+                DialogResult::Continue
+            }
+            KeyCode::Right | KeyCode::Char(' ') if self.add_focused == 5 => {
+                self.add_smart_rename_override = match self.add_smart_rename_override {
+                    None => Some(true),
+                    Some(true) => Some(false),
+                    Some(false) => None,
+                };
+                DialogResult::Continue
+            }
+            KeyCode::Left if self.add_focused == 5 => {
+                self.add_smart_rename_override = match self.add_smart_rename_override {
+                    None => Some(false),
+                    Some(false) => Some(true),
+                    Some(true) => None,
+                };
                 DialogResult::Continue
             }
             KeyCode::Enter => {
@@ -187,10 +227,15 @@ impl ProjectsDialog {
                     ));
                     return DialogResult::Continue;
                 }
-                let name = canonical
+                let base_name = canonical
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "project".to_string());
+                let name = crate::session::projects::unique_name(
+                    &self.profile,
+                    self.add_scope,
+                    &base_name,
+                );
                 let base_branch = {
                     let b = self.add_base_branch.value().trim();
                     if b.is_empty() {
@@ -199,9 +244,14 @@ impl ProjectsDialog {
                         Some(b.to_string())
                     }
                 };
+                let overrides = crate::session::projects::ProjectOverrides {
+                    worktree_enabled: self.add_worktree_override,
+                    smart_rename: self.add_smart_rename_override,
+                };
                 let project =
                     Project::new(name.clone(), canonical.to_string_lossy(), self.add_scope)
-                        .with_base_branch(base_branch);
+                        .with_base_branch(base_branch)
+                        .with_overrides(overrides);
                 let is_git = project.is_git();
                 match projects::add(
                     &self.profile,
@@ -273,7 +323,7 @@ impl ProjectsDialog {
         let dialog_width: u16 = 76;
         let list_height: u16 = (self.items.len() as u16).clamp(3, 12);
         let adding_extra: u16 = if matches!(self.mode, Mode::Adding) {
-            3
+            5
         } else {
             0
         };
@@ -286,7 +336,7 @@ impl ProjectsDialog {
             Constraint::Length(list_height),
             Constraint::Length(1),
             Constraint::Length(if matches!(self.mode, Mode::Adding) {
-                7
+                9
             } else {
                 1
             }),
@@ -427,7 +477,48 @@ impl ProjectsDialog {
                         Style::default().fg(theme.accent).bold(),
                     ),
                 ]);
-                let mut lines = vec![path_line, base_line, scope_line, override_line];
+                let worktree_label_style = if self.add_focused == 4 {
+                    Style::default().fg(theme.accent).underlined()
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                let worktree_value = match self.add_worktree_override {
+                    None => "(use global default)".to_string(),
+                    Some(true) => "on".to_string(),
+                    Some(false) => "off".to_string(),
+                };
+                let worktree_line = Line::from(vec![
+                    Span::styled("Worktree default: ", worktree_label_style),
+                    Span::styled(
+                        format!("< {} >", worktree_value),
+                        Style::default().fg(theme.accent).bold(),
+                    ),
+                ]);
+                let smart_rename_label_style = if self.add_focused == 5 {
+                    Style::default().fg(theme.accent).underlined()
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                let smart_rename_value = match self.add_smart_rename_override {
+                    None => "(use global default)".to_string(),
+                    Some(true) => "on".to_string(),
+                    Some(false) => "off".to_string(),
+                };
+                let smart_rename_line = Line::from(vec![
+                    Span::styled("Smart rename: ", smart_rename_label_style),
+                    Span::styled(
+                        format!("< {} >", smart_rename_value),
+                        Style::default().fg(theme.accent).bold(),
+                    ),
+                ]);
+                let mut lines = vec![
+                    path_line,
+                    base_line,
+                    scope_line,
+                    override_line,
+                    worktree_line,
+                    smart_rename_line,
+                ];
                 if let Some(err) = &self.error {
                     lines.push(Line::from(Span::styled(
                         err.clone(),
@@ -580,6 +671,56 @@ mod tests {
             dialog.non_git_notice.is_some(),
             "notice should show when the latch can't be read"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn add_form_sets_worktree_override_on_submit() {
+        let temp = tempdir().unwrap();
+        let _home = isolate_home(temp.path());
+        let repo = temp.path().join("overridden");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let mut dialog = ProjectsDialog::new("test");
+        dialog.handle_key(key(KeyCode::Char('a')));
+        dialog.add_input = Input::new(repo.to_string_lossy().to_string());
+        // Tab from path(0) -> base(1) -> scope(2) -> allow_override(3) -> worktree_override(4).
+        for _ in 0..4 {
+            dialog.handle_key(key(KeyCode::Tab));
+        }
+        assert_eq!(dialog.add_focused, 4);
+        dialog.handle_key(key(KeyCode::Right)); // None -> Some(true)
+        dialog.handle_key(key(KeyCode::Enter));
+
+        let saved = crate::session::projects::load_global().expect("load global");
+        let project = saved
+            .iter()
+            .find(|p| p.name == "overridden")
+            .expect("project should be saved");
+        assert_eq!(project.overrides.worktree_enabled, Some(true));
+        assert_eq!(project.overrides.smart_rename, None);
+    }
+
+    #[test]
+    #[serial]
+    fn add_form_worktree_override_left_cycles_opposite_of_right() {
+        // The rendered `< value >` chevrons promise Left/Right go opposite
+        // directions; Left from None must land on Some(false), the reverse of
+        // what Right/Space give (Some(true)).
+        let temp = tempdir().unwrap();
+        let _home = isolate_home(temp.path());
+        let repo = temp.path().join("left-cycle");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let mut dialog = ProjectsDialog::new("test");
+        dialog.handle_key(key(KeyCode::Char('a')));
+        dialog.add_input = Input::new(repo.to_string_lossy().to_string());
+        for _ in 0..4 {
+            dialog.handle_key(key(KeyCode::Tab));
+        }
+        assert_eq!(dialog.add_focused, 4);
+        dialog.handle_key(key(KeyCode::Left));
+        assert_eq!(dialog.add_worktree_override, Some(false));
     }
 
     #[test]

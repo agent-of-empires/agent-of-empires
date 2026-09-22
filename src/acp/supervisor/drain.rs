@@ -48,6 +48,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             startup_failures: Arc::clone(&self.startup_failures),
             pending_context_resets: Arc::clone(&self.pending_context_resets),
             context_reset,
+            respawned_in_place: Arc::clone(&self.respawned_in_place),
         };
         crate::task_util::spawn_supervised(
             "supervisor.drain",
@@ -70,6 +71,7 @@ struct Drain<S> {
     startup_failures: SharedSet,
     pending_context_resets: SharedSet,
     context_reset: Option<PendingContextReset>,
+    respawned_in_place: SharedSet,
 }
 
 /// What a worker's event stream said before it closed.
@@ -468,6 +470,7 @@ impl<S: BroadcastSink> Drain<S> {
             "structured view worker respawned"
         );
         lock_recover(&self.incompatible_binaries).remove(session_id);
+        lock_recover(&self.respawned_in_place).insert(session_id.clone());
         Some((respawn_lease, inbound))
     }
 
@@ -1002,5 +1005,57 @@ mod tests {
             worker_registry::load("s-resp").unwrap().is_none(),
             "no record survives for either runner"
         );
+        assert!(
+            sup.take_respawned_in_place().is_empty(),
+            "a retired replacement never reached the agent"
+        );
+    }
+
+    /// The reconciler reads this flag to remind the agent its `Monitor` died.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_installed_crash_respawn_is_flagged_for_the_reconciler() {
+        let _home = isolate_home();
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.alive(4242).alive(4343);
+        let gate = Gate::default();
+        let sup = Arc::new(
+            Supervisor::new(VecSink::new())
+                .with_process_control(control.clone())
+                .with_launcher(gated_launcher(&gate, 4343)),
+        );
+        save_record("s-crash", 4242, 0);
+        let socket = worker_registry::socket_path_for("s-crash").unwrap();
+        let lease = sup
+            .test_install_runner(
+                "s-crash",
+                runner_config(socket),
+                Some(RunnerIdentity {
+                    pid: 4242,
+                    generation: 0,
+                }),
+            )
+            .await;
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+        let _drain = sup.start_drain_task("s-crash".into(), lease, inbound_rx, None);
+        drop(inbound_tx);
+
+        gate.entered.notified().await;
+        assert!(sup.take_respawned_in_place().is_empty());
+        gate.open.notify_one();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut flagged = Vec::new();
+        while flagged.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "respawn was not flagged"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            flagged = sup.take_respawned_in_place();
+        }
+        assert_eq!(flagged, vec!["s-crash".to_string()]);
+        sup.shutdown_idle("s-crash").await.expect("shutdown");
     }
 }

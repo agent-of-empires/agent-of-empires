@@ -118,8 +118,8 @@ pub struct AppState {
     pub summary_semaphore: tokio::sync::Semaphore,
     /// Suppression set for the startup-recovery cascade.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
-    /// Bumped after a committed session membership or view transition is on disk and
-    /// mirrored in `instances`.
+    /// Bumped under the `instances` write lock by any change an earlier disk snapshot
+    /// would not carry, so a reload holding that snapshot drops itself.
     pub mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Ids whose startup-recovery cascade is scheduled but not yet complete.
     pub recovery_pending: crate::session::recovery::RecoveryPending,

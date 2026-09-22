@@ -117,6 +117,7 @@ pub async fn list_sessions(
         .list_sessions_resolver_misses
         .load(std::sync::atomic::Ordering::Relaxed);
     let mut session_cfg_cache = SessionCfgCache::new(&state.list_sessions_resolver_misses);
+    let mut project_override_cache = ProjectRegistryCache::new();
 
     // Overlay custom-agent ACP capability; built-ins were resolved in the
     // constructor. Distinct `(profile, project_path)` pairs resolve once via
@@ -230,7 +231,9 @@ pub async fn list_sessions(
                 continue;
             }
             let session_cfg = session_cfg_cache.resolve(&inst.source_profile, &inst.project_path);
-            let cfg = resolve_smart_rename_config(session_cfg);
+            let smart_rename_override = project_override_cache
+                .smart_rename_override(&inst.source_profile, inst.repo_path());
+            let cfg = resolve_smart_rename_config(session_cfg, smart_rename_override);
             let eligible = check_eligible_resolved(
                 inst.is_structured(),
                 cfg.setting_on,

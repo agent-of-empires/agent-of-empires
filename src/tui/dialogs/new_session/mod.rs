@@ -165,6 +165,8 @@ pub struct NewSessionDialog {
     pub(super) focused_field: usize,
     pub(super) available_tools: Vec<String>,
     pub(super) worktree_enabled: bool,
+    /// Set by a direct worktree toggle, so a later path pick keeps the user's choice.
+    pub(super) worktree_dirty: bool,
     pub(super) worktree_branch: Input,
     pub(super) create_new_branch: bool,
     /// Base branch input in the worktree config overlay; empty means the
@@ -327,6 +329,12 @@ fn handle_editable_list_key(
     }
 }
 
+/// The registered project's `worktree.enabled` override for `path`, if any.
+fn project_worktree_override(profile: &str, path: &str) -> Option<bool> {
+    crate::session::projects::find_by_canonical_path(profile, std::path::Path::new(path.trim()))
+        .and_then(|p| p.overrides.worktree_enabled)
+}
+
 /// Whether `tool` can back a structured-view (ACP) session, judged against
 /// the resolved config.
 fn compute_structured_capable(tool: &str, config: &crate::session::Config) -> bool {
@@ -420,7 +428,9 @@ impl NewSessionDialog {
             .is_some_and(|a| a.host_only);
         let sandbox_enabled =
             docker_available && config.sandbox.enabled_by_default && !is_default_tool_host_only;
-        let worktree_enabled = config.worktree.enabled && !is_default_tool_host_only;
+        let worktree_enabled = project_worktree_override(profile, &current_dir)
+            .unwrap_or(config.worktree.enabled)
+            && !is_default_tool_host_only;
         let yolo_mode = config.session.yolo_mode_default;
 
         let selected_tool = available_tools
@@ -478,6 +488,7 @@ impl NewSessionDialog {
             available_projects: Vec::new(),
             dir_picker: DirPicker::new(),
             worktree_enabled,
+            worktree_dirty: false,
             worktree_branch: Input::default(),
             create_new_branch: true,
             base_branch: Input::default(),
@@ -665,6 +676,18 @@ impl NewSessionDialog {
         self.available_profiles.len() > 1
     }
 
+    /// Only the worktree toggle follows a picked or typed path, so other edits survive. A direct
+    /// toggle or scratch mode keeps the current value.
+    fn seed_worktree_for_path(&mut self) {
+        if self.worktree_dirty || self.scratch {
+            return;
+        }
+        let profile = self.selected_profile().to_string();
+        let on = project_worktree_override(&profile, self.path.value())
+            .unwrap_or_else(|| self.resolve_config_for_path(&profile).worktree.enabled);
+        self.worktree_enabled = on && !self.selected_tool_host_only();
+    }
+
     fn resolve_config_for_path(&self, profile: &str) -> crate::session::Config {
         let path = self.path.value().trim();
         if path.is_empty() {
@@ -759,7 +782,10 @@ impl NewSessionDialog {
         self.sandbox_enabled = self.docker_available
             && config.sandbox.enabled_by_default
             && !self.selected_tool_host_only();
-        self.worktree_enabled = config.worktree.enabled && !self.selected_tool_host_only();
+        self.worktree_enabled = project_worktree_override(&profile, self.path.value())
+            .unwrap_or(config.worktree.enabled)
+            && !self.selected_tool_host_only();
+        self.worktree_dirty = false;
 
         self.sandbox_image = Input::new(config.sandbox.default_image.clone());
 
@@ -829,6 +855,7 @@ impl NewSessionDialog {
             available_projects: Vec::new(),
             dir_picker: DirPicker::new(),
             worktree_enabled: config.worktree.enabled,
+            worktree_dirty: false,
             worktree_branch: Input::default(),
             create_new_branch: true,
             base_branch: Input::default(),
@@ -900,6 +927,7 @@ impl NewSessionDialog {
             available_projects: Vec::new(),
             dir_picker: DirPicker::new(),
             worktree_enabled: false,
+            worktree_dirty: false,
             worktree_branch: Input::default(),
             create_new_branch: true,
             base_branch: Input::default(),
@@ -1063,6 +1091,9 @@ impl NewSessionDialog {
             .iter()
             .find(|(_, rect)| rect.contains(pos))
             .map(|(field, _)| *field)?;
+        if self.focused_field == self.path_field() && hit_field != self.focused_field {
+            self.seed_worktree_for_path();
+        }
         self.focused_field = hit_field;
         self.activate_focused_field();
         Some(DialogResult::Continue)
@@ -1124,6 +1155,7 @@ impl NewSessionDialog {
                 );
             } else {
                 self.worktree_enabled = !self.worktree_enabled;
+                self.worktree_dirty = true;
                 if !self.worktree_enabled {
                     self.worktree_config_mode = false;
                 }
@@ -1206,6 +1238,7 @@ impl NewSessionDialog {
                         self.workspace_repo_dir_picker_active = false;
                     } else {
                         self.path = Input::new(path);
+                        self.seed_worktree_for_path();
                         self.recompute_path_ghost();
                     }
                 }
@@ -1285,6 +1318,9 @@ impl NewSessionDialog {
             }
             KeyCode::Enter => {
                 self.error_message = None;
+                if self.focused_field == self.path_field() {
+                    self.seed_worktree_for_path();
+                }
                 // The server provisions the scratch dir, so no path check.
                 if !self.scratch {
                     let path_str = self.path.value().trim().to_string();
@@ -1302,6 +1338,7 @@ impl NewSessionDialog {
             KeyCode::Tab | KeyCode::Down => {
                 if self.focused_field == self.path_field() {
                     self.clear_path_ghost();
+                    self.seed_worktree_for_path();
                 }
                 if self.focused_field == fields.group {
                     self.clear_group_ghost();
@@ -1318,6 +1355,7 @@ impl NewSessionDialog {
             KeyCode::BackTab | KeyCode::Up => {
                 if self.focused_field == self.path_field() {
                     self.clear_path_ghost();
+                    self.seed_worktree_for_path();
                 }
                 if self.focused_field == fields.group {
                     self.clear_group_ghost();
@@ -1390,6 +1428,7 @@ impl NewSessionDialog {
                     return DialogResult::Continue;
                 }
                 self.worktree_enabled = !self.worktree_enabled;
+                self.worktree_dirty = true;
                 if !self.worktree_enabled {
                     self.worktree_config_mode = false;
                 }
