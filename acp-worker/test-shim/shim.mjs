@@ -128,6 +128,11 @@ async function handleDeleteSession(params) {
 // session/new.
 let model = "default";
 const MODEL_VALUES = ["default", "opus", "sonnet"];
+// SHIM_RENUMBER_ON_MODEL=1 renames the thought-level option after a model
+// switch, as an adapter that rebuilds its option set around the switch does. A
+// client that re-reads the id from the set-model response follows it; one that
+// kept the establish-time id addresses an option that no longer exists.
+let thoughtLevelId = "thought_level";
 
 function configOptions() {
   const options = [];
@@ -143,7 +148,7 @@ function configOptions() {
   }
   if (process.env.SHIM_THOUGHT_LEVEL === "1") {
     options.push({
-      id: "thought_level",
+      id: thoughtLevelId,
       name: "Thinking",
       category: "thought_level",
       type: "select",
@@ -160,10 +165,11 @@ function configOptions() {
 // SHIM_CONFIG_OPTION_RECORD_FILE records `<configId>=<value>` per call.
 async function handleSetConfigOption(params) {
   await record("SHIM_CONFIG_OPTION_RECORD_FILE", `${params.configId}=${params.value}\n`);
-  if (params.configId === "thought_level") thoughtLevel = params.value;
+  if (params.configId === thoughtLevelId) thoughtLevel = params.value;
   if (params.configId === "model") {
     if (!MODEL_VALUES.includes(params.value)) throw new Error(`unknown model ${params.value}`);
     model = params.value;
+    if (process.env.SHIM_RENUMBER_ON_MODEL === "1") thoughtLevelId = "thought_level_v2";
   }
   return { configOptions: configOptions() ?? [] };
 }

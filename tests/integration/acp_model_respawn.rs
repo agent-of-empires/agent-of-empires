@@ -179,23 +179,35 @@ async fn pinned_model_skipped_when_already_current() {
         eprintln!("skipping: {reason}");
         return;
     }
-    let temp = tempfile::tempdir().expect("tempdir");
-    let record_path = temp.path().join("config-option-calls.log");
-    // The shim's initial `currentValue` is "default".
-    let config = spawn_config(
-        shim_path(),
-        shim_env(&record_path, true, false),
-        Some("stored-model-session".into()),
-        Some("default".into()),
-        None,
-    );
-    run(config, "model-current").await;
+    // Both rows in one run: "no model= line" is equally true of a session that
+    // never reached the apply, or of the apply being gone, so the
+    // differing-value row is what gives the equal-value row meaning. The
+    // effort pin rides along as proof the post-handshake path ran at all.
+    for (pin, expect_sent) in [("opus", true), ("default", false)] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let record_path = temp.path().join("config-option-calls.log");
+        // The shim's initial `currentValue` is "default".
+        let config = spawn_config(
+            shim_path(),
+            shim_env(&record_path, true, true),
+            Some("stored-model-session".into()),
+            Some(pin.into()),
+            Some("high".into()),
+        );
+        run(config, "model-current").await;
 
-    let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
-    assert!(
-        !recorded.lines().any(|line| line.starts_with("model=")),
-        "a model the agent already reports must not be re-sent (recorded: {recorded:?})"
-    );
+        let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
+        assert!(
+            recorded.lines().any(|line| line == "thought_level=high"),
+            "{pin}: the post-handshake apply path must have run (recorded: {recorded:?})"
+        );
+        assert_eq!(
+            recorded.lines().any(|line| line == format!("model={pin}")),
+            expect_sent,
+            "{pin}: a model the agent already reports must not be re-sent, and one \
+             it does not report must be (recorded: {recorded:?})"
+        );
+    }
 }
 
 /// The model is applied before the effort: the adapter rebuilds its option set
@@ -295,5 +307,37 @@ async fn reset_reapplies_the_live_model_pick() {
     assert_eq!(
         recorded, "model=sonnet\nmodel=opus\nmodel=opus\n",
         "a reset must re-apply the live pick, not the spawn-time model"
+    );
+}
+
+/// The reason the model is applied first, and the reason its response is read
+/// back: an adapter may rebuild its option set around the switch. A client that
+/// kept the establish-time id addresses an option that no longer exists, and
+/// the effort pin is silently lost on every respawn. The shim's id is otherwise
+/// fixed, so nothing else here would notice.
+#[tokio::test]
+#[serial_test::parallel]
+async fn effort_id_is_re_read_from_the_model_switch_response() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let temp = tempfile::tempdir().expect("tempdir");
+    let record_path = temp.path().join("config-option-calls.log");
+    let mut env = shim_env(&record_path, true, true);
+    env.push(("SHIM_RENUMBER_ON_MODEL".into(), "1".into()));
+    let config = spawn_config(
+        shim_path(),
+        env,
+        Some("stored-model-session".into()),
+        Some("opus".into()),
+        Some("high".into()),
+    );
+    run(config, "model-renumber").await;
+
+    let recorded = std::fs::read_to_string(&record_path).expect("record file");
+    assert!(
+        recorded.lines().any(|line| line == "thought_level_v2=high"),
+        "the effort must use the id the switch response advertised (recorded: {recorded:?})"
     );
 }
