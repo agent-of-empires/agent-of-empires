@@ -22,7 +22,6 @@ pub(super) struct ResumeTarget {
     pub(super) id: String,
     tool: String,
     agent_override: Option<String>,
-    model: Option<String>,
     pub(super) project_path: String,
     stored_acp_session_id: Option<String>,
     source_profile: String,
@@ -38,7 +37,6 @@ impl ResumeTarget {
             id: inst.id.clone(),
             tool: inst.tool.clone(),
             agent_override: inst.agent_name.clone(),
-            model: inst.agent_model.clone(),
             project_path: inst.project_path.clone(),
             stored_acp_session_id: inst.acp_session_id.clone(),
             source_profile: inst.source_profile.clone(),
@@ -317,7 +315,7 @@ async fn build_spawn_request(
     // Re-read under the session lock: a worktree rename holds it across the
     // move, so a snapshotted path could be stale (#2260). Released before
     // ensure_container, which takes the same lock.
-    let (cwd, seed_history_replay, fork_from, acp_mode_id, acp_effort) = {
+    let (cwd, seed_history_replay, fork_from, acp_mode_id, acp_effort, agent_model) = {
         let _guard = inst_lock.lock().await;
         let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
@@ -329,6 +327,7 @@ async fn build_spawn_request(
             inst.fork_pending.clone(),
             inst.acp_mode_id.clone(),
             inst.acp_effort.clone(),
+            inst.agent_model.clone(),
         )
     };
     let agent = supervisor
@@ -363,7 +362,7 @@ async fn build_spawn_request(
         cwd,
         additional_dirs: vec![],
         provider_env: vec![],
-        model: target.model.clone(),
+        model: agent_model,
         // `acp_effort` only holds a user-set effort, so presence is its provenance.
         effort_explicit: acp_effort.is_some(),
         effort: acp_effort,
@@ -528,6 +527,23 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(req.effort, None);
+
+        // The model too: a pick landing after the tick snapshotted its targets
+        // must reach the worker the tick is about to start. The handshake
+        // re-asserts whatever the request carries, so a snapshot read here does
+        // not merely miss the pick, it pushes the replaced value at the agent.
+        state
+            .instances
+            .write()
+            .await
+            .iter_mut()
+            .find(|i| i.id == "sess-moved")
+            .expect("fixture")
+            .agent_model = Some("claude-opus-5".to_string());
+        let req = build_spawn_request(&state.session_service, &target)
+            .await
+            .unwrap();
+        assert_eq!(req.model.as_deref(), Some("claude-opus-5"));
     }
 
     /// A live stale worker must never be classified dead, which would lose its PID.
