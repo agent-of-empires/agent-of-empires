@@ -1,8 +1,10 @@
 // Settings persist through the real server: REST round-trips, the schema UI, and the theme picker.
 
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Locator, Page } from "@playwright/test";
 import { test, expect, authHeaders, bootDashboard, type ServeHandle } from "../helpers/liveTest";
-import { loginWithPassphrase, spawnAoeServe } from "../helpers/aoeServe";
+import { appDirFor, loginWithPassphrase, resolveAoeBinary, spawnAoeServe } from "../helpers/aoeServe";
 
 // #1189: the theme resolver once deadlocked per request, which mocked specs cannot see.
 test.describe("theme API", () => {
@@ -244,4 +246,95 @@ test.describe("passphrase mode", () => {
     expect(await patchImage("ghcr.io/example/img:elevated", "203.0.113.10")).toBe(200);
     expect(await savedImage()).toBe("ghcr.io/example/img:elevated");
   });
+});
+
+test("global settings migrate from profiles and reject stale profile writes", async ({ spawnServe, page }) => {
+  let appDir = "";
+  const serve = await spawnServe({
+    seedFn: ({ home, xdg }) => {
+      appDir = appDirFor(home, xdg, resolveAoeBinary());
+      writeFileSync(join(appDir, ".schema_version"), "29");
+      writeFileSync(join(appDir, "config.toml"), "default_profile = 'work'\n[theme]\nname = 'empire'\n");
+      for (const name of ["alpha", "work"]) mkdirSync(join(appDir, "profiles", name), { recursive: true });
+      writeFileSync(join(appDir, "profiles", "alpha", "config.toml"), "[theme]\nname = 'rose-pine'\n");
+      writeFileSync(
+        join(appDir, "profiles", "work", "config.toml"),
+        "[theme]\nname = 'dracula'\nidle_decay_minutes = 5\n[session]\nsidebar_position = 'left'\nconfirm_before_quit = false\nsession_id_poller_max_threads = 12\ndefault_tool = 'codex'\n[web]\nnotify_on_idle = true\n",
+      );
+    },
+  });
+  const profile = await defaultProfile(serve);
+  const globalUrl = `${serve.baseUrl}/api/settings`;
+  const profileUrl = `${serve.baseUrl}/api/profiles/${encodeURIComponent(profile)}/settings`;
+  const effectiveUrl = `${globalUrl}?profile=${encodeURIComponent(profile)}`;
+  const migrated = await getJson(globalUrl);
+  expect(migrated.theme.name).toBe("dracula");
+  expect(migrated.session.confirm_before_quit).toBe(false);
+  expect(migrated.session.session_id_poller_max_threads).toBe(12);
+  expect(migrated.web.notify_on_idle).toBe(true);
+  const profileBefore = readFileSync(join(appDir, "profiles", "work", "config.toml"), "utf8");
+  expect(profileBefore).not.toContain("sidebar_position");
+  expect(profileBefore).not.toContain("confirm_before_quit");
+  const staleOverride = await fetch(profileUrl, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session: { sidebar_position: "right", default_tool: "claude" } }),
+  });
+  expect(staleOverride.status).toBe(400);
+  expect((await staleOverride.json()).message).toContain("session.sidebar_position");
+  expect(readFileSync(join(appDir, "profiles", "work", "config.toml"), "utf8")).toBe(profileBefore);
+  const logUrl = `${serve.baseUrl}/api/log-level`;
+  const runtimeLog = await fetch(logUrl, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ level: "debug" }),
+  });
+  expect(runtimeLog.ok).toBe(true);
+  const { current: temporaryFilter } = await runtimeLog.json();
+
+  await page.goto(`${serve.baseUrl}/settings/session`);
+  const position = labelledSelect(page, /^Sidebar Position$/);
+  await expect(position).toHaveValue("left");
+  const [saveResponse] = await Promise.all([
+    page.waitForResponse((response) => response.url() === globalUrl && response.request().method() === "PATCH"),
+    position.selectOption("right"),
+  ]);
+  expect(saveResponse.ok()).toBe(true);
+
+  for (const url of [globalUrl, effectiveUrl]) {
+    const saved = await fetch(url).then((r) => r.json());
+    expect(saved.session.sidebar_position).toBe("right");
+  }
+  const overrides = await fetch(profileUrl).then((r) => r.json());
+  expect(overrides.session.sidebar_position).toBeUndefined();
+  expect(overrides.session.default_tool).toBe("codex");
+  expect(overrides.theme.idle_decay_minutes).toBe(5);
+  const logStatus = await fetch(logUrl).then((r) => r.json());
+  expect(logStatus.current).toBe(temporaryFilter);
+
+  await serve.restart();
+  await page.reload();
+  await expect(position).toHaveValue("right");
+  const persisted = await fetch(globalUrl).then((r) => r.json());
+  expect(persisted.session.sidebar_position).toBe("right");
+});
+
+test("clearing a logging target removes its global override", async ({ serve, page }) => {
+  await page.goto(`${serve.baseUrl}/settings/logging`);
+  const target = labelledSelect(page, /^acp\.protocol$/);
+  await expect(target).toBeVisible();
+  await target.selectOption("debug");
+  const globalUrl = `${serve.baseUrl}/api/settings`;
+  await expect(async () => {
+    const saved = await fetch(globalUrl).then((r) => r.json());
+    expect(saved.logging.targets["acp.protocol"]).toBe("debug");
+  }).toPass({ timeout: 5_000 });
+
+  await target.selectOption("");
+  await expect(async () => {
+    const saved = await fetch(globalUrl).then((r) => r.json());
+    expect(saved.logging.targets).toEqual({});
+  }).toPass({ timeout: 5_000 });
+  await page.reload();
+  await expect(target).toHaveValue("");
 });

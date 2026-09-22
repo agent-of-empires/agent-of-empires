@@ -651,6 +651,10 @@ last_seen_version = "{}"
         let cmd_str = self.build_tmux_command(args);
         let start_gate = self.home_dir.path().join("tui-start");
         let cmd_str = if self.input_barrier {
+            if start_gate.exists() {
+                std::fs::remove_file(&start_gate).expect("reset TUI startup gate");
+            }
+            self.render_log_offset.set(0);
             std::fs::File::create(self.home_dir.path().join("render.log"))
                 .expect("create render observation");
             format!(

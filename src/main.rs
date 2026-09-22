@@ -311,11 +311,10 @@ async fn run(
             .is_some()
             .then(cli::migrate::stderr_reporter);
         migrations::run_migrations_with(reporter)?;
+        agent_of_empires::session::poller::configure_session_id_poller_max_threads(
+            agent_of_empires::session::poller::configured_session_id_poller_max_threads(&profile),
+        );
     }
-
-    agent_of_empires::session::poller::configure_session_id_poller_max_threads(
-        agent_of_empires::session::poller::configured_session_id_poller_max_threads(&profile),
-    );
 
     // Unknown keys are only reported here; parse failures only when no subscriber is up.
     // Hidden machine-spawned subcommands never print into a worker's redirected stderr.

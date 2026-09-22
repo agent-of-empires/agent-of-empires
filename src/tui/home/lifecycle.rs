@@ -32,6 +32,7 @@ impl HomeView {
         Ok(view)
     }
 
+    /// Load visible profiles and global UI state with an injectable reconciliation worker.
     fn new_with_reconcile(
         active_profile: Option<String>,
         available_tools: AvailableTools,
@@ -218,6 +219,10 @@ impl HomeView {
             sort_order,
             group_by,
             row_tag_mode: resolved.session.row_tag,
+            sidebar_position: user_config
+                .as_ref()
+                .map(|c| c.session.sidebar_position)
+                .unwrap_or_default(),
             agent_clipboard_forward: resolved.tmux.clipboard
                 != crate::session::config::TmuxSettingMode::Disabled,
             hyperlink_cells: crate::tui::hyperlink::SharedHyperlinks::default(),

@@ -48,7 +48,7 @@ fn migrate_file(path: &Path) -> Result<()> {
     let mut value: Value = match serde_json::from_str(&content) {
         Ok(value) => value,
         Err(error) => {
-            tracing::debug!("v030: cannot parse {}: {error}; skipping", path.display());
+            tracing::debug!("v031: cannot parse {}: {error}; skipping", path.display());
             return Ok(());
         }
     };
