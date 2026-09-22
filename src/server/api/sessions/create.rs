@@ -296,11 +296,17 @@ impl std::error::Error for HooksNeedTrust {}
 /// an orphan worktree.
 #[derive(Debug)]
 pub(crate) struct CreateHookPlan {
-    /// Commands to run, already merged (repo overrides global/profile per type).
-    pub(crate) on_create: Vec<String>,
+    /// Already merged (repo overrides global/profile per type).
+    pub(crate) hooks: Option<crate::session::config::repo_config::ResolvedHooks>,
     /// `(hooks_hash, mcp_hash)` to persist into `trusted_repos.toml` when the
     /// caller passed `trust_hooks: true`. `None` when nothing needs recording.
     pub(crate) trust_write: Option<(Option<String>, Option<String>)>,
+}
+
+impl CreateHookPlan {
+    pub(crate) fn on_create(&self) -> &[String] {
+        self.hooks.as_ref().map_or(&[], |h| &h.hooks().on_create)
+    }
 }
 
 /// Resolve the repo's `on_create` hooks and the trust decision. Returns
@@ -317,11 +323,8 @@ pub(crate) fn resolve_create_hook_plan(
     // Scratch sessions have no repo-anchored config, so skip the repo trust
     // check and fall back to profile-level hooks, matching the CLI.
     if scratch {
-        let on_create = repo_config::resolve_global_profile_hooks(profile)
-            .map(|h| h.on_create)
-            .unwrap_or_default();
         return Ok(CreateHookPlan {
-            on_create,
+            hooks: repo_config::ResolvedHooks::global(profile),
             trust_write: None,
         });
     }
@@ -332,11 +335,8 @@ pub(crate) fn resolve_create_hook_plan(
             // A failed trust check must not drop already-trusted global/profile
             // hooks; degrade to profile hooks like the CLI does.
             tracing::warn!(target: "http.api.sessions", "Failed to check repo trust: {e:#}");
-            let on_create = repo_config::resolve_global_profile_hooks(profile)
-                .map(|h| h.on_create)
-                .unwrap_or_default();
             return Ok(CreateHookPlan {
-                on_create,
+                hooks: repo_config::ResolvedHooks::global(profile),
                 trust_write: None,
             });
         }
@@ -387,18 +387,15 @@ pub(crate) fn resolve_create_hook_plan(
     } else {
         None
     };
-    let on_create = match repo_hooks {
-        Some(h) => repo_config::merge_hooks_with_config(profile, h)
-            .map(|m| m.on_create)
-            .unwrap_or_default(),
-        None => repo_config::resolve_global_profile_hooks(profile)
-            .map(|h| h.on_create)
-            .unwrap_or_default(),
+    let hooks = match repo_hooks {
+        Some(h) => repo_config::ResolvedHooks::with_repo(
+            profile,
+            std::path::Path::new(&trust.project_path),
+            h,
+        ),
+        None => repo_config::ResolvedHooks::global(profile),
     };
-    Ok(CreateHookPlan {
-        on_create,
-        trust_write,
-    })
+    Ok(CreateHookPlan { hooks, trust_write })
 }
 
 /// Record pending trust and run the planned `on_create` hooks (#2066), after
@@ -415,7 +412,7 @@ pub(crate) fn run_create_hooks(
         repo_config::trust_repo(project_path, hooks_hash.as_deref(), mcp_hash.as_deref())?;
     }
 
-    if plan.on_create.is_empty() {
+    if plan.on_create().is_empty() {
         return Ok(());
     }
 
@@ -430,7 +427,7 @@ pub(crate) fn run_create_hooks(
         let workdir = instance.container_workdir();
         if let Some(sandbox) = instance.sandbox_info.as_ref() {
             repo_config::execute_hooks_in_container_streamed(
-                &plan.on_create,
+                plan.on_create(),
                 &sandbox.container_name,
                 &workdir,
                 &progress_tx,
@@ -439,7 +436,7 @@ pub(crate) fn run_create_hooks(
         }
     } else {
         repo_config::execute_hooks_streamed(
-            &plan.on_create,
+            plan.on_create(),
             std::path::Path::new(&instance.project_path),
             &progress_tx,
             &hook_env,

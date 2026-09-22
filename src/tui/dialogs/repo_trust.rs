@@ -22,9 +22,9 @@ pub struct RepoTrustDialog {
     repo_hooks: HooksConfig,
     /// Redacted project MCP servers; empty when there is no `.mcp.json`.
     mcp_servers: Vec<ProjectMcpServer>,
-    hooks_on_trust: Option<HooksConfig>,
+    hooks_on_trust: Option<repo_config::ResolvedHooks>,
     /// Hooks to run on a skip: already-trusted ones only.
-    hooks_on_skip: Option<HooksConfig>,
+    hooks_on_skip: Option<repo_config::ResolvedHooks>,
     /// Hashes to record on approval; `Some` only for a surface needing trust.
     hooks_hash: Option<String>,
     mcp_hash: Option<String>,
@@ -43,10 +43,10 @@ pub enum RepoTrustAction {
         hooks_hash: Option<String>,
         mcp_hash: Option<String>,
         project_path: String,
-        hooks: Option<HooksConfig>,
+        hooks: Option<repo_config::ResolvedHooks>,
     },
     Skip {
-        hooks: Option<HooksConfig>,
+        hooks: Option<repo_config::ResolvedHooks>,
     },
 }
 
@@ -56,8 +56,8 @@ impl RepoTrustDialog {
         merged_hooks: HooksConfig,
         repo_hooks: HooksConfig,
         mcp_servers: Vec<ProjectMcpServer>,
-        hooks_on_trust: Option<HooksConfig>,
-        hooks_on_skip: Option<HooksConfig>,
+        hooks_on_trust: Option<repo_config::ResolvedHooks>,
+        hooks_on_skip: Option<repo_config::ResolvedHooks>,
         hooks_hash: Option<String>,
         mcp_hash: Option<String>,
         project_path: String,

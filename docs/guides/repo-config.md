@@ -17,7 +17,14 @@ on_destroy = ["docker-compose down"]
 - **`on_launch`** runs on every start, including restarts. Failures are logged as warnings and do not prevent a user-initiated start, though during startup recovery a timed-out hook marks the recovered session as errored rather than launching with partial setup.
 - **`on_destroy`** runs when a session is deleted, before worktree and sandbox cleanup, so teardown commands can still reach running containers. Failures never prevent deletion.
 
-For a sandboxed session these run inside the container.
+Hooks run inside the container for a sandboxed session and in your host shell otherwise, so a path can resolve in one mode and not the other. An absolute host path fails in the container unless `sandbox.extra_volumes` mounts it, and a repo cannot set that key. Guard optional scripts on their presence only, so a real failure still aborts creation:
+
+```toml
+[hooks]
+on_create = ["sh -c '[ -x /opt/setup.sh ] || exit 0; exec /opt/setup.sh'"]
+```
+
+Keep environment-specific hooks out of global config. A global `on_create` applies to every repo that does not declare its own, so one unresolvable path there blocks session creation in projects that never mention it. When `on_create` fails, the TUI and `aoe add` name the config file that declared it; the web dashboard shows a generic error and logs the file to the `aoe serve` log.
 
 Each hook receives the session's metadata as environment variables: `AOE_SESSION_ID`, `AOE_SESSION_TITLE` (also the worktree branch name), `AOE_PROJECT_PATH` (equals `$PWD` in `on_create` and `on_launch`), `AOE_PROFILE`, `AOE_TOOL`, `AOE_GROUP_PATH`, and `AOE_SESSION_BRANCH` on worktree sessions. Container hooks get the same set. Quote any expansion that may contain spaces, since titles often do:
 

@@ -327,7 +327,13 @@ pub(crate) async fn spawn_structured_session(
                 &created_workspace_worktrees,
                 None,
             );
-            return Err(anyhow::anyhow!("on_create hook failed: {e:#}"));
+            let hint = hook_plan
+                .hooks
+                .as_ref()
+                .and_then(|h| h.origin_hint("on_create"))
+                .map(|hint| format!("\n{hint}"))
+                .unwrap_or_default();
+            return Err(anyhow::anyhow!("on_create hook failed: {e:#}{hint}"));
         }
 
         // Anything that fails between here and the final `Ok(..)` would otherwise orphan

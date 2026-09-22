@@ -8,7 +8,9 @@
 //!
 //! Launch marker, exactly 4 lines: terminal id (tty leaf, `/` as `-`), launch id,
 //! non-empty pending pre-launch session path, routing fingerprint (64 hex).
-//! Terminal breadcrumb, 2 or 3 lines: absolute cwd, session path, optional `fresh`.
+//! Terminal breadcrumb, 2 to 4 lines: absolute cwd, session path, zero, one, or
+//! both extras in either order, each at most once: literal `fresh` or
+//! `cwdstat <dev> <ino>` with decimal device and inode values.
 //!
 //! The marker's launch id and fingerprint prove the generation, not that the
 //! breadcrumb was written after launch; that also requires freshness (host:
@@ -234,6 +236,36 @@ struct Breadcrumb<'a> {
     fresh: bool,
 }
 
+fn parse_breadcrumb_extras<'a>(extras: impl Iterator<Item = &'a str>) -> Result<bool> {
+    let mut fresh = false;
+    let mut cwdstat = false;
+    for extra in extras {
+        if extra == "fresh" {
+            if fresh {
+                anyhow::bail!("OMP terminal breadcrumb has duplicate fresh metadata");
+            }
+            fresh = true;
+            continue;
+        }
+
+        let Some(identity) = extra.strip_prefix("cwdstat ") else {
+            anyhow::bail!("OMP terminal breadcrumb has unknown metadata");
+        };
+        if cwdstat {
+            anyhow::bail!("OMP terminal breadcrumb has duplicate cwdstat metadata");
+        }
+        let mut fields = identity.split(' ');
+        let valid = matches!(fields.next(), Some(dev) if !dev.is_empty() && dev.bytes().all(|byte| byte.is_ascii_digit()))
+            && matches!(fields.next(), Some(ino) if !ino.is_empty() && ino.bytes().all(|byte| byte.is_ascii_digit()))
+            && fields.next().is_none();
+        if !valid {
+            anyhow::bail!("OMP terminal breadcrumb has invalid cwdstat metadata");
+        }
+        cwdstat = true;
+    }
+    Ok(fresh)
+}
+
 fn parse_breadcrumb(content: &str) -> Result<Breadcrumb<'_>> {
     let mut lines = content.lines();
     let cwd = lines
@@ -244,14 +276,7 @@ fn parse_breadcrumb(content: &str) -> Result<Breadcrumb<'_>> {
         .next()
         .filter(|value| !value.is_empty())
         .context("OMP terminal breadcrumb has no session path")?;
-    let fresh = match lines.next() {
-        None => false,
-        Some("fresh") => true,
-        Some(_) => anyhow::bail!("OMP terminal breadcrumb has an invalid marker"),
-    };
-    if lines.next().is_some() {
-        anyhow::bail!("OMP terminal breadcrumb has unexpected trailing data");
-    }
+    let fresh = parse_breadcrumb_extras(lines)?;
     Ok(Breadcrumb {
         cwd,
         session_path,
@@ -763,6 +788,34 @@ mod tests {
     ) -> Result<String> {
         capture_omp_session_id_from_terminal(metadata, exclusion, terminal_id, None)
             .map(|observation| observation.sid)
+    }
+    #[test]
+    fn breadcrumb_extras_accept_known_formats_and_reject_invalid_ones() {
+        let accepted = [
+            ("/work\n/session.jsonl\n", false),
+            ("/work\n/session.jsonl\nfresh\n", true),
+            ("/work\n/session.jsonl\ncwdstat 12 34\n", false),
+            ("/work\n/session.jsonl\nfresh\ncwdstat 12 34\n", true),
+            ("/work\n/session.jsonl\ncwdstat 12 34\nfresh\n", true),
+        ];
+        for (content, expected_fresh) in accepted {
+            let breadcrumb = parse_breadcrumb(content)
+                .unwrap_or_else(|error| panic!("expected valid breadcrumb {content:?}: {error:#}"));
+            assert_eq!(breadcrumb.cwd, "/work");
+            assert_eq!(breadcrumb.session_path, "/session.jsonl");
+            assert_eq!(breadcrumb.fresh, expected_fresh, "{content:?}");
+        }
+
+        for content in [
+            "/work\n/session.jsonl\nunknown\n",
+            "/work\n/session.jsonl\ncwdstat 12\n",
+            "/work\n/session.jsonl\ncwdstat 12 34 56\n",
+            "/work\n/session.jsonl\ncwdstat twelve 34\n",
+            "/work\n/session.jsonl\nfresh\nfresh\n",
+            "/work\n/session.jsonl\ncwdstat 12 34\ncwdstat 12 34\n",
+        ] {
+            assert!(parse_breadcrumb(content).is_err(), "{content:?}");
+        }
     }
 
     #[test]

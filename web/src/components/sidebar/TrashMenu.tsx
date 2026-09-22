@@ -1,6 +1,6 @@
 import { useCallback, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { RotateCcw, Trash, Trash2, X } from "lucide-react";
+import { RotateCcw, Trash2, X } from "lucide-react";
 import type { Workspace } from "../../lib/types";
 import { isSessionActive } from "../../lib/session";
 import { useIdleDecayWindowMs } from "../../lib/idleDecay";
@@ -116,7 +116,7 @@ export function TrashMenu({
                     aria-label="Empty Trash"
                     className={DANGER}
                   >
-                    <Trash className="h-3.5 w-3.5 shrink-0" />
+                    <Trash2 className="h-3.5 w-3.5 shrink-0" />
                     Empty Trash
                   </button>
                 )}
