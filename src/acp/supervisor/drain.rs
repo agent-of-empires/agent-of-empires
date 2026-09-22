@@ -11,8 +11,8 @@ use tracing::{debug, info, warn};
 
 use super::agents::log_wrapper_substitution;
 use super::launch::{
-    before_session_env, overlay_env, publish_rejection, refresh_spawn_model_effort,
-    resolve_mcp_servers,
+    apply_claude_store_pin, before_session_env, overlay_env, publish_rejection,
+    refresh_spawn_model_effort, resolve_mcp_servers,
 };
 use super::teardown::{settle_lease, tear_down_replacement, tear_down_runner, wait_for_exit};
 use super::{
@@ -324,17 +324,6 @@ impl<S: BroadcastSink> Drain<S> {
         }
 
         self.refresh_launch_env(&mut config).await;
-        if config.sandbox_info.is_none() {
-            if let Some(store) = &config.claude_store_pin {
-                config
-                    .host_environment
-                    .retain(|(key, _)| key != "CLAUDE_CONFIG_DIR");
-                config.host_environment.push((
-                    "CLAUDE_CONFIG_DIR".into(),
-                    store.to_string_lossy().to_string(),
-                ));
-            }
-        }
         if let Some((wrapper, base)) = &config.wrapper_substitution {
             log_wrapper_substitution(session_id, &config.tool, wrapper, base);
         }
@@ -470,6 +459,10 @@ impl<S: BroadcastSink> Drain<S> {
                     "{what} on respawn; reusing the environment from the prior launch"
                 );
             }
+            apply_claude_store_pin(
+                &mut config.host_environment,
+                config.claude_store_pin.as_deref(),
+            );
         }
 
         config.mcp_servers = resolve_mcp_servers(
@@ -478,6 +471,7 @@ impl<S: BroadcastSink> Drain<S> {
             config.source_profile.clone(),
             config.cwd.clone(),
             config.host_environment.clone(),
+            config.claude_store_pin.clone(),
             "MCP re-resolution on respawn failed",
         )
         .await;
@@ -1005,5 +999,114 @@ mod tests {
         }
         assert_eq!(flagged, vec!["s-crash".to_string()]);
         sup.shutdown_idle("s-crash").await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn respawn_reapplies_selected_claude_store_before_native_mcp_discovery() {
+        use agent_client_protocol::schema::v1::McpServer;
+
+        let (_home, temp) = isolate_home();
+        let declared = temp.path().join("declared");
+        let selected = temp.path().join("selected");
+        std::fs::create_dir_all(&declared).unwrap();
+        std::fs::create_dir_all(&selected).unwrap();
+        std::fs::write(
+            declared.join(".claude.json"),
+            r#"{ "mcpServers": { "declared": { "command": "declared" } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            selected.join(".claude.json"),
+            r#"{ "mcpServers": { "selected": { "command": "selected" } } }"#,
+        )
+        .unwrap();
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            format!(
+                "[host_hooks]\nbefore_session = \"printf 'CLAUDE_CONFIG_DIR={}\\nHOOK_VALUE=kept\\n'\"\n\
+                 [session.agent_config_dir]\nclaude = \"{}\"\n",
+                temp.path().join("hook").display(),
+                declared.display()
+            ),
+        )
+        .unwrap();
+
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.alive(4242).alive(4343);
+        let (config_tx, mut config_rx) = mpsc::unbounded_channel();
+        let held_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<Event>>>> = Default::default();
+        let launcher_senders = Arc::clone(&held_senders);
+        let launcher: Launcher = Arc::new(move |config, session_id| {
+            let config_tx = config_tx.clone();
+            let senders = Arc::clone(&launcher_senders);
+            Box::pin(async move {
+                save_record(&session_id.0, 4343, config.generation);
+                config_tx.send(config).unwrap();
+                let (client, tx) = crate::acp::acp_client::AcpClient::fake_for_test(session_id);
+                senders.lock().unwrap().push(tx);
+                Ok(client.with_runner_pid(4343))
+            })
+        });
+        let sup = Arc::new(
+            Supervisor::new(VecSink::new())
+                .with_process_control(control)
+                .with_launcher(launcher),
+        );
+        save_record("s-store", 4242, 0);
+        let socket = worker_registry::socket_path_for("s-store").unwrap();
+        let mut config = runner_config(socket);
+        config.claude_store_pin = Some(selected.clone());
+        config.host_environment = vec![("CLAUDE_CONFIG_DIR".into(), "stale".into())];
+        let lease = sup
+            .test_install_runner(
+                "s-store",
+                config,
+                Some(RunnerIdentity {
+                    pid: 4242,
+                    generation: 0,
+                }),
+            )
+            .await;
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+        let drain = sup.start_drain_task("s-store".into(), lease, inbound_rx);
+        drop(inbound_tx);
+
+        let launched = tokio::time::timeout(Duration::from_secs(5), config_rx.recv())
+            .await
+            .expect("respawn should launch")
+            .expect("launcher should capture config");
+        let names: Vec<_> = launched
+            .mcp_servers
+            .iter()
+            .map(|server| match server {
+                McpServer::Stdio(server) => server.name.as_str(),
+                McpServer::Http(server) => server.name.as_str(),
+                McpServer::Sse(server) => server.name.as_str(),
+                _ => "unknown",
+            })
+            .collect();
+        assert_eq!(names, ["selected"]);
+        assert_eq!(
+            launched
+                .host_environment
+                .iter()
+                .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                .map(|(_, value)| value.as_str()),
+            selected.to_str()
+        );
+        assert!(launched
+            .host_environment
+            .contains(&("HOOK_VALUE".into(), "kept".into())));
+
+        sup.shutdown_idle("s-store").await.expect("shutdown");
+        held_senders.lock().unwrap().clear();
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("drain should stop")
+            .unwrap();
     }
 }

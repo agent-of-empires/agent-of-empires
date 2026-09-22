@@ -2339,8 +2339,7 @@
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/SwitchViewDialog.tsx",
-        "web/src/App.tsx",
-        "web/src/hooks/app/useSessionLifecycle.ts"
+        "web/src/App.tsx"
       ]
     },
     {

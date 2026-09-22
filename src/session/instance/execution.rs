@@ -1738,34 +1738,46 @@ impl Instance {
 
     /// Whether two executions describe one context.
     ///
-    /// A symlinked app, temp or home root spells the same store or working
-    /// directory two ways, so the paths are reduced to their identities before
-    /// comparing; everything else must match exactly.
+    /// Host paths compare by local filesystem identity. Paths in every other
+    /// filesystem domain compare as pure lexical paths.
     pub(super) fn execution_identity_matches(
         left: &ExecutionBinding,
         right: &ExecutionBinding,
     ) -> bool {
-        fn identity(path: &std::path::Path) -> std::path::PathBuf {
-            crate::session::capture::canonicalize_allowing_missing_leaf(path)
-                .unwrap_or_else(|| path.to_path_buf())
+        fn paths_match(left: &std::path::Path, right: &std::path::Path, filesystem: &str) -> bool {
+            if left == right {
+                return true;
+            }
+            let identity = |path: &std::path::Path| {
+                if filesystem == "host" {
+                    crate::session::capture::canonicalize_allowing_missing_leaf(path)
+                        .unwrap_or_else(|| crate::git::template::lexical_normalize(path))
+                } else {
+                    crate::git::template::lexical_normalize(path)
+                }
+            };
+            identity(left) == identity(right)
         }
         fn locations_match(left: &[ExecutionLocation], right: &[ExecutionLocation]) -> bool {
             left.len() == right.len()
                 && left.iter().zip(right).all(|(left, right)| {
                     left.filesystem == right.filesystem
-                        && identity(&left.path) == identity(&right.path)
+                        && paths_match(&left.path, &right.path, &left.filesystem)
                 })
         }
         left.agent == right.agent
             && left.filesystem == right.filesystem
             && left.cwd_filesystem == right.cwd_filesystem
-            && identity(&left.cwd) == identity(&right.cwd)
+            && paths_match(&left.cwd, &right.cwd, &left.cwd_filesystem)
             && locations_match(&left.configuration, &right.configuration)
+            && left.stores.len() == right.stores.len()
             && left
                 .stores
                 .iter()
-                .map(|store| identity(store))
-                .eq(right.stores.iter().map(|store| identity(store)))
+                .zip(&right.stores)
+                .all(|(left_store, right_store)| {
+                    paths_match(left_store, right_store, &left.filesystem)
+                })
     }
 
     pub(super) fn validate_conversation_target(
@@ -2236,6 +2248,60 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_identity_canonicalizes_symlinks_only_on_the_host_filesystem() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let alias = temp.path().join("alias");
+        for path in ["cwd", "config", "store"] {
+            std::fs::create_dir_all(real.join(path)).unwrap();
+        }
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let binding = |root: &std::path::Path| ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![root.join("store")],
+            configuration: vec![ExecutionLocation {
+                filesystem: "host".into(),
+                path: root.join("config"),
+            }],
+            cwd: root.join("cwd"),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        let host = binding(&real);
+        let host_alias = binding(&alias);
+        assert!(Instance::execution_identity_matches(&host, &host_alias));
+
+        let mut runtime_cwd = host.clone();
+        runtime_cwd.cwd_filesystem = "runtime:docker:test".into();
+        let mut runtime_cwd_alias = runtime_cwd.clone();
+        runtime_cwd_alias.cwd = alias.join("cwd");
+        assert!(!Instance::execution_identity_matches(
+            &runtime_cwd,
+            &runtime_cwd_alias
+        ));
+
+        let mut runtime_config = host.clone();
+        runtime_config.configuration[0].filesystem = "runtime:docker:test".into();
+        let mut runtime_config_alias = runtime_config.clone();
+        runtime_config_alias.configuration[0].path = alias.join("config");
+        assert!(!Instance::execution_identity_matches(
+            &runtime_config,
+            &runtime_config_alias
+        ));
+
+        let mut container_store = host.clone();
+        container_store.filesystem = "container:session".into();
+        let mut container_store_alias = container_store.clone();
+        container_store_alias.stores[0] = alias.join("store");
+        assert!(!Instance::execution_identity_matches(
+            &container_store,
+            &container_store_alias
+        ));
+    }
 
     fn hermes_fixture() -> (tempfile::TempDir, NativeLaunchInputs, rusqlite::Connection) {
         let root = tempfile::tempdir().unwrap();

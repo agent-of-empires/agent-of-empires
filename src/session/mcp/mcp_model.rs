@@ -174,9 +174,15 @@ pub fn resolve_effective(
     profile: Option<&str>,
     cwd: &Path,
     session_env: &[(String, String)],
+    native_config_override: Option<&Path>,
 ) -> Vec<ResolvedMcpServer> {
-    let native = load_native_mcp_servers_checked_from_home(agent_key, profile, session_env)
-        .map(NativeRead::into_enabled);
+    let native = load_native_mcp_servers_checked_from_home(
+        agent_key,
+        profile,
+        session_env,
+        native_config_override,
+    )
+    .map(NativeRead::into_enabled);
     let global = crate::session::get_app_dir().and_then(|dir| load_global_mcp_servers(&dir));
     let per_profile = crate::session::get_profile_dir_path(profile.unwrap_or_default())
         .and_then(|dir| load_standard_mcp_servers(&dir.join("mcp.json")));
@@ -239,13 +245,14 @@ pub struct McpSurfaceView {
 /// against (and recorded in) the drift store.
 pub fn resolve_surface(agent: &str, profile: Option<&str>, cwd: &Path) -> McpSurfaceView {
     let session_env = session_env_for_discovery(profile);
-    let effective = resolve_effective(agent, profile, cwd, &session_env);
-    let reconcile = load_native_mcp_servers_checked_from_home(agent, profile, &session_env)
-        .and_then(|read| super::mcp_state::reconcile_agent(agent, &read))
-        .unwrap_or_else(|e| {
-            warn!(target: "acp.mcp", agent = %agent, error = %e, "failed to reconcile MCP drift store");
-            Default::default()
-        });
+    let effective = resolve_effective(agent, profile, cwd, &session_env, None);
+    let reconcile =
+        load_native_mcp_servers_checked_from_home(agent, profile, &session_env, None)
+            .and_then(|read| super::mcp_state::reconcile_agent(agent, &read))
+            .unwrap_or_else(|e| {
+                warn!(target: "acp.mcp", agent = %agent, error = %e, "failed to reconcile MCP drift store");
+                Default::default()
+            });
     let kept_on_removal = reconcile
         .removed
         .into_iter()
@@ -334,6 +341,7 @@ pub fn load_native_mcp_servers_checked_from_home(
     agent_key: &str,
     profile: Option<&str>,
     session_env: &[(String, String)],
+    native_config_override: Option<&Path>,
 ) -> Result<NativeRead> {
     let home = dirs::home_dir().context("could not resolve home dir for native MCP config")?;
     let explicit = resolved_profile_config(profile)
@@ -343,7 +351,12 @@ pub fn load_native_mcp_servers_checked_from_home(
         native_config_for(agent_key),
         Some(NativeMcpConfig::StandardJson(_))
     );
+    let native_config_override = matches!(agent_key, "claude" | "claude-code")
+        .then_some(native_config_override)
+        .flatten()
+        .map(Path::to_path_buf);
     let config_dir = pick_native_config_dir(
+        native_config_override,
         explicit,
         reads_env,
         session_env,
@@ -352,17 +365,19 @@ pub fn load_native_mcp_servers_checked_from_home(
     read_native(agent_key, &home, config_dir.as_deref())
 }
 
-/// The directory the launched agent reads its native config from: the exact-tool
-/// `agent_config_dir` setting, then `CLAUDE_CONFIG_DIR` from the session env (last
-/// entry wins), then from the daemon env, else the home default (`None`).
+/// The directory the launched agent reads its native config from: a selected
+/// Claude store, the exact-tool agent config directory setting, then
+/// CLAUDE_CONFIG_DIR from the session env (last entry wins), then from the
+/// daemon env, else the home default.
 fn pick_native_config_dir(
+    native_config_override: Option<PathBuf>,
     explicit: Option<PathBuf>,
     reads_claude_config_dir: bool,
     session_env: &[(String, String)],
     daemon_env: Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
-    if explicit.is_some() || !reads_claude_config_dir {
-        return explicit;
+    if native_config_override.is_some() || explicit.is_some() || !reads_claude_config_dir {
+        return native_config_override.or(explicit);
     }
     // A relative path would resolve differently for the daemon and the agent.
     let usable = |dir: PathBuf| dir.is_absolute().then_some(dir);
@@ -663,11 +678,21 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             assert_eq!(
-                pick_native_config_dir(explicit, reads, &env, daemon_env),
+                pick_native_config_dir(None, explicit, reads, &env, daemon_env),
                 expected,
                 "{label}"
             );
         }
+        assert_eq!(
+            pick_native_config_dir(
+                p("/selected"),
+                p("/explicit"),
+                true,
+                &[("CLAUDE_CONFIG_DIR".into(), "/session".into())],
+                daemon(),
+            ),
+            p("/selected")
+        );
     }
 
     #[test]

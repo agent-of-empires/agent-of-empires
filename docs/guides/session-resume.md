@@ -60,7 +60,7 @@ On automatic start or restart, an unknown stored conversation starts fresh with 
 aoe session set-session-id <session> <native-id> --store /absolute/native/store
 ```
 
-For agents whose store comes from configuration, `--store` names the routed store directory. For Pi and OMP it names the exact existing transcript file, whose header must name the requested ID. A missing or incompatible store is an error.
+`--store` explicitly selects a Claude configuration directory. For Pi and OMP it must name the exact existing transcript file, whose header must name the requested ID. Other agents resolve their store from configuration and reject explicit store routing.
 
 To start fresh once:
 
