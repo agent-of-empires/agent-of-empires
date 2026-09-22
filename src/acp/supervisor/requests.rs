@@ -170,20 +170,21 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
         client.set_config_option(config_id, value).await?;
-        // A watchdog respawn clones the cached config, which the daemon's
-        // persisted pick never reaches; keyed on `model` like that persistence.
-        if config_id == "model" {
-            if let Some(WorkerKind::Runner { spawn_config }) = self
-                .workers
-                .lock()
-                .await
-                .get_mut(session_id)
-                .map(|h| &mut h.kind)
-            {
-                set_spawn_model(spawn_config, Some(value.to_string()));
-            }
-        }
         Ok(())
+    }
+
+    /// A watchdog respawn clones the cached spawn config, which the daemon's
+    /// persisted model pick never reaches.
+    pub async fn refresh_cached_model(&self, session_id: &str, model: &str) {
+        if let Some(WorkerKind::Runner { spawn_config }) = self
+            .workers
+            .lock()
+            .await
+            .get_mut(session_id)
+            .map(|h| &mut h.kind)
+        {
+            set_spawn_model(spawn_config, Some(model.to_string()));
+        }
     }
 
     pub async fn resolve_permission(

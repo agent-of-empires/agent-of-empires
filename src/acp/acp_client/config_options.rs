@@ -42,8 +42,7 @@ pub(super) struct SessionChannels {
     pub(super) available_mode_ids: Option<Vec<String>>,
     pub(super) mode_config_option_id: Option<String>,
     pub(super) thought_level_config_option_id: Option<String>,
-    /// The model option's id and the value the agent reports for it.
-    pub(super) model_config_option: Option<(String, String)>,
+    pub(super) model_option: Option<ModelOption>,
 }
 
 impl SessionChannels {
@@ -62,7 +61,7 @@ impl SessionChannels {
             thought_level_config_option_id: options
                 .and_then(thought_level_config_id)
                 .map(|id| id.0.to_string()),
-            model_config_option: options.and_then(model_config_option),
+            model_option: options.and_then(model_option),
         }
     }
 }
@@ -87,7 +86,7 @@ fn config_option_success_events(
     events
 }
 
-fn config_option_failure_event(
+pub(super) fn config_option_failure_event(
     config_id: String,
     value: String,
     reason: String,
@@ -145,7 +144,7 @@ pub(super) fn dispatch_set_config_option(
 
 /// Best-effort application of a configured default. A value the agent no
 /// longer advertises is rejected and warned, never failing the caller.
-/// Returns the option list the agent answered with.
+/// Returns the agent's option list, or the rejection reason.
 pub(super) async fn apply_config_default(
     connection: &ConnectionTo<Agent>,
     event_tx: &mpsc::Sender<Event>,
@@ -153,7 +152,7 @@ pub(super) async fn apply_config_default(
     config_id: SessionConfigId,
     value: &str,
     session_label: &str,
-) -> Option<Vec<SessionConfigOption>> {
+) -> Result<Vec<SessionConfigOption>, String> {
     info!(
         target: "acp.protocol",
         session = %session_label,
@@ -171,7 +170,7 @@ pub(super) async fn apply_config_default(
             if let Some(event) = config_options_event(Some(resp.config_options.clone())) {
                 let _ = event_tx.send(event).await;
             }
-            Some(resp.config_options)
+            Ok(resp.config_options)
         }
         Err(e) => {
             warn!(
@@ -179,7 +178,7 @@ pub(super) async fn apply_config_default(
                 session = %session_label,
                 "structured view default failed: {e}"
             );
-            None
+            Err(e.to_string())
         }
     }
 }
@@ -205,19 +204,53 @@ pub(super) fn mode_config_id(options: &[SessionConfigOption]) -> Option<SessionC
     select_config_id(options, SessionConfigOptionCategory::Mode)
 }
 
-pub(super) fn model_config_id(options: &[SessionConfigOption]) -> Option<SessionConfigId> {
-    select_config_id(options, SessionConfigOptionCategory::Model)
+/// The `category:"model"` select a session advertised, as last reported.
+#[derive(Debug)]
+pub(super) struct ModelOption {
+    pub(super) id: String,
+    current_value: String,
+    current_name: Option<String>,
 }
 
-/// The model option's id and current value.
-fn model_config_option(options: &[SessionConfigOption]) -> Option<(String, String)> {
-    options.iter().find_map(|o| match &o.kind {
-        SessionConfigKind::Select(select)
-            if o.category == Some(SessionConfigOptionCategory::Model) =>
-        {
-            Some((o.id.0.to_string(), select.current_value.0.to_string()))
+impl ModelOption {
+    /// Whether re-sending `pick` would be a no-op. Matching the display name
+    /// too spares the round-trip for aliases like `opus` that the agent
+    /// reports as a canonical id; fuzzier aliases are still re-sent.
+    pub(super) fn is_current(&self, pick: &str) -> bool {
+        self.current_value.eq_ignore_ascii_case(pick)
+            || self
+                .current_name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(pick))
+    }
+}
+
+pub(super) fn model_option(options: &[SessionConfigOption]) -> Option<ModelOption> {
+    options.iter().find_map(|o| {
+        let SessionConfigKind::Select(select) = &o.kind else {
+            return None;
+        };
+        if o.category != Some(SessionConfigOptionCategory::Model) {
+            return None;
         }
-        _ => None,
+        let current = &select.current_value;
+        let current_name = match &select.options {
+            SessionConfigSelectOptions::Ungrouped(opts) => opts
+                .iter()
+                .find(|c| &c.value == current)
+                .map(|c| c.name.clone()),
+            SessionConfigSelectOptions::Grouped(groups) => groups
+                .iter()
+                .flat_map(|g| &g.options)
+                .find(|c| &c.value == current)
+                .map(|c| c.name.clone()),
+            _ => None,
+        };
+        Some(ModelOption {
+            id: o.id.0.to_string(),
+            current_value: current.0.to_string(),
+            current_name,
+        })
     })
 }
 
@@ -456,5 +489,30 @@ mod tests {
                 if config_id == "mode" && value == "v" && reason == "rejected"
         ));
         assert!(config_options_event(None).is_none());
+    }
+
+    #[test]
+    fn model_option_is_current_cases() {
+        use agent_client_protocol::schema::v1::SessionConfigSelectOption;
+        let options = [SessionConfigOption::select(
+            "model",
+            "Model",
+            "claude-opus-5",
+            vec![
+                SessionConfigSelectOption::new("claude-opus-5", "Opus"),
+                SessionConfigSelectOption::new("claude-sonnet-5", "Sonnet"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model)];
+        let option = model_option(&options).unwrap();
+        assert_eq!(option.id, "model");
+        for (pick, want) in [
+            ("claude-opus-5", true),
+            ("opus", true),
+            ("sonnet", false),
+            ("claude-sonnet-5", false),
+        ] {
+            assert_eq!(option.is_current(pick), want, "{pick}");
+        }
     }
 }

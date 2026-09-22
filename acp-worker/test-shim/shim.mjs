@@ -124,7 +124,8 @@ async function handleDeleteSession(params) {
 }
 
 // SHIM_THOUGHT_LEVEL=1 advertises one thought-level select. SHIM_MODEL_OPTION=1
-// adds a `category:"model"` picker that rejects unknown values.
+// adds a `category:"model"` picker that rejects unknown values and resets on
+// session/new.
 let model = "default";
 const MODEL_VALUES = ["default", "opus", "sonnet"];
 
@@ -184,6 +185,8 @@ async function handleNewSession(params) {
   if (recordFile) await writeFile(recordFile, JSON.stringify(params?.mcpServers ?? []));
   const sessionId = "shim-" + crypto.randomUUID();
   sessions.set(sessionId, {});
+  // A fresh session starts on the default model, as real adapters do.
+  model = "default";
   return withConfigOptions({ sessionId });
 }
 

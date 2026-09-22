@@ -23,8 +23,8 @@ use super::notifications::{now_ms, Shared};
 use super::ReadyTx;
 use crate::acp::acp_client::commands::{ClientCmd, ConnectMode};
 use crate::acp::acp_client::config_options::{
-    apply_config_default, config_options_event, mode_config_id, modes_available_event,
-    thought_level_config_id, SessionChannels,
+    apply_config_default, config_option_failure_event, config_options_event, mode_config_id,
+    modes_available_event, thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
 };
 use crate::acp::acp_client::control::{establish_session_v3, DaemonControlClient};
 use crate::acp::acp_client::errors::{acp_internal_error, AcpError, IncompatibleAgentError};
@@ -507,7 +507,7 @@ impl Session {
         ) {
             match mode_config_id(options) {
                 Some(config_id) => {
-                    apply_config_default(
+                    let _ = apply_config_default(
                         &self.connection,
                         &self.shared.event_tx,
                         id.clone(),
@@ -536,33 +536,46 @@ impl Session {
             return;
         };
         let label = &self.shared.session_label;
-        match &self.channels.model_config_option {
-            Some((_, current)) if current == model => debug!(
+        let Some(option) = &self.channels.model_option else {
+            debug!(
+                target: "acp.protocol",
+                session = %label,
+                "structured view model skipped; no model option"
+            );
+            return;
+        };
+        if option.is_current(model) {
+            debug!(
                 target: "acp.protocol",
                 session = %label,
                 model,
                 "structured view model already current"
-            ),
-            Some((config_id, _)) => {
-                let options = apply_config_default(
-                    &self.connection,
-                    &self.shared.event_tx,
-                    self.acp_session_id.clone(),
-                    SessionConfigId::new(config_id.clone()),
-                    model,
-                    label,
-                )
-                .await;
-                if let Some(options) = options {
-                    self.channels.thought_level_config_option_id =
-                        thought_level_config_id(&options).map(|id| id.0.to_string());
-                }
+            );
+            return;
+        }
+        let result = apply_config_default(
+            &self.connection,
+            &self.shared.event_tx,
+            self.acp_session_id.clone(),
+            SessionConfigId::new(option.id.clone()),
+            model,
+            label,
+        )
+        .await;
+        match result {
+            Ok(options) => {
+                self.channels.thought_level_config_option_id =
+                    thought_level_config_id(&options).map(|id| id.0.to_string());
             }
-            None => debug!(
-                target: "acp.protocol",
-                session = %label,
-                "structured view model skipped; no model option"
-            ),
+            Err(reason) => {
+                let event = config_option_failure_event(
+                    option.id.clone(),
+                    model.to_string(),
+                    reason,
+                    ConfigOptionDispatchPurpose::Generic,
+                );
+                self.shared.emit(event).await;
+            }
         }
     }
 
@@ -574,7 +587,7 @@ impl Session {
         };
         match self.channels.thought_level_config_option_id.as_deref() {
             Some(config_id) => {
-                apply_config_default(
+                let _ = apply_config_default(
                     &self.connection,
                     &self.shared.event_tx,
                     self.acp_session_id.clone(),
