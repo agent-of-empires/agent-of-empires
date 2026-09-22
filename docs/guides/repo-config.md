@@ -24,7 +24,7 @@ Hooks run inside the container for a sandboxed session and in your host shell ot
 on_create = ["sh -c '[ -x /opt/setup.sh ] || exit 0; exec /opt/setup.sh'"]
 ```
 
-Keep environment-specific hooks out of global config. A global `on_create` applies to every repo that does not declare its own, so one unresolvable path there blocks session creation in projects that never mention it. When `on_create` fails, the error names the config file that declared it.
+Keep environment-specific hooks out of global config. A global `on_create` applies to every repo that does not declare its own, so one unresolvable path there blocks session creation in projects that never mention it. When `on_create` fails in the TUI, the error names the config file that declared it.
 
 Each hook receives the session's metadata as environment variables: `AOE_SESSION_ID`, `AOE_SESSION_TITLE` (also the worktree branch name), `AOE_PROJECT_PATH` (equals `$PWD` in `on_create` and `on_launch`), `AOE_PROFILE`, `AOE_TOOL`, `AOE_GROUP_PATH`, and `AOE_SESSION_BRANCH` on worktree sessions. Container hooks get the same set. Quote any expansion that may contain spaces, since titles often do:
 
