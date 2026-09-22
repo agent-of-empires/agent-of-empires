@@ -430,7 +430,7 @@ impl Drop for FailNextListProfilesGuard {
 }
 
 /// Enumerate profile directory names in `profiles_dir`, skipping symlinks.
-fn list_profile_names_in(profiles_dir: &std::path::Path) -> Result<Vec<String>> {
+pub(crate) fn list_profile_names_in(profiles_dir: &std::path::Path) -> Result<Vec<String>> {
     let mut profiles = Vec::new();
     for entry in fs::read_dir(profiles_dir)? {
         let entry = entry?;

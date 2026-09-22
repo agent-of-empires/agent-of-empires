@@ -41,6 +41,7 @@ mod scroll_pane_isolation;
 mod search;
 mod session_feed_tests;
 mod settings_scroll_wiring;
+mod sidebar_position;
 mod stacked_single_seam;
 mod status_rows_menu;
 mod store_move;

@@ -8,6 +8,8 @@ Settings resolve in layers, each overriding the one before it, field by field:
 
 Unset fields inherit from the layer above. List fields replace rather than extend. Everything below is also editable from the TUI settings screen (`s`) and, unless noted, from the web dashboard.
 
+Global-only settings use the global config. On upgrade, the default profile's values for them move there, and other profiles' values are removed. `PATCH /api/profiles/<name>/settings` rejects global-only fields with HTTP 400; use `PATCH /api/settings` instead.
+
 A project registry entry can also override `worktree.enabled` and `session.smart_rename` for that project, from the web Projects view or the TUI add-project form. This override wins over all three layers. It lives in your own registry (`projects.json`), not the repo, so it does not weaken the `repo = "deny"` policy on either field.
 
 ## File locations
@@ -73,6 +75,7 @@ agent_status_hooks = true
 smart_rename = true
 auto_stop_idle_secs = 0   # 0 disables; e.g. 7200 = stop after 2h idle
 row_tag = "branch"        # none | auto | profile | sandbox | branch
+sidebar_position = "left" # left | right; TUI session list
 ```
 
 | Option | Default | Description |
@@ -84,6 +87,7 @@ row_tag = "branch"        # none | auto | profile | sandbox | branch
 | `prevent_sleep_idle_grace_minutes` | `15` | Minutes (0 to 240) every session must stay idle before the inhibitor is released. A session that never reaches `Idle` (`Waiting` on a prompt, `Creating` forever) holds it indefinitely. |
 | `session_id_poller_max_threads` | `50` | Ceiling on concurrent session-id pollers per process. Past the ceiling, the overflow's ids refresh on a 5 s to 60 s backoff instead of every status tick. Global only, applied at process start. |
 | `row_tag` | `"branch"` | Metadata next to a TUI session title: `none`, `auto` (profile code in all-profiles view), `profile`, `sandbox`, or `branch`. |
+| `sidebar_position` | `"left"` | TUI session sidebar position: `left` or `right`. Global only. Narrow terminals keep the stacked layout. |
 | `tie_workdir_to_name` | `true` | Keep a managed worktree session's directory named after its title. See [Worktrees](worktrees.md#naming). |
 | `pre_trust_agent_folders` | `false` | Pre-trust each host session's worktree in the agent's own config (Claude Code, Codex, Gemini) so it does not open on a folder-trust prompt. Config-dir overrides are honored, and an `agent_config_dir` entry wins over them. Trust also activates the repo's `.claude/settings.json`, hooks included, so enable it only for directories you would have trusted by hand. Sandboxed sessions always pre-trust their own staged config. |
 | `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config; see [Adding a New Agent](../development/adding-agents.md#hook-format-reference). Disabling it leaves status to pane reading but keeps identity hooks used for native resume. |
@@ -304,7 +308,7 @@ vt_live = true
 | `status_bar` | `"auto"` | Paint aoe's themed status bar (title, branch, sandbox, detach hint) on its own sessions. The bar is a whole theme, so `"auto"` steps aside whenever you have a tmux config at all. `"disabled"` reverts aoe's session-scoped `status*` overrides, so your own config governs. See [tmux status bar](tmux-status-bar.md). |
 | `mouse` | `"auto"` | Set tmux `mouse` on aoe's sessions, which is what turns a wheel or touch scroll into copy-mode scrollback. `"auto"` defers only when your tmux config sets `mouse` itself, and enables it otherwise. |
 | `clipboard` | `"auto"` | Forward the agent's OSC 52 clipboard writes (`set-clipboard on`, `allow-passthrough on`) to your terminal or the dashboard. Without it, "select to copy" inside an agent silently fails. Same per-option `"auto"` as `mouse`; live-send forwarding stays on for `"auto"` and `"enabled"`. |
-| `socket_name` | unset | Run aoe's sessions on a private tmux server (`tmux -L <name>`), so your own `tmux ls` stays separate. Bare name only, applied at the next aoe start. Global/profile only. |
+| `socket_name` | unset | Run aoe's sessions on a private tmux server (`tmux -L <name>`), so your own `tmux ls` stays separate. Bare name only, applied at the next aoe start. Global only. |
 | `vt_live` | `true` | Render agent previews and the dashboard's agent terminal from a persistent VT channel instead of `capture-pane` polling. See [the VT live transport](live-mode.md#the-vt-live-transport). |
 
 Per-option detection reads `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`, and `~/.config/tmux/tmux.conf` for a `set` / `setw` of the option. It is deliberately conservative: an option reached through `source-file`, `if-shell`, a false `%if`, or a key binding is not detected, so set the mode to `"disabled"` if you keep yours in one of those places. `/etc/tmux.conf` is not consulted.
@@ -361,7 +365,7 @@ environment = ["GH_TOKEN=$AOE_GH_TOKEN"]
 
 ## Profiles
 
-Profiles are separate workspaces with their own sessions, groups, and overrides of anything above.
+Profiles are separate workspaces with their own sessions, groups, and overrides of profile-overridable settings.
 
 ```bash
 aoe                        # "default" profile

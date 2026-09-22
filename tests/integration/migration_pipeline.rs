@@ -83,3 +83,36 @@ fn test_partial_version_runs_remaining() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+#[serial]
+fn global_only_settings_migrate_before_the_schema_version_advances() -> Result<()> {
+    let _temp = setup_temp_home();
+    let app = agent_of_empires::session::get_app_dir()?;
+    let profile = agent_of_empires::session::get_profile_dir("work")?.join("config.toml");
+    fs::write(app.join(".schema_version"), "29")?;
+    fs::write(app.join("config.toml"), "default_profile = 'work'\n")?;
+    fs::write(&profile, "[invalid")?;
+
+    assert!(agent_of_empires::migrations::run_migrations().is_err());
+    assert_eq!(fs::read_to_string(app.join(".schema_version"))?, "29");
+    assert_eq!(fs::read_to_string(&profile)?, "[invalid");
+
+    fs::write(&profile, "[theme]\nname = 'dracula'\n[session]\nconfirm_before_quit = false\ndefault_tool = 'codex'\n")?;
+    agent_of_empires::migrations::run_migrations()?;
+    let global = agent_of_empires::session::Config::load()?;
+    assert_eq!(global.theme.name, "dracula");
+    assert!(!global.session.confirm_before_quit);
+    let effective = agent_of_empires::session::resolve_config("work")?;
+    assert_eq!(effective.theme.name, "dracula");
+    assert!(!effective.session.confirm_before_quit);
+    assert_eq!(effective.session.default_tool.as_deref(), Some("codex"));
+    let saved: toml::Table = fs::read_to_string(&profile)?.parse()?;
+    assert!(!saved.contains_key("theme"));
+    assert_eq!(saved["session"].as_table().unwrap().len(), 1);
+    assert_eq!(
+        fs::read_to_string(app.join(".schema_version"))?.parse::<u32>()?,
+        agent_of_empires::migrations::current_schema_version()
+    );
+    Ok(())
+}

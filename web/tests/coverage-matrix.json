@@ -628,6 +628,23 @@
       "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"]
     },
     {
+      "id": "settings.global-migration-and-persistence",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/settings-persistence.spec.ts"],
+      "components": ["web/src/components/SettingsView.tsx"]
+    },
+    {
+      "id": "settings.global-write-scope",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/settings/__tests__/SchemaFieldPatches.test.tsx",
+        "src/hooks/__tests__/useSettingsCommands.test.tsx"
+      ],
+      "components": ["web/src/components/SettingsView.tsx", "web/src/hooks/useSettingsCommands.ts"]
+    },
+    {
       "id": "settings.session-auto-stop-idle",
       "kind": "vitest",
       "risk": "medium",

@@ -77,7 +77,7 @@ use self::watchers::{RELOAD_FAILED_TITLE, WATCHER_WARNING_TITLE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DragKind {
-    ListDivider { start_col: u16, start_width: u16 },
+    ListDivider,
     PreviewSelect,
     SettingsScrollbar,
 }
@@ -216,6 +216,7 @@ pub struct HomeView {
     pub(super) status_flash: Option<(String, std::time::Instant)>,
     pub(super) live_send_ctrl_c_flash_until: Option<std::time::Instant>,
     pub(super) sidebar_collapsed: bool,
+    pub(super) sidebar_position: crate::session::config::SidebarPosition,
     pub(super) passive_pane_synced: std::collections::HashMap<String, PassiveSynced>,
     pub(super) passive_pane_declined:
         std::collections::HashMap<String, ((u16, u16), std::time::Instant)>,

@@ -251,6 +251,7 @@ fn reject_response(rej: PatchRejection) -> axum::response::Response {
         .into_response()
 }
 
+/// Persist a global patch and apply side effects for the sections it changes.
 pub async fn update_settings(
     State(state): State<Arc<AppState>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
@@ -294,32 +295,41 @@ pub async fn update_settings(
                 .collect()
         })
         .unwrap_or_default();
-    // Fold validated `plugin:<id>` sections into their on-disk storage path
-    // (`plugins.<id>.settings.*`) before the generic merge.
     rewrite_plugin_sections(&mut body);
 
     let result = tokio::task::spawn_blocking(move || {
-        crate::session::update_config(|config| -> anyhow::Result<()> {
+        crate::session::update_config(|config| -> anyhow::Result<_> {
             let mut current = serde_json::to_value(&*config)?;
             crate::session::config::settings_schema::merge_json(&mut current, &body);
-            *config = serde_json::from_value(current)?;
-            Ok(())
+            // The target editor sends the complete map, including removals.
+            if let Some(targets) = body.pointer("/logging/targets") {
+                current["logging"]["targets"] = if targets.is_null() {
+                    serde_json::json!({})
+                } else {
+                    targets.clone()
+                };
+            }
+            let updated: crate::session::Config = serde_json::from_value(current)?;
+            let logging_changed = config.logging.default_level != updated.logging.default_level
+                || config.logging.targets != updated.logging.targets;
+            *config = updated;
+            Ok((config.clone(), logging_changed))
         })
-        .and_then(|inner| inner)?;
-        Ok::<_, anyhow::Error>(crate::session::Config::load_or_warn())
+        .and_then(|inner| inner)
     })
     .await;
 
     match result {
-        Ok(Ok(config)) => {
-            // Apply the new filter live and persist runtime_filter so acp
-            // runners pick it up via the notify watcher.
-            if let Ok(app_dir) = crate::session::get_app_dir() {
-                crate::logging::apply_persisted_config(
-                    &config.logging.default_level,
-                    &config.logging.targets,
-                    &app_dir,
-                );
+        Ok(Ok((config, logging_changed))) => {
+            // No-op and restart-only edits preserve temporary runtime filters.
+            if logging_changed {
+                if let Ok(app_dir) = crate::session::get_app_dir() {
+                    crate::logging::apply_persisted_config(
+                        &config.logging.default_level,
+                        &config.logging.targets,
+                        &app_dir,
+                    );
+                }
             }
             // Notify each touched plugin's worker after the durable write (#2897).
             if !plugin_changes.is_empty() {
@@ -1722,9 +1732,6 @@ pub async fn update_profile_settings(
     if let Err(e) = validate_profile_name(&name) {
         return api_error(StatusCode::BAD_REQUEST, "validation_failed", e);
     }
-    // Strip host-execution surfaces (`local_only`) before validation and merge,
-    // so they can never become a profile override (#1692).
-    strip_local_only(&mut body);
     // Reject any leaf outside the CityHall allowlist, so the endpoint kept open
     // for the Sessions trash toggles cannot write arbitrary overrides (#7).
     if state.cityhall_mode {
@@ -1740,7 +1747,7 @@ pub async fn update_profile_settings(
     // loopback-trusted caller is elevated per the #1168 carve-out (#2610).
     let elevated = handler_elevated(&state, session.as_deref(), loopback.is_some()).await;
 
-    // Validate every remaining leaf against the schema (#1692). An
+    // Validate every leaf against the schema (#1692). An
     // elevation_required 403 mirrors the path-shape gate's payload so
     // web/src/lib/fetchInterceptor.ts fires the passphrase prompt (#1510).
     // `description` is profile-only and rejected on the global endpoint.
@@ -1748,45 +1755,10 @@ pub async fn update_profile_settings(
         return reject_response(rej);
     }
 
-    let result = tokio::task::spawn_blocking(move || {
-        // `logging` is process-global, so peel it off and write it to the
-        // global Config; everything else stays a per-profile override.
-        let mut body = body;
-        let logging_patch = body.as_object_mut().and_then(|obj| obj.remove("logging"));
-        if let Some(patch) = logging_patch {
-            let global = crate::session::update_config(|global| -> anyhow::Result<()> {
-                let mut current = serde_json::to_value(&*global)?;
-                if let Some(current_obj) = current.as_object_mut() {
-                    match current_obj.get_mut("logging") {
-                        Some(existing) => {
-                            if let (Some(existing_obj), Some(new_obj)) =
-                                (existing.as_object_mut(), patch.as_object())
-                            {
-                                for (k, v) in new_obj {
-                                    existing_obj.insert(k.clone(), v.clone());
-                                }
-                            } else {
-                                current_obj.insert("logging".to_string(), patch);
-                            }
-                        }
-                        None => {
-                            current_obj.insert("logging".to_string(), patch);
-                        }
-                    }
-                }
-                *global = serde_json::from_value(current)?;
-                Ok(())
-            })
-            .and_then(|inner| inner.map(|()| crate::session::Config::load_or_warn()))?;
-            if let Ok(app_dir) = crate::session::get_app_dir() {
-                crate::logging::apply_persisted_config(
-                    &global.logging.default_level,
-                    &global.logging.targets,
-                    &app_dir,
-                );
-            }
-        }
+    // Validate scope before stripping, including global-only local fields.
+    strip_local_only(&mut body);
 
+    let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::load_profile_config(&name).unwrap_or_default();
         let mut current = serde_json::to_value(&config)?;
         // Apply each validated leaf onto the sparse override object: null

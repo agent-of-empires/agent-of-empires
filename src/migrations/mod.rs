@@ -34,6 +34,7 @@ mod v026_repoint_acp_default_agent;
 pub(crate) mod v027_isolate_sandbox_stores;
 mod v028_clear_archived_live_status;
 mod v029_fold_pending_initial_turn;
+mod v030_global_only_profile_settings;
 pub(crate) mod v031_isolate_sandbox_content;
 
 /// Fixtures shared by the migrations that rewrite agent hook files.
@@ -183,6 +184,11 @@ const MIGRATIONS: &[Migration] = &[
         29,
         "fold_pending_initial_turn",
         v029_fold_pending_initial_turn::run,
+    ),
+    (
+        30,
+        "global_only_profile_settings",
+        v030_global_only_profile_settings::run,
     ),
     (
         31,

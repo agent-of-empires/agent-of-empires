@@ -3,7 +3,7 @@
 //! keyboard `<`/`>` tests exercise indirectly via save_list_width).
 
 use super::*;
-use crate::session::config::load_config;
+use crate::session::config::{load_config, update_config, SidebarPosition};
 use ratatui::layout::Rect;
 
 /// Stage the geometry a real side-by-side render would produce: a
@@ -39,7 +39,7 @@ fn hit_divider_is_false_in_stacked_mode() {
 
 #[test]
 #[serial]
-fn drag_updates_list_width_relative_to_start() {
+fn drag_updates_list_width_to_pointer() {
     let mut env = create_test_env_empty();
     stage_side_by_side(&mut env);
     assert!(
@@ -135,4 +135,76 @@ fn drag_start_misses_off_divider_column() {
     stage_side_by_side(&mut env);
     assert!(!env.view.handle_drag_start(34, 5));
     assert!(env.view.drag_state.is_none());
+}
+
+/// A side change commits the last width without reusing the old pointer origin.
+#[test]
+#[serial]
+fn changing_sidebar_position_ends_drag_at_last_width() {
+    let mut env = create_test_env_empty();
+    for position in [SidebarPosition::Left, SidebarPosition::Right] {
+        update_config(|config| config.session.sidebar_position = position).unwrap();
+        env.view.try_refresh_from_config_watcher().unwrap();
+        env.view.list_width = 35;
+        render_geometry(&mut env.view);
+        let divider = env.view.divider_col.unwrap();
+        let row = env.view.list_area.y + 1;
+        let drag_col = match position {
+            SidebarPosition::Left => divider + 10,
+            SidebarPosition::Right => divider - 10,
+        };
+        assert!(env.view.handle_drag_start(divider, row));
+        assert!(env.view.handle_drag_move(drag_col, row));
+        assert_eq!(env.view.list_width, 45);
+
+        env.view.try_refresh_from_config_watcher().unwrap();
+        assert!(
+            env.view.drag_state.is_some(),
+            "unchanged side keeps the drag"
+        );
+        assert!(!env.view.handle_drag_move(drag_col, row));
+
+        let next_position = match position {
+            SidebarPosition::Left => SidebarPosition::Right,
+            SidebarPosition::Right => SidebarPosition::Left,
+        };
+        update_config(|config| config.session.sidebar_position = next_position).unwrap();
+        env.view.try_refresh_from_config_watcher().unwrap();
+        render_geometry(&mut env.view);
+        assert!(!env.view.handle_drag_move(drag_col, row));
+        assert_eq!(
+            env.view.list_width, 45,
+            "old geometry must not resize the list"
+        );
+        assert!(env.view.drag_state.is_none());
+        assert!(!env.view.handle_drag_end());
+        assert_eq!(
+            load_config().unwrap().unwrap().app_state.home_list_width,
+            Some(45)
+        );
+    }
+}
+
+/// Reversed horizontal drags obey both width limits and save the final width.
+#[test]
+#[serial]
+fn right_divider_drag_clamps_and_persists() {
+    let mut env = create_test_env_empty();
+    env.view.sidebar_position = SidebarPosition::Right;
+    render_geometry(&mut env.view);
+    let divider = env.view.divider_col.unwrap();
+    let row = env.view.list_area.y + 1;
+    assert!(env.view.hit_divider(divider, row));
+    assert!(!env.view.hit_list(divider, row));
+    assert!(!env.view.hit_preview(divider, row));
+    assert!(env.view.handle_drag_start(divider, row));
+    assert!(env.view.handle_drag_move(0, row));
+    assert_eq!(env.view.list_width, 80);
+    assert!(env.view.handle_drag_move(u16::MAX, row));
+    assert_eq!(env.view.list_width, 10);
+    assert!(env.view.handle_drag_end());
+    assert_eq!(
+        load_config().unwrap().unwrap().app_state.home_list_width,
+        Some(10)
+    );
 }

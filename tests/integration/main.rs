@@ -72,4 +72,5 @@ mod serve_disk_reload_helper_equivalence;
 mod serve_dns_rebinding_gate;
 mod serve_dynamic_profile_rewire;
 mod serve_filewatch_propagation;
+mod serve_settings_logging;
 mod telemetry;
