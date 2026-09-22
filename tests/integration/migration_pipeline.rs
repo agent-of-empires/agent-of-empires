@@ -157,30 +157,41 @@ fn schema_v30_runs_pr_conversation_migrations() -> Result<()> {
 
 #[test]
 #[serial]
-fn schema_v31_reconciles_upstream_global_only_settings() -> Result<()> {
-    let _temp = setup_temp_home();
-    let app = agent_of_empires::session::get_app_dir()?;
-    let profile = agent_of_empires::session::get_profile_dir("work")?.join("config.toml");
-    fs::write(app.join(".schema_version"), "31")?;
-    fs::write(app.join("config.toml"), "default_profile = 'work'\n")?;
-    fs::write(
-        &profile,
-        "[session]\nsidebar_position = 'right'\ndefault_tool = 'codex'\n",
-    )?;
+fn schema_v31_and_v32_reconcile_upstream_global_only_settings() -> Result<()> {
+    for initial_version in [31, 32] {
+        let _temp = setup_temp_home();
+        let app = agent_of_empires::session::get_app_dir()?;
+        let profile = agent_of_empires::session::get_profile_dir("work")?.join("config.toml");
+        fs::write(app.join(".schema_version"), initial_version.to_string())?;
+        fs::write(app.join("config.toml"), "default_profile = 'work'\n")?;
+        fs::write(
+            &profile,
+            "[session]\nsidebar_position = 'right'\ndefault_tool = 'codex'\n",
+        )?;
 
-    agent_of_empires::migrations::run_migrations()?;
+        agent_of_empires::migrations::run_migrations()?;
 
-    let global: toml::Table = fs::read_to_string(app.join("config.toml"))?.parse()?;
-    assert_eq!(
-        global["session"]["sidebar_position"].as_str(),
-        Some("right")
-    );
-    let saved: toml::Table = fs::read_to_string(&profile)?.parse()?;
-    assert!(saved["session"].get("sidebar_position").is_none());
-    assert_eq!(saved["session"]["default_tool"].as_str(), Some("codex"));
-    assert_eq!(
-        fs::read_to_string(app.join(".schema_version"))?.parse::<u32>()?,
-        agent_of_empires::migrations::current_schema_version()
-    );
+        let global: toml::Table = fs::read_to_string(app.join("config.toml"))?.parse()?;
+        assert_eq!(
+            global["session"]["sidebar_position"].as_str(),
+            Some("right"),
+            "schema v{initial_version}"
+        );
+        let saved: toml::Table = fs::read_to_string(&profile)?.parse()?;
+        assert!(
+            saved["session"].get("sidebar_position").is_none(),
+            "schema v{initial_version}"
+        );
+        assert_eq!(
+            saved["session"]["default_tool"].as_str(),
+            Some("codex"),
+            "schema v{initial_version}"
+        );
+        assert_eq!(
+            fs::read_to_string(app.join(".schema_version"))?.parse::<u32>()?,
+            agent_of_empires::migrations::current_schema_version(),
+            "schema v{initial_version}"
+        );
+    }
     Ok(())
 }
