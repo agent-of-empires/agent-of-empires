@@ -65,12 +65,14 @@ interface Props {
   /** Built-in + custom agents, used only to gate the Claude import tab.
    *  Optional so render sites that never reach import (and tests) can omit it. */
   agents?: AgentInfo[];
+  /** Reports the selected saved project's worktree override, if any. */
+  onSelectSavedProject?: (override: boolean | undefined) => void;
 }
 
-export function ProjectStep({ data, profile, onChange, initialTab, agents = [] }: Props) {
+export function ProjectStep({ data, profile, onChange, initialTab, agents = [], onSelectSavedProject }: Props) {
   // Keep the user's tab choice while profile-scoped suggestions load.
   const [manualTab, setManualTab] = useState<Tab | null>(initialTab ?? null);
-  const { loading, query, setQuery, filteredSaved, filteredRecent, hasPicks } = useProjectPicker(profile);
+  const { loading, saved, query, setQuery, filteredSaved, filteredRecent, hasPicks } = useProjectPicker(profile);
   const activeTab: Tab = manualTab ?? (!loading && !hasPicks ? "browse" : "recent");
   const setActiveTab = setManualTab;
 
@@ -96,8 +98,14 @@ export function ProjectStep({ data, profile, onChange, initialTab, agents = [] }
     (filteredSaved.some((s) => normalizePath(s.path) === selectedPath) ||
       filteredRecent.some((r) => normalizePath(r.path) === selectedPath));
 
-  const handleBrowseSelect = (path: string) => {
+  const selectPath = (path: string) => {
     onChange("path", path);
+    const matched = saved.find((project) => normalizePath(project.path) === normalizePath(path));
+    onSelectSavedProject?.(matched?.overrides?.worktree_enabled);
+  };
+
+  const handleBrowseSelect = (path: string) => {
+    selectPath(path);
     setActiveTab("recent");
   };
 
@@ -233,7 +241,7 @@ export function ProjectStep({ data, profile, onChange, initialTab, agents = [] }
               filteredSaved={filteredSaved}
               filteredRecent={filteredRecent}
               isSelected={(path) => data.path === path}
-              onSelect={(path) => onChange("path", path)}
+              onSelect={selectPath}
               emptyMessage="No projects match that search. Try the Browse tab."
             />
           )}

@@ -7,10 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use super::palette::color_to_palette;
 
-/// Whether a theme renders against a dark or light surface. Drives
-/// web-side surface ramp derivation (dark themes lighten from
-/// background, light themes darken from background) and selects the
-/// fallback syntax highlighter theme when none is specified.
+/// Whether a theme renders against a dark or light surface. Drives the web
+/// surface-ramp direction and the fallback syntax highlighter theme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeAppearance {
@@ -18,16 +16,13 @@ pub enum ThemeAppearance {
     Light,
 }
 
-/// Per-theme syntax-highlighter metadata. Lives in `[syntax]` in the
-/// TOML so renderer-specific knobs don't pollute the flat semantic
-/// color fields.
+/// Per-theme syntax-highlighter metadata, in `[syntax]` so renderer knobs stay
+/// out of the flat semantic color fields.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeSyntax {
-    /// Name of the Shiki theme module to load on the web (`github-dark`,
-    /// `dracula`, `catppuccin-latte`, etc.). `None` falls back by
-    /// appearance: dark themes get `github-dark`, light themes get
-    /// `github-light`.
+    /// Shiki theme module the web loads. `None` falls back by appearance:
+    /// `github-dark` for dark themes, `github-light` for light ones.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shiki_theme: Option<String>,
 }
@@ -38,10 +33,9 @@ impl ThemeSyntax {
     }
 }
 
-/// Convert the user-configured decay duration (minutes) into a `Duration`.
-/// `0` returns `Duration::ZERO`, which the freshness logic treats as
-/// "fully decayed immediately" — a documented opt-out: every Idle row
-/// renders with the static idle look the moment its Stop hook fires.
+/// Convert the configured decay duration (minutes) into a `Duration`. `0` gives
+/// `Duration::ZERO`, the documented opt-out: every Idle row renders with the
+/// static idle look the moment its Stop hook fires.
 pub fn idle_decay_window(minutes: u64) -> Duration {
     Duration::from_secs(minutes.saturating_mul(60))
 }
@@ -76,23 +70,17 @@ pub struct Theme {
     pub running: Color,
     #[serde(with = "hex_color")]
     pub waiting: Color,
-    /// Color for a session within the idle decay window (just transitioned
-    /// to Idle, hasn't aged out yet). Held constant for the full window so
-    /// the breathe rattle's pulse stays visually consistent, then snaps to
-    /// `idle` once the window expires. Should sit between `waiting`
-    /// (brightest, "needs you NOW") and `idle` (dimmest, "no rush") on the
-    /// theme's perceived-attention scale.
+    /// Color for a session inside the idle decay window. Held constant for the
+    /// whole window so the breathe rattle's pulse stays consistent, then snaps to
+    /// `idle`. Sits between `waiting` and `idle` on the attention scale.
     #[serde(with = "hex_color")]
     pub fresh_idle: Color,
     #[serde(with = "hex_color")]
     pub idle: Color,
-    /// Color for a session carrying an unread marker (a finished turn the
-    /// user hasn't viewed, or a manual "flag for later"). Applied to resting
-    /// rows (Idle/Unknown) in place of the decaying idle color so unread work
-    /// stands out without being as loud as Waiting/Error. Gated behind the
-    /// `session.unread_indicator` config toggle (on by default). A theme TOML
-    /// that omits this key inherits that theme's own `accent` (filled at load
-    /// time by `fill_unread_from_accent`), not Empire's default.
+    /// Color for a session carrying an unread marker, applied to resting rows in
+    /// place of the decaying idle color so unread work stands out without being as
+    /// loud as Waiting/Error. Gated on `session.unread_indicator`. A TOML omitting
+    /// this inherits that theme's own `accent` via `fill_unread_from_accent`.
     #[serde(with = "hex_color")]
     pub unread: Color,
     #[serde(with = "hex_color")]
@@ -125,11 +113,9 @@ pub struct Theme {
     #[serde(with = "hex_color")]
     pub sandbox: Color,
 
-    /// Whether the theme is dark or light. Optional; when absent the
-    /// resolver classifies the theme from `background` luminance. Use
-    /// per-field `#[serde(default)]` so a partial custom TOML that
-    /// omits this field deserializes to `None` rather than inheriting
-    /// Empire's `Dark`.
+    /// Whether the theme is dark or light; absent, the resolver classifies it from
+    /// `background` luminance. Per-field `#[serde(default)]` so a partial custom
+    /// TOML deserializes to `None` rather than inheriting Empire's `Dark`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appearance: Option<ThemeAppearance>,
 
@@ -233,11 +219,10 @@ impl From<RawThemeDefaults> for Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        // Serde calls Theme::default() while deserializing partial custom
-        // TOMLs, so this must not call load_theme() or parse Theme itself.
-        // Parse the Empire builtin through a raw no-default shape instead:
-        // empire.toml stays the single source for fallback colors, while
-        // optional renderer metadata still defaults to None / empty here.
+        // Serde calls `Theme::default()` while deserializing partial custom TOMLs,
+        // so this must not call `load_theme` or parse `Theme` itself. Parsing the
+        // Empire builtin through a raw no-default shape keeps empire.toml the
+        // single source for fallback colors.
         let raw: RawThemeDefaults =
             toml::from_str(include_str!("../../../themes/builtin/empire.toml"))
                 .expect("embedded empire theme defaults must parse");
@@ -246,14 +231,10 @@ impl Default for Theme {
 }
 
 impl Theme {
-    /// Color for an Idle session, given the elapsed time since it
-    /// transitioned to Idle and the user-configured decay window.
-    ///
-    /// Two-state binary: `fresh_idle` while age is inside the window,
-    /// `idle` once past it (or when age/window aren't usable: `None` age,
-    /// zero window). The pulse phase deliberately holds a constant color
-    /// — a continuous lerp under the breathe rattle reads as noisy. If we
-    /// ever want a gradient back, add an interpolator and call it here.
+    /// Color for an Idle session, given the time since it went Idle and the
+    /// configured decay window: `fresh_idle` inside the window, `idle` past it (or
+    /// when age and window are unusable). The pulse holds a constant color; a
+    /// continuous lerp under the breathe rattle reads as noisy.
     pub fn idle_color_at_age(&self, age: Option<Duration>, window: Duration) -> Color {
         let Some(age) = age else {
             return self.idle;
@@ -264,24 +245,19 @@ impl Theme {
         self.fresh_idle
     }
 
-    /// Color for a session shown as dormant: a structured-view worker that was
-    /// auto-stopped for inactivity and is resumable (see
-    /// `Instance::is_shown_dormant`). A dim amber, the `fresh_idle` attention
-    /// amber pulled halfway toward `dimmed`, so it reads as "parked, not
-    /// urgent" and stays distinct from both the bright fresh-idle amber and
-    /// the neutral `dimmed` used for a deliberate Stop. Derived from existing
-    /// theme colors (not a stored field) so it needs no per-theme definition
-    /// and stays out of the `color_fields_mut` drift guard. See #2250.
+    /// Color for a dormant session: a structured-view worker auto-stopped for
+    /// inactivity and resumable. A dim amber, `fresh_idle` pulled halfway toward
+    /// `dimmed`, so it reads as parked rather than urgent and stays distinct from a
+    /// deliberate Stop. Derived rather than stored, so it needs no per-theme
+    /// definition and stays out of the `color_fields_mut` drift guard (#2250).
     pub fn dormant(&self) -> Color {
         blend(self.fresh_idle, self.dimmed, 0.5)
     }
 }
 
-/// Linear RGB blend of `a` and `b` at `t` (0.0 = all `a`, 1.0 = all `b`).
-/// Falls back to `a` if either color is a non-RGB terminal color; theme
-/// colors are always loaded as RGB via `hex_color`, so that path is defensive
-/// only. Mirrors the private `mix` in `resolved.rs`; kept local to avoid a
-/// backwards dependency from this foundational module onto `resolved`.
+/// Linear RGB blend of `a` and `b` at `t` (0.0 = all `a`). Falls back to `a` for
+/// a non-RGB terminal color, which theme colors never are. Mirrors the private
+/// `mix` in `resolved.rs`, kept local to avoid a backwards dependency.
 fn blend(a: Color, b: Color, t: f32) -> Color {
     let rgb = |c: Color| match c {
         Color::Rgb(r, g, bl) => Some((r, g, bl)),
@@ -296,10 +272,9 @@ fn blend(a: Color, b: Color, t: f32) -> Color {
 }
 
 impl Theme {
-    /// Mutable references to every `Color` field, in declaration order. The
-    /// single authoritative list shared by `downsample_to_palette` and the
-    /// structural guard test. New `Color` fields added to `Theme` must be
-    /// added here too; non-color metadata (appearance, syntax, etc.) must not.
+    /// Mutable references to every `Color` field, in declaration order: the
+    /// authoritative list shared by `downsample_to_palette` and the structural
+    /// guard test. Non-color metadata must not be added here.
     pub fn color_fields_mut(&mut self) -> [&mut Color; 26] {
         [
             &mut self.background,
@@ -363,10 +338,8 @@ impl Theme {
         ]
     }
 
-    /// Convert every `Color::Rgb` field to the nearest xterm-256 palette index
-    /// (`Color::Indexed`). In-place. Idempotent: already-Indexed / named /
-    /// Reset colors are untouched. Use when the downstream transport mangles
-    /// 24-bit RGB escapes but handles 256-palette fine (e.g. Termius mosh).
+    /// Convert every `Color::Rgb` field to the nearest xterm-256 index, in place.
+    /// Idempotent. For transports that mangle 24-bit RGB but handle 256-palette.
     pub fn downsample_to_palette(&mut self) {
         for field in self.color_fields_mut() {
             *field = color_to_palette(*field);
@@ -424,19 +397,11 @@ mod tests {
 
     #[test]
     fn downsample_to_palette_converts_all_fields() {
-        // Structural guard: every Color field listed in `color_fields_mut`
-        // must survive downsampling without an Rgb left behind.
-        //
-        // Tradeoff vs the pre-PR version: that one cross-checked against
-        // the serialized field count, so a Color field added to Theme but
-        // missing from `downsample_to_palette` failed loud. Here the test
-        // is only as strong as `color_fields_mut`: if a new Color field is
-        // added to Theme but not to `color_fields_mut`, the downsample
-        // silently misses it and this test still passes. We accept that
-        // because `color_fields_mut` is the single source of truth for
-        // "what counts as a color field" (both downsample and the
-        // `default_matches_empire_toml` drift guard consume it), so the
-        // only way to drift is to forget two spots at once instead of one.
+        // Structural guard: every Color field listed in `color_fields_mut` must
+        // survive downsampling without an Rgb left behind. The test is only as
+        // strong as that list, which is accepted because it is the single source of
+        // truth for what counts as a color field (the `default_matches_empire_toml`
+        // drift guard consumes it too), so drifting means forgetting two spots.
         let mut theme = load_theme("empire");
         theme.downsample_to_palette();
         for color in theme.color_fields() {
@@ -525,22 +490,13 @@ mod tests {
 
     #[test]
     fn theme_attention_hierarchy_holds() {
-        // Visual hierarchy: Waiting is the most attention-grabbing state;
-        // fresh-idle sits one rung dimmer; decayed idle blends in. On dark
-        // backgrounds "more attention" means HIGHER perceived luminance;
-        // on light backgrounds it means LOWER (the warm hues read against
-        // the bright surface). The check picks the comparison direction
-        // off the theme's own background. Rec. 601 is good enough for a
-        // pairwise sanity check, not a formal contrast metric.
-        //
-        // Heuristic limit: a custom user theme with a mid-tone background
-        // (luminance near the 128 cutoff) could fall on the wrong side of
-        // the dark/light split and fail this assertion in surprising
-        // ways. That's intentional, the test guards every built-in
-        // registered in `BUILTIN_THEMES`, not arbitrary user themes loaded
-        // from `~/.config/agent-of-empires/themes/*.toml`. If a custom-theme
-        // contributor needs to bypass this, they should pick `fresh_idle`
-        // themselves rather than rely on the test to validate it.
+        // Visual hierarchy: Waiting grabs the most attention, fresh-idle one rung
+        // dimmer, decayed idle blends in. On dark backgrounds more attention means
+        // higher perceived luminance; on light backgrounds, lower. The comparison
+        // direction comes off the theme's own background; Rec. 601 is good enough
+        // for a pairwise sanity check. A custom theme with a mid-tone background
+        // could fall on the wrong side of the split, which is why this guards only
+        // the builtins in `BUILTIN_THEMES`.
         fn luminance(c: Color) -> f32 {
             match c {
                 Color::Rgb(r, g, b) => 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32,
@@ -572,9 +528,8 @@ mod tests {
             cmp("waiting", w, "fresh_idle", f);
             // Fresh-idle beats fully-decayed idle.
             cmp("fresh_idle", f, "idle", i);
-            // Unread sits between waiting and idle (Attention sort
-            // promoter from #2088). Its relationship to fresh_idle is
-            // intentionally unconstrained: themes may tie them.
+            // Unread sits between waiting and idle (#2088); its relationship to
+            // fresh_idle is intentionally unconstrained, so themes may tie them.
             cmp("waiting", w, "unread", u);
             cmp("unread", u, "idle", i);
         }

@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-//
-// Covers ToastProvider + ToastBusBridge: rendering info/error variants,
-// the auto-dismiss timer, manual dismiss, the empty state, the
-// service-worker push -> in-app toast path, and the clickable
-// session-jump toast.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
@@ -11,11 +6,7 @@ import { ToastBusBridge, ToastProvider } from "../Toasts";
 import { toastBus } from "../../lib/toastBus";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
 
-// jsdom ships no navigator.serviceWorker; the ToastProvider effect bails
-// out without one. Install a real EventTarget once at module load so the
-// SW push -> in-app toast path is exercised. It must stay installed across
-// the global RTL cleanup (test-setup.ts) because React's passive unmount
-// calls navigator.serviceWorker.removeEventListener.
+// jsdom ships no navigator.serviceWorker; the ToastProvider effect bails out without one.
 const swTarget = new EventTarget();
 Object.defineProperty(navigator, "serviceWorker", {
   value: swTarget,

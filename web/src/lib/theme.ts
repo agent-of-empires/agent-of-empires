@@ -1,9 +1,4 @@
-// Resolved theme types + runtime applicator. The server (Rust) owns
-// the projection from canonical TUI Theme -> CSS variables; this file
-// just consumes the typed payload from /api/themes/:name and applies
-// it on the root element via document.documentElement.style.setProperty,
-// then mirrors the payload into localStorage so the next page load
-// can paint the right palette before the React app hydrates.
+// Resolved theme types; applies the server's CSS variable projection to the root and caches it for the next cold paint.
 
 export type ThemeAppearance = "dark" | "light";
 
@@ -40,10 +35,7 @@ function writeCachedResolvedTheme(theme: ResolvedTheme): void {
   safeSetItem(STORAGE_KEY, JSON.stringify(theme));
 }
 
-// Apply the resolved theme to the document root. Uses setProperty
-// (not a dynamic <style> tag) so no CSP allowance is needed and
-// Tailwind v4 utilities that reference the same variable names
-// repaint immediately.
+// setProperty needs no CSP allowance and repaints Tailwind utilities immediately.
 export function applyResolvedTheme(theme: ResolvedTheme): void {
   const root = document.documentElement;
   for (const [name, value] of Object.entries(theme.web.cssVars)) {
@@ -58,9 +50,7 @@ export function applyResolvedTheme(theme: ResolvedTheme): void {
   writeCachedResolvedTheme(theme);
 }
 
-// Notification key used by the theme hook to broadcast theme changes
-// across components (e.g. shiki call sites re-render against the new
-// syntax theme without needing to subscribe to a context).
+// Lets Shiki call sites re-render on theme changes without a context.
 export const THEME_CHANGED_EVENT = "aoe:theme-changed";
 
 export function dispatchThemeChanged(theme: ResolvedTheme): void {

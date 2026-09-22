@@ -4,33 +4,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook } from "@testing-library/react";
 
 import { useMobileKeyboard } from "./useMobileKeyboard";
+import { stubMatchMedia } from "./__tests__/fixtures";
 
 type Listener = (...args: unknown[]) => void;
 
-// A minimal matchMedia stub that lets a test flip `pointer: coarse`.
-function stubMatchMedia(initialCoarse: boolean) {
-  let matches = initialCoarse;
-  const listeners = new Set<Listener>();
-  const mql = {
-    get matches() {
-      return matches;
-    },
-    media: "(pointer: coarse)",
-    addEventListener: (_: string, cb: Listener) => listeners.add(cb),
-    removeEventListener: (_: string, cb: Listener) => listeners.delete(cb),
-  };
-  window.matchMedia = vi.fn().mockReturnValue(mql) as unknown as typeof window.matchMedia;
-  return {
-    set(next: boolean) {
-      matches = next;
-      listeners.forEach((cb) => cb());
-    },
-    listenerCount: () => listeners.size,
-  };
-}
-
-// A controllable visualViewport. height is mutable; resize/scroll fire the
-// registered listeners synchronously.
 function stubVisualViewport(initialHeight: number) {
   const listeners = new Map<string, Set<Listener>>();
   const vv = {
@@ -65,13 +42,11 @@ let rafQueue: FrameRequestCallback[] = [];
 
 beforeEach(() => {
   rafQueue = [];
-  // Synchronous-but-controlled rAF so polling loops are drainable.
   vi.spyOn(window, "requestAnimationFrame").mockImplementation((cb: FrameRequestCallback) => {
     rafQueue.push(cb);
     return rafQueue.length;
   });
   vi.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {});
-  // Tall layout viewport; keyboard shrinks the visual viewport below it.
   Object.defineProperty(window, "innerHeight", { configurable: true, value: 800, writable: true });
   window.scrollTo = vi.fn();
 });
@@ -82,7 +57,6 @@ afterEach(() => {
   delete window.visualViewport;
 });
 
-// Drain the rAF poll queue a bounded number of times.
 function drainRaf(rounds = 30) {
   for (let i = 0; i < rounds && rafQueue.length > 0; i++) {
     const next = rafQueue.shift()!;
@@ -90,132 +64,74 @@ function drainRaf(rounds = 30) {
   }
 }
 
+function mountMobile(height = 800) {
+  stubMatchMedia(true, "(pointer: coarse)");
+  const vp = stubVisualViewport(height);
+  const hook = renderHook(() => useMobileKeyboard());
+  const resizeTo = (h: number) =>
+    act(() => {
+      vp.setHeight(h);
+      vp.fire("resize");
+      drainRaf();
+    });
+  return { ...hook, vp, resizeTo };
+}
+
 describe("useMobileKeyboard", () => {
   it("reports mobile from an initial coarse pointer", () => {
-    stubMatchMedia(true);
-    stubVisualViewport(800);
-    const { result } = renderHook(() => useMobileKeyboard());
-    expect(result.current.isMobile).toBe(true);
-    expect(result.current.keyboardOpen).toBe(false);
-    expect(result.current.keyboardHeight).toBe(0);
+    const { result } = mountMobile();
+    expect(result.current).toEqual({ isMobile: true, keyboardOpen: false, keyboardHeight: 0 });
   });
 
   it("is a no-op on the desktop (fine pointer) path", () => {
-    stubMatchMedia(false);
+    stubMatchMedia(false, "(pointer: coarse)");
     const ctl = stubVisualViewport(800);
     const { result } = renderHook(() => useMobileKeyboard());
     expect(result.current.isMobile).toBe(false);
-    // The viewport effect early-returns, so no resize/scroll listeners are wired.
-    expect(ctl.listenerCount("resize")).toBe(0);
-    expect(ctl.listenerCount("scroll")).toBe(0);
+    expect(ctl.listenerCount("resize") + ctl.listenerCount("scroll")).toBe(0);
   });
 
-  it("detects the keyboard opening and measures the bottom inset", () => {
-    stubMatchMedia(true);
-    const vp = stubVisualViewport(800);
-
-    const { result } = renderHook(() => useMobileKeyboard());
-    expect(result.current.keyboardOpen).toBe(false);
-
-    // Keyboard occludes 300px of the 800px viewport.
-    act(() => {
-      vp.setHeight(500);
-      vp.fire("resize");
-      drainRaf();
-    });
-
-    expect(result.current.keyboardOpen).toBe(true);
-    // padding = innerHeight(800) - vvHeight(500) - safeBottom(0) = 300
-    expect(result.current.keyboardHeight).toBe(300);
-  });
-
-  it("ignores a small URL-bar nudge (under the 100px threshold)", () => {
-    stubMatchMedia(true);
-    const vp = stubVisualViewport(800);
-
-    const { result } = renderHook(() => useMobileKeyboard());
-
-    act(() => {
-      vp.setHeight(760); // 40px occlusion, below the keyboard threshold
-      vp.fire("resize");
-      drainRaf();
-    });
-
-    expect(result.current.keyboardOpen).toBe(false);
-    expect(result.current.keyboardHeight).toBe(0);
-  });
-
-  it("flips back to closed when the keyboard is dismissed", () => {
-    stubMatchMedia(true);
-    const vp = stubVisualViewport(800);
-
-    const { result } = renderHook(() => useMobileKeyboard());
-
-    act(() => {
-      vp.setHeight(500);
-      vp.fire("resize");
-      drainRaf();
-    });
-    expect(result.current.keyboardOpen).toBe(true);
-
-    act(() => {
-      vp.setHeight(800);
-      vp.fire("resize");
-      drainRaf();
-    });
-    expect(result.current.keyboardOpen).toBe(false);
-    expect(result.current.keyboardHeight).toBe(0);
+  it("measures the keyboard inset, ignores a URL-bar nudge, and closes on dismiss", () => {
+    const { result, resizeTo } = mountMobile();
+    resizeTo(760);
+    expect(result.current).toMatchObject({ keyboardOpen: false, keyboardHeight: 0 });
+    resizeTo(500);
+    expect(result.current).toMatchObject({ keyboardOpen: true, keyboardHeight: 300 });
+    resizeTo(800);
+    expect(result.current).toMatchObject({ keyboardOpen: false, keyboardHeight: 0 });
   });
 
   it("starts polling when a text input gains focus", () => {
-    stubMatchMedia(true);
-    const vp = stubVisualViewport(800);
-
-    const { result } = renderHook(() => useMobileKeyboard());
-
+    const { result, vp } = mountMobile();
     const input = document.createElement("input");
     document.body.appendChild(input);
-
     act(() => {
       vp.setHeight(500);
       input.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
       drainRaf();
     });
-
     expect(result.current.keyboardOpen).toBe(true);
     input.remove();
   });
 
   it("becomes mobile when matchMedia later reports coarse, then clears on leaving", () => {
-    const mq = stubMatchMedia(false);
+    const mq = stubMatchMedia(false, "(pointer: coarse)");
     stubVisualViewport(800);
-
     const { result } = renderHook(() => useMobileKeyboard());
-    expect(result.current.isMobile).toBe(false);
-
     act(() => mq.set(true));
     expect(result.current.isMobile).toBe(true);
-
     act(() => mq.set(false));
-    expect(result.current.isMobile).toBe(false);
-    expect(result.current.keyboardOpen).toBe(false);
-    expect(result.current.keyboardHeight).toBe(0);
+    expect(result.current).toEqual({ isMobile: false, keyboardOpen: false, keyboardHeight: 0 });
   });
 
   it("removes all viewport listeners on unmount", () => {
-    stubMatchMedia(true);
-    const vp = stubVisualViewport(800);
+    stubMatchMedia(true, "(pointer: coarse)");
     const docRemove = vi.spyOn(document, "removeEventListener");
     const winRemove = vi.spyOn(window, "removeEventListener");
-
-    const { unmount } = renderHook(() => useMobileKeyboard());
-    expect(vp.listenerCount("resize")).toBe(1);
-    expect(vp.listenerCount("scroll")).toBe(1);
-
+    const { unmount, vp } = mountMobile();
+    expect([vp.listenerCount("resize"), vp.listenerCount("scroll")]).toEqual([1, 1]);
     unmount();
-
-    expect(vp.listenerCount("resize")).toBe(0);
-    expect(vp.listenerCount("scroll")).toBe(0);
+    expect([vp.listenerCount("resize"), vp.listenerCount("scroll")]).toEqual([0, 0]);
     expect(docRemove).toHaveBeenCalledWith("focusin", expect.any(Function));
     expect(winRemove).toHaveBeenCalledWith("orientationchange", expect.any(Function));
     expect(winRemove).toHaveBeenCalledWith("scroll", expect.any(Function));

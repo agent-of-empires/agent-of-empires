@@ -15,12 +15,8 @@ pub(super) type SessionIdentityBaseline = (
     crate::session::Status,
 );
 
-/// Merge a drained instance's captured identity back into live state, but only
-/// the identity fields and only if they are unchanged since the baseline. The
-/// daemon needs this field-level, baseline-guarded merge because it drops the
-/// shared async lock across `spawn_blocking`, so the live instance may have
-/// been mutated meanwhile. The single-threaded TUI re-inserts the whole
-/// instance instead (see `apply_session_id_updates`); keep the two in sync.
+/// Merge a drained instance's captured identity back into live state, but only the identity
+/// fields and only if they are unchanged since the baseline.
 pub(super) fn apply_drained_identity_if_unchanged(
     live: &mut Instance,
     drained: &Instance,
@@ -32,8 +28,6 @@ pub(super) fn apply_drained_identity_if_unchanged(
         live.agent_session_id = drained.agent_session_id.clone();
         live.omp_capture_generation = drained.omp_capture_generation.clone();
         // The drain also records the transcript path a Pi pane published.
-        // Guarded by the same sid baseline: the path names a conversation, so
-        // carrying it onto a row whose sid moved would pair two conversations.
         live.pi_session_path = drained.pi_session_path.clone();
         if live.resume_probe_failed_sid == *baseline_marker {
             live.resume_probe_failed_sid = drained.resume_probe_failed_sid.clone();
@@ -61,9 +55,8 @@ fn apply_poller_runtime_if_unchanged(
 }
 
 pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
-    // Drain poller observations into sessions.json so daemon-only sessions
-    // persist post-`/clear` sids (#2291). Snapshot + spawn_blocking + reapply,
-    // never holding AppState across the flock or tmux exec, per storage.rs:46.
+    // Drain poller observations into sessions.json so daemon-only sessions persist
+    // post-`/clear` sids.
     let snapshot = state.instances.read().await.clone();
     let file_watch = state.file_watch.clone();
     match tokio::task::spawn_blocking(move || {
@@ -85,14 +78,10 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
             })
             .collect();
         let mut snapshot = snapshot;
-        // Preserve a final queued observation before replacing a stopped
-        // worker. Repair runs afterward and binds to any generation the drain
-        // just made durable.
+        // Preserve a final queued observation before replacing a stopped worker.
         let outcome =
             crate::session::sync::drain_and_persist_session_ids(&mut snapshot, &file_watch);
-        // One observation for the whole repair walk, as on the TUI side: this
-        // visits every instance, so a per-item `list-sessions` fork scales with
-        // the store.
+        // One observation for the whole repair walk, as on the TUI side.
         let live = crate::tmux::LiveSessionSnapshot::new();
         let backoff_before = repair_backoffs(&snapshot);
         let runtime_changed: std::collections::HashSet<String> = snapshot
@@ -104,9 +93,7 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                     .then(|| inst.id.clone())
             })
             .collect();
-        // The walk ran on a clone: a deferral recorded there must reach the
-        // live row, or the next tick re-probes (and re-warns) as if nothing
-        // had been scheduled.
+        // The walk ran on a clone.
         let deferred = changed_repair_backoffs(&backoff_before, &snapshot);
         (outcome, snapshot, baseline, runtime_changed, deferred)
     })

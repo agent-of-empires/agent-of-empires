@@ -1,7 +1,5 @@
 //! ACP-specific request, response, and broadcast wire types shared by the
-//! structured view daemon and its clients. The session-list contract and its
-//! queue and attachment types live in crate::daemon so no-default clients use
-//! the same JSON shape as the server.
+//! structured view daemon and its clients.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -30,34 +28,19 @@ fn strip_transcript_path(event: &Event) -> Cow<'_, Event> {
 }
 
 /// One frame on the per-AppState structured view broadcast channel: the structured view
-/// session id plus the typed structured view Event. Subscribed WebSocket
-/// clients filter on the session id and serialise to JSON only at the
-/// WS write boundary; in-process consumers (status listener,
-/// acp_session_id listener) match on the typed enum directly so a
-/// rename of an `Event` variant breaks the build instead of silently
-/// breaking listener behaviour.
-///
-/// `Arc<Event>` so the broadcast clone-per-subscriber stays cheap even
-/// as the number of WS clients grows.
+/// session id plus the typed structured view Event.
 #[derive(Debug, Clone)]
 pub struct AcpBroadcastFrame {
     pub session_id: String,
     pub seq: u64,
     pub event: Arc<Event>,
     /// Which installed worker produced this frame, for in-process
-    /// consumers that must reject a replaced worker's queued frames.
-    /// `None` whenever no live worker authored it: a server-side publish,
-    /// a replay off the event log, or a frame parsed from the wire. The
-    /// field is deliberately absent from both serde impls below, so
-    /// provenance never leaves this process.
+    /// consumers that must reject a replaced worker's queued frames. Never serialized.
     pub worker_generation: Option<u64>,
 }
 
 impl Serialize for AcpBroadcastFrame {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // Custom impl so the wire format stays the same (untagged
-        // event JSON) without forcing every consumer to round-trip
-        // through serde_json::Value.
         use serde::ser::SerializeStruct;
         let mut s = serializer.serialize_struct("AcpBroadcastFrame", 3)?;
         s.serialize_field("session_id", &self.session_id)?;
@@ -69,9 +52,7 @@ impl Serialize for AcpBroadcastFrame {
 
 impl<'de> Deserialize<'de> for AcpBroadcastFrame {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // Mirror of the Serialize impl. Clients need to parse frames
-        // streamed over WebSocket, so the type round-trips through
-        // serde even though the server only emits it.
+        // Mirror of the Serialize impl.
         #[derive(Deserialize)]
         struct Wire {
             session_id: String,
@@ -89,18 +70,12 @@ impl<'de> Deserialize<'de> for AcpBroadcastFrame {
 }
 
 /// One attachment as the web composer uploads it: the raw base64 bytes
-/// inline in the prompt POST. This is the untrusted request shape; the
-/// server decodes it, sniffs the magic bytes, enforces size/MIME/count
-/// caps and the agent's capability gate, then maps it to an ACP
-/// `ContentBlock` for the agent and a metadata-only
-/// `PromptAttachmentRef` for replay. Bytes never reach the event log.
-/// See #1000 / #965.
+/// inline in the prompt POST.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptAttachmentUpload {
     pub kind: PromptAttachmentKind,
     pub mime_type: String,
-    /// Standard base64 (no `data:` URL prefix). The client strips the
-    /// prefix before sending.
+    /// Standard base64 (no `data:` URL prefix).
     pub data: String,
     #[serde(default)]
     pub name: Option<String>,
@@ -116,23 +91,12 @@ pub struct PromptRequest {
     pub attachments: Vec<PromptAttachmentUpload>,
     /// Optional client-minted stable id for this prompt, threaded into the
     /// emitted `Event::UserPromptSent` so a client can reconcile its
-    /// optimistic transcript row by id. Accepts either `prompt_id` or the
-    /// shorter `id` key; `#[serde(default)]` keeps clients that send neither
-    /// (today's behavior) working unchanged.
+    /// optimistic transcript row by id.
     #[serde(default, alias = "id")]
     pub prompt_id: Option<String>,
 }
 
 /// `POST /api/sessions/{id}/acp/prompt/diff-comments` body.
-///
-/// The "Send diff comments" dialog sends the structured review (so the
-/// transcript can re-render the rich card) alongside `assembled_markdown`,
-/// the exact WYSIWYG prompt the user approved in the preview. The server
-/// forwards `assembled_markdown` to the agent verbatim and records both
-/// in an `Event::UserDiffCommentsPrompt`. The frontend owns markdown
-/// assembly (sort, headings, code-fence sizing, repo prefixes); the
-/// server does not re-derive it, so the card payload and the agent-visible
-/// text can never disagree.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffCommentsPromptRequest {
@@ -149,22 +113,12 @@ pub struct ResolveApprovalRequest {
     pub decision: ApprovalDecisionWire,
     /// The `option_id` the user picked off the agent's own labels, for an
     /// approval the client rendered as an answer list (`Approval.choice`).
-    /// Omitted by trio-only clients; `decision` then picks by option kind,
-    /// as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub option_id: Option<String>,
 }
 
 /// PascalCase JSON variants (`Allow`, `AllowAlways`, `Deny`,
 /// `Cancelled`) matching the web frontend's approval flow.
-///
-/// `Cancelled` means "the user dismissed this without answering": it
-/// takes the resolver's cancellation path rather than being mapped onto
-/// an option, so it is the only safe way to dismiss an answer-list card
-/// (`Deny` would answer with the first reject-kind option). The daemon
-/// also synthesizes it when sweeping orphaned approvals on attach (see
-/// #1099), and it appears in `Event::ApprovalResolved` payloads
-/// broadcast back over WS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ApprovalDecisionWire {
@@ -199,31 +153,16 @@ impl From<ApprovalDecision> for ApprovalDecisionWire {
 /// `GET /api/sessions/{id}/acp/replay?since=N` query string.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ReplayQuery {
-    /// Last seq the client has applied. The endpoint returns frames
-    /// strictly newer than this. Defaults to 0 (full replay).
+    /// Last seq the client has applied.
     #[serde(default)]
     pub since: u64,
-    /// Max frames to return in this page. Omitted falls back to the
-    /// server's default page size; the server also clamps to a hard
-    /// max. Clients paginate by passing the previous response's
-    /// `next_cursor` back as `since` while `has_more` is true.
+    /// Max frames to return in this page.
     #[serde(default)]
     pub limit: Option<u64>,
-    /// Backward (older-first paging) cursor. When set, the endpoint
-    /// ignores `since` and returns the `limit` events with `seq < before`
-    /// that sit closest below `before`, in ascending order, so the client
-    /// can render recent-first and lazily page older history as the user
-    /// scrolls up. The tail (most recent page) is requested with
-    /// `before = u64::MAX`. `next_cursor` then carries the lowest seq of
-    /// the page, passed back as `before` for the next-older page while
-    /// `has_more` is true. Forward `since`/`limit` paging is unaffected.
+    /// Backward (older-first paging) cursor.
     #[serde(default)]
     pub before: Option<u64>,
-    /// Optional projection selector. Omitted (the default) returns the raw
-    /// `frames` shape every existing client relies on. `view=rows` folds the
-    /// SAME selected page through `TranscriptModel` and returns the built
-    /// `TranscriptRow[]` in `rows` instead of `frames`, with the same pagination
-    /// metadata.
+    /// Optional projection selector.
     #[serde(default)]
     pub view: Option<String>,
 }
@@ -231,48 +170,33 @@ pub struct ReplayQuery {
 /// `GET /api/sessions/{id}/acp/replay` response.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReplayResponse {
-    /// Frames the client missed, in publish order. Empty when the
-    /// client is already caught up.
+    /// Frames the client missed, in publish order.
     pub frames: Vec<AcpBroadcastFrame>,
     /// True when the requested `since` predates what's still in the
     /// buffer (the client missed events that have since been evicted).
-    /// Clients should treat the conversation log as truncated and
-    /// request a fresh start, e.g. by reloading.
     pub lost: bool,
     /// Highest seq the buffer has seen, even if it's been evicted.
-    /// Lets the client decide whether reloading is worth it.
     pub highest_seq: u64,
     /// Lowest seq still stored on disk for this session, or `None`
-    /// when no events have been recorded yet. Lets clients display the
-    /// retention window in status output and detect mid-flight prunes.
+    /// when no events have been recorded yet.
     #[serde(default)]
     pub lowest_seq: Option<u64>,
     /// Cursor to pass back as `since` for the next page: the highest
     /// seq this page consumed (including rows that failed to
     /// deserialise, so a corrupt row can't stall a paging loop).
-    /// `None` for an empty page. Only meaningful with `has_more`.
     #[serde(default)]
     pub next_cursor: Option<u64>,
     /// True when more events exist beyond this page within the store.
-    /// Clients keep paging (advancing `since` to `next_cursor`) while
-    /// this is set. Always false for an unbounded (`limit`-less) reply.
     #[serde(default)]
     pub has_more: bool,
     /// Present only when the request passed `view=rows`: the selected page
     /// of events folded through `TranscriptModel`, in place of the raw
-    /// `frames`. `frames` is empty in that case. Absent (skipped) for the
-    /// default projection, so the frames response byte-shape is unchanged
-    /// for clients that do not pass `view=rows`. Per-page folding cannot see
-    /// context from earlier pages, so a page whose `tool_start` sits in an
-    /// older page relies on `TranscriptModel`'s synth-on-missing-start (its
-    /// intended, already-implemented behavior).
+    /// `frames`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<Vec<crate::acp::transcript::TranscriptRow>>,
 }
 
-/// `GET /api/sessions/{id}/acp/files` response. Workspace file
-/// list for the composer's `@`-mention picker, walked from the
-/// session's project root and capped at 5000 entries.
+/// `GET /api/sessions/{id}/acp/files` response.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FilesResponse {
     /// Relative paths (POSIX-style), sorted.
@@ -284,9 +208,7 @@ pub struct FilesResponse {
 /// `GET /api/sessions/{id}/acp/context-primer?before_seq=N` query.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ContextPrimerQuery {
-    /// `seq` of the `SessionContextReset` event. The primer only
-    /// includes events with `seq < before_seq` so post-reset noise
-    /// (the reset notice itself, any subsequent prompts) stays out.
+    /// `seq` of the `SessionContextReset` event.
     pub before_seq: u64,
 }
 
@@ -294,21 +216,16 @@ pub struct ContextPrimerQuery {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ContextPrimerResponse {
     /// Rendered markdown primer ready to drop into the composer.
-    /// Empty string when there is no prior transcript to recap.
     pub primer: String,
     pub included_event_count: usize,
     pub included_turn_count: usize,
     /// True when older turns were dropped or the newest turn was
-    /// truncated within itself to fit the budget. Frontend can surface
-    /// this via a "transcript was abbreviated" hint.
+    /// truncated within itself to fit the budget.
     pub truncated: bool,
     pub max_chars: usize,
     /// The user's most recent `UserPromptSent` text WHEN the session
     /// ended in a non-success terminal state (rate-limit or startup
-    /// error). The prompt never reached the agent, so it does not
-    /// belong in the transcript recap; the frontend can drop it back
-    /// into the composer as the user's pending request. None for
-    /// normal recap cases. See #1281 / #1282.
+    /// error).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unprocessed_prompt: Option<String>,
 }
@@ -317,19 +234,13 @@ pub struct ContextPrimerResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SwitchAgentRequest {
     /// Registry key or configured custom ACP agent name (e.g.
-    /// `"codex"`, `"opencode"`, `"my-custom-bridge"`). Must be a built-in
-    /// registry agent or a custom agent with a valid `agent_acp_cmd`; an
-    /// unknown or unconfigured name returns 400.
+    /// `"codex"`, `"opencode"`, `"my-custom-bridge"`).
     pub target: String,
-    /// Optional model override forwarded to the new agent. None falls
-    /// back to the instance's existing `agent_model`.
+    /// Optional model override forwarded to the new agent.
     #[serde(default)]
     pub model: Option<String>,
     /// Why the switch happened, recorded verbatim in the `AgentSwitched`
-    /// event and surfaced in the transcript divider. The rate-limit
-    /// recovery flow sends `"rate_limited"`; an explicit user-initiated
-    /// switch (composer control, `aoe acp switch-agent`) sends
-    /// `"manual"`. Defaults to `"manual"` when omitted.
+    /// event and surfaced in the transcript divider.
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -340,15 +251,9 @@ pub struct SwitchAgentResponse {
     pub session_id: String,
     /// Registry key the session is now running.
     pub agent: String,
-    /// Highest seq BEFORE the AgentSwitched event was emitted. The
-    /// frontend uses this when fetching `/acp/context-primer` so
-    /// the primer recaps the prior backend's transcript without
-    /// including the handoff event itself.
+    /// Highest seq BEFORE the AgentSwitched event was emitted.
     pub before_seq: u64,
-    /// The seq the AgentSwitched event was assigned. The frontend
-    /// awaits the reducer reaching this seq before showing the
-    /// recovery composer prefill so the divider, state-clear, and
-    /// primer prefill all land in order.
+    /// The seq the AgentSwitched event was assigned.
     pub switch_seq: u64,
     /// Owned so the client side can deserialize the response (a
     /// `&'static str` field is not `DeserializeOwned`).
@@ -361,8 +266,6 @@ mod tests {
 
     #[test]
     fn prompt_request_defaults_attachments_when_absent() {
-        // Text-only clients (and the CLI/TUI structured view HTTP client) send
-        // `{"text":"..."}` with no attachments key; it must deserialise.
         let req: PromptRequest = serde_json::from_str(r#"{"text":"hello"}"#).unwrap();
         assert_eq!(req.text, "hello");
         assert!(req.attachments.is_empty());
@@ -370,8 +273,6 @@ mod tests {
 
     #[test]
     fn prompt_request_accepts_prompt_id_and_id_alias() {
-        // Absent -> None (today's behavior); either `prompt_id` or the short
-        // `id` key populates it.
         let cases: [(&str, Option<&str>); 3] = [
             (r#"{"text":"hi"}"#, None),
             (r#"{"text":"hi","prompt_id":"cmp-1"}"#, Some("cmp-1")),
@@ -410,8 +311,6 @@ mod tests {
         assert_eq!(back.session_id, "s-1");
         assert_eq!(back.seq, 42);
         assert!(matches!(*back.event, Event::ThinkingStarted));
-        // Worker provenance is in-process only: it must not reach the wire,
-        // and a frame parsed back from it carries no generation to trust.
         assert!(!json.contains("worker_generation"));
         assert_eq!(back.worker_generation, None);
     }
@@ -461,8 +360,6 @@ mod tests {
 
     #[test]
     fn switch_agent_request_optional_fields_default_to_none() {
-        // A bare body (the rate-limit recovery modal's original shape)
-        // still deserializes; model and reason are optional.
         let body = serde_json::json!({ "target": "codex" });
         let parsed: SwitchAgentRequest = serde_json::from_value(body).unwrap();
         assert_eq!(parsed.target, "codex");
@@ -479,9 +376,6 @@ mod tests {
 
     #[test]
     fn replay_query_defaults_limit_when_absent() {
-        // A pre-pagination client sends `{"since":N}` with no `limit`;
-        // the `#[serde(default)]` must keep it parsing (None = server
-        // default page).
         let query: ReplayQuery = serde_json::from_str(r#"{"since":42}"#).unwrap();
         assert_eq!(query.since, 42);
         assert_eq!(query.limit, None);
@@ -489,8 +383,6 @@ mod tests {
 
     #[test]
     fn replay_response_defaults_paging_fields_when_absent() {
-        // A pre-pagination response body has no `next_cursor`/`has_more`;
-        // newer clients must still deserialize it with sane defaults.
         let response: ReplayResponse =
             serde_json::from_str(r#"{"frames":[],"lost":false,"highest_seq":0,"lowest_seq":null}"#)
                 .unwrap();

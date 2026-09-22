@@ -1,23 +1,20 @@
 // @vitest-environment jsdom
-//
-// Render coverage for the QueuedPromptsStrip clear-boundary divider
-// (#1356). The strip lifts up a visual hint when the queued items will
-// fire as separate POSTs because one of them is a clear-command alias.
-
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
 import type { QueuedPrompt } from "../../lib/acpTypes";
-import { QueuedPromptsStrip } from "./StructuredView";
+import { QueuedPromptsStrip } from "./PromptStrips";
+
+afterEach(() => {
+  cleanup();
+});
 
 function mk(id: string, text: string): QueuedPrompt {
   return { id, text, queuedAt: "2026-05-21T00:00:00.000Z" };
 }
 
-// The clear-boundary hint reads server-owned `SessionResponse.clear_aliases`
-// (published through `AgentProfileProvider`), not the classifier profile, so
-// the test supplies them the way the server resolves them per agent.
+// Server-owned clear aliases per agent, as `SessionResponse.clear_aliases` resolves them.
 const SERVER_CLEAR_ALIASES: Record<string, string[]> = {
   claude: ["/clear"],
   codex: ["/new"],
@@ -45,177 +42,87 @@ function renderWithProfile(
   );
 }
 
-describe("QueuedPromptsStrip clear-boundary divider (#1356)", () => {
-  afterEach(() => {
-    cleanup();
-  });
-
-  it("renders a divider above a queued /clear under the claude profile", () => {
-    // Two-entry queue stays under the desktop visibleDefault=2 collapse
-    // threshold so both rows render without an expand click.
-    const { queryAllByTestId } = renderWithProfile("claude", [mk("a", "first"), mk("c", "/clear")]);
-    expect(queryAllByTestId("queued-clear-boundary")).toHaveLength(1);
-  });
-
-  it("renders a divider below a queued /clear when it leads the visible queue", () => {
-    const { queryAllByTestId } = renderWithProfile("claude", [mk("c", "/clear"), mk("b", "second")]);
-    expect(queryAllByTestId("queued-clear-boundary")).toHaveLength(1);
-  });
-
-  it("renders no divider when the queue contains no clear-command aliases", () => {
-    const { queryAllByTestId } = renderWithProfile("claude", [mk("a", "first"), mk("b", "second")]);
-    expect(queryAllByTestId("queued-clear-boundary")).toHaveLength(0);
+describe("QueuedPromptsStrip", () => {
+  // Two entries stay under the desktop collapse threshold, so both rows render.
+  it.each([
+    ["claude", ["first", "/clear"], 1],
+    ["claude", ["/clear", "second"], 1],
+    ["claude", ["first", "second"], 0],
+    ["claude", ["first", "/clear --hard"], 1],
+    ["codex", ["first", "/new"], 1],
+    // gemini has no clear aliases, so `/clear` text is not a boundary.
+    ["gemini", ["first", "/clear"], 0],
+  ])("%s queue %o renders %i clear-boundary dividers", (tool, texts, dividers) => {
+    const { queryAllByTestId } = renderWithProfile(
+      tool,
+      texts.map((t, i) => mk(String(i), t)),
+    );
+    expect(queryAllByTestId("queued-clear-boundary")).toHaveLength(dividers);
   });
 
   it("renders nothing when the queue is empty", () => {
-    const { container } = renderWithProfile("claude", []);
-    expect(container.firstChild).toBeNull();
+    expect(renderWithProfile("claude", []).container.firstChild).toBeNull();
   });
 
-  it("does not render a divider for an agent profile without clear aliases (gemini)", () => {
-    const { queryAllByTestId } = renderWithProfile("gemini", [mk("a", "first"), mk("c", "/clear")]);
-    // gemini's clearAliases are empty; even with `/clear` text in the
-    // queue, the strip should not show a boundary because the agent
-    // does not honour `/clear`.
-    expect(queryAllByTestId("queued-clear-boundary")).toHaveLength(0);
-  });
-
-  it("treats `/new` as a boundary under the codex profile", () => {
-    const { queryAllByTestId } = renderWithProfile("codex", [mk("a", "first"), mk("n", "/new")]);
-    expect(queryAllByTestId("queued-clear-boundary")).toHaveLength(1);
-  });
-
-  it("treats a `/clear` invocation with trailing args as a boundary", () => {
-    const { queryAllByTestId } = renderWithProfile("claude", [mk("a", "first"), mk("c", "/clear --hard")]);
-    expect(queryAllByTestId("queued-clear-boundary")).toHaveLength(1);
-  });
-
-  it("renders the Clear all button when the queue has more than one entry", () => {
-    const { getByRole } = renderWithProfile("claude", [mk("a", "first"), mk("b", "second")]);
-    expect(getByRole("button", { name: /clear all/i })).toBeTruthy();
-  });
-
-  it("omits the Clear all button when the queue has exactly one entry", () => {
-    const { queryByRole } = renderWithProfile("claude", [mk("a", "only")]);
-    expect(queryByRole("button", { name: /clear all/i })).toBeNull();
-  });
-});
-
-describe("QueuedPromptsStrip send-now affordance", () => {
-  afterEach(() => {
-    cleanup();
+  it.each([
+    [["only"], false],
+    [["first", "second"], true],
+  ])("Clear all for %o: %s", (texts, shown) => {
+    const { queryByRole } = renderWithProfile(
+      "claude",
+      texts.map((t, i) => mk(String(i), t)),
+    );
+    expect(queryByRole("button", { name: /clear all/i }) !== null).toBe(shown);
   });
 
   it("force-sends the row's prompt when Send now is clicked", () => {
     const sent: QueuedPrompt[] = [];
     const row = mk("a", "ship it");
-    const { getAllByTestId } = renderWithProfile("claude", [row], {
-      onSendNow: (p) => sent.push(p),
-      canSendNow: true,
-    });
-    fireEvent.click(getAllByTestId("queued-send-now")[0]);
+    const { getByTestId } = renderWithProfile("claude", [row], { onSendNow: (p) => sent.push(p) });
+    fireEvent.click(getByTestId("queued-send-now"));
     expect(sent).toEqual([row]);
   });
 
-  it("disables Send now when the session is down (worker stopped / disconnected)", () => {
-    const { getAllByTestId } = renderWithProfile("claude", [mk("a", "wait")], {
-      canSendNow: false,
-    });
-    expect((getAllByTestId("queued-send-now")[0] as HTMLButtonElement).disabled).toBe(true);
+  it("disables Send now when the session is down", () => {
+    const { getByTestId } = renderWithProfile("claude", [mk("a", "wait")], { canSendNow: false });
+    expect((getByTestId("queued-send-now") as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it("labels Send now as an interrupt while a non-steerable turn is running", () => {
-    const idle = renderWithProfile("claude", [mk("a", "go")], { sendNowInterrupts: false });
-    expect(idle.getAllByTestId("queued-send-now")[0].getAttribute("aria-label")).toBe("Send this queued message now");
-    cleanup();
-    const busy = renderWithProfile("claude", [mk("a", "go")], { sendNowInterrupts: true });
-    const btn = busy.getAllByTestId("queued-send-now")[0];
-    expect(btn.getAttribute("aria-label")).toContain("Stop the current turn");
-    // Still pressable while the turn runs: that is the whole point of the interrupt.
+  it.each([
+    [false, "Send this queued message now"],
+    [true, "Stop the current turn and send this queued message"],
+  ])("labels Send now (interrupts=%s) and keeps it pressable", (sendNowInterrupts, label) => {
+    const btn = renderWithProfile("claude", [mk("a", "go")], { sendNowInterrupts }).getByTestId("queued-send-now");
+    expect(btn.getAttribute("aria-label")).toBe(label);
     expect((btn as HTMLButtonElement).disabled).toBe(false);
   });
-});
 
-describe("QueuedPromptRow attachment indicator (#1833)", () => {
-  afterEach(() => {
-    cleanup();
-  });
-
-  const withImage: QueuedPrompt = {
-    id: "img",
-    text: "look at this",
-    queuedAt: "2026-05-21T00:00:00.000Z",
-    attachments: [
-      {
-        kind: "image",
-        mimeType: "image/png",
-        dataB64: "aA==",
-        name: "shot.png",
-      },
-    ],
-  };
-
-  it("renders a thumbnail for an image attachment on a queued row", () => {
+  it("renders a thumbnail for an image attachment and no strip for text-only rows", () => {
+    const withImage: QueuedPrompt = {
+      ...mk("img", "look at this"),
+      attachments: [{ kind: "image", mimeType: "image/png", dataB64: "aA==", name: "shot.png" }],
+    };
     const { getByTestId, getByAltText } = renderWithProfile("claude", [withImage]);
     expect(getByTestId("queued-attachments")).toBeTruthy();
-    const img = getByAltText("shot.png") as HTMLImageElement;
-    expect(img.src).toContain("data:image/png;base64,aA==");
-  });
-
-  it("renders no attachment strip for a text-only queued row", () => {
-    const { queryByTestId } = renderWithProfile("claude", [mk("a", "plain text")]);
-    expect(queryByTestId("queued-attachments")).toBeNull();
-  });
-});
-
-describe("QueuedPromptRow expanded-state bounds (#1642)", () => {
-  afterEach(() => {
+    expect((getByAltText("shot.png") as HTMLImageElement).src).toContain("data:image/png;base64,aA==");
     cleanup();
+    expect(renderWithProfile("claude", [mk("a", "plain text")]).queryByTestId("queued-attachments")).toBeNull();
   });
 
-  // A multi-thousand-char paste: trips isQueuedPromptLong (>160 chars) so
-  // the row gets the clamp + "…" affordance.
-  const hugePaste = "lorem ipsum ".repeat(500);
-
-  it("clamps a long collapsed prompt and offers the expand affordance", () => {
-    const { getByTitle, getByRole } = renderWithProfile("claude", [mk("a", hugePaste)]);
+  it("clamps a long prompt, then bounds the expanded text in a scroll box with the toggle outside it", () => {
+    const { getByTitle, getByRole } = renderWithProfile("claude", [mk("a", "lorem ipsum ".repeat(500))]);
     const textButton = getByTitle("Click to edit");
     expect(textButton.className).toContain("line-clamp-3");
-    // `block` must NOT co-exist with `line-clamp-3`: its `display:block`
-    // wins the cascade over line-clamp's `-webkit-box` and silently kills
-    // the clamp, rendering the whole paste. See #1642.
+    // `block` would override line-clamp's -webkit-box display and render the whole paste.
     expect(textButton.className.split(/\s+/)).not.toContain("block");
-    // Collapsed affordance is the "…" toggle.
-    expect(getByRole("button", { name: "Show full queued prompt" })).toBeTruthy();
-  });
 
-  it("bounds the expanded prompt to a scrollable box so it cannot grow the strip", () => {
-    const { getByTitle, getByRole } = renderWithProfile("claude", [mk("a", hugePaste)]);
     fireEvent.click(getByRole("button", { name: "Show full queued prompt" }));
-
-    // Clamp is gone once expanded.
-    const textButton = getByTitle("Click to edit");
-    expect(textButton.className).not.toContain("line-clamp-3");
-
-    // The text now lives inside a height-capped, scrollable wrapper, so a
-    // huge paste scrolls in place instead of pushing the composer off-screen.
-    const box = textButton.parentElement as HTMLElement;
+    expect(getByTitle("Click to edit").className).not.toContain("line-clamp-3");
+    const box = getByTitle("Click to edit").parentElement as HTMLElement;
     expect(box.className).toContain("max-h-48");
     expect(box.className).toContain("overflow-y-auto");
-  });
-
-  it("keeps the Show less toggle outside the scrollable region so it stays reachable", () => {
-    const { getByTitle, getByRole } = renderWithProfile("claude", [mk("a", hugePaste)]);
-    fireEvent.click(getByRole("button", { name: "Show full queued prompt" }));
-
-    const collapseToggle = getByRole("button", {
-      name: "Collapse queued prompt",
-    });
+    const collapseToggle = getByRole("button", { name: "Collapse queued prompt" });
     expect(collapseToggle.textContent).toBe("Show less");
-
-    // The toggle must be a sibling of the capped box, not a descendant of
-    // it; otherwise it would scroll away with the paste and get buried.
-    const box = getByTitle("Click to edit").parentElement as HTMLElement;
     expect(box.contains(collapseToggle)).toBe(false);
   });
 });

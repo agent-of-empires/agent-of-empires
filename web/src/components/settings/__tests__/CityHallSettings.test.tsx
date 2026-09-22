@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-//
-// Contract test for the CityHall export panel. The panel is the only settings
-// surface that hands an admin a file to carry to another system, so what matters
-// is that nothing is offered before a bundle exists, that a failed export
-// surfaces the server's reason rather than a blank pane, and that the download
-// really carries the fetched bytes.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, waitFor } from "@testing-library/react";

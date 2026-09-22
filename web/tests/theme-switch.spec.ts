@@ -1,11 +1,4 @@
-// Theme picker repaint coverage (issue #1189).
-//
-// These tests intercept the /api/themes/:name and /api/theme/current
-// endpoints with canned ResolvedTheme payloads and assert that the
-// dashboard's runtime CSS variable application path actually paints
-// the requested palette. Without these, a regression in
-// useResolvedTheme / applyResolvedTheme / the pre-React bootstrap
-// would only surface in manual QA.
+// #1189: resolved theme payloads repaint the dashboard's CSS variables.
 
 import { test, expect, waitForResponseBody, observeFor } from "./helpers/mockedTest";
 
@@ -113,7 +106,6 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
   test("useResolvedTheme applies fetched theme on mount", async ({ page }) => {
     await stubTheme(page, { dracula: dracula() }, dracula());
     await page.goto("/");
-    // Allow the hook's mount-time fetch + apply to land.
     await expect.poll(() => readCssVar(page, "--color-surface-900")).toBe("#282a36");
     const fg = await readCssVar(page, "--color-text-primary");
     expect(fg).toBe("#f8f8f2");
@@ -139,8 +131,7 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
     await page.goto("/");
     await expect.poll(() => readCssVar(page, "--color-surface-900")).toBe("#0f172a");
 
-    // Settings.tsx would normally fire this after the user picks a
-    // theme. Exercise the same event the picker dispatches.
+    // The event the picker dispatches.
     await page.evaluate(() => {
       window.dispatchEvent(
         new CustomEvent("aoe:theme-picker-changed", {
@@ -163,13 +154,8 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
   });
 
   test("pre-React bootstrap paints cached theme before hydration", async ({ page }) => {
-    // Goal: verify the static /theme-bootstrap.js path executes and
-    // applies the cached payload BEFORE useResolvedTheme's fetch
-    // lands. To make the assertion specific to the bootstrap (and
-    // not the React-side apply), stub /api/theme/current to never
-    // resolve — only the bootstrap can have set dataset.theme. Also
-    // listen for `securitypolicyviolation` so a CSP regression on
-    // the bootstrap source fails the test loudly. Review on PR #1197.
+    // The cached payload must paint from /theme-bootstrap.js before React; /api/theme/current never resolves, and a CSP
+    // violation (an inlined bootstrap) fails the test (#1197).
     const violations: string[] = [];
     page.on("console", (msg) => {
       const t = msg.text();
@@ -179,8 +165,6 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
     });
     await page.addInitScript(() => {
       document.addEventListener("securitypolicyviolation", (ev) => {
-        // Surface as console.error so the .on("console") listener
-        // above catches it.
         console.error(
           "CSP violation:",
           (ev as SecurityPolicyViolationEvent).violatedDirective,
@@ -191,21 +175,15 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
     await page.addInitScript((cached) => {
       localStorage.setItem("aoe-resolved-theme", JSON.stringify(cached));
     }, dracula());
-    // Hang the React-side fetch so dataset.theme can only have come
-    // from the bootstrap.
     await page.route("**/api/theme/current", () => {
-      // Intentionally never call route.fulfill / route.continue: the
-      // fetch hangs until the page closes.
+      // Never fulfilled.
     });
     await page.route("**/api/themes/*", () => {
-      // Same here for the picker-event path.
+      // Never fulfilled.
     });
 
     await page.goto("/");
 
-    // Bootstrap runs synchronously in <head> before React mounts,
-    // so dataset.theme + --color-surface-900 should be visible
-    // immediately after navigation.
     await expect
       .poll(() => readCssVar(page, "--color-surface-900"), {
         timeout: 1500,
@@ -215,9 +193,6 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
     const dataTheme = await page.evaluate(() => document.documentElement.dataset.theme);
     expect(dataTheme).toBe("dracula");
 
-    // CSP regression check: the bootstrap must load successfully.
-    // If `src="/theme-bootstrap.js"` ever gets reverted to an inline
-    // <script>, the strict CSP fires `securitypolicyviolation`.
     expect(violations).toEqual([]);
   });
 
@@ -226,21 +201,13 @@ test.describe("Theme picker runtime palette swap (#1189)", () => {
     await page.goto("/");
     await expect.poll(() => readCssVar(page, "--color-surface-900")).toBe("#282a36");
 
-    // The body's background-color resolves through Tailwind's
-    // `background: var(--color-surface-900)`. After applyResolvedTheme,
-    // the body should compute to Dracula's bg (RGB 40, 42, 54).
+    // Dracula's surface-900 is rgb(40, 42, 54).
     const bg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
-    // rgb(40, 42, 54) -> "rgb(40, 42, 54)" or "rgba(40, 42, 54, 1)"
     expect(bg).toMatch(/40,\s*42,\s*54/);
   });
 
   test("slow mount fetch does not overwrite a faster picker pick", async ({ page }) => {
-    // Regression test for the in-flight ordering bug: if the user
-    // picks Dracula while the mount-time /api/theme/current is still
-    // pending, the eventual mount response (Empire) used to win the
-    // last-write race. useResolvedTheme now tags each fetch with a
-    // monotonic seq and discards responses older than the last
-    // applied one. Hold the mount until the picker palette is visible.
+    // A pick made while the mount-time fetch is pending must win; stale responses are discarded by sequence.
     const empire: ResolvedThemePayload = {
       name: "empire",
       source: "builtin",

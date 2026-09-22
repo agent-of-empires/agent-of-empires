@@ -1,22 +1,12 @@
 import { test, expect } from "./helpers/mockedTest";
+import { mockStructuredSessionApis, openStructuredViewFor } from "./helpers/structuredSessionMocks";
 import { devices, type Page } from "@playwright/test";
-import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 
-// Mobile keyboard regression for the structured-view composer (#2011).
-//
-// On iOS regular Safari the layout viewport does NOT shrink when the soft
-// keyboard opens (interactive-widget=resizes-content is Chromium/Android only,
-// and dvh does not track the iOS keyboard), so the composer footer was left
-// pinned to the full-height bottom edge, hidden behind the keyboard. The fix
-// reserves `keyboardHeight` as bottom padding on the structured-view root so
-// the chat viewport absorbs the shrink and the composer rises above the
-// keyboard. On platforms where innerHeight shrinks with the keyboard (iOS PWA,
-// iOS 26 Safari, Android Chrome) `keyboardHeight` is 0, so the reservation is a
-// no-op and the existing dvh path is untouched.
-//
-// We render the structured view in mocked mode (one running ACP session, no
-// live agent) and drive the iOS keyboard by overriding visualViewport, the
-// same technique as mobile-keyboard.spec.ts.
+// #2011: on iOS regular Safari the layout viewport does not shrink when the
+// soft keyboard opens, so the composer footer stayed pinned behind it. The fix
+// reserves `keyboardHeight` as bottom padding on the structured-view root. Where
+// innerHeight does shrink (iOS PWA, iOS 26 Safari, Android Chrome) that height
+// is 0 and the dvh path is untouched.
 
 test.use({ ...devices["iPhone 13"] });
 
@@ -24,75 +14,10 @@ const SESSION_ID = "sess-acp-kbd";
 const TITLE = "acp-kbd";
 
 async function setup(page: Page) {
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
-  for (const path of [
-    "settings",
-    "themes",
-    "agents",
-    "profiles",
-    "groups",
-    "devices",
-    "docker/status",
-    "about",
-    "system/update-status",
-  ]) {
-    await page.route(`**/api/${path}`, (r) =>
-      r.fulfill({
-        json:
-          path === "docker/status" || path === "about" || path === "settings" || path === "system/update-status"
-            ? {}
-            : [],
-      }),
-    );
-  }
-  await page.route("**/api/sessions", (r) => {
-    if (r.request().method() === "POST") return r.fulfill({ status: 400 });
-    return r.fulfill({
-      json: {
-        sessions: [
-          {
-            id: SESSION_ID,
-            title: TITLE,
-            project_path: "/tmp/acp-kbd",
-            group_path: "/tmp",
-            tool: "claude",
-            status: "Running",
-            yolo_mode: false,
-            created_at: new Date().toISOString(),
-            last_accessed_at: null,
-            last_error: null,
-            branch: null,
-            main_repo_path: null,
-            is_sandboxed: false,
-            has_terminal: true,
-            profile: "default",
-            workspace_repos: [],
-            view: "structured",
-            acp_worker_state: "running",
-            claude_fullscreen: false,
-          },
-        ],
-        workspace_ordering: [],
-      },
-    });
-  });
-  await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
-  await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
-  await page.routeWebSocket(/\/sessions\/[^/]+\/ws(\?|$)/, () => {});
-  await page.routeWebSocket(/\/sessions\/[^/]+\/acp\/ws/, () => {});
+  await mockStructuredSessionApis(page, { id: SESSION_ID, title: TITLE, projectPath: "/tmp/acp-kbd" });
 }
 
-async function openStructuredSession(page: Page) {
-  await page.goto("/");
-  await expect(page.locator("header")).toBeVisible();
-  // On a mobile viewport the sidebar is collapsed behind a toggle; open it
-  // before the session link is reachable.
-  await openMobileSidebar(page);
-  await clickSidebarSession(page, TITLE);
-  await expect(page.getByTestId("structured-view-root")).toBeVisible({
-    timeout: 10000,
-  });
-}
+const openStructuredSession = (page: Page) => openStructuredViewFor(page, TITLE);
 
 // Override visualViewport.height (and optionally innerHeight) to mimic the soft
 // keyboard, then fire the resize the hook listens for.

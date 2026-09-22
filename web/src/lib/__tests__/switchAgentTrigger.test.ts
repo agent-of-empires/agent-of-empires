@@ -26,7 +26,6 @@ function captureDispatch(): () => OpenSwitchAgentDetail[] {
 }
 
 afterEach(() => {
-  // Drain any latch left over so tests stay independent.
   consumePendingSwitchAgent("s1");
   consumePendingSwitchAgent("s2");
 });
@@ -42,14 +41,12 @@ describe("requestSwitchAgent", () => {
   it("stashes the request so a later consume for the same id wins", () => {
     requestSwitchAgent("s1");
     expect(consumePendingSwitchAgent("s1")).toBe(true);
-    // Latch is one-shot: a second consume returns false.
     expect(consumePendingSwitchAgent("s1")).toBe(false);
   });
 
   it("does not satisfy a consume for a different session", () => {
     requestSwitchAgent("s1");
     expect(consumePendingSwitchAgent("s2")).toBe(false);
-    // The original latch is still pending for s1.
     expect(consumePendingSwitchAgent("s1")).toBe(true);
   });
 

@@ -1,33 +1,9 @@
 /* eslint-disable no-control-regex -- this file's whole job is to match ESC sequences */
-// ANSI SGR parser for Bash tool output and the live terminal view.
-//
-// claude-agent-acp forwards `\x1b[...m` color escapes from commands
-// like `git status --color=always` and `gls --color=always`. Shiki's
-// bash grammar treats them as raw text, so the user sees literal
-// `[01;34m` noise unless we render them ourselves. Agents also emit
-// `\x1b]8;;URL\x1b\TEXT\x1b]8;;\x1b\` OSC 8 hyperlinks (e.g. `gh pr
-// create` output); there is no xterm here to interpret those, so
-// without this parser they show up as literal escape bytes (#3519).
-//
-// One pass walks every escape sequence in order, carrying the SGR style
-// and the open hyperlink target as a single state. Text between sequences
-// becomes a segment stamped with that state, so there are no string
-// coordinates for two passes to disagree about.
-//
-// Carriage-return repaints are collapsed first, because that is a
-// line-oriented rewrite that needs no coordinate agreement.
+// ANSI SGR and OSC 8 hyperlink parser for tool output and the live terminal. One pass carries style and link target as a single state.
 
-// Any CSI sequence: ESC [ params final-byte (any letter).
 const ANY_CSI = /\[[\d;?]*[a-zA-Z]/g;
 
-// Every escape sequence this parser understands, in one alternation so a
-// single walk sees them in the order they appear:
-//   1-2: CSI params + final byte. `m` is SGR; every other final byte is
-//        cursor movement, line erase and the like, dropped.
-//   3-4: OSC code + payload, terminated by BEL or ST (`ESC \`). Code 8
-//        carries `params;URI` and opens or closes a hyperlink; every other
-//        code (title sets, OSC 52 clipboard) is dropped whole, payload
-//        included, because none of it is meant to render.
+// CSI (`m` is SGR, other final bytes dropped) or OSC terminated by BEL/ST (code 8 is a hyperlink, other codes dropped with their payload).
 const TOKEN = /\[([\d;?]*)([a-zA-Z])|\]([0-9]+)(?:;([^\x07]*))?(?:\\|\x07)/g;
 
 export interface AnsiStyle {
@@ -43,25 +19,16 @@ export interface AnsiStyle {
 export interface AnsiSegment {
   text: string;
   style: AnsiStyle;
-  /** Hyperlink target when this span fell inside an OSC 8 sequence. */
   url?: string;
 }
 
-/** Everything an escape sequence can leave in effect past the end of a
- *  line: tmux emits a reset only when the style changes, and a hyperlink
- *  legitimately spans lines, so a per-line parse must thread both. */
+/** What can outlive a line: tmux resets style only on change, and links span lines. */
 export interface AnsiState {
   style: AnsiStyle;
-  /** Target of a hyperlink still open at this point, if any. */
   url?: string;
 }
 
-// Match a real escape sequence, not just an `ESC [` or `ESC ]` prefix. A
-// markdown blob that quotes the literal characters "[" — e.g. agent
-// docs about color output — would otherwise trip the ANSI fast path, find
-// nothing to style, and render as a plain `<pre>` instead of going through
-// Shiki for highlighting. Output whose only sequence is a hyperlink counts:
-// it has no color code, and skipping it here leaks the escape bytes.
+// A real sequence, not just a quoted `ESC [` prefix, so markdown still reaches Shiki. Hyperlink-only output counts.
 const HAS_ANSI = /\[[\d;?]*[a-zA-Z]|\][0-9]+(?:;[^\x07]*)?(?:\\|\x07)/;
 
 export function hasAnsi(text: string): boolean {
@@ -72,20 +39,12 @@ export function stripAnsi(text: string): string {
   return text.replace(ANY_CSI, "");
 }
 
-/** Collapse `\r` repaints: within each `\n`-separated line, drop
- *  everything before the last `\r` so progress bars show their
- *  final state instead of a concatenated history. CRLF line endings
- *  are preserved (a bare `\r` immediately before `\n` carries no
- *  redraw payload, and stripping it would corrupt Windows-emitted
- *  output). */
+/** Keep only the text after the last `\r` in each line so progress bars show their final state; CRLF is preserved. */
 export function collapseCarriageReturns(text: string): string {
   if (text.indexOf("\r") < 0) return text;
   return text
     .split("\n")
     .map((line) => {
-      // Strip a trailing `\r` (the leftover half of `\r\n`) before
-      // looking for redraw markers, then re-attach if no redraw was
-      // present so multi-line CRLF text round-trips unchanged.
       const hadCrlf = line.endsWith("\r");
       const body = hadCrlf ? line.slice(0, -1) : line;
       const idx = body.lastIndexOf("\r");
@@ -95,7 +54,7 @@ export function collapseCarriageReturns(text: string): string {
     .join("\n");
 }
 
-/** Standard ANSI 16-color palette (VS Code dark+ approximation). */
+/** Standard 16-color palette (VS Code dark+ approximation). */
 const FG: Record<number, string> = {
   30: "#000000",
   31: "#cd3131",
@@ -133,7 +92,6 @@ const BG: Record<number, string> = {
   107: "#ffffff",
 };
 
-/** xterm 256-color palette → CSS color. */
 function palette256(n: number): string {
   if (n < 16) {
     const ordered = [
@@ -168,14 +126,12 @@ function palette256(n: number): string {
 }
 
 function applySgr(style: AnsiStyle, params: number[]): AnsiStyle {
-  // ESC[m / ESC[0m → full reset. Treat empty params as 0.
   if (params.length === 0) return {};
   const next: AnsiStyle = { ...style };
   let i = 0;
   while (i < params.length) {
     const c = params[i];
     if (c === 0) {
-      // Reset all
       for (const k of Object.keys(next) as (keyof AnsiStyle)[]) {
         delete next[k];
       }
@@ -221,7 +177,7 @@ function applySgr(style: AnsiStyle, params: number[]): AnsiStyle {
       next.bg = BG[c];
       i++;
     } else if (c === 38 || c === 48) {
-      // Extended color: 38;5;n (256-color) or 38;2;r;g;b (truecolor).
+      // 38;5;n (256-color) or 38;2;r;g;b (truecolor).
       const target: "fg" | "bg" = c === 38 ? "fg" : "bg";
       const mode = params[i + 1];
       if (mode === 5) {
@@ -234,26 +190,20 @@ function applySgr(style: AnsiStyle, params: number[]): AnsiStyle {
         i++;
       }
     } else {
-      // Unknown / unsupported (e.g. 53 overline) — skip.
       i++;
     }
   }
   return next;
 }
 
-/** Parse `text` into styled segments, starting from the escape state
- *  `initial` leaves in effect and reporting the state left at the end.
- *  This is the resumable core behind [`parseAnsi`]: a color or an open
- *  hyperlink legitimately spans lines, so a per-line parse cache must
- *  thread both through explicitly. */
+/** Resumable core of [`parseAnsi`], threading style and link state across lines. */
 export function parseAnsiFrom(text: string, initial: AnsiState): { segs: AnsiSegment[]; exit: AnsiState } {
   const clean = collapseCarriageReturns(text);
   const segs: AnsiSegment[] = [];
   let last = 0;
   let style: AnsiStyle = { ...initial.style };
   let url = initial.url;
-  // A dropped sequence (cursor movement, a title set) leaves the state
-  // untouched, so the text on either side of it is one span rather than two.
+  // A dropped sequence leaves the state untouched, so surrounding text stays one span.
   let restyled = true;
   const emit = (chunk: string) => {
     if (chunk.length === 0) return;
@@ -270,7 +220,6 @@ export function parseAnsiFrom(text: string, initial: AnsiState): { segs: AnsiSeg
     emit(clean.slice(last, idx));
     last = idx + m[0].length;
     if (m[2] !== undefined) {
-      // CSI: SGR restyles, every other final byte is dropped.
       if (m[2] !== "m") continue;
       const raw = m[1] ?? "";
       style = applySgr(style, raw === "" ? [] : raw.split(";").map((n) => Number(n)));
@@ -280,10 +229,7 @@ export function parseAnsiFrom(text: string, initial: AnsiState): { segs: AnsiSeg
     if (m[3] !== "8") continue;
     const payload = m[4] ?? "";
     const sep = payload.indexOf(";");
-    // OSC 8 carries `params;URI`. An empty URI closes the link; a second
-    // open before a close (malformed input) retargets rather than nests.
-    // An open with no close runs to the end of the parsed text, so a frame
-    // cut mid-link still shows its visible text.
+    // An empty URI closes the link; a second open retargets; an unclosed link runs to the end.
     url = (sep >= 0 ? payload.slice(sep + 1) : "") || undefined;
     restyled = true;
   }
@@ -291,7 +237,6 @@ export function parseAnsiFrom(text: string, initial: AnsiState): { segs: AnsiSeg
   return { segs, exit: { style, url } };
 }
 
-/** Parse a string with ANSI escape sequences into styled segments. */
 export function parseAnsi(text: string): AnsiSegment[] {
   return parseAnsiFrom(text, { style: {} }).segs;
 }

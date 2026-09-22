@@ -1,23 +1,28 @@
 // @vitest-environment jsdom
-//
-// Wiring contract for the rate-limit recovery buttons. StructuredView
-// passes `onSwitchAgent={() => setRecoveryOpen(true)}` and the only way
-// the user reaches the SwitchAgentModal from here is by clicking the handoff
-// button SystemNotices conditionally renders below the rate-limit banner. The
-// same banner now also exposes the same-agent Resume now callback.
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { RateLimitRecoverySection, SystemNotices } from "./SystemNotices";
 
-import { SystemNotices } from "./StructuredView";
+vi.mock("../../lib/api", () => ({
+  fetchAcpAgents: vi.fn(),
+  switchAcpAgent: vi.fn(),
+  fetchContextPrimer: vi.fn(),
+}));
+
+import { fetchAcpAgents, switchAcpAgent, fetchContextPrimer } from "../../lib/api";
 
 afterEach(() => {
   cleanup();
 });
 
-function mount(overrides?: Partial<React.ComponentProps<typeof SystemNotices>>) {
-  const manualReconnect = vi.fn();
-  const props: React.ComponentProps<typeof SystemNotices> = {
+const LIMITED = { status: "limited", resets_at: "2099-01-01T00:00:00Z", kind: "rate_limit" };
+const PARIS = "Internal error: You've hit your weekly limit · resets 4am (Europe/Paris)";
+
+type NoticeProps = React.ComponentProps<typeof SystemNotices>;
+
+function noticeProps(overrides?: Partial<NoticeProps>): NoticeProps {
+  return {
     status: "open",
     lagged: false,
     rateLimit: null,
@@ -27,227 +32,107 @@ function mount(overrides?: Partial<React.ComponentProps<typeof SystemNotices>>) 
     retryCount: 0,
     retryCountdown: 0,
     maxRetries: 7,
-    manualReconnect,
+    manualReconnect: vi.fn(),
     ...overrides,
   };
-  return { manualReconnect, ...render(<SystemNotices {...props} />) };
 }
 
-describe("SystemNotices auto-resume status (#3514)", () => {
-  const rateLimit = { status: "limited", resets_at: "2099-01-01T00:00:00Z", kind: "rate_limit" };
+const mount = (overrides?: Partial<NoticeProps>) => render(<SystemNotices {...noticeProps(overrides)} />);
 
-  it("says the park ends by itself when auto-resume is armed", () => {
-    const { getByText } = mount({ rateLimit, rateLimitAutoResume: true });
-    expect(getByText(/Auto-resume is armed/)).toBeDefined();
+describe("SystemNotices", () => {
+  it("renders nothing for a healthy session", () => {
+    expect(mount().container.firstChild).toBeNull();
   });
 
-  it("says auto-resume is off and how to recover when it is not", () => {
-    const { getByText } = mount({ rateLimit, rateLimitAutoResume: false });
-    expect(getByText(/Auto-resume is off for this profile/)).toBeDefined();
+  it.each([
+    [true, /Auto-resume is armed/],
+    [false, /Auto-resume is off for this profile/],
+    // Unknown: claim nothing.
+    [undefined, null],
+  ])("auto-resume %s", (rateLimitAutoResume, expected) => {
+    const { queryByText } = mount({ rateLimit: LIMITED, rateLimitAutoResume });
+    if (expected) expect(queryByText(expected)).not.toBeNull();
+    else expect(queryByText(/Auto-resume/)).toBeNull();
   });
 
-  it("claims nothing about auto-resume when the caller does not know", () => {
-    const { queryByText } = mount({ rateLimit });
-    expect(queryByText(/Auto-resume/)).toBeNull();
-  });
-});
-
-describe("SystemNotices rate-limit handoff", () => {
-  it("renders the switch-agent button only when rateLimit + handler are set", () => {
-    const onSwitchAgent = vi.fn();
-    const onResumeRateLimit = vi.fn();
-    const { getByRole, queryByRole, rerender } = mount({
-      rateLimit: {
-        status: "limited",
-        resets_at: "2099-01-01T00:00:00Z",
-        kind: "rate_limit",
-      },
-      onSwitchAgent,
-      onResumeRateLimit,
-    });
-    const button = getByRole("button", { name: /continue in another agent/i });
-    expect(button).toBeDefined();
-    expect(getByRole("button", { name: /resume now/i })).toBeDefined();
-
-    // Re-render with onSwitchAgent unset; button should disappear.
-    rerender(
-      <SystemNotices
-        status="open"
-        lagged={false}
-        rateLimitRetriesExhausted={false}
-        rateLimit={{
-          status: "limited",
-          resets_at: "2099-01-01T00:00:00Z",
-          kind: "rate_limit",
-        }}
-        hasEverOpened
-        reconnecting={false}
-        retryCount={0}
-        retryCountdown={0}
-        maxRetries={7}
-        manualReconnect={vi.fn()}
-      />,
-    );
-    expect(queryByRole("button", { name: /continue in another agent/i })).toBeNull();
-  });
-
-  // #3152: with a reported reset the banner shows the clock. Without one it
-  // must show what the agent said instead of a fabricated time.
-  it("renders the reset clock only when the agent reported one", () => {
-    const { getByText, queryByText, rerender } = mount({
-      rateLimit: {
-        status: "Internal error: You've hit your weekly limit · resets 4am (Europe/Paris)",
-        resets_at: "2099-01-01T09:30:00Z",
-        kind: "rate_limit",
-      },
-    });
-    const expected = new Date("2099-01-01T09:30:00Z").toLocaleTimeString();
-    expect(getByText(`Rate-limited (rate_limit); resets at ${expected}.`)).toBeDefined();
-
-    rerender(
-      <SystemNotices
-        status="open"
-        lagged={false}
-        rateLimitRetriesExhausted={false}
-        rateLimit={{
-          status: "Internal error: You've hit your weekly limit · resets 4am (Europe/Paris)",
-          resets_at: null,
-          kind: "rate_limit",
-        }}
-        hasEverOpened
-        reconnecting={false}
-        retryCount={0}
-        retryCountdown={0}
-        maxRetries={7}
-        manualReconnect={vi.fn()}
-      />,
-    );
-    expect(
-      getByText("Rate-limited (rate_limit); You've hit your weekly limit · resets 4am (Europe/Paris)"),
-    ).toBeDefined();
-    expect(queryByText(/resets at \d/)).toBeNull();
-  });
-
-  // An unparseable reset is the same story as none at all: show what the
-  // agent said, never "Invalid Date". See #3152.
-  it("falls back to the agent's wording when the reported reset is unparseable", () => {
-    const { getByText, queryByText } = mount({
-      rateLimit: {
-        status: "Internal error: You've hit your weekly limit · resets 4am (Europe/Paris)",
-        resets_at: "not-a-timestamp",
-        kind: "rate_limit",
-      },
-    });
-    expect(
-      getByText("Rate-limited (rate_limit); You've hit your weekly limit · resets 4am (Europe/Paris)"),
-    ).toBeDefined();
-    expect(queryByText(/Invalid Date/)).toBeNull();
-  });
-
-  // The connection-end path (`classify_rate_limit_from_message`) puts the whole
-  // error Display string in `status`, transport prefix and the raw
-  // `{"errorKind":"rate_limit"}` fingerprint included, and that path never has
-  // a reported reset. The banner must not render the JSON payload. See #3152.
-  it("strips transport prefixes and the JSON fingerprint from the agent's wording", () => {
-    const { getByText, queryByText } = mount({
-      rateLimit: {
+  // Without a parseable reset, the banner shows the agent's own wording, never a made-up clock.
+  it.each([
+    [
+      "a reported reset",
+      { status: PARIS, resets_at: "2099-01-01T09:30:00Z" },
+      `Rate-limited (rate_limit); resets at ${new Date("2099-01-01T09:30:00Z").toLocaleTimeString()}.`,
+    ],
+    [
+      "no reset",
+      { status: PARIS, resets_at: null },
+      "Rate-limited (rate_limit); You've hit your weekly limit · resets 4am (Europe/Paris)",
+    ],
+    [
+      "an unparseable reset",
+      { status: PARIS, resets_at: "not-a-timestamp" },
+      "Rate-limited (rate_limit); You've hit your weekly limit · resets 4am (Europe/Paris)",
+    ],
+    [
+      "transport prefixes and a JSON fingerprint",
+      {
         status:
           'ACP connection failed: Internal error: You\'ve hit your limit · resets 12:10pm (Europe/Paris): {\n  "errorKind":"rate_limit"\n}',
         resets_at: null,
-        kind: "rate_limit",
       },
-    });
-    expect(getByText("Rate-limited (rate_limit); You've hit your limit · resets 12:10pm (Europe/Paris)")).toBeDefined();
-    expect(queryByText(/errorKind/)).toBeNull();
-    expect(queryByText(/ACP connection failed/)).toBeNull();
+      "Rate-limited (rate_limit); You've hit your limit · resets 12:10pm (Europe/Paris)",
+    ],
+    [
+      "only a fingerprint",
+      { status: '{"errorKind":"rate_limit"}', resets_at: null },
+      "Rate-limited (rate_limit); the agent did not report a reset time.",
+    ],
+  ])("words the rate limit for %s", (_label, limit, expected) => {
+    const { getByText, container } = mount({ rateLimit: { ...limit, kind: "rate_limit" } });
+    expect(getByText(expected)).toBeDefined();
+    expect(container.textContent).not.toMatch(/Invalid Date|errorKind|ACP connection failed/);
+    if (!expected.includes("resets at")) expect(container.textContent).not.toMatch(/resets at \d/);
   });
 
-  // Nothing but the fingerprint: there is no wording to show, so say so rather
-  // than leaving a dangling "Rate-limited (rate_limit); ".
-  it("falls back to a sentence when the status carries no wording at all", () => {
-    const { getByText } = mount({
-      rateLimit: { status: '{"errorKind":"rate_limit"}', resets_at: null, kind: "rate_limit" },
-    });
-    expect(getByText("Rate-limited (rate_limit); the agent did not report a reset time.")).toBeDefined();
-  });
+  it("shows both recovery actions only with a rate limit and their handlers", () => {
+    const onSwitchAgent = vi.fn();
+    const onResumeRateLimit = vi.fn();
+    const { getByRole, queryByRole, rerender } = mount({ rateLimit: LIMITED, onSwitchAgent, onResumeRateLimit });
+    fireEvent.click(getByRole("button", { name: /continue in another agent/i }));
+    fireEvent.click(getByRole("button", { name: /resume now/i }));
+    expect(onSwitchAgent).toHaveBeenCalledTimes(1);
+    expect(onResumeRateLimit).toHaveBeenCalledTimes(1);
 
-  it("hides the switch-agent button when rateLimit is null", () => {
-    const { queryByRole } = mount({
-      reconnecting: true,
-      status: "connecting",
-      retryCount: 1,
-      retryCountdown: 3,
-      onSwitchAgent: vi.fn(),
-      onResumeRateLimit: vi.fn(),
-    });
+    rerender(<SystemNotices {...noticeProps({ rateLimit: LIMITED })} />);
+    expect(queryByRole("button", { name: /continue in another agent/i })).toBeNull();
+
+    rerender(
+      <SystemNotices
+        {...noticeProps({
+          reconnecting: true,
+          status: "connecting",
+          retryCount: 1,
+          retryCountdown: 3,
+          onSwitchAgent,
+          onResumeRateLimit,
+        })}
+      />,
+    );
     expect(queryByRole("button", { name: /continue in another agent/i })).toBeNull();
     expect(queryByRole("button", { name: /resume now/i })).toBeNull();
   });
 
-  it("invokes onSwitchAgent on click", () => {
-    const onSwitchAgent = vi.fn();
-    const { getByRole } = mount({
-      rateLimit: {
-        status: "limited",
-        resets_at: "2099-01-01T00:00:00Z",
-        kind: "rate_limit",
-      },
-      onSwitchAgent,
-    });
-    fireEvent.click(getByRole("button", { name: /continue in another agent/i }));
-    expect(onSwitchAgent).toHaveBeenCalledTimes(1);
-  });
-
-  it("invokes onResumeRateLimit on click", () => {
-    const onResumeRateLimit = vi.fn();
-    const { getByRole } = mount({
-      rateLimit: {
-        status: "limited",
-        resets_at: "2099-01-01T00:00:00Z",
-        kind: "rate_limit",
-      },
-      onResumeRateLimit,
-    });
-    fireEvent.click(getByRole("button", { name: /resume now/i }));
-    expect(onResumeRateLimit).toHaveBeenCalledTimes(1);
-  });
-
-  it("disables Resume now while retrying", () => {
-    const { getByRole } = mount({
-      rateLimit: {
-        status: "limited",
-        resets_at: "2099-01-01T00:00:00Z",
-        kind: "rate_limit",
-      },
-      onResumeRateLimit: vi.fn(),
-      rateLimitResumeState: "retrying",
-    });
-    const button = getByRole("button", { name: /resuming/i }) as HTMLButtonElement;
-    expect(button.disabled).toBe(true);
-  });
-
-  it("keeps Resume now disabled after a successful resume request", () => {
-    const { getByRole, getByText } = mount({
-      rateLimit: {
-        status: "limited",
-        resets_at: "2099-01-01T00:00:00Z",
-        kind: "rate_limit",
-      },
-      onResumeRateLimit: vi.fn(),
-      rateLimitResumeState: "ok",
-    });
-    const button = getByRole("button", { name: /resume requested/i }) as HTMLButtonElement;
-    expect(button.disabled).toBe(true);
-    expect(getByText(/Resume requested\. New events should start streaming shortly/i)).toBeDefined();
+  it.each([
+    ["retrying", /resuming/i, null],
+    ["ok", /resume requested/i, /Resume requested\. New events should start streaming shortly/i],
+  ] as const)("disables Resume while %s", (rateLimitResumeState, name, note) => {
+    const { getByRole, queryByText } = mount({ rateLimit: LIMITED, onResumeRateLimit: vi.fn(), rateLimitResumeState });
+    expect((getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(true);
+    if (note) expect(queryByText(note)).not.toBeNull();
   });
 
   it("shows failed resume feedback while retaining both actions", () => {
     const { getByRole, getByText } = mount({
-      rateLimit: {
-        status: "limited",
-        resets_at: "2099-01-01T00:00:00Z",
-        kind: "rate_limit",
-      },
+      rateLimit: LIMITED,
       onResumeRateLimit: vi.fn(),
       onSwitchAgent: vi.fn(),
       rateLimitResumeState: "failed",
@@ -258,38 +143,66 @@ describe("SystemNotices rate-limit handoff", () => {
     expect(getByRole("button", { name: /continue in another agent/i })).toBeDefined();
   });
 
-  it("renders nothing for a healthy session", () => {
-    const { container } = mount();
-    expect(container.firstChild).toBeNull();
-  });
-
-  // #3688: the state a real cap park reaches. `Stopped` does not clear
-  // `rate_limit` in the server fold, so the adapter snapshot from the last
-  // rejection is still there and both recovery buttons render alongside the
-  // give-up note. Mounting without the snapshot would assert a combination
-  // the daemon never produces.
-  it("shows the auto-resume stopped note with both recovery paths still offered", () => {
-    const onSwitchAgent = vi.fn();
-    const onResumeRateLimit = vi.fn();
-    const { getByText, getByRole } = mount({
-      rateLimitRetriesExhausted: true,
-      rateLimit: { status: "limited", resets_at: "2099-01-01T00:00:00Z", kind: "usage" },
-      onSwitchAgent,
-      onResumeRateLimit,
-    });
-    expect(getByText(/Auto-resume stopped: the same prompt was re-sent too many times/i)).toBeDefined();
-    expect(getByRole("button", { name: /resume now/i })).toBeDefined();
-    expect(getByRole("button", { name: /continue in another agent/i })).toBeDefined();
-  });
-
-  // The park outlives the snapshot only after a resume clears it, and the
-  // note must survive that on its own so the banner does not vanish.
-  it("shows the note with no rate-limit snapshot, without recovery buttons", () => {
+  // `Stopped` does not clear `rate_limit` server-side, so a cap park keeps the snapshot and both buttons.
+  it.each([
+    [{ status: "limited", resets_at: "2099-01-01T00:00:00Z", kind: "usage" }, true],
+    [null, false],
+  ])("shows the auto-resume stopped note (snapshot %o)", (rateLimit, buttons) => {
     const { getByText, queryByRole } = mount({
       rateLimitRetriesExhausted: true,
+      rateLimit,
+      onSwitchAgent: vi.fn(),
       onResumeRateLimit: vi.fn(),
     });
     expect(getByText(/Auto-resume stopped: the same prompt was re-sent too many times/i)).toBeDefined();
-    expect(queryByRole("button", { name: /resume now/i })).toBeNull();
+    expect(queryByRole("button", { name: /resume now/i }) !== null).toBe(buttons);
+    expect(queryByRole("button", { name: /continue in another agent/i }) !== null).toBe(buttons);
+  });
+});
+
+describe("RateLimitRecoverySection", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fetchAcpAgents).mockResolvedValue([
+      { name: "claude", description: "Claude", command: "claude-agent-acp" },
+      { name: "codex", description: "OpenAI Codex", command: "codex-acp" },
+    ]);
+    vi.mocked(switchAcpAgent).mockResolvedValue({
+      session_id: "s-1",
+      agent: "codex",
+      before_seq: 5,
+      switch_seq: 6,
+      status: "switched",
+    });
+    vi.mocked(fetchContextPrimer).mockResolvedValue({
+      primer: "ctx",
+      included_event_count: 1,
+      included_turn_count: 1,
+      truncated: false,
+      max_chars: 4_000,
+      unprocessed_prompt: "deploy",
+    });
+  });
+
+  it("opens the modal from the children trigger, forwards the handoff prefill, and closes", async () => {
+    const onPrefill = vi.fn();
+    const { findByText, getByText, queryByText } = render(
+      <RateLimitRecoverySection sessionId="s-1" currentAgent="claude" onPrefill={onPrefill}>
+        {({ onSwitchAgent }) => (
+          <button type="button" onClick={onSwitchAgent}>
+            handoff
+          </button>
+        )}
+      </RateLimitRecoverySection>,
+    );
+    expect(queryByText(/Continue in another agent\?/i)).toBeNull();
+    fireEvent.click(getByText("handoff"));
+    await findByText(/Continue in another agent\?/i);
+    fireEvent.click(await findByText(/Continue in codex/));
+    await waitFor(() => expect(onPrefill).toHaveBeenCalledTimes(1));
+    const prefilled = onPrefill.mock.calls[0]?.[0] as string;
+    expect(prefilled).toContain("CONTEXT HANDOFF");
+    expect(prefilled).toContain("deploy");
+    await waitFor(() => expect(queryByText(/Continue in another agent\?/i)).toBeNull());
   });
 });

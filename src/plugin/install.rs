@@ -18,14 +18,12 @@ use super::lockfile::{LockedPlugin, Lockfile};
 use super::registry::ValidationState;
 use super::source::PluginSource;
 
-/// Build output goes to the CLI terminal or a dashboard job log.
 pub enum OperationLog {
     Inherit,
     File(std::fs::File),
 }
 
 impl OperationLog {
-    /// Open an append log; newly created Unix files use mode 0600.
     pub fn file(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -44,7 +42,6 @@ impl OperationLog {
         Ok(OperationLog::File(file))
     }
 
-    /// Write one host-side progress line.
     fn line(&self, msg: &str) {
         match self {
             OperationLog::Inherit => eprintln!("{msg}"),
@@ -54,7 +51,6 @@ impl OperationLog {
         }
     }
 
-    /// Route child stdout and stderr to the selected destination.
     fn child_stdio(&self) -> Result<(Stdio, Stdio)> {
         match self {
             OperationLog::Inherit => Ok((Stdio::inherit(), Stdio::inherit())),
@@ -67,8 +63,6 @@ impl OperationLog {
     }
 }
 
-/// Set the enabled flag for a known plugin id in the global config, then reload
-/// the registry so the change takes effect.
 pub fn set_enabled(plugin_id: &str, enabled: bool) -> Result<()> {
     let registry = super::registry();
     if registry.get(plugin_id).is_none() {
@@ -79,30 +73,14 @@ pub fn set_enabled(plugin_id: &str, enabled: bool) -> Result<()> {
     Ok(())
 }
 
-/// Where a live enable/disable landed, so the caller can tell the user
-/// whether a running daemon's workers actually reconciled.
 #[derive(Debug)]
 pub enum LiveToggle {
-    /// A running daemon applied the change: config written and its plugin
-    /// host reconciled, so a worker launched or stopped immediately.
     Daemon,
-    /// No daemon is running; the change was written to config locally.
     Local,
-    /// A daemon appears to be running but the toggle could not go through it
-    /// (unreachable, read-only, auth). The change was written locally, so the
-    /// daemon's workers keep their old state until it restarts or the plugin
-    /// is toggled from the dashboard.
     LocalDaemonStale { reason: String },
 }
 
-/// [`set_enabled`], but routed through a running local daemon when there is
-/// one. `set_enabled` alone only rewrites config and this process's registry;
-/// a live daemon would keep a disabled plugin's worker running (and never
-/// launch an enabled one) until restart. The daemon's own handler does the
-/// same config write plus a worker reconcile, so prefer it whenever it is up.
 pub async fn set_enabled_live(plugin_id: &str, enabled: bool) -> Result<LiveToggle> {
-    // Validate against the local registry first so an unknown id fails the
-    // same way with or without a daemon.
     if super::registry().get(plugin_id).is_none() {
         bail!("unknown plugin {plugin_id:?}; see `aoe plugin list`");
     }
@@ -120,8 +98,6 @@ pub async fn set_enabled_live(plugin_id: &str, enabled: bool) -> Result<LiveTogg
     .await;
     match daemon_result {
         Ok(()) => {
-            // The daemon wrote config to disk; refresh this process's
-            // registry from it rather than writing again.
             super::reload_registry();
             Ok(LiveToggle::Daemon)
         }
@@ -134,22 +110,13 @@ pub async fn set_enabled_live(plugin_id: &str, enabled: bool) -> Result<LiveTogg
     }
 }
 
-/// Whether a running daemon picked up a plugin's changed tree.
 #[derive(Debug)]
 pub enum LiveRestart {
-    /// A running daemon reloaded the plugin and replaced its worker.
     Daemon,
-    /// No daemon runs plugin workers (none running, or a read-only one); the
-    /// next daemon launches the new build.
     NoDaemon,
-    /// A daemon appears to be running but the request failed (unreachable,
-    /// auth, or a daemon too old for the endpoint), so its worker keeps the
-    /// previous build until it restarts.
     DaemonStale { reason: String },
 }
 
-/// Ask a running local daemon to reload `plugin_id` after an update replaced
-/// its tree. Its plugin host otherwise keeps supervising the old worker.
 pub async fn restart_worker_live(plugin_id: &str) -> LiveRestart {
     let Ok(endpoint) = crate::acp::client::discovery::discover_local() else {
         return LiveRestart::NoDaemon;
@@ -178,24 +145,15 @@ fn enable_in_config(plugin_id: &str, enabled: bool) -> Result<()> {
     })
 }
 
-/// What an install or update did, for the caller to report.
 #[derive(Debug)]
 pub struct InstallReport {
     pub id: String,
     pub version: String,
-    /// Capabilities the manifest declares.
     pub capabilities: Vec<String>,
-    /// Whether the plugin is granted and live after the operation.
     pub granted: bool,
-    /// Resolved trust / validation provenance, for the success output.
     pub validation: ValidationState,
 }
 
-/// Resolve the display validation for a just-installed plugin, mirroring
-/// `registry::validation_for`: a featured-verified source is `Featured`, any
-/// other `gh:` source is `Community`, and a local directory is `Local`. The
-/// content hash is already verified upstream (`featured_verified`), so this maps
-/// from that decision rather than re-hashing the tree.
 fn install_validation(featured_verified: bool, source: &str) -> ValidationState {
     if featured_verified {
         ValidationState::Featured
@@ -206,27 +164,15 @@ fn install_validation(featured_verified: bool, source: &str) -> ValidationState 
     }
 }
 
-/// How an update treats a version that would need fresh consent (changed
-/// capabilities, build recipe, or UI slots).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsentMode {
-    /// Prompt the user (the manual `aoe plugin update` path).
     Interactive,
-    /// Apply only a "clean" update that needs no new consent; skip anything that
-    /// would (the opt-in startup auto-update sweep). Never prompts, never runs a
-    /// changed build step or installs a changed capability/UI set unattended.
     CleanOnlyNonInteractive,
 }
 
-/// The result of an update attempt.
 #[derive(Debug)]
 pub enum UpdateOutcome {
-    /// The update was applied (the tree was replaced and the lockfile rewritten).
     Applied(InstallReport),
-    /// A `CleanOnlyNonInteractive` update was skipped because it needs consent;
-    /// the prior version stays installed and active. `fingerprint` identifies the
-    /// skipped version so a caller (the auto-update sweep) can compare it to the
-    /// user's recorded dismissal and avoid re-nagging.
     Skipped {
         id: String,
         reason: String,
@@ -234,126 +180,72 @@ pub enum UpdateOutcome {
     },
 }
 
-/// One dashboard UI slot a plugin contributes to, in a consent disclosure.
 #[derive(Debug, Clone, Serialize)]
 pub struct UiView {
     pub slot: String,
     pub id: String,
 }
 
-/// The structured disclosure an in-app (web / TUI) update approval renders. The
-/// same payload the terminal prompt describes, so every surface consents to the
-/// identical change. `fingerprint` pins the exact content the user is approving
-/// (the source tree plus any release-binary asset and the trust class), so
-/// `apply_update` can refuse if the remote moved since this was shown.
 #[derive(Debug, Clone, Serialize)]
 pub struct UpdateConsent {
     pub id: String,
     pub from_version: String,
     pub to_version: String,
-    /// Capabilities currently granted (the prior approval).
     pub prior_capabilities: Vec<String>,
-    /// Capabilities the new manifest declares.
     pub new_capabilities: Vec<String>,
-    /// Capabilities present in the new set but not the prior one.
     pub added_capabilities: Vec<String>,
-    /// Capabilities present in the prior set but not the new one.
     pub removed_capabilities: Vec<String>,
-    /// The dashboard UI slots the new version contributes to.
     pub ui: Vec<UiView>,
-    /// Build commands the new version will run, unsandboxed, at apply time.
     pub build_steps: Vec<String>,
-    /// A human description when the worker runtime kind changes (e.g. a script
-    /// becomes a downloaded release binary), else `None`.
     pub runtime_change: Option<String>,
-    /// The plugin was a verified featured plugin and the update no longer is.
     pub trust_downgrade: bool,
-    /// Content fingerprint of the version being approved.
     pub fingerprint: String,
-    /// Whether declining keeps the current version active (always true for the
-    /// in-app path, which never touches the tree on decline).
     pub stays_active_if_declined: bool,
-    /// What changed between the installed version and this one, for the user to
-    /// review before approving. Best-effort; empty or unavailable on any fetch
-    /// failure.
     pub changelog: UpdateChangelog,
 }
 
-/// What a non-interactive update preview found for one installed plugin.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UpdatePreview {
-    /// The remote matches the installed content; nothing to do.
     NoUpdate,
-    /// A newer version that needs no fresh consent; still returned to the UI for
-    /// review so the user sees the changelog before applying.
     SafeUpdate {
         to_version: String,
         fingerprint: String,
         changelog: UpdateChangelog,
     },
-    /// A newer version that expands access (capabilities, build steps, UI,
-    /// runtime, or trust) and must be explicitly approved. `dismissed` is set
-    /// when the user already declined this exact fingerprint. Boxed because the
-    /// consent payload dwarfs the other variants.
     ConsentRequired {
         consent: Box<UpdateConsent>,
         dismissed: bool,
     },
 }
 
-/// Everything an install needs after fetching and validating, before any
-/// consent decision or filesystem mutation. Computing this in one place is what
-/// lets the CLI prompt and the in-app preview/apply flow stay in lockstep, the
-/// same split `Prepared` gives the update path.
 struct PreparedInstall {
-    /// Persisted source string for a later `update`.
     persisted_source: String,
-    /// The install is off the audited-release default path (an explicit `@ref`
-    /// or a no-release default-branch fallback).
     unverified: bool,
-    /// One line stating what is being installed.
     notice: String,
     fetched: FetchedPlugin,
     featured_verified: bool,
     id: String,
     capabilities: Vec<String>,
     manifest_hash: String,
-    /// Content fingerprint of the fetched version (tree + release asset + trust).
     fingerprint: String,
     validation: ValidationState,
 }
 
-/// The structured disclosure an in-app (web / TUI) install approval renders, the
-/// same data the terminal prompt prints. `fingerprint` pins the exact content
-/// being approved so `apply_install` refuses if the remote moved since this was
-/// shown.
 #[derive(Debug, Clone, Serialize)]
 pub struct InstallConsent {
     pub id: String,
     pub version: String,
-    /// Persisted source slug (`gh:owner/repo[@ref]`).
     pub source: String,
-    /// One line stating what is being installed (resolved release, ref, etc).
     pub notice: String,
-    /// The source is off the audited-release default path (explicit ref or a
-    /// no-release default-branch fallback); the dashboard warns on it.
     pub unverified: bool,
-    /// Resolved trust class (featured / community / local).
     pub validation: String,
-    /// Capabilities the manifest declares (each needs a grant).
     pub capabilities: Vec<String>,
-    /// Dashboard UI slots the plugin contributes to.
     pub ui: Vec<UiView>,
-    /// Build commands the plugin will run, unsandboxed, at install time.
     pub build_steps: Vec<String>,
-    /// Content fingerprint of the version being approved.
     pub fingerprint: String,
 }
 
-/// Resolve, fetch, and validate an install candidate without touching the
-/// installed tree. Network-only. The caller decides consent (CLI prompt or web
-/// preview/apply) and then calls [`apply_prepared_install`].
 async fn prepare_install(input: &str) -> Result<PreparedInstall> {
     let source = PluginSource::parse(input)?;
     let resolved = resolve_source(source, true).await?;
@@ -393,9 +285,6 @@ async fn prepare_install(input: &str) -> Result<PreparedInstall> {
     })
 }
 
-/// Move the fetched tree into place, build it, and persist the grant, config,
-/// and lockfile. Consent is already decided by the caller; build output goes to
-/// `log`. A failed build leaves nothing behind.
 fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<InstallReport> {
     let final_dir = super::plugins_dir()?.join(&p.id);
     if final_dir.exists() {
@@ -412,16 +301,10 @@ fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<Ins
     ));
     move_into_place(&p.fetched, &final_dir)?;
     if let Err(e) = build_in_place(&p.id, &final_dir, &p.fetched.manifest, log) {
-        // A failed build must not leave a half-installed tree behind; nothing
-        // is persisted to config or the lockfile, so removing the directory
-        // returns the host to its pre-install state.
         let _ = std::fs::remove_dir_all(&final_dir);
         return Err(e);
     }
 
-    // Persist config and lockfile together; if either fails, roll the install
-    // back so a half-written config/lock and an untracked tree do not block
-    // retries with "already installed" or leave the two out of sync.
     let persisted = (|| -> Result<()> {
         persist_install(
             &p.persisted_source,
@@ -451,8 +334,6 @@ fn apply_prepared_install(p: &PreparedInstall, log: &OperationLog) -> Result<Ins
     })
 }
 
-/// Install an external plugin from `input` (`gh:owner/repo[@ref]` or a local
-/// dir). Prompts once for the manifest's capabilities unless `assume_yes`.
 pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
     let prepared = prepare_install(input).await?;
     eprintln!("{}", prepared.notice);
@@ -478,10 +359,6 @@ pub async fn install(input: &str, assume_yes: bool) -> Result<InstallReport> {
     apply_prepared_install(&prepared, &OperationLog::Inherit)
 }
 
-/// Classify an install candidate for an in-app approval without installing it:
-/// the dashboard "what would this install do" probe. Network-only. Restricted
-/// to `gh:` sources so a browser request never makes the daemon read an
-/// arbitrary local path; local installs stay on the CLI.
 pub async fn preview_install(input: &str) -> Result<InstallConsent> {
     if !input.starts_with("gh:") {
         bail!("web install supports gh: sources only; use `aoe plugin install` for a local path");
@@ -513,11 +390,6 @@ pub async fn preview_install(input: &str) -> Result<InstallConsent> {
     })
 }
 
-/// Apply an install previewed in-app, granting whatever the fetched manifest
-/// declares. `expected_fingerprint` pins the exact content the user approved: if
-/// the remote moved since the preview, this refuses rather than installing
-/// something the user never saw. Build output goes to `log`. `gh:` only, like
-/// [`preview_install`].
 pub async fn apply_install(
     input: &str,
     expected_fingerprint: &str,
@@ -535,54 +407,30 @@ pub async fn apply_install(
     apply_prepared_install(&prepared, log)
 }
 
-/// Re-fetch an installed external plugin from its recorded source, prompting on
-/// a changed capability set (the manual `aoe plugin update` path). A changed
-/// capability set re-prompts; until re-approved the plugin's contributions stay
-/// inactive (the grant no longer covers the installed manifest).
 pub async fn update(id: &str) -> Result<InstallReport> {
     match update_with_consent(id, ConsentMode::Interactive).await? {
         UpdateOutcome::Applied(report) => Ok(report),
-        // Interactive mode prompts rather than skipping, so this is unreachable;
-        // map it to an error rather than panicking if that ever changes.
         UpdateOutcome::Skipped { id, reason, .. } => {
             bail!("update for {id} was skipped unexpectedly: {reason}")
         }
     }
 }
 
-/// Re-fetch an installed external plugin and apply it only if it needs no new
-/// consent (the opt-in startup auto-update sweep). Returns whether it was
-/// applied or skipped; never prompts.
 pub async fn update_clean(id: &str) -> Result<UpdateOutcome> {
     update_with_consent(id, ConsentMode::CleanOnlyNonInteractive).await
 }
 
-/// Everything an update needs after fetching and diffing, before any decision
-/// about whether to apply it. Computing the consent decision in exactly one
-/// place is what lets the CLI prompt, the in-app preview/apply flow, and the
-/// auto-update sweep stay in lockstep instead of drifting apart.
 struct Prepared {
     id: String,
     source_str: String,
-    /// One line stating what was fetched (resolved release, ref). Printed by
-    /// the interactive CLI path only; the in-app preview/apply flows render
-    /// their own surfaces and must not write to a raw-mode terminal.
     notice: String,
     fetched: FetchedPlugin,
     featured_verified: bool,
     prior_grant: Option<CapabilityGrant>,
     capabilities: Vec<String>,
     manifest_hash: String,
-    /// Content fingerprint of the fetched version (tree + release asset + trust).
     fingerprint: String,
-    /// Content fingerprint of the currently installed version, from the
-    /// lockfile; `None` when no lock entry exists.
     prior_fingerprint: Option<String>,
-    /// The installed source ref and resolved commit (from the lockfile), and the
-    /// fetched target ref and commit. Drive the changelog assembly in
-    /// `preview_update`. `requested_ref` is the source tag/branch (a no-`@ref`
-    /// release install resolves to the release tag here); `release_tag` is NOT
-    /// used (it is release-binary asset provenance only).
     prior_requested_ref: Option<String>,
     prior_resolved_commit: Option<String>,
     target_requested_ref: Option<String>,
@@ -598,19 +446,10 @@ struct Prepared {
     needs_consent: bool,
 }
 
-/// A content fingerprint of an installed or fetched version: the source tree
-/// hash, the release-binary asset hash (whose bytes the tree hash does not
-/// cover), and the trust class. This pins exactly what a consent approval
-/// covers, so a preview cannot be applied if the remote moved underneath it: a
-/// manifest hash alone would miss a `build.sh` or worker script changing under
-/// an unchanged `aoe-plugin.toml`, which run unsandboxed at apply time.
 fn fingerprint(tree_hash: &str, asset_sha256: Option<&str>, trust: &str) -> String {
     format!("{tree_hash}|{}|{trust}", asset_sha256.unwrap_or(""))
 }
 
-/// Fetch an installed plugin's recorded source and diff it against what is on
-/// disk, classifying whether the update needs fresh consent. Network-only: it
-/// never touches the installed tree.
 async fn prepare_update(id: &str) -> Result<Prepared> {
     let config = Config::load()?;
     let plugin_config = config
@@ -624,10 +463,6 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     let prior_grant = plugin_config.grant.clone();
 
     let source = PluginSource::parse(&source_str)?;
-    // A no-`@ref` install tracks the release channel: re-resolve the latest
-    // release each update (rolling). Disallow the default-branch fallback here
-    // so an update never silently switches a release-tracking install onto the
-    // moving default branch; an explicit `@ref` install keeps following its ref.
     let resolved = resolve_source(source, false).await?;
     let fetched = fetch::fetch(&resolved.source).await?;
     if fetched.manifest.id.as_str() != id {
@@ -643,7 +478,6 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     let capabilities = capability_strings(&fetched)?;
     let manifest_hash = PluginManifest::hash_bytes(&fetched.manifest_bytes);
 
-    // The lockfile is the source of truth for what is installed on disk.
     let lock = Lockfile::load()?;
     let prior_locked = lock.get(id);
     let prior_tree_hash = prior_locked
@@ -654,9 +488,6 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     let from_version = prior_locked
         .map(|l| l.version.clone())
         .unwrap_or_else(|| "?".to_string());
-    // Captured before `fetched` is moved into the returned struct. The source
-    // ref is `requested_ref` (a no-`@ref` release install resolved its tag into
-    // this field), never `release_tag`.
     let prior_requested_ref = prior_locked.and_then(|l| l.requested_ref.clone());
     let prior_resolved_commit = prior_locked.and_then(|l| l.resolved_commit.clone());
     let target_requested_ref = fetched.requested_ref.clone();
@@ -686,12 +517,6 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
         .map(|s| s.to_string())
         .collect();
 
-    // Build steps run unsandboxed at apply time, so a changed recipe must
-    // re-prompt. A manifest hash misses a build script changing under an
-    // unchanged `aoe-plugin.toml`, so key this on the source tree hash: if the
-    // tree moved and the new version declares build steps, the recipe could have
-    // changed. Fall back to the manifest-hash heuristic only when no prior tree
-    // hash is recorded (a pre-v2 lock).
     let manifest_changed =
         prior_grant.as_ref().map(|g| g.manifest_hash.as_str()) != Some(manifest_hash.as_str());
     let tree_changed = if prior_tree_hash.is_empty() {
@@ -700,13 +525,7 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
         prior_tree_hash != fetched.tree_hash
     };
     let build_changed = tree_changed && !build_steps(&fetched.manifest).is_empty();
-    // UI contributions are disclosed at install, so an update that changes the
-    // manifest while declaring UI slots must re-disclose them: otherwise an
-    // update could add dashboard slots the user never saw.
     let ui_changed = manifest_changed && !fetched.manifest.ui.is_empty();
-    // A worker that switches between an in-tree command and a downloaded release
-    // binary is a meaningful change in auditability, even when capabilities are
-    // unchanged; disclose and re-prompt for it.
     let new_is_release_binary = matches!(
         fetched.manifest.runtime,
         Some(RuntimeSpec::ReleaseBinary { .. })
@@ -721,15 +540,8 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     } else {
         None
     };
-    // A plugin that was a verified featured plugin and no longer is has lost the
-    // curated-index vouch; treat the downgrade as consent-worthy.
     let trust_downgrade = prior_trust == "featured" && !featured_verified;
 
-    // Re-prompt when there is something to consent to or disclose: capabilities
-    // that changed, a build recipe that could have changed, UI slots on a
-    // changed manifest, a runtime-kind switch, or a trust downgrade. Dropping
-    // all capabilities with no other trigger has nothing to grant, so it still
-    // (re)grants silently.
     let needs_consent = (!capabilities.is_empty() && caps_changed)
         || build_changed
         || ui_changed
@@ -763,12 +575,6 @@ async fn prepare_update(id: &str) -> Result<Prepared> {
     })
 }
 
-/// Apply a prepared update with an already-decided grant: replace the tree, run
-/// the build, persist the grant and lockfile, and reload the registry. A `None`
-/// grant declines a consent-required update: it leaves the previously trusted
-/// version active without rewriting the tree or lockfile, matching the in-app
-/// decline. (Arbitrary build steps the user just refused must never run, and a
-/// declined capability expansion must not silently replace the install.)
 fn apply_prepared(
     prepared: &Prepared,
     grant: Option<CapabilityGrant>,
@@ -816,12 +622,7 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
         eprintln!("{}", prepared.notice);
     }
 
-    // Decide the grant BEFORE touching the installed tree, so a declined or
-    // non-interactive prompt bails while the old install, config, and lockfile
-    // are still consistent.
     let grant = if prepared.needs_consent {
-        // The auto-update sweep declines anything needing consent: skip without
-        // touching the tree, leaving the working version active.
         if mode == ConsentMode::CleanOnlyNonInteractive {
             return Ok(UpdateOutcome::Skipped {
                 id: id.to_string(),
@@ -844,15 +645,12 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
             None
         }
     } else if prepared.capabilities.is_empty() {
-        // Nothing to grant; an empty capability set keeps the plugin active.
         Some(CapabilityGrant {
             manifest_hash: prepared.manifest_hash.clone(),
             capabilities: vec![],
             granted_at: chrono::Utc::now(),
         })
     } else {
-        // Capabilities unchanged and the build recipe (if any) unchanged: carry
-        // the prior grant forward, refreshed to the new manifest hash.
         prepared.prior_grant.clone().map(|g| CapabilityGrant {
             manifest_hash: prepared.manifest_hash.clone(),
             capabilities: g.capabilities,
@@ -867,9 +665,6 @@ async fn update_with_consent(id: &str, mode: ConsentMode) -> Result<UpdateOutcom
     )?))
 }
 
-/// Build the structured consent disclosure from a prepared update. The
-/// changelog is assembled by the caller (`preview_update`) and passed in, so the
-/// disclosure stays free of network work.
 fn consent_of(p: &Prepared, changelog: UpdateChangelog) -> UpdateConsent {
     UpdateConsent {
         id: p.id.clone(),
@@ -905,8 +700,6 @@ fn consent_of(p: &Prepared, changelog: UpdateChangelog) -> UpdateConsent {
     }
 }
 
-/// Assemble the changelog for a prepared update from its prior/target refs and
-/// commits. Best-effort and network-bound; only called from `preview_update`.
 async fn changelog_of(p: &Prepared) -> UpdateChangelog {
     let source = match PluginSource::parse(&p.source_str) {
         Ok(s) => s,
@@ -922,14 +715,11 @@ async fn changelog_of(p: &Prepared) -> UpdateChangelog {
     .await
 }
 
-/// Classify an available update for one installed plugin without applying it:
-/// the in-app (web / TUI) "what would this update do" probe. Network-only.
 pub async fn preview_update(id: &str) -> Result<UpdatePreview> {
     let prepared = prepare_update(id).await?;
     if prepared.prior_fingerprint.as_ref() == Some(&prepared.fingerprint) {
         return Ok(UpdatePreview::NoUpdate);
     }
-    // One best-effort changelog fetch, behind this explicit user-driven preview.
     let changelog = changelog_of(&prepared).await;
     if !prepared.needs_consent {
         return Ok(UpdatePreview::SafeUpdate {
@@ -948,13 +738,6 @@ pub async fn preview_update(id: &str) -> Result<UpdatePreview> {
     })
 }
 
-/// Apply an update that was previewed in-app, granting whatever the fetched
-/// manifest declares. `expected_fingerprint` pins the exact content the user
-/// approved: if the remote moved since the preview, this refuses rather than
-/// silently granting something the user never saw. A capability-expanding update
-/// MUST carry a fingerprint, so approval cannot bypass the stale-preview guard;
-/// a safe update may omit it. Clears any recorded dismissal on success (via
-/// `persist_update`).
 pub async fn apply_update(
     id: &str,
     expected_fingerprint: Option<String>,
@@ -967,8 +750,6 @@ pub async fn apply_update(
                 "the available update for {id} changed since it was shown; review it again before approving"
             );
         }
-        // A consent-needing update must be pinned to what the user reviewed;
-        // refuse an unpinned approval rather than grant blind.
         None if prepared.needs_consent => {
             bail!("approving the update for {id} requires the fingerprint it was previewed with");
         }
@@ -982,27 +763,16 @@ pub async fn apply_update(
     apply_prepared(&prepared, grant, log)
 }
 
-/// The disclosure for re-approving an installed plugin whose grant no longer
-/// covers its manifest (`needs_reapproval`), built entirely from the on-disk
-/// install; no network. Unlike an update this replaces nothing and runs no
-/// build steps: approving grants the already-installed manifest's declared
-/// capabilities, pinned to its hash.
 #[derive(Debug, Clone, Serialize)]
 pub struct ReapproveConsent {
     pub id: String,
     pub version: String,
-    /// Resolved trust class (featured / community / local).
     pub validation: String,
-    /// Capabilities the installed manifest declares (the grant this approves).
     pub capabilities: Vec<String>,
-    /// Dashboard UI slots the installed manifest contributes to.
     pub ui: Vec<UiView>,
-    /// Pin: the installed manifest's hash. `approve_installed` refuses if the
-    /// manifest on disk changed after this disclosure was shown.
     pub manifest_hash: String,
 }
 
-/// Build the [`ReapproveConsent`] disclosure for an installed external plugin.
 pub fn reapprove_consent(id: &str) -> Result<ReapproveConsent> {
     let registry = super::registry();
     let plugin = registry
@@ -1047,17 +817,7 @@ pub fn reapprove_consent(id: &str) -> Result<ReapproveConsent> {
     })
 }
 
-/// Grant the installed manifest's declared capabilities, pinned to its hash:
-/// the approve half of the re-approval flow. `expected_manifest_hash` pins the
-/// disclosure the user saw ([`reapprove_consent`]); if the on-disk manifest
-/// changed since, this refuses rather than granting something unseen.
 pub fn approve_installed(id: &str, expected_manifest_hash: &str) -> Result<()> {
-    // Re-read the installed tree before honoring the pin: the disclosure may
-    // have been open for a while, and the process-global registry the
-    // disclosure was built from could be stale against disk. Without this, a
-    // manifest changed on disk after the popup opened would pass a
-    // stale-vs-stale hash comparison and write a grant the next load rejects
-    // (safe, but reported as success).
     super::reload_registry();
     let consent = reapprove_consent(id)?;
     if consent.manifest_hash != expected_manifest_hash {
@@ -1081,19 +841,6 @@ pub fn approve_installed(id: &str, expected_manifest_hash: &str) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort: push already-persisted enable/disable states to a running
-/// daemon so its workers reconcile without a restart. The settings save path
-/// writes `config.plugins` wholesale rather than toggling one id at a time,
-/// so it calls this afterwards with every id whose enabled flag changed. A
-/// missing daemon is fine (nothing to reconcile); a failure only warns, since
-/// the on-disk state is already correct and applies on the daemon's next
-/// start.
-///
-/// Batches are ordered: the daemon endpoint rewrites config per request, so a
-/// stale batch landing after a newer save's batch would persist the older
-/// value. A generation counter (bumped synchronously here, so it follows call
-/// order) supersedes older batches, and a global lock serializes the actual
-/// requests, so the newest save's values always land last.
 pub fn nudge_daemon_enabled(changes: Vec<(String, bool)>) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -1105,8 +852,6 @@ pub fn nudge_daemon_enabled(changes: Vec<(String, bool)>) {
     let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     tokio::spawn(async move {
         let _serialize = IN_FLIGHT.lock().await;
-        // A newer save superseded this batch while it waited its turn;
-        // its values are already stale against disk, so drop it.
         if GENERATION.load(Ordering::SeqCst) != generation {
             return;
         }
@@ -1134,8 +879,6 @@ pub fn nudge_daemon_enabled(changes: Vec<(String, bool)>) {
     });
 }
 
-/// Record that the user declined an available update by its fingerprint, so the
-/// popup and the auto-update notification stop nagging until the next version.
 pub fn dismiss_update(id: &str, fingerprint: &str) -> Result<()> {
     update_config(|config| {
         let Some(entry) = config.plugins.get_mut(id) else {
@@ -1149,8 +892,6 @@ pub fn dismiss_update(id: &str, fingerprint: &str) -> Result<()> {
     })?
 }
 
-/// Human-readable reason an auto-update was skipped, for the sweep log and the
-/// in-app notification.
 fn skip_reason(prepared: &Prepared) -> String {
     let mut parts = Vec::new();
     if prepared.caps_changed {
@@ -1175,8 +916,6 @@ fn skip_reason(prepared: &Prepared) -> String {
     }
 }
 
-/// Remove an installed external plugin: its tree, its config entry, and its
-/// lockfile entry.
 pub fn uninstall(id: &str) -> Result<()> {
     PluginId::new(id.to_string()).map_err(|e| anyhow!("{e}"))?;
     let config = Config::load()?;
@@ -1202,8 +941,6 @@ pub fn uninstall(id: &str) -> Result<()> {
     Ok(())
 }
 
-/// [`uninstall`] with progress written to `log`, for the dashboard job path so a
-/// terminal-less user gets a readable tail that ends in success or failure.
 pub fn uninstall_logged(id: &str, log: &OperationLog) -> Result<()> {
     log.line(&format!("uninstalling {id}"));
     uninstall(id)?;
@@ -1211,10 +948,6 @@ pub fn uninstall_logged(id: &str, log: &OperationLog) -> Result<()> {
     Ok(())
 }
 
-/// Reject a manifest that collides with a compiled-in builtin (always) or that
-/// claims a reserved first-party namespace (`aoe.*` / `agent-of-empires.*`)
-/// without being featured-verified. A featured-verified plugin is the one case
-/// allowed into a reserved namespace (#2364).
 fn reject_reserved_or_builtin(manifest: &PluginManifest, featured_verified: bool) -> Result<()> {
     let id = manifest.id.as_str();
     if super::registry::is_builtin_id(id) {
@@ -1226,39 +959,18 @@ fn reject_reserved_or_builtin(manifest: &PluginManifest, featured_verified: bool
     Ok(())
 }
 
-/// Refuse a plugin whose declared `aoe_version` range excludes this host. A
-/// plugin author states which aoe versions a plugin version was tested against;
-/// installing outside that range invites runtime failure, so block it at
-/// install/update with the manifest's own actionable message. The load-time
-/// twin in the registry scan skips rather than bails so an aoe upgrade cannot
-/// brick startup.
 fn reject_incompatible_host(manifest: &PluginManifest) -> Result<()> {
     manifest
         .host_compat(env!("CARGO_PKG_VERSION"))
         .map_err(|msg| anyhow!("{}: {msg}", manifest.id.as_str()))
 }
 
-/// What [`resolve_source`] decided to fetch.
 struct ResolvedSource {
-    /// The source to actually fetch. A no-`@ref` GitHub source is rewritten to
-    /// the resolved release tag; everything else is passed through unchanged.
     source: PluginSource,
-    /// The install is off the audited-release default path: an explicit `@ref`,
-    /// or the no-release default-branch fallback. The install path confirms
-    /// before proceeding; update ignores it (it has its own consent flow).
     unverified: bool,
-    /// One line stating what is being installed, printed by the caller.
     notice: String,
 }
 
-/// Resolve what to fetch for an install or update.
-///
-/// A no-`@ref` GitHub source installs the latest stable release, the audited
-/// default path. With no published release, `allow_branch_fallback` (install)
-/// falls back to the default branch as an unverified install; without it
-/// (update) that is an error, so a release-tracking install never silently
-/// switches onto the moving default branch. An explicit `@ref` is an unverified
-/// opt-in fetched as-is; a local source is unchanged.
 async fn resolve_source(
     source: PluginSource,
     allow_branch_fallback: bool,
@@ -1313,11 +1025,6 @@ async fn resolve_source(
     }
 }
 
-/// Confirm an install that is off the audited-release default path (an explicit
-/// ref, or the no-release default-branch fallback). Mirrors
-/// [`confirm_capabilities`]: a non-interactive stdin without `--yes` is an
-/// error, not a silent yes. The caller has already printed what is being
-/// installed, so this only states the trust caveat and prompts.
 fn confirm_unverified() -> Result<bool> {
     if !io::stdin().is_terminal() {
         bail!("this is unverified, un-audited code; re-run with --yes to install it");
@@ -1336,18 +1043,6 @@ fn confirm_unverified() -> Result<bool> {
     ))
 }
 
-/// Check a fetched plugin against the curated index. Returns whether it is a
-/// verified featured plugin.
-///
-/// If the id is in the index, the install must come from the pinned source slug
-/// (case-insensitively, GitHub slugs are not case-sensitive) and must not ship a
-/// release-binary worker (its bytes are not covered by the tree hash yet, so a
-/// featured pin cannot vouch for them); both are hard errors. The tree hash is
-/// checked against the entry's set of vetted release hashes: a match is
-/// featured-verified, while an id-in-index but hash-not-vetted install is simply
-/// an unvetted version (returns `false`, treated as community) rather than a
-/// tamper-refuse. The reserved-namespace gate downstream still blocks an
-/// unvetted version of a reserved-namespace plugin.
 fn verify_featured(featured: &FeaturedIndex, fetched: &FetchedPlugin) -> Result<bool> {
     let id = fetched.manifest.id.as_str();
     let Some(entry) = featured.get(id) else {
@@ -1369,8 +1064,6 @@ fn verify_featured(featured: &FeaturedIndex, fetched: &FetchedPlugin) -> Result<
     Ok(entry.verifies(&fetched.tree_hash))
 }
 
-/// The manifest's capabilities as strings, rejecting any this host does not
-/// recognize (never silently granted).
 fn capability_strings(fetched: &FetchedPlugin) -> Result<Vec<String>> {
     let unknown: Vec<&str> = fetched
         .manifest
@@ -1393,10 +1086,6 @@ fn capability_strings(fetched: &FetchedPlugin) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Whether an install must prompt for consent rather than auto-grant silently.
-/// Capabilities and build steps need a grant; UI contributions need no grant
-/// but are disclosed, so a UI-only plugin still prompts rather than installing
-/// silently (#2366).
 fn install_needs_consent(
     capabilities: &[String],
     build: &[BuildStep],
@@ -1405,11 +1094,6 @@ fn install_needs_consent(
     !capabilities.is_empty() || !build.is_empty() || !ui.is_empty()
 }
 
-/// Prompt the user to grant a plugin's capabilities and run any build steps.
-/// Fails on a non-interactive stdin rather than silently granting; the caller
-/// can pass `--yes` there. Build steps are disclosed verbatim because they run
-/// as the user, outside capability enforcement, before the plugin is
-/// registered.
 fn confirm_capabilities(
     id: &str,
     capabilities: &[String],
@@ -1429,8 +1113,6 @@ fn confirm_capabilities(
             println!("  - {capability}");
         }
     }
-    // UI contributions are not capabilities (they need no grant), but the user
-    // should know the plugin will render into the dashboard before trusting it.
     if !ui.is_empty() {
         println!("Plugin {id} will add UI elements to these dashboard slots:");
         for u in ui {
@@ -1446,11 +1128,6 @@ fn confirm_capabilities(
             println!("  $ {}", step.command.join(" "));
         }
     }
-    // The honest model (D8): the host enforces these capabilities at its API
-    // boundary, which stops a cooperative plugin from overreaching. It does NOT
-    // contain an adversarial plugin: a granted worker runs as an ordinary
-    // process with no OS-level isolation. Build steps run with the same trust,
-    // earlier. State this on every grant prompt.
     println!(
         "Note: installing trusts this plugin. The host checks capabilities at its API boundary,\n\
          but a plugin worker (and any build step) runs without OS-level sandboxing, so a malicious\n\
@@ -1467,10 +1144,7 @@ fn confirm_capabilities(
     ))
 }
 
-/// Move a fetched plugin's staging tree into its final directory.
 fn move_into_place(fetched: &FetchedPlugin, final_dir: &std::path::Path) -> Result<()> {
-    // The staging tree lives under the plugins dir, so this rename is
-    // same-filesystem and atomic. On update, the old dir is replaced.
     if final_dir.exists() {
         std::fs::remove_dir_all(final_dir)
             .with_context(|| format!("replacing {}", final_dir.display()))?;
@@ -1483,8 +1157,6 @@ fn move_into_place(fetched: &FetchedPlugin, final_dir: &std::path::Path) -> Resu
     })
 }
 
-/// The build steps a `command` runtime declares, or an empty slice for any
-/// other (or absent) runtime.
 fn build_steps(manifest: &PluginManifest) -> &[BuildStep] {
     match &manifest.runtime {
         Some(RuntimeSpec::Command { build, .. }) => build,
@@ -1492,10 +1164,6 @@ fn build_steps(manifest: &PluginManifest) -> &[BuildStep] {
     }
 }
 
-/// Run a plugin's declared build steps in its final directory, then confirm the
-/// worker entrypoint is runnable. Builds run in the final directory (not the
-/// staging tree) because tools like Python venvs embed absolute paths and are
-/// not relocatable, so a build followed by a rename would break the worker.
 fn build_in_place(
     plugin_id: &str,
     dir: &Path,
@@ -1503,17 +1171,6 @@ fn build_in_place(
     log: &OperationLog,
 ) -> Result<()> {
     run_build(plugin_id, dir, build_steps(manifest), log)?;
-    // A build can succeed by exit code yet not produce the entrypoint (every
-    // step skipped on this platform, or a no-op build against a broken
-    // project). Resolve the launch command now, while the user is watching, so
-    // the failure is a clear install error instead of an opaque launch error
-    // the next time the daemon starts.
-    //
-    // Only for an in-tree entrypoint. A `system = true` worker resolves its
-    // program on PATH, and the install shell's PATH is not the daemon's PATH:
-    // checking it here neither guarantees the daemon can launch the worker nor
-    // should it reject a valid system-tool plugin whose tool is simply absent
-    // from the install shell. Leave that entrypoint to resolve at launch.
     if let Some(RuntimeSpec::Command {
         command,
         system: false,
@@ -1531,12 +1188,6 @@ fn build_in_place(
     Ok(())
 }
 
-/// Execute build steps sequentially in `dir`. Each step's argv is resolved with
-/// the same policy as the launch command, immediately before it runs, so a step
-/// like `.venv/bin/pip` resolves once the prior step created it. Build stdin is
-/// `/dev/null` so an interactive prompt cannot hang a `--yes` install; stdout
-/// and stderr go to `log` (the terminal for the CLI, or the job log file for a
-/// dashboard install) so the user sees build progress either way.
 fn run_build(plugin_id: &str, dir: &Path, steps: &[BuildStep], log: &OperationLog) -> Result<()> {
     let os = std::env::consts::OS;
     for (i, step) in steps.iter().enumerate() {
@@ -1569,24 +1220,12 @@ fn run_build(plugin_id: &str, dir: &Path, steps: &[BuildStep], log: &OperationLo
     Ok(())
 }
 
-/// Replace an installed plugin's directory with a freshly fetched tree and run
-/// its build, keeping the prior version intact if the build fails.
-///
-/// A leftover `<id>.bak` means a previous update was interrupted between
-/// exposing the new tree and finishing the build, leaving a possibly half-built
-/// `<id>`; the backup is the last known-good version, so recover it first.
-/// Then move the current install aside, place the new tree, and build: on
-/// success drop the backup, on failure restore it so the user is never left
-/// worse off than before the update.
 fn replace_and_build(
     plugin_id: &str,
     fetched: &FetchedPlugin,
     final_dir: &Path,
     log: &OperationLog,
 ) -> Result<()> {
-    // `with_file_name`, not `with_extension`: a plugin id like `acme.worker`
-    // has a dot, and `with_extension("bak")` would replace `.worker`, yielding
-    // `acme.bak` and colliding with every other `acme.*` plugin's backup.
     let backup_dir = final_dir.with_file_name(format!("{plugin_id}.bak"));
 
     if backup_dir.exists() {
@@ -1630,10 +1269,6 @@ fn replace_and_build(
     }
 }
 
-/// The source string to persist for a later `update`. A GitHub source keeps the
-/// original `gh:owner/repo[@ref]` so the ref survives; a local source is
-/// canonicalized to an absolute path so `update` does not resolve relative to
-/// whatever directory happened to be current at install time.
 fn persisted_source(source: &PluginSource, input: &str) -> String {
     match source {
         PluginSource::Github { .. } => input.to_string(),
@@ -1671,8 +1306,6 @@ fn persist_update(id: &str, source: &str, grant: Option<CapabilityGrant>) -> Res
             .or_insert_with(PluginConfig::default);
         entry.source = Some(source.to_string());
         entry.grant = grant;
-        // The applied version is no longer "the update the user declined"; clear
-        // any stale dismissal so a later update is surfaced normally.
         entry.dismissed_update = None;
     })
 }
@@ -1733,9 +1366,6 @@ mod tests {
 
     #[test]
     fn reject_incompatible_host_blocks_out_of_range_and_allows_in_range() {
-        // The host is this crate's CARGO_PKG_VERSION (a 1.x release); a range
-        // bracketing 1.x installs, a future-major-only range is refused with an
-        // id-prefixed message.
         let in_range = manifest_with_aoe_version(Some(">=1.0.0, <2.0.0"));
         assert!(reject_incompatible_host(&in_range).is_ok());
 
@@ -1744,18 +1374,13 @@ mod tests {
         assert!(err.contains("acme.thing"), "{err}");
         assert!(err.contains("plugin requires aoe"), "{err}");
 
-        // No declared range installs everywhere.
         assert!(reject_incompatible_host(&manifest_with_aoe_version(None)).is_ok());
     }
 
     #[test]
     fn install_consent_required_for_caps_build_or_ui() {
-        // Nothing declared: auto-grant is fine.
         assert!(!install_needs_consent(&[], &[], &[]));
-        // A capability needs a grant.
         assert!(install_needs_consent(&["net".to_string()], &[], &[]));
-        // A UI-only plugin must still prompt so the slots are disclosed (#2366):
-        // the regression this guards is auto-granting when only `ui` is set.
         assert!(install_needs_consent(
             &[],
             &[],
@@ -1765,9 +1390,6 @@ mod tests {
 
     #[tokio::test]
     async fn web_install_rejects_non_gh_sources() {
-        // The web install path is gh: only, so a browser request can never make
-        // the daemon read an arbitrary local path. Both must bail before any
-        // network or filesystem work, with a message naming the gh: constraint.
         let err = preview_install("/tmp/some/plugin")
             .await
             .unwrap_err()

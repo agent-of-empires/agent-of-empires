@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DiffComment, DiffCommentDraft, DiffCommentsStorageV1 } from "../components/diff/comments/types";
 import { EMPTY_STORAGE, loadComments, saveComments } from "../components/diff/comments/storage";
+import { listen } from "./domEvents";
+import { useLatestRef } from "./useLatestRef";
 
 export interface UseDiffCommentsResult {
   comments: DiffComment[];
@@ -17,36 +19,24 @@ export interface UseDiffCommentsResult {
   clearComments(): void;
 }
 
-/** Session-scoped comments store backed by localStorage. Comments
- *  persist across page reloads inside the same session and are wiped
- *  when the user explicitly clears them or after a successful send
- *  (when `clearAfterSend` is true). State only switches when the
- *  session id changes; if the active session changes we reload from
- *  storage so each session sees its own list. See #928. */
 export function useDiffComments(sessionId: string | null): UseDiffCommentsResult {
   const [state, setState] = useState<DiffCommentsStorageV1>(() =>
     sessionId ? loadComments(sessionId) : { ...EMPTY_STORAGE },
   );
 
-  // Track the latest state in a ref so save operations always have
-  // the current data without depending on state in effect deps.
-  const stateRef = useRef(state);
-  useEffect(() => {
-    stateRef.current = state;
-  }, [state]);
+  const stateRef = useLatestRef(state);
   const [trackedSessionId, setTrackedSessionId] = useState(sessionId);
 
-  // Render-time sync: reload from storage when sessionId changes.
   if (sessionId !== trackedSessionId) {
     setTrackedSessionId(sessionId);
     setState(sessionId ? loadComments(sessionId) : { ...EMPTY_STORAGE });
   }
 
-  // Debounced save to localStorage. A counter drives the effect so
-  // it re-runs when state changes, but we read the latest state via
-  // stateRef to avoid a direct state dependency.
   const [saveCounter, setSaveCounter] = useState(0);
-  const bumpSave = useCallback(() => setSaveCounter((c) => c + 1), []);
+  const patch = useCallback((fn: (s: DiffCommentsStorageV1) => DiffCommentsStorageV1) => {
+    setState(fn);
+    setSaveCounter((c) => c + 1);
+  }, []);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (!sessionId) return;
@@ -56,86 +46,43 @@ export function useDiffComments(sessionId: string | null): UseDiffCommentsResult
     return () => {
       if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
     };
-  }, [sessionId, saveCounter]);
+  }, [sessionId, saveCounter, stateRef]);
 
-  // Flush any pending debounced write before the tab closes / hides
-  // so the user doesn't lose the last keystrokes on a refresh.
   useEffect(() => {
     if (!sessionId) return;
     const flush = () => saveComments(sessionId, stateRef.current);
-    window.addEventListener("beforeunload", flush);
-    window.addEventListener("pagehide", flush);
-    return () => {
-      window.removeEventListener("beforeunload", flush);
-      window.removeEventListener("pagehide", flush);
-    };
-  }, [sessionId]);
+    return listen(flush, [window, "beforeunload"], [window, "pagehide"]);
+  }, [sessionId, stateRef]);
 
   const addComment = useCallback(
     (draft: DiffCommentDraft): DiffComment => {
       const created: DiffComment = {
-        id: cryptoRandomId(),
+        id: globalThis.crypto.randomUUID(),
         createdAt: new Date().toISOString(),
         ...draft,
       };
-      setState((s) => ({ ...s, comments: [...s.comments, created] }));
-      bumpSave();
+      patch((s) => ({ ...s, comments: [...s.comments, created] }));
       return created;
     },
-    [bumpSave],
+    [patch],
   );
 
   const updateComment = useCallback(
     (id: string, body: string) => {
-      const ts = new Date().toISOString();
-      setState((s) => ({
-        ...s,
-        comments: s.comments.map((c) => (c.id === id ? { ...c, body, updatedAt: ts } : c)),
-      }));
-      bumpSave();
+      const updatedAt = new Date().toISOString();
+      patch((s) => ({ ...s, comments: s.comments.map((c) => (c.id === id ? { ...c, body, updatedAt } : c)) }));
     },
-    [bumpSave],
+    [patch],
   );
 
   const deleteComment = useCallback(
-    (id: string) => {
-      setState((s) => ({
-        ...s,
-        comments: s.comments.filter((c) => c.id !== id),
-      }));
-      bumpSave();
-    },
-    [bumpSave],
+    (id: string) => patch((s) => ({ ...s, comments: s.comments.filter((c) => c.id !== id) })),
+    [patch],
   );
-
-  const clearComments = useCallback(() => {
-    setState((s) => ({ ...s, comments: [] }));
-    bumpSave();
-  }, [bumpSave]);
-
-  const setClearAfterSend = useCallback(
-    (v: boolean) => {
-      setState((s) => ({ ...s, clearAfterSend: v }));
-      bumpSave();
-    },
-    [bumpSave],
-  );
-
-  const setIntroDraft = useCallback(
-    (v: string) => {
-      setState((s) => ({ ...s, introDraft: v }));
-      bumpSave();
-    },
-    [bumpSave],
-  );
-
-  const setOutroDraft = useCallback(
-    (v: string) => {
-      setState((s) => ({ ...s, outroDraft: v }));
-      bumpSave();
-    },
-    [bumpSave],
-  );
+  const clearComments = useCallback(() => patch((s) => ({ ...s, comments: [] })), [patch]);
+  const setClearAfterSend = useCallback((v: boolean) => patch((s) => ({ ...s, clearAfterSend: v })), [patch]);
+  const setIntroDraft = useCallback((v: string) => patch((s) => ({ ...s, introDraft: v })), [patch]);
+  const setOutroDraft = useCallback((v: string) => patch((s) => ({ ...s, outroDraft: v })), [patch]);
 
   return useMemo(
     () => ({
@@ -154,8 +101,4 @@ export function useDiffComments(sessionId: string | null): UseDiffCommentsResult
     }),
     [state, addComment, updateComment, deleteComment, clearComments, setClearAfterSend, setIntroDraft, setOutroDraft],
   );
-}
-
-function cryptoRandomId(): string {
-  return globalThis.crypto.randomUUID();
 }

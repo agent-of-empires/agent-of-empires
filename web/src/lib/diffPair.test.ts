@@ -61,7 +61,6 @@ describe("diffPair hunk shape", () => {
 
   it("assigns line numbers per side (null on the absent side)", () => {
     const r = diffPair("a\nc", "a\nb\nc");
-    // a: equal (1,1), b: add (null,2), c: equal (2,3)
     expect(r.hunk.lines).toEqual([
       { type: "equal", old_line_num: 1, new_line_num: 1, content: "a" },
       { type: "add", old_line_num: null, new_line_num: 2, content: "b" },

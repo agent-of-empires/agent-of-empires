@@ -25,9 +25,8 @@ impl ProjectSessionPickerDialog {
         Self { picker, projects }
     }
 
-    /// Resolve a label chosen from the picker back to the project's path.
-    /// Labels embed the path so they are unique; matching on the label is
-    /// safe even when two scopes share a name.
+    /// Resolve a picked label back to its path. Labels embed the path, so they
+    /// stay unique when two scopes share a name.
     fn path_for_label(&self, label: &str) -> Option<String> {
         self.projects
             .iter()

@@ -1,925 +1,193 @@
-/* eslint-disable react-refresh/only-export-components */
-// VSCode/Cursor-style composer for the structured view.
-//
-// Built on assistant-ui's `<ComposerPrimitive.Root>` plus the official
-// `Unstable_TriggerPopover` family for `@` mentions and `/` slash
-// commands. We provide TriggerAdapters that feed categories/items
-// from our own state (the workspace file listing for `@`, a static
-// command list for `/`).
-//
-// Icons via lucide-react.
+// Structured view composer: assistant-ui's ComposerPrimitive with `@` file and
+// `/` command trigger popovers, attachments, queue recall, and draft persistence.
 
-import { ComposerPrimitive, useAui, useAuiState } from "@assistant-ui/react";
-import {
-  unstable_defaultDirectiveFormatter as defaultDirectiveFormatter,
-  type Unstable_TriggerAdapter,
-  type Unstable_TriggerItem,
-} from "@assistant-ui/core";
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { AtSign, ChevronUp, Paperclip, Pencil, Slash, Square, X } from "lucide-react";
+import { ComposerPrimitive } from "@assistant-ui/react";
+import { unstable_defaultDirectiveFormatter as defaultDirectiveFormatter } from "@assistant-ui/core";
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
+import { AtSign, Paperclip, Pencil, Slash } from "lucide-react";
 
-import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
-import { replaceSlashCommand } from "./slashCompletion";
-import { SessionConfigControls } from "./SessionConfigControls";
-import { Tooltip } from "../Tooltip";
-import { ProvenanceBadge } from "../ProvenanceBadge";
+import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
+import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useSkillIndex } from "../../hooks/useSkillIndex";
-import { badgeLabel, badgeTone, resolveSkillSource, type SkillIndex } from "../../lib/skillProvenance";
-import { SwitchAgentModal } from "./SwitchAgentModal";
+import { clearDraft, clearDraftAttachments } from "../../lib/acpDrafts";
+import type { AcpState, PromptAttachmentInput, PromptCapabilities, QueuedPrompt } from "../../lib/acpTypes";
+import { isIOS, isStandalone } from "../../lib/platform";
+import { sessionEntries } from "../../lib/pluginUi";
+import { usePluginUiEntries } from "../../lib/pluginUiContext";
 import {
   clearPendingSwitchAgent,
   getPendingSwitchAgent,
   subscribePendingSwitchAgent,
 } from "../../lib/switchAgentTrigger";
-import type {
-  AcpState,
-  PromptAttachmentInput,
-  PromptAttachmentKind,
-  PromptCapabilities,
-  QueuedPrompt,
-} from "../../lib/acpTypes";
-import { clearDraft, clearDraftAttachments, getDraft, setDraft } from "../../lib/acpDrafts";
-import { isIOS, isStandalone } from "../../lib/platform";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
-import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
-import { useAgentProfile, useClearAliases } from "../../lib/agentProfileContext";
-import { resolveModeChannel } from "../../lib/modeChannel";
-import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
-import { useDictationBurstGuard } from "./useDictationBurstGuard";
-import { nextRecallTarget, recallBannerInfo, type RecallCursor, type RecallNav } from "./recallNav";
 import { PluginComposerActions } from "../plugin/PluginSlots";
 import { composerDraftOperation, type ComposerDraftOperation } from "../plugin/composerDraftOperation";
-import { usePluginUiEntries } from "../../lib/pluginUiContext";
-import { sessionEntries } from "../../lib/pluginUi";
-
-export {
-  DICTATION_BURST_TIMEOUT_MS,
-  decideDictationAction,
-  type DictationBurstState,
-  type DictationDecision,
-  type DictationEvent,
-} from "./useDictationBurstGuard";
-
-/** Live handle onto the composer scope: the slice of `aui.composer` this file
- *  drives. Replaces the `useComposerRuntime()` hook dropped in
- *  @assistant-ui/react 0.15. */
-export type ComposerClient = Pick<ReturnType<typeof useAui>["composer"], "getState" | "setText">;
-
-/** Decision returned by {@link decideEnterAction} for an Enter
- *  keystroke on the structured view composer textarea.
- *  - `send`: dispatch via our custom send path; covers the
- *    mid-turn queue branch (#1031) where ComposerPrimitive.Input
- *    hard-blocks Enter on its own.
- *  - `default`: let the primitive run its built-in keymap. On
- *    desktop that is Enter-to-send / Shift+Enter for newline. On
- *    touch-primary devices the `unstable_insertNewlineOnTouchEnter`
- *    prop on ComposerPrimitive.Input downgrades plain Enter to a
- *    native newline, so the on-screen Return key never dispatches
- *    (#1129); we no longer intercept it here. */
-export type EnterAction = "send" | "default";
-
-/** Pure decision helper for the composer's Enter keystroke. Extracted
- *  so the decision matrix can be unit-tested without mounting the
- *  whole composer + assistant-ui runtime. The textarea handler reads
- *  the same matrix at runtime. See #1129. */
-export function decideEnterAction(
-  event: {
-    key: string;
-    shiftKey: boolean;
-    ctrlKey: boolean;
-    metaKey: boolean;
-    isComposing: boolean;
-  },
-  ctx: { isMobile: boolean; turnActive: boolean },
-): EnterAction {
-  if (event.key !== "Enter") return "default";
-  if (event.isComposing) return "default";
-  if (event.shiftKey || event.ctrlKey || event.metaKey) return "default";
-  // Touch-primary devices: ComposerPrimitive.Input's
-  // `unstable_insertNewlineOnTouchEnter` resolves the submit mode to
-  // "none", so plain Enter inserts a newline natively and never
-  // submits. Fall through to "default" and let the primitive own it;
-  // crucially this also keeps mobile mid-turn Enter from hitting the
-  // "send" queue path below.
-  if (ctx.isMobile) return "default";
-  if (ctx.turnActive) return "send";
-  return "default";
-}
-
-/** Decision returned by {@link decideArrowRecall} for an ArrowUp /
- *  ArrowDown keystroke on the composer textarea.
- *  - `older`: browse toward older queued prompts (ArrowUp).
- *  - `newer`: browse toward newer queued prompts, or the stashed draft
- *    past the newest (ArrowDown).
- *  - `default`: let the textarea move the caret as usual. */
-export type ArrowRecallAction = "older" | "newer" | "default";
-
-/** Pure decision helper for shell-history-style queue recall. ArrowUp
- *  enters recall only when the caret is at the very start and the queue
- *  is non-empty, so multi-line caret movement is never hijacked; once
- *  browsing, both arrows own navigation regardless of caret. Extracted
- *  so the matrix is unit-testable without mounting the composer. */
-export function decideArrowRecall(
-  event: {
-    key: string;
-    shiftKey: boolean;
-    ctrlKey: boolean;
-    metaKey: boolean;
-    altKey: boolean;
-    isComposing: boolean;
-  },
-  ctx: { caretAtStart: boolean; browsing: boolean; queueLen: number },
-): ArrowRecallAction {
-  if (event.isComposing) return "default";
-  if (event.shiftKey || event.ctrlKey || event.metaKey || event.altKey) return "default";
-  if (event.key === "ArrowUp") {
-    if (ctx.browsing || (ctx.caretAtStart && ctx.queueLen > 0)) return "older";
-    return "default";
-  }
-  if (event.key === "ArrowDown") {
-    if (ctx.browsing) return "newer";
-    return "default";
-  }
-  return "default";
-}
-
-/** Decision returned by {@link decideBeforeInputAction} for a
- *  `beforeinput` event on the structured view composer textarea.
- *  - `newline`: caller should preventDefault, stop propagation, and
- *    manually insert a literal "\n" at the caret. Used on touch-primary
- *    devices where the on-screen keyboard's Enter fires
- *    `beforeinput` with `insertLineBreak` / `insertParagraph` instead
- *    of a `keydown` (Android Chrome's GBoard / Samsung Keyboard / many
- *    others). Without this, assistant-ui's bubble-phase Send wins.
- *  - `default`: do nothing, let the primitive run. */
-export type BeforeInputAction = "newline" | "default";
-
-/** Pure decision helper for the composer's `beforeinput` event.
- *  Extracted so the matrix is unit-testable without mounting the
- *  composer. The textarea handler reads the same matrix at runtime.
- *  See #1174. */
-export function decideBeforeInputAction(
-  inputType: string,
-  isComposing: boolean,
-  ctx: { isMobile: boolean },
-): BeforeInputAction {
-  if (!ctx.isMobile) return "default";
-  if (isComposing) return "default";
-  if (inputType !== "insertLineBreak" && inputType !== "insertParagraph") {
-    return "default";
-  }
-  return "newline";
-}
-
-/** Height (px) of the iOS software-keyboard accessory bar (the predictive /
- *  AutoFill strip that sits on top of the keys). On an installed iOS PWA the
- *  layout viewport shrinks for the keys but not this strip, so it floats over
- *  the bottom of the page and covers the composer's Send button. We reserve
- *  this much space below the composer footer to lift Send clear of it. Value is
- *  the standard iOS accessory-bar height; a device tweak may refine it. */
-export const IOS_ACCESSORY_BAR_PX = 44;
-
-/** Wrapper class + inline style for the composer's outer <div>.
- *
- *  Both keyboard states cancel the App root's `safe-area-inset-bottom` padding
- *  with a negative bottom margin so the composer's background and top border
- *  reach the physical bottom of the screen. Without this the App root reserves
- *  its home-indicator inset (~34px) BELOW the composer, leaving a visible empty
- *  strip under the input on an installed iOS PWA. See #1143 and the
- *  keyboard-closed bottom-gap fix.
- *
- *  The App root no longer reserves the bottom safe-area inset (see
- *  `.safe-area-inset` in index.css), so the composer sits at the physical
- *  bottom edge on its own; there is no App-root padding to cancel, hence no
- *  negative margin.
- *
- *  Keyboard CLOSED: just the base `pb-3` gap. The input hugs the bottom (no
- *  home-indicator reservation, per the user preference for the composer).
- *
- *  Keyboard OPEN: drop the bottom padding (the home indicator is occluded by
- *  the keyboard). `accessoryBarPx` re-adds padding that lifts the footer above
- *  the iOS predictive/AutoFill accessory bar (see IOS_ACCESSORY_BAR_PX); it is
- *  0 off iOS-PWA. The keyboard lift itself is handled by the structured-view
- *  root's `keyboardHeight` padding, not here.
- *
- *  Extracted as a pure helper so the layout decision can be unit-tested without
- *  mounting the whole composer. */
-export function composerWrapperLayout(opts: { keyboardOpen: boolean; accessoryBarPx?: number }): {
-  className: string;
-  style: React.CSSProperties | undefined;
-} {
-  if (!opts.keyboardOpen) {
-    return {
-      className: "border-t border-surface-800 bg-surface-900 px-4 pt-3 pb-3",
-      style: undefined,
-    };
-  }
-  const clearance = opts.accessoryBarPx ?? 0;
-  return {
-    className: "border-t border-surface-800 bg-surface-900 px-4 pt-3 pb-0",
-    // Inline paddingBottom overrides pb-0 when we need accessory-bar clearance.
-    style: clearance > 0 ? { paddingBottom: clearance } : undefined,
-  };
-}
-
-/** True when the current device is touch-primary AND no precise
- *  pointer (mouse / trackpad / stylus tip) is also attached. An iPad
- *  with a Bluetooth keyboard + Magic Keyboard trackpad reports both
- *  `(pointer: coarse)` (touchscreen) and `(any-pointer: fine)`
- *  (trackpad); treating that as desktop preserves Enter-to-send for
- *  hardware-keyboard typing. See #1129 open questions. */
-function detectMobileInput(): boolean {
-  if (typeof window === "undefined" || !window.matchMedia) return false;
-  const coarse = window.matchMedia("(pointer: coarse)").matches;
-  const anyFine = window.matchMedia("(any-pointer: fine)").matches;
-  return coarse && !anyFine;
-}
-
-/** Client-side mirror of the server's per-prompt attachment cap. */
-const MAX_ATTACHMENTS = 8;
-
-/** Map a file's MIME type to the ACP attachment kind. */
-function mimeToKind(mime: string): PromptAttachmentKind {
-  if (mime.startsWith("image/")) return "image";
-  if (mime.startsWith("audio/")) return "audio";
-  return "resource";
-}
-
-/** Whether the current agent accepts the given attachment kind. */
-function kindSupported(kind: PromptAttachmentKind, caps: PromptCapabilities | null): boolean {
-  if (!caps) return false;
-  if (kind === "image") return caps.image;
-  if (kind === "audio") return caps.audio;
-  return caps.embeddedContext;
-}
-
-/** The `accept` attribute for the file picker, narrowed to the kinds
- *  the agent advertises so the OS dialog only offers usable files. */
-function acceptForCaps(caps: PromptCapabilities | null): string {
-  const parts: string[] = [];
-  if (caps?.image) parts.push("image/*");
-  if (caps?.audio) parts.push("audio/*");
-  if (caps?.embeddedContext) parts.push(".txt,.md,.json,.pdf");
-  return parts.join(",");
-}
-
-/** Read a File into standard base64 (no `data:` prefix). */
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(reader.error ?? new Error("read failed"));
-    reader.onload = () => {
-      const result = typeof reader.result === "string" ? reader.result : "";
-      // `data:<mime>;base64,<b64>` → keep only the base64 tail.
-      resolve(result.slice(result.indexOf(",") + 1));
-    };
-    reader.readAsDataURL(file);
-  });
-}
+import {
+  AttachmentChips,
+  ModePicker,
+  PopoverItems,
+  QueueSendButton,
+  SendButton,
+  StopButton,
+  ToolbarButton,
+  UsageHint,
+} from "./ComposerControls";
+import {
+  acceptForCaps,
+  composerWrapperLayout,
+  decideArrowRecall,
+  decideBeforeInputAction,
+  decideEnterAction,
+  fitTextarea,
+  insertAtCaret,
+  insertNewlineAtCaret,
+  insertRawTextAtCaret,
+  insertSlashCommand,
+  IOS_ACCESSORY_BAR_PX,
+} from "./composerInput";
+import { SessionConfigControls } from "./SessionConfigControls";
+import { SwitchAgentModal } from "./SwitchAgentModal";
+import {
+  useAttachments,
+  useComposerClient,
+  useDraftPersistence,
+  useIsMobileInput,
+  useLoadText,
+  useQueueRecall,
+  useTriggerAdapters,
+  type ComposerClient,
+} from "./useComposerHooks";
+import { useDictationBurstGuard } from "./useDictationBurstGuard";
 
 interface Props {
   sessionId: string;
-  /** Registry key of the agent the session currently runs. Drives the
-   *  "Switch agent" control's filtered target list and handoff copy. */
   currentAgent: AcpState["agent"];
   availableModes: AcpState["availableModes"];
   currentModeId: AcpState["currentModeId"];
-  /** Legacy enum-based mode used as fallback when the agent does not
-   *  advertise modes via NewSessionResponse. */
+  /** Fallback when the agent advertises no modes. */
   legacyMode: AcpState["mode"];
-  /** Per-session selectors advertised by the adapter (model,
-   *  reasoning effort, future categories). Empty when the adapter
-   *  does not emit `ConfigOptionUpdate`. See #1403. */
   configOptions: AcpState["configOptions"];
-  /** In-flight config-option click; drives the pending affordance
-   *  on the just-clicked option. */
   pendingConfigOption: AcpState["pendingConfigOption"];
-  /** Send `session/set_config_option` for the given pair. */
   setConfigOption: (configId: string, value: string) => void | Promise<void>;
-  /** Latest agent-reported context-window usage. Null until the agent
-   *  has emitted at least one ACP `UsageUpdate`. */
   sessionUsage: AcpState["sessionUsage"];
-  /** Slash commands the agent advertised in its most recent
-   *  AvailableCommandsUpdate. Includes plugins/skills/MCP commands.
-   *  Empty until the agent emits the first list. */
   availableCommands: AcpState["availableCommands"];
-  /** True when the structured view WS is open and the worker is healthy
-   *  (running, not stopped, not restarting). When false the Send /
-   *  QueueSend buttons stay clickable, but submissions take the
-   *  enqueue path in `sendPrompt` so they fire on resume rather than
-   *  POSTing into a non-running session. The tooltip swaps to name
-   *  the queue behavior so users understand the click is not lost.
-   *  See #1359. */
+  /** WS open and worker healthy. Sends still work when false; they queue until resume. */
   connected: boolean;
-  /** True while the agent is producing the current turn. When true the
-   *  composer keeps its textarea editable and surfaces a queue-send
-   *  button alongside Stop; sends go through the client-side queue (see
-   *  #1031). When false the regular ComposerPrimitive.Send path runs as
-   *  before. */
+  /** Mid-turn the textarea stays editable and sends go through the queue. */
   turnActive: boolean;
-  /** Push the composer text straight onto the structured view queue. Bypasses
-   *  the ComposerPrimitive.Send path (which assistant-ui hard-disables
-   *  while `thread.isRunning && !capabilities.queue`). Used by the
-   *  mid-turn Send button + the Enter-while-running handler. */
+  /** Queue path used by the custom send buttons and mid-turn Enter, which the primitive blocks. */
   enqueuePrompt: (text: string, attachments?: PromptAttachmentInput[]) => void | Promise<void>;
-  /** Attachment kinds the current agent accepts, gating the paperclip
-   *  / paste / drop affordances. Null until the handshake reports it.
-   *  See #1000 / #965. */
   promptCapabilities: PromptCapabilities | null;
-  /** Attachments staged for the next send, owned by AcpRuntime so
-   *  the assistant-ui Enter / Send path can read them on submit. */
+  /** Owned by AcpRuntime so the idle Enter path can read them on submit. */
   pendingAttachments: PromptAttachmentInput[];
   setPendingAttachments: React.Dispatch<React.SetStateAction<PromptAttachmentInput[]>>;
-  /** When set, replace the current composer text with `text` and
-   *  focus the textarea (cursor at end). Used by the context-primer
-   *  banner to prefill a transcript recap before send. The `id` is
-   *  a fresh nonce per insertion so the effect re-fires even when
-   *  the same text is inserted twice. See #1004. */
+  /** Replaces the text and focuses; a fresh `id` re-applies the same text. */
   primerPrefill?: { id: string; text: string } | null;
-  /** The prompt queue, oldest first. Drives ArrowUp/ArrowDown recall:
-   *  ArrowUp on an origin caret loads the newest entry for editing,
-   *  further arrows walk the queue shell-history style. */
+  /** Oldest first; source for ArrowUp/ArrowDown recall. */
   queuedPrompts: QueuedPrompt[];
-  /** Edit a queued prompt in place by id, preserving its position. Used
-   *  when the user submits while browsing the queue, so an edit does not
-   *  enqueue a duplicate. */
   editQueuedPrompt: (id: string, text: string) => void;
 }
 
-export function Composer({
-  sessionId,
-  currentAgent,
-  availableModes,
-  currentModeId,
-  legacyMode,
-  configOptions,
-  pendingConfigOption,
-  setConfigOption,
-  sessionUsage,
-  availableCommands,
-  connected,
-  turnActive,
-  enqueuePrompt,
-  promptCapabilities,
-  pendingAttachments,
-  setPendingAttachments,
-  primerPrefill,
-  queuedPrompts,
-  editQueuedPrompt,
-}: Props) {
+const POPOVER_CLASS =
+  "absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 shadow-xl";
+
+export function Composer(props: Props) {
+  const { sessionId, turnActive, connected, promptCapabilities, queuedPrompts } = props;
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const { files } = useFilesIndex(sessionId);
-
-  const attachmentsEnabled =
-    !!promptCapabilities &&
-    (promptCapabilities.image || promptCapabilities.audio || promptCapabilities.embeddedContext);
-
-  // Stage files dropped, pasted, or picked. Filters to kinds the agent
-  // accepts and respects the per-prompt count cap; oversize / type
-  // rejection beyond this is enforced authoritatively server-side.
-  const addFiles = useCallback(
-    async (files: FileList | File[]) => {
-      // Only encode up to the remaining slots: base64 work on files the
-      // cap would discard anyway stalls the composer on large drops.
-      const remaining = Math.max(0, MAX_ATTACHMENTS - pendingAttachments.length);
-      if (remaining === 0) return;
-      const list = Array.from(files).slice(0, remaining);
-      const accepted: PromptAttachmentInput[] = [];
-      for (const file of list) {
-        const kind = mimeToKind(file.type || "application/octet-stream");
-        if (!kindSupported(kind, promptCapabilities)) continue;
-        const dataB64 = await fileToBase64(file);
-        if (!dataB64) continue;
-        accepted.push({
-          kind,
-          mimeType: file.type || "application/octet-stream",
-          name: file.name || undefined,
-          dataB64,
-        });
-      }
-      if (accepted.length === 0) return;
-      setPendingAttachments((prev) => prev.concat(accepted).slice(0, MAX_ATTACHMENTS));
-    },
-    [pendingAttachments.length, promptCapabilities, setPendingAttachments],
-  );
-
-  const supportedPendingAttachments = useMemo(
-    () =>
-      promptCapabilities
-        ? pendingAttachments.filter((att) => kindSupported(att.kind, promptCapabilities))
-        : pendingAttachments,
-    [pendingAttachments, promptCapabilities],
-  );
-
-  const removeAttachment = useCallback(
-    (index: number) => {
-      const target = supportedPendingAttachments[index];
-      if (!target) return;
-      setPendingAttachments((prev) => prev.filter((att) => att !== target));
-    },
-    [setPendingAttachments, supportedPendingAttachments],
-  );
-
-  // When the soft keyboard is up the App root's safe-area-inset-bottom
-  // padding reserves space for the iOS home indicator that the keyboard
-  // already physically occludes, leaving a visible gap between the
-  // composer and the top of the keyboard. Cancel that reservation and
-  // drop our own bottom padding while the keyboard is open. See #1143.
-  const { keyboardOpen } = useMobileKeyboard();
-
-  // On an installed iOS PWA the keyboard's accessory bar (predictive / AutoFill
-  // strip) floats over the bottom of the page and covers Send, because the
-  // layout viewport shrinks for the keys but not that strip. Reserve clearance
-  // for it there; regular iOS Safari lifts the whole composer via keyboardHeight
-  // already, so this stays PWA-only to avoid a double gap. See #1143.
-  const iosPwa = useMemo(() => isIOS() && isStandalone(), []);
-
-  // Touch-primary device flag for the Enter-key decision matrix.
-  // Re-evaluated on `(pointer: coarse)` / `(any-pointer: fine)`
-  // changes so plugging in a Bluetooth keyboard on an iPad flips
-  // behavior live without a refresh. See #1129.
-  const [isMobile, setIsMobile] = useState<boolean>(() => detectMobileInput());
-  useEffect(() => {
-    if (typeof window === "undefined" || !window.matchMedia) return;
-    const coarseMql = window.matchMedia("(pointer: coarse)");
-    const fineMql = window.matchMedia("(any-pointer: fine)");
-    const onChange = () => setIsMobile(detectMobileInput());
-    coarseMql.addEventListener("change", onChange);
-    fineMql.addEventListener("change", onChange);
-    return () => {
-      coarseMql.removeEventListener("change", onChange);
-      fineMql.removeEventListener("change", onChange);
-    };
-  }, []);
-
-  // Adapter for the @ file picker. We deliberately skip the
-  // category step (return []) so the popover lands directly in
-  // search-results mode — the resource short-circuits to
-  // adapter.search() when there are no categories. That gives us a
-  // single-pane file list instead of a "Files" category drill-down.
-  const fileAdapter: Unstable_TriggerAdapter = useMemo(
-    () => ({
-      categories: () => [],
-      categoryItems: () => [],
-      search: (query) => {
-        const items = files.map((path) => ({
-          id: path,
-          type: "file",
-          label: path,
-          description: extDescription(path),
-        }));
-        return fuzzyFilter(items, query, 30);
-      },
-    }),
-    [files],
-  );
-
-  // Slash commands: built from the agent's AvailableCommandsUpdate, plus
-  // any server-declared clear aliases the agent doesn't advertise
-  // itself (codex / opencode emit `/new` as a UI affordance but their
-  // ACP servers don't list it in `available_commands_update`, so the
-  // palette would otherwise be missing the very command we detect
-  // server-side as a session-clear boundary). Server-owned via
-  // `SessionResponse.clear_aliases`. See #1133 + multi-agent parity
-  // follow-up.
-  const clearAliases = useClearAliases();
-  const slashItems: Unstable_TriggerItem[] = useMemo(() => {
-    const advertised = new Set(availableCommands.map((c) => c.name));
-    const items: Unstable_TriggerItem[] = availableCommands.map((c) => ({
-      id: c.name,
-      type: "command",
-      label: `/${c.name}`,
-      description: c.description,
-      acceptsInput: c.accepts_input,
-    }));
-    for (const alias of clearAliases) {
-      const name = alias.startsWith("/") ? alias.slice(1) : alias;
-      if (!name || advertised.has(name)) continue;
-      const item = {
-        id: name,
-        type: "command" as const,
-        label: `/${name}`,
-        description: "clear conversation",
-        acceptsInput: false,
-      } as Unstable_TriggerItem;
-      items.push(item);
-      advertised.add(name);
-    }
-    return items;
-  }, [availableCommands, clearAliases]);
-  const slashAdapter: Unstable_TriggerAdapter = useMemo(
-    () => ({
-      categories: () => [],
-      categoryItems: () => [],
-      search: (query) => fuzzyFilter(slashItems, query, 30),
-    }),
-    [slashItems],
-  );
-
-  // Provenance lookup for the `/` picker's badges (#3052): resolves a
-  // command name (which the composer indexes by the agent's advertised
-  // frontmatter name) to the skill's source, so a skill-backed slash
-  // command reads the same "AoE" / agent-root label as the skills manager
-  // and the SkillToolCard.
+  const { client, composerText, draftTextRef } = useComposerClient();
+  const loadText = useLoadText(client, taRef);
+  const attachments = useAttachments(promptCapabilities, props.pendingAttachments, props.setPendingAttachments);
+  const { fileAdapter, slashAdapter } = useTriggerAdapters(sessionId, props.availableCommands);
   const skillIndex = useSkillIndex();
+  const isMobile = useIsMobileInput();
+  const { keyboardOpen } = useMobileKeyboard();
+  // Regular iOS Safari already lifts the composer by keyboardHeight; only the PWA needs this.
+  const iosPwa = useMemo(() => isIOS() && isStandalone(), []);
+  const recall = useQueueRecall(queuedPrompts, client, loadText);
+  const canSend = composerText.trim().length > 0 || attachments.supported.length > 0;
 
-  // 0.15 swapped the stable `useComposerRuntime()` handle for `aui.composer`,
-  // a bound accessor that gets a fresh identity on every store update and
-  // whose `getState()` is the snapshot of the render it came from. The
-  // handlers below are long-lived (a debounced draft writer, keydown recall,
-  // plugin draft ops), so hand them a stable wrapper that always reads
-  // through to the current scope. Without this, an effect keyed on the
-  // accessor tears down on every keystroke and its cleanup persists a stale
-  // draft (#3094 regression).
-  const aui = useAui();
-  const composerRef = useRef(aui.composer);
-  useEffect(() => {
-    composerRef.current = aui.composer;
-  }, [aui]);
-  const composerText = useAuiState((s) => s.composer.text);
-  // The text that draft persistence should write. The store applies `setText`
-  // on a scheduled task, so `getState()` still reports the pre-send text for a
-  // tick after a send clears the composer; a persist racing that window would
-  // put the just-sent prompt back (#3094). This ref is stamped synchronously
-  // by the `setText` wrapper below and reconciled from the store whenever it
-  // actually changes, so it is never behind either source.
-  const draftTextRef = useRef(composerText);
-  useEffect(() => {
-    draftTextRef.current = composerText;
-  }, [composerText]);
-  const composerRuntime = useMemo<ComposerClient>(
-    () => ({
-      getState: () => composerRef.current.getState(),
-      setText: (text: string) => {
-        draftTextRef.current = text;
-        composerRef.current.setText(text);
-      },
-    }),
-    [],
-  );
-
-  // Reactive send-eligibility: the send buttons are grayed out and inert
-  // unless there is something to send, i.e. non-whitespace text OR at least
-  // one supported attachment (an attachment-only prompt is valid, e.g. a
-  // pasted screenshot). Mirrors the guard in `sendFromTextarea`, so clicking
-  // Send with an empty composer can no longer be a silent no-op. The text
-  // lives in the assistant-ui composer store, which 0.15 exposes through the
-  // `useAuiState` selector above rather than a per-scope `subscribe`.
-  const composerHasText = composerText.trim().length > 0;
-  const canSend = composerHasText || supportedPendingAttachments.length > 0;
-
-  // ArrowUp/ArrowDown queue recall (shell-history style). recallRef holds
-  // the id of the queued prompt currently loaded into the composer plus
-  // the draft that was there before browsing began; null when not
-  // browsing. A ref (not state) so the synchronous keydown handler always
-  // reads the live value with no stale closure. Anchored on the stable
-  // queued-prompt id so a background drain never targets the wrong row.
-  const recallRef = useRef<RecallCursor | null>(null);
-  // Render-visible mirror of the browse: drives the "Editing queued
-  // message N of M" banner. recallRef stays the synchronous source of
-  // truth for the keydown handler; applyRecall keeps the two in step.
-  const [recallInfo, setRecallInfo] = useState<{ pos: number; total: number } | null>(null);
-
-  const applyRecall = useCallback(
-    (next: RecallCursor | null) => {
-      recallRef.current = next;
-      setRecallInfo(recallBannerInfo(queuedPrompts, next));
-    },
-    [queuedPrompts],
-  );
-
-  // Load `text` into the composer with the caret at the end, mirroring
-  // the primer-prefill effect's focus + resize dance (setText alone does
-  // not fire onInput, so auto-grow has to be nudged manually).
-  const loadRecallText = useCallback(
-    (text: string) => {
-      composerRuntime.setText(text);
-      requestAnimationFrame(() => {
-        const el = taRef.current;
-        if (!el) return;
-        el.focus();
-        const len = el.value.length;
-        try {
-          el.setSelectionRange(len, len);
-        } catch {
-          // ignore: setSelectionRange can throw on detached nodes
-        }
-        el.style.height = "auto";
-        el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
-      });
-    },
-    [composerRuntime],
-  );
-
-  // Apply a pure recall navigation decision to the composer.
-  const applyNav = useCallback(
-    (nav: RecallNav) => {
-      switch (nav.kind) {
-        case "load":
-          applyRecall(nav.cursor);
-          loadRecallText(nav.text);
-          break;
-        case "restore":
-          loadRecallText(nav.text);
-          applyRecall(null);
-          break;
-        case "exit":
-          applyRecall(null);
-          break;
-        case "none":
-          break;
-      }
-    },
-    [applyRecall, loadRecallText],
-  );
-
-  // Browse toward older queued prompts (ArrowUp): enters recall stashing
-  // the current draft, then walks down and stops at the oldest.
-  const recallOlder = useCallback(() => {
-    applyNav(nextRecallTarget(queuedPrompts, recallRef.current, "older", composerRuntime.getState().text));
-  }, [queuedPrompts, composerRuntime, applyNav]);
-
-  // Browse toward newer queued prompts (ArrowDown); past the newest,
-  // restore the stashed draft and exit.
-  const recallNewer = useCallback(() => {
-    applyNav(nextRecallTarget(queuedPrompts, recallRef.current, "newer", ""));
-  }, [queuedPrompts, applyNav]);
-
-  // Esc while browsing restores the stashed draft and exits, matching the
-  // banner's hint.
-  const cancelRecallToDraft = useCallback(() => {
-    const cur = recallRef.current;
-    if (!cur) return;
-    loadRecallText(cur.stashedDraft);
-    applyRecall(null);
-  }, [loadRecallText, applyRecall]);
-
-  // Unified submit for the custom Send / QueueSend buttons and the
-  // mid-turn Enter path: drains the textarea text + staged attachments
-  // through `enqueuePrompt` (which is the structured view `sendPrompt`), then
-  // clears both. The idle assistant-ui Enter path submits via the
-  // runtime's `onNew`, which reads the same staged attachments from
-  // AcpRuntime. See #1000 / #965.
   const submitComposer = useCallback(() => {
-    const cur = recallRef.current;
+    const cur = recall.recallRef.current;
     if (cur) {
-      applyRecall(null);
-      const text = composerRuntime.getState().text.trim();
-      // Submitting while browsing edits that queued entry in place rather
-      // than enqueuing a duplicate. If it drained since recall (id gone),
-      // fall through to a normal send so the edited text is never lost.
+      recall.applyRecall(null);
+      const text = client.getState().text.trim();
+      // Submitting while browsing edits in place; if the entry drained, send normally so nothing is lost.
       if (text && queuedPrompts.some((p) => p.id === cur.id)) {
-        editQueuedPrompt(cur.id, text);
-        composerRuntime.setText("");
-        const el = taRef.current;
-        if (el) el.style.height = "auto";
+        props.editQueuedPrompt(cur.id, text);
+        client.setText("");
+        if (taRef.current) taRef.current.style.height = "auto";
         return;
       }
     }
-    void sendFromTextarea(taRef, composerRuntime, enqueuePrompt, sessionId, supportedPendingAttachments, () =>
-      setPendingAttachments([]),
+    sendFromTextarea(taRef, client, props.enqueuePrompt, sessionId, attachments.supported, () =>
+      props.setPendingAttachments([]),
     );
-  }, [
-    composerRuntime,
-    enqueuePrompt,
-    sessionId,
-    setPendingAttachments,
-    supportedPendingAttachments,
-    queuedPrompts,
-    editQueuedPrompt,
-    applyRecall,
-  ]);
-  const getPluginComposerSnapshot = useCallback(() => {
-    const ta = taRef.current;
-    const text = composerRuntime.getState().text;
-    const fallbackPos = text.length;
-    return {
-      text,
-      selectionStart: ta?.selectionStart ?? fallbackPos,
-      selectionEnd: ta?.selectionEnd ?? ta?.selectionStart ?? fallbackPos,
-    };
-  }, [composerRuntime]);
-  const applyPluginDraftOperation = useCallback(
-    (operation: ComposerDraftOperation) => {
-      const ta = taRef.current;
-      if (!ta) {
-        if (operation.kind === "set-text") composerRuntime.setText(operation.text);
-        else composerRuntime.setText(`${composerRuntime.getState().text}${operation.text}`);
-        return;
-      }
-      if (operation.kind === "set-text") {
-        composerRuntime.setText(operation.text);
-        requestAnimationFrame(() => {
-          const el = taRef.current;
-          if (!el) return;
-          el.focus();
-          const len = operation.text.length;
-          el.setSelectionRange(len, len);
-          el.style.height = "auto";
-          el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
-        });
-        return;
-      }
-      insertRawTextAtCaret(ta, operation.text, operation.kind === "replace-selection");
-    },
-    [composerRuntime],
-  );
-  const pluginUiEntries = usePluginUiEntries();
-  const pluginComposerEntries = useMemo(
-    () => sessionEntries(pluginUiEntries, "composer-action", sessionId),
-    [pluginUiEntries, sessionId],
-  );
-  const seenPluginDraftOpsRef = useRef<Set<string>>(new Set());
-  useEffect(() => {
-    for (const entry of pluginComposerEntries) {
-      const draft = composerDraftOperation(entry);
-      if (!draft) continue;
-      const key = `${entry.plugin_id}:${entry.id}:${draft.id}`;
-      if (seenPluginDraftOpsRef.current.has(key)) continue;
-      seenPluginDraftOpsRef.current.add(key);
-      applyPluginDraftOperation(draft.operation);
-    }
-  }, [applyPluginDraftOperation, pluginComposerEntries]);
+  }, [client, props, sessionId, attachments.supported, queuedPrompts, recall]);
 
-  // Manual agent switch dialog. Opened from the sidebar row context menu
-  // (see WorkspaceSidebar's "Switch agent" item) via the cross-component
-  // trigger below. Unlike the rate-limit recovery path (which lives up in
-  // StructuredView), this is available at any time so a user can hand back
-  // to, say, claude after a rate-limit handoff to codex.
+  usePluginDraftOperations(sessionId, client, taRef);
+  usePrimerPrefill(props.primerPrefill, loadText);
+  useDraftPersistence(sessionId, client, composerText, draftTextRef, taRef);
+  useInitialFocus(isMobile, taRef);
+  // Sidebar session selection focuses the composer even when already mounted.
+  useFocusTerminalTarget("composer", taRef);
+
+  // Opened from the sidebar row's "Switch agent" item.
   const pendingSwitchAgentSessionId = useSyncExternalStore(
     subscribePendingSwitchAgent,
     getPendingSwitchAgent,
     () => null,
   );
-  const switchAgentOpen = pendingSwitchAgentSessionId === sessionId;
+  const dictationGuard = useDictationBurstGuard((text) => client.setText(text));
 
-  // iOS Safari native dictation (#1431): WebKit fires `beforeinput` /
-  // `input` with `inputType: "insertReplacementText"` per partial
-  // recognition and tracks a private range pointer into the textarea
-  // that is invalidated by any controlled-value re-render. The guard
-  // suspends assistant-ui's `setText` flush for the burst, buffers the
-  // textarea value, and drains it back into the runtime once the burst
-  // ends (1200 ms timeout, blur, or non-replacement input).
-  const dictationGuard = useDictationBurstGuard((text) => {
-    composerRuntime.setText(text);
-  });
-
-  // Context-primer prefill: when the parent passes a `primerPrefill`
-  // payload (after the user clicked "Resume with prior context" on the
-  // banner), replace the composer text with the primer + focus the
-  // textarea + position the cursor at the end. Keyed on `id` so the
-  // effect re-fires for repeat insertions, but not for unrelated
-  // parent re-renders that recreate the wrapping object. See #1004.
-  const primerId = primerPrefill?.id ?? null;
-  const primerText = primerPrefill?.text ?? null;
-  // Refs keep a snapshot of the primer values for the effect body, so the
-  // effect can access them without directly referencing reactive props
-  // (which would trigger no-event-handler). The refs are synced in a passive
-  // effect rather than during render to satisfy react-hooks/refs.
-  const primerIdRef = useRef(primerId);
-  const primerTextRef = useRef(primerText);
-  useEffect(() => {
-    primerIdRef.current = primerId;
-  }, [primerId]);
-  useEffect(() => {
-    primerTextRef.current = primerText;
-  }, [primerText]);
-  useEffect(() => {
-    if (!primerIdRef.current || primerTextRef.current == null) return;
-    composerRuntime.setText(primerTextRef.current);
-    requestAnimationFrame(() => {
-      const el = taRef.current;
-      if (!el) return;
-      el.focus();
-      const len = el.value.length;
-      try {
-        el.setSelectionRange(len, len);
-      } catch {
-        // ignore: non-text inputs can throw here
-      }
-      el.style.height = "auto";
-      el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // Esc while browsing restores the draft, ahead of the primitive's own Escape handling.
+    if (e.key === "Escape" && recall.recallRef.current != null) {
+      e.preventDefault();
+      e.stopPropagation();
+      recall.cancelToDraft();
+      return;
+    }
+    const el = taRef.current;
+    const keys = {
+      key: e.key,
+      shiftKey: e.shiftKey,
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      altKey: e.altKey,
+      isComposing: e.nativeEvent.isComposing,
+    };
+    const recallAction = decideArrowRecall(keys, {
+      caretAtStart: !!el && el.selectionStart === 0 && el.selectionEnd === 0,
+      browsing: recall.recallRef.current != null,
+      queueLen: queuedPrompts.length,
     });
-  }, [composerRuntime, primerId]);
-
-  // Auto-grow the textarea up to ~6 visible lines.
-  const onInput = (e: React.FormEvent<HTMLTextAreaElement>) => {
-    const el = e.currentTarget;
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+    if (recallAction !== "default") {
+      e.preventDefault();
+      e.stopPropagation();
+      recall.recall(recallAction);
+      return;
+    }
+    if (decideEnterAction(keys, { isMobile, turnActive }) === "default") return;
+    e.preventDefault();
+    e.stopPropagation();
+    submitComposer();
   };
 
-  // Per-session draft persistence: keep an unsent prompt across
-  // sidebar navigation / route changes by mirroring composer text into
-  // localStorage. The StructuredView unmounts when the user switches to
-  // another session, so without this the draft is gone on return.
-  // Keyed by sessionId; cleared when the text goes empty (user deleted
-  // it, or the runtime cleared after a successful send).
-  useEffect(() => {
-    const saved = getDraft(sessionId);
-    if (saved && composerRuntime.getState().text === "") {
-      composerRuntime.setText(saved);
-      // setText doesn't fire the textarea's onInput, so the auto-grow
-      // never runs for the restored value. Resize manually once the DOM
-      // has the seeded text.
-      requestAnimationFrame(() => {
-        const el = taRef.current;
-        if (el) {
-          el.style.height = "auto";
-          el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
-        }
-      });
-    }
-
-    // Page-unload flush. Effect cleanup runs on React unmount (sidebar
-    // navigation) but not on a full reload, PWA cold start, or mobile
-    // OS evicting the tab. Without these listeners, whatever the debounce
-    // below is still holding at the moment the page dies is lost; on a fast
-    // typer that's the last sentence or two of the draft (#1358).
-    // visibilitychange covers iOS Safari, which fires pagehide only on
-    // real unload, not on app-switch.
-    const flush = () => setDraft(sessionId, draftTextRef.current);
-    const onHidden = () => {
-      if (document.visibilityState === "hidden") flush();
-    };
-    window.addEventListener("beforeunload", flush);
-    window.addEventListener("pagehide", flush);
-    document.addEventListener("visibilitychange", onHidden);
-    return () => {
-      window.removeEventListener("beforeunload", flush);
-      window.removeEventListener("pagehide", flush);
-      document.removeEventListener("visibilitychange", onHidden);
-      flush();
-    };
-  }, [composerRuntime, sessionId]);
-
-  // Debounced mirror of the live composer text. Re-running on each edit is
-  // the debounce: the cleanup cancels the pending write before the next one
-  // is scheduled. Kept separate from the effect above so the unload listeners
-  // and its unmount flush survive individual keystrokes. The value is read at
-  // fire time, not captured, so a write scheduled just before a send persists
-  // the cleared text rather than resurrecting the sent prompt.
-  useEffect(() => {
-    const writeTimer = window.setTimeout(() => setDraft(sessionId, draftTextRef.current), 250);
-    return () => window.clearTimeout(writeTimer);
-  }, [composerText, sessionId]);
-
-  // Claim focus on mount, then re-claim a couple of times if focus fell to
-  // <body> (some surfaces grab and release focus shortly after mount). Only
-  // when focus is on body or this element, so an intentional click elsewhere
-  // (e.g. the live terminal input) keeps it.
-  //
-  // Mobile skips this entirely (#1178): auto-focusing the textarea pops
-  // the soft keyboard on every session open / switch, which is the wrong
-  // default for the read-traffic that dominates mobile usage. Users tap
-  // the composer when they want to type.
-  useEffect(() => {
-    if (isMobile) return;
-    const el = taRef.current;
-    if (!el) return;
-    el.focus();
-    const reclaim = () => {
-      const active = document.activeElement as HTMLElement | null;
-      if (!active || active === document.body || active === el) {
-        el.focus();
-      }
-    };
-    const t1 = window.setTimeout(reclaim, 250);
-    const t2 = window.setTimeout(reclaim, 700);
-    return () => {
-      window.clearTimeout(t1);
-      window.clearTimeout(t2);
-    };
-  }, [isMobile]);
-
-  // Explicit focus from sidebar session selection (#1454). Lands focus on
-  // the composer even when it is already mounted (re-selecting the active
-  // session, where the keyed remount above never fires); the latch inside
-  // the hook covers the first-open race. App only dispatches "composer" on
-  // desktop, so no coarse-pointer gate is needed here.
-  useFocusTerminalTarget("composer", taRef);
-
-  const wrapperLayout = composerWrapperLayout({
-    keyboardOpen,
-    accessoryBarPx: iosPwa ? IOS_ACCESSORY_BAR_PX : 0,
-  });
+  const wrapperLayout = composerWrapperLayout({ keyboardOpen, accessoryBarPx: iosPwa ? IOS_ACCESSORY_BAR_PX : 0 });
   return (
     <div className={wrapperLayout.className} style={wrapperLayout.style}>
       <div
         {...tourAnchor(TOUR_ANCHORS.composer)}
         className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl"
         onDragOver={(e) => {
-          const hasFiles = Array.from(e.dataTransfer?.types ?? []).includes("Files");
-          if (!hasFiles) return;
-          e.preventDefault();
+          if (Array.from(e.dataTransfer?.types ?? []).includes("Files")) e.preventDefault();
         }}
         onDrop={(e) => {
           const dropped = e.dataTransfer?.files;
           if (!dropped || dropped.length === 0) return;
           e.preventDefault();
-          if (!attachmentsEnabled) return;
-          void addFiles(dropped);
+          if (attachments.enabled) void attachments.addFiles(dropped);
         }}
       >
         <ComposerPrimitive.Unstable_TriggerPopoverRoot>
@@ -931,37 +199,22 @@ export function Composer({
               "transition-colors duration-150",
             ].join(" ")}
           >
-            {/* Queue-recall banner (#2147): signals that the composer is
-                editing an existing queued prompt rather than composing a
-                new one. */}
-            {recallInfo && (
+            {recall.recallInfo && (
               <div className="flex items-center justify-between gap-2 rounded-t-lg border-b border-surface-700 bg-surface-800 px-3 py-1.5 text-xs text-text-secondary">
                 <span className="flex items-center gap-1.5 font-medium text-text-primary">
                   <Pencil className="h-3.5 w-3.5 text-brand-400" />
-                  Editing queued message {recallInfo.pos} of {recallInfo.total}
+                  Editing queued message {recall.recallInfo.pos} of {recall.recallInfo.total}
                 </span>
                 <span className="text-text-dim">Enter saves · Esc restores draft · ↑ ↓ to browse</span>
               </div>
             )}
 
-            {/* @ file picker — Directive behavior chips the path into
-                the prompt text using the default formatter. */}
-            <ComposerPrimitive.Unstable_TriggerPopover
-              char="@"
-              adapter={fileAdapter}
-              className="absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 shadow-xl"
-            >
+            <ComposerPrimitive.Unstable_TriggerPopover char="@" adapter={fileAdapter} className={POPOVER_CLASS}>
               <ComposerPrimitive.Unstable_TriggerPopover.Directive formatter={defaultDirectiveFormatter} />
               <PopoverItems trigger="@" />
             </ComposerPrimitive.Unstable_TriggerPopover>
 
-            {/* / slash commands — Action behavior fires a handler and
-                strips the `/cmd` text from the input. */}
-            <ComposerPrimitive.Unstable_TriggerPopover
-              char="/"
-              adapter={slashAdapter}
-              className="absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 shadow-xl"
-            >
+            <ComposerPrimitive.Unstable_TriggerPopover char="/" adapter={slashAdapter} className={POPOVER_CLASS}>
               <ComposerPrimitive.Unstable_TriggerPopover.Action
                 onExecute={(item) => insertSlashCommand(taRef, item)}
                 removeOnExecute
@@ -969,176 +222,55 @@ export function Composer({
               <PopoverItems trigger="/" skillIndex={skillIndex} />
             </ComposerPrimitive.Unstable_TriggerPopover>
 
-            {/* Input area — tall by default, grows up to 200px */}
             <ComposerPrimitive.Input
               ref={taRef}
               rows={2}
-              // On touch-primary devices (phone / tablet without a
-              // hardware keyboard) plain Enter inserts a newline
-              // instead of dispatching; messages send only via the
-              // explicit Send button. Detected upstream via the
-              // `(pointer: coarse) and (not (any-pointer: fine))`
-              // media query, matching WhatsApp / Slack / ChatGPT
-              // mobile conventions. Replaces our former consumer-side
-              // caret re-insertion dance. See assistant-ui#4091 / #1129.
+              // Touch-primary Enter inserts a newline; sending is the Send button's job.
               unstable_insertNewlineOnTouchEnter
-              // assistant-ui's default Escape binding cancels the active
-              // run (see ComposerPrimitive.Input's `cancelOnEscape`
-              // default). The structured view deliberately keeps cancel behind
-              // an explicit gesture, the Stop button, because Claude
-              // Code CLI also hijacks Escape for cancel and a stray
-              // press would lose work the user did not mean to abort.
+              // Cancel stays behind the Stop button; a stray Escape must not abort a turn.
               cancelOnEscape={false}
               placeholder={
                 turnActive
-                  ? // Same condition as QueueSendButton, so the
-                    // placeholder and the button next to it never give
-                    // opposite instructions. See #2805.
-                    connected && promptCapabilities?.steering
+                  ? connected && promptCapabilities?.steering
                     ? "Add to the current turn… (the agent picks it up mid-work)"
                     : "Queue a follow-up… (sent when current turn ends)"
                   : "Send a message…  Type @ for files, / for commands"
               }
-              onInput={onInput}
+              onInput={(e) => fitTextarea(e.currentTarget)}
               onFocus={() => {
-                // Defensive scrollIntoView for mobile soft-keyboard cycles.
-                // The App root no longer pins height for structured view (#1177),
-                // so `h-dvh` shrinks with the keyboard and the composer
-                // should naturally lift into view; this is a belt-and-
-                // braces hop after the keyboard animation completes so
-                // any UA that lags the layout-viewport update still ends
-                // up scrolled to the composer.
+                // Belt and braces for UAs that lag the keyboard's layout-viewport update.
                 if (!isMobile) return;
                 window.setTimeout(() => {
-                  taRef.current?.scrollIntoView({
-                    block: "end",
-                    behavior: "smooth",
-                  });
+                  taRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
                 }, 300);
               }}
               onBeforeInput={(e) => {
-                // Android Chrome's GBoard / Samsung Keyboard often fire
-                // `beforeinput` with `insertLineBreak` / `insertParagraph`
-                // for the on-screen Enter key WITHOUT a usable `keydown`
-                // (key is "Unidentified" or keyCode 229). The keydown
-                // matrix below misses those, so assistant-ui's bubble-
-                // phase Send wins and sends the message. Intercept here
-                // for mobile, insert a literal newline at the caret, and
-                // let the keydown matrix handle the platforms that do
-                // fire a real Enter keydown. See #1174.
                 const ne = e.nativeEvent as InputEvent;
-                const newlineAction = decideBeforeInputAction(ne.inputType, ne.isComposing, { isMobile });
-                if (newlineAction === "newline") {
+                if (decideBeforeInputAction(ne.inputType, ne.isComposing, { isMobile }) === "newline") {
                   e.preventDefault();
                   e.stopPropagation();
                   insertNewlineAtCaret(taRef);
                   return;
                 }
-                // iOS native dictation burst detection (#1431). Driven
-                // from `beforeinput` rather than `input` so the burst
-                // flag is set before assistant-ui's onChange (composed
-                // by radix) gets a chance to run and call `setText`.
+                // Must run before the primitive's onChange calls setText.
                 dictationGuard.observeInputType(ne.inputType, Date.now());
               }}
               onChange={(e) => {
-                // Suppress assistant-ui's controlled-input flush while
-                // an iOS dictation burst is active (#1431). Radix's
-                // `composeEventHandlers` (used by ComposerPrimitive.Input)
-                // skips the downstream handler when `defaultPrevented`
-                // is set on the SyntheticEvent.
-                if (dictationGuard.shouldSuppressUpstream(e.currentTarget.value)) {
-                  e.preventDefault();
-                }
+                // defaultPrevented makes the primitive skip its controlled-value flush during dictation.
+                if (dictationGuard.shouldSuppressUpstream(e.currentTarget.value)) e.preventDefault();
               }}
-              onBlur={() => {
-                // Tapping Send (or anywhere outside the textarea) blurs
-                // the iOS soft-keyboard-owned field; flush the dictation
-                // buffer first so the pending text lands in
-                // assistant-ui state before the Send click reads it.
-                dictationGuard.flushOnBlur();
-              }}
-              onKeyDown={(e) => {
-                // Queue recall (#2147). ArrowUp at the caret origin (or
-                // while already browsing) walks toward older queued
-                // prompts and loads them for editing; ArrowDown walks back
-                // toward newer entries and the stashed draft. Decided by
-                // decideArrowRecall so multi-line caret movement is never
-                // hijacked. Runs before the Enter matrix below.
-                //
-                // Esc while browsing restores the stashed draft and exits,
-                // intercepted before ComposerPrimitive.Input's cancelOnEscape.
-                if (e.key === "Escape" && recallRef.current != null) {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  cancelRecallToDraft();
-                  return;
-                }
-                const el = taRef.current;
-                const caretAtStart = !!el && el.selectionStart === 0 && el.selectionEnd === 0;
-                const recallAction = decideArrowRecall(
-                  {
-                    key: e.key,
-                    shiftKey: e.shiftKey,
-                    ctrlKey: e.ctrlKey,
-                    metaKey: e.metaKey,
-                    altKey: e.altKey,
-                    isComposing: e.nativeEvent.isComposing,
-                  },
-                  {
-                    caretAtStart,
-                    browsing: recallRef.current != null,
-                    queueLen: queuedPrompts.length,
-                  },
-                );
-                if (recallAction !== "default") {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  if (recallAction === "older") recallOlder();
-                  else recallNewer();
-                  return;
-                }
-                // Two-way Enter dispatch. See decideEnterAction for
-                // the full matrix; the inline branches below handle
-                // each outcome:
-                //   - "send": desktop, mid-turn, plain Enter.
-                //     ComposerPrimitive.Input hard-blocks Enter while
-                //     thread.isRunning && !queue (#1031), so we
-                //     intercept and route through our queue path.
-                //   - "default": modifier keys, IME compose, non-Enter
-                //     keys, desktop idle Enter, or any touch-primary
-                //     Enter; let the primitive's built-in keymap run.
-                //     Touch-primary plain Enter is downgraded to a
-                //     native newline by the Input's
-                //     `unstable_insertNewlineOnTouchEnter` prop.
-                const action = decideEnterAction(
-                  {
-                    key: e.key,
-                    shiftKey: e.shiftKey,
-                    ctrlKey: e.ctrlKey,
-                    metaKey: e.metaKey,
-                    isComposing: e.nativeEvent.isComposing,
-                  },
-                  { isMobile, turnActive },
-                );
-                if (action === "default") return;
-                // action === "send"
-                e.preventDefault();
-                e.stopPropagation();
-                submitComposer();
-              }}
+              // Flush dictation before a Send click reads the text.
+              onBlur={() => dictationGuard.flushOnBlur()}
+              onKeyDown={onKeyDown}
               onPaste={(e) => {
-                // Cmd/Ctrl+V of an image (screenshot) lands here as a
-                // clipboard file item. Capture supported files and stage
-                // them; let text paste fall through untouched. See #965.
-                if (!attachmentsEnabled) return;
-                const items = Array.from(e.clipboardData?.items ?? []);
-                const files = items
+                if (!attachments.enabled) return;
+                const files = Array.from(e.clipboardData?.items ?? [])
                   .filter((it) => it.kind === "file")
                   .map((it) => it.getAsFile())
                   .filter((f): f is File => f != null);
                 if (files.length === 0) return;
                 e.preventDefault();
-                void addFiles(files);
+                void attachments.addFiles(files);
               }}
               autoFocus={!isMobile}
               className={[
@@ -1148,47 +280,9 @@ export function Composer({
               ].join(" ")}
             />
 
-            {/* Staged attachments — thumbnails for images, labelled
-                chips for audio / resources. Removable before send. */}
-            {supportedPendingAttachments.length > 0 && (
-              <div className="flex flex-wrap gap-2 px-3 pt-1">
-                {supportedPendingAttachments.map((att, i) => (
-                  <div
-                    key={`${att.name ?? att.kind}-${i}`}
-                    className="group/att relative flex items-center gap-2 rounded-md border border-surface-700 bg-surface-800 py-1 pl-1 pr-2 text-[11px] text-text-secondary"
-                  >
-                    {att.kind === "image" ? (
-                      <img
-                        src={`data:${att.mimeType};base64,${att.dataB64}`}
-                        alt={att.name ?? "attachment"}
-                        className="h-8 w-8 rounded object-cover"
-                      />
-                    ) : (
-                      <span className="flex h-8 w-8 items-center justify-center rounded bg-surface-700">
-                        <Paperclip className="h-3.5 w-3.5" />
-                      </span>
-                    )}
-                    <span className="max-w-[120px] truncate">{att.name ?? att.kind}</span>
-                    <button
-                      type="button"
-                      aria-label={`Remove ${att.name ?? "attachment"}`}
-                      title="Remove attachment"
-                      onClick={() => removeAttachment(i)}
-                      className="rounded p-0.5 text-text-dim hover:bg-surface-700 hover:text-text-secondary"
-                    >
-                      <X className="h-3 w-3" />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
+            <AttachmentChips attachments={attachments.supported} onRemove={attachments.remove} />
 
-            {/* Footer strip: affordances on the left, send/stop on the
-                right. The left cluster wraps onto extra rows when crowded
-                (mode/model/effort/attachment) so the right action cluster
-                stays pinned and fully reachable on narrow viewports. No
-                overflow-x scroll here: it would force overflow-y to clip
-                the upward-opening model dropdown. See #1717. */}
+            {/* The left cluster wraps rather than scrolls, which would clip the upward model dropdown. */}
             <div
               data-testid="composer-footer"
               className="flex items-end gap-2 border-t border-surface-800/60 px-2 pb-2 pt-1.5"
@@ -1209,13 +303,13 @@ export function Composer({
                 <ToolbarButton
                   icon={<Paperclip className="h-3.5 w-3.5" />}
                   label={
-                    attachmentsEnabled
+                    attachments.enabled
                       ? "Attach files (image / audio / resource)"
                       : promptCapabilities
                         ? "This agent does not accept attachments"
                         : "Waiting for agent capabilities…"
                   }
-                  disabled={!attachmentsEnabled}
+                  disabled={!attachments.enabled}
                   onClick={() => fileInputRef.current?.click()}
                 />
                 <input
@@ -1226,7 +320,7 @@ export function Composer({
                   className="hidden"
                   onChange={(e) => {
                     const picked = e.target.files;
-                    if (picked && picked.length > 0) void addFiles(picked);
+                    if (picked && picked.length > 0) void attachments.addFiles(picked);
                     // Reset so re-picking the same file fires onChange.
                     e.target.value = "";
                   }}
@@ -1234,23 +328,23 @@ export function Composer({
                 <span className="mx-1 h-4 w-px bg-surface-700" aria-hidden />
                 <ModePicker
                   sessionId={sessionId}
-                  availableModes={availableModes}
-                  currentModeId={currentModeId}
-                  legacyMode={legacyMode}
-                  configOptions={configOptions}
-                  pendingConfigOption={pendingConfigOption}
-                  setConfigOption={setConfigOption}
+                  availableModes={props.availableModes}
+                  currentModeId={props.currentModeId}
+                  legacyMode={props.legacyMode}
+                  configOptions={props.configOptions}
+                  pendingConfigOption={props.pendingConfigOption}
+                  setConfigOption={props.setConfigOption}
                 />
                 <SessionConfigControls
-                  configOptions={configOptions}
-                  pendingConfigOption={pendingConfigOption}
-                  onSetConfigOption={setConfigOption}
+                  configOptions={props.configOptions}
+                  pendingConfigOption={props.pendingConfigOption}
+                  onSetConfigOption={props.setConfigOption}
                 />
               </div>
 
               <div data-testid="composer-actions" className="flex shrink-0 items-center gap-2">
-                <UsageHint usage={sessionUsage} />
-                <PluginComposerActions sessionId={sessionId} getSnapshot={getPluginComposerSnapshot} />
+                <UsageHint usage={props.sessionUsage} />
+                <PluginComposerActions sessionId={sessionId} getSnapshot={() => pluginSnapshot(client, taRef)} />
                 {turnActive ? (
                   <>
                     <StopButton />
@@ -1270,588 +364,122 @@ export function Composer({
         </ComposerPrimitive.Unstable_TriggerPopoverRoot>
       </div>
       <SwitchAgentModal
-        open={switchAgentOpen}
+        open={pendingSwitchAgentSessionId === sessionId}
         sessionId={sessionId}
-        currentAgent={currentAgent}
+        currentAgent={props.currentAgent}
         onClose={() => clearPendingSwitchAgent()}
-        onPrefill={(text) => {
-          composerRuntime.setText(text);
-          requestAnimationFrame(() => {
-            const el = taRef.current;
-            if (!el) return;
-            el.focus();
-            const len = el.value.length;
-            try {
-              el.setSelectionRange(len, len);
-            } catch {
-              // ignore: non-text inputs can throw here
-            }
-            el.style.height = "auto";
-            el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
-          });
-        }}
+        onPrefill={loadText}
         trigger="manual"
       />
     </div>
   );
 }
 
-/** Popover items list — same render shape for @ and / since both
- *  have a single category and we surface a flat list. `skillIndex` is only
- *  passed for the `/` picker (#3052): when a command name resolves to a
- *  known skill, its provenance badge renders inline with the label. */
-function PopoverItems({ trigger, skillIndex }: { trigger: string; skillIndex?: SkillIndex }) {
-  return (
-    <ComposerPrimitive.Unstable_TriggerPopoverItems className="max-h-64 overflow-y-auto">
-      {(items) =>
-        items.length === 0 ? (
-          <div className="px-3 py-2 text-xs italic text-text-dim">No matches</div>
-        ) : (
-          items.map((item, i) => {
-            const source = skillIndex ? resolveSkillSource(skillIndex, item.id) : null;
-            return (
-              <ComposerPrimitive.Unstable_TriggerPopoverItem
-                key={item.id}
-                item={item}
-                index={i}
-                className={[
-                  "flex w-full items-start gap-2 px-3 py-2 text-left text-xs",
-                  "hover:bg-surface-800/60",
-                  "data-[highlighted=true]:bg-surface-800",
-                ].join(" ")}
-              >
-                <span className="font-mono text-text-dim">{trigger}</span>
-                <span className="min-w-0 flex-1">
-                  <span className="flex items-center gap-1.5">
-                    <span className="block truncate font-medium text-text-primary">{item.label}</span>
-                    {source && <ProvenanceBadge label={badgeLabel(source)} tone={badgeTone(source)} />}
-                  </span>
-                  {item.description && (
-                    <span className="block truncate text-[11px] text-text-dim">{item.description}</span>
-                  )}
-                </span>
-              </ComposerPrimitive.Unstable_TriggerPopoverItem>
-            );
-          })
-        )
-      }
-    </ComposerPrimitive.Unstable_TriggerPopoverItems>
-  );
-}
-
-/** Write the picked slash command into the composer, replacing the
- *  `/token` the caret sits in (or inserting at the caret when there is
- *  no token, the toolbar-button path).
- *
- *  Goes through the DOM rather than `runtime.setText` on purpose.
- *  assistant-ui keeps its own cursor position for trigger detection and
- *  only advances it from composer input events, so a bare `setText`
- *  moves the text out from under a stale cursor: detection keeps
- *  matching the old prefix, the popover never closes, and its keyboard
- *  handler claims the next Enter and re-picks with a stale trigger
- *  range, which is how `/address-pr-comments` came back as
- *  `ess-pr-comments /address-pr-comments` (#3418). Writing through the
- *  textarea and dispatching a real `InputEvent` makes
- *  `ComposerPrimitive.Input`'s own `onChange` apply the text and the
- *  caret together, in one handler.
- *
- *  The trailing space `replaceSlashCommand` leaves after the command is
- *  what keeps detection from re-firing on the text we just wrote, for
- *  no-arg commands as much as for ones taking arguments (#1512).
- *
- *  Runs after the popover's `removeOnExecute` strip, which rebuilds the
- *  buffer from its own trigger snapshot; ours is the last write in
- *  `selectItem`, so it is the one that lands. */
-export function insertSlashCommand(ref: React.RefObject<HTMLTextAreaElement | null>, item: Unstable_TriggerItem) {
-  const ta = ref.current;
-  if (!ta) return;
-  const caret = ta.selectionStart ?? ta.value.length;
-  const { text, cursor } = replaceSlashCommand(ta.value, caret, ta.selectionEnd ?? caret, item.id);
-  writeComposerValue(ta, text, cursor, "insertText", `/${item.id}`);
-}
-
-/** Replace the textarea's value the way a keystroke would, so
- *  assistant-ui picks it up.
- *
- *  Uses the native `value` setter because React patches its own on the
- *  instance, and dispatches an `InputEvent` carrying `inputType` and
- *  `data` because the trigger popover keys off those fields (#1149).
- *
- *  The caret is set BEFORE the dispatch: `ComposerPrimitive.Input`'s
- *  `onChange` reads `selectionStart` in the same handler that applies
- *  the text, and assigning `value` parks the caret at the end, so
- *  dispatching first hands the popover a cursor pointing past the text
- *  it is about to detect against. */
-function writeComposerValue(ta: HTMLTextAreaElement, next: string, caret: number, inputType: string, data?: string) {
-  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
-  setter?.call(ta, next);
-  ta.focus();
-  ta.setSelectionRange(caret, caret);
-  ta.dispatchEvent(new InputEvent("input", { bubbles: true, inputType, ...(data === undefined ? {} : { data }) }));
-}
-
-/** Insert a literal "\n" at the textarea's caret. Used by the
- *  `beforeinput` interception path for mobile Enter (#1174): when
- *  Android's on-screen keyboard fires `beforeinput` with
- *  `insertLineBreak` / `insertParagraph` (and possibly no usable
- *  `keydown`), we preventDefault on the synthetic line-break and
- *  insert one ourselves so the cursor lands one position past the
- *  newline. Skips the trigger-detection whitespace padding that
- *  `insertAtCaret` does for `@` / `/`; a newline doesn't need it. */
-export function insertNewlineAtCaret(ref: React.RefObject<HTMLTextAreaElement | null>): void {
-  const ta = ref.current;
-  if (!ta) return;
-  const start = ta.selectionStart ?? ta.value.length;
-  const end = ta.selectionEnd ?? start;
-  const before = ta.value.slice(0, start);
-  const after = ta.value.slice(end);
-  writeComposerValue(ta, `${before}\n${after}`, before.length + 1, "insertLineBreak");
-}
-
-/** Insert `text` at the textarea's caret and re-focus. The toolbar
- *  buttons use this to inject `@` or `/` so the trigger popover opens
- *  without forcing the user to grab the keyboard.
- *
- *  Exported for tests. We dispatch a real `InputEvent` (not a generic
- *  `Event`) so assistant-ui's `Unstable_TriggerPopover` sees the
- *  `inputType: "insertText"` + `data: text` fields it relies on for
- *  trigger detection. Without those, the popover library treats the
- *  toolbar-injected character as untracked text and a subsequent
- *  `removeOnExecute` cannot find the trigger to strip, leaving a
- *  duplicate `@@` / `//` in the input (#1149). */
-export function insertAtCaret(ref: React.RefObject<HTMLTextAreaElement | null>, text: string) {
-  const ta = ref.current;
-  if (!ta) return;
-  const start = ta.selectionStart ?? ta.value.length;
-  const end = ta.selectionEnd ?? start;
-  const before = ta.value.slice(0, start);
-  // Trigger detection requires whitespace (or start-of-string) before
-  // the trigger char; pad if we're mid-word.
-  const needsSpace = before.length > 0 && !/[\s\n\t]$/.test(before) ? " " : "";
-  const next = before + needsSpace + text + ta.value.slice(end);
-  writeComposerValue(ta, next, before.length + needsSpace.length + text.length, "insertText", text);
-}
-
-function insertRawTextAtCaret(ta: HTMLTextAreaElement, text: string, replaceSelection: boolean) {
-  const start = ta.selectionStart ?? ta.value.length;
-  const end = replaceSelection ? (ta.selectionEnd ?? start) : start;
-  const next = ta.value.slice(0, start) + text + ta.value.slice(end);
-  writeComposerValue(ta, next, start + text.length, "insertText", text);
-  ta.style.height = "auto";
-  ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
-}
-
-function extDescription(path: string): string | undefined {
-  const m = path.match(/\.([a-z0-9]+)$/i);
-  return m?.[1]?.toLowerCase();
-}
-
-/* ── Toolbar buttons ─────────────────────────────────────────────── */
-
-function ToolbarButton({
-  icon,
-  label,
-  hint,
-  disabled,
-  onClick,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  hint?: string;
-  disabled?: boolean;
-  onClick?: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      title={label}
-      aria-label={label}
-      disabled={disabled}
-      onClick={onClick}
-      className={[
-        "inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-text-dim",
-        "hover:bg-surface-800 hover:text-text-secondary",
-        "disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-transparent disabled:hover:text-text-dim",
-        "transition-colors",
-      ].join(" ")}
-    >
-      {icon}
-      {hint && <span className="font-mono">{hint}</span>}
-    </button>
-  );
-}
-
-/* ── Mode picker ─────────────────────────────────────────────────── */
-
-interface ModePickerProps {
-  sessionId: string;
-  availableModes: AcpState["availableModes"];
-  currentModeId: string | null;
-  legacyMode: AcpState["mode"];
-  configOptions: AcpState["configOptions"];
-  pendingConfigOption: AcpState["pendingConfigOption"];
-  setConfigOption: (configId: string, value: string) => void | Promise<void>;
-}
-
-/** POST the legacy `session/set_mode` path. Used by the SessionModeState
- *  and claude-fallback channels; the config-option channel switches via
- *  `setConfigOption` instead. */
-async function postLegacyMode(sessionId: string, id: string): Promise<void> {
-  try {
-    await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/mode`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode_id: id }),
-    });
-  } catch {
-    // The agent broadcasts CurrentModeChanged on success; if the request
-    // fails the UI stays on the current mode.
-  }
-}
-
-function ModePicker({
-  sessionId,
-  availableModes,
-  currentModeId,
-  legacyMode,
-  configOptions,
-  pendingConfigOption,
-  setConfigOption,
-}: ModePickerProps) {
-  const profile = useAgentProfile();
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement | null>(null);
-
-  // Resolve which channel drives the picker (config option vs ACP
-  // SessionModeState vs claude fallback) and pair each with its own
-  // write path so the two never drift. See lib/modeChannel.ts.
-  const channel = resolveModeChannel({
-    configOptions,
-    availableModes,
-    currentModeId,
-    legacyMode,
-    pendingConfigOption,
-    allowLegacyFallback: profile.capabilities.legacyModeFallback,
-  });
-
-  // Close on outside click / Esc. Declared before the early return so
-  // hook order stays stable across renders where `channel` is null.
-  useEffect(() => {
-    if (!open) return;
-    const onClick = (e: MouseEvent) => {
-      if (!ref.current?.contains(e.target as Node)) setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("mousedown", onClick);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onClick);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [open]);
-
-  // Nothing advertised on an agent without a claude-style taxonomy:
-  // render no picker rather than a phantom vocabulary it would reject.
-  if (!channel) return null;
-
-  const current = channel.modes.find((m) => m.id === channel.activeId) ?? channel.modes[0]!;
-
-  // Tint the chip by id pattern so destructive modes are visually loud.
-  const tone = toneForId(channel.activeId);
-
-  const select = (id: string) => {
-    setOpen(false);
-    if (id === channel.activeId || id === channel.pendingId) return;
-    if (channel.kind === "config") {
-      void setConfigOption(channel.configId, id);
-    } else {
-      void postLegacyMode(sessionId, id);
-    }
+function pluginSnapshot(client: ComposerClient, taRef: React.RefObject<HTMLTextAreaElement | null>) {
+  const ta = taRef.current;
+  const text = client.getState().text;
+  return {
+    text,
+    selectionStart: ta?.selectionStart ?? text.length,
+    selectionEnd: ta?.selectionEnd ?? ta?.selectionStart ?? text.length,
   };
+}
 
-  return (
-    <div ref={ref} {...tourAnchor(TOUR_ANCHORS.modePicker)} className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        title={current.description || `Mode: ${current.name}`}
-        className={[
-          "inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium",
-          "transition-colors",
-          tone,
-        ].join(" ")}
-      >
-        <span>{current.name}</span>
-        <ChevronUp className="h-3 w-3 opacity-70" />
-      </button>
-      {open && (
-        <div
-          className="absolute bottom-full left-0 z-30 mb-1 w-56 overflow-hidden rounded-md border border-surface-700 bg-surface-850 shadow-xl"
-          role="menu"
-        >
-          <div className="border-b border-surface-800 px-3 py-1.5 text-[10px] uppercase tracking-wider text-text-dim">
-            {channel.label}
-          </div>
-          {channel.modes.map((opt) => {
-            const isPending = opt.id === channel.pendingId;
-            return (
-              <button
-                key={opt.id}
-                type="button"
-                role="menuitem"
-                disabled={isPending}
-                onClick={() => select(opt.id)}
-                className={[
-                  "flex w-full items-start gap-2 px-3 py-2 text-left text-xs hover:bg-surface-800",
-                  opt.id === channel.activeId ? "bg-surface-800/60" : "",
-                  isPending ? "cursor-not-allowed opacity-50" : "",
-                ].join(" ")}
-              >
-                <span
-                  className={[
-                    "mt-0.5 inline-block h-3 w-3 shrink-0 rounded-full border",
-                    opt.id === channel.activeId ? "border-brand-500 bg-brand-500" : "border-surface-700",
-                  ].join(" ")}
-                />
-                <span className="min-w-0 flex-1">
-                  <span className="block font-medium text-text-primary">{opt.name}</span>
-                  {opt.description && <span className="block text-[11px] text-text-dim">{opt.description}</span>}
-                </span>
-                {isPending && <span className="text-[10px] uppercase text-text-dim">…</span>}
-              </button>
-            );
-          })}
-        </div>
-      )}
-    </div>
+/** Apply each plugin draft operation once, keyed by plugin, entry, and operation id. */
+function usePluginDraftOperations(
+  sessionId: string,
+  client: ComposerClient,
+  taRef: React.RefObject<HTMLTextAreaElement | null>,
+) {
+  const apply = useCallback(
+    (operation: ComposerDraftOperation) => {
+      const ta = taRef.current;
+      if (operation.kind === "set-text") {
+        client.setText(operation.text);
+        if (!ta) return;
+        requestAnimationFrame(() => {
+          const el = taRef.current;
+          if (!el) return;
+          el.focus();
+          el.setSelectionRange(operation.text.length, operation.text.length);
+          fitTextarea(el);
+        });
+      } else if (!ta) {
+        client.setText(`${client.getState().text}${operation.text}`);
+      } else {
+        insertRawTextAtCaret(ta, operation.text, operation.kind === "replace-selection");
+      }
+    },
+    [client, taRef],
   );
-}
-
-function toneForId(id: string): string {
-  if (/bypass|yolo/i.test(id)) return "border-rose-700/50 bg-rose-950/30 text-rose-300 hover:border-rose-700";
-  if (/accept/i.test(id)) return "border-amber-700/50 bg-amber-950/30 text-amber-300 hover:border-amber-700";
-  if (/plan/i.test(id)) return "border-cyan-800/50 bg-cyan-950/30 text-cyan-300 hover:border-cyan-700";
-  return "border-surface-700 bg-surface-800 text-text-secondary hover:border-surface-600";
-}
-
-/* ── Usage hint ──────────────────────────────────────────────────── */
-
-function UsageHint({ usage }: { usage: AcpState["sessionUsage"] }) {
-  if (!usage || usage.size <= 0) return null;
-  const pct = Math.min(100, Math.round((usage.used / usage.size) * 100));
-  const tone = pct >= 90 ? "text-rose-400" : pct >= 75 ? "text-amber-400" : "text-text-dim";
-  const usedLabel = formatTokens(usage.used);
-  const sizeLabel = formatTokens(usage.size);
-  const cost = usage.cost ? formatCost(usage.cost.amount, usage.cost.currency) : null;
-  const explanation =
-    `Context window: ${usage.used.toLocaleString()} of ${usage.size.toLocaleString()} tokens used (${pct}%). ` +
-    `Color warns as the window fills.` +
-    (cost ? ` ${cost} is cumulative session spend since the last /clear or /compact.` : "");
-  return (
-    <Tooltip text={explanation} multiline>
-      <span
-        className={`hidden sm:inline-flex items-center gap-1 text-[11px] tabular-nums ${tone}`}
-        aria-label={explanation}
-      >
-        <span>
-          {usedLabel}/{sizeLabel}
-        </span>
-        <span className="opacity-70">({pct}%)</span>
-        {cost ? <span className="opacity-70">· {cost}</span> : null}
-      </span>
-    </Tooltip>
+  const pluginUiEntries = usePluginUiEntries();
+  const entries = useMemo(
+    () => sessionEntries(pluginUiEntries, "composer-action", sessionId),
+    [pluginUiEntries, sessionId],
   );
+  const seenRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    for (const entry of entries) {
+      const draft = composerDraftOperation(entry);
+      if (!draft) continue;
+      const key = `${entry.plugin_id}:${entry.id}:${draft.id}`;
+      if (seenRef.current.has(key)) continue;
+      seenRef.current.add(key);
+      apply(draft.operation);
+    }
+  }, [apply, entries]);
 }
 
-function formatTokens(n: number): string {
-  if (n < 1_000) return String(n);
-  if (n < 1_000_000) return `${(n / 1_000).toFixed(n < 10_000 ? 1 : 0)}k`;
-  return `${(n / 1_000_000).toFixed(n < 10_000_000 ? 2 : 1)}M`;
+/** Load the primer text whenever a new prefill id arrives. */
+function usePrimerPrefill(primerPrefill: Props["primerPrefill"], loadText: (text: string) => void) {
+  const primerId = primerPrefill?.id ?? null;
+  const primerText = primerPrefill?.text ?? null;
+  // Mirrored into refs so the effect keys on the id alone.
+  const primerIdRef = useRef(primerId);
+  const primerTextRef = useRef(primerText);
+  useEffect(() => {
+    primerIdRef.current = primerId;
+    primerTextRef.current = primerText;
+  }, [primerId, primerText]);
+  useEffect(() => {
+    if (!primerIdRef.current || primerTextRef.current == null) return;
+    loadText(primerTextRef.current);
+  }, [loadText, primerId]);
 }
 
-function formatCost(amount: number, currency: string): string {
-  try {
-    return new Intl.NumberFormat(undefined, {
-      style: "currency",
-      currency,
-      maximumFractionDigits: amount < 1 ? 4 : 2,
-    }).format(amount);
-  } catch {
-    return `${amount.toFixed(amount < 1 ? 4 : 2)} ${currency}`;
-  }
+/** Desktop only (focus pops the soft keyboard on mobile): focus on mount and
+ *  reclaim briefly if focus fell back to body. */
+function useInitialFocus(isMobile: boolean, taRef: React.RefObject<HTMLTextAreaElement | null>) {
+  useEffect(() => {
+    if (isMobile) return;
+    const el = taRef.current;
+    if (!el) return;
+    el.focus();
+    const reclaim = () => {
+      const active = document.activeElement as HTMLElement | null;
+      if (!active || active === document.body || active === el) el.focus();
+    };
+    const timers = [window.setTimeout(reclaim, 250), window.setTimeout(reclaim, 700)];
+    return () => timers.forEach((t) => window.clearTimeout(t));
+  }, [isMobile, taRef]);
 }
 
-/* ── Send / Stop ─────────────────────────────────────────────────── */
-
-function SendButton({
-  connected = true,
-  disabled = false,
-  onSend,
-}: {
-  connected?: boolean;
-  disabled?: boolean;
-  onSend: () => void;
-}) {
-  // When the session is inactive (WS closed, worker stopped, worker
-  // restarting) we leave the button clickable: `sendPrompt` routes the
-  // text into the local queue and the drain effect fires it on resume.
-  // The tooltip swaps so users can tell the click queued rather than
-  // sent. A custom button (not ComposerPrimitive.Send) drives submit so
-  // the staged attachments ride along and an attachment-only prompt can
-  // send even with empty text. See #1359 / #1000.
-  //
-  // `disabled` grays it out and blocks the click when there is nothing to
-  // send (empty text, no attachments), so an empty click is no longer a
-  // silent no-op.
-  const title = disabled
-    ? "Type a message to send"
-    : connected
-      ? "Send, Enter"
-      : "Session not active, will send on resume";
-  const label = connected ? "Send message" : "Queue message until session resumes";
-  return (
-    <button
-      type="button"
-      aria-label={label}
-      title={title}
-      onClick={onSend}
-      disabled={disabled}
-      className={[
-        "group/send inline-flex items-center justify-center gap-1",
-        "rounded-lg bg-brand-600 px-2.5 py-1.5 text-white shadow-sm",
-        "transition-all duration-100",
-        disabled ? "cursor-not-allowed opacity-40" : "hover:bg-brand-500 active:scale-[0.98]",
-      ].join(" ")}
-    >
-      <PaperPlaneIcon />
-    </button>
-  );
-}
-
-function StopButton() {
-  const aui = useAui();
-  return (
-    <button
-      type="button"
-      aria-label="Stop"
-      title="Stop the agent"
-      onClick={() => aui.thread.cancelRun()}
-      className={[
-        "inline-flex items-center justify-center gap-1.5",
-        "rounded-lg border border-surface-600 bg-surface-800",
-        "px-2.5 py-1.5 text-[12px] font-medium text-text-secondary",
-        "hover:border-rose-700/60 hover:bg-rose-950/30 hover:text-rose-300",
-        "active:scale-[0.98] transition-all duration-100",
-      ].join(" ")}
-    >
-      <Square className="h-3.5 w-3.5 fill-current" strokeWidth={0} />
-      <span>Stop</span>
-    </button>
-  );
-}
-
-/** Send button rendered alongside Stop while a turn is in flight.
- *  Bypasses ComposerPrimitive.Send (which is disabled by the SDK when
- *  the thread is running). Shows a small badge with the current queue
- *  length so users can see at a glance how many follow-ups are stacked
- *  up. See #1031. Inactive sessions (WS closed, worker stopped /
- *  restarting) keep the button clickable and swap the tooltip; the
- *  click routes through `sendPrompt`'s enqueue branch instead of
- *  POSTing. See #1359. */
-function QueueSendButton({
-  connected,
-  steering,
-  disabled = false,
-  onSend,
-}: {
-  connected: boolean;
-  steering: boolean;
-  disabled?: boolean;
-  onSend: () => void;
-}) {
-  // A steerable agent takes the message into the turn already running,
-  // so the queue-after copy would be wrong. Disconnected still wins:
-  // steering does nothing for a prompt that cannot reach the daemon,
-  // and those really do park. See #2805.
-  //
-  // No queue-count badge here: the QueuedPromptsStrip above the composer
-  // already lists the queued items and their count, so a badge on this
-  // button just duplicated it. `disabled` grays it out when there is nothing
-  // to queue (empty composer, no attachments).
-  const title = disabled
-    ? "Type a message to queue"
-    : !connected
-      ? "Queue follow-up, will send on resume, Enter"
-      : steering
-        ? "Send into the current turn, Enter"
-        : "Queue follow-up (sent when current turn ends), Enter";
-  return (
-    <button
-      type="button"
-      aria-label={connected && steering ? "Send message into the current turn" : "Queue follow-up message"}
-      {...tourAnchor(TOUR_ANCHORS.queueSend)}
-      title={title}
-      onClick={onSend}
-      disabled={disabled}
-      className={[
-        "group/send relative inline-flex items-center justify-center gap-1",
-        "rounded-lg bg-brand-600 px-2.5 py-1.5 text-white shadow-sm",
-        "transition-all duration-100",
-        disabled ? "cursor-not-allowed opacity-40" : "hover:bg-brand-500 active:scale-[0.98]",
-      ].join(" ")}
-    >
-      <PaperPlaneIcon />
-    </button>
-  );
-}
-
-/** Pulls current composer text, hands it to the structured view queue, then
- *  clears the textarea + persisted draft. Shared by the mid-turn Send
- *  button and the Enter-while-running keyboard handler. */
+/** Send text and staged attachments through the queue, then clear the composer.
+ *  The persisted draft clears synchronously so a racing remount cannot restore it. */
 function sendFromTextarea(
   taRef: React.RefObject<HTMLTextAreaElement | null>,
-  composerRuntime: ComposerClient,
-  enqueuePrompt: (text: string, attachments?: PromptAttachmentInput[]) => void | Promise<void>,
+  client: ComposerClient,
+  enqueuePrompt: Props["enqueuePrompt"],
   sessionId: string,
-  attachments: PromptAttachmentInput[] = [],
-  clearAttachments?: () => void,
+  attachments: PromptAttachmentInput[],
+  clearAttachments: () => void,
 ): void {
-  if (!composerRuntime) return;
-  const text = composerRuntime.getState().text.trim();
-  // Allow an attachment-only prompt (e.g. a pasted screenshot with no
-  // text); otherwise require some text.
+  const text = client.getState().text.trim();
   if (!text && attachments.length === 0) return;
   void enqueuePrompt(text, attachments.length > 0 ? attachments : undefined);
-  composerRuntime.setText("");
-  // Clear the persisted draft synchronously, not via the 250ms debounced
-  // flush: a remount racing a resume/queue re-render otherwise restores the
-  // just-sent text from localStorage. See #3094 / #3087.
+  client.setText("");
   clearDraft(sessionId);
   clearDraftAttachments(sessionId);
-  clearAttachments?.();
-  // Manually reset the textarea height; auto-grow runs on input events
-  // and we cleared the value without firing one.
-  const el = taRef.current;
-  if (el) el.style.height = "auto";
-}
-
-function PaperPlaneIcon() {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      width="14"
-      height="14"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M22 2 11 13" />
-      <path d="M22 2 15 22l-4-9-9-4 20-7Z" />
-    </svg>
-  );
+  clearAttachments();
+  if (taRef.current) taRef.current.style.height = "auto";
 }

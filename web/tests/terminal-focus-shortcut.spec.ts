@@ -39,16 +39,13 @@ async function focusKind(page: Page, kind: "agent" | "paired") {
     await page.locator('[data-term="agent"]').first().locator("textarea").focus();
     return;
   }
-  // Tabbed docks (#2437): the paired shell mounts only when its terminal tab is
-  // the active tab, so activate it first (desktop). On mobile the picker handles
-  // it and there is no tab strip.
+  // #2437: on desktop the paired shell mounts only while its tab is active.
   const termTab = page.locator('[data-testid^="pane-tab-terminal:"]').first();
   if (await termTab.count()) await termTab.click();
   const visiblePaired = page.locator('[data-term="paired"]:visible').first();
   await visiblePaired.locator("textarea").focus();
 }
 
-// Push focus off any panel so we can test the "from outside" behavior.
 async function blurAll(page: Page) {
   await page.evaluate(() => {
     const a = document.activeElement as HTMLElement | null;
@@ -67,7 +64,6 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page);
-    // The paired shell mounts on demand once its tab is active (tabbed docks).
 
     await focusKind(page, "agent");
     await expect.poll(() => focusedKind(page)).toBe("agent");
@@ -89,8 +85,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await blurAll(page);
     await expect.poll(() => focusedKind(page)).toBe(null);
 
-    // Semantic match for VSCode's Ctrl+` "open/focus the terminal": from
-    // outside both panes, focus lands in paired (the secondary shell).
+    // Like VS Code, from outside both panes focus goes to the paired shell.
     await page.keyboard.press("ControlOrMeta+`");
     await expect.poll(() => focusedKind(page)).toBe("paired");
   });
@@ -193,7 +188,6 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await page.goto("/");
     await openSession(page);
 
-    // Click the file in the diff list.
     await page.locator('button:has-text("foo.ts")').first().click();
     const agent = page.locator('[data-term="agent"]');
     const backToTerminal = page.getByRole("button", { name: "Back to terminal" });
@@ -207,7 +201,6 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await expect(backToTerminal).toBeVisible();
     await expect(agent).toBeHidden();
 
-    // Press Cmd+` → handler clears selectedFilePath, then rAF-dispatches.
     await page.keyboard.press("ControlOrMeta+`");
     await expect.poll(() => focusedKind(page)).toBe("agent");
     await expect(agent).toBeVisible();
@@ -221,24 +214,17 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await openSession(page);
     await focusKind(page, "agent");
 
-    // Tabbed docks (#2437): the paired tab mounts lazily on first focus. Warm it
-    // up once (and return to agent) so the rapid loop below toggles a mounted
-    // panel and stays deterministic, instead of racing the one-time mount.
+    // Mount the paired tab once so the loop toggles mounted panels.
     await page.keyboard.press("ControlOrMeta+`");
     await expect.poll(() => focusedKind(page)).toBe("paired");
     await page.keyboard.press("ControlOrMeta+`");
     await expect.poll(() => focusedKind(page)).toBe("agent");
 
-    // 11 toggles total = odd flips from agent → paired.
     for (let i = 0; i < 11; i++) {
       await page.keyboard.press("ControlOrMeta+`");
     }
     await expect.poll(() => focusedKind(page)).toBe("paired");
   });
-
-  // (The xterm-only `term-focused` panel CSS ring was removed with the xterm
-  // renderer; focus correctness is covered by the focusedKind() assertions
-  // above.)
 });
 
 // ────────────────────────────────────────────────────────────────────
@@ -250,19 +236,14 @@ test.describe("Cmd/Ctrl+` mobile", () => {
   test("toggle works correctly on a mobile viewport", async ({ page }) => {
     await mockTerminalApis(page);
     await page.goto("/");
-    // Sidebar is collapsed on mobile by default; open it to access the
-    // session list.
     await page.getByRole("button", { name: "Toggle sidebar" }).click();
     await openSession(page);
 
-    // Single full-viewport pane on mobile (#1452). Cmd+` promotes and
-    // focuses the paired shell, mounting it lazily; there is exactly one
-    // paired instance, no slide-in copy.
+    // #1452: one full-viewport pane; the chord promotes a single paired instance.
     await page.keyboard.press("ControlOrMeta+`");
     await expect(page.locator('[data-term="paired"]')).toHaveCount(1);
     await expect.poll(() => focusedKind(page)).toBe("paired");
 
-    // Pressing again returns to the agent terminal.
     await page.keyboard.press("ControlOrMeta+`");
     await expect.poll(() => focusedKind(page)).toBe("agent");
 
@@ -281,9 +262,7 @@ test.describe("Help overlay", () => {
     await mockTerminalApis(page);
     await page.goto("/");
 
-    // Open the help overlay via the TopBar "More options" menu rather than
-    // pressing "?" — synthetic key events for `?` proved finicky across
-    // keyboard layouts and the menu path is what users actually use.
+    // Synthetic `?` presses vary by layout, so open help from the menu.
     await page.getByRole("button", { name: "More options" }).click();
     await page.getByRole("menuitem", { name: "Help" }).click();
 

@@ -1,14 +1,9 @@
 //! Scroll calculation for lists with "N more above/below" indicators.
 
-/// Result of scroll calculation for a list with indicator lines.
 pub struct ScrollLayout {
-    /// Number of items to skip from the beginning.
     pub scroll_offset: usize,
-    /// Number of items to display.
     pub list_visible: usize,
-    /// Whether to show the "[N more above]" indicator.
     pub has_more_above: bool,
-    /// Whether to show the "[N more below]" indicator.
     pub has_more_below: bool,
 }
 

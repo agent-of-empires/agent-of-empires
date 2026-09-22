@@ -21,11 +21,9 @@ pub(crate) fn render_wrapped(text: &str, width: u16) -> Vec<Line<'static>> {
 }
 
 /// Accumulates `pulldown-cmark` events into themed ratatui lines.
-///
-/// Inline emphasis pushes/pops modifiers on `mod_stack`; the union of the
-/// stack is the active style. Block elements (headings, paragraphs, code
-/// blocks) are separated by a single blank line at top level. Code-block
-/// content is emitted line-by-line with `DIM`, never the ``` fences.
+/// Inline emphasis pushes/pops modifiers on `mod_stack`, whose union is the
+/// active style. Block elements are separated by a single blank line at top
+/// level; code-block content is emitted line-by-line, never the fences.
 #[derive(Default)]
 struct MarkdownBuilder {
     lines: Vec<Line<'static>>,
@@ -35,9 +33,8 @@ struct MarkdownBuilder {
     /// ordered list, `None` an unordered list.
     list_stack: Vec<Option<u64>>,
     in_code_block: bool,
-    /// Destination of the innermost open link, so the URL can be appended
-    /// (dimmed, in parens) after the link text on close. `None` when the
-    /// URL matches the visible text (autolinks), which would just repeat.
+    /// Destination of the innermost open link, appended dimmed in parens after
+    /// the link text. `None` when the URL matches the visible text.
     link_dest: Option<String>,
     /// Visible text accumulated inside the open link, for the
     /// autolink-repeat check.
@@ -198,10 +195,9 @@ impl MarkdownBuilder {
                     self.push_span(&text, Modifier::DIM);
                 }
             }
-            // A soft break (single newline in the source) renders as a
-            // real line break, matching how Claude Code prints agent
-            // output. A reply formatted one item per line must not collapse
-            // into one wrapped paragraph.
+            // A soft break renders as a real line break, matching how Claude
+            // Code prints agent output: a reply formatted one item per line must
+            // not collapse into one wrapped paragraph.
             Event::SoftBreak if !self.in_code_block => self.flush(),
             Event::HardBreak => self.flush(),
             Event::Rule => {
@@ -212,9 +208,8 @@ impl MarkdownBuilder {
         }
     }
 
-    /// Flush the in-progress table row as one pipe-separated line. The
-    /// TUI markdown pass is single-sweep, so cells are not column-aligned;
-    /// the head row is bolded and rows keep their reading order.
+    /// Flush the in-progress table row as one pipe-separated line. The pass is
+    /// single-sweep, so cells are not column-aligned; the head row is bolded.
     fn flush_table_row(&mut self, extra: Modifier) {
         let Some(cells) = self.table_row.take() else {
             return;

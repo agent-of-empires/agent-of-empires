@@ -74,10 +74,8 @@ impl<Req: Send + 'static, Res: Send + 'static> Worker<Req, Res> {
         }
     }
 
-    /// Enqueue a request (non-blocking). A send failure means the worker
-    /// thread is gone (channel closed at teardown, or a panic in the
-    /// handler). Log it rather than dropping silently so a stuck-looking
-    /// in-flight row is traceable.
+    /// Enqueue a request. A send failure means the worker thread is gone, so
+    /// log it rather than dropping silently.
     pub fn request(&self, req: Req) {
         if let Err(e) = self.request_tx.send(req) {
             tracing::warn!(
@@ -89,11 +87,8 @@ impl<Req: Send + 'static, Res: Send + 'static> Worker<Req, Res> {
         }
     }
 
-    /// Non-blocking poll for a completed result. Surfaces `Disconnected`
-    /// (returned forever once the worker thread is gone, e.g. after a panic
-    /// in the handler) rather than collapsing it into `None`, so the caller
-    /// can clear stuck in-flight state instead of leaving rows pinned on a
-    /// transient status forever.
+    /// Non-blocking poll. Surfaces `Disconnected` rather than collapsing it
+    /// into `None`, so callers can clear state stuck on a dead worker.
     pub fn try_recv(&self) -> Result<Res, mpsc::TryRecvError> {
         self.result_rx.try_recv()
     }
@@ -111,9 +106,7 @@ impl<Req: Send + 'static, Res: Send + 'static> Worker<Req, Res> {
         drop(result_rx);
         result
     }
-    /// Test-only worker with one pre-seeded result and no handler; requests
-    /// are drained and ignored. Lets consumer tests exercise the
-    /// result-application path without running real side effects.
+    /// Test-only worker with one pre-seeded result; requests are ignored.
     #[cfg(test)]
     pub(crate) fn seeded_for_test(thread_name: &str, result: Res) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<Req>();

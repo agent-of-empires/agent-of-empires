@@ -1,7 +1,7 @@
 id = "vibe"
 
-# Vibe's selection menus and approval prompts all outrank its activity
-# signals: it keeps rendering a spinner under a menu it is blocked on.
+# Vibe's selection menus and approval prompts all outrank its activity signals:
+# it keeps rendering a spinner under a menu it is blocked on.
 [[rules]]
 id = "menu_footer"
 state = "waiting"
@@ -34,17 +34,15 @@ region = "whole_recent"
 visible = true
 line_regex = ['(?i)^\s*\x{203A}\s*\S']
 
-# Braille only: Vibe's Textual spinner draws no other frame, and a middle dot
-# or bullet is ordinary separator punctuation in its parked output.
+# Braille only: Vibe's Textual spinner draws no other frame, and a middle dot or
+# bullet is ordinary separator punctuation in its parked output.
 [[rules]]
 extends = "spinner"
 id = "spinner"
 priority = 960
 
-# Loose on purpose: these words are matched anywhere in the window, which is
-# the behaviour this detector has always had. A pane too narrow for the status
-# word makes Textual stack it one character per row, so the window is unstacked
-# first to read it back as a word.
+# Loose on purpose: these words are matched anywhere in the window, which is the
+# behaviour this detector has always had.
 [[rules]]
 id = "activity_word"
 state = "running"

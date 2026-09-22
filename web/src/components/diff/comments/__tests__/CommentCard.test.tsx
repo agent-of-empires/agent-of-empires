@@ -1,7 +1,4 @@
 // @vitest-environment jsdom
-//
-// Coverage for CommentCard: saved view with range label, the stale chip,
-// Edit -> CommentForm round-trip (onSave + back to view), and Delete.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -24,7 +21,7 @@ function comment(over: Partial<DiffComment> = {}): DiffComment {
 }
 
 function anchored(over: Partial<AnchoredComment> = {}, c: Partial<DiffComment> = {}): AnchoredComment {
-  return { comment: comment(c), status: "active", contentChanged: false, ...over };
+  return { comment: comment(c), status: "active", ...over };
 }
 
 afterEach(cleanup);

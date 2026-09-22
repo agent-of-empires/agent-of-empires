@@ -1,13 +1,11 @@
 //! Server-owned prompt-queue HTTP handlers.
 //!
 //! The daemon persists and drains the queue, so follow-ups survive client
-//! reloads and closed PWAs. These handlers expose queue mutations to clients.
-//!
-//! Attachments ride with a queued prompt: the enqueue POST carries the same
-//! `PromptAttachmentUpload` shape as `/acp/prompt`, the bytes are validated and
-//! buffered in the event store's pending-attachment table (keyed by the prompt
-//! id, outside the seq-keyed retention prune), and the drain reloads and
-//! forwards them. A per-session byte cap bounds how much a client can buffer.
+//! reloads. Attachments ride with a queued prompt: the enqueue POST carries the
+//! same `PromptAttachmentUpload` shape as `/acp/prompt`, the bytes are buffered
+//! in the event store's pending-attachment table (keyed by prompt id, outside
+//! the seq-keyed retention prune), and the drain reloads and forwards them. A
+//! per-session byte cap bounds how much a client can buffer.
 
 use std::sync::Arc;
 
@@ -18,27 +16,25 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
 
-use super::acp::{read_only_block, validate_attachments};
+use super::acp::validate_attachments;
+use super::read_only_block;
 use crate::acp::protocol::PromptAttachmentUpload;
 use crate::daemon::PromptAttachmentRef;
 use crate::server::session_service::EditQueuedOutcome;
 use crate::server::AppState;
 
-/// Cap on total queued-attachment bytes buffered per session. Generous enough
-/// for several image follow-ups (`/acp/prompt` caps one prompt at 20 MiB) while
-/// bounding what an undrained queue can hold on disk.
+/// Cap on total queued-attachment bytes buffered per session: enough for
+/// several image follow-ups while bounding what an undrained queue holds.
 const MAX_QUEUED_ATTACHMENT_BYTES_PER_SESSION: u64 = 64 * 1024 * 1024;
 
-/// Cap on queue depth per session. The queue lives on the `Instance`, and every
+/// Cap on queue depth per session. The queue lives on the `Instance` and every
 /// mutation rewrites the whole profile session file, so depth costs disk I/O on
-/// each enqueue rather than just memory. Well above any plausible run of
-/// follow-ups a person lines up behind one turn.
+/// each enqueue rather than just memory.
 const MAX_QUEUED_PROMPTS_PER_SESSION: usize = 100;
 
-/// Cap on a single queued prompt's text. Matches nothing upstream because
-/// `/acp/prompt` streams straight to the agent, while this text is persisted to
-/// the session file and rewritten on every subsequent queue mutation. 256 KiB
-/// is far past a pasted stack trace and still bounds that rewrite.
+/// Cap on a single queued prompt's text. Unlike `/acp/prompt`, which streams
+/// straight to the agent, this text is persisted and rewritten on every
+/// subsequent queue mutation, so 256 KiB bounds that rewrite.
 const MAX_QUEUED_TEXT_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Deserialize)]
@@ -53,9 +49,8 @@ pub struct EnqueueRequest {
     /// Optional provenance: which device queued it.
     #[serde(default)]
     pub origin_device: Option<String>,
-    /// Image/file attachments to deliver with the prompt when it drains. Same
-    /// untrusted wire shape as `/acp/prompt`; `#[serde(default)]` keeps
-    /// text-only enqueues working unchanged.
+    /// Attachments to deliver when the prompt drains. Same untrusted wire shape
+    /// as `/acp/prompt`; `#[serde(default)]` keeps text-only enqueues working.
     #[serde(default)]
     pub attachments: Vec<PromptAttachmentUpload>,
 }
@@ -85,8 +80,8 @@ pub async fn queue_enqueue(
     if !session_exists(&state, &id).await {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     }
-    // A text-only prompt may be empty ONLY if it carries attachments (an
-    // image-only follow-up). A truly empty enqueue is rejected.
+    // A prompt may be empty only if it carries attachments (an image-only
+    // follow-up). A truly empty enqueue is rejected.
     if req.text.trim().is_empty() && req.attachments.is_empty() {
         return (StatusCode::BAD_REQUEST, "empty prompt").into_response();
     }
@@ -101,16 +96,15 @@ pub async fn queue_enqueue(
             .into_response();
     }
     // Re-enqueuing an existing id rewrites that row's text and replaces its
-    // buffered blobs, so it is a queue mutation of exactly the kind
-    // `edit_queued_prompt` and `remove_queued_prompt` are serialized against:
-    // landing inside a drain's snapshot-to-send window means the old text goes
-    // to the agent and `retire_drained_rows` then deletes the row and the
-    // freshly buffered bytes (#3621). Claimed here rather than in
-    // `buffer_and_enqueue` because the prompt endpoint's `Queued` disposition
-    // reaches that helper already holding the guard, and it is not reentrant.
+    // blobs, so it is the same kind of mutation `edit_queued_prompt` and
+    // `remove_queued_prompt` serialize against: landing inside a drain's
+    // snapshot-to-send window sends the old text and then retires the row along
+    // with the freshly buffered bytes (#3621). Claimed here rather than in
+    // `buffer_and_enqueue`, which the prompt endpoint reaches already holding
+    // the guard and which is not reentrant.
     let _submission = state.session_service.prompt_submission(&id).await;
-    // Depth cap. Re-enqueuing an existing id replaces that row rather than
-    // adding one, so it must not count against a full queue.
+    // Depth cap. Re-enqueuing an existing id replaces that row, so it must not
+    // count against a full queue.
     {
         let queue = state.session_service.queued_prompts_snapshot(&id).await;
         if queue.len() >= MAX_QUEUED_PROMPTS_PER_SESSION && !queue.iter().any(|q| q.id == req.id) {
@@ -122,8 +116,8 @@ pub async fn queue_enqueue(
         }
     }
 
-    // Decode + validate + capability-gate the attachments exactly as the live
-    // prompt path does (size / MIME / count caps, image magic-byte sniff).
+    // Decode, validate and capability-gate the attachments exactly as the live
+    // prompt path does.
     let blobs = match validate_attachments(&state, &id, &req.attachments) {
         Ok(b) => b,
         Err((status, msg)) => return (status, msg).into_response(),
@@ -150,10 +144,9 @@ pub async fn queue_enqueue(
 /// Buffer already-validated attachment blobs under `prompt_id` and append the
 /// prompt to the session's server-owned queue.
 ///
-/// Shared by `queue_enqueue` and the prompt endpoint's `Queued` disposition
-/// (Tier 3), so a prompt the daemon decides to park is byte-for-byte the same
-/// queue row a client would have created itself: same per-session cap, same
-/// idempotent-by-id replace, same blob bookkeeping.
+/// Shared by `queue_enqueue` and the prompt endpoint's `Queued` disposition, so
+/// a prompt the daemon parks is byte-for-byte the queue row a client would have
+/// created itself.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn buffer_and_enqueue(
     state: &Arc<AppState>,
@@ -164,9 +157,9 @@ pub(super) async fn buffer_and_enqueue(
     origin_device: Option<String>,
     created_at: String,
 ) -> Result<crate::daemon::QueuedPromptEntry, (StatusCode, String)> {
-    // Per-session buffer cap: reject rather than let an undrained queue grow
-    // without bound. Re-enqueuing the same id replaces its blobs, so subtract
-    // what this prompt already holds before checking headroom.
+    // Per-session buffer cap, so an undrained queue cannot grow without bound.
+    // Re-enqueuing the same id replaces its blobs, so subtract what this prompt
+    // already holds before checking headroom.
     if !blobs.is_empty() {
         let incoming: u64 = blobs.iter().map(|b| b.data.len() as u64).sum();
         let existing_for_prompt: u64 = state
@@ -188,9 +181,9 @@ pub(super) async fn buffer_and_enqueue(
         }
     }
 
-    // Buffer the bytes keyed by the prompt id, then hand the metadata-only refs
-    // to the store. Re-enqueue is idempotent: clear any prior blobs for this id
-    // first so a re-post with a different attachment set replaces cleanly.
+    // Buffer the bytes keyed by the prompt id, then hand metadata-only refs to
+    // the store. Re-enqueue is idempotent: clear any prior blobs for this id so
+    // a re-post with a different attachment set replaces cleanly.
     let refs: Vec<PromptAttachmentRef> = blobs
         .iter()
         .map(|b| PromptAttachmentRef {
@@ -201,11 +194,10 @@ pub(super) async fn buffer_and_enqueue(
             size: b.data.len() as u64,
         })
         .collect();
-    // Unconditional, not gated on whether this request carried attachments:
+    // Unconditional, not gated on this request carrying attachments:
     // `enqueue_prompt` replaces the row's refs with whatever came in, so a
-    // re-enqueue that drops the attachments would otherwise orphan the prior
-    // blobs, holding bytes against the per-session cap that nothing can ever
-    // deliver or reclaim before the 24h sweep.
+    // re-enqueue that drops them would orphan the prior blobs against the
+    // per-session cap until the 24h sweep.
     state
         .acp_event_store
         .delete_pending_attachments_for_ref(id, prompt_id);
@@ -230,7 +222,7 @@ pub(super) async fn buffer_and_enqueue(
         Some(entry) => Ok(entry),
         None => {
             // Session vanished between the existence check and the enqueue;
-            // drop any blobs we just buffered so they don't leak.
+            // drop the blobs just buffered so they do not leak.
             state
                 .acp_event_store
                 .delete_pending_attachments_for_ref(id, prompt_id);
@@ -282,8 +274,8 @@ pub async fn queue_edit(
             (StatusCode::NOT_FOUND, "queued prompt not found").into_response()
         }
         // Same rule as enqueue: a row with neither text nor attachments cannot
-        // be delivered. The drain retires such a row rather than wedging on it
-        // now, but silently discarding what the user typed is worse than a 400.
+        // be delivered, and silently discarding what the user typed is worse
+        // than a 400.
         EditQueuedOutcome::WouldEmpty => (StatusCode::BAD_REQUEST, "empty prompt").into_response(),
     }
 }
@@ -326,9 +318,9 @@ mod tests {
     use std::time::Duration;
 
     /// #3621: `POST /queue` rewrites an existing row's text and blobs when the
-    /// client re-posts its id, so it must wait for an in-flight delivery the
-    /// same way an edit does. Otherwise the drain sends the pre-rewrite text
-    /// and then retires the row, dropping what the client just posted.
+    /// client re-posts its id, so it must wait for an in-flight delivery the way
+    /// an edit does; otherwise the drain sends the pre-rewrite text and then
+    /// retires the row.
     #[tokio::test]
     async fn a_re_enqueue_waits_for_an_in_flight_delivery() {
         let _app_dir = crate::session::test_support::isolate_app_dir();

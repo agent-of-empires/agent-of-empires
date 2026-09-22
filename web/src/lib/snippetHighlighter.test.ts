@@ -35,25 +35,35 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("fallbackShikiTheme", () => {
-  it("returns the dark default for dark appearance", () => {
-    expect(fallbackShikiTheme("dark")).toBe(DEFAULT_SHIKI_THEME);
-    expect(DEFAULT_SHIKI_THEME).toBe("github-dark");
-  });
-
-  it("returns the light default for light appearance", () => {
-    expect(fallbackShikiTheme("light")).toBe(DEFAULT_SHIKI_THEME_LIGHT);
-    expect(DEFAULT_SHIKI_THEME_LIGHT).toBe("github-light");
-  });
-
-  it("returns the dark default when appearance is undefined", () => {
-    expect(fallbackShikiTheme(undefined)).toBe(DEFAULT_SHIKI_THEME);
-  });
+it.each([
+  ["dark", DEFAULT_SHIKI_THEME, "github-dark"],
+  ["light", DEFAULT_SHIKI_THEME_LIGHT, "github-light"],
+  [undefined, DEFAULT_SHIKI_THEME, "github-dark"],
+] as const)("fallbackShikiTheme(%s) is %s", (appearance, constant, name) => {
+  expect(fallbackShikiTheme(appearance)).toBe(constant);
+  expect(constant).toBe(name);
 });
 
 describe("resolveSnippetTheme", () => {
-  it("returns a known theme unchanged", () => {
-    expect(resolveSnippetTheme("dracula", "dark")).toBe("dracula");
+  it.each([
+    "dracula",
+    "github-dark",
+    "github-light",
+    "github-dark-dimmed",
+    "catppuccin-latte",
+    "material-theme-ocean",
+    "dark-plus",
+    "light-plus",
+    "monokai",
+    "solarized-dark",
+    "solarized-light",
+    "red",
+    "min-light",
+    "gruvbox-dark-medium",
+    "github-dark-high-contrast",
+    "github-light-high-contrast",
+  ])("keeps the bundled theme %s", (theme) => {
+    expect(resolveSnippetTheme(theme, "dark")).toBe(theme);
   });
 
   it("returns the appearance-appropriate fallback for an unknown theme, warning once", () => {
@@ -62,35 +72,9 @@ describe("resolveSnippetTheme", () => {
     expect(resolveSnippetTheme("not-a-real-theme", "dark")).toBe(DEFAULT_SHIKI_THEME);
     expect(resolveSnippetTheme("not-a-real-theme")).toBe(DEFAULT_SHIKI_THEME);
     expect(warn).toHaveBeenCalledTimes(1);
-    warn.mockRestore();
-  });
-
-  it("accepts every other registered theme cleanly", () => {
-    for (const theme of [
-      "github-dark",
-      "github-light",
-      "github-dark-dimmed",
-      "catppuccin-latte",
-      "material-theme-ocean",
-      "dark-plus",
-      "light-plus",
-      "monokai",
-      "solarized-dark",
-      "solarized-light",
-      "red",
-      "min-light",
-      "gruvbox-dark-medium",
-      "github-dark-high-contrast",
-      "github-light-high-contrast",
-    ]) {
-      expect(resolveSnippetTheme(theme, "dark")).toBe(theme);
-    }
   });
 });
 
-// The Rust side asserts every builtin theme *has* a `shiki_theme`; this asserts
-// the id it names is one shiki can actually load, which the wholesale registry
-// read no longer checks for us.
 describe("builtin theme syntax palettes", () => {
   it("each name a palette shiki bundles", () => {
     const dir = new URL("../../../themes/builtin/", import.meta.url);
@@ -104,86 +88,56 @@ describe("builtin theme syntax palettes", () => {
   });
 });
 
-describe("langIdForHint", () => {
-  it("passes through ids Shiki already bundles under that name", () => {
-    expect(langIdForHint("typescript")).toBe("typescript");
-    expect(langIdForHint("json")).toBe("json");
-    expect(langIdForHint("ts")).toBe("ts");
-    expect(langIdForHint("rs")).toBe("rs");
-    expect(langIdForHint("yaml")).toBe("yaml");
-    expect(langIdForHint("console")).toBe("console");
-    expect(langIdForHint("c++")).toBe("c++");
-    expect(langIdForHint("c#")).toBe("c#");
-  });
-
-  it("maps the residual extension gaps Shiki doesn't alias itself", () => {
-    expect(langIdForHint("h")).toBe("c");
-    expect(langIdForHint("hpp")).toBe("cpp");
-    expect(langIdForHint("cc")).toBe("cpp");
-    expect(langIdForHint("htm")).toBe("html");
-    expect(langIdForHint("svg")).toBe("xml");
-    expect(langIdForHint("ex")).toBe("elixir");
-    expect(langIdForHint("exs")).toBe("elixir");
-    expect(langIdForHint("hrl")).toBe("erlang");
-    expect(langIdForHint("ml")).toBe("ocaml");
-    expect(langIdForHint("mli")).toBe("ocaml");
-  });
-
-  it("resolves fence aliases Shiki doesn't ship", () => {
-    expect(langIdForHint("golang")).toBe("go");
-    expect(langIdForHint("cplusplus")).toBe("cpp");
-    expect(langIdForHint("bash-session")).toBe("bash");
-    expect(langIdForHint("terminal")).toBe("bash");
-  });
-
-  it("is case insensitive", () => {
-    expect(langIdForHint("RUST")).toBe("rust");
-    expect(langIdForHint("Python")).toBe("python");
-    expect(langIdForHint("TS")).toBe("ts");
-  });
-
-  it("resolves filename-based keys", () => {
-    expect(langIdForHint("Dockerfile")).toBe("dockerfile");
-    expect(langIdForHint("Makefile")).toBe("make");
-    expect(langIdForHint("makefile")).toBe("make");
-    expect(langIdForHint("CMakeLists")).toBe("cmake");
-  });
-
-  it("returns null for hints Shiki doesn't recognise", () => {
-    expect(langIdForHint("notalang")).toBeNull();
-    expect(langIdForHint("")).toBeNull();
-    expect(langIdForHint("unknownext")).toBeNull();
-    expect(langIdForHint("constructor")).toBeNull();
-    expect(langIdForHint("toString")).toBeNull();
-  });
+it.each<[string, string | null]>([
+  ...["typescript", "json", "ts", "rs", "yaml", "console", "c++", "c#"].map((id): [string, string] => [id, id]),
+  ["h", "c"],
+  ["hpp", "cpp"],
+  ["cc", "cpp"],
+  ["htm", "html"],
+  ["svg", "xml"],
+  ["ex", "elixir"],
+  ["exs", "elixir"],
+  ["hrl", "erlang"],
+  ["ml", "ocaml"],
+  ["mli", "ocaml"],
+  ["golang", "go"],
+  ["cplusplus", "cpp"],
+  ["bash-session", "bash"],
+  ["terminal", "bash"],
+  ["RUST", "rust"],
+  ["Python", "python"],
+  ["TS", "ts"],
+  ["Dockerfile", "dockerfile"],
+  ["Makefile", "make"],
+  ["makefile", "make"],
+  ["CMakeLists", "cmake"],
+  ["notalang", null],
+  ["", null],
+  ["unknownext", null],
+  ["constructor", null],
+  ["toString", null],
+])("langIdForHint(%j) is %j", (hint, expected) => {
+  expect(langIdForHint(hint)).toBe(expected);
 });
 
 describe("langHintForPath", () => {
-  it("resolves extensions through directory paths", () => {
-    expect(langHintForPath("src/lib/highlighter.ts")).toBe("ts");
-    expect(langHintForPath("/abs/path/to/main.rs")).toBe("rs");
-    expect(langHintForPath("src/constructor.ts")).toBe("ts");
+  it.each([
+    ["src/lib/highlighter.ts", "ts"],
+    ["/abs/path/to/main.rs", "rs"],
+    ["src/constructor.ts", "ts"],
+    ["Dockerfile", "Dockerfile"],
+    ["Makefile", "Makefile"],
+    ["makefile", "makefile"],
+    ["/repo/build/Dockerfile", "Dockerfile"],
+    ["a/b/c/CMakeLists.txt", "CMakeLists"],
+    ["README", ""],
+    ["/some/dir/LICENSE", ""],
+  ])("%j gives %j", (path, expected) => {
+    expect(langHintForPath(path)).toBe(expected);
   });
 
-  it("resolves filename overrides without an extension", () => {
-    expect(langHintForPath("Dockerfile")).toBe("Dockerfile");
-    expect(langHintForPath("Makefile")).toBe("Makefile");
-    expect(langHintForPath("makefile")).toBe("makefile");
-  });
-
-  it("resolves filename overrides through directory paths", () => {
-    expect(langHintForPath("/repo/build/Dockerfile")).toBe("Dockerfile");
-    expect(langHintForPath("a/b/c/CMakeLists.txt")).toBe("CMakeLists");
-  });
-
-  it("returns an empty hint for files with no extension", () => {
-    expect(langHintForPath("README")).toBe("");
-    expect(langHintForPath("/some/dir/LICENSE")).toBe("");
-  });
-
-  it("treats dotfiles as having no recognised extension", () => {
-    expect(langIdForHint(langHintForPath(".gitignore"))).toBeNull();
-    expect(langIdForHint(langHintForPath(".env"))).toBeNull();
+  it.each([".gitignore", ".env"])("dotfile %j has no recognised language", (path) => {
+    expect(langIdForHint(langHintForPath(path))).toBeNull();
   });
 });
 

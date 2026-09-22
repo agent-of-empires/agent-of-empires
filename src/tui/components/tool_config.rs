@@ -67,11 +67,8 @@ fn tool_config_suffix_spans(
     spans
 }
 
-/// Outcome of feeding a key to the tool-config overlay.
 pub enum ToolConfigOutcome {
-    /// The overlay stays open.
     Continue,
-    /// The overlay should close (Enter/Esc).
     Close,
 }
 

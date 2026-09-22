@@ -3,12 +3,21 @@
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import { useCancelEscalation } from "../useCancelEscalation";
+import { nextCancelAction, useCancelEscalation } from "../useCancelEscalation";
 
-// Regression guard for #2237: the Stop button must escalate to force-end on a
-// second press without depending on the server-confirmed `cancelling` flag,
-// and the local intent must reset on turn end (turnSeq bump) and on session
-// switch so it never leaks across turns or sessions.
+// A second Stop must force-end without the server's `cancelling` confirmation,
+// which never arrives for an orphaned turn; the intent resets per turn and session.
+describe("nextCancelAction", () => {
+  it.each([
+    [false, false, "cancel"],
+    [false, true, "force"],
+    [true, false, "force"],
+    [true, true, "force"],
+  ])("cancelling=%s alreadyRequested=%s -> %s", (cancelling, alreadyRequested, expected) => {
+    expect(nextCancelAction(cancelling, alreadyRequested)).toBe(expected);
+  });
+});
+
 describe("useCancelEscalation (#2237)", () => {
   function setup(initial: { sessionId?: string; turnSeq?: number; cancelling?: boolean } = {}) {
     const cancelPrompt = vi.fn().mockResolvedValue(undefined);
@@ -56,13 +65,10 @@ describe("useCancelEscalation (#2237)", () => {
     await act(async () => {
       await result.current();
     });
-    // Next turn: pendingUserPromptSeq advances.
     rerender({ sessionId: "s-1", turnSeq: 2, cancelling: false });
     await act(async () => {
       await result.current();
     });
-    // Back to graceful cancel: the stale "already requested" intent does not
-    // carry into the new turn.
     expect(cancelPrompt).toHaveBeenCalledTimes(2);
     expect(forceEndTurn).not.toHaveBeenCalled();
   });
@@ -72,12 +78,10 @@ describe("useCancelEscalation (#2237)", () => {
     await act(async () => {
       await result.current();
     });
-    // Switch to a different session that happens to share the same turnSeq.
     rerender({ sessionId: "s-2", turnSeq: 5, cancelling: false });
     await act(async () => {
       await result.current();
     });
-    // First press in the new session must be a graceful cancel, not a force.
     expect(cancelPrompt).toHaveBeenCalledTimes(2);
     expect(forceEndTurn).not.toHaveBeenCalled();
   });

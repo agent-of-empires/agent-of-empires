@@ -1,31 +1,10 @@
 // @vitest-environment jsdom
-//
-// Pins the web settings search box: it stays closed until you type, filters
-// the schema-backed settings, and emits the chosen hit (with its resolved jump
-// tab) through onJump so SettingsView can switch tabs and scroll to the field.
 
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { SettingsSearch } from "../SettingsSearch";
 import type { SettingsFieldDescriptor } from "../../../lib/types";
-
-const ALLOW = { policy: "allow" } as const;
-const NONE = { rule: "none" } as const;
-
-function descriptor(
-  over: Partial<SettingsFieldDescriptor> & Pick<SettingsFieldDescriptor, "section" | "field" | "label">,
-): SettingsFieldDescriptor {
-  return {
-    category: "Sandbox",
-    description: "",
-    widget: { kind: "toggle" },
-    web_write: ALLOW,
-    profile_overridable: true,
-    validation: NONE,
-    advanced: false,
-    ...over,
-  };
-}
+import { descriptor } from "./fixtures";
 
 const SCHEMA: SettingsFieldDescriptor[] = [
   descriptor({ section: "theme", field: "name", label: "Theme", category: "Theme" }),
@@ -38,8 +17,6 @@ const SCHEMA: SettingsFieldDescriptor[] = [
 ];
 
 describe("SettingsSearch", () => {
-  // This repo's component tests do not load jest-dom, so assertions use plain
-  // DOM presence (queryBy -> null) instead of toBeInTheDocument.
   it("shows no result list until the user types", () => {
     render(<SettingsSearch schema={SCHEMA} loading={false} onJump={vi.fn()} />);
     expect(screen.queryByText("Theme")).toBeNull();
@@ -53,7 +30,6 @@ describe("SettingsSearch", () => {
     const input = screen.getByPlaceholderText("Search settings...");
     fireEvent.change(input, { target: { value: "tool" } });
 
-    // The matching hit shows; the unrelated one is filtered out.
     const hit = screen.getByTestId("settings-search-hit-acp-show_tool_durations");
     expect(hit).toBeTruthy();
     expect(screen.queryByTestId("settings-search-hit-theme-name")).toBeNull();

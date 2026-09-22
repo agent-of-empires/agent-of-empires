@@ -1,16 +1,6 @@
-// Documentation screenshot capture (NOT a behavior test).
-//
-// Drives a seeded `aoe serve` (and, for structured view, a scripted fake ACP
-// agent) through the live harness and writes hero PNGs into
-// docs/assets/web/ and docs/assets/acp/. The docs reference these
-// images; this spec is how they are regenerated.
-//
-// Run via scripts/dev/capture-web-screenshots.sh, or directly:
-//   npx playwright test --config=playwright.capture.config.ts
-//
-// Determinism: fixed viewports, reduced motion, and seeded data only.
-// The output is intended to be visually stable across runs so the
-// committed PNGs only change when the UI actually changes.
+// Regenerates docs/assets/{web,acp} screenshots from seeded servers (not a behavior test).
+// Run via scripts/dev/capture-web-screenshots.sh or playwright.capture.config.ts. Fixed viewports, reduced
+// motion, and seeded data keep the PNGs stable.
 
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -31,14 +21,11 @@ const MOBILE = { width: 390, height: 844 };
 async function shot(page: Page, rel: string): Promise<void> {
   const out = join(ASSETS, rel);
   mkdirSync(join(out, ".."), { recursive: true });
-  // Let late layout (xterm fit, fonts, status glyphs) settle.
   await page.waitForTimeout(700);
   await page.screenshot({ path: out });
   console.log(`captured ${rel}`);
 }
 
-// One non-structured view serve seeded with three sessions; one of them carries
-// uncommitted changes so the diff panel renders real hunks.
 base("web dashboard surfaces", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
     authMode: "none",
@@ -51,7 +38,6 @@ base("web dashboard surfaces", async ({ page }, testInfo) => {
           throw new Error(`aoe add ${title} failed: ${res.stderr?.toString() ?? "<none>"}`);
         }
       };
-      // Plain sessions for a populated sidebar.
       for (const [sub, title] of [
         ["auth-service", "auth-service"],
         ["web-frontend", "web-frontend"],
@@ -62,7 +48,6 @@ base("web dashboard surfaces", async ({ page }, testInfo) => {
         commitAll(dir, "init", env);
         add(dir, title);
       }
-      // A session with uncommitted changes for the diff view.
       const apiDir = join(home, "api-server");
       initWorkingRepo(apiDir, env);
       writeFiles(apiDir, {
@@ -84,7 +69,6 @@ base("web dashboard surfaces", async ({ page }, testInfo) => {
     await page.emulateMedia({ reducedMotion: "reduce" });
     await page.setViewportSize(DESKTOP);
 
-    // Dashboard home.
     await page.goto(`${serve.baseUrl}/`);
     await page.getByRole("link").filter({ hasText: "api-server" }).first().waitFor({ timeout: 15_000 });
     await shot(page, "web/dashboard.png");
@@ -93,12 +77,10 @@ base("web dashboard surfaces", async ({ page }, testInfo) => {
     const api = sessions.find((s) => s.title === "api-server");
     if (!api) throw new Error("seeded session 'api-server' missing");
 
-    // Session view (terminal + diff split).
     await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(api.id)}`);
     await page.locator(".xterm").first().waitFor({ timeout: 15_000 });
     await shot(page, "web/terminal.png");
 
-    // Diff: open a changed file so its hunks render in the viewer.
     await page
       .getByText("3 files", { exact: true })
       .first()
@@ -107,7 +89,6 @@ base("web dashboard surfaces", async ({ page }, testInfo) => {
     const fileRow = page.getByText("auth.ts", { exact: true }).first();
     if (await fileRow.isVisible().catch(() => false)) {
       await fileRow.click();
-      // Wait for the changed line from the seeded edit to render.
       await page
         .getByText(/issueToken/)
         .first()
@@ -117,7 +98,6 @@ base("web dashboard surfaces", async ({ page }, testInfo) => {
     }
     await shot(page, "web/diff.png");
 
-    // Settings.
     await page.goto(`${serve.baseUrl}/settings`);
     await page.waitForTimeout(600);
     await shot(page, "web/settings.png");
@@ -126,8 +106,6 @@ base("web dashboard surfaces", async ({ page }, testInfo) => {
   }
 });
 
-// Structured view overview + interface, driven by a scripted fake ACP agent that
-// emits a plan, agent text, and a few tool-call cards.
 const ACP_SCRIPT = {
   turns: [
     {
@@ -232,21 +210,17 @@ base("structured view surfaces", async ({ page }, testInfo) => {
     await composer.fill("Wire auth into login() and add a health route.");
     await composer.press("Enter");
 
-    // Wait for the agent's closing message to confirm the turn rendered.
     await page
       .getByText(/tests pass/i)
       .first()
       .waitFor({ timeout: 20_000 });
     await shot(page, "structured view/overview.png");
 
-    // Mobile framing for the interface page (composer + cards on a phone).
-    // Reload at the phone width so the layout mounts in mobile mode with
-    // the sidebar collapsed, rather than mid-switch with the drawer open.
+    // Reload at phone width so it mounts in mobile mode.
     await page.setViewportSize(MOBILE);
     await page.goto(`${serve.baseUrl}/session/${encodeURIComponent(seeded.id)}`);
     await waitForStructuredView(page);
-    // The mobile drawer mounts open; tap the content area to the right of
-    // it (the backdrop) so it slides away and the structured view is clear.
+    // Tap the backdrop to close the drawer.
     const sidebarHeading = page.getByTestId("sidebar-axis-heading");
     if (await sidebarHeading.isVisible()) {
       await page.mouse.click(340, 450);
@@ -260,7 +234,6 @@ base("structured view surfaces", async ({ page }, testInfo) => {
   }
 });
 
-// A scripted permission request so the approval card renders.
 const APPROVAL_SCRIPT = {
   turns: [
     {
@@ -323,7 +296,6 @@ base("structured view approval card", async ({ page }, testInfo) => {
     await composer.fill("push my changes");
     await composer.press("Enter");
 
-    // The approval card carries the tool title.
     await page
       .getByText(/git push --force/i)
       .first()

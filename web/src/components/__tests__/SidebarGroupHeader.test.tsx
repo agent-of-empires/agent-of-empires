@@ -1,77 +1,27 @@
 // @vitest-environment jsdom
-//
-// RTL coverage for the reworked project header row (#2207): the per-project
-// session count, the icon (owner avatar vs Folder fallback), the data-draggable
-// hook, and the drag-release click suppression. The suppression branches
-// (window open while dragging, click swallowed row-wide) are timing/pointer
-// dependent and flaky to hit through Playwright, so they are pinned down here
-// where `dragHandle.isDragging` can be controlled directly.
+// Drag-release click suppression is timing dependent in a browser, so it is pinned here via `isDragging`.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
-import { SidebarGroupHeader } from "../WorkspaceSidebar";
+import { SidebarGroupHeader } from "../sidebar/SidebarGroupHeader";
 import type { SidebarGroup } from "../../lib/sidebarGroups";
-import type { SessionResponse, Workspace } from "../../lib/types";
+import type { SessionStatus, Workspace } from "../../lib/types";
+import { makeSession, makeWorkspace } from "./fixtures";
 
-function session(id: string): SessionResponse {
-  return {
+type Sunk = "archived" | "snoozed";
+const SUNK = { archived: { archived_at: "2025-01-02T00:00:00Z" }, snoozed: { snoozed_until: "2099-01-01T00:00:00Z" } };
+
+function workspace(id: string, statuses: SessionStatus[], sunk?: Sunk): Workspace {
+  return makeWorkspace(
     id,
-    title: id,
-    project_path: "/p",
-    group_path: "/p",
-    tool: "claude",
-    status: "Idle",
-    yolo_mode: false,
-    created_at: "2025-01-01T00:00:00Z",
-    last_accessed_at: null,
-    idle_entered_at: null,
-    last_error: null,
-    branch: null,
-    main_repo_path: null,
-    is_sandboxed: false,
-    favorited: false,
-    has_managed_worktree: false,
-    has_terminal: true,
-    profile: "default",
-    cleanup_defaults: { delete_worktree: false, delete_branch: false, delete_sandbox: false },
-    remote_owner: null,
-    notify_on_waiting: null,
-    notify_on_idle: null,
-    notify_on_error: null,
-    claude_fullscreen: false,
-    workspace_repos: [],
-  };
-}
-
-function workspace(id: string, count: number): Workspace {
-  return {
-    id,
-    branch: null,
-    projectPath: "/p",
-    displayName: id,
-    agents: ["claude"],
-    primaryAgent: "claude",
-    status: "idle",
-    sessions: Array.from({ length: count }, (_, i) => session(`${id}-s${i}`)),
-  };
-}
-
-// A workspace whose every session is sunk (archived or snoozed) is "sunk"
-// per workspaceIsSunk, drops out of the live row list, and must not count
-// toward the header badge. See #2372.
-function sunkWorkspace(id: string, count: number, kind: "archived" | "snoozed"): Workspace {
-  const ws = workspace(id, count);
-  ws.sessions = ws.sessions.map((s) =>
-    kind === "archived"
-      ? { ...s, archived_at: "2025-01-02T00:00:00Z" }
-      : { ...s, snoozed_until: "2099-01-01T00:00:00Z" },
+    statuses.map((status, i) => makeSession({ id: `${id}-s${i}`, title: id, status, ...(sunk && SUNK[sunk]) })),
   );
-  return ws;
 }
+const idle = (n: number) => Array<SessionStatus>(n).fill("Idle");
+const views = (...wss: Workspace[]) => wss.map((w) => ({ key: w.id, workspace: w }));
 
 function group(over: Partial<SidebarGroup> = {}): SidebarGroup {
-  const workspaces = over.workspaces ?? [{ key: "w1", workspace: workspace("w1", 3) }];
   return {
     id: "g1",
     kind: "repo",
@@ -80,7 +30,7 @@ function group(over: Partial<SidebarGroup> = {}): SidebarGroup {
     alias: null,
     color: null,
     remoteOwner: null,
-    workspaces,
+    workspaces: views(workspace("w1", idle(3))),
     status: "idle",
     collapsed: false,
     capabilities: { appearance: true, reorder: true, create: "repo" },
@@ -92,14 +42,17 @@ function group(over: Partial<SidebarGroup> = {}): SidebarGroup {
   };
 }
 
-function dragHandle(isDragging: boolean) {
-  return { setActivatorNodeRef: () => {}, attributes: {}, listeners: {}, isDragging };
-}
+const dragHandle = (isDragging: boolean) => ({
+  setActivatorNodeRef: () => {},
+  attributes: {},
+  listeners: {},
+  isDragging,
+});
 
 function renderHeader(props: Partial<Parameters<typeof SidebarGroupHeader>[0]> = {}) {
   const onClick = vi.fn();
   const onNewSession = vi.fn();
-  render(
+  const ui = (p: typeof props) => (
     <SidebarGroupHeader
       group={group()}
       hasActiveChild={false}
@@ -107,159 +60,74 @@ function renderHeader(props: Partial<Parameters<typeof SidebarGroupHeader>[0]> =
       onNewSession={onNewSession}
       onUpdateAppearance={() => {}}
       offline={false}
-      {...props}
-    />,
+      {...p}
+    />
   );
-  return { onClick, onNewSession };
+  const { rerender } = render(ui(props));
+  return { onClick, onNewSession, rerender: (p: typeof props) => rerender(ui(p)) };
 }
 
-afterEach(() => cleanup());
+const text = (id: string) => screen.queryByTestId(id)?.textContent;
+
+afterEach(cleanup);
 
 describe("SidebarGroupHeader", () => {
-  it("counts live (non-sunk) workspaces, matching the rows rendered below", () => {
-    renderHeader({
-      group: group({
-        workspaces: [
-          { key: "a", workspace: workspace("a", 2) },
-          { key: "b", workspace: workspace("b", 3) },
-        ],
-      }),
-    });
-    // Two live workspaces, both shown as rows, so the badge reads (2).
-    expect(screen.getByTestId("sidebar-group-session-count").textContent).toBe("(2)");
+  it.each([
+    ["two live workspaces", views(workspace("a", idle(2)), workspace("b", idle(3))), "(2)"],
+    // Sunk rows render in the footer, so they are not counted (#2372).
+    [
+      "live plus sunk",
+      views(workspace("live", idle(1)), workspace("arch", idle(1), "archived"), workspace("zz", idle(1), "snoozed")),
+      "(1)",
+    ],
+    ["only sunk", views(workspace("arch", idle(2), "archived"), workspace("zz", idle(1), "snoozed")), "(0)"],
+  ])("counts %s as %s", (_n, workspaces, count) => {
+    renderHeader({ group: group({ workspaces }) });
+    expect(text("sidebar-group-session-count")).toBe(count);
   });
 
-  it("excludes archived and snoozed workspaces from the count (#2372)", () => {
-    renderHeader({
-      group: group({
-        workspaces: [
-          { key: "live", workspace: workspace("live", 1) },
-          { key: "arch", workspace: sunkWorkspace("arch", 1, "archived") },
-          { key: "snoozed", workspace: sunkWorkspace("snoozed", 1, "snoozed") },
-        ],
-      }),
-    });
-    // Only the live workspace is a visible row; sunk ones drop to the footer.
-    expect(screen.getByTestId("sidebar-group-session-count").textContent).toBe("(1)");
+  it.each([
+    ["Waiting and Error sessions", views(workspace("a", ["Waiting", "Running"]), workspace("b", ["Error"])), "2"],
+    ["nothing needing attention", views(workspace("w1", idle(3))), undefined],
+    // Sunk wins over Waiting.
+    ["waiting but archived sessions", views(workspace("arch", ["Waiting", "Waiting"], "archived")), undefined],
+  ])("attention badge for %s is %s", (_n, workspaces, badge) => {
+    renderHeader({ group: group({ workspaces }) });
+    expect(text("sidebar-group-attention-badge")).toBe(badge);
   });
 
-  it("reads (0) when every workspace is sunk", () => {
-    renderHeader({
-      group: group({
-        workspaces: [
-          { key: "arch", workspace: sunkWorkspace("arch", 2, "archived") },
-          { key: "snoozed", workspace: sunkWorkspace("snoozed", 1, "snoozed") },
-        ],
-      }),
-    });
-    expect(screen.getByTestId("sidebar-group-session-count").textContent).toBe("(0)");
-  });
-
-  it("renders the Folder fallback icon when the project has no remote owner", () => {
-    renderHeader({ group: group({ remoteOwner: null }) });
-    // The owner avatar is an <img alt={owner}>; with no owner it is absent.
+  it("renders the owner avatar when there is a remote owner, else the folder icon", () => {
+    renderHeader({ group: group({ remoteOwner: "octocat" }) });
+    expect(screen.getByRole("img").getAttribute("alt")).toBe("octocat");
+    cleanup();
+    renderHeader();
     expect(screen.queryByRole("img")).toBeNull();
     expect(screen.getByTestId("sidebar-group-icon")).not.toBeNull();
   });
 
-  it("renders the owner avatar when the project has a remote owner", () => {
-    renderHeader({ group: group({ remoteOwner: "octocat" }) });
-    const img = screen.getByRole("img") as HTMLImageElement;
-    expect(img.getAttribute("alt")).toBe("octocat");
-  });
-
-  it("marks the header draggable only when a drag handle is provided", () => {
-    renderHeader({ dragHandle: dragHandle(false) });
+  it("marks the header draggable only with a drag handle", () => {
+    const { rerender } = renderHeader({ dragHandle: dragHandle(false) });
     expect(screen.getByTestId("sidebar-group-header").getAttribute("data-draggable")).toBe("true");
-    cleanup();
-    renderHeader();
+    rerender({});
     expect(screen.getByTestId("sidebar-group-header").getAttribute("data-draggable")).toBeNull();
   });
 
-  it("toggles collapse on a normal click (no drag in flight)", () => {
-    const { onClick } = renderHeader({ dragHandle: dragHandle(false) });
-    fireEvent.click(screen.getByText("my-project"));
-    expect(onClick).toHaveBeenCalledTimes(1);
-  });
-
-  it("swallows clicks on every control while a drag is in flight", () => {
-    const { onClick, onNewSession } = renderHeader({ dragHandle: dragHandle(true) });
-    // Drag active: the row-level capture handler must suppress both the
-    // toggle and the New Session button, not just the toggle.
-    fireEvent.click(screen.getByText("my-project"));
-    fireEvent.click(screen.getByLabelText("New session in my-project"));
-    expect(onClick).not.toHaveBeenCalled();
-    expect(onNewSession).not.toHaveBeenCalled();
-  });
-
-  it("keeps suppressing briefly after the drag ends, then releases", () => {
+  it("swallows clicks on every control during a drag and briefly after, then toggles again", () => {
     vi.useFakeTimers();
     try {
-      const onClick = vi.fn();
-      const { rerender } = render(
-        <SidebarGroupHeader
-          group={group()}
-          hasActiveChild={false}
-          onClick={onClick}
-          onNewSession={() => {}}
-          onUpdateAppearance={() => {}}
-          offline={false}
-          dragHandle={dragHandle(true)}
-        />,
-      );
-      // Drag ends: window collapses from Infinity to a short tail.
-      rerender(
-        <SidebarGroupHeader
-          group={group()}
-          hasActiveChild={false}
-          onClick={onClick}
-          onNewSession={() => {}}
-          onUpdateAppearance={() => {}}
-          offline={false}
-          dragHandle={dragHandle(false)}
-        />,
-      );
+      const { onClick, onNewSession, rerender } = renderHeader({ dragHandle: dragHandle(true) });
+      fireEvent.click(screen.getByText("my-project"));
+      fireEvent.click(screen.getByLabelText("New session in my-project"));
+      rerender({ dragHandle: dragHandle(false) });
       fireEvent.click(screen.getByText("my-project"));
       expect(onClick).not.toHaveBeenCalled();
+      expect(onNewSession).not.toHaveBeenCalled();
 
-      // After the tail expires a click toggles again.
       vi.advanceTimersByTime(300);
       fireEvent.click(screen.getByText("my-project"));
       expect(onClick).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }
-  });
-
-  it("shows an attention badge summing Waiting/Error sessions across the group", () => {
-    const wsA = workspace("a", 2);
-    wsA.sessions = [
-      { ...wsA.sessions[0]!, status: "Waiting" },
-      { ...wsA.sessions[1]!, status: "Running" },
-    ];
-    const wsB = workspace("b", 1);
-    wsB.sessions = [{ ...wsB.sessions[0]!, status: "Error" }];
-    renderHeader({
-      group: group({
-        workspaces: [
-          { key: "a", workspace: wsA },
-          { key: "b", workspace: wsB },
-        ],
-      }),
-    });
-    expect(screen.getByTestId("sidebar-group-attention-badge").textContent).toBe("2");
-  });
-
-  it("hides the attention badge when nothing needs attention", () => {
-    renderHeader({ group: group({ workspaces: [{ key: "w1", workspace: workspace("w1", 3) }] }) });
-    expect(screen.queryByTestId("sidebar-group-attention-badge")).toBeNull();
-  });
-
-  it("does not count sunk sessions toward the attention badge", () => {
-    // Archived but Waiting: the sunk short-circuit must win, so no badge.
-    const ws = sunkWorkspace("arch", 2, "archived");
-    ws.sessions = ws.sessions.map((s) => ({ ...s, status: "Waiting" }));
-    renderHeader({ group: group({ workspaces: [{ key: "arch", workspace: ws }] }) });
-    expect(screen.queryByTestId("sidebar-group-attention-badge")).toBeNull();
   });
 });

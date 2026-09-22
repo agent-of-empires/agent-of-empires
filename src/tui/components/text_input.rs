@@ -7,7 +7,6 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::tui::styles::Theme;
 
-/// Finds the longest common prefix among a set of strings.
 pub fn longest_common_prefix(values: &[String]) -> String {
     if values.is_empty() {
         return String::new();

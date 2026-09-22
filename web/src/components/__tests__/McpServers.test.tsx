@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-//
-// Contract test for the MCP servers settings panel (#1996). The live
-// Playwright spec covers the read/provenance/redaction happy path against a
-// real backend; this locks in the mutation handlers (conflict resolve, keep,
-// drop) and their notice branches, which the live coverage does not feed into
-// the Vitest patch lane. The api module is mocked so each handler's
-// success / stale / failure path is driven deterministically.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -117,36 +110,30 @@ async function openConflictModal() {
 }
 
 describe("McpServers conflict resolution", () => {
-  it("resolving 'Keep AoE version' posts the winner + fingerprint and reloads", async () => {
-    resolveMcpConflict.mockResolvedValue("applied");
-    const dialog = await openConflictModal();
-    // After an applied resolution the surface reloads with no conflict.
-    fetchMcpServers.mockResolvedValue(response());
-    fireEvent.click(within(dialog).getByText("Keep AoE version"));
-    await waitFor(() => expect(resolveMcpConflict).toHaveBeenCalledWith("fs", "claude", "aoe", "fp-123"));
-    await waitFor(() => expect(screen.queryByLabelText("resolve fs")).toBeNull());
-  });
+  it.each([
+    ["Keep AoE version", "aoe"],
+    ["Use native", "native"],
+  ] as [string, "aoe" | "native"][])(
+    "'%s' posts its winner with the fingerprint and reloads",
+    async (button, winner) => {
+      resolveMcpConflict.mockResolvedValue("applied");
+      const dialog = await openConflictModal();
+      // After an applied resolution the surface reloads with no conflict.
+      fetchMcpServers.mockResolvedValue(response());
+      fireEvent.click(within(dialog).getByText(button));
+      await waitFor(() => expect(resolveMcpConflict).toHaveBeenCalledWith("fs", "claude", winner, "fp-123"));
+      await waitFor(() => expect(screen.queryByLabelText("resolve fs")).toBeNull());
+    },
+  );
 
-  it("'Use native' resolves with the native winner", async () => {
-    resolveMcpConflict.mockResolvedValue("applied");
-    const dialog = await openConflictModal();
-    fetchMcpServers.mockResolvedValue(response());
-    fireEvent.click(within(dialog).getByText("Use native"));
-    await waitFor(() => expect(resolveMcpConflict).toHaveBeenCalledWith("fs", "claude", "native", "fp-123"));
-  });
-
-  it("a stale result shows the 'already resolved' notice", async () => {
-    resolveMcpConflict.mockResolvedValue("stale");
-    const dialog = await openConflictModal();
-    fireEvent.click(within(dialog).getByText("Keep AoE version"));
-    expect(await screen.findByText(/already resolved by another surface/)).toBeTruthy();
-  });
-
-  it("an error result shows the failure notice", async () => {
-    resolveMcpConflict.mockResolvedValue("error");
+  it.each([
+    ["stale", /already resolved by another surface/],
+    ["error", /Could not resolve "fs"/],
+  ] as [McpResolveResult, RegExp][])("a %s result shows its notice", async (result, notice) => {
+    resolveMcpConflict.mockResolvedValue(result);
     const dialog = await openConflictModal();
     fireEvent.click(within(dialog).getByText("Keep AoE version"));
-    expect(await screen.findByText(/Could not resolve "fs"/)).toBeTruthy();
+    expect(await screen.findByText(notice)).toBeTruthy();
   });
 
   it("cancel closes the modal without resolving", async () => {
@@ -171,41 +158,32 @@ describe("McpServers keep / drop", () => {
     });
   }
 
-  it("keep promotes the server and reloads on success", async () => {
+  it.each([
+    ["keep", keepMcpServer],
+    ["drop", dropMcpServer],
+  ] as [string, typeof keepMcpServer][])("%s applies to the server and reloads on success", async (action, call) => {
     fetchMcpServers.mockResolvedValue(keptResponse());
-    keepMcpServer.mockResolvedValue(true);
+    call.mockResolvedValue(true);
     render(<McpServers />);
-    const keepBtn = await screen.findByLabelText("keep gone");
+    const button = await screen.findByLabelText(`${action} gone`);
     fetchMcpServers.mockResolvedValue(response());
-    fireEvent.click(keepBtn);
-    await waitFor(() => expect(keepMcpServer).toHaveBeenCalledWith("gone", "claude"));
-    await waitFor(() => expect(screen.queryByLabelText("keep gone")).toBeNull());
+    fireEvent.click(button);
+    await waitFor(() => expect(call).toHaveBeenCalledWith("gone", "claude"));
+    await waitFor(() => expect(screen.queryByLabelText(`${action} gone`)).toBeNull());
   });
 
-  it("keep failure shows a notice and does not clear the row", async () => {
-    fetchMcpServers.mockResolvedValue(keptResponse());
-    keepMcpServer.mockResolvedValue(false);
-    render(<McpServers />);
-    fireEvent.click(await screen.findByLabelText("keep gone"));
-    expect(await screen.findByText(/Could not keep "gone"/)).toBeTruthy();
-    expect(screen.getByLabelText("keep gone")).toBeTruthy();
-  });
-
-  it("drop discards the server on success", async () => {
-    fetchMcpServers.mockResolvedValue(keptResponse());
-    dropMcpServer.mockResolvedValue(true);
-    render(<McpServers />);
-    const dropBtn = await screen.findByLabelText("drop gone");
-    fetchMcpServers.mockResolvedValue(response());
-    fireEvent.click(dropBtn);
-    await waitFor(() => expect(dropMcpServer).toHaveBeenCalledWith("gone", "claude"));
-  });
-
-  it("drop failure shows a notice", async () => {
-    fetchMcpServers.mockResolvedValue(keptResponse());
-    dropMcpServer.mockResolvedValue(false);
-    render(<McpServers />);
-    fireEvent.click(await screen.findByLabelText("drop gone"));
-    expect(await screen.findByText(/Could not drop "gone"/)).toBeTruthy();
-  });
+  it.each([
+    ["keep", keepMcpServer, /Could not keep "gone"/],
+    ["drop", dropMcpServer, /Could not drop "gone"/],
+  ] as [string, typeof keepMcpServer, RegExp][])(
+    "%s failure shows a notice and leaves the row in place",
+    async (action, call, notice) => {
+      fetchMcpServers.mockResolvedValue(keptResponse());
+      call.mockResolvedValue(false);
+      render(<McpServers />);
+      fireEvent.click(await screen.findByLabelText(`${action} gone`));
+      expect(await screen.findByText(notice)).toBeTruthy();
+      expect(screen.getByLabelText(`${action} gone`)).toBeTruthy();
+    },
+  );
 });

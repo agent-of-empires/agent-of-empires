@@ -10,6 +10,7 @@ import type {
   BrowseResponse,
   GroupInfo,
   ProjectInfo,
+  ProjectOverrides,
   DockerStatusResponse,
   CreateSessionRequest,
   ClaudeSessionSummary,
@@ -1824,6 +1825,7 @@ export async function createProject(body: {
   allow_override?: boolean;
   default_base_branch?: string;
   pinned?: boolean;
+  overrides?: ProjectOverrides;
 }): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
   try {
     const res = await fetch("/api/projects", {
@@ -1871,11 +1873,15 @@ export async function deleteProject(name: string, target: ProjectTarget): Promis
   }
 }
 
-/** Omitted fields are preserved; a null base branch clears it. */
+/** Omitted fields are preserved. Null clears a base branch or individual override. */
 export async function updateProject(
   name: string,
   target: ProjectTarget,
-  patch: { default_base_branch?: string | null; pinned?: boolean },
+  patch: {
+    default_base_branch?: string | null;
+    pinned?: boolean;
+    overrides?: { [K in keyof ProjectOverrides]?: ProjectOverrides[K] | null };
+  },
 ): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
   try {
     const res = await fetch(`/api/projects/${encodeURIComponent(name)}?${projectQuery(target)}`, {

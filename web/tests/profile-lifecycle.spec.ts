@@ -1,19 +1,8 @@
-// Profile lifecycle: create, select, rename, set default, delete, driven
-// through the dashboard UI (ProfileSelector inside the Session tab of
-// SettingsView plus the "Default profile" SelectField). Ported from live to
-// the mocked suite: a stateful in-route profile store stands in for the
-// backend, so each assertion checks both the request the UI emitted and that
-// the dropdowns reflect the mutated list after the component's re-fetch.
-//
-// Split into independent tests because SettingsView's `profiles` state is
-// fetched once on mount and only refreshes when its own `handleSetDefault`
-// fires, so a UI chain that mixes ProfileSelector edits with the Default
-// profile dropdown picks up stale options without a page reload.
-//
-// The backend's own persistence of these mutations is a server contract; the
-// component-level validation branches live in ProfileSelector.test.tsx.
+// Profile create, rename, default, and delete through Settings against a stateful mock. Separate tests because
+// SettingsView fetches profiles once and would show stale default options after ProfileSelector edits.
 
 import { test, expect } from "./helpers/mockedTest";
+import { mockSettingsApis } from "./helpers/apiMocks";
 import type { Page } from "@playwright/test";
 
 interface ProfileState {
@@ -23,19 +12,12 @@ interface ProfileState {
 
 interface ProfileMockHandle {
   profiles: ProfileState[];
-  /** Recorded POST /api/profiles bodies. */
   posts: Array<{ name?: string }>;
-  /** Recorded renames as { from, body }. */
   renames: Array<{ from: string; body: { new_name?: string } }>;
-  /** Recorded DELETE /api/profiles/<name> targets. */
   deletes: string[];
-  /** Recorded PATCH /api/default-profile bodies. */
   defaultPatches: Array<{ name?: string }>;
 }
 
-/** Stateful stubs for everything the Settings session tab touches. Mutations
- *  update `handle.profiles`, so the GET the component re-issues after each
- *  action returns the post-mutation list and the dropdowns must follow. */
 async function installProfileMocks(page: Page, initial: string[] = ["main"]): Promise<ProfileMockHandle> {
   const handle: ProfileMockHandle = {
     profiles: initial.map((name, i) => ({ name, is_default: i === 0 })),
@@ -45,29 +27,7 @@ async function installProfileMocks(page: Page, initial: string[] = ["main"]): Pr
     defaultPatches: [],
   };
 
-  // Keep the sessions poll green so SettingsView's offline guard does not
-  // disable the content fieldset (the Default profile select lives inside it).
-  await page.route(
-    (url) => url.pathname === "/api/sessions",
-    (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }),
-  );
-  await page.route(
-    (url) => url.pathname === "/api/about",
-    (r) =>
-      r.fulfill({
-        json: { read_only: false, auth_mode: "none", behind_tunnel: false, profile: "main" },
-      }),
-  );
-  // Schema may be empty: the session tab's Default profile selector is the
-  // one non-schema row and renders regardless.
-  await page.route(
-    (url) => url.pathname === "/api/settings/schema",
-    (r) => r.fulfill({ json: [] }),
-  );
-  await page.route(
-    (url) => url.pathname === "/api/settings",
-    (r) => r.fulfill({ json: { session: {} } }),
-  );
+  await mockSettingsApis(page, { settings: () => ({ session: {} }) });
 
   await page.route(
     (url) => url.pathname === "/api/profiles",
@@ -137,7 +97,6 @@ test("create profile via + New POSTs /api/profiles and the dropdown gains it", a
   await nameInput.press("Enter");
 
   await expect.poll(() => handle.posts).toEqual([{ name: "work" }]);
-  // ProfileSelector reloads its list after a successful create.
   await expect(profileSelect(page).locator('option[value="work"]')).toHaveCount(1);
   expect(handle.profiles.find((p) => p.name === "main")?.is_default).toBe(true);
   expect(handle.profiles.find((p) => p.name === "work")?.is_default).toBe(false);
@@ -147,7 +106,6 @@ test("rename profile via Rename PATCHes .../rename and the selection follows", a
   const handle = await installProfileMocks(page, ["main", "work"]);
   await openSessionSettings(page);
 
-  // Select `work` so Rename targets it (rename acts on the selectedProfile).
   await profileSelect(page).selectOption("work");
   await expect(profileSelect(page)).toHaveValue("work");
 
@@ -173,18 +131,15 @@ test("set default profile via Default profile dropdown PATCHes /api/default-prof
   await defaultSelect.selectOption("work");
 
   await expect.poll(() => handle.defaultPatches).toEqual([{ name: "work" }]);
-  // handleSetDefault re-fetches; the dropdown now reflects the new default.
   await expect(defaultSelect).toHaveValue("work");
 });
 
 test("delete profile via Delete issues DELETE /api/profiles/<name>", async ({ page }) => {
   const handle = await installProfileMocks(page, ["main", "scratch"]);
-  // Auto-accept the native confirm() dialog the component pops.
   page.on("dialog", (d) => d.accept());
   await openSessionSettings(page);
 
-  // Select the non-default profile so Delete is visible (the component hides
-  // it for the default row, and the server rejects deleting the active one).
+  // Delete is hidden for the default profile.
   await profileSelect(page).selectOption("scratch");
   await expect(profileSelect(page)).toHaveValue("scratch");
 
@@ -192,7 +147,6 @@ test("delete profile via Delete issues DELETE /api/profiles/<name>", async ({ pa
 
   await expect.poll(() => handle.deletes).toEqual(["scratch"]);
   expect(handle.profiles.map((p) => p.name)).toEqual(["main"]);
-  // The selection falls back to the default profile after the reload.
   await expect(profileSelect(page)).toHaveValue("main");
   await expect(profileSelect(page).locator("option")).toHaveCount(1);
 });

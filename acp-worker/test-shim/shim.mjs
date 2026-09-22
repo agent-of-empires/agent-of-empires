@@ -1,64 +1,73 @@
 #!/usr/bin/env node
 /**
- * Minimal ACP agent shim for structured-view integration tests. Does NOT call any
- * model. Replays a scripted sequence of session updates so we can verify
- * the Rust ACP client end-to-end without API keys or network access.
- *
- * Behavior on `prompt`:
- *   1. Emit one `agent_message_chunk` text event echoing the prompt.
- *   2. Emit a `tool_call` event with kind=read, status=pending.
- *   3. Emit a matching `tool_call_update` with status=completed.
- *   4. Emit a final `agent_message_chunk` saying "done".
- *   5. Resolve with stopReason=end_turn.
- *
- * Used by `tests/acp_acp_smoke.rs`.
+ * Scripted ACP agent for structured-view integration tests; calls no model.
+ * A plain prompt echoes it, runs one read tool call, and ends with "done".
+ * Prompt keywords and SHIM_* env vars select the scenarios below.
  */
 
 import * as acp from "@agentclientprotocol/sdk";
-import { Readable, Writable } from "node:stream";
+import net from "node:net";
+import { appendFile, access, writeFile } from "node:fs/promises";
+import { Duplex, Readable, Writable } from "node:stream";
 
-// ponytail: one shim process serves exactly one ACP connection, so
-// module-level state is equivalent to the old per-connection instance state.
+// One shim process serves one ACP connection, so module state is per connection.
 const sessions = new Map();
-// Resolver shared by every parking test mode: prompt() waits on a Promise
-// that the session/cancel handler resolves so the test can assert the
-// watchdog without waiting for CANCEL_ESCALATION_GRACE to elapse.
+// Resolves a parked prompt when session/cancel arrives.
 let parkedPromptResolve = null;
+// Current value of the SHIM_THOUGHT_LEVEL config option.
+let thoughtLevel = "medium";
 
-// SHIM_PRESEED_SESSION_ID lets a test attach to the shim via the socket
-// transport with `ConnectMode::Resume` (which skips `session/new`) and still
-// get a working `prompt`. Without it, the shim's prompt handler rejects
-// unknown session ids.
-const preseed = process.env.SHIM_PRESEED_SESSION_ID;
-if (preseed) {
-  sessions.set(preseed, {});
+// SHIM_PRESEED_SESSION_ID: a known session for a Resume attach that skips session/new.
+if (process.env.SHIM_PRESEED_SESSION_ID) {
+  sessions.set(process.env.SHIM_PRESEED_SESSION_ID, {});
 }
 
-// SHIM_EMIT_UNSOLICITED_NOTIF reproduces a still-alive runner forwarding a
-// single mid-turn notification shortly after the daemon reattaches in Resume
-// mode, with no prompt issued. Used by the #1216 test to confirm the
-// resume-idle watchdog disarms on the first inbound notification (instead of
-// firing after normal mid-turn silence). The value is the delay in ms before
-// the emit (default 150); after this one notification the shim stays silent so
-// the test can assert no synthetic Stopped follows. Requires
-// SHIM_PRESEED_SESSION_ID so the notification carries a known session.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function waitForFile(path) {
+  while (true) {
+    try {
+      await access(path);
+      return;
+    } catch {
+      await sleep(10);
+    }
+  }
+}
+
+async function record(envVar, line) {
+  const file = process.env[envVar];
+  if (file) await appendFile(file, line);
+}
+
+function park() {
+  return new Promise((resolve) => {
+    parkedPromptResolve = resolve;
+  }).then(() => ({ stopReason: "cancelled" }));
+}
+
+const textContent = (text) => [{ type: "content", content: { type: "text", text } }];
+const usage = (used, cost) => ({
+  sessionUpdate: "usage_update",
+  used,
+  size: 200000,
+  ...(cost ? { cost: { amount: 0.01, currency: "USD" } } : {}),
+});
+
+/**
+ * SHIM_EMIT_UNSOLICITED_NOTIF=<delay ms>: after a Resume reattach, emit one
+ * mid-turn chunk with no prompt, then stay silent. SHIM_UNSOLICITED_RELEASE_FILE
+ * holds the emit until that file exists.
+ */
 function emitUnsolicitedNotifIfRequested(client) {
   const raw = process.env.SHIM_EMIT_UNSOLICITED_NOTIF;
-  if (raw === undefined) return;
   const sessionId = process.env.SHIM_PRESEED_SESSION_ID;
-  if (!sessionId) return;
+  if (raw === undefined || !sessionId) return;
   const delayMs = Number.parseInt(raw, 10);
   setTimeout(
     async () => {
       const release = process.env.SHIM_UNSOLICITED_RELEASE_FILE;
-      if (release) {
-        const { access } = await import("node:fs/promises");
-        while (true) {
-          try { await access(release); break; } catch {
-            await new Promise((resolve) => setTimeout(resolve, 10));
-          }
-        }
-      }
+      if (release) await waitForFile(release);
       client
         .notify("session/update", {
           sessionId,
@@ -74,26 +83,15 @@ function emitUnsolicitedNotifIfRequested(client) {
 }
 
 function handleInitialize(params) {
-  const agentCapabilities = {
-    // SHIM_LOAD_SESSION=1 advertises loadSession so the Rust client resumes a
-    // stored id via session/load instead of falling through to session/new.
-    // Default off mirrors the adapters that cannot resume.
-    loadSession: process.env.SHIM_LOAD_SESSION === "1",
-  };
-  // SHIM_DELETE_CAPABILITY=1 advertises sessionCapabilities.delete
-  // so the Rust client's session/delete dispatch path can be
-  // exercised end-to-end. Tests for #1404 toggle this; default off
-  // mirrors the negative-path adapters (aoe-agent, codex, opencode).
+  // SHIM_LOAD_SESSION=1 advertises loadSession.
+  const agentCapabilities = { loadSession: process.env.SHIM_LOAD_SESSION === "1" };
+  // SHIM_DELETE_CAPABILITY=1 advertises session/delete.
   if (process.env.SHIM_DELETE_CAPABILITY === "1") {
     agentCapabilities.sessionCapabilities = { delete: {} };
   }
-  // SHIM_MCP_CAPABILITY advertises mcpCapabilities so the Rust client's
-  // http/sse capability gating can be exercised. Comma list, e.g. "http",
-  // "sse", or "http,sse". Absent => neither advertised (stdio only).
+  // SHIM_MCP_CAPABILITY: comma list of "http" / "sse" MCP transports.
   if (process.env.SHIM_MCP_CAPABILITY) {
-    const caps = process.env.SHIM_MCP_CAPABILITY.split(",").map((s) =>
-      s.trim(),
-    );
+    const caps = process.env.SHIM_MCP_CAPABILITY.split(",").map((s) => s.trim());
     agentCapabilities.mcpCapabilities = {
       http: caps.includes("http"),
       sse: caps.includes("sse"),
@@ -104,45 +102,28 @@ function handleInitialize(params) {
     agentCapabilities,
     agentInfo: {
       name: "@agentclientprotocol/claude-agent-acp",
-      // Keep at (or above) the agent_compat floor in
-      // src/acp/agent_compat.rs, or the gate rejects the shim's handshake.
+      // At or above the floor in src/acp/agent_compat.rs.
       version: "0.55.0",
     },
   };
 }
 
-// session/delete handler registered only when SHIM_DELETE_CAPABILITY=1.
-// Without the registration, the SDK's request dispatcher returns -32601
-// method_not_found, which is the negative-path expectation aoe needs to test
-// against (matches aoe-agent, codex, opencode behavior).
-//
-// SHIM_DELETE_MODE controls the response shape so tests can drive the success
-// / timeout / failure branches without spinning up distinct shim binaries.
-// SHIM_DELETE_RECORD_FILE, when set, appends one line per call with the
-// requested sessionId so tests assert the RPC actually fired.
+/**
+ * session/delete (only with SHIM_DELETE_CAPABILITY=1; otherwise the SDK answers
+ * method_not_found). SHIM_DELETE_MODE: success | slow | error.
+ * SHIM_DELETE_RECORD_FILE records each requested session id.
+ */
 async function handleDeleteSession(params) {
   const mode = process.env.SHIM_DELETE_MODE ?? "success";
-  const recordFile = process.env.SHIM_DELETE_RECORD_FILE;
-  if (recordFile) {
-    const fs = await import("node:fs/promises");
-    await fs.appendFile(recordFile, `${params.sessionId}\n`);
-  }
-  if (mode === "slow") {
-    await new Promise((r) => setTimeout(r, 3000));
-    return {};
-  }
+  await record("SHIM_DELETE_RECORD_FILE", `${params.sessionId}\n`);
+  if (mode === "slow") await sleep(3000);
   if (mode === "error") {
     throw acp.RequestError.internalError({}, "shim deliberate failure");
   }
   return {};
 }
 
-// Config-option catalog the shim advertises when SHIM_THOUGHT_LEVEL=1: one
-// thought-level select, the shape claude-agent-acp and codex use for reasoning
-// effort. `thoughtLevel` tracks the currently selected value so a
-// session/set_config_option response reflects the pick.
-let thoughtLevel = "medium";
-
+// SHIM_THOUGHT_LEVEL=1 advertises one thought-level select.
 function configOptions() {
   if (process.env.SHIM_THOUGHT_LEVEL !== "1") return undefined;
   return [
@@ -160,42 +141,89 @@ function configOptions() {
   ];
 }
 
-// SHIM_CONFIG_OPTION_RECORD_FILE, when set, appends one `<configId>=<value>`
-// line per session/set_config_option call so tests assert the RPC actually
-// fired (and with which value) rather than inferring it from events.
+// SHIM_CONFIG_OPTION_RECORD_FILE records `<configId>=<value>` per call.
 async function handleSetConfigOption(params) {
-  const recordFile = process.env.SHIM_CONFIG_OPTION_RECORD_FILE;
-  if (recordFile) {
-    const fs = await import("node:fs/promises");
-    await fs.appendFile(recordFile, `${params.configId}=${params.value}\n`);
-  }
-  if (params.configId === "thought_level") {
-    thoughtLevel = params.value;
-  }
+  await record("SHIM_CONFIG_OPTION_RECORD_FILE", `${params.configId}=${params.value}\n`);
+  if (params.configId === "thought_level") thoughtLevel = params.value;
   return { configOptions: configOptions() ?? [] };
 }
 
-// session/load: resume the stored id the client passed. Registered only when
-// SHIM_LOAD_SESSION=1, matching the advertised capability.
-function handleLoadSession(params) {
-  sessions.set(params.sessionId, {});
+function withConfigOptions(response) {
   const options = configOptions();
-  return options ? { configOptions: options } : {};
+  return options ? { ...response, configOptions: options } : response;
 }
 
+// session/load, registered only with SHIM_LOAD_SESSION=1.
+function handleLoadSession(params) {
+  sessions.set(params.sessionId, {});
+  return withConfigOptions({});
+}
+
+// SHIM_MCP_RECORD_FILE captures the mcpServers forwarded on session/new.
 async function handleNewSession(params) {
-  // SHIM_MCP_RECORD_FILE, when set, captures the mcp_servers the client
-  // forwarded on session/new so tests assert MCP forwarding end to end.
   const recordFile = process.env.SHIM_MCP_RECORD_FILE;
-  if (recordFile) {
-    const fs = await import("node:fs/promises");
-    await fs.writeFile(recordFile, JSON.stringify(params?.mcpServers ?? []));
-  }
+  if (recordFile) await writeFile(recordFile, JSON.stringify(params?.mcpServers ?? []));
   const sessionId = "shim-" + crypto.randomUUID();
   sessions.set(sessionId, {});
-  const options = configOptions();
-  return options ? { sessionId, configOptions: options } : { sessionId };
+  return withConfigOptions({ sessionId });
 }
+
+/** Scenarios whose turn parks until session/cancel. */
+const PARKED_SCENARIOS = {
+  // Wraps up its accounting (cost usage), then never answers: ends as prompt_complete.
+  COST_THEN_SILENCE: [
+    { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "wedged response complete" } },
+    usage(300, true),
+  ],
+  // Goes silent with no cost marker: the watchdog orphans the turn.
+  SILENCE_NO_COST: [
+    { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "wedged mid-response" } },
+    usage(120, false),
+  ],
+  // A Claude async agent launch: the watchdog stays suppressed.
+  ASYNC_AGENT_ORPHAN: [
+    {
+      sessionUpdate: "tool_call",
+      toolCallId: "tc-async-agent-1",
+      title: "Research async target",
+      kind: "other",
+      status: "pending",
+      rawInput: { description: "Research target", prompt: "..." },
+    },
+    {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tc-async-agent-1",
+      status: "completed",
+      content: textContent("Async agent launched successfully.\nagentId: async-test-1 (internal ID)"),
+    },
+  ],
+  // A ScheduleWakeup whose interim update carries raw_input, then a cost marker
+  // the wakeup suppression must override.
+  WAKEUP_ORPHAN: [
+    {
+      sessionUpdate: "tool_call",
+      toolCallId: "tc-wakeup-1",
+      title: "ScheduleWakeup",
+      kind: "other",
+      status: "pending",
+      rawInput: { delaySeconds: 60, reason: "test scheduled wakeup", prompt: "continue" },
+    },
+    {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tc-wakeup-1",
+      status: "in_progress",
+      title: "ScheduleWakeup",
+      rawInput: { delaySeconds: 60, reason: "test scheduled wakeup", prompt: "continue" },
+    },
+    {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tc-wakeup-1",
+      status: "completed",
+      content: textContent("Next wakeup scheduled."),
+    },
+    usage(1200, true),
+  ],
+};
 
 async function handlePrompt(params, client) {
   if (!sessions.has(params.sessionId)) {
@@ -205,273 +233,51 @@ async function handlePrompt(params, client) {
     .filter((c) => c.type === "text")
     .map((c) => c.text)
     .join("\n");
+  const notify = (update) =>
+    client.notify("session/update", { sessionId: params.sessionId, update });
+  const chunk = (text) =>
+    notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
 
-  // COST_THEN_SILENCE reproduces the upstream
-  // `agentclientprotocol/claude-agent-acp#688` failure mode for
-  // tests/integration/acp_silent_orphan.rs: the turn wraps up its
-  // accounting and then never returns the PromptResponse. The daemon
-  // reads the cost marker as authoritative and ends it cleanly as
-  // `prompt_complete` (#2237); SILENCE_NO_COST below is the shape that
-  // actually orphans, so neither name promises the other's outcome.
-  // Sequence:
-  //   1. emit one assistant chunk
-  //   2. emit a cost-populated usage_update (claude-agent-acp's
-  //      "wrap up accounting" marker the daemon uses as a
-  //      terminal-candidate signal)
-  //   3. park until cancel() resolves the promise
-  // `used` and `size` are mandatory in the ACP usage_update schema, so a
-  // payload without them is rejected before the daemon sees any usage at
-  // all and this scenario silently degrades into SILENCE_NO_COST (#3811).
-  // Without the cancel handler we'd hang the test for the full
-  // CANCEL_ESCALATION_GRACE; the explicit resolve keeps the test
-  // under a second while still exercising the watchdog. See #1240.
-  if (userText.includes("COST_THEN_SILENCE")) {
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text: "wedged response complete" },
-      },
-    });
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "usage_update",
-        used: 300,
-        size: 200000,
-        cost: { amount: 0.01, currency: "USD" },
-      },
-    });
-    await new Promise((resolve) => {
-      parkedPromptResolve = resolve;
-    });
-    return { stopReason: "cancelled" };
-  }
-
-  // SILENCE_NO_COST is the genuinely wedged turn: the adapter streams a
-  // chunk and a mid-turn usage_update that carries no cost, then goes
-  // silent without ever wrapping up its accounting. Nothing arms the fast
-  // grace, so the base grace expires and the watchdog cancels the turn and
-  // reports `prompt_orphaned`. Kept apart from COST_THEN_SILENCE so the
-  // cost-bearing recovery of #2237 and the orphan cancel are each covered
-  // by a scenario that can only reach them (#3811).
-  if (userText.includes("SILENCE_NO_COST")) {
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text: "wedged mid-response" },
-      },
-    });
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "usage_update",
-        used: 120,
-        size: 200000,
-      },
-    });
-    await new Promise((resolve) => {
-      parkedPromptResolve = resolve;
-    });
-    return { stopReason: "cancelled" };
-  }
-
-  // ASYNC_AGENT_ORPHAN reproduces the Claude SDK async-agent shape
-  // for the #1360 watchdog suppression test. Sequence:
-  //   1. emit tool_call for an Agent invocation
-  //   2. emit tool_call_update with status=completed and content text
-  //      "Async agent launched successfully. agentId: ..." (the marker
-  //      the Rust classifier looks for to flip async_agent_running)
-  //   3. park until cancel() resolves the promise
-  // The Rust test then drains for longer than the base watchdog grace
-  // and asserts NO `prompt_orphaned` Stopped frame arrived. Without
-  // the async detection, the watchdog would fire ~300ms after the
-  // completion; with it, the effective grace is lifted to 30 minutes
-  // so the test window stays silent.
-  if (userText.includes("ASYNC_AGENT_ORPHAN")) {
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "tool_call",
-        toolCallId: "tc-async-agent-1",
-        title: "Research async target",
-        kind: "other",
-        status: "pending",
-        rawInput: { description: "Research target", prompt: "..." },
-      },
-    });
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "tool_call_update",
-        toolCallId: "tc-async-agent-1",
-        status: "completed",
-        content: [
-          {
-            type: "content",
-            content: {
-              type: "text",
-              text: "Async agent launched successfully.\nagentId: async-test-1 (internal ID)",
-            },
-          },
-        ],
-      },
-    });
-    await new Promise((resolve) => {
-      parkedPromptResolve = resolve;
-    });
-    return { stopReason: "cancelled" };
-  }
-
-  // BACKGROUND_BASH_ORPHAN reproduces the #1401 shape: the Claude SDK
-  // `Bash` tool fired with `run_in_background: true`. The visible
-  // ToolCall completes immediately with the marker
-  // "Command running in background with ID: <id>", then the prompt
-  // parks. The Rust watchdog must observe the off-protocol marker and
-  // stay suppressed past the fast grace.
-  //
-  // Adding WRAP_UP to the prompt appends the cost-populated
-  // usage_update that ends the turn's accounting. A backgrounded command
-  // is fire-and-forget and legitimately outlives its turn, so that frame
-  // drops the off-protocol floor (#1858) and the turn recovers cleanly
-  // rather than staying suppressed. The two shapes reach opposite
-  // outcomes, so each test picks the one it means to assert (#3811).
-  if (userText.includes("BACKGROUND_BASH_ORPHAN")) {
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "tool_call",
-        toolCallId: "tc-bg-orphan-1",
-        title: "Bash",
-        kind: "execute",
-        status: "pending",
-        rawInput: { command: "sleep 600", run_in_background: true },
-      },
-    });
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "tool_call_update",
-        toolCallId: "tc-bg-orphan-1",
-        status: "completed",
-        content: [
-          {
-            type: "content",
-            content: {
-              type: "text",
-              text: "Command running in background with ID: btest-orphan-1. Output is being written to: /tmp/x",
-            },
-          },
-        ],
-      },
-    });
-    if (userText.includes("WRAP_UP")) {
-      await client.notify("session/update", {
-        sessionId: params.sessionId,
-        update: {
-          sessionUpdate: "usage_update",
-          used: 1200,
-          size: 200000,
-          cost: { amount: 0.01, currency: "USD" },
-        },
-      });
+  // Checked in this order, as the scenarios' keywords are distinct.
+  for (const keyword of ["COST_THEN_SILENCE", "SILENCE_NO_COST", "ASYNC_AGENT_ORPHAN"]) {
+    if (userText.includes(keyword)) {
+      for (const update of PARKED_SCENARIOS[keyword]) await notify(update);
+      return park();
     }
-    await new Promise((resolve) => {
-      parkedPromptResolve = resolve;
-    });
-    return { stopReason: "cancelled" };
   }
 
-  // WAKEUP_ORPHAN reproduces the ScheduleWakeup path from #1401: the
-  // agent registers an absolute wake-at, then idles intentionally
-  // waiting for the scheduled prompt to fire. A cost-populated
-  // usage_update follows so the daemon would otherwise switch to the
-  // fast grace; the wakeup suppression must override it until
-  // `at + base_grace` passes.
+  // A run_in_background Bash; WRAP_UP adds the cost marker that ends the
+  // turn's accounting, so the turn recovers instead of staying suppressed.
+  if (userText.includes("BACKGROUND_BASH_ORPHAN")) {
+    await notify({
+      sessionUpdate: "tool_call",
+      toolCallId: "tc-bg-orphan-1",
+      title: "Bash",
+      kind: "execute",
+      status: "pending",
+      rawInput: { command: "sleep 600", run_in_background: true },
+    });
+    await notify({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "tc-bg-orphan-1",
+      status: "completed",
+      content: textContent(
+        "Command running in background with ID: btest-orphan-1. Output is being written to: /tmp/x",
+      ),
+    });
+    if (userText.includes("WRAP_UP")) await notify(usage(1200, true));
+    return park();
+  }
+
   if (userText.includes("WAKEUP_ORPHAN")) {
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "tool_call",
-        toolCallId: "tc-wakeup-1",
-        title: "ScheduleWakeup",
-        kind: "other",
-        status: "pending",
-        rawInput: {
-          delaySeconds: 60,
-          reason: "test scheduled wakeup",
-          prompt: "continue",
-        },
-      },
-    });
-    // Real claude-agent-acp lands `raw_input` on an interim
-    // `tool_call_update` BEFORE the final completed frame; the
-    // watchdog now requires this carrier to fire `WakeupPending`
-    // (so a Failed completion doesn't blindly suppress for the
-    // delay window). Mirror the real shape: emit one in-progress
-    // update with raw_input.delaySeconds, then a final completed
-    // update.
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "tool_call_update",
-        toolCallId: "tc-wakeup-1",
-        status: "in_progress",
-        title: "ScheduleWakeup",
-        rawInput: {
-          delaySeconds: 60,
-          reason: "test scheduled wakeup",
-          prompt: "continue",
-        },
-      },
-    });
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "tool_call_update",
-        toolCallId: "tc-wakeup-1",
-        status: "completed",
-        content: [
-          {
-            type: "content",
-            content: {
-              type: "text",
-              text: "Next wakeup scheduled.",
-            },
-          },
-        ],
-      },
-    });
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "usage_update",
-        used: 1200,
-        size: 200000,
-        cost: { amount: 0.01, currency: "USD" },
-      },
-    });
-    await new Promise((resolve) => {
-      parkedPromptResolve = resolve;
-    });
-    return { stopReason: "cancelled" };
+    for (const update of PARKED_SCENARIOS.WAKEUP_ORPHAN) await notify(update);
+    return park();
   }
 
-  // Optional slow path: tests that need to observe mid-turn UI
-  // (e.g. the working spinner) include "SLOW" in the prompt so the
-  // shim adds a configurable delay between events.
-  const slow = userText.includes("SLOW");
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // SLOW spaces the events so a test can observe mid-turn UI.
+  const pause = () => (userText.includes("SLOW") ? sleep(800) : undefined);
 
-  // Optional rate-limit path: tests for #1281 include "RATE_LIMIT"
-  // in the prompt so the shim returns the same JSON-RPC error shape
-  // claude-agent-acp emits when the Anthropic API rejects a request
-  // for quota reasons. Uses the SDK's RequestError so the structured
-  // `data` field reaches the wire (a plain `throw new Error(...)`
-  // would be stringified into the message). The Rust ACP client
-  // must classify this as RateLimit + Stopped{rate_limited} instead
-  // of treating it as a worker crash.
+  // The JSON-RPC error claude-agent-acp returns on a provider quota rejection.
   if (userText.includes("RATE_LIMIT")) {
     throw acp.RequestError.internalError(
       { errorKind: "rate_limit" },
@@ -479,102 +285,57 @@ async function handlePrompt(params, client) {
     );
   }
 
-  await client.notify("session/update", {
-    sessionId: params.sessionId,
-    update: {
-      sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: `received: ${userText}` },
-    },
-  });
-  if (slow) await sleep(800);
+  await chunk(`received: ${userText}`);
+  await pause();
 
-  // Usage on either side of completion exercises native turn observation.
   if (userText.includes("USAGE_BEFORE_")) {
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "usage_update",
-        used: 120,
-        size: 200000,
-        ...(userText.includes("USAGE_BEFORE_COST")
-          ? { cost: { amount: 0.01, currency: "USD" } }
-          : {}),
-      },
-    });
+    await notify(usage(120, userText.includes("USAGE_BEFORE_COST")));
   }
 
-  await client.notify("session/update", {
-    sessionId: params.sessionId,
-    update: {
-      sessionUpdate: "tool_call",
-      toolCallId: "tc-1",
-      title: "Reading shim file",
-      kind: "read",
-      status: "pending",
-      locations: [{ path: "/tmp/shim.txt" }],
-      rawInput: { path: "/tmp/shim.txt" },
-    },
+  await notify({
+    sessionUpdate: "tool_call",
+    toolCallId: "tc-1",
+    title: "Reading shim file",
+    kind: "read",
+    status: "pending",
+    locations: [{ path: "/tmp/shim.txt" }],
+    rawInput: { path: "/tmp/shim.txt" },
   });
-  if (slow) await sleep(800);
+  await pause();
 
-  await client.notify("session/update", {
-    sessionId: params.sessionId,
-    update: {
-      sessionUpdate: "tool_call_update",
-      toolCallId: "tc-1",
-      status: "completed",
-      rawOutput: { content: "shim file contents" },
-    },
+  await notify({
+    sessionUpdate: "tool_call_update",
+    toolCallId: "tc-1",
+    status: "completed",
+    rawOutput: { content: "shim file contents" },
   });
-  if (slow) await sleep(800);
+  await pause();
 
   if (userText.includes("USAGE_AFTER_NO_COST")) {
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: { sessionUpdate: "usage_update", used: 300, size: 200000 },
-    });
+    await notify({ sessionUpdate: "usage_update", used: 300, size: 200000 });
   }
-
   if (userText.includes("USAGE_OBSERVATION")) {
-    await new Promise((resolve) => {
-      parkedPromptResolve = resolve;
-    });
-    return { stopReason: "cancelled" };
+    return park();
   }
 
-  // Optional fs round-trip exercised by tests via prompt keywords.
   if (userText.includes("FS_READ_WRITE")) {
     try {
-      // Write a fresh file inside the session cwd.
+      const path = process.cwd() + "/shim-roundtrip.txt";
       await client.request("fs/write_text_file", {
         sessionId: params.sessionId,
-        path: process.cwd() + "/shim-roundtrip.txt",
+        path,
         content: "hello from shim",
       });
-      // Read it back.
       const read = await client.request("fs/read_text_file", {
         sessionId: params.sessionId,
-        path: process.cwd() + "/shim-roundtrip.txt",
+        path,
       });
-      await client.notify("session/update", {
-        sessionId: params.sessionId,
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: `fs_read=${read.content}` },
-        },
-      });
+      await chunk(`fs_read=${read.content}`);
     } catch (err) {
-      await client.notify("session/update", {
-        sessionId: params.sessionId,
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: `fs_error=${err.message ?? err}` },
-        },
-      });
+      await chunk(`fs_error=${err.message ?? err}`);
     }
   }
 
-  // Optional terminal round-trip exercised by tests.
   if (userText.includes("TERMINAL_RUN")) {
     try {
       const { terminalId } = await client.request("terminal/create", {
@@ -582,137 +343,71 @@ async function handlePrompt(params, client) {
         command: "echo",
         args: ["terminal-roundtrip-ok"],
       });
-      const exit = await client.request("terminal/wait_for_exit", {
-        sessionId: params.sessionId,
-        terminalId,
-      });
-      const out = await client.request("terminal/output", {
-        sessionId: params.sessionId,
-        terminalId,
-      });
-      // WaitForTerminalExitResponse flattens TerminalExitStatus, so
-      // exitCode is at the top level. Fall back to nested in case the
-      // SDK wraps it differently in a future version.
-      const code =
-        exit.exitCode ?? exit.exit_code ?? exit.exitStatus?.exitCode ?? "?";
-      await client.notify("session/update", {
-        sessionId: params.sessionId,
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          content: {
-            type: "text",
-            text: `terminal_output=${out.output.trim()};exit=${code}`,
-          },
-        },
-      });
-      await client
-        .request("terminal/release", {
-          sessionId: params.sessionId,
-          terminalId,
-        })
-        .catch(() => {});
+      const terminal = { sessionId: params.sessionId, terminalId };
+      const exit = await client.request("terminal/wait_for_exit", terminal);
+      const out = await client.request("terminal/output", terminal);
+      const code = exit.exitCode ?? exit.exit_code ?? exit.exitStatus?.exitCode ?? "?";
+      await chunk(`terminal_output=${out.output.trim()};exit=${code}`);
+      await client.request("terminal/release", terminal).catch(() => {});
     } catch (err) {
-      await client.notify("session/update", {
-        sessionId: params.sessionId,
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: `terminal_error=${err.message ?? err}` },
-        },
-      });
+      await chunk(`terminal_error=${err.message ?? err}`);
     }
   }
 
-  // Optional permission request, controlled by prompt content so tests
-  // can opt into exercising the approval round-trip.
-  if (userText.includes("REQUEST_PERMISSION")) {
+  const askPermission = async (toolCall, options) => {
     const response = await client.request("session/request_permission", {
       sessionId: params.sessionId,
-      toolCall: {
+      toolCall,
+      options,
+    });
+    return response.outcome.outcome === "selected" ? response.outcome.optionId : "cancelled";
+  };
+
+  if (userText.includes("REQUEST_PERMISSION")) {
+    const verdict = await askPermission(
+      {
         toolCallId: "tc-2",
         title: "Modify shim config",
         kind: "edit",
         status: "pending",
         locations: [{ path: "/tmp/shim-config.json" }],
-        rawInput: {
-          path: "/tmp/shim-config.json",
-          content: '{"x":1}',
-        },
+        rawInput: { path: "/tmp/shim-config.json", content: '{"x":1}' },
       },
-      options: [
+      [
         { kind: "allow_once", name: "Allow once", optionId: "yes" },
         { kind: "reject_once", name: "Reject", optionId: "no" },
       ],
-    });
-    const verdict =
-      response.outcome.outcome === "selected"
-        ? response.outcome.optionId
-        : "cancelled";
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text: `permission_outcome=${verdict}` },
-      },
-    });
+    );
+    await chunk(`permission_outcome=${verdict}`);
   }
 
-  // A permission request whose options carry a question rather than an
-  // allow/deny vocabulary: every option is allow_once, so answering by
-  // kind would always pick the first. See #3741.
+  // Every option is allow_once, so answering by kind would always pick the first.
   if (userText.includes("REQUEST_CHOICE")) {
     const names = ["Option Alpha", "Option Bravo", "Option Charlie", "Option Delta"];
-    const response = await client.request("session/request_permission", {
-      sessionId: params.sessionId,
-      toolCall: {
+    const verdict = await askPermission(
+      {
         toolCallId: "tc-choice",
         title: "Pick an option",
         kind: "other",
         status: "pending",
         rawInput: { message: "Which one?" },
       },
-      options: names.map((name, index) => ({
-        kind: "allow_once",
-        name,
-        optionId: `choice-${index}`,
-      })),
-    });
-    const verdict =
-      response.outcome.outcome === "selected"
-        ? response.outcome.optionId
-        : "cancelled";
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text: `choice_outcome=${verdict}` },
-      },
-    });
+      names.map((name, index) => ({ kind: "allow_once", name, optionId: `choice-${index}` })),
+    );
+    await chunk(`choice_outcome=${verdict}`);
   }
 
-  await client.notify("session/update", {
-    sessionId: params.sessionId,
-    update: {
-      sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: "done" },
-    },
-  });
+  await chunk("done");
 
+  // SHIM_PROMPT_COMPLETION_RELEASE_FILE holds the prompt response until the file exists.
   const completionRelease = process.env.SHIM_PROMPT_COMPLETION_RELEASE_FILE;
-  if (completionRelease) {
-    const { access } = await import("node:fs/promises");
-    while (true) {
-      try { await access(completionRelease); break; } catch { await sleep(10); }
-    }
-  }
+  if (completionRelease) await waitForFile(completionRelease);
   return {
     stopReason: userText.includes("MAX_TOKENS") ? "max_tokens" : "end_turn",
   };
 }
 
 function handleCancel() {
-  // Unstick a parked prompt so it returns and the daemon's prompt_fut
-  // resolves. Other prompt branches finish synchronously so this is a
-  // no-op for them.
   if (parkedPromptResolve) {
     const resolve = parkedPromptResolve;
     parkedPromptResolve = null;
@@ -720,26 +415,15 @@ function handleCancel() {
   }
 }
 
-// AOE_ACP_SOCKET: when set, connect to that unix socket as the
-// transport instead of using stdio. Used by sandboxed structured-view sessions
-// (Docker bind-mounts the socket into the container) and for
-// integration tests that exercise the socket transport.
-import net from "node:net";
-import { Duplex } from "node:stream";
-
 async function bootstrap() {
   let inputWeb;
   let outputWeb;
+  // AOE_ACP_SOCKET: use that unix socket as the transport instead of stdio.
   if (process.env.AOE_ACP_SOCKET) {
     const sock = await new Promise((resolve, reject) => {
-      const s = net.createConnection(process.env.AOE_ACP_SOCKET, () =>
-        resolve(s),
-      );
+      const s = net.createConnection(process.env.AOE_ACP_SOCKET, () => resolve(s));
       s.on("error", reject);
     });
-    // The unix socket is a single bidirectional stream. acp.ndJsonStream
-    // expects (writable, readable) so we hand it the socket twice via
-    // Duplex.toWeb on both halves.
     inputWeb = Duplex.toWeb(sock).writable;
     outputWeb = Duplex.toWeb(sock).readable;
     sock.on("end", () => process.exit(0));
@@ -755,12 +439,8 @@ async function bootstrap() {
     .onRequest("authenticate", () => ({}))
     .onRequest("session/new", ({ params }) => handleNewSession(params))
     .onRequest("session/set_mode", () => ({}))
-    .onRequest("session/set_config_option", ({ params }) =>
-      handleSetConfigOption(params),
-    )
-    .onRequest("session/prompt", ({ params, client }) =>
-      handlePrompt(params, client),
-    )
+    .onRequest("session/set_config_option", ({ params }) => handleSetConfigOption(params))
+    .onRequest("session/prompt", ({ params, client }) => handlePrompt(params, client))
     .onNotification("session/cancel", () => handleCancel())
     .onConnect((connection) => emitUnsolicitedNotifIfRequested(connection.client));
   if (process.env.SHIM_DELETE_CAPABILITY === "1") {

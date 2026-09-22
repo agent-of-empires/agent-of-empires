@@ -1,14 +1,7 @@
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { FontSizeControl } from "./FontSizeControl";
 
-/** Dashboard display preferences for the structured view. These are not agent
- *  config, so they live in `aoe-web-settings` rather than the ACP schema, and
- *  apply live to the conversation transcript only. Like the rest of that entry
- *  they are mirrored to the daemon's web-UI state by `webUiSync`, so they are
- *  not per-browser.
- *
- *  Values are read already clamped: `useWebSettings` normalizes both fields in
- *  `normalizeSnapshot`, so no re-clamping is needed here. */
+/** Structured view display preferences, stored in `aoe-web-settings` (already clamped). */
 export function StructuredViewDisplaySettings() {
   const { settings, update } = useWebSettings();
 

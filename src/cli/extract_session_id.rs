@@ -1,10 +1,4 @@
 //! Hidden `aoe __extract-session-id` subcommand.
-//!
-//! Reads an agent hook payload from stdin, extracts the configured top-level
-//! native identity field, validates its shell-safe storage form, and writes it
-//! atomically through the hardened hook sidecar. Hooks fired by a nested agent
-//! that inherited the pane's identity variables are ignored. Hook failures never
-//! block agents. Stdin is capped at 1 MiB to bound memory.
 
 use std::io::Read;
 
@@ -44,10 +38,6 @@ pub async fn run(args: ExtractSessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-/// Every process the pane agent starts inherits `AOE_AGENT_PID` and
-/// `AOE_AGENT_BIN`, including another agent run from its shell tool, so the
-/// hook belongs to the pane only when the walk up to the launched pid passes
-/// at most one agent process. Panes launched without them keep writing.
 fn fired_by_pane_agent() -> bool {
     let agent_pid = std::env::var("AOE_AGENT_PID")
         .ok()
@@ -76,7 +66,6 @@ fn walk_reaches_single_agent(
     let mut agents = 0;
     for hop in 0..MAX_ANCESTORS {
         let Some((ppid, argv0)) = parent_and_argv0(pid) else {
-            // No readable process table proves nothing, so keep the write.
             return hop == 0;
         };
         if std::path::Path::new(&argv0)
@@ -130,6 +119,9 @@ mod tests {
     use crate::hooks::test_support::BaseGuard;
     use std::os::unix::fs::PermissionsExt;
 
+    const UUID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const OTHER: &str = "11111111-2222-3333-4444-555555555555";
+
     fn extract(payload: &str, instance_id: &str) -> Result<()> {
         run_inner(
             payload.as_bytes(),
@@ -143,19 +135,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(hook_base)]
-    fn top_level_wins_over_nested() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        let nested = "11111111-2222-3333-4444-555555555555";
-        let top = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        let payload = format!(r#"{{"context":{{"session_id":"{nested}"}},"session_id":"{top}"}}"#);
-        extract(&payload, "nested_first").unwrap();
-        assert_eq!(read_sidecar(&base, "nested_first").as_deref(), Some(top));
-    }
-
-    #[test]
     fn only_the_pane_agent_owns_the_hook() {
-        // (pid, ppid, argv0) from the hook's parent shell upward.
         type Chain = &'static [(u32, u32, &'static str)];
         let cases: [(&str, u32, Chain, bool); 7] = [
             ("direct launch", 9, &[(10, 9, "sh"), (9, 1, "claude")], true),
@@ -213,134 +193,84 @@ mod tests {
 
     #[test]
     #[serial_test::serial(hook_base)]
-    fn extracts_compact_payload() {
+    fn accepted_payloads_write_the_top_level_session_id() {
         let (_g, base, _tmp) = BaseGuard::ready();
-        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        let payload = format!(r#"{{"session_id":"{uuid}","cwd":"/x"}}"#);
-        extract(&payload, "compact").unwrap();
-        assert_eq!(read_sidecar(&base, "compact").as_deref(), Some(uuid));
+        const UPPER: &str = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
+        const OPAQUE: &str = "conversation_opaque.123";
+        let cases: [(&str, String, &str); 6] = [
+            (
+                "compact",
+                format!(r#"{{"session_id":"{UUID}","cwd":"/x"}}"#),
+                UUID,
+            ),
+            (
+                "multi_line",
+                format!("{{\n  \"session_id\":\"{UUID}\",\n  \"cwd\":\"/x\"\n}}"),
+                UUID,
+            ),
+            ("uppercase", format!(r#"{{"session_id":"{UPPER}"}}"#), UPPER),
+            ("opaque", format!(r#"{{"session_id":"{OPAQUE}"}}"#), OPAQUE),
+            (
+                "top_level_beats_nested",
+                format!(r#"{{"context":{{"session_id":"{OTHER}"}},"session_id":"{UUID}"}}"#),
+                UUID,
+            ),
+            (
+                "prompt_injection",
+                format!(r#"{{"session_id":"{UUID}","prompt":"\"session_id\":\"{OTHER}\""}}"#),
+                UUID,
+            ),
+        ];
+        for (name, payload, expected) in cases {
+            extract(&payload, name).unwrap();
+            assert_eq!(
+                read_sidecar(&base, name).as_deref(),
+                Some(expected),
+                "{name}"
+            );
+        }
     }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn rejected_payloads_write_no_sidecar() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let oversized = "x".repeat(STDIN_BYTE_CAP as usize * 2);
+        let cases: [(&str, &str, &str); 6] = [
+            ("no_sid", r#"{"cwd":"/x","other":"value"}"#, "session_id"),
+            ("non_string", r#"{"session_id":12345}"#, "session_id"),
+            ("unsafe_id", r#"{"session_id":"unsafe id;rm"}"#, "unsafe"),
+            ("malformed", "not json {{{", ""),
+            ("empty", "", ""),
+            ("oversized", oversized.as_str(), ""),
+        ];
+        for (name, payload, needle) in cases {
+            let err = extract(payload, name).unwrap_err().to_string();
+            assert!(err.contains(needle), "{name}: {err}");
+            assert!(read_sidecar(&base, name).is_none(), "{name}: {err}");
+        }
+    }
+
     #[test]
     #[serial_test::serial(hook_base)]
     fn conversation_identity_prefers_conversation_id_and_falls_back() {
         let (_g, base, _tmp) = BaseGuard::ready();
         let conversation = "conversation_opaque.123";
-        let session = "11111111-2222-3333-4444-555555555555";
         let field = crate::agents::HookIdentityField::ConversationIdOrSessionId;
 
-        let payload = format!(r#"{{"conversation_id":"{conversation}","session_id":"{session}"}}"#);
+        let payload = format!(r#"{{"conversation_id":"{conversation}","session_id":"{OTHER}"}}"#);
         run_inner(payload.as_bytes(), "conversation_preferred", field).unwrap();
         assert_eq!(
             read_sidecar(&base, "conversation_preferred").as_deref(),
             Some(conversation)
         );
 
-        let fallback = format!(r#"{{"session_id":"{session}"}}"#);
+        let fallback = format!(r#"{{"session_id":"{OTHER}"}}"#);
         run_inner(fallback.as_bytes(), "conversation_fallback", field).unwrap();
         assert_eq!(
             read_sidecar(&base, "conversation_fallback").as_deref(),
-            Some(session)
+            Some(OTHER)
         );
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn extracts_multi_line_payload() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        let payload = format!("{{\n  \"session_id\":\"{uuid}\",\n  \"cwd\":\"/x\"\n}}");
-        extract(&payload, "multi_line").unwrap();
-        assert_eq!(read_sidecar(&base, "multi_line").as_deref(), Some(uuid));
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn accepts_uppercase_uuid() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        let uuid = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
-        let payload = format!(r#"{{"session_id":"{uuid}"}}"#);
-        extract(&payload, "uppercase").unwrap();
-        assert_eq!(read_sidecar(&base, "uppercase").as_deref(), Some(uuid));
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn ignores_user_prompt_injection() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        let real = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        let fake = "11111111-2222-3333-4444-555555555555";
-        let payload = format!(r#"{{"session_id":"{real}","prompt":"\"session_id\":\"{fake}\""}}"#);
-        extract(&payload, "prompt_injection").unwrap();
-        assert_eq!(
-            read_sidecar(&base, "prompt_injection").as_deref(),
-            Some(real)
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn errors_when_no_session_id() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        let payload = r#"{"cwd":"/x","other":"value"}"#;
-        let err = extract(payload, "no_sid").unwrap_err();
-        assert!(err.to_string().contains("session_id"), "got: {err}");
-        assert!(read_sidecar(&base, "no_sid").is_none());
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn errors_on_malformed_json() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        let err = extract("not json {{{", "malformed").unwrap_err();
-        assert!(read_sidecar(&base, "malformed").is_none(), "got: {err}");
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn errors_on_empty_stdin() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        let err = extract("", "empty").unwrap_err();
-        assert!(read_sidecar(&base, "empty").is_none(), "got: {err}");
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn accepts_safe_opaque_session_id() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        let payload = r#"{"session_id":"conversation_opaque.123"}"#;
-        extract(payload, "opaque_id").unwrap();
-        assert_eq!(
-            read_sidecar(&base, "opaque_id").as_deref(),
-            Some("conversation_opaque.123")
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn rejects_unsafe_session_id() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        let payload = r#"{"session_id":"unsafe id;rm"}"#;
-        let err = extract(payload, "unsafe_id").unwrap_err();
-        assert!(read_sidecar(&base, "unsafe_id").is_none(), "got: {err}");
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn rejects_non_string_session_id() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        let payload = r#"{"session_id":12345}"#;
-        let err = extract(payload, "non_string").unwrap_err();
-        assert!(err.to_string().contains("session_id"), "got: {err}");
-        assert!(read_sidecar(&base, "non_string").is_none());
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn oversized_garbage_yields_no_sidecar() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        let oversized = "x".repeat(STDIN_BYTE_CAP as usize * 2);
-        let _ = extract(&oversized, "oversized");
-        assert!(read_sidecar(&base, "oversized").is_none());
     }
 
     #[test]
@@ -373,8 +303,8 @@ mod tests {
         std::fs::create_dir(base.join(inst)).unwrap();
         std::fs::set_permissions(base.join(inst), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::os::unix::fs::symlink(&decoy, base.join(inst).join("session_id")).unwrap();
-        let payload = r#"{"session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"#;
-        let _ = extract(payload, inst);
+        let payload = format!(r#"{{"session_id":"{UUID}"}}"#);
+        let _ = extract(&payload, inst);
         assert_eq!(
             std::fs::read_to_string(&decoy).unwrap(),
             "do not overwrite",

@@ -1,28 +1,16 @@
-//! Migration v025: re-enable the delete confirmation on existing installs.
+//! Migration v025: rewrite a persisted `session.confirm_delete = false` to
+//! `true` in the global `config.toml`.
 //!
-//! `session.confirm_delete` shipped defaulting off (#2595), and `update_config`
-//! re-serializes the whole `Config` on every write, so any install that has
-//! ever saved a setting carries an explicit `confirm_delete = false` in its
-//! `config.toml`. Flipping the compiled default to on (#3364) therefore reaches
-//! nobody but fresh installs: the persisted `false` outranks the serde default
-//! forever, and `d` keeps trashing on one keystroke.
-//!
-//! This rewrites a persisted `false` to `true` in the global `config.toml` so
-//! the guard actually lands. A `false` on disk is indistinguishable from a
-//! deliberate opt-out, but since the old default was off, nearly every one of
-//! them is a serialized default rather than a choice; the rare deliberate
-//! opt-out is one settings toggle (or one tick of the dialog's "don't warn me
-//! again" box) away from being restored.
-//!
-//! Profile configs are deliberately untouched. They are sparse, holding only
-//! the keys a user actually overrode, so a `confirm_delete = false` there is a
-//! real decision rather than a serialized default. Repo configs never carry
-//! this setting at all.
+//! The setting shipped defaulting off and `update_config` re-serializes every
+//! key, so any install that ever saved a setting carries an explicit `false`
+//! that outranks the new compiled default. Nearly all of those are serialized
+//! defaults rather than opt-outs, and the rare opt-out is one toggle away.
+//! Profile configs are sparse, so a `false` there is a real decision and stays.
 
+use super::config_file;
 use anyhow::Result;
-use std::fs;
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::info;
 
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
@@ -32,45 +20,28 @@ pub fn run() -> Result<()> {
 /// Inner body so the test can drive the migration end-to-end against a temp
 /// file instead of inlining a near-copy of the production logic.
 pub(crate) fn run_in(path: &Path) -> Result<()> {
-    if !path.exists() {
-        debug!("No global config.toml, nothing to re-enable for v025");
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(path)?;
-    // A config that does not parse is skipped rather than aborting startup:
-    // this migration is a default correction, not a load-bearing relocation.
-    let mut doc: toml::Table = match content.parse() {
-        Ok(table) => table,
-        Err(e) => {
-            debug!("failed to parse {}: {e}, skipping", path.display());
-            return Ok(());
+    config_file::rewrite(path, |doc| {
+        let Some(session) = doc.get_mut("session").and_then(|s| s.as_table_mut()) else {
+            return false;
+        };
+        // Only a persisted `false` is rewritten: an absent key already resolves
+        // to the new default, and a `true` is where this is headed anyway.
+        if session.get("confirm_delete").and_then(|v| v.as_bool()) != Some(false) {
+            return false;
         }
-    };
-
-    let Some(session) = doc.get_mut("session").and_then(|s| s.as_table_mut()) else {
-        return Ok(());
-    };
-    // Only a persisted `false` is rewritten. An absent key already resolves to
-    // the new default, so materializing it would just re-pin what the default
-    // already says, and a `true` is already where this migration is headed.
-    if session.get("confirm_delete").and_then(|v| v.as_bool()) != Some(false) {
-        return Ok(());
-    }
-    session.insert("confirm_delete".into(), true.into());
-
-    info!(
-        "v025: re-enabled session.confirm_delete in {}, which had the pre-#3364 default persisted",
-        path.display()
-    );
-    let new_content = toml::to_string_pretty(&doc)?;
-    crate::session::atomic_write(path, new_content.as_bytes())?;
-    Ok(())
+        session.insert("confirm_delete".into(), true.into());
+        info!(
+            "v025: re-enabled session.confirm_delete in {}, which had the pre-#3364 default persisted",
+            path.display()
+        );
+        true
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn write(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::TempDir::new().unwrap();

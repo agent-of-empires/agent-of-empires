@@ -2162,6 +2162,39 @@ async fn smart_rename_rejects_only_trusted_command_overrides() {
     assert_eq!(rejection_code(repo.path()).await, "command_overridden");
 }
 
+// Manual regeneration bypasses the current-title gate but still requires a prompt.
+#[tokio::test]
+#[serial_test::serial]
+async fn force_smart_rename_ignores_a_custom_name() {
+    use axum::body::to_bytes;
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+
+    let mut inst = Instance::new("Vikings", "/tmp/custom-name-regen");
+    inst.title = "Fix login bug".to_string();
+    inst.tool = "claude".to_string();
+    inst.source_profile = "default".to_string();
+    inst.view = crate::session::View::Structured;
+    let id = inst.id.clone();
+
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let resp = force_smart_rename(axum::extract::State(state), axum::extract::Path(id))
+        .await
+        .into_response();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+    let msg = String::from_utf8_lossy(&body);
+    assert!(
+        !msg.contains("custom name"),
+        "manual regenerate must not refuse a custom-named session; got: {msg}"
+    );
+    assert!(
+        msg.contains("No prompt to name this session from yet"),
+        "must fall through to the next gate instead; got: {msg}"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn list_sessions_shares_config_resolution_across_overlays() {
@@ -5197,4 +5230,70 @@ async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
             choice: false,
         }]
     );
+}
+
+// A worktree session's project_path is its checkout, so the override must be keyed by the main repo.
+#[tokio::test]
+#[serial_test::serial]
+async fn list_sessions_applies_project_smart_rename_override_to_worktree_sessions() {
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let repo = tempfile::tempdir().expect("repo");
+    let checkout = tempfile::tempdir().expect("worktree checkout");
+    crate::session::projects::add(
+        "default",
+        crate::session::ProjectScope::Global,
+        crate::session::Project::new(
+            "demo",
+            repo.path().to_string_lossy(),
+            crate::session::ProjectScope::Global,
+        )
+        .with_overrides(crate::session::ProjectOverrides {
+            smart_rename: Some(false),
+            ..Default::default()
+        }),
+        false,
+    )
+    .unwrap();
+
+    let mk = |path: &std::path::Path| {
+        let mut inst = Instance::new("Vikings", path.to_str().unwrap());
+        inst.tool = "claude".to_string();
+        inst.source_profile = "default".to_string();
+        inst.view = crate::session::View::Structured;
+        inst
+    };
+    let mut in_worktree = mk(checkout.path());
+    in_worktree.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "feat".to_string(),
+        main_repo_path: repo.path().to_string_lossy().into_owned(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
+    // Same checkout without the worktree link: unregistered, so it stays eligible.
+    let unregistered = mk(checkout.path());
+
+    let state = crate::server::test_support::build_test_app_state(vec![
+        mk(repo.path()),
+        in_worktree,
+        unregistered,
+    ]);
+    let resp = list_sessions(
+        axum::extract::State(state),
+        axum::extract::Query(ListSessionsQuery { state: None }),
+    )
+    .await
+    .into_response();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let states: Vec<&str> = envelope["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["smart_rename"].as_str().unwrap())
+        .collect();
+    assert_eq!(states, ["inactive", "inactive", "pending"]);
 }

@@ -8,40 +8,26 @@ AoE runs multiple AI agents in parallel, each in its own tmux session, optionall
 
 ## See it in action
 
-<iframe
-width="100%"
-style="aspect-ratio:16/9;border-radius:8px"
-src="https://www.youtube-nocookie.com/embed/videoseries?list=UUjGgsnOCZXvvk6UwUQAuwPg"
-title="Agent of Empires YouTube Channel"
-frameborder="0"
-allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-allowfullscreen
+<iframe width="100%" style="aspect-ratio:16/9;border-radius:8px" src="https://www.youtube-nocookie.com/embed/videoseries?list=UUjGgsnOCZXvvk6UwUQAuwPg" title="Agent of Empires YouTube Channel" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen
 ></iframe>
 
 ![Agent of Empires Demo](assets/demo.gif)
 
 ## Why AoE?
 
-Running several AI coding agents in parallel across tasks or branches means juggling terminal windows, git branches, and container lifecycles by hand. AoE handles it for you:
+Running several agents in parallel across tasks or branches means juggling terminal windows, git branches, and container lifecycles by hand. AoE handles that:
 
-- **Two ways to use it.** A TUI for the terminal, or a web dashboard you can open in any browser, even on your phone. Same sessions, same data.
-- **One dashboard for all agents.** See status (running, waiting, idle, error) at a glance. Toggle to paired shell terminals with `t`.
-- **Git worktrees built in.** Create a session and AoE creates a branch + worktree automatically. Delete the session and AoE cleans up.
-- **Docker sandboxing.** Run agents in isolated containers with your project mounted and auth credentials shared across containers.
-- **Per-repo configuration.** Drop a `.agent-of-empires/config.toml` in your repo for project-specific settings and hooks that run on session creation or launch.
-- **Sessions survive everything.** AoE wraps tmux, so agents keep running when you close the TUI, disconnect SSH, or your terminal crashes.
+- **Two front-ends, same sessions.** A TUI in your terminal, and a web dashboard in any browser, phone included.
+- **One dashboard for every agent.** Status (running, waiting, idle, error) at a glance, with `t` toggling to the paired shell.
+- **Git worktrees built in.** A session creates its branch and worktree, and deleting it cleans them up.
+- **Container sandboxing.** Agents run isolated, with your project mounted and auth shared across containers.
+- **Per-repo configuration.** A `.agent-of-empires/config.toml` carries project settings and lifecycle hooks.
+- **Sessions survive everything.** AoE wraps tmux, so agents keep running when you close the TUI, drop SSH, or crash your terminal.
 
-## Supported Agents
+## Supported agents
 
 Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Oh My Pi (OMP), Factory Droid, Hermes, Kiro CLI, Qwen Code, Kimi Code, and Prime Agent. AoE auto-detects which are installed.
 
-Agents carry a lifecycle state in AoE's registry. When an upstream vendor
-deprecates a CLI, AoE keeps supporting it but marks it everywhere it appears
-(`aoe agents`, `aoe acp doctor`, session creation, the new-session and restart
-pickers, the web wizard, and the switch-agent modal), so you always know before
-you launch one.
+Each agent carries a lifecycle state in AoE's registry, so when a vendor deprecates a CLI, AoE keeps supporting it but marks it everywhere it appears (`aoe agents`, `aoe acp doctor`, session creation, the restart and switch-agent pickers, the web wizard) before you launch one.
 
-<div class="cta-box">
-<p><strong>Ready to get started?</strong></p>
-<p><a href="installation.html">Install AoE</a></p>
-</div>
+<div class="cta-box"> <p><strong>Ready to get started?</strong></p> <p><a href="installation.html">Install AoE</a></p> </div>

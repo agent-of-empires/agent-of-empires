@@ -1,19 +1,8 @@
-// Server-side sync for the web dashboard's UI preferences.
-//
-// Single-tenant: there is one user, so preferences that today live in
-// per-browser localStorage (sidebar sort/axis, tool density, repo
-// appearance/order, group collapse, last-used tool, welcome-seen, the web
-// settings blob) should follow the user across browsers and devices. Rather
-// than rewrite every store, we keep their localStorage API and mirror a
-// registered set of keys to a server-side blob through the `safeStorage`
-// write chokepoint, then hydrate localStorage from the server before first
-// paint. Keys NOT listed here (layout dimensions tied to screen size,
-// per-session drafts, caches, the cold-load theme cache) stay purely local.
+// Mirror a registered set of localStorage UI preferences to the server through the safeStorage write chokepoint, so they follow the single user across browsers.
 
 import { getWebUiState, patchWebUiState } from "./api";
 import { configureStorageSync } from "./safeStorage";
 
-// Exact localStorage keys that sync to the server.
 const EXACT_KEYS = new Set<string>([
   "aoe-welcome-seen", // theme welcome modal seen (mirrors the server-side tour flag)
   "aoe.acp.toolDensity.v1", // compact/detailed tool display
@@ -27,15 +16,14 @@ const EXACT_KEYS = new Set<string>([
   "aoe-web-settings", // dashboard prefs (persistent terminals, auto-open keyboard, fonts)
 ]);
 
-// Group-collapse keys are dynamic (one per repo/group), so match by prefix.
+// Group-collapse keys are per repo/group, so match by prefix.
 const KEY_PREFIXES = ["aoe-repo-collapsed-", "aoe-nested-group-collapsed-", "aoe-group-collapsed-"];
 
 export function isSyncedKey(key: string): boolean {
   return EXACT_KEYS.has(key) || KEY_PREFIXES.some((p) => key.startsWith(p));
 }
 
-// Debounce writes so a burst (dragging the sort handle, toggling several
-// groups) collapses into a single PATCH.
+// Debounced so bursts collapse into one PATCH.
 let pending: Record<string, string | null> = {};
 let timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -54,7 +42,7 @@ function scheduleWrite(key: string, value: string | null): void {
 
 let initialized = false;
 
-/** Wire the localStorage write chokepoint to the server. Idempotent. */
+/** Idempotent. */
 export function initWebUiSync(): void {
   if (initialized) return;
   initialized = true;
@@ -68,7 +56,7 @@ function rawSet(key: string, value: string): void {
     // eslint-disable-next-line no-restricted-syntax
     window.localStorage?.setItem(key, value);
   } catch {
-    // storage disabled / quota; non-fatal
+    // storage disabled or full; non-fatal
   }
 }
 
@@ -87,23 +75,12 @@ function enumerateLocalSyncedKeys(): string[] {
   return out;
 }
 
-/**
- * Pull the server's UI-state blob into localStorage before the app renders so
- * stores read the synced (cross-device) values on first paint. Server wins on
- * conflict; any synced key present only locally is backfilled to the server so
- * an existing browser's prefs propagate on first run. Best-effort: on fetch
- * failure the local cache is left untouched. Uses raw localStorage writes so
- * applying server values does not echo back through the sync chokepoint.
- */
+/** Pull server values into localStorage before first paint (server wins). Raw writes avoid echoing back through the sync chokepoint. */
 export async function hydrateWebUiStateFromServer(): Promise<void> {
   const server = await getWebUiState();
   if (!server) return;
 
-  // One-time migration: only seed the server from this browser's existing
-  // localStorage when the server has NEVER stored anything. Backfilling once
-  // the server is non-empty would resurrect keys another device legitimately
-  // deleted (a local key absent from the server can mean "deleted elsewhere",
-  // not "never synced"), so we don't.
+  // Seed the server only when it has never stored anything; later a missing key may mean deleted elsewhere.
   if (Object.keys(server).length === 0) {
     const backfill: Record<string, string | null> = {};
     for (const key of enumerateLocalSyncedKeys()) {
@@ -114,7 +91,6 @@ export async function hydrateWebUiStateFromServer(): Promise<void> {
     return;
   }
 
-  // Server is the source of truth: apply its values locally.
   for (const [key, value] of Object.entries(server)) {
     rawSet(key, value);
   }

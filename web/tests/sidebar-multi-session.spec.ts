@@ -1,4 +1,6 @@
 import { test, expect } from "./helpers/mockedTest";
+import { mockStaticApis } from "./helpers/apiMocks";
+import { sessionResponse } from "./helpers/sessions";
 import { Page } from "@playwright/test";
 
 // Two sessions sharing the same `(project_path, branch=null)` collapsed
@@ -44,7 +46,7 @@ async function mockApis(
   options: { rowTag?: "none" | "auto" | "profile" | "sandbox" | "branch" } = {},
 ) {
   let rowTag = options.rowTag ?? "branch";
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
+  await mockStaticApis(page);
   await page.route("**/api/settings**", (r) => {
     const pathname = new URL(r.request().url()).pathname;
     if (pathname === "/api/settings/schema") return r.fulfill({ json: ROW_TAG_SCHEMA });
@@ -60,31 +62,11 @@ async function mockApis(
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
       json: {
-        sessions: sessions.map((s) => ({
-          id: s.id,
-          title: s.title,
-          project_path: s.project_path,
-          group_path: s.project_path,
-          tool: "claude",
-          status: s.status ?? "Idle",
-          yolo_mode: false,
-          created_at: new Date().toISOString(),
-          last_accessed_at: null,
-          last_error: null,
-          branch: s.branch,
-          main_repo_path: null,
-          is_sandboxed: false,
-          has_terminal: true,
-          profile: "default",
-          workspace_repos: [],
-        })),
+        sessions: sessions.map((s) => sessionResponse({ ...s })),
         workspace_ordering: [],
       },
     });
   });
-  for (const path of ["themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
-    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
-  }
 }
 
 test.describe("Sidebar multi-session (#956)", () => {

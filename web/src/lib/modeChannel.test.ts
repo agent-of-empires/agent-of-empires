@@ -40,8 +40,6 @@ describe("resolveModeChannel", () => {
     const channel = resolveModeChannel({
       ...BASE,
       configOptions: [OPENCODE_MODE_OPTION],
-      // Even with the claude fallback allowed, a real config option wins
-      // so OpenCode's user is never shown a mode it would reject.
       allowLegacyFallback: true,
     });
     expect(channel!.modes.some((m) => m.id === "default")).toBe(false);
@@ -54,7 +52,6 @@ describe("resolveModeChannel", () => {
       pendingConfigOption: { configId: "mode", value: "plan" },
     });
     expect(channel!.pendingId).toBe("plan");
-    // Active stays put (pessimistic UI) until the adapter confirms.
     expect(channel!.activeId).toBe("build");
   });
 

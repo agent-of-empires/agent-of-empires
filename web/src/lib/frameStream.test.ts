@@ -14,8 +14,6 @@ function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
   return u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) as ArrayBuffer;
 }
 
-/** Streaming raw-deflate that emits one sync-flushed chunk per frame,
- *  mirroring the server's FrameDeflater (shared dictionary across calls). */
 function makeDeflater() {
   const stream = zlib.createDeflateRaw();
   const pending: Buffer[] = [];
@@ -107,7 +105,6 @@ describe("frameStream", () => {
         expect(writer.write).toHaveBeenCalledTimes(1);
         inflater.dispose();
 
-        // Release the pending operation after disposal, then join its error handler.
         if (failure === "read") {
           rejectRead(new Error("cancelled read"));
           resolveWrite();

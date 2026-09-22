@@ -30,8 +30,7 @@ import { PluginUiProvider, usePluginUiEntries } from "./lib/pluginUiContext";
 import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
 import { nextAttentionSessionId, sessionNeedsAttention, workspaceIsTrashed } from "./lib/sidebarSort";
-import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
-import { useSidebarAxis } from "./hooks/useSidebarAxis";
+import { useSidebarAxis, useSidebarSortMode } from "./hooks/useSidebarPrefs";
 import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
 import { useProjects } from "./hooks/useProjects";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
@@ -51,7 +50,7 @@ import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
 import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollapsed } from "./lib/paneLayout";
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
-import { PluginPaneBody } from "./components/plugin/PluginSlots";
+import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   deleteWorkspaceSessions,
@@ -108,7 +107,8 @@ import {
   forwardTerminalBeforeInput,
 } from "./lib/mobileKeyboardProxy";
 import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
-import { WorkspaceSidebar, SnoozeModal } from "./components/WorkspaceSidebar";
+import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
+import { SnoozeModal } from "./components/sidebar/SnoozeModal";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
 import { StopSessionDialog } from "./components/StopSessionDialog";
 import { SwitchViewDialog } from "./components/SwitchViewDialog";
@@ -778,6 +778,12 @@ function AppContent({
     ...(activeSession?.view === "structured" ? ["agents"] : []),
     ...(caps.cityhall ? [] : pluginPanes.map((p) => p.id)),
   ];
+  // The mobile picker/single-pane view reuses this exact list (minus
+  // "terminal", desktop's multi-instance extra-terminal dock, which has no
+  // single-pane mobile equivalent) so its available views can't drift from
+  // desktop's capability/session gating the way the sub-agents and Files
+  // panes previously did.
+  const mobilePaneIds = allPaneIds.filter((id) => id !== "terminal");
 
   // Fetch the diff when the panel is actually showing: on desktop when the
   // split is expanded, on mobile when the diff view is the active pane.
@@ -863,11 +869,14 @@ function AppContent({
     setPairedMounted(true);
   }
 
-  // A plugin pane promoted into the mobile main pane can vanish (plugin
-  // unloaded, or the new session has no such pane). Fall back to the agent
-  // view so the user is never stranded on a blank pane. Mirrors the diff /
-  // paired guards above; render-phase derivation per the block at the top.
-  if (isPluginPaneId(rightPanelView) && !pluginPanes.some((p) => p.id === rightPanelView)) {
+  // A gated mobile view (a builtin pane like diff/files/agents, or a plugin
+  // pane) can vanish out from under the current selection: plugin unloaded,
+  // capability change, or the session's structured-view state changed. Fall
+  // back to the agent view so the user is never stranded on a blank pane.
+  // Mirrors the paired guard above; render-phase derivation per the block at
+  // the top.
+  const isGatedBuiltinView = rightPanelView === "diff" || rightPanelView === "files" || rightPanelView === "agents";
+  if ((isGatedBuiltinView || isPluginPaneId(rightPanelView)) && !mobilePaneIds.includes(rightPanelView)) {
     setRightPanelView("agent");
   }
 
@@ -1283,6 +1292,8 @@ function AppContent({
       const latest = projectSessions[0];
       const profile = latest?.profile || requireProjectProfile();
       if (!profile) return;
+      const key = normalizeProjectPathKey(repoPath);
+      const registered = projects.find((project) => normalizeProjectPathKey(project.path) === key);
 
       setWizardPrefill({
         path: repoPath,
@@ -1291,10 +1302,11 @@ function AppContent({
         sandboxEnabled: latest?.is_sandboxed ?? false,
         profile,
         group: latest?.group_path || undefined,
+        worktreeEnabled: registered?.overrides?.worktree_enabled,
       });
       setShowSessionWizard(true);
     },
-    [sessions, requireProjectProfile],
+    [sessions, projects, requireProjectProfile],
   );
 
   const handlePinProject = useCallback(
@@ -1351,6 +1363,27 @@ function AppContent({
       if (profile && projects.includes(project)) setProjectForm({ editProject: project, profile });
     },
     [projects, requireProjectProfile],
+  );
+
+  const handleEditProjectSettings = useCallback(
+    async (group: SidebarGroup) => {
+      const profile = requireProjectProfile();
+      if (!profile) return;
+      const registered = group.registeredProjects.find((project) => projects.includes(project));
+      if (registered) {
+        setProjectForm({ editProject: registered, profile });
+        return;
+      }
+      if (!group.repoPath) return;
+      const result = await createProject({ path: group.repoPath, scope: "global", profile });
+      if (!result.ok || !result.project) {
+        toastBus.handler?.error(result.error ?? "Failed to register project");
+        return;
+      }
+      await refreshProjects();
+      setProjectForm({ editProject: result.project, profile });
+    },
+    [projects, refreshProjects, requireProjectProfile],
   );
 
   // Remove only the registrations captured by this sidebar row.
@@ -1824,6 +1857,7 @@ function AppContent({
           view={rightPanelView}
           pluginPanes={pluginPanes}
           onBackToAgent={() => handlePickView("agent")}
+          onOpenAgentsPane={() => handlePickView("agents")}
           pairedMounted={pairedMounted}
           activeSession={activeSession ?? null}
           activeSessionId={activeSessionId}
@@ -2278,6 +2312,7 @@ function AppContent({
               onCreateSession={handleCreateSession}
               onPinProject={projectsReady ? handlePinProject : undefined}
               onUnpinProject={projectsReady ? handleUnpinProject : undefined}
+              onEditProjectSettings={projectsReady ? handleEditProjectSettings : undefined}
               savedProjects={savedProjects}
               onAddProject={handleAddProject}
               onEditProject={handleEditProject}
@@ -2423,6 +2458,7 @@ function AppContent({
             open={pickerOpen && singlePane}
             active={rightPanelView}
             pluginPanes={pluginPanes}
+            availablePanes={mobilePaneIds}
             onSelect={handlePickView}
             onClose={() => setPickerOpen(false)}
           />

@@ -1,17 +1,9 @@
-//! Thin typed GitHub HTTP client built on the already-present `reqwest`.
-//!
-//! This is the single surface for talking to `api.github.com`. It owns the
-//! base URL, the standard headers, and the mapping from HTTP responses to the
-//! typed [`GitHubError`] taxonomy. Only unauthenticated public reads (such as
-//! the update check) are wired up today via [`GitHubClient::unauthenticated`].
+//! Typed GitHub HTTP client: the single surface for `api.github.com`.
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS, NON_ALPHANUMERIC};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT};
 use reqwest::StatusCode;
 
-/// Characters to percent-encode inside a single URL path segment (a release
-/// tag). Encodes the path separator and other reserved/query characters while
-/// leaving unreserved ones like `.`, `-`, `_` intact.
 const TAG_SEGMENT: &AsciiSet = &CONTROLS
     .add(b'/')
     .add(b' ')
@@ -20,9 +12,7 @@ const TAG_SEGMENT: &AsciiSet = &CONTROLS
     .add(b'%')
     .add(b'&')
     .add(b'+');
-/// Encode a search `q` value: encode everything non-alphanumeric (spaces,
-/// `:`, etc.) so the qualifier syntax (`topic:aoe-plugin fork:false`) survives
-/// into the query string intact.
+/// Encode everything non-alphanumeric so qualifier syntax survives in the query string.
 const QUERY_VALUE: &AsciiSet = NON_ALPHANUMERIC;
 
 use serde::de::DeserializeOwned;
@@ -31,58 +21,43 @@ use std::time::Duration;
 
 use crate::github::error::{GitHubError, Result};
 
-/// Configuration for constructing a [`GitHubClient`].
 #[derive(Debug, Clone)]
 pub struct GitHubClientConfig {
-    /// API base, normally `https://api.github.com`. Overridable for tests.
     pub api_base: String,
     pub user_agent: String,
     pub timeout: Duration,
 }
 
-/// A configured GitHub HTTP client.
 pub struct GitHubClient {
     http: reqwest::Client,
     api_base: String,
 }
 
-/// A GitHub release.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitHubRelease {
     pub tag_name: String,
     #[serde(default)]
     pub body: Option<String>,
     pub published_at: Option<String>,
-    /// A draft (unpublished) release. Excluded from a public list, but kept here
-    /// so the changelog can filter defensively.
     #[serde(default)]
     pub draft: bool,
-    /// A prerelease (alpha/beta/rc). `releases/latest` excludes these; the list
-    /// endpoint does not, so the changelog filters them to match the stable
-    /// channel the update path tracks.
+    /// The list endpoint includes prereleases; `releases/latest` does not.
     #[serde(default)]
     pub prerelease: bool,
-    /// Release assets (downloadable binaries). Empty for the update check; used
-    /// by plugin install to fetch a release-binary worker.
     #[serde(default)]
     pub assets: Vec<GitHubAsset>,
 }
 
-/// The result of comparing two commits (`/compare/{base}...{head}`). Only the
-/// fields the changelog needs are deserialized.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitHubCompare {
-    /// `ahead`, `behind`, `diverged`, or `identical`.
     pub status: String,
-    /// Total commits between base and head. May exceed `commits.len()` because
-    /// the compare endpoint caps the returned list at 250.
+    /// The compare endpoint caps `commits` at 250, so this may exceed its length.
     #[serde(default)]
     pub total_commits: u64,
     #[serde(default)]
     pub commits: Vec<GitHubCompareCommit>,
 }
 
-/// One commit in a compare result.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitHubCompareCommit {
     pub sha: String,
@@ -91,24 +66,20 @@ pub struct GitHubCompareCommit {
     pub commit: GitHubCommitInner,
 }
 
-/// The commit metadata nested under a compare commit.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitHubCommitInner {
     #[serde(default)]
     pub message: String,
 }
 
-/// A single downloadable asset attached to a release.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitHubAsset {
     pub name: String,
     pub browser_download_url: String,
 }
 
-/// A repository returned by the search API (the subset plugin discovery shows).
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitHubRepo {
-    /// `owner/repo`.
     pub full_name: String,
     #[serde(default)]
     pub html_url: String,
@@ -132,7 +103,6 @@ struct ApiErrorBody {
 }
 
 impl GitHubClient {
-    /// Client for public, unauthenticated requests.
     pub fn unauthenticated(config: GitHubClientConfig) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -157,7 +127,6 @@ impl GitHubClient {
         })
     }
 
-    /// `GET /repos/{owner}/{repo}/releases?per_page={per_page}`
     pub async fn list_releases(
         &self,
         owner: &str,
@@ -171,13 +140,6 @@ impl GitHubClient {
         self.send_json(self.http.get(url)).await
     }
 
-    /// `GET /repos/{owner}/{repo}/compare/{base}...{head}`
-    ///
-    /// Returns the commits on `head` that are not on `base`, base-exclusive and
-    /// head-inclusive. The endpoint caps the returned list at 250 commits, so
-    /// `total_commits` may exceed `commits.len()`; callers mark truncation off
-    /// that gap. A ref containing `/` (a branch like `release/1.x`) is encoded so
-    /// it stays one path segment.
     pub async fn compare_commits(
         &self,
         owner: &str,
@@ -194,21 +156,18 @@ impl GitHubClient {
         self.send_json(self.http.get(url)).await
     }
 
-    /// `GET /repos/{owner}/{repo}/releases/latest`
     pub async fn latest_release(&self, owner: &str, repo: &str) -> Result<GitHubRelease> {
         let url = format!("{}/repos/{}/{}/releases/latest", self.api_base, owner, repo);
         self.send_json(self.http.get(url)).await
     }
 
-    /// `GET /repos/{owner}/{repo}/releases/tags/{tag}`
     pub async fn release_by_tag(
         &self,
         owner: &str,
         repo: &str,
         tag: &str,
     ) -> Result<GitHubRelease> {
-        // A tag like `release/1.2.3` is valid and must not split into extra path
-        // segments, or the API 404s on a real tag.
+        // A tag like `release/1.2.3` must stay one path segment.
         let tag = utf8_percent_encode(tag, TAG_SEGMENT);
         let url = format!(
             "{}/repos/{}/{}/releases/tags/{}",
@@ -217,11 +176,6 @@ impl GitHubClient {
         self.send_json(self.http.get(url)).await
     }
 
-    /// `GET /search/repositories?q={query}&sort=stars&order=desc`
-    ///
-    /// Unauthenticated search is heavily rate limited (about 10 requests per
-    /// minute per IP); a 403/429 surfaces as [`GitHubError::RateLimited`] so the
-    /// caller can say so plainly rather than reporting a generic API error.
     pub async fn search_repositories(&self, query: &str, per_page: u8) -> Result<Vec<GitHubRepo>> {
         let q = utf8_percent_encode(query, QUERY_VALUE);
         let url = format!(
@@ -232,10 +186,6 @@ impl GitHubClient {
         Ok(response.items)
     }
 
-    /// Fetch a single file's raw contents via the contents API (`Accept:
-    /// application/vnd.github.raw`). Used to read a plugin's `aoe-plugin.toml`
-    /// for the details view without cloning. `reference` pins the branch, tag,
-    /// or commit (`?ref=`); `None` reads the repo's default branch.
     pub async fn get_repo_file(
         &self,
         owner: &str,
@@ -290,8 +240,6 @@ fn classify_transport_error(error: reqwest::Error) -> GitHubError {
     }
 }
 
-/// Map a non-success HTTP response to the typed error with the right hint.
-/// Pure and header-driven so it is unit-testable without a live API.
 fn classify_status(status: StatusCode, headers: &HeaderMap, body: &str) -> GitHubError {
     match status {
         StatusCode::UNAUTHORIZED => GitHubError::Unauthorized,
@@ -327,11 +275,7 @@ fn is_rate_limited(headers: &HeaderMap) -> bool {
     remaining_zero || headers.contains_key("retry-after")
 }
 
-/// A 403 is only treated as a missing-scope failure when the response body
-/// actually says so. GitHub sends `X-Accepted-OAuth-Scopes` on many responses,
-/// including ones that are forbidden for unrelated reasons, so the header alone
-/// is not evidence. The named scope still comes from that header. Precise
-/// per-operation scope mapping is tracked in the scope-elevation follow-up.
+/// Missing-scope only when the body says so; many unrelated 403s carry the header.
 fn missing_scope(headers: &HeaderMap, body: &str) -> Option<String> {
     if !body.to_lowercase().contains("scope") {
         return None;
@@ -339,8 +283,6 @@ fn missing_scope(headers: &HeaderMap, body: &str) -> Option<String> {
     accepted_scopes(headers)
 }
 
-/// The scopes GitHub says the endpoint accepts, taken from
-/// `X-Accepted-OAuth-Scopes` so the hint names the real missing scope.
 fn accepted_scopes(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-accepted-oauth-scopes")
@@ -400,77 +342,80 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_maps_to_unauthorized() {
-        let err = classify_status(StatusCode::UNAUTHORIZED, &HeaderMap::new(), "");
-        assert!(matches!(err, GitHubError::Unauthorized));
-    }
-
-    #[test]
-    fn forbidden_with_scope_error_names_the_scope() {
-        let headers = headers_with(&[("x-accepted-oauth-scopes", "repo")]);
-        let err = classify_status(
-            StatusCode::FORBIDDEN,
-            &headers,
-            r#"{"message":"requires the repo scope"}"#,
+    fn classify_status_separates_scope_rate_limit_and_plain_api_errors() {
+        let scope_header = &[("x-accepted-oauth-scopes", "repo")][..];
+        type ErrorCase = (
+            StatusCode,
+            &'static [(&'static str, &'static str)],
+            &'static str,
+            fn(GitHubError),
         );
-        match err {
-            GitHubError::InsufficientScope { scopes } => assert_eq!(scopes, "repo"),
-            other => panic!("expected InsufficientScope, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn forbidden_with_workflow_scope_names_workflow() {
-        let headers = headers_with(&[("x-accepted-oauth-scopes", "repo, workflow")]);
-        let err = classify_status(
-            StatusCode::FORBIDDEN,
-            &headers,
-            r#"{"message":"missing the workflow scope"}"#,
-        );
-        match err {
-            GitHubError::InsufficientScope { scopes } => assert!(scopes.contains("workflow")),
-            other => panic!("expected InsufficientScope, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn forbidden_with_scope_header_but_no_scope_message_is_api() {
-        // The header alone is not evidence; many 403s carry it.
-        let headers = headers_with(&[("x-accepted-oauth-scopes", "repo")]);
-        let err = classify_status(
-            StatusCode::FORBIDDEN,
-            &headers,
-            r#"{"message":"Resource not accessible by integration"}"#,
-        );
-        assert!(matches!(err, GitHubError::Api { .. }));
-    }
-
-    #[test]
-    fn forbidden_rate_limited_maps_to_rate_limited() {
-        let headers = headers_with(&[("x-ratelimit-remaining", "0")]);
-        let err = classify_status(StatusCode::FORBIDDEN, &headers, "");
-        assert!(matches!(err, GitHubError::RateLimited));
-    }
-
-    #[test]
-    fn too_many_requests_maps_to_rate_limited() {
-        let err = classify_status(StatusCode::TOO_MANY_REQUESTS, &HeaderMap::new(), "");
-        assert!(matches!(err, GitHubError::RateLimited));
-    }
-
-    #[test]
-    fn plain_forbidden_maps_to_api_error() {
-        let err = classify_status(
-            StatusCode::FORBIDDEN,
-            &HeaderMap::new(),
-            r#"{"message":"Resource protected"}"#,
-        );
-        match err {
-            GitHubError::Api { status, message } => {
-                assert_eq!(status, StatusCode::FORBIDDEN);
-                assert_eq!(message, "Resource protected");
-            }
-            other => panic!("expected Api, got {other:?}"),
+        let cases: [ErrorCase; 8] = [
+            (StatusCode::UNAUTHORIZED, &[], "", |err| {
+                assert!(matches!(err, GitHubError::Unauthorized))
+            }),
+            (
+                StatusCode::FORBIDDEN,
+                scope_header,
+                r#"{"message":"requires the repo scope"}"#,
+                |err| match err {
+                    GitHubError::InsufficientScope { scopes } => assert_eq!(scopes, "repo"),
+                    other => panic!("expected InsufficientScope, got {other:?}"),
+                },
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                &[("x-accepted-oauth-scopes", "repo, workflow")],
+                r#"{"message":"missing the workflow scope"}"#,
+                |err| match err {
+                    GitHubError::InsufficientScope { scopes } => {
+                        assert!(scopes.contains("workflow"))
+                    }
+                    other => panic!("expected InsufficientScope, got {other:?}"),
+                },
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                scope_header,
+                r#"{"message":"Resource not accessible by integration"}"#,
+                |err| assert!(matches!(err, GitHubError::Api { .. })),
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                &[("x-ratelimit-remaining", "0")],
+                "",
+                |err| assert!(matches!(err, GitHubError::RateLimited)),
+            ),
+            (StatusCode::TOO_MANY_REQUESTS, &[], "", |err| {
+                assert!(matches!(err, GitHubError::RateLimited))
+            }),
+            (
+                StatusCode::FORBIDDEN,
+                &[],
+                r#"{"message":"Resource protected"}"#,
+                |err| match err {
+                    GitHubError::Api { status, message } => {
+                        assert_eq!(status, StatusCode::FORBIDDEN);
+                        assert_eq!(message, "Resource protected");
+                    }
+                    other => panic!("expected Api, got {other:?}"),
+                },
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &[],
+                "",
+                |err| match err {
+                    GitHubError::Api { status, message } => {
+                        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+                        assert_eq!(message, "no response body");
+                    }
+                    other => panic!("expected Api, got {other:?}"),
+                },
+            ),
+        ];
+        for (status, headers, body, check) in cases {
+            check(classify_status(status, &headers_with(headers), body));
         }
     }
 
@@ -484,18 +429,6 @@ mod tests {
         match err {
             GitHubError::NotFound { resource } => assert_eq!(resource, "Not Found"),
             other => panic!("expected NotFound, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn server_error_maps_to_api() {
-        let err = classify_status(StatusCode::INTERNAL_SERVER_ERROR, &HeaderMap::new(), "");
-        match err {
-            GitHubError::Api { status, message } => {
-                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-                assert_eq!(message, "no response body");
-            }
-            other => panic!("expected Api, got {other:?}"),
         }
     }
 

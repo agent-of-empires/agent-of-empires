@@ -1,6 +1,3 @@
-// Tests for the `<tool_use_error>` wrapper-parser used by every per-kind
-// structured view tool card's error body. See issue #1090.
-
 import { describe, expect, it } from "vitest";
 
 import { describeToolErrorTag, parseToolError } from "./toolErrorParse";
@@ -56,10 +53,6 @@ describe("parseToolError", () => {
   });
 
   it("strips the wrapper when prose precedes it", () => {
-    // claude-agent-acp sometimes joins multiple ContentBlock::Text
-    // entries with `\n` before the wrapper; the anchored regex used to
-    // miss this and leak `<tool_use_error>…</tool_use_error>` into the
-    // rendered body. See follow-up to #1090.
     const raw = "Preamble note\n<tool_use_error>File does not exist.</tool_use_error>";
     expect(parseToolError(raw)).toEqual({
       body: "File does not exist.",
@@ -68,11 +61,6 @@ describe("parseToolError", () => {
   });
 
   it("strips trailing empty code fences glued onto the wrapper", () => {
-    // Observed in the wild: claude-agent-acp emits a second
-    // ContentBlock::Text containing an empty markdown code fence after
-    // the wrapper. `extract_tool_content_text` joins blocks with `\n`,
-    // so the body used to render an empty `` ``` ``` `` below the
-    // unwrapped error. Drop adapter formatting noise entirely.
     const raw = "<tool_use_error>File does not exist.</tool_use_error>\n```\n```";
     expect(parseToolError(raw)).toEqual({
       body: "File does not exist.",
@@ -81,8 +69,6 @@ describe("parseToolError", () => {
   });
 
   it("strips the wrapper from a long path-bearing message", () => {
-    // Regression for the reported case: a `Read` of a missing file
-    // returns this exact shape from claude-agent-acp.
     const raw =
       "<tool_use_error>File does not exist. Note: your current working directory is /Users/seluj78/aoe/dev-agent-of-empires-worktrees/test31.</tool_use_error>";
     const parsed = parseToolError(raw);

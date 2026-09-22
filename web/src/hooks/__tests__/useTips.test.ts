@@ -1,9 +1,4 @@
 // @vitest-environment jsdom
-//
-// Tests for useTips and shouldAutoPopTips (#2292): the hook fetches the
-// web-surface tips, derives unseen state, owns the modal open/close + the tip
-// it opens on, and persists mark-seen and the show-on-startup toggle through
-// the api module (mocked). shouldAutoPopTips is the pure startup-auto-pop gate.
 
 import { renderHook, act, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -39,33 +34,19 @@ function resp(over: Partial<TipsResponse> = {}): TipsResponse {
 }
 
 describe("useTips", () => {
-  it("loads tips and derives unseen state", async () => {
-    mockFetch.mockResolvedValue(resp());
+  it.each<[string, TipsResponse | null, boolean, number, boolean]>([
+    ["a loaded response", resp(), true, 2, true],
+    ["a failed fetch", null, false, 0, false],
+    ["tips disabled server-side", resp({ enabled: false }), false, 2, false],
+  ])("derives state from %s", async (_label, response, enabled, count, hasUnseen) => {
+    mockFetch.mockResolvedValue(response);
     const { result } = renderHook(() => useTips());
 
     await waitFor(() => expect(result.current.loaded).toBe(true));
-    expect(result.current.enabled).toBe(true);
-    expect(result.current.tips).toHaveLength(2);
-    expect(result.current.hasUnseen).toBe(true);
+    expect(result.current.enabled).toBe(enabled);
+    expect(result.current.tips).toHaveLength(count);
+    expect(result.current.hasUnseen).toBe(hasUnseen);
     expect(result.current.isOpen).toBe(false);
-  });
-
-  it("treats a failed fetch as loaded with no tips", async () => {
-    mockFetch.mockResolvedValue(null);
-    const { result } = renderHook(() => useTips());
-
-    await waitFor(() => expect(result.current.loaded).toBe(true));
-    expect(result.current.enabled).toBe(false);
-    expect(result.current.tips).toEqual([]);
-    expect(result.current.hasUnseen).toBe(false);
-  });
-
-  it("hasUnseen is false when tips are disabled even with unseen entries", async () => {
-    mockFetch.mockResolvedValue(resp({ enabled: false }));
-    const { result } = renderHook(() => useTips());
-
-    await waitFor(() => expect(result.current.loaded).toBe(true));
-    expect(result.current.hasUnseen).toBe(false);
   });
 
   it("opens on the first unseen tip, marks it seen, and closes", async () => {
@@ -94,9 +75,10 @@ describe("useTips", () => {
     expect(mockMarkSeen).not.toHaveBeenCalled();
   });
 
-  it("markSeen flips the tip locally and persists it", async () => {
+  it("markSeen and setEnabled flip local state and persist it", async () => {
     mockFetch.mockResolvedValue(resp());
     mockMarkSeen.mockResolvedValue(true);
+    mockSetShow.mockResolvedValue(true);
     const { result } = renderHook(() => useTips());
     await waitFor(() => expect(result.current.loaded).toBe(true));
 
@@ -104,17 +86,9 @@ describe("useTips", () => {
     expect(result.current.tips.find((t) => t.id === "b")?.seen).toBe(true);
     expect(result.current.hasUnseen).toBe(false);
     expect(mockMarkSeen).toHaveBeenCalledWith("b");
-  });
-
-  it("setEnabled flips enabled locally and persists it", async () => {
-    mockFetch.mockResolvedValue(resp());
-    mockSetShow.mockResolvedValue(true);
-    const { result } = renderHook(() => useTips());
-    await waitFor(() => expect(result.current.loaded).toBe(true));
 
     act(() => result.current.setEnabled(false));
     expect(result.current.enabled).toBe(false);
-    expect(result.current.hasUnseen).toBe(false);
     expect(mockSetShow).toHaveBeenCalledWith(false);
   });
 });

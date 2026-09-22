@@ -2,14 +2,7 @@ import { test, expect } from "./helpers/mockedTest";
 import { devices } from "@playwright/test";
 import { agentMessageChunk, mockAcpSession, openStructuredSession, waitForComposerConnected } from "./helpers/acpMock";
 
-// User story: on a phone the top bar and the composer eat a third of the
-// screen. Each gets its own handle that folds it away and hands the freed
-// height to the transcript; the handles stay tappable in both states so the
-// user is never stranded in a collapsed layout.
-//
-// Mocked (not live) because everything asserted here is client-side layout:
-// no backend state is involved. One test walks all four combinations rather
-// than four tests, per the repo's "one test per behavior" rule.
+// On phones the top bar and composer each fold away behind a handle that stays tappable in both states.
 test.use({ ...devices["iPhone 13"] });
 
 test.describe("mobile conversation chrome collapse", () => {
@@ -24,17 +17,13 @@ test.describe("mobile conversation chrome collapse", () => {
     const headerToggle = page.getByTestId("header-collapse-toggle");
     const composerToggle = page.getByTestId("composer-collapse-toggle");
 
-    // Heights, not visibility: a collapsed region clips a child that still has
-    // a box of its own, so Playwright would report the child as visible. The
-    // contract is that the *row* releases its layout height.
+    // Measure heights: a clipped child still reports visible, but the row must release its height.
     const heightOf = async (testId: string) => (await page.getByTestId(testId).boundingBox())!.height;
     const viewportHeight = () => heightOf("acp-viewport");
 
     await expect(page.getByTestId("composer-footer")).toBeVisible();
 
-    // Type before collapsing: the draft has to survive the round trip, which is
-    // what keeps the composer mounted rather than unmounted while hidden. Done
-    // before the baseline heights because the textarea sizes to its content.
+    // The draft must survive collapsing; typed before the baseline because the textarea sizes to content.
     const draft = page.getByRole("textbox").first();
     await draft.fill("half-written prompt");
 
@@ -44,17 +33,12 @@ test.describe("mobile conversation chrome collapse", () => {
     expect(composerHeight).toBeGreaterThan(0);
     const bothExpanded = await viewportHeight();
 
-    // Composer collapsed, header still expanded.
     await expect(composerToggle).toHaveAttribute("aria-label", "Collapse message composer");
     await composerToggle.click();
     await expect.poll(() => heightOf("conversation-composer")).toBe(0);
     expect(await heightOf("conversation-header")).toBe(headerHeight);
     await expect(composerToggle).toHaveAttribute("aria-label", "Expand message composer");
-    // `inert` in a real browser, not just the property jsdom can report: the
-    // hidden composer takes neither a tap on the transcript (which normally
-    // focuses it) nor a direct focus() call. Driven through the DOM because an
-    // inert subtree is off the accessibility tree, so role queries cannot see
-    // it while collapsed.
+    // A collapsed composer is inert: taps and focus() miss it. It is off the accessibility tree, so query the DOM.
     await page.mouse.click(150, 250);
     const focusedAfter = await page.evaluate(() => {
       document.querySelector<HTMLTextAreaElement>("textarea")?.focus();
@@ -64,7 +48,6 @@ test.describe("mobile conversation chrome collapse", () => {
     const composerOnly = await viewportHeight();
     expect(composerOnly).toBeCloseTo(bothExpanded + composerHeight, 0);
 
-    // Both collapsed: the handles are still on screen and tappable.
     await headerToggle.click();
     await expect.poll(() => heightOf("conversation-header")).toBe(0);
     await expect(headerToggle).toBeVisible();
@@ -72,14 +55,11 @@ test.describe("mobile conversation chrome collapse", () => {
     const bothCollapsed = await viewportHeight();
     expect(bothCollapsed).toBeCloseTo(composerOnly + headerHeight, 0);
 
-    // Header collapsed, composer restored: the two states are independent.
     await composerToggle.click();
     await expect.poll(() => heightOf("conversation-composer")).toBe(composerHeight);
     expect(await heightOf("conversation-header")).toBe(0);
     expect(await viewportHeight()).toBeLessThan(bothCollapsed);
 
-    // Back to both expanded, and the composer still works after the round trip:
-    // the draft is intact and sends.
     await headerToggle.click();
     await expect.poll(() => heightOf("conversation-header")).toBe(headerHeight);
     expect(await viewportHeight()).toBeCloseTo(bothExpanded, 0);
@@ -90,11 +70,7 @@ test.describe("mobile conversation chrome collapse", () => {
     await expect.poll(() => mock.promptBodies.map((b) => b.text)).toContain("still typing");
   });
 
-  // Regression for the hit-target hazard: the handles are overlays, so any
-  // clickable area wider than the tab the user can see silently eats taps on
-  // whatever sits underneath. An earlier revision wrapped the 28x16 tab in an
-  // invisible 32x32 button and made the update banner's dismiss control (same
-  // corner) untappable for as long as a release was pending.
+  // The handles overlay content, so their hit area must equal the painted tab; a larger wrapper once ate the update banner's dismiss taps.
   test("each handle's clickable area is the tab you can see, so it intercepts nothing around it", async ({ page }) => {
     const mock = await mockAcpSession(page, {
       title: "story-collapse-hit",
@@ -115,8 +91,6 @@ test.describe("mobile conversation chrome collapse", () => {
     await openStructuredSession(page, mock);
     await waitForComposerConnected(page);
 
-    // What `elementFromPoint` reports at a viewport point, as a handle test id
-    // (the SVG glyph is a child of the button, so walk up to the button).
     const handleAt = (x: number, y: number) =>
       page.evaluate(
         ([px, py]) =>
@@ -129,18 +103,12 @@ test.describe("mobile conversation chrome collapse", () => {
 
     for (const testId of ["header-collapse-toggle", "composer-collapse-toggle"]) {
       const box = (await page.getByTestId(testId).boundingBox())!;
-      // The 28x16 tab of the accepted design. Asserted because the geometry is
-      // the behavior: this is what the user aims at and all they can hit.
       expect({ width: box.width, height: box.height }).toEqual({ width: 28, height: 16 });
-      // The clickable element is the painted one. Without this, a transparent
-      // button wrapping a smaller painted tab would still measure "as big as
-      // it looks" below, because every measurement would be the wrapper's.
+      // The painted element is the clickable one, so a transparent wrapper cannot pass.
       const painted = await page
         .getByTestId(testId)
         .evaluate((el) => getComputedStyle(el).backgroundColor !== "rgba(0, 0, 0, 0)");
       expect(painted, `${testId} paints its own hit area`).toBe(true);
-      // Inside the tab it is the handle; a few pixels outside it, on every
-      // side, the handle is already out of the way.
       expect(await handleAt(box.x + box.width / 2, box.y + box.height / 2)).toBe(testId);
       const outside = [
         [box.x + box.width / 2, box.y - 6],
@@ -153,19 +121,13 @@ test.describe("mobile conversation chrome collapse", () => {
       }
     }
 
-    // The concrete collision: the banner's dismiss control shares the header
-    // handle's corner. A real click asserts interception, which a geometry
-    // check alone would not (Playwright fails the click if anything covers it).
+    // A real click proves nothing covers the banner's dismiss control in the same corner.
     const dismiss = page.getByRole("button", { name: "Dismiss update notice" });
     await dismiss.click({ timeout: 5_000 });
     await expect(page.getByRole("status", { name: /Update available/i })).toHaveCount(0);
   });
 
-  // The feature is phone-only, and the header region is now wrapped on every
-  // view rather than only the collapsible ones, so "desktop is untouched" is a
-  // claim this branch has to keep making. Crossing the breakpoint is the same
-  // behavior from the other side: the chrome must come back, unforced, without
-  // dropping what the user had typed.
+  // Phone-only: crossing to desktop restores both regions without losing the draft.
   test("desktop renders no handles, and crossing the breakpoint restores the chrome", async ({ page }) => {
     const mock = await mockAcpSession(page, {
       title: "story-collapse-desktop",
@@ -178,8 +140,6 @@ test.describe("mobile conversation chrome collapse", () => {
     const composerToggle = page.getByTestId("composer-collapse-toggle");
     const heightOf = async (testId: string) => (await page.getByTestId(testId).boundingBox())!.height;
 
-    // Type, collapse both on the phone, then cross `md`. A collapsed composer
-    // is off the accessibility tree, so its value is read through the DOM.
     await page.getByRole("textbox").first().fill("typed on the phone");
     const draftValue = () => page.evaluate(() => document.querySelector("textarea")?.value ?? null);
     await headerToggle.click();
@@ -190,18 +150,11 @@ test.describe("mobile conversation chrome collapse", () => {
     await page.setViewportSize({ width: 1280, height: 800 });
     await expect(headerToggle).toHaveCount(0);
     await expect(composerToggle).toHaveCount(0);
-    // Neither region stays folded: desktop has room for both, and the top bar
-    // is the only navigation the other views have.
     await expect.poll(() => heightOf("conversation-header")).toBeGreaterThan(0);
     await expect.poll(() => heightOf("conversation-composer")).toBeGreaterThan(0);
     await expect(page.getByRole("textbox").first()).toHaveValue("typed on the phone");
 
-    // Back under `md`: the handles return, and the draft is still there. The
-    // two collapse states are deliberately scoped differently, so they come
-    // back differently. Header state lives in `App`, which spans the
-    // breakpoint, so it is still collapsed. Composer state is local to the
-    // structured view, and crossing `md` swaps App's whole mobile pane for the
-    // desktop split, so the view remounts and the composer returns expanded.
+    // Back on a phone: header collapse lives in App and persists, but the structured view remounts, so the composer returns expanded.
     await page.setViewportSize({ width: 390, height: 664 });
     await expect(headerToggle).toBeVisible();
     await expect(composerToggle).toBeVisible();

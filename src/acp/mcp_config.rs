@@ -1,12 +1,4 @@
 //! ACP boundary for MCP server forwarding.
-//!
-//! Parsing, layering, provenance, and the precedence merge all live in the
-//! always-compiled `session::mcp::mcp_model` resolver, which the unified management
-//! surface (#1996), the CLI, and the TUI also read. This module is the thin
-//! edge that converts the resolver's winning set into ACP `McpServer`
-//! wire values and drops any transport the agent did not advertise. Sharing one
-//! resolver across forwarding and display guarantees what the user sees equals
-//! what the agent receives.
 
 use agent_client_protocol::schema::v1::{
     EnvVariable, HttpHeader, McpCapabilities, McpServer, McpServerHttp, McpServerSse,
@@ -19,8 +11,7 @@ use crate::session::mcp::project_mcp::{ProjectMcpServer, ProjectMcpTransport};
 
 /// Convert resolved, transport-typed servers (parsed and merged by
 /// `session::mcp::mcp_model`) into ACP `McpServer` values for forwarding through
-/// `session/new` and `session/load`. The caller passes the winning set of the
-/// precedence merge, so the converted list is exactly what reaches the agent.
+/// `session/new` and `session/load`.
 pub fn project_servers_to_acp(servers: Vec<ProjectMcpServer>) -> Vec<McpServer> {
     servers
         .into_iter()
@@ -55,9 +46,7 @@ fn to_headers(headers: BTreeMap<String, String>) -> Vec<HttpHeader> {
 
 /// Drop servers the agent cannot accept: `stdio` is always supported, but
 /// `http` / `sse` are only valid when the agent advertised the matching
-/// capability in its `initialize` response. Forwarding an unadvertised remote
-/// transport is a protocol violation, so drop (with a warning) rather than
-/// send. Unknown future transports are dropped for the same reason.
+/// capability in its `initialize` response.
 pub fn filter_for_capabilities(
     servers: Vec<McpServer>,
     caps: &McpCapabilities,
@@ -118,15 +107,17 @@ mod tests {
     }
 
     #[test]
-    fn converts_stdio_with_args_and_env() {
+    fn converts_every_transport_with_its_args_env_and_headers() {
         let servers = to_acp(
             r#"{ "mcpServers": {
-                "fs": { "command": "mcp-fs", "args": ["--root", "."], "env": { "TOKEN": "secret" } }
+                "fs": { "command": "mcp-fs", "args": ["--root", "."], "env": { "TOKEN": "secret" } },
+                "h": { "type": "http", "url": "https://e/mcp", "headers": { "Authorization": "Bearer x" } },
+                "s": { "type": "sse", "url": "https://e/sse" }
             } }"#,
         );
+        assert_eq!(names(&servers), vec!["fs", "h", "s"]);
         match &servers[0] {
             McpServer::Stdio(s) => {
-                assert_eq!(s.name, "fs");
                 assert_eq!(s.command.to_string_lossy(), "mcp-fs");
                 assert_eq!(s.args, vec!["--root".to_string(), ".".to_string()]);
                 assert_eq!(s.env[0].name, "TOKEN");
@@ -134,17 +125,7 @@ mod tests {
             }
             other => panic!("expected stdio, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn converts_remote_transports() {
-        let servers = to_acp(
-            r#"{ "mcpServers": {
-                "h": { "type": "http", "url": "https://e/mcp", "headers": { "Authorization": "Bearer x" } },
-                "s": { "type": "sse", "url": "https://e/sse" }
-            } }"#,
-        );
-        match &servers[0] {
+        match &servers[1] {
             McpServer::Http(h) => {
                 assert_eq!(h.url, "https://e/mcp");
                 assert_eq!(h.headers[0].name, "Authorization");
@@ -152,7 +133,7 @@ mod tests {
             }
             other => panic!("expected http, got {other:?}"),
         }
-        assert!(matches!(&servers[1], McpServer::Sse(_)));
+        assert!(matches!(&servers[2], McpServer::Sse(_)));
     }
 
     #[test]

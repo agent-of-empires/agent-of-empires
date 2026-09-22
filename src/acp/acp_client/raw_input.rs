@@ -4,13 +4,9 @@
 use crate::acp::state::Event;
 use tracing::{debug, info, warn};
 
-/// Build a `WakeupScheduled` event from a `ScheduleWakeup` tool's
-/// raw_input. Reads `delaySeconds` (number, falls back to numeric
-/// string) and the optional `reason`; computes the absolute wake
-/// timestamp from `Utc::now()`. Returns `None` if `delaySeconds` is
-/// missing, non-finite, or so large the wake time is unrepresentable,
-/// better to skip the event than publish a wakeup at epoch zero or
-/// panic on overflow. See #1091.
+/// Reads `delaySeconds` (a number, or a numeric string) into an absolute wake
+/// time. A missing, non-finite, or unrepresentable delay skips the event
+/// rather than publishing a wakeup at epoch zero or overflowing (#1091).
 pub(super) fn wakeup_event_from_raw(raw_input: &serde_json::Value) -> Option<Event> {
     let Some(delay_value) = raw_input.get("delaySeconds") else {
         debug!(
@@ -62,11 +58,9 @@ pub(super) fn wakeup_event_from_raw(raw_input: &serde_json::Value) -> Option<Eve
     Some(Event::WakeupScheduled { at, reason })
 }
 
-/// Build a `MonitorArmed` event from a `Monitor` tool's raw_input. Reads
-/// the optional `description` for the badge label. Returns `None` when the
-/// frame carries neither `description` nor `command`: claude-agent-acp emits
-/// the initial `tool_call` frame with empty args (the real args land on a
-/// later `ToolCallUpdate`), and an empty frame should not arm the badge.
+/// `None` for a frame carrying neither `description` nor `command`:
+/// claude-agent-acp sends the initial `tool_call` with empty args, and that
+/// must not arm the badge.
 pub(super) fn monitor_event_from_raw(raw_input: &serde_json::Value) -> Option<Event> {
     let description = raw_input
         .get("description")
@@ -84,13 +78,10 @@ pub(super) fn monitor_event_from_raw(raw_input: &serde_json::Value) -> Option<Ev
     Some(Event::MonitorArmed { description })
 }
 
-/// Detect a Claude async sub-agent launch in an otherwise-unmapped ACP
-/// update and build a typed `BackgroundAgentLaunched`. The launch arrives
-/// as `{ _meta: { claudeCode: { toolName: "Agent", toolResponse: {
-/// agentId, description, prompt, resolvedModel, outputFile, status:
-/// "async_launched" } } }, toolCallId }`. Returns `None` for anything
-/// else (the caller falls back to `RawAgentUpdate`). Field extraction is
-/// fully defensive: a missing `agentId` is the only hard requirement.
+/// A Claude async sub-agent launch, arriving as `_meta.claudeCode` with
+/// `toolName: "Agent"` and a `toolResponse` whose `status` is
+/// `"async_launched"`. `agentId` is the only required field; anything else
+/// falls back to `RawAgentUpdate`.
 pub(super) fn background_agent_launched_from_value(v: &serde_json::Value) -> Option<Event> {
     let cc = v.get("_meta")?.get("claudeCode")?;
     if cc.get("toolName").and_then(|t| t.as_str()) != Some("Agent") {
@@ -128,7 +119,7 @@ mod tests {
 
     #[test]
     fn wakeup_from_raw_rejects_unusable_delays() {
-        let cases = [
+        for (label, raw) in [
             ("missing", serde_json::json!({})),
             ("non-numeric", serde_json::json!({ "delaySeconds": "soon" })),
             ("negative", serde_json::json!({ "delaySeconds": -1.0 })),
@@ -136,8 +127,7 @@ mod tests {
             ("non-finite", serde_json::json!({ "delaySeconds": "inf" })),
             // Finite, but past the range chrono can add to `now`.
             ("overflowing", serde_json::json!({ "delaySeconds": 1e18 })),
-        ];
-        for (label, raw) in cases {
+        ] {
             assert!(
                 wakeup_event_from_raw(&raw).is_none(),
                 "{label} delaySeconds must not emit WakeupScheduled"
@@ -145,9 +135,8 @@ mod tests {
         }
     }
 
-    // The JSON-number path is covered end to end by
-    // `map_tool_call_update_emits_wakeup_when_title_and_raw_input_land_in_update`;
-    // only the numeric-string fallback is unique to this layer.
+    /// The JSON-number path is covered end to end in `update_events`; only the
+    /// numeric-string fallback is unique to this layer.
     #[test]
     fn wakeup_from_raw_schedules_delay_given_as_string() {
         let before = chrono::Utc::now();
@@ -195,20 +184,26 @@ mod tests {
         }
     }
 
+    /// Another tool, a synchronous Agent call, and an empty payload all stay
+    /// `RawAgentUpdate`.
     #[test]
     fn background_agent_launched_ignores_non_agent_meta() {
-        // A normal tool-response RawAgentUpdate must not be promoted.
-        let bash = serde_json::json!({
-            "_meta": { "claudeCode": { "toolName": "Bash", "toolResponse": {} } }
-        });
-        assert!(background_agent_launched_from_value(&bash).is_none());
-        // An Agent update that is not an async launch (no status) stays raw.
-        let sync = serde_json::json!({
-            "_meta": { "claudeCode": { "toolName": "Agent", "toolResponse": {
-                "agentId": "x"
-            }}}
-        });
-        assert!(background_agent_launched_from_value(&sync).is_none());
-        assert!(background_agent_launched_from_value(&serde_json::json!({})).is_none());
+        for raw in [
+            serde_json::json!({
+                "_meta": { "claudeCode": { "toolName": "Bash", "toolResponse": {} } }
+            }),
+            serde_json::json!({
+                "_meta": { "claudeCode": {
+                    "toolName": "Agent",
+                    "toolResponse": { "agentId": "x" }
+                }}
+            }),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                background_agent_launched_from_value(&raw).is_none(),
+                "{raw}"
+            );
+        }
     }
 }

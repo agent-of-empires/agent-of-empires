@@ -1,30 +1,21 @@
-// Shared mocked-Playwright setup for the sidebar-reorder story specs
-// under `web/tests/sidebar-reorder-*.spec.ts` (#1419). The drag-to-
-// reorder UI sits on top of dnd-kit and a handful of REST endpoints;
-// the per-test specifics are just the input gesture + the assertion.
-// Extracted from `sidebar-drag-reorder.spec.ts` and trimmed to what
-// the story specs actually need.
+// Mocked sidebar API surface for sidebar specs.
 
 import type { Page, Route } from "@playwright/test";
+import { sessionResponse } from "./sessions";
 
 export interface MockSessionInput {
   id: string;
   title: string;
   project_path: string;
   branch: string | null;
-  /** ISO 8601 timestamp; controls newest-first default ordering. */
   created_at?: string;
-  /** User group (`aoe add -g`); empty means Ungrouped on the group axis. */
   group?: string;
-  /** Parsed remote owner of the repo's `origin` remote; null/omitted means
-   *  the repo has no resolvable owner and buckets into "No organization"
-   *  on the org axis (#3283). */
+  /** Null means "No organization" on the org axis (#3283). */
   remote_owner?: string | null;
-  /** Host-scoped identity key ("owner@host") backing the org axis's
-   *  bucketing; defaults to `${remote_owner}@example.com` when omitted, so
-   *  most specs need only set `remote_owner`. Set explicitly to test
-   *  same-named owners on different hosts staying in separate buckets. */
+  /** Defaults to `${remote_owner}@example.com`. */
   remote_owner_key?: string | null;
+  /** Extra SessionResponse fields merged over the defaults. */
+  fields?: Record<string, unknown>;
 }
 
 type MockSession = MockSessionInput & { created_at: string };
@@ -32,76 +23,46 @@ type MockSession = MockSessionInput & { created_at: string };
 function fillCreatedAt(s: MockSessionInput, fallbackIndex: number): MockSession {
   return {
     ...s,
-    // Stagger fallback timestamps a day apart so a list seeded in
-    // arrival order has a deterministic newest-first sort if anything
-    // ever falls back to created_at.
     created_at: s.created_at ?? new Date(Date.UTC(2025, 0, 1 + fallbackIndex)).toISOString(),
   };
 }
 
-function sessionResponse(s: MockSession) {
-  return {
+function toResponse(s: MockSession) {
+  return sessionResponse({
     id: s.id,
     title: s.title,
     project_path: s.project_path,
-    // The server stores the `-g` group here and leaves it empty when the
-    // session was added without one; empty buckets as Ungrouped on the
-    // group axis. The repo axis never reads it.
     group_path: s.group ?? "",
-    tool: "claude",
-    status: "Idle",
-    yolo_mode: false,
     created_at: s.created_at,
-    last_accessed_at: null,
-    idle_entered_at: null,
-    last_error: null,
     branch: s.branch,
-    main_repo_path: null,
-    is_sandboxed: false,
-    has_terminal: true,
-    profile: "default",
-    workspace_repos: [],
     remote_owner: s.remote_owner ?? null,
     remote_owner_key:
       s.remote_owner_key !== undefined ? s.remote_owner_key : s.remote_owner ? `${s.remote_owner}@example.com` : null,
-  };
+    ...s.fields,
+  });
 }
 
-/** Workspace id format used by the server: `<project_path>::<branch>`
- *  for branched sessions, `<project_path>::__session__::<id>` for
- *  ones without a branch. Mirrors `useWorkspaces.ts:31`. */
+/** The server's workspace id (see useWorkspaces.ts). */
 export function workspaceId(s: { project_path: string; branch: string | null; id: string }): string {
   return s.branch ? `${s.project_path}::${s.branch}` : `${s.project_path}::__session__::${s.id}`;
 }
 
 export interface SidebarMockHandle {
-  /** Recorded `PUT /api/workspace-ordering` bodies in arrival order. */
   puts: Array<{ order?: string[] }>;
-  /** Override the fulfill response for the next PUT (used by the
-   *  failure-mode story). Reset after each call. */
+  /** One-shot override for the next PUT's response. */
   nextPutResponse: { status?: number; body?: string } | null;
-  /** Override the read_only flag from `/api/about` (used by the
-   *  read-only story). */
   readOnly: boolean;
 }
 
 export interface SidebarMockOptions {
   sessions: MockSessionInput[];
-  /** Server-supplied workspace ordering (the full list, with each id
-   *  composed via `workspaceId`). Defaults to the input order. */
+  /** Defaults to the input order. */
   ordering?: string[];
-  /** Add `read_only: true` to the `/api/about` response. */
   readOnly?: boolean;
-  /** Mirror the real server: a successful PUT replaces the ordering
-   *  served by subsequent GET /api/sessions, so reload round-trips are
-   *  meaningful. Off by default; the failure-mode story relies on a
-   *  rejected PUT leaving the served order untouched either way. */
+  /** A successful PUT replaces the served ordering, like the real server. */
   persistPutOrdering?: boolean;
 }
 
-/** Install routes for the surface the sidebar uses. Returns a handle
- *  the test can read for captured PUT bodies and tweak the next PUT's
- *  fulfill (for the failure-mode story). */
 export async function installSidebarMocks(page: Page, opts: SidebarMockOptions): Promise<SidebarMockHandle> {
   const filled = opts.sessions.map((s, i) => fillCreatedAt(s, i));
   const handle: SidebarMockHandle = {
@@ -117,7 +78,7 @@ export async function installSidebarMocks(page: Page, opts: SidebarMockOptions):
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
       json: {
-        sessions: filled.map(sessionResponse),
+        sessions: filled.map(toResponse),
         workspace_ordering: ordering,
       },
     });
@@ -151,9 +112,6 @@ export async function installSidebarMocks(page: Page, opts: SidebarMockOptions):
   return handle;
 }
 
-/** Standard three sessions in one repo, used by the activation /
- *  suppression / mobile stories. Title -> branch -> id are aligned so
- *  the test reads naturally. */
 export function threeSessionsInOneRepo(): MockSessionInput[] {
   return [
     {

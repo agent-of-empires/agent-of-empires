@@ -1,4 +1,4 @@
-//! Acknowledgment dialog for first-time agent status hook installation
+//! Acknowledgment dialog for first-time status hook installation.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -17,8 +17,7 @@ pub struct HooksInstallDialog {
     scroll_offset: u16,
     accept_button_area: Rect,
     cancel_button_area: Rect,
-    /// Which button the mouse is over, for the hover highlight. Visual
-    /// only; never changes `selected`.
+    /// The hovered button. Visual only; never changes `selected`.
     hover: HoverState,
 }
 
@@ -55,9 +54,8 @@ impl HooksInstallDialog {
         None
     }
 
-    /// Highlight the button under the cursor without changing the
-    /// Accept / Cancel selection. See `ConfirmDialog::handle_hover` for
-    /// the rationale. Returns `true` when the highlighted button changed.
+    /// Highlight the button under the cursor without changing the selection.
+    /// True when the highlight changed.
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
         self.hover.update(
             col,
@@ -136,6 +134,8 @@ impl HooksInstallDialog {
             "Each hook runs:",
             Style::default().bold(),
         )));
+        // The euid shown matches the runtime path baked into the hook command,
+        // and is already exposed by `id -u`. A placeholder would mislead.
         lines.push(Line::from(format!(
             "  {}",
             self.disclosure.status_write_command
@@ -166,22 +166,13 @@ impl HooksInstallDialog {
 
         let dialog_width = 64.min(area.width.saturating_sub(4));
         let dialog_height = (content_height + 6).min(area.height.saturating_sub(4));
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(match &self.machine {
-                Some(machine) => format!(" Agent Status Hooks on {machine} "),
-                None => " Agent Status Hooks ".to_string(),
-            })
-            .title_style(Style::default().fg(theme.accent).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let title = match &self.machine {
+            Some(machine) => format!(" Agent Status Hooks on {machine} "),
+            None => " Agent Status Hooks ".to_string(),
+        };
+        let block = super::toned_dialog_block(title, theme.accent, theme.accent);
+        let (_, inner) =
+            super::render_dialog_frame(frame, area, dialog_width, dialog_height, block);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -192,7 +183,6 @@ impl HooksInstallDialog {
             ])
             .split(inner);
 
-        // Header
         let header = Paragraph::new(
             "AoE needs to install hooks into your agent's settings\nto detect session status (running/waiting/idle).",
         )
@@ -200,7 +190,6 @@ impl HooksInstallDialog {
         .wrap(Wrap { trim: true });
         frame.render_widget(header, chunks[0]);
 
-        // Scrollable content
         let visible_lines: Vec<Line> = content_lines
             .into_iter()
             .skip(self.scroll_offset as usize)
@@ -214,7 +203,6 @@ impl HooksInstallDialog {
             );
         frame.render_widget(content_paragraph, chunks[1]);
 
-        // Buttons
         let accept_style = if self.selected {
             Style::default().fg(theme.running).bold()
         } else {
@@ -270,11 +258,7 @@ impl HooksInstallDialog {
 mod tests {
     use super::*;
     use crate::session::hook_disclosure::HookCommand;
-    use crossterm::event::KeyModifiers;
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
+    use crate::tui::dialogs::test_keys::key;
 
     fn dialog(machine: Option<&str>) -> HooksInstallDialog {
         HooksInstallDialog::new(
@@ -336,18 +320,14 @@ mod tests {
         let mut dialog = dialog(None);
         dialog.accept_button_area = Rect::new(2, 5, 12, 1);
         dialog.cancel_button_area = Rect::new(20, 5, 14, 1);
-        assert!(dialog.selected);
-
-        // Over Accept: highlight it, selection unchanged.
-        assert!(dialog.handle_hover(3, 5));
-        assert_eq!(dialog.hover.current(), Some(dialog.accept_button_area));
-        assert!(dialog.selected, "hover must not flip the selection");
-
-        // Over Cancel.
-        assert!(dialog.handle_hover(21, 5));
-        assert_eq!(dialog.hover.current(), Some(dialog.cancel_button_area));
-
-        // Off the buttons clears.
+        for (col, want) in [
+            (3, dialog.accept_button_area),
+            (21, dialog.cancel_button_area),
+        ] {
+            assert!(dialog.handle_hover(col, 5));
+            assert_eq!(dialog.hover.current(), Some(want));
+            assert!(dialog.selected, "hover must not flip the selection");
+        }
         assert!(dialog.handle_hover(0, 0));
         assert_eq!(dialog.hover.current(), None);
     }
@@ -372,6 +352,8 @@ mod tests {
         assert!(text.contains("trust these hooks in /hooks"), "{text}");
         assert!(text.contains("pane-based status detection"), "{text}");
     }
+
+    /// Write `contents` as the profile's `config.toml` and return its dir.
 
     #[test]
     fn a_remote_disclosure_names_the_machine_the_paths_belong_to() {

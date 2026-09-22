@@ -1,127 +1,71 @@
 # Native Session Resume
 
-AoE terminal sessions resume the same native agent conversation after a reboot, an `aoe` upgrade, or a tmux server restart when the agent exposes an authoritative identity source. AoE records only identities attributable to that pane or to its physically isolated sandbox store. An ambiguous shared-store match is ignored rather than guessed.
+A terminal session resumes the same native agent conversation after a reboot, an `aoe` upgrade, or a tmux server restart, when the agent exposes an authoritative identity source. AoE records only identities attributable to that pane or to its physically isolated sandbox store; an ambiguous shared-store match is ignored rather than guessed.
 
-Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fresh pane generation rotate the recorded identity when the upstream agent publishes the change. The old identity and any artifact predating the launch boundary cannot be recaptured after an AoE process restart.
+Runtime conversation changes (`/clear`, `/new`, a fork, a fresh pane generation) rotate the recorded identity when the agent publishes the change. Neither the old identity nor an artifact predating the launch boundary can be recaptured after an AoE restart.
 
 ## Automatic capture matrix
 
 | Agent | Host terminal | Sandboxed terminal | Authoritative source |
 |-------|---------------|--------------------|----------------------|
 | Claude Code | Yes | Yes | Pane-scoped native hook |
-| OpenCode | Opt-in | No | AoE-preassigned native ID |
-| Vibe | No | No | None verified |
-| Codex | No | Yes | Isolated managed store |
-| Gemini CLI | No | Yes | Isolated managed store |
 | Cursor Agent | Yes | Yes | `beforeSubmitPrompt` hook `conversation_id` |
-| Droid | No | No | None verified |
 | Pi | Yes | Yes | Pane-scoped AoE extension |
-| GitHub Copilot CLI | No | No | None verified |
-| Settl | No | No | None verified |
-| Hermes | No | Yes | Isolated managed store |
-| Qwen Code | No | No | None verified |
-| Kiro CLI | No | No | None verified |
-| Antigravity | No | No | None verified |
-| Kimi CLI | No | Yes | Isolated managed store |
 | OMP | Yes | Yes | Pane-scoped routed terminal store |
+| OpenCode | Opt-in | No | AoE-preassigned native id |
+| Codex, Gemini CLI, Hermes, Kimi CLI | No | Yes | Isolated managed store |
 | Prime Agent | No | Yes | Root-only publication and isolated managed store |
+| Vibe, Droid, Copilot CLI, Settl, Qwen Code, Kiro CLI, Antigravity | No | No | None verified |
 
-`No` means automatic identity discovery is unsupported in that environment. OpenCode host capture additionally requires `session.opencode_preassign_session_id = true`. AoE does not scan a shared store or infer an identity from recency. For an agent with native resume support, a user-provided exact ID remains authoritative and can still be passed explicitly in an unsupported automatic-capture environment. Agents with no verified native resume contract reject automatic resume entirely.
+`No` means automatic discovery is unsupported there, not that resume is: a user-provided exact id stays authoritative for any agent with a verified resume contract, and agents with no such contract reject automatic resume entirely. OpenCode host capture also needs `session.opencode_preassign_session_id = true`. AoE never scans a shared store or infers an identity from recency.
 
-Prime Agent captures depth-zero roots, not the child sessions spawned by its recursive language model (RLM) runtime. If a root publishes a new conversation whose transcript is confirmed absent, automatic restart starts an empty conversation instead of resuming the previous history. This boundary survives launch attempts, but the unwritten native ID is not preserved. Once the transcript exists and its root header is validated, normal resume uses that ID. An explicitly pinned ID remains authoritative.
+Sandbox config and conversation stores are staged per AoE instance, including custom `agent_config_dir` roots, and a cross-process lease guards each managed store, so two sessions in the same directory cannot claim each other's conversation.
 
-The Prime integration is verified with 0.9.1 (the oldest tested version) and 0.9.4. It requires `-e <extension>` and numeric `rlmDepth: 0` in native root headers and the extension API's `getHeader()` result. Missing or nonnumeric depth is not treated as a root. Older versions are unverified; the sandbox installer follows the upstream stable channel, so these checks do not guarantee every future image build.
+Custom agents inherit native resume when `agent_detect_as` resolves to a built-in and the launch command is either that built-in's own binary token or a single bare token (the renamed-wrapper shape); command overrides follow the same rule. Path-qualified scripts, remote launchers, redirections, pipes, and other shell control syntax fail closed. Automatic capture is stricter still: a renamed wrapper keeps it only where the agent publishes its identity under the pane's own AoE marker (Claude, Cursor, Pi). Every other source infers ownership from the launch, so a wrapped OpenCode, OMP, or managed-store agent resumes a pinned id but captures nothing on its own.
 
-Prime automatic capture requires a session directory mapped into its writable, isolated managed store. Settings files must be readable, bounded regular files; symlinked settings are deliberately refused because their container-visible target cannot be inferred safely from the host path. An unresolved configuration does not trigger a scan of the default directory. Poller repair logs the refusal under `session.capture` and retries after 30 seconds. Use regular settings files, or an explicit `--session-dir` within `/root/.prime/agent` to select a verified directory without consulting settings.
+Disabling `agent_status_hooks` removes status writers only; identity hooks declared for native resume stay installed.
 
-Sandbox config and conversation stores are staged under a separate directory for each AoE instance, including custom `agent_config_dir` roots. A cross-process lease guards each managed store. Two sessions in the same working directory therefore cannot claim each other's conversation.
-
-Custom agents inherit native resume when `agent_detect_as` resolves to a built-in agent and the configured launch is either that built-in's own binary token or a single bare token, which is the renamed-wrapper shape. Built-in command overrides follow the same rule. Path-qualified scripts, remote launchers, comments, redirections, pipes, shell expansion, and other shell control syntax fail closed. A bare token is resolved by the launch shell's `PATH`, which is what ties it to the agent AoE resolved.
-
-Automatic capture is stricter than resume. A renamed wrapper keeps automatic capture only where the agent publishes its identity under the pane's own AoE marker, meaning Claude, Cursor, and Pi. Every other source infers ownership from the launch itself and needs the built-in's exact binary token, so a wrapped OpenCode, OMP, or managed-store agent resumes an explicitly pinned ID but captures nothing on its own.
-
-Disabling `agent_status_hooks` removes status writers only. Any authoritative identity hooks declared for native resume remain installed.
-
-To branch a conversation into a new session instead of resuming it in place, see [Forking Sessions](./session-fork.md).
+**Prime Agent** captures depth-zero roots, not the child sessions its recursive runtime spawns, and requires `-e <extension>` plus a numeric `rlmDepth: 0` in native root headers. If a root publishes a conversation whose transcript is confirmed absent, a restart starts an empty conversation rather than resuming. Capture also needs a session directory mapped into its writable managed store, with bounded regular settings files: symlinked settings are refused, since their container-visible target cannot be inferred from the host path, and the refusal is logged under `session.capture` and retried after 30 seconds. Pass an explicit `--session-dir` inside `/root/.prime/agent` to select a verified directory.
 
 ## Pinning or resetting a conversation
 
-Pin a terminal session to a specific native conversation:
-
 ```sh
-aoe session set-session-id <session-name-or-id> <native-session-id>
+aoe session set-session-id <session> <native-session-id>   # pin
+aoe session set-session-id <session> ""                    # start fresh once
 ```
 
-The pin is sticky: every launch uses the agent's native resume argument until you change it. If AoE cannot prove whether a pinned conversation is invalid and only sees the resumed pane exit, it preserves the pinned ID and reports a recoverable resume failure instead of starting fresh automatically.
+A pin is sticky: every launch resumes it until you change it. If AoE cannot prove a pinned conversation invalid and only sees the resumed pane exit, it keeps the id and reports a recoverable resume failure rather than silently starting fresh. Clearing is one-shot: the next launch starts fresh, and automatic capture takes over again where the matrix supports it. To drop the persisted state entirely, delete and recreate the session.
 
-Retry after fixing the underlying issue, set a different conversation ID, or explicitly start fresh once:
+Structured-view sessions manage their conversation through ACP and reject `set-session-id`. Toggle the session out of structured view first, or set the resume target from the structured view UI.
 
-```sh
-aoe session set-session-id <session-name-or-id> ""
-```
+State lives in the profile's `sessions.json`: `agent_session_id` (the observed conversation id), `resume_intent` (`Default`, `Use(id)`, or `Cleared`, absent when default), `resume_probe_failed_sid` (the last pinned id whose probe failed ambiguously, which stops startup recovery retrying it until you act), and, for Pi, `pi_session_path` (the transcript path the pane published, since Pi indexes conversations by the directory they started in). Only `resume_intent` is yours to set, through the CLI above.
 
-This is one-shot. The next launch starts fresh, then automatic capture takes over again when the matrix supports that environment.
+## Forking a session
 
-Structured-view sessions manage their own conversation through ACP and reject `set-session-id`. Toggle the session out of structured view first, or set the resume target through the structured view UI.
+A fork starts a new, independent session from an existing session's conversation, so you can take the same history in a different direction. Only the fork is new: the original session and its transcript are untouched.
+
+- **TUI**: the command palette's **Fork session (resume context, diverge)**, or **Fork session** on a session row's right-click menu. There is no keyboard shortcut by design. The new-session dialog opens prefilled with the source's working directory and group, titled `<name> (fork)`.
+- **Web**: **Fork session** on the sidebar context menu of a forkable session.
+- **CLI**: `aoe add --fork-from <session-id-or-title>`.
+
+The fork inherits the parent's conversation, agent, group, and working directory. The directory is required so the agent can resolve the prior conversation, which is also why `--fork-from` cannot be combined with `--worktree` / `--new-branch`, `--sandbox` / `--sandbox-image`, or a `--cmd` carrying its own `--resume` flags. Passing a `--tool` that differs from the parent's agent is rejected rather than run against the wrong agent, since a captured conversation is agent-specific. From there the fork is its own session: its own id, its own row, restarts independent of the parent.
+
+Forking needs an agent that can branch a conversation: claude, codex, and opencode for terminal sessions, and the Claude adapter for structured sessions. Resume-only agents (gemini, vibe, copilot) and agents without resume in AoE (cursor, droid, kiro, qwen) hide or refuse the action.
 
 ## Swapping the engine on a restart
 
-The restart dialog can change the tool a session runs. Session IDs live in
-per-agent namespaces, so swapping to a different agent parks the outgoing
-agent's conversation under its own tool name and starts a new one; swapping
-back restores what was parked.
+The restart dialog can change the tool a session runs. Session IDs live in per-agent namespaces, so swapping to a different agent parks the outgoing agent's conversation under its own tool name and starts a new one; swapping back restores what was parked.
 
-Two tool names can also point at the same agent on different accounts, through
-`[session.agent_config_dir]`. That swap changes the agent's config root, so the
-conversation is still on disk but under the account you swapped away from. AoE
-carries it across: it copies the transcript into the incoming account's config
-root so the agent resumes where it left off, and the row keeps its conversation
-ID, its model, and its effort setting, since none of those changed agent.
+Two tool names can also point at the same agent on different accounts, through `[session.agent_config_dir]`. That swap changes the agent's config root, so the conversation is still on disk but under the account you swapped away from. AoE carries it across: it copies the transcript into the incoming account's config root so the agent resumes where it left off, and the row keeps its conversation id, model, and effort setting, since none of those changed agent.
 
-The carry applies only when the new tool resolves to the same built-in agent,
-the session has a conversation to carry, and AoE knows the agent's transcript
-layout (Claude Code today). Anything else takes the parking swap above.
+The carry applies only when the new tool resolves to the same built-in agent, the session has a conversation to carry, and AoE knows the agent's transcript layout (Claude Code today). Anything else takes the parking swap above.
 
-The outgoing account keeps its own copy, so swapping accounts back and forth
-stays continuous: the account you swap away from is the one that was just
-running, so on the way back its transcript replaces the older copy the earlier
-swap left behind. A copy the incoming account wrote more recently than the
-outgoing one is left alone.
+The outgoing account keeps its own copy, so swapping accounts back and forth stays continuous: the account you swap away from is the one that was just running, so on the way back its transcript replaces the older copy the earlier swap left behind. A copy the incoming account wrote more recently than the outgoing one is left alone.
 
-## Importing existing Claude Code sessions (web dashboard)
+## Importing an existing Claude conversation
 
-If you already have Claude Code conversations started outside AoE (plain `claude` in a terminal), you can pull one into a structured-view session from the web dashboard.
+Conversations started outside AoE can be pulled into a structured-view session from the web wizard's **Import from Claude** tab, which appears only when both Claude Code and `claude-agent-acp` are installed, since the import resumes through that adapter. It lists the Claude Code sessions on disk (under `$CLAUDE_CONFIG_DIR` or `~/.claude/projects`), newest first, with each one's first prompt, working directory, and last-used time.
 
-In the new-session wizard, open the **Import from Claude** tab. The tab only appears when both Claude Code and its ACP adapter (`claude-agent-acp`) are installed, since the import resumes the conversation through that adapter. It lists the Claude Code sessions found on disk (under `$CLAUDE_CONFIG_DIR` or `~/.claude/projects`), newest first, with each session's first prompt, working directory, and last-used time. Type in the filter box to narrow by title or path.
+Picking one creates a structured-view session in that conversation's original working directory and resumes it, so the prior transcript is there and you can keep going. It always uses the recorded directory and never creates a worktree, because the conversation only resolves where it started. The original is read in place, not copied.
 
-Pick a session and launch. AoE creates a structured-view session in that conversation's original working directory and resumes it, so the prior transcript shows up in the structured view and you can keep going. The import always uses the recorded working directory and does not create a worktree, because the conversation only resolves in the directory it was started in.
-
-The list only shows conversations worth importing: AoE's own Claude sessions are filtered out, including scratch sessions, sessions AoE already manages, and any conversation living inside an AoE worktree directory (the `*-worktrees` folders AoE creates for sessions). Sessions whose working directory no longer exists are hidden by default, since they cannot be resumed; tick "show missing directories" to see them (they appear disabled).
-
-This reads the existing conversation in place; the original session keeps existing and is not copied.
-
-## Disabling
-
-There is no toggle. To start fresh once, use `set-session-id ""`. To drop the persisted state entirely, delete the session and recreate it.
-
-## Storage
-
-State lives in `sessions.json` in your AoE config directory:
-
-- **Linux**: `$XDG_CONFIG_HOME/agent-of-empires/profiles/<profile>/sessions.json`
-- **macOS/Windows**: `~/.agent-of-empires/profiles/<profile>/sessions.json`
-
-Four relevant fields:
-
-- `agent_session_id`: the observed conversation ID. Auto-managed; do not edit.
-- `resume_intent`: your intent (`Default`, `Use(id)`, `Cleared`). Set via the CLI above. Absent when `Default`.
-- `resume_probe_failed_sid`: the last pinned ID whose resume probe failed ambiguously.
-  This loop-breaker prevents startup recovery from retrying that same ID automatically until user action changes the resume state.
-- `pi_session_path`: for Pi sessions, the transcript path the pane published.
-  Pi indexes conversations by the directory they started in, so this is what
-  resumes one whose worktree has since moved. Pi writes a transcript lazily, so
-  this can name a file that does not exist yet. A launch that would otherwise
-  pass that conversation to `pi --session`, which fails outright on an ID it
-  cannot resolve, starts fresh instead and lets the pane's next conversation
-  take over. Launches that pin with `--session-id` are unaffected, since that
-  flag creates the conversation rather than failing. Auto-managed; do not edit.
+The list hides conversations not worth importing: AoE's own Claude sessions, scratch sessions, and anything inside an AoE worktree directory. Sessions whose directory no longer exists are hidden until you tick "show missing directories", and then shown disabled.

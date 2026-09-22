@@ -1,4 +1,4 @@
-//! Sound configuration: [`SoundConfig`], profile-level overrides, and volume helpers.
+//! Sound configuration, profile-level overrides, and volume helpers.
 
 use aoe_settings_derive::SettingsSection;
 use serde::{Deserialize, Serialize};
@@ -75,17 +75,14 @@ pub(super) fn is_default_volume(v: &f64) -> bool {
     (*v - 1.0).abs() < 1e-9
 }
 
-/// Returns the 15 volume level strings "0.1", "0.2", ..., "1.5"
 pub fn volume_options() -> Vec<String> {
     (1..=15).map(|i| format!("{:.1}", i as f64 * 0.1)).collect()
 }
 
-/// Convert an f64 volume to the nearest Select index (1..=15)
 pub fn volume_to_index(v: f64) -> usize {
     ((v.clamp(0.1, 1.5) / 0.1).round() as usize).min(15) - 1
 }
 
-/// Parse a volume option string back to f64
 pub fn volume_from_option(s: &str) -> f64 {
     s.parse::<f64>().unwrap_or(1.0).clamp(0.1, 1.5)
 }
@@ -104,112 +101,77 @@ mod tests {
         assert!(config.on_idle.is_none());
         assert!(config.on_error.is_none());
         assert!(config.on_approval.is_none());
-        // Fresh installs load `Config::default()` when no config.toml exists;
-        // a 0.0 default here would mute all playback on first run.
+        // A 0.0 default would mute playback on a fresh install.
         assert!((config.volume - 1.0).abs() < 1e-9);
     }
 
     #[test]
-    fn test_sound_config_deserialize_empty() {
-        let config: SoundConfig = toml::from_str("").unwrap();
-        assert!(!config.enabled);
-    }
-
-    #[test]
-    fn test_sound_config_deserialize() {
-        let toml = r#"
-            enabled = true
-            on_error = "alarm"
-        "#;
-        let config: SoundConfig = toml::from_str(toml).unwrap();
-        assert!(config.enabled);
-        assert_eq!(config.on_error, Some("alarm".to_string()));
-    }
-
-    /// Regression: the schema used to have a `mode` field (`random` or
-    /// `{ specific = "name" }`). It is gone now; configs read between
-    /// upgrade and migration must still deserialize cleanly with the
-    /// unknown field silently dropped by serde.
-    #[test]
-    fn test_legacy_sound_mode_is_ignored() {
-        let toml = r#"
-            enabled = true
-            mode = { specific = "wololo" }
-        "#;
-        let config: SoundConfig = toml::from_str(toml).expect("legacy mode should not error");
-        assert!(config.enabled);
-    }
-
-    #[test]
-    fn test_sound_config_deserialize_on_approval() {
-        let toml = r#"
-            enabled = true
-            on_approval = "alarm"
-        "#;
-        let config: SoundConfig = toml::from_str(toml).unwrap();
-        assert!(config.enabled);
-        assert_eq!(config.on_approval, Some("alarm".to_string()));
-    }
-
-    #[test]
-    fn test_volume_options_count_and_range() {
-        let options = volume_options();
-        assert_eq!(options.len(), 15);
-        assert_eq!(options[0], "0.1");
-        assert_eq!(options[14], "1.5");
-    }
-
-    #[test]
-    fn test_volume_options_step() {
-        let options = volume_options();
-        for (i, opt) in options.iter().enumerate() {
-            let expected = format!("{:.1}", (i + 1) as f64 * 0.1);
-            assert_eq!(opt, &expected);
+    fn deserialize_reads_known_keys_and_tolerates_the_removed_mode_field() {
+        let cases = [
+            ("", None, None),
+            ("enabled = true\non_error = \"alarm\"", Some("alarm"), None),
+            (
+                "enabled = true\non_approval = \"alarm\"",
+                None,
+                Some("alarm"),
+            ),
+            // The removed `mode` field must still deserialize.
+            (
+                "enabled = true\nmode = { specific = \"wololo\" }",
+                None,
+                None,
+            ),
+        ];
+        for (toml, on_error, on_approval) in cases {
+            let config: SoundConfig = toml::from_str(toml).expect(toml);
+            assert_eq!(config.enabled, !toml.is_empty(), "{toml}");
+            assert_eq!(config.on_error.as_deref(), on_error, "{toml}");
+            assert_eq!(config.on_approval.as_deref(), on_approval, "{toml}");
         }
     }
 
     #[test]
-    fn test_volume_to_index_normal_values() {
-        assert_eq!(volume_to_index(0.1), 0);
-        assert_eq!(volume_to_index(1.0), 9);
-        assert_eq!(volume_to_index(1.5), 14);
+    fn volume_options_are_fifteen_tenths_from_a_tenth_to_one_and_a_half() {
+        let options = volume_options();
+        assert_eq!(options.len(), 15);
+        for (i, opt) in options.iter().enumerate() {
+            assert_eq!(opt, &format!("{:.1}", (i + 1) as f64 * 0.1));
+        }
     }
 
     #[test]
-    fn test_volume_to_index_clamps_below_min() {
-        assert_eq!(volume_to_index(0.0), 0);
-        assert_eq!(volume_to_index(-1.0), 0);
+    fn volume_to_index_clamps_to_the_option_range() {
+        for (volume, index) in [
+            (0.1, 0),
+            (1.0, 9),
+            (1.5, 14),
+            (0.0, 0),
+            (-1.0, 0),
+            (2.0, 14),
+            (99.0, 14),
+        ] {
+            assert_eq!(volume_to_index(volume), index, "{volume}");
+        }
     }
 
     #[test]
-    fn test_volume_to_index_clamps_above_max() {
-        assert_eq!(volume_to_index(2.0), 14);
-        assert_eq!(volume_to_index(99.0), 14);
-    }
-
-    #[test]
-    fn test_volume_from_option_valid() {
-        assert!((volume_from_option("0.1") - 0.1).abs() < 1e-9);
-        assert!((volume_from_option("1.0") - 1.0).abs() < 1e-9);
-        assert!((volume_from_option("1.5") - 1.5).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_volume_from_option_clamps_below_min() {
-        assert!((volume_from_option("0.0") - 0.1).abs() < 1e-9);
-        assert!((volume_from_option("-1.0") - 0.1).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_volume_from_option_clamps_above_max() {
-        assert!((volume_from_option("2.0") - 1.5).abs() < 1e-9);
-        assert!((volume_from_option("99.9") - 1.5).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_volume_from_option_invalid_falls_back_to_default() {
-        assert!((volume_from_option("") - 1.0).abs() < 1e-9);
-        assert!((volume_from_option("bad") - 1.0).abs() < 1e-9);
+    fn volume_from_option_clamps_and_falls_back_to_the_default() {
+        for (option, expected) in [
+            ("0.1", 0.1),
+            ("1.0", 1.0),
+            ("1.5", 1.5),
+            ("0.0", 0.1),
+            ("-1.0", 0.1),
+            ("2.0", 1.5),
+            ("99.9", 1.5),
+            ("", 1.0),
+            ("bad", 1.0),
+        ] {
+            assert!(
+                (volume_from_option(option) - expected).abs() < 1e-9,
+                "{option}"
+            );
+        }
     }
 
     #[test]

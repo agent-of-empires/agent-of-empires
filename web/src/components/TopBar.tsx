@@ -7,6 +7,7 @@ import { PluginStatusBarSegments } from "./plugin/PluginSlots";
 import { ActivityBar } from "./ActivityBar";
 import type { PaneDisplay } from "./Dock";
 import { useWebSettings } from "../hooks/useWebSettings";
+import { StrokeIcon } from "./icons";
 
 interface Props {
   activeWorkspace: Workspace | undefined;
@@ -27,20 +28,16 @@ interface Props {
   onLogout: () => void;
   loginRequired: boolean;
   isOffline: boolean;
-  /** When true, render a "DEV" badge (in the `status-waiting` amber)
-   *  in the right-hand status zone so debug builds (port 8081 /
-   *  `aoe_dev_` tmux / `~/.agent-of-empires-dev/`) are visually distinct
-   *  from release builds at a glance, including in PWA installs where
-   *  the port is not visible in the window chrome. Driven by
-   *  `ServerAbout.build_flavor === "debug"`. See #1055. */
+  /** When true, render a "DEV" badge (in the `status-waiting` amber) in the right-hand status zone so debug builds
+   *  (port 8081 / `aoe_dev_` tmux / `~/.agent-of-empires-dev/`) are visually distinct from release builds at a
+   *  glance, including in PWA installs where the port is not visible in the window chrome. */
   isDevBuild: boolean;
   /** Opens the tip-of-the-day modal; wired into the overflow menu so tips are
    *  re-readable any time, like GIMP/DBeaver's Help menu entry. */
   onOpenTips: () => void;
   onGoDashboard: () => void;
-  /** When true (desktop, sidebar open, not in a full-width settings/projects
-   *  view), the header's left zone widens to match the sidebar column and the
-   *  divider runs vertically through the header instead of a bottom border, so
+  /** When true (desktop, sidebar open, not in a full-width settings/projects view), the header's left zone widens
+   *  to match the sidebar column and the divider runs vertically through the header instead of a bottom border, so
    *  the top-left of the header reads as part of the sidebar. */
   sidebarColumnVisible: boolean;
   /** Mirror of `sidebarColumnVisible` for the right side: when the right panel
@@ -82,18 +79,15 @@ export function TopBar({
     return items;
   }, [onOpenHelp, onStartTutorial, onOpenTips, onOpenAbout, onLogout, loginRequired]);
 
-  // The left zone only borrows the sidebar's width while that column is
-  // visible, so the compact rail only crowds the wordmark in that combination.
-  // Read from the pref rather than SidebarCompactContext: the header is a
-  // sibling of the sidebar, outside the provider.
+  // The left zone only borrows the sidebar's width while that column is visible, so the compact rail only crowds
+  // the wordmark in that combination.
   const { settings: webSettings } = useWebSettings();
   const hideWordmark = sidebarColumnVisible && webSettings.sidebarCompact;
 
   return (
     <header {...tourAnchor(TOUR_ANCHORS.topbar)} className="h-12 bg-surface-850 flex items-stretch shrink-0">
-      {/* LEFT ZONE — widens to the sidebar column when it's visible so the
-          divider runs vertically through the header instead of cutting across
-          it; otherwise it keeps the shared bottom border like the rest. */}
+      {/* Left zone: widens to the sidebar column when it's visible so the divider runs vertically through the
+         header instead of cutting across it; otherwise it keeps the shared bottom border like the rest. */}
       <div
         className={`flex items-center gap-2 px-3 min-w-0 shrink-0 border-b border-surface-700/60 ${
           sidebarColumnVisible ? "md:w-[var(--aoe-sidebar-width)] md:bg-surface-800 md:border-b-0 md:border-r" : ""
@@ -105,19 +99,10 @@ export function TopBar({
           title="Toggle sidebar"
           aria-label="Toggle sidebar"
         >
-          <svg
-            width="16"
-            height="16"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          >
+          <StrokeIcon size={16} strokeWidth="1.5">
             <rect x="3" y="3" width="18" height="18" rx="2" />
             <line x1="9" y1="3" x2="9" y2="21" />
-          </svg>
+          </StrokeIcon>
         </button>
 
         <button
@@ -126,16 +111,13 @@ export function TopBar({
           aria-label="Go to dashboard"
         >
           <img src="/icon-192.png" alt="" width="18" height="18" className="rounded-sm shrink-0" />
-          {/* This zone matches the sidebar column, so a compact rail leaves no
-              room for the wordmark next to the toggle and the logo: it would sit
-              flush against the divider and read as clipped. The logo alone still
-              links to the dashboard. Mobile keeps it, since the zone only takes
-              the column width from md up. See #2288. */}
+          {/* This zone matches the sidebar column, so a compact rail leaves no room for the wordmark next to the
+             toggle and the logo: it would sit flush against the divider and read as clipped. */}
           <span className={`font-mono text-xs leading-none truncate ${hideWordmark ? "md:hidden" : ""}`}>aoe</span>
         </button>
       </div>
 
-      {/* CENTER ZONE — palette trigger; carries the bottom border across the
+      {/* Center zone: palette trigger; carries the bottom border across the
           middle, between the two column-aligned zones. */}
       <div className="flex-1 flex items-center px-3 min-w-0 border-b border-surface-700/60">
         <div className="flex-1 flex justify-center px-2">
@@ -143,9 +125,8 @@ export function TopBar({
         </div>
       </div>
 
-      {/* RIGHT ZONE — widens to the right-panel column when it's visible so the
-          divider runs vertically through the header instead of cutting across
-          it; otherwise it keeps the shared bottom border like the rest. */}
+      {/* Right zone: widens to the right-panel column when it's visible so the divider runs vertically through
+         the header instead of cutting across it; otherwise it keeps the shared bottom border like the rest. */}
       <div
         className={`flex items-center justify-end gap-1.5 px-3 shrink-0 border-b border-surface-700/60 ${
           rightColumnVisible ? "md:w-[var(--aoe-right-panel-width)] md:border-b-0 md:border-l" : ""
@@ -173,9 +154,7 @@ export function TopBar({
 
         {activeWorkspace && activeSession && (
           <>
-            {/* Desktop: per-pane toggles. Mobile: one button that opens the
-                full-viewport view picker (#1452); there is no side dock to
-                toggle pane-by-pane below md. */}
+            {/* Desktop: per-pane toggles. */}
             <ActivityBar paneIds={paneIds} descriptorFor={paneDescriptor} isOpen={isPaneOpen} onToggle={onTogglePane} />
             <button
               onClick={onToggleDiff}
@@ -183,19 +162,10 @@ export function TopBar({
               title="Toggle panels"
               aria-label="Toggle panels"
             >
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
+              <StrokeIcon size={16} strokeWidth="1.5">
                 <rect x="3" y="3" width="18" height="18" rx="2" />
                 <line x1="15" y1="3" x2="15" y2="21" />
-              </svg>
+              </StrokeIcon>
             </button>
           </>
         )}

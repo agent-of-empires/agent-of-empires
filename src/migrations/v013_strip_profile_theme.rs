@@ -1,37 +1,18 @@
-//! Migration v013: strip per-profile theme overrides.
-//!
-//! The theme became a single global preference: one theme paints every surface
-//! (TUI boot, Settings close, tmux status bar, web `/api/theme/current`)
-//! regardless of which session profile is active. Before that, the web
-//! dashboard's theme picker wrote `name` / `color_mode` into the *active
-//! profile's* `config.toml`, while the TUI wrote them to the global config and
-//! booted from it. A profile-level theme then shadowed the global pick on every
-//! Settings open/close, flipping the theme (e.g. empire -> rose-pine) until the
-//! next restart.
-//!
-//! This removes `name` and `color_mode` from the `[theme]` table of every
-//! `profiles/*/config.toml`, leaving the global `config.toml` (the authoritative
-//! theme) untouched. `idle_decay_minutes` stays profile-overridable, so only
-//! those two keys are pulled. Idempotent: a profile with no theme override is
-//! left alone.
+//! Migration v013: strip `name` and `color_mode` from the `[theme]` table of
+//! every `profiles/*/config.toml`. The theme is a single global preference
+//! now, and a profile override shadowed the global pick on every Settings
+//! open and close. `idle_decay_minutes` stays profile-overridable, and the
+//! global config is left untouched.
 
-use anyhow::{Context, Result};
-use std::fs;
+use super::config_file;
+use anyhow::Result;
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::info;
 
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
-    let profiles_dir = app_dir.join("profiles");
-    if !profiles_dir.exists() {
-        debug!("No profiles dir; nothing to strip for v013");
-        return Ok(());
-    }
-    for entry in fs::read_dir(&profiles_dir)? {
-        let entry = entry?;
-        if entry.path().is_dir() {
-            strip_profile_theme(&entry.path().join("config.toml"))?;
-        }
+    for path in config_file::profile_configs(&app_dir)? {
+        strip_profile_theme(&path)?;
     }
     Ok(())
 }
@@ -41,46 +22,34 @@ pub fn run() -> Result<()> {
 const GLOBAL_THEME_KEYS: &[&str] = &["name", "color_mode"];
 
 fn strip_profile_theme(path: &Path) -> Result<()> {
-    if !path.exists() {
-        debug!("Profile config {} does not exist, skipping", path.display());
-        return Ok(());
-    }
-    let content = fs::read_to_string(path)?;
-    let mut doc: toml::Table = content
-        .parse()
-        .with_context(|| format!("Failed to parse {} during v013 migration", path.display()))?;
-
-    let Some(theme) = doc.get_mut("theme").and_then(|t| t.as_table_mut()) else {
-        return Ok(());
-    };
-
-    let mut removed = Vec::new();
-    for key in GLOBAL_THEME_KEYS {
-        if theme.remove(*key).is_some() {
-            removed.push(*key);
+    config_file::rewrite_strict(path, "v013", |doc| {
+        let Some(theme) = doc.get_mut("theme").and_then(|t| t.as_table_mut()) else {
+            return false;
+        };
+        let removed: Vec<_> = GLOBAL_THEME_KEYS
+            .iter()
+            .filter(|key| theme.remove(**key).is_some())
+            .collect();
+        if removed.is_empty() {
+            return false;
         }
-    }
-    if removed.is_empty() {
-        return Ok(());
-    }
-    // Drop an emptied [theme] table so the file doesn't keep a dangling header.
-    if theme.is_empty() {
-        doc.remove("theme");
-    }
-
-    info!(
-        "Stripping global-only theme keys {:?} from profile config {} (theme is now global)",
-        removed,
-        path.display()
-    );
-    let new_content = toml::to_string_pretty(&doc)?;
-    crate::session::atomic_write(path, new_content.as_bytes())?;
-    Ok(())
+        // Drop an emptied [theme] so the file keeps no dangling header.
+        if theme.is_empty() {
+            doc.remove("theme");
+        }
+        info!(
+            "Stripping global-only theme keys {:?} from profile config {} (theme is now global)",
+            removed,
+            path.display()
+        );
+        true
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn write(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::TempDir::new().unwrap();

@@ -1,16 +1,5 @@
-//! Discovery of existing Claude Code sessions on disk, for importing them
-//! into a structured-view session via `session/load`.
-//!
-//! Claude Code stores one session per file at
-//! `<config>/projects/<encoded-cwd>/<sessionId>.jsonl`, where `<config>` is
-//! `$CLAUDE_CONFIG_DIR` or `~/.claude`. The `<sessionId>` is the filename
-//! stem and equals the id `claude-agent-acp` resumes via the SDK `resume`
-//! param, so importing is just: create a structured session whose
-//! `acp_session_id` is this id, with the session's recorded `cwd`.
-//!
-//! The encoded directory name is lossy (path separators and real hyphens
-//! both render as `-`), so we read the real `cwd` from inside the file
-//! rather than decoding the directory name.
+//! Discovery of existing Claude Code sessions on disk, for importing them into a structured-view
+//! session via `session/load`.
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -18,15 +7,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-/// Cap how many lines we read per file when extracting metadata. The `cwd`
-/// and first user message live at the head of the transcript; a few hundred
-/// lines is plenty without reading a multi-MB file fully.
+/// Cap how many lines we read per file when extracting metadata.
 const MAX_SCAN_LINES: usize = 400;
 
-/// Cap how many sessions the picker shows. Newest first, so older sessions
-/// past the cap are the least likely to be resumed. Applied by the endpoint
-/// AFTER it filters out AoE-managed sessions, so a burst of managed sessions
-/// can't squeeze real imports off the list.
+/// Cap how many sessions the picker shows.
 pub const MAX_SESSIONS: usize = 200;
 
 /// A discovered Claude Code session, summarized for the import picker.
@@ -59,12 +43,9 @@ fn claude_config_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude"))
 }
 
-/// Literal directory tokens derived from the worktree path templates, e.g.
-/// `"-worktrees"` from `"../{repo-name}-worktrees/{branch}"` and `"-workspace-"`
-/// from `"../{branch}-workspace-{session-id}"`. A cwd living under a directory
-/// whose name contains one of these is an AoE worktree or workspace, so it is
-/// excluded from the import picker. Derived from config so a custom template is
-/// honored. See #2276.
+/// Literal directory tokens derived from the worktree path templates, e.g. `"-worktrees"` from
+/// `"../{repo-name}-worktrees/{branch}"` and `"-workspace-"` from
+/// `"../{branch}-workspace-{session-id}"`.
 fn worktree_dir_markers() -> Vec<String> {
     let cfg = crate::session::Config::load_or_warn();
     let mut markers = Vec::new();
@@ -98,11 +79,7 @@ fn strip_placeholders(seg: &str) -> String {
     out
 }
 
-/// True when `cwd` is an AoE scratch directory (`<app_dir>/scratch/<id>`),
-/// regardless of namespace. The serving daemon's `get_app_dir()` only resolves
-/// one namespace (release vs `-dev`), so a scratch session from the other
-/// namespace slips past a plain `starts_with` check; match the app-dir name +
-/// `scratch` component pair instead. See #2276.
+/// True when `cwd` is an AoE scratch directory (`<app_dir>/scratch/<id>`), regardless of namespace.
 fn cwd_is_aoe_scratch(cwd: &str) -> bool {
     let comps: Vec<&str> = Path::new(cwd)
         .components()
@@ -113,9 +90,7 @@ fn cwd_is_aoe_scratch(cwd: &str) -> bool {
         .any(|w| w[0].contains("agent-of-empires") && w[1] == "scratch")
 }
 
-/// True when any directory component of `cwd` contains a worktree marker. Uses
-/// `contains` (not a suffix match) because workspace dirs carry the marker
-/// mid-name, e.g. `<branch>-workspace-<id>`.
+/// True when any directory component of `cwd` contains a worktree marker.
 fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
     if markers.is_empty() {
         return false;
@@ -127,17 +102,8 @@ fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
     })
 }
 
-/// Scan all discoverable Claude Code sessions, newest first (uncapped; the
-/// endpoint applies `MAX_SESSIONS` after ownership filtering). Returns an empty
-/// vec when the projects directory is absent (e.g. Claude Code was never run).
-/// Unreadable files are skipped, not fatal.
-///
-/// AoE's own internal Claude runs are excluded: scratch sessions (cwd under
-/// `<app_dir>/scratch/`, matched by layout so both release and -dev namespaces
-/// are covered) and worktree / workspace sessions (cwd under a dir named by the
-/// worktree path template). Sessions AoE already manages by id or project_path
-/// are filtered separately by the endpoint, which has the instance list.
-/// See #2276.
+/// Scan all discoverable Claude Code sessions, newest first (uncapped; the endpoint applies
+/// `MAX_SESSIONS` after ownership filtering).
 pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
     let Some(config_dir) = claude_config_dir() else {
         return Vec::new();
@@ -145,10 +111,7 @@ pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
     scan_sessions_in(&config_dir)
 }
 
-/// Scan the `projects/` tree under `config_dir` (the resolved Claude config
-/// directory). Split out from [`scan_sessions`] so tests can point at a temp
-/// config tree without mutating the global `CLAUDE_CONFIG_DIR` env (which would
-/// race the parallel test runner). See [`scan_sessions`] for filtering rules.
+/// Scan the `projects/` tree under `config_dir` (the resolved Claude config directory).
 pub fn scan_sessions_in(config_dir: &Path) -> Vec<ClaudeSessionSummary> {
     let projects = config_dir.join("projects");
     let Ok(project_dirs) = fs::read_dir(&projects) else {
@@ -171,16 +134,12 @@ pub fn scan_sessions_in(config_dir: &Path) -> Vec<ClaudeSessionSummary> {
                 continue;
             }
             if let Some(summary) = summarize_file(&fpath) {
-                // Scratch sessions live under `<app_dir>/scratch/<id>`. Match by
-                // layout so both release and -dev namespaces are excluded the
-                // same way (the feature does not discriminate between them).
+                // Scratch sessions live under `<app_dir>/scratch/<id>`.
                 if cwd_is_aoe_scratch(&summary.cwd) {
                     continue;
                 }
-                // AoE creates session worktrees under a directory named by the
-                // worktree path template (e.g. "<repo>-worktrees"). Any cwd
-                // inside one is an AoE-managed worktree (or a one-shot AoE ran
-                // there, like smart-rename), not a conversation to import.
+                // AoE creates session worktrees under a directory named by the worktree path
+                // template (e.g. "<repo>-worktrees").
                 if cwd_under_worktree(&summary.cwd, &worktree_markers) {
                     continue;
                 }
@@ -194,10 +153,6 @@ pub fn scan_sessions_in(config_dir: &Path) -> Vec<ClaudeSessionSummary> {
 }
 
 /// Retain sessions whose recorded `cwd` is at or under one of `roots`.
-/// Component-aware via [`Path::starts_with`], so a root of `/a/app` does not
-/// match a cwd of `/a/app-v2`. Comparison is lexical on the paths as given;
-/// callers wanting symlink-robust matching should canonicalize `roots` (and the
-/// cwds) first.
 pub fn sessions_under_paths(
     sessions: Vec<ClaudeSessionSummary>,
     roots: &[PathBuf],
@@ -261,9 +216,7 @@ fn summarize_file(path: &Path) -> Option<ClaudeSessionSummary> {
     })
 }
 
-/// Pull a human-readable title from a `user` record. Skips command wrappers
-/// and caveat blocks (e.g. `<local-command-...>`, `<command-name>`) that
-/// Claude Code injects, since they are noise, not the user's actual prompt.
+/// Pull a human-readable title from a `user` record.
 fn extract_user_title(record: &serde_json::Value) -> Option<String> {
     if record.get("type").and_then(|v| v.as_str()) != Some("user") {
         return None;
@@ -283,10 +236,8 @@ fn extract_user_title(record: &serde_json::Value) -> Option<String> {
     Some(truncate(&text, 120))
 }
 
-/// A user message's displayable text, or `None` for the command wrappers and
-/// caveat blocks Claude Code injects (`<local-command-...>`, `<command-...>`).
-/// Only those specific wrappers are dropped; a real prompt like `<div> is
-/// rendering wrong` is kept.
+/// A user message's displayable text, or `None` for the command wrappers and caveat blocks Claude
+/// Code injects (`<local-command-...>`, `<command-...>`).
 fn displayable_user_text(text: &str) -> Option<&str> {
     let text = text.trim();
     if text.is_empty() || text.starts_with("<local-command-") || text.starts_with("<command-") {
@@ -348,12 +299,10 @@ mod tests {
 
     #[test]
     fn title_keeps_angle_bracket_prompts_and_skips_only_wrappers() {
-        // A real prompt that starts with '<' is kept.
         assert_eq!(
             displayable_user_text("<div> is rendering wrong"),
             Some("<div> is rendering wrong")
         );
-        // Injected command wrappers are dropped.
         assert_eq!(
             displayable_user_text("<local-command-caveat>x</local-command-caveat>"),
             None
@@ -414,7 +363,6 @@ mod tests {
             "/Users/me/aoe/agent-of-empires-worktrees/Saracens/sub",
             &markers
         ));
-        // Workspace dirs carry the marker mid-name (contains, not suffix).
         assert!(cwd_under_worktree(
             "/Users/me/aoe/soft-close-grace-window-workspace-55406399",
             &markers
@@ -472,8 +420,6 @@ mod tests {
             .into_iter()
             .map(|s| s.session_id)
             .collect();
-        // Root itself and descendants match; the sibling `app-v2` does NOT
-        // (component-aware, not a string prefix), nor does an unrelated dir.
         assert_eq!(kept, vec!["a", "b"]);
     }
 
@@ -512,7 +458,6 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].session_id, "713b7f46-d0f2-454e-91be-a3305d35660c");
         assert_eq!(found[0].cwd, cwd_str);
-        // Absent projects dir yields an empty scan, never an error.
         assert!(scan_sessions_in(&tmp.path().join("nope")).is_empty());
     }
 }

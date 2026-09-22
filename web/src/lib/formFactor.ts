@@ -1,29 +1,14 @@
-// Coarse client form-factor classification for the telemetry seen ping (#1883).
-//
-// The daemon snapshot's os/arch describe the host running `aoe serve`, not the
-// device the user is looking at, so a phone PWA talking to a Mac daemon was
-// indistinguishable from a desktop tab. This derives one of a closed set of
-// coarse classes from the same media-query primitives the layout hooks already
-// use (`isStandalone` in `lib/platform`, `useIsCoarsePointer`,
-// `useIsWideViewport`), so the seen ping can carry it. No user-agent string,
-// screen size, or device model is ever read or sent.
+// Coarse client form factor for the telemetry ping, since the daemon's os/arch describe the host.
 
 import { isStandalone } from "./platform";
 
-/** The closed set of classes the daemon accepts; anything else is rejected
- *  server-side and never stored. Mirrors `telemetry::form_factor` in Rust. */
+/** Mirrors `telemetry::form_factor` in Rust; other values are rejected server-side. */
 export type ClientFormFactor = "desktop" | "desktop_pwa" | "mobile" | "mobile_pwa";
 
 const matchesMedia = (query: string): boolean =>
   typeof window !== "undefined" && Boolean(window.matchMedia?.(query).matches);
 
-/** Classify the current client. Precedence is documented and deterministic so a
- *  touch laptop or a tablet lands in exactly one bucket:
- *  - `pwa` suffix iff the app is running standalone / installed;
- *  - `mobile` iff the primary pointer is coarse AND the viewport is below the
- *    `md` breakpoint (768px); a wide coarse-pointer client (touch laptop) and a
- *    narrow fine-pointer client (small desktop window) both stay `desktop`;
- *  - `desktop` otherwise. */
+/** `_pwa` when standalone; `mobile` only for a coarse pointer below 768px; otherwise `desktop`. */
 export function clientFormFactor(): ClientFormFactor {
   const mobile = matchesMedia("(pointer: coarse)") && !matchesMedia("(min-width: 768px)");
   if (isStandalone()) {

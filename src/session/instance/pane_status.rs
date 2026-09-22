@@ -4,20 +4,11 @@
 use super::*;
 
 /// omp's error banner footer, and the terminal retry lines it can replace.
-/// They live here rather than with detection: the manifest carries its own
-/// copies for deciding status, while these drive the message this module
-/// lifts out of the banner.
 const OMP_BANNER_DISMISSAL_ANCHOR: &str = "dismissed when you send your next message";
 const OMP_TERMINAL_RETRY_MARKERS: &[&str] =
     &["error: retry budget exhausted", "error: retry failed after"];
 
 /// Build a short human-readable hint for why a session transitioned to Error.
-///
-/// Called when we set Status::Error but don't already have a `last_error`
-/// populated (e.g. an agent process exited on its own). We grab the last few
-/// non-empty lines of the pane and pick something that looks like an error
-/// message; otherwise fall back to a generic "stopped responding" string so
-/// the UI never renders an Error state without any explanation.
 pub(super) fn summarize_error_from_pane(pane_content: &str) -> String {
     const MAX_BANNER_LINES: usize = 3;
 
@@ -30,11 +21,7 @@ pub(super) fn summarize_error_from_pane(pane_content: &str) -> String {
         .take(12)
         .collect();
 
-    // omp pins an error banner whose dismissal footer is the anchor. When the
-    // anchor is the lowest of {anchor, terminal retry lines} (positions are
-    // 1-based from the bottom of the tail), the banner message is the reason:
-    // walk up from the anchor (excluded), collecting the consecutive message
-    // lines until the first border line (all `─`), at most MAX_BANNER_LINES.
+    // omp pins an error banner whose dismissal footer is the anchor.
     let anchor_idx = tail
         .iter()
         .position(|l| l.to_lowercase().contains(OMP_BANNER_DISMISSAL_ANCHOR));
@@ -66,9 +53,8 @@ pub(super) fn summarize_error_from_pane(pane_content: &str) -> String {
             let mut reason = String::new();
             for line in msg_lines.iter().rev() {
                 let mut text = line.trim();
-                // status.error glyphs across omp themes (✘ default, ✖
-                // poimandres override, [!!] ascii, U+F00D nerd); ✕ is the
-                // tool-result icon.error slot, included defensively.
+                // status.error glyphs across omp themes (✘ default, ✖ poimandres override, [!!]
+                // ascii, U+F00D nerd); ✕ is the tool-result icon.error slot, included defensively.
                 for glyph in ["✖", "✘", "✕", "[!!]", "\u{f00d}"] {
                     if let Some(rest) = text.strip_prefix(glyph) {
                         text = rest.trim_start();
@@ -139,15 +125,8 @@ pub(super) fn resolve_detected_status(
 ) -> Status {
     match detected {
         Status::Idle if has_command_override => {
-            // Custom commands run agents through wrapper scripts that appear
-            // as shell processes to tmux, so we can't trust the pane's current
-            // command here; decide from pane *content* instead. A pane that is
-            // still rendering the agent TUI is genuinely parked at its prompt,
-            // so a detected Idle is real and we keep it (otherwise on_idle /
-            // on_waiting status hooks never fire for wrapped agents, e.g. an
-            // opencode session launched via agent_command_override, see #2022).
-            // Only declare Error when the pane is actually dead; a live pane
-            // without recognizable agent content stays Unknown.
+            // Custom commands run agents through wrapper scripts that appear as shell processes to
+            // tmux, so we can't trust the pane's current command here.
             if is_dead {
                 Status::Error
             } else if pane_has_agent_content(pane_content, tool) {
@@ -183,10 +162,7 @@ fn pane_looks_like_bare_shell_prompt(raw_content: &str) -> bool {
     last.ends_with('$') || last.ends_with('#') || last.ends_with('%') || last.ends_with('\u{276f}')
 }
 
-/// Check whether captured pane content indicates a living agent rather than
-/// a bare shell prompt. Used to prevent `is_shell_stale()` from producing
-/// false `Error` status when the agent binary is a shell wrapper or spawns
-/// persistent child shell processes.
+/// Check whether captured pane content indicates a living agent rather than a bare shell prompt.
 fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
     let clean = crate::tmux::utils::strip_ansi(raw_content);
     let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -195,16 +171,14 @@ fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
         return false;
     }
 
-    // If the last visible line looks like a shell prompt, the agent likely
-    // exited and the shell took over. This catches servers with verbose MOTD
-    // that would otherwise exceed the line-count threshold.
+    // If the last visible line looks like a shell prompt, the agent likely exited and the shell
+    // took over.
     if pane_looks_like_bare_shell_prompt(raw_content) {
         return false;
     }
 
-    // Agent TUIs fill the screen with UI elements. A bare shell prompt
-    // (after MOTD) rarely exceeds this threshold once the prompt check
-    // above filters out typical shell endings.
+    // Agent TUIs fill the screen with UI elements. A bare shell prompt (after MOTD) rarely exceeds
+    // this threshold once the prompt check above filters out typical shell endings.
     if non_empty.len() > 5 {
         return true;
     }
@@ -232,6 +206,8 @@ fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const AGENT_UI: &str = "ctrl+p commands \u{2022} OpenCode 1.3.13+650d0db";
 
     #[test]
     fn summarize_error_from_pane_handles_banner_shapes() {
@@ -293,115 +269,12 @@ mod tests {
     }
 
     #[test]
-    fn test_pane_has_agent_content_bare_shell() {
-        assert!(!pane_has_agent_content("$ ", "opencode"));
-        assert!(!pane_has_agent_content("user@host:~$ ", "opencode"));
-        assert!(!pane_has_agent_content("\n\n$ \n", "opencode"));
-    }
-
-    #[test]
-    fn test_resolve_detected_status_shell_stale_agent_content_stays_idle() {
-        let content = "ctrl+p commands \u{2022} OpenCode 1.3.13+650d0db";
-        assert_eq!(
-            resolve_detected_status(Status::Idle, false, true, false, content, "opencode"),
-            Status::Idle
-        );
-    }
-
-    #[test]
-    fn test_resolve_detected_status_shell_stale_bare_prompt_is_error() {
-        for detected in [Status::Idle, Status::Waiting] {
-            assert_eq!(
-                resolve_detected_status(
-                    detected,
-                    false,
-                    true,
-                    false,
-                    "Welcome\nuser@host:~$ ",
-                    "opencode",
-                ),
-                Status::Error
-            );
-        }
-    }
-
-    #[test]
-    fn test_resolve_detected_status_shell_stale_unclear_is_unknown() {
-        assert_eq!(
-            resolve_detected_status(
-                Status::Idle,
-                false,
-                true,
-                false,
-                "Restoring previous session...",
-                "opencode",
-            ),
-            Status::Unknown
-        );
-        assert_eq!(
-            resolve_detected_status(Status::Idle, false, true, false, "", "opencode"),
-            Status::Unknown
-        );
-    }
-
-    #[test]
-    fn test_resolve_detected_status_keeps_hard_failures_as_error() {
-        assert_eq!(
-            resolve_detected_status(Status::Idle, true, false, false, "", "opencode"),
-            Status::Error
-        );
-        assert_eq!(
-            resolve_detected_status(Status::Idle, true, true, true, "", "opencode"),
-            Status::Error
-        );
-    }
-
-    #[test]
-    fn test_resolve_detected_status_live_command_override_is_unknown() {
-        assert_eq!(
-            resolve_detected_status(Status::Idle, false, true, true, "$ ", "opencode"),
-            Status::Unknown
-        );
-    }
-
-    #[test]
-    fn test_resolve_detected_status_command_override_agent_content_stays_idle() {
-        // A wrapped agent (agent_command_override) whose pane still renders the
-        // agent TUI must keep its detected Idle so on_idle / on_waiting status
-        // hooks fire; previously the override masked every Idle to Unknown and
-        // those hooks never ran (#2022).
-        let content = "ctrl+p commands \u{2022} OpenCode 1.16.2";
-        assert_eq!(
-            resolve_detected_status(Status::Idle, false, false, true, content, "opencode"),
-            Status::Idle
-        );
-    }
-
-    #[test]
-    fn test_pane_has_agent_content_agent_ui() {
-        let opencode_idle = "ctrl+p commands \u{2022} OpenCode 1.3.13+650d0db";
-        assert!(pane_has_agent_content(opencode_idle, "opencode"));
-    }
-
-    #[test]
-    fn test_pane_has_agent_content_substantial_output() {
+    fn pane_agent_content_ignores_bare_shells_and_substring_matches() {
         let many_lines = (0..10)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(pane_has_agent_content(&many_lines, "vibe"));
-    }
-
-    #[test]
-    fn test_pane_has_agent_content_empty() {
-        assert!(!pane_has_agent_content("", "opencode"));
-        assert!(!pane_has_agent_content("   \n  \n  ", "opencode"));
-    }
-
-    #[test]
-    fn test_pane_has_agent_content_shell_prompt_at_end() {
-        // Verbose MOTD followed by shell prompt should be detected as a
-        // bare shell, not agent content, even with >5 lines.
+        // A verbose MOTD is still a bare shell, even past the line-count threshold.
         let motd_then_prompt = "Welcome to Ubuntu 22.04 LTS\n\
             System load:  0.5\n\
             Memory usage: 42%\n\
@@ -410,34 +283,80 @@ mod tests {
             Temperature:  45C\n\
             2 updates available\n\
             user@host:~$ ";
-        assert!(!pane_has_agent_content(motd_then_prompt, "opencode"));
-
-        // Same with # prompt (root)
-        let root_prompt = "line1\nline2\nline3\nline4\nline5\nline6\n# ";
-        assert!(!pane_has_agent_content(root_prompt, "opencode"));
-
-        // Fish/zsh fancy prompt (❯)
-        let fancy_prompt = "line1\nline2\nline3\nline4\nline5\nline6\n\u{276f}";
-        assert!(!pane_has_agent_content(fancy_prompt, "opencode"));
+        let cases: &[(&str, &str, bool)] = &[
+            ("$ ", "opencode", false),
+            ("user@host:~$ ", "opencode", false),
+            ("\n\n$ \n", "opencode", false),
+            ("", "opencode", false),
+            ("   \n  \n  ", "opencode", false),
+            (AGENT_UI, "opencode", true),
+            (&many_lines, "vibe", true),
+            (motd_then_prompt, "opencode", false),
+            (
+                "line1\nline2\nline3\nline4\nline5\nline6\n# ",
+                "opencode",
+                false,
+            ),
+            (
+                "line1\nline2\nline3\nline4\nline5\nline6\n\u{276f}",
+                "opencode",
+                false,
+            ),
+            // A short tool name matches a word, not any substring that contains it.
+            ("api endpoint ready", "pi", false),
+            ("pipeline started", "pi", false),
+            ("pi file saved", "pi", true),
+            ("done\npi>", "pi", true),
+            ("OpenCode v1.0", "opencode", true),
+            // Agents are also recognized by their binary alias.
+            ("agy ready", "antigravity", true),
+        ];
+        for (content, tool, want) in cases {
+            assert_eq!(
+                pane_has_agent_content(content, tool),
+                *want,
+                "{tool}: {content:?}"
+            );
+        }
     }
 
     #[test]
-    fn test_pane_has_agent_content_short_tool_name() {
-        // Short tool names like "pi" should NOT match substrings in
-        // unrelated content (e.g., "api" contains "pi").
-        assert!(!pane_has_agent_content("api endpoint ready", "pi"));
-        assert!(!pane_has_agent_content("pipeline started", "pi"));
-
-        // But "pi" as a standalone word should match.
-        assert!(pane_has_agent_content("pi file saved", "pi"));
-        assert!(pane_has_agent_content("done\npi>", "pi"));
-
-        // Longer names like "opencode" should still match.
-        assert!(pane_has_agent_content("OpenCode v1.0", "opencode"));
-    }
-
-    #[test]
-    fn test_pane_has_agent_content_matches_agent_binary_alias() {
-        assert!(pane_has_agent_content("agy ready", "antigravity"));
+    fn detected_status_resolves_dead_panes_and_untrusted_shell_commands() {
+        const BARE: &str = "Welcome\nuser@host:~$ ";
+        // (detected, is_dead, is_shell_stale, has_command_override, pane, want)
+        let cases: &[(Status, bool, bool, bool, &str, Status)] = &[
+            // A stale shell keeps Idle only while the agent UI is still on screen.
+            (Status::Idle, false, true, false, AGENT_UI, Status::Idle),
+            (Status::Idle, false, true, false, BARE, Status::Error),
+            (Status::Waiting, false, true, false, BARE, Status::Error),
+            (
+                Status::Idle,
+                false,
+                true,
+                false,
+                "Restoring...",
+                Status::Unknown,
+            ),
+            (Status::Idle, false, true, false, "", Status::Unknown),
+            (Status::Idle, true, false, false, "", Status::Error),
+            (Status::Idle, true, true, true, "", Status::Error),
+            // A wrapped agent still rendering its TUI keeps Idle so status hooks fire.
+            (Status::Idle, false, true, true, "$ ", Status::Unknown),
+            (Status::Idle, false, false, true, AGENT_UI, Status::Idle),
+        ];
+        for (detected, is_dead, is_shell_stale, has_override, pane, want) in cases {
+            assert_eq!(
+                resolve_detected_status(
+                    *detected,
+                    *is_dead,
+                    *is_shell_stale,
+                    *has_override,
+                    pane,
+                    "opencode",
+                ),
+                *want,
+                "{detected:?} dead={is_dead} stale={is_shell_stale} override={has_override} {pane:?}"
+            );
+        }
     }
 }

@@ -1,8 +1,4 @@
 // @vitest-environment jsdom
-//
-// Coverage for OverflowMenu: the trigger toggles a menu of items, clicking an
-// item fires its handler and closes the menu, and the menu closes on outside
-// click and Escape. aria-expanded tracks the open state.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";

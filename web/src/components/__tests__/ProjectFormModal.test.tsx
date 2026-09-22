@@ -69,4 +69,42 @@ describe("ProjectFormModal", () => {
     finishRefresh();
     await screen.findByText("Closed");
   });
+
+  it("pre-selects 'Off' for smart-rename when the project has that override set", () => {
+    render(
+      <ProjectFormModal
+        initial={{
+          name: "extra",
+          path: "/repo/extra",
+          scope: "global",
+          pinned: false,
+          overrides: { smart_rename: false },
+        }}
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+
+    const smartRenameSelect = screen.getByText("Smart session rename").nextElementSibling as HTMLSelectElement;
+    expect(smartRenameSelect.value).toBe("off");
+  });
+
+  it("pre-selects 'On' for worktree-by-default when the project has that override set", () => {
+    render(
+      <ProjectFormModal
+        initial={{
+          name: "extra",
+          path: "/repo/extra",
+          scope: "global",
+          pinned: false,
+          overrides: { worktree_enabled: true },
+        }}
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+
+    const worktreeSelect = screen.getByText("Worktree by default").nextElementSibling as HTMLSelectElement;
+    expect(worktreeSelect.value).toBe("on");
+  });
 });

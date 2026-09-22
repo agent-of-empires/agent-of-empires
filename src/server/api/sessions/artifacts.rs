@@ -2,17 +2,15 @@
 
 use super::*;
 
-/// Largest artifact the dashboard will serve inline. Generated screenshots
-/// and status pages are small; the cap just bounds a pathological read.
+/// Largest artifact the dashboard serves inline; the cap just bounds a
+/// pathological read.
 const MAX_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
 
-/// Serve a file from a session's managed artifact directory
-/// (`GET /api/sessions/{id}/artifacts/{*path}`). Auth is enforced by the
-/// global middleware; `resolve_artifact_path` canonicalizes and confines the
-/// request to the session's artifact root, so neither `..` nor a symlink can
-/// escape it and arbitrary host paths are never served. HTML is sent as an
-/// attachment (never inline) so a generated page cannot execute script in the
-/// dashboard's authenticated origin. See #2587.
+/// Serve a file from a session's managed artifact directory.
+/// `resolve_artifact_path` canonicalizes and confines the request to the
+/// session's artifact root, so neither `..` nor a symlink can escape it. HTML is
+/// sent as an attachment, never inline, so a generated page cannot execute
+/// script in the dashboard's authenticated origin (#2587).
 pub async fn serve_session_artifact(Path((id, path)): Path<(String, String)>) -> impl IntoResponse {
     let resolved = tokio::task::spawn_blocking(move || {
         crate::session::artifacts::resolve_artifact_path(&id, &path)
@@ -42,10 +40,9 @@ pub async fn serve_session_artifact(Path((id, path)): Path<(String, String)>) ->
     let mime = mime_guess::from_path(&file_path).first_or_octet_stream();
     let essence = mime.essence_str();
     // Any type that can execute script when opened as a top-level document is
-    // served as a download, never inline. The frontend opens artifacts via
-    // `window.open(blob:)`, and a blob URL inherits the dashboard's origin, so
-    // an HTML/XHTML/SVG/XML artifact would otherwise run script in the
-    // authenticated origin. Images and other passive types stay inline. See #2587.
+    // served as a download. The frontend opens artifacts via `window.open(blob:)`
+    // and a blob URL inherits the dashboard's origin, so an HTML/SVG/XML artifact
+    // would otherwise run script there. Passive types stay inline (#2587).
     let force_download = matches!(
         essence,
         "text/html" | "application/xhtml+xml" | "image/svg+xml" | "application/xml" | "text/xml"

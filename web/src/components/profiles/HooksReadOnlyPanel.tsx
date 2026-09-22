@@ -1,38 +1,15 @@
 import type { EffectiveHookGroup, HookSource } from "../../lib/profileHooks";
 
-interface Props {
-  groups: EffectiveHookGroup[];
-}
-
 const SOURCE_BADGE: Record<HookSource, { label: string; className: string }> = {
-  override: {
-    label: "Profile override",
-    className: "bg-brand-600/15 text-brand-400",
-  },
-  "override-empty": {
-    label: "Overridden: none",
-    className: "bg-surface-700 text-text-dim",
-  },
-  inherited: {
-    label: "Inherited from global",
-    className: "bg-surface-700 text-text-secondary",
-  },
-  none: {
-    label: "None",
-    className: "bg-surface-700 text-text-dim",
-  },
+  override: { label: "Profile override", className: "bg-brand-600/15 text-brand-400" },
+  "override-empty": { label: "Overridden: none", className: "bg-surface-700 text-text-dim" },
+  inherited: { label: "Inherited from global", className: "bg-surface-700 text-text-secondary" },
+  none: { label: "None", className: "bg-surface-700 text-text-dim" },
 };
 
-/** Read-only view of a profile's effective lifecycle hooks.
- *
- *  Lifecycle hooks run arbitrary shell commands on session create/launch/
- *  destroy, so a hooks section set through the API would be remote code
- *  execution. The `hooks` section is absent from the settings schema, so the
- *  server rejects hook writes (validate_patch in
- *  src/session/config/settings_schema/policy.rs) and this panel deliberately renders
- *  display-only: it takes no onChange/save props and exposes no inputs, so
- *  there is no path from here to a profile PATCH. */
-export function HooksReadOnlyPanel({ groups }: Props) {
+/** Display-only on purpose: hooks run shell commands, so the server rejects hook
+ *  writes and this panel must never offer a path to a profile PATCH. */
+export function HooksReadOnlyPanel({ groups }: { groups: EffectiveHookGroup[] }) {
   return (
     <section className="rounded-lg border border-surface-700 bg-surface-900 p-4">
       <h3 className="text-sm font-semibold text-text-primary">Lifecycle hooks</h3>

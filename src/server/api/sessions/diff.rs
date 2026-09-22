@@ -12,10 +12,9 @@ pub struct RichDiffFileInfo {
     pub status: String,
     pub additions: usize,
     pub deletions: usize,
-    /// Name of the workspace repo this file belongs to. None for
-    /// single-repo (non-workspace) sessions. The frontend uses this to
-    /// group entries in the sidebar diff list and to disambiguate
-    /// path collisions across repos. See #1047.
+    /// Workspace repo this file belongs to, `None` for single-repo sessions.
+    /// The frontend groups the sidebar list by it and uses it to disambiguate
+    /// path collisions across repos (#1047).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_name: Option<String>,
 }
@@ -26,15 +25,13 @@ pub struct RepoBase {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_name: Option<String>,
     pub base_branch: String,
-    /// Worktree path this entry's diff was computed in. The web base
-    /// picker queries it for that repo's branch list, so a workspace
-    /// member's typeahead lists its own branches rather than the launch
-    /// repo's. See #3329.
+    /// Worktree path this entry's diff was computed in. The web base picker
+    /// queries it so a workspace member's typeahead lists its own branches
+    /// rather than the launch repo's (#3329).
     pub repo_path: String,
-    /// This entry's explicit override, when one is set. Absent means
-    /// `base_branch` came from the recorded creation base, the profile
-    /// default, or auto-detection, so the client hides its reset
-    /// affordance. See #3329.
+    /// This entry's explicit override, when set. Absent means `base_branch`
+    /// came from the creation base, the profile default, or auto-detection, so
+    /// the client hides its reset affordance (#3329).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_override: Option<String>,
 }
@@ -42,11 +39,9 @@ pub struct RepoBase {
 #[derive(Serialize)]
 pub struct RichDiffFilesResponse {
     pub files: Vec<RichDiffFileInfo>,
-    /// One entry per repo whose diff was computed. Single-repo
-    /// sessions get a one-element array with `repo_name: None`;
-    /// workspace sessions get one entry per workspace member. Replaces
-    /// the previous single-string `base_branch` since each member can
-    /// have a different default. See #1047.
+    /// One entry per repo whose diff was computed: one element with
+    /// `repo_name: None` for single-repo sessions, one per member for workspace
+    /// sessions, since each member can have a different default (#1047).
     pub per_repo_bases: Vec<RepoBase>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
@@ -59,9 +54,9 @@ pub struct RichFileContentsResponse {
     pub file: RichDiffFileInfo,
     pub old_content: String,
     pub new_content: String,
-    /// Server-computed unified diff of old → new. The client parses this as
-    /// text (`parsePatchFiles`) instead of re-diffing the contents, which
-    /// would block the main thread on large files. Empty for binary files.
+    /// Server-computed unified diff of old to new. The client parses it as
+    /// text rather than re-diffing, which would block the main thread on large
+    /// files. Empty for binary files.
     pub patch: String,
     pub is_binary: bool,
     /// True if the file was too large to send inline; contents are omitted.
@@ -69,28 +64,22 @@ pub struct RichFileContentsResponse {
 }
 
 /// Caps for the contents-based diff endpoint. The client renders with a
-/// virtualized, off-main-thread highlighter (`@pierre/diffs`), so the DOM and
-/// main thread are no longer the bottleneck; the only real cost is JSON
-/// payload size and the client-side parse. The byte cap is the real guard
-/// against pathological payloads (minified bundles, generated code, data
-/// blobs); the line cap is a secondary backstop.
+/// virtualized, off-main-thread highlighter, so the real cost is JSON payload
+/// size: the byte cap guards against pathological payloads and the line cap is
+/// a backstop.
 const MAX_CONTENTS_BYTES: usize = 5_000_000;
 const MAX_CONTENTS_LINES: usize = 200_000;
 
 /// Validate a user-supplied relative file path against a workdir.
 ///
-/// Returns `(canonical_path, is_changed)` if the requested path is safe to read
-/// (no absolute, no `..`, no symlink-escape out of the workdir). `is_changed`
-/// is true when the path appears in `changed_files` (diffable); false marks an
-/// in-repo file with no diff against the base, served via the full-file
-/// fallback (gated further on being a tracked blob; see
-/// [`crate::git::diff::compute_unchanged_file_contents`]). See #1810.
+/// Returns `(canonical_path, is_changed)` when the path is safe to read (not
+/// absolute, no `..`, no symlink escape). `is_changed` marks a diffable path;
+/// false marks an in-repo file with no diff against the base, served via the
+/// full-file fallback (#1810).
 ///
-/// A path that is neither in the changed set nor present on disk yields
-/// `NOT_FOUND`. The non-canonical fallback is reserved for the changed-set case
-/// (a file deleted in the working tree but still diffable); the unchanged
-/// branch requires canonicalization to succeed. Returns `Err(status, message)`
-/// otherwise.
+/// A path neither in the changed set nor on disk yields `NOT_FOUND`. The
+/// non-canonical fallback is reserved for the changed-set case, where a file
+/// deleted in the working tree is still diffable.
 pub(super) fn validate_diff_path(
     workdir: &std::path::Path,
     requested: &std::path::Path,
@@ -115,8 +104,8 @@ pub(super) fn validate_diff_path(
 
     let is_changed = changed_files.iter().any(|f| f.path == requested);
 
-    // Canonicalize both sides and verify containment as defense in depth
-    // against symlinks that might point outside the workdir.
+    // Canonicalize both sides and verify containment, as defense in depth
+    // against symlinks pointing outside the workdir.
     let canonical_workdir = workdir.canonicalize().map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -131,35 +120,28 @@ pub(super) fn validate_diff_path(
             }
             Ok((c, is_changed))
         }
-        // The file isn't on disk. A changed file may have been deleted in the
-        // working tree but is still diffable, so fall back to the non-canonical
-        // (component-vetted) path. An unchanged path that isn't on disk has
-        // nothing to show.
+        // Not on disk. A changed file may have been deleted in the working
+        // tree but is still diffable, so fall back to the component-vetted
+        // path; an unchanged path that is not on disk has nothing to show.
         Err(_) if is_changed => Ok((full, true)),
         Err(_) => Err((StatusCode::NOT_FOUND, "file not found")),
     }
 }
 
-/// One repo's worth of diff context: a name (for workspace members),
-/// the filesystem path the diff helper walks, and the two base-branch
-/// layers that vary per repo. See #1047, #3329.
+/// One repo's worth of diff context: a name for workspace members, the path
+/// the diff helper walks, and the two base-branch layers that vary per repo.
 #[derive(Clone, Debug)]
 pub(super) struct DiffRepo {
     /// Workspace member name, or None for single-repo sessions.
     pub(super) name: Option<String>,
     pub(super) path: String,
     /// Explicit override for this entry's diff base, set via
-    /// `PATCH /api/sessions/{id}/diff-base`, the `aoe session set-base`
-    /// CLI, or the TUI diff view's `b` keybind. For a workspace member
-    /// that is `WorkspaceRepo::base_branch_override`; for a single-repo
-    /// session's own checkout it is `Instance::base_branch_override`.
-    /// See #970, #3329.
+    /// `PATCH /api/sessions/{id}/diff-base`, `aoe session set-base`, or the TUI
+    /// diff view's `b` keybind (#970, #3329).
     pub(super) base_override: Option<String>,
-    /// The branch this entry's worktree was created from, recorded at
-    /// creation. `WorkspaceRepo::base_branch` for a workspace member,
-    /// `WorktreeInfo::base_branch` for a single-repo session. Slots
-    /// below the explicit override but above the profile default and
-    /// auto-detection. See #1951, #3329.
+    /// The branch this entry's worktree was created from. Slots below the
+    /// explicit override but above the profile default and auto-detection
+    /// (#1951, #3329).
     pub(super) recorded_base: Option<String>,
 }
 
@@ -167,11 +149,9 @@ struct DiffContext {
     repos: Vec<DiffRepo>,
 }
 
-/// Expand a session into the list of repos whose diffs the sidebar
-/// cares about. Workspace sessions iterate `workspace_info.repos`
-/// (each `worktree_path` becomes one entry); single-repo sessions
-/// fall back to a one-element list of `[project_path]` so the
-/// existing flow is unchanged. See #1047.
+/// Expand a session into the repos whose diffs the sidebar cares about:
+/// one entry per `workspace_info.repos` member, or a one-element
+/// `[project_path]` list for a single-repo session (#1047).
 async fn resolve_diff_repos(
     state: &AppState,
     id: &str,
@@ -189,9 +169,8 @@ async fn resolve_diff_repos(
 /// The repo entries for one session, split out of [`resolve_diff_repos`] so the
 /// per-repo base plumbing is testable without an `AppState`.
 pub(super) fn diff_repos_of(inst: &crate::session::Instance) -> Vec<DiffRepo> {
-    // A session with any repo record (a creation-time workspace, repos attached
-    // later, or both) lists one entry per repo. A session with none falls back
-    // to its project_path, which is the single-repo flow unchanged.
+    // A session with any repo record lists one entry per repo; a session with
+    // none falls back to its project_path.
     let mut repos: Vec<DiffRepo> = inst
         .all_repos()
         .iter()
@@ -203,10 +182,9 @@ pub(super) fn diff_repos_of(inst: &crate::session::Instance) -> Vec<DiffRepo> {
         })
         .collect();
     if inst.workspace_info.is_none() {
-        // A session with no repo records is single-repo: its own checkout is
-        // the only entry, and the session-level override is that entry's
-        // override. `attach_project` converts a session into a workspace, so
-        // a named entry and this unnamed one never coexist. See #3329.
+        // A session with no repo records is single-repo, so the session-level
+        // override is that entry's override. `attach_project` converts a session
+        // into a workspace, so a named entry and this one never coexist (#3329).
         repos.insert(
             0,
             DiffRepo {
@@ -223,12 +201,10 @@ pub(super) fn diff_repos_of(inst: &crate::session::Instance) -> Vec<DiffRepo> {
     repos
 }
 
-/// Resolve the diff base for one repo. The repo's own override wins
-/// over the base its worktree was recorded as forked from, which wins
-/// over the profile's `DiffConfig.default_branch`, which wins over
-/// auto-detection (`get_default_base_ref`). Every layer above the
-/// config default is per repo, so each workspace member resolves
-/// independently. See #970, #1951, #3329.
+/// Resolve the diff base for one repo: the repo's own override, then the base
+/// its worktree was recorded as forked from, then the profile's
+/// `DiffConfig.default_branch`, then auto-detection. Every layer above the
+/// config default is per repo (#970, #1951, #3329).
 pub(super) fn resolve_diff_base(
     override_value: Option<&str>,
     recorded_base: Option<&str>,
@@ -328,11 +304,11 @@ pub async fn session_diff_files(
             .into_response(),
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "Diff files panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -340,10 +316,9 @@ pub async fn session_diff_files(
 #[derive(Deserialize)]
 pub struct FileDiffQuery {
     pub path: String,
-    /// Workspace repo name when the session is a multi-repo workspace.
-    /// Omitted for single-repo sessions; if a workspace session omits
-    /// it, the handler defaults to the first member so the legacy
-    /// single-repo URL keeps working for the primary repo. See #1047.
+    /// Workspace repo name, omitted for single-repo sessions. A workspace
+    /// session that omits it defaults to the first member, so the legacy
+    /// single-repo URL keeps working (#1047).
     #[serde(default)]
     pub repo: Option<String>,
 }
@@ -368,39 +343,30 @@ pub async fn session_diff_file(
         Err(resp) => return resp,
     };
 
-    // Pick the workspace member named in `?repo=`. When the param is
-    // missing we default to the first member, which matches the
-    // legacy single-repo URL contract (`?path=...` against the
-    // session's primary repo). When the named repo doesn't exist, the
-    // request is rejected so a stale link doesn't quietly diff the
-    // wrong repo. See #1047.
+    // Default to the first member when `?repo=` is missing, matching the
+    // legacy single-repo URL contract. A named repo that does not exist is
+    // rejected, so a stale link cannot quietly diff the wrong one (#1047).
     let selected_repo = match query.repo.as_deref() {
         Some(name) => match ctx.repos.iter().find(|r| r.name.as_deref() == Some(name)) {
             Some(r) => r.clone(),
             None => {
-                return (
+                return api_error(
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "bad_request",
-                        "message": "unknown workspace repo"
-                    })),
-                )
-                    .into_response();
+                    "bad_request",
+                    "unknown workspace repo",
+                );
             }
         },
-        // A workspace row can persist with `repos: []`; without this arm
-        // the omitted-`repo` default would panic on the empty list.
+        // A workspace row can persist with `repos: []`; without this arm the
+        // omitted-`repo` default would panic on the empty list.
         None => match ctx.repos.first() {
             Some(r) => r.clone(),
             None => {
-                return (
+                return api_error(
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "bad_request",
-                        "message": "workspace has no repos"
-                    })),
-                )
-                    .into_response();
+                    "bad_request",
+                    "workspace has no repos",
+                );
             }
         },
     };
@@ -428,10 +394,9 @@ pub async fn session_diff_file(
                 repo_path,
             );
 
-            // Validate the requested path. Files in the changed set are diffed;
-            // an in-repo file with no diff against the base is served through
-            // the full-file fallback below. The path-traversal and containment
-            // checks are the security boundary preventing arbitrary reads.
+            // Files in the changed set are diffed; an in-repo file with no
+            // diff is served through the full-file fallback below. The
+            // traversal and containment checks are the security boundary.
             let changed_files = scan_state
                 .changed_files_cached(repo_path, &base_branch)
                 .map_err(|e| DiffFileError::Internal(e.into()))?;
@@ -448,7 +413,7 @@ pub async fn session_diff_file(
                 };
 
             // Full-file fallback: an agent-cited file with no diff against the
-            // base. Render its current contents instead of a dead end. See #1810.
+            // base renders its current contents instead of a dead end (#1810).
             if !is_changed {
                 let full =
                     diff::compute_unchanged_file_contents(repo_path, file_path, &canonical_path)
@@ -489,13 +454,12 @@ pub async fn session_diff_file(
             }
 
             // Hand the client raw old/new text plus a server-computed unified
-            // patch. `@pierre/diffs` parses and renders that patch client-side
-            // (virtualized, off-main-thread highlighting) without re-running
-            // the diff algorithm in the browser.
+            // patch, which it renders virtualized and off-main-thread without
+            // re-running the diff algorithm.
             let contents = diff::compute_file_contents(repo_path, file_path, &base_branch)
                 .map_err(|e| DiffFileError::Internal(e.into()))?;
-            // additions/deletions aren't computed on this path; reuse the counts
-            // the changed-files scan already produced for the sidebar.
+            // additions/deletions are not computed on this path; reuse the
+            // counts the changed-files scan already produced.
             let (additions, deletions) = changed_files
                 .iter()
                 .find(|f| f.path == *file_path)
@@ -541,31 +505,25 @@ pub async fn session_diff_file(
 
     match result {
         Ok(Ok(value)) => (StatusCode::OK, Json(value)).into_response(),
-        Ok(Err(DiffFileError::BadRequest(msg))) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "bad_request", "message": msg})),
-        )
-            .into_response(),
-        Ok(Err(DiffFileError::NotFound(msg))) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "not_found", "message": msg})),
-        )
-            .into_response(),
+        Ok(Err(DiffFileError::BadRequest(msg))) => {
+            api_error(StatusCode::BAD_REQUEST, "bad_request", msg)
+        }
+        Ok(Err(DiffFileError::NotFound(msg))) => api_error(StatusCode::NOT_FOUND, "not_found", msg),
         Ok(Err(DiffFileError::Internal(e))) => {
             tracing::error!(target: "http.api.sessions", "File diff failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "diff_failed", "message": "Failed to compute file diff"})),
+                "diff_failed",
+                "Failed to compute file diff",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "File diff panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -575,9 +533,9 @@ pub struct SessionFileQuery {
     pub path: String,
 }
 
-/// Response for the session file-read endpoint. Mirrors the typed shape of its
-/// sibling [`RichFileContentsResponse`]; `content` is empty for a binary or
-/// truncated file (the client renders a notice instead).
+/// Response for the session file-read endpoint, mirroring
+/// [`RichFileContentsResponse`]. `content` is empty for a binary or truncated
+/// file, and the client renders a notice.
 #[derive(Serialize)]
 pub struct SessionFileResponse {
     pub content: String,
@@ -587,18 +545,17 @@ pub struct SessionFileResponse {
 
 /// Read a session file for the dashboard file viewer (#3088).
 ///
-/// Git-agnostic (works on non-git scratch sessions). A read is allowed when the
-/// canonical target is under a session project root (project_path + worktree
-/// paths) or is a path the agent touched this session, recovered from the ACP
-/// event log. Confinement and bounded reading live in the private
-/// `file_provenance` module.
+/// Git-agnostic, so it works on non-git scratch sessions. A read is allowed when
+/// the canonical target is under a session project root or is a path the agent
+/// touched this session. Confinement and bounded reading live in
+/// `file_provenance`.
 pub async fn session_file(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<SessionFileQuery>,
 ) -> impl IntoResponse {
-    // Reads workspace file contents: the same code-inspection surface as the
-    // diff reads, and the Files pane is hidden in CityHall, so close it too.
+    // Reads workspace file contents, the same inspection surface as the diff
+    // reads, and the Files pane is hidden in CityHall.
     if let Some(resp) = crate::server::api::cityhall_block(&state) {
         return resp;
     }
@@ -617,18 +574,16 @@ pub async fn session_file(
 
     let result = tokio::task::spawn_blocking(move || {
         // Canonicalize project roots up front; a root that no longer resolves
-        // is dropped so a stale worktree can't break or widen confinement.
+        // is dropped, so a stale worktree cannot break or widen confinement.
         let roots: Vec<std::path::PathBuf> = project_paths
             .iter()
             .filter_map(|p| p.canonicalize().ok())
             .collect();
 
-        // Provenance fallback: page the whole session log and collect the paths
-        // the agent touched. Deferred behind a closure so it runs only when the
-        // target is outside every project root; a workspace file (the common
-        // case) never pays for the replay.
+        // Provenance fallback, deferred behind a closure so the whole session
+        // log is only paged when the target is outside every project root.
         // ponytail: per-request scan on the miss path; cache per session keyed
-        // on highest_seq if it shows up hot on long/active sessions.
+        // on highest_seq if it shows up hot.
         let touched = || {
             let mut events = Vec::new();
             let mut since = 0u64;
@@ -668,11 +623,11 @@ pub async fn session_file(
             .into_response(),
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "session_file panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }
@@ -692,19 +647,19 @@ pub struct VolumeIgnoresGlobPreview {
 
 #[derive(Serialize)]
 pub struct VolumeIgnoresPreviewResponse {
-    /// True once the user has acknowledged the snapshot-expansion behavior, so
-    /// the wizard can skip the confirm modal without another round trip.
+    /// True once the user has acknowledged snapshot expansion, so the wizard
+    /// can skip the confirm modal without another round trip.
     pub acknowledged: bool,
     /// One entry per glob `volume_ignores` pattern with the directories it
     /// currently matches (container-side paths). Empty when none are configured.
     pub globs: Vec<VolumeIgnoresGlobPreview>,
 }
 
-/// Dry-run how glob `volume_ignores` entries would expand for a session rooted at
-/// `path`, without creating anything. The wizard calls this before a sandbox
-/// create to decide whether to show the snapshot-expansion confirm modal (#2045).
-/// Read-only: no `read_only` guard needed. Closed in CityHall mode: it
-/// resolves repo config for a caller-supplied host path.
+/// Dry-run how glob `volume_ignores` entries would expand for a session rooted
+/// at `path`, creating nothing. The wizard calls it before a sandbox create to
+/// decide whether to show the confirm modal (#2045). Read-only, so no
+/// `read_only` guard; closed in CityHall, since it resolves repo config for a
+/// caller-supplied host path.
 pub async fn preview_volume_ignores_globs(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<VolumeIgnoresPreviewQuery>,
@@ -750,19 +705,19 @@ pub async fn preview_volume_ignores_globs(
         }
         Ok(Err(e)) => {
             tracing::warn!(target: "http.api.sessions", "volume_ignores glob preview failed: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "preview_failed", "message": "Failed to preview volume_ignores"})),
+                "preview_failed",
+                "Failed to preview volume_ignores",
             )
-                .into_response()
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "volume_ignores glob preview panicked: {}", e);
-            (
+            api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+                "internal",
+                "Internal server error",
             )
-                .into_response()
         }
     }
 }

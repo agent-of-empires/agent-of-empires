@@ -1,0 +1,371 @@
+import { test, expect } from "./helpers/mockedTest";
+import type { Locator, Page } from "@playwright/test";
+import {
+  confirmDelete,
+  installTrashMocks,
+  openDeleteDialogFromRow,
+  openPurgeDialog,
+  openTrash,
+  sessionRows,
+  trashRows,
+  trashToggle,
+} from "./helpers/trashMocks";
+
+test.use({ viewport: { width: 1280, height: 720 } });
+
+// #2489: the default Delete moves a session to Trash; Restore brings it back.
+test.describe("Session trash flow", () => {
+  const SESSION = { id: "sess-trash", title: "story-trash", projectPath: "/tmp/story", groupPath: "/tmp" };
+  const row = (page: Page, title = "story-trash") => sessionRows(page).filter({ hasText: title }).first();
+
+  test("trash moves the row into Trash, restore brings it back", async ({ page }) => {
+    const handle = await installTrashMocks(page, [{ ...SESSION, trashed: false }]);
+    await page.goto("/session/sess-trash");
+
+    const dialog = await openDeleteDialogFromRow(page, row(page));
+    await expect(dialog.locator('[data-testid="delete-session-permanent"]')).not.toBeChecked();
+    await confirmDelete(dialog);
+    await expect.poll(() => handle.trashedIds.length, { timeout: 10_000 }).toBe(1);
+
+    await expect(trashToggle(page)).toContainText("Trash", { timeout: 10_000 });
+    await openTrash(page);
+    const trashRow = trashRows(page).filter({ hasText: "story-trash" });
+    await expect(trashRow.locator('[data-testid="sidebar-trash-open"]')).toContainText("Open");
+    await expect(trashRow.locator('[data-testid="sidebar-trash-restore"]')).toContainText("Restore");
+    await expect(trashRow.locator('[data-testid="sidebar-trash-purge"]')).toContainText("Delete");
+
+    await trashRow.locator('[data-testid="sidebar-trash-restore"]').click();
+    await expect.poll(() => handle.restoredIds.length, { timeout: 10_000 }).toBe(1);
+    await expect(trashToggle(page)).toHaveCount(0, { timeout: 10_000 });
+    await expect(row(page)).toBeVisible({ timeout: 10_000 });
+  });
+
+  test("a failed trash surfaces an error and keeps the row", async ({ page }) => {
+    const handle = await installTrashMocks(page, [{ ...SESSION, trashed: false }]);
+    handle.failTrash = true;
+    await page.goto("/session/sess-trash");
+
+    await confirmDelete(await openDeleteDialogFromRow(page, row(page)));
+    await expect.poll(() => handle.trashedIds.length, { timeout: 10_000 }).toBe(1);
+    await expect(trashToggle(page)).toHaveCount(0, { timeout: 5_000 });
+  });
+
+  test("Delete from the Trash panel opens the permanent-delete dialog", async ({ page }) => {
+    const handle = await installTrashMocks(page, [{ ...SESSION, trashed: true }]);
+    await page.goto("/");
+    await openTrash(page);
+
+    // Deleting an already-trashed row goes straight to permanent delete.
+    const dialog = await openPurgeDialog(page, trashRows(page).filter({ hasText: "story-trash" }));
+    await expect(dialog.locator('[data-testid="delete-session-permanent"]')).toHaveCount(0);
+    await confirmDelete(dialog);
+    await expect.poll(() => handle.deletedIds.length, { timeout: 10_000 }).toBe(1);
+  });
+
+  test("long trashed session names keep Trash actions and the delete dialog usable", async ({ page }) => {
+    const title = `story-trash-${"x".repeat(240)}`;
+    const handle = await installTrashMocks(page, [{ ...SESSION, title, trashed: true }]);
+    await page.goto("/");
+
+    await trashToggle(page).click();
+    const panelBox = (await page.locator('[data-testid="sidebar-trash-menu"]').boundingBox())!;
+    const toggleBox = (await trashToggle(page).boundingBox())!;
+    expect(panelBox.x + panelBox.width).toBeGreaterThan(toggleBox.x + toggleBox.width + 100);
+
+    const trashRow = trashRows(page).filter({ hasText: title });
+    await expect(trashRow).toBeVisible({ timeout: 10_000 });
+    await expect(trashRow.locator('[data-testid="sidebar-trash-open"]')).toContainText("Open");
+    const restore = trashRow.locator('[data-testid="sidebar-trash-restore"]');
+    await expect(restore).toContainText("Restore");
+    await expect(restore).toBeInViewport({ ratio: 1 });
+    const purge = trashRow.locator('[data-testid="sidebar-trash-purge"]');
+    await expect(purge).toContainText("Delete");
+    await expect(purge).toBeInViewport({ ratio: 1 });
+
+    const dialog = await openPurgeDialog(page, trashRow);
+    await expect(dialog).toContainText(title);
+    await expect(dialog.getByRole("button", { name: /^Delete$/ })).toBeInViewport({ ratio: 1 });
+    const panelFits = await dialog
+      .locator('[data-testid="delete-session-dialog-panel"]')
+      .evaluate((node) => node.scrollWidth <= node.clientWidth);
+    expect(panelFits).toBe(true);
+
+    await confirmDelete(dialog);
+    await expect.poll(() => handle.deletedIds.length, { timeout: 10_000 }).toBe(1);
+  });
+});
+
+// #2530, #2533: sessions on one `repoPath::branch` form one workspace even when
+// split across user groups; trash, restore and delete act on the whole workspace.
+test.describe("Multi-session workspace trash", () => {
+  // The group axis slices the workspace by group_path; the repo axis cannot reproduce #2533.
+  const workspace = (...parts: Array<{ id: string; groupPath: string; trashed: boolean; deleteToTrash?: boolean }>) =>
+    parts.map((p) => ({ ...p, projectPath: "/tmp/repo", mainRepoPath: "/tmp/repo", branch: "feat/x" }));
+  const install = (page: Page, sessions: ReturnType<typeof workspace>, failDeleteIds?: string[]) =>
+    installTrashMocks(page, sessions, { groupAxis: true, ownerLast: true, failDeleteIds });
+
+  const affected = (dialog: Locator) => ({
+    count: dialog.locator('[data-testid="delete-session-affected-count"]'),
+    list: dialog.locator('[data-testid="delete-session-affected-list"]'),
+  });
+
+  test("live workspace Delete presents workspace trash scope (#2538)", async ({ page }) => {
+    const handle = await install(
+      page,
+      workspace(
+        { id: "sess-a", groupPath: "alpha", trashed: false },
+        { id: "sess-b", groupPath: "alpha", trashed: false },
+      ),
+    );
+    await page.goto("/");
+
+    const dialog = await openDeleteDialogFromRow(page, sessionRows(page).first());
+    await expect(dialog.locator("#delete-session-dialog-title")).toContainText("Delete Workspace");
+    await expect(dialog).toContainText("Move this workspace to Trash?");
+    await expect(affected(dialog).count).toContainText("all 2 sessions");
+    await expect(affected(dialog).list).toContainText("sess-a");
+    await expect(affected(dialog).list).toContainText("sess-b");
+
+    await confirmDelete(dialog);
+    await expect.poll(() => [...handle.trashedIds].sort(), { timeout: 10_000 }).toEqual(["sess-a", "sess-b"]);
+  });
+
+  test("workspace Delete uses trash-first when any live session defaults to Trash (#2538)", async ({ page }) => {
+    await install(
+      page,
+      workspace(
+        { id: "sess-a", groupPath: "alpha", trashed: false, deleteToTrash: false },
+        { id: "sess-b", groupPath: "alpha", trashed: false, deleteToTrash: true },
+      ),
+    );
+    await page.goto("/");
+
+    const dialog = await openDeleteDialogFromRow(page, sessionRows(page).first());
+    await expect(dialog).toContainText("Move this workspace to Trash?", { timeout: 5_000 });
+    await expect(dialog.locator('[data-testid="delete-session-permanent"]')).toBeVisible();
+  });
+
+  test("a workspace trashed in only one group slice does not appear in Trash (#2533)", async ({ page }) => {
+    await install(
+      page,
+      workspace(
+        { id: "sess-a", groupPath: "alpha", trashed: true },
+        { id: "sess-b", groupPath: "beta", trashed: false },
+      ),
+    );
+    await page.goto("/");
+    // A live sibling keeps the workspace out of Trash.
+    await expect(sessionRows(page).first()).toBeVisible({ timeout: 10_000 });
+    await expect(trashToggle(page)).toHaveCount(0, { timeout: 5_000 });
+  });
+
+  test("Restore from Trash restores every session of a split workspace (#2533)", async ({ page }) => {
+    const handle = await install(
+      page,
+      workspace(
+        { id: "sess-a", groupPath: "alpha", trashed: true },
+        { id: "sess-b", groupPath: "beta", trashed: true },
+      ),
+    );
+    await page.goto("/");
+    await openTrash(page, 1);
+
+    await trashRows(page).first().locator('[data-testid="sidebar-trash-restore"]').click();
+    await expect.poll(() => [...handle.restoredIds].sort(), { timeout: 10_000 }).toEqual(["sess-a", "sess-b"]);
+  });
+
+  test("permanent Delete purges every session of a trashed workspace (#2530)", async ({ page }) => {
+    const handle = await install(
+      page,
+      workspace(
+        { id: "sess-a", groupPath: "alpha", trashed: true },
+        { id: "sess-b", groupPath: "beta", trashed: true },
+      ),
+    );
+    await page.goto("/");
+    await openTrash(page);
+
+    const dialog = await openPurgeDialog(page, trashRows(page).first());
+    await expect(dialog.locator("#delete-session-dialog-title")).toContainText("Delete Workspace");
+    await expect(dialog).toContainText("Permanently delete this workspace?");
+    await expect(affected(dialog).count).toContainText("all 2 sessions");
+    await expect(affected(dialog).list).toContainText("sess-a");
+    await expect(affected(dialog).list).toContainText("sess-b");
+    await confirmDelete(dialog);
+
+    await expect.poll(() => [...handle.deletedIds].sort(), { timeout: 10_000 }).toEqual(["sess-a", "sess-b"]);
+    // One request carries the whole workspace; ordering is covered by the Rust order_workspace_deletion tests.
+    expect([...(handle.deleteBodies.at(-1)?.session_ids ?? [])].sort()).toEqual(["sess-a", "sess-b"]);
+  });
+
+  test("a sibling delete failure aborts before the owner and leaves the workspace in Trash (#2530)", async ({
+    page,
+  }) => {
+    // Owner-last: sess-b is removed, sess-c fails and aborts, so the owner survives.
+    const handle = await install(
+      page,
+      workspace(
+        { id: "sess-a", groupPath: "alpha", trashed: true },
+        { id: "sess-b", groupPath: "beta", trashed: true },
+        { id: "sess-c", groupPath: "gamma", trashed: true },
+      ),
+      ["sess-c"],
+    );
+    await page.goto("/");
+    await openTrash(page);
+
+    await confirmDelete(await openPurgeDialog(page, trashRows(page).first()));
+    await expect.poll(() => [...handle.deletedIds].sort(), { timeout: 10_000 }).toEqual(["sess-b"]);
+    await expect(trashToggle(page)).toBeVisible({ timeout: 10_000 });
+  });
+
+  test("a failed owner delete keeps the open owner and does not redirect (#2539 review)", async ({ page }) => {
+    const handle = await install(
+      page,
+      workspace(
+        { id: "sess-a", groupPath: "alpha", trashed: true },
+        { id: "sess-b", groupPath: "beta", trashed: true },
+      ),
+      ["sess-a"],
+    );
+    await page.goto("/session/sess-a");
+    await openTrash(page);
+
+    const dialog = await openPurgeDialog(page, trashRows(page).first());
+    await confirmDelete(dialog);
+
+    await expect(dialog).toHaveCount(0, { timeout: 10_000 });
+    await expect.poll(() => handle.deletedIds, { timeout: 5_000 }).toEqual(["sess-b"]);
+    await expect(page).toHaveURL(/\/session\/sess-a/);
+  });
+
+  for (const open of ["sess-a", "sess-b"] as const) {
+    test(`redirects to / after the open ${open === "sess-a" ? "primary" : "sibling"} is purged`, async ({ page }) => {
+      await install(
+        page,
+        workspace(
+          { id: "sess-a", groupPath: "alpha", trashed: true },
+          { id: "sess-b", groupPath: "beta", trashed: true },
+        ),
+      );
+      await page.goto(`/session/${open}`);
+      await openTrash(page);
+
+      await confirmDelete(await openPurgeDialog(page, trashRows(page).first()));
+      await expect(page).toHaveURL(/\/$/, { timeout: 10_000 });
+    });
+  }
+});
+
+// #3167: Empty Trash confirms with the count and purges each trashed workspace
+// with one atomic DELETE.
+test.describe("Empty Trash", () => {
+  async function confirmEmptyTrash(page: Page) {
+    await page.locator('[data-testid="sidebar-trash-empty"]').click();
+    const dialog = page.locator('[data-testid="empty-trash-dialog"]');
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
+    return dialog;
+  }
+
+  test("purges every trashed workspace after confirm (#3167)", async ({ page }) => {
+    const handle = await installTrashMocks(page, [
+      {
+        id: "sess-a",
+        branch: "feat/a",
+        mainRepoPath: "/tmp/sess-a",
+        trashed: true,
+        cleanableWorktree: true,
+        sandboxed: true,
+      },
+      { id: "sess-b", branch: "feat/b", mainRepoPath: "/tmp/sess-b", trashed: true },
+    ]);
+    await page.goto("/");
+    await openTrash(page, 2);
+
+    const dialog = await confirmEmptyTrash(page);
+    await expect(dialog).toContainText("Permanently delete 2 trashed sessions? This cannot be undone.");
+    await dialog.locator('[data-testid="empty-trash-confirm"]').click();
+
+    await expect.poll(() => [...handle.deletedIds].sort(), { timeout: 10_000 }).toEqual(["sess-a", "sess-b"]);
+
+    // Forced like the TUI, with each workspace's cleanup flags.
+    const byId = new Map(handle.deleteBodies.map((b) => [(b.session_ids ?? [])[0], b]));
+    expect(byId.get("sess-a")).toMatchObject({
+      session_ids: ["sess-a"],
+      force_delete: true,
+      delete_worktree: true,
+      delete_branch: true,
+      delete_sandbox: true,
+    });
+    expect(byId.get("sess-b")).toMatchObject({
+      session_ids: ["sess-b"],
+      force_delete: true,
+      delete_worktree: false,
+      delete_branch: false,
+      delete_sandbox: false,
+    });
+    await expect(trashToggle(page)).toHaveCount(0, { timeout: 10_000 });
+  });
+
+  test("a partial failure keeps the failed workspace in Trash and toasts one summary (#3167)", async ({ page }) => {
+    const handle = await installTrashMocks(
+      page,
+      [
+        { id: "sess-a", branch: "feat/a", mainRepoPath: "/tmp/sess-a", trashed: true },
+        { id: "sess-b", branch: "feat/b", mainRepoPath: "/tmp/sess-b", trashed: true },
+      ],
+      { failDeleteIds: ["sess-b"] },
+    );
+    await page.goto("/");
+    await openTrash(page, 2);
+
+    const dialog = await confirmEmptyTrash(page);
+    await dialog.locator('[data-testid="empty-trash-confirm"]').click();
+
+    // Every workspace is still attempted; one summary toast reports the failure.
+    await expect(page.getByRole("alert")).toContainText("Some trashed sessions could not be deleted", {
+      timeout: 10_000,
+    });
+    await expect.poll(() => [...handle.deletedIds], { timeout: 10_000 }).toEqual(["sess-a"]);
+    expect(handle.deleteBodies.length).toBe(2);
+    await expect(trashToggle(page)).toHaveCount(1, { timeout: 10_000 });
+  });
+
+  test("is a no-op with an empty trash: the control is absent (#3167)", async ({ page }) => {
+    const handle = await installTrashMocks(page, [
+      { id: "sess-live", branch: "feat/live", mainRepoPath: "/tmp/sess-live", trashed: false },
+    ]);
+    await page.goto("/");
+    await expect(sessionRows(page).first()).toBeVisible({ timeout: 10_000 });
+    await expect(trashToggle(page)).toHaveCount(0, { timeout: 5_000 });
+    await expect(page.locator('[data-testid="sidebar-trash-empty"]')).toHaveCount(0, { timeout: 5_000 });
+    expect(handle.deleteBodies.length).toBe(0);
+  });
+});
+
+// Deleting the session you are viewing: the row disappears and the route falls
+// back to the dashboard. The dialog's checkbox-to-DELETE-body mapping is
+// covered by the DeleteSessionDialog vitest.
+test.describe("Delete active session", () => {
+  test("deleting the active session removes the row and falls back to /", async ({ page }) => {
+    const handle = await installTrashMocks(page, [
+      {
+        id: "sess-active",
+        title: "story-delete-active",
+        projectPath: "/tmp/story",
+        groupPath: "/tmp",
+        trashed: false,
+        deleteToTrash: false,
+      },
+    ]);
+    await page.goto("/session/sess-active");
+    await expect(page).toHaveURL(/\/session\/sess-active/);
+
+    const row = sessionRows(page).filter({ hasText: "story-delete-active" }).first();
+    await confirmDelete(await openDeleteDialogFromRow(page, row));
+
+    await expect.poll(() => handle.deleteBodies.length, { timeout: 10_000 }).toBe(1);
+    await expect(page).not.toHaveURL(/\/session\/sess-active/, { timeout: 10_000 });
+    await expect(row).toHaveCount(0, { timeout: 10_000 });
+  });
+});

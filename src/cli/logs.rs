@@ -1,8 +1,4 @@
 //! `aoe logs` - view the configured AoE log file with a pretty viewer.
-//!
-//! Resolves the path from `[logging].file_path`, picks the best available
-//! viewer (lnav > bat > less > plain stdout), and prints a one-line tip when
-//! `lnav` is missing so users know there's a better experience available.
 
 use anyhow::Result;
 use clap::Args;
@@ -101,12 +97,10 @@ pub async fn run(args: LogsArgs) -> Result<()> {
 fn run_viewer(viewer: Viewer, path: &Path, args: &LogsArgs) -> Result<()> {
     match viewer {
         Viewer::Lnav => {
-            // lnav handles --follow natively and ignores --lines.
             Command::new("lnav").arg(path).status()?;
             Ok(())
         }
         Viewer::Bat => {
-            // bat has no follow mode; downgrade to less +F or plain tail.
             if args.follow {
                 let fallback = if which::which("less").is_ok() {
                     Viewer::Less
@@ -123,9 +117,6 @@ fn run_viewer(viewer: Viewer, path: &Path, args: &LogsArgs) -> Result<()> {
         }
         Viewer::Less => {
             if args.follow {
-                // `less +F` on a file can't seek to "last N"; route through
-                // tail when --lines is set so the user only sees the recent
-                // window plus live appends.
                 if let Some(n) = args.lines {
                     return tail_pipe_into(path, n, Command::new("less").args(["-R", "+F"]));
                 }
@@ -187,9 +178,6 @@ fn pipe_through(cmd: &mut Command, content: &str) -> Result<()> {
     Ok(())
 }
 
-/// Spawn `tail -n N -F path` and feed its stdout into `viewer`'s stdin so the
-/// viewer keeps following live appends while only showing the last N lines.
-/// Kills tail when the viewer exits so we don't leak a background tail.
 fn tail_pipe_into(path: &Path, lines: usize, viewer: &mut Command) -> Result<()> {
     use std::process::Stdio;
     let mut tail = Command::new("tail")

@@ -1,16 +1,4 @@
 // @vitest-environment jsdom
-//
-// FullFileViewer contract (#1810, #4003): the whole-file view for a file with
-// no diff against the base. It renders through the shared `@pierre/diffs` file
-// renderer, so what is worth pinning here is the handoff, that the file name
-// and text reach the renderer unchanged, that line numbers are left enabled,
-// and that a file switch re-keys the view instead of reusing the previous
-// file's instance.
-//
-// The renderer manipulates the DOM and spins up workers, neither of which runs
-// under jsdom, so it is mocked with a stand-in that surfaces what it was
-// handed (the same approach as the DiffFileViewer specs). Real rendering,
-// including the gutter itself, is covered by the live Playwright suite.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render } from "@testing-library/react";
@@ -24,6 +12,9 @@ vi.mock("../pierre/DiffWorkerPoolProvider", () => ({
   DiffWorkerPoolProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
 }));
 
+// Stubbed: the renderer touches the DOM and spins up workers, neither of
+// which runs under jsdom. The stand-in surfaces what it was handed; the real
+// gutter is covered by the live Playwright suite.
 vi.mock("@pierre/diffs/react", () => ({
   Virtualizer: ({ children }: { children: React.ReactNode }) => <div data-testid="virtualizer">{children}</div>,
   File: ({

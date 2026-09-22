@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-//
-// Behavior contract for the tip-of-the-day modal: shows one tip at a time,
-// Previous/Next cycle through them, each shown tip is marked seen, and the
-// "Show tips on startup" checkbox reflects and toggles the preference. The
-// persistence round-trip (GET /api/tips, mark-seen, show toggle) is covered by
-// web/tests/live/tips.spec.ts; this suite is pure prop-driven.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";

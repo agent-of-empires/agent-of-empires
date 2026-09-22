@@ -4,6 +4,7 @@ import { useLongPressDrag, type DragAxis } from "../hooks/useLongPressDrag";
 import { bracketedPaste, readClipboardText } from "../lib/clipboard";
 import { toastBus } from "../lib/toastBus";
 import { invalidateRetainedImeContext } from "../lib/mobileKeyboardProxy";
+import { StrokeIcon } from "./icons";
 
 function execCommandPaste(): boolean {
   try {
@@ -41,9 +42,8 @@ export function MobileTerminalToolbar({ sendData, keyboardOpen, ctrlActive, onCt
     if (keyboardOpen) inputElRef.current?.focus();
   }, [inputElRef, keyboardOpen]);
 
-  // Every toolbar key reaches the PTY without a `beforeinput` on either
-  // hidden input, so the retained IME syllable stops mirroring the line it
-  // shadowed. Drop it before the key lands. See #3877.
+  // Every toolbar key reaches the PTY without a `beforeinput` on either hidden input, so the retained IME syllable
+  // stops mirroring the line it shadowed.
   const sendOutOfBand = useCallback(
     (data: string) => {
       invalidateRetainedImeContext(inputElRef.current);
@@ -91,8 +91,6 @@ export function MobileTerminalToolbar({ sendData, keyboardOpen, ctrlActive, onCt
     <div
       className={strip}
       // Prevent toolbar taps from stealing focus away from the proxy input.
-      // Without this, every button tap blurs the proxy and iOS closes the
-      // soft keyboard. onClick handlers still fire normally.
       onMouseDown={(e) => e.preventDefault()}
     >
       <button type="button" aria-label="Arrow up" className={btnBase} {...upHandlers}>
@@ -140,11 +138,7 @@ export function MobileTerminalToolbar({ sendData, keyboardOpen, ctrlActive, onCt
           haptic();
           const t = toastBus.handler;
           if (!window.isSecureContext) {
-            // No Clipboard API on a plain-HTTP origin. WebKit still honours
-            // execCommand("paste") from a tap, behind its own Paste prompt,
-            // when an editable is focused: the paste event lands on the
-            // terminal's input, whose handler brackets it. Other engines
-            // return false. Must run before any await to stay in the gesture.
+            // No Clipboard API on a plain-HTTP origin.
             const active = document.activeElement;
             const editable = active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement;
             if (keyboardOpen && editable && execCommandPaste()) return;
@@ -159,20 +153,10 @@ export function MobileTerminalToolbar({ sendData, keyboardOpen, ctrlActive, onCt
           t?.error("Couldn't read clipboard. Try copying again, or open this dashboard in Safari.");
         }}
       >
-        <svg
-          width="14"
-          height="14"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-        >
+        <StrokeIcon size={14} strokeWidth="2" hidden>
           <rect x="9" y="2" width="6" height="4" rx="1" />
           <path d="M8 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-2" />
-        </svg>
+        </StrokeIcon>
       </button>
     </div>
   );

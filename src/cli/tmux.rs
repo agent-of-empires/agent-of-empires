@@ -47,7 +47,6 @@ pub fn run_status(args: TmuxStatusArgs) -> Result<()> {
             }
         }
         None => {
-            // Not in an aoe session - output nothing (cleaner for tmux status bar)
             if args.format == "json" {
                 println!("null");
             }

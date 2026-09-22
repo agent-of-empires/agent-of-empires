@@ -1,171 +1,43 @@
 # tmux Status Bar
 
-Agent of Empires can display session information in your tmux status bar, showing:
-- **Session title**: The name of your aoe session
-- **Git branch**: For worktree sessions
-- **Container name**: For sandboxed (Docker) sessions
+aoe can paint its own themed status bar on the sessions it creates, showing the session title, the branch for worktree sessions, and the container name for sandboxed ones:
 
-## How It Works
-
-When you start a session, aoe configures the tmux status bar to display this information in your active theme's colors (Empire by default).
-
-**Example status bars:**
 ```
-aoe: My Session | 14:30                           # Basic session
-aoe: My Session | feature-branch | 14:30          # Worktree session
-aoe: My Session ⬡ aoe-sandbox-a1b2c3d4 | 14:30     # Sandboxed session
-aoe: My Session | main ⬡ aoe-sandbox-a1b2c3d4 | 14:30  # Worktree + sandbox
+aoe: My Session | feature-branch | 14:30
+aoe: My Session ⬡ aoe-sandbox-a1b2c3d4 | 14:30
 ```
 
-## Auto Mode (Default)
+`[tmux] status_bar` controls it: `"auto"` (default) paints the bar only when you have no tmux config, since the bar is a whole theme and a half-merge with yours would please nobody; `"enabled"` always paints it; `"disabled"` never does and reverts aoe's session-scoped `status*` overrides, so your own config governs. `mouse` and `clipboard` share the same three modes but a narrower `"auto"`: each defers only when your tmux config sets that specific option. See the [configuration reference](configuration.md#tmux) for the full table and which files are scanned.
 
-By default, aoe uses "auto" mode for the status bar:
+## Clipboard pass-through
 
-- **If you don't have a `~/.tmux.conf`**: aoe automatically styles the status bar for aoe sessions
-- **If you have a `~/.tmux.conf`**: aoe assumes you prefer your own configuration and does not modify the status bar
+TUI agents copy to the system clipboard with OSC 52 escape sequences, which tmux swallows by default, so "select to copy" inside an agent silently fails. With pass-through on, aoe sets `set-clipboard on` and `allow-passthrough on` for its sessions and those sequences reach your terminal. Set `clipboard = "disabled"` if you do not trust the wrapped agent's output, since pass-through lets the inner program write arbitrary escape sequences to your outer terminal. If you manage your own config, set both options yourself. Some terminals also need clipboard write permission enabled (Ghostty's `clipboard-write = allow`).
 
-This ensures beginners get a helpful status bar out of the box, while experienced tmux users retain full control.
+## Using your own status bar
 
-## Configuration
-
-Configure the status bar behavior in `~/.agent-of-empires/config.toml`:
-
-```toml
-[tmux]
-# "auto" (default) - Apply only if no ~/.tmux.conf exists
-# "enabled"        - Always apply aoe status bar styling
-# "disabled"       - Never apply, use your own tmux config
-status_bar = "auto"
-mouse = "auto"     # Same modes, but see the note below on what "auto" means here
-clipboard = "auto" # Same modes, and the same per-option "auto" as mouse
-```
-
-All three settings share the same three modes, but they differ in what `"auto"`
-looks at. The status bar is a whole theme, nine tmux options wide, so its
-`"auto"` steps aside whenever you have a tmux config at all. `mouse` and
-`clipboard` each map to specific tmux options, so their `"auto"` steps aside only
-when your config actually sets one of those options, and applies aoe's value
-otherwise. That matters because tmux's own defaults for `mouse` and
-`set-clipboard` are off while the Web dashboard's touch scroll and agent
-"select to copy" need them on: a config that exists for a prefix key or a theme
-and never mentions them still gets both features. See
-[Configuration](configuration.md) for the full table and for which files are
-scanned.
-
-### Values
-
-| Value | Description |
-|-------|-------------|
-| `auto` | Apply status bar if user has no tmux config (default) |
-| `enabled` | Always apply aoe status bar to aoe sessions |
-| `disabled` | Never modify tmux status bar |
-
-## Clipboard Pass-through
-
-TUI agents copy to the system clipboard via OSC 52 escape sequences, which tmux swallows by default, so "select to copy" inside the agent silently fails. With clipboard pass-through (the default in `auto` mode unless your own tmux config sets `set-clipboard` or `allow-passthrough`), aoe lets those sequences reach your terminal emulator.
-
-Set `clipboard = "disabled"` if you don't trust the wrapped agent's terminal output (pass-through lets the inner program write arbitrary escape sequences to your outer terminal).
-
-If you manage your own `~/.tmux.conf`, set these yourself:
-
-```tmux
-set -g set-clipboard on
-set -g allow-passthrough on
-```
-
-Some terminal emulators also need clipboard write permission enabled (Ghostty's `clipboard-write = allow`, etc.).
-
-## Custom Integration
-
-If you have your own tmux configuration but want to display aoe session info, use the `aoe tmux status` command.
-
-### Basic Integration
-
-Add this to your `~/.tmux.conf`:
+`aoe tmux status` prints the current session's info, and returns nothing outside an aoe session:
 
 ```tmux
 set -g status-right "#(aoe tmux status) | %H:%M"
 ```
 
-This will show the aoe session title and branch when attached to an aoe session, and nothing when in other tmux sessions.
+`aoe tmux status --format json` emits `{"title": "My Session", "branch": "feature-branch", "sandbox": null}` for scripting.
 
-### JSON Output
-
-For more advanced scripting:
-
-```bash
-aoe tmux status --format json
-```
-
-Output:
-```json
-{"title": "My Session", "branch": "feature-branch", "sandbox": null}
-```
-
-For a sandboxed session:
-```json
-{"title": "My Session", "branch": null, "sandbox": "aoe-sandbox-a1b2c3d4"}
-```
-
-Returns `null` if not in an aoe session.
-
-### Example: Conditional Display
-
-```tmux
-# Only show aoe info if in an aoe session
-set -g status-right "#{?#{==:#(aoe tmux status),},,%#(aoe tmux status) | }%H:%M"
-```
-
-## tmux User Options
-
-aoe sets `@aoe_title`, `@aoe_branch` (worktree sessions), `@aoe_sandbox` (sandboxed sessions), and `@aoe_kind` on each session, which you can reference in your own config:
+aoe also sets tmux user options on each session: `@aoe_title`, `@aoe_branch` (worktree sessions), `@aoe_sandbox` (sandboxed sessions), and `@aoe_kind`.
 
 ```tmux
 set -g status-right "#{@aoe_title} #{@aoe_branch} #{@aoe_sandbox} | %H:%M"
-```
 
-`@aoe_kind` is what kind of session it is: `agent`, `term` (paired terminal),
-`cterm` (container terminal), or `tool`. It is written when the session is
-created and survives renames, so it stays accurate where the session name
-cannot: a title such as `term notes` gives an agent session a name shaped like
-a paired terminal's. A session started by an earlier aoe carries no value until
-it is restarted.
-
-Read it, but do not set it. A value of yours at server (`set -s`), window
-(`set -w`) or global-window (`set -gw`) scope does not sit behind the one aoe
-writes, it replaces it for every session on the server, and a global-session
-one (`set -g`) is read by every session that has no value of its own. aoe
-discards any value the server-wide scopes could have produced rather than
-believe a pane is something it is not, so setting one costs you the marker
-entirely: those sessions fall back to being classified by name, which is the
-ambiguity `@aoe_kind` exists to remove. Window and pane scope vary per pane
-and cannot be discarded this way at all.
-
-```tmux
 # Only decorate the agent pane
 set -g status-right "#{?#{==:#{@aoe_kind},agent},#{@aoe_title},} | %H:%M"
 ```
 
+`@aoe_kind` is `agent`, `term` (paired terminal), `cterm` (container terminal), or `tool`. It is written at creation and survives renames, so it stays accurate where the session name cannot: a title such as `term notes` gives an agent session a name shaped like a paired terminal's. Sessions started by an earlier aoe carry no value until they restart.
+
+Read `@aoe_kind`, but do not set it. A value at server, window, or global-window scope replaces aoe's for every session on the server rather than sitting behind it, and aoe discards values those scopes could have produced rather than believe a pane is something it is not. Setting one therefore costs you the marker entirely, and those sessions fall back to being classified by name, which is the ambiguity `@aoe_kind` exists to remove.
+
 ## Troubleshooting
 
-### Status bar not showing
-
-1. Check if you have a `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`, or `~/.config/tmux/tmux.conf`
-2. If so, either:
-   - Set `status_bar = "enabled"` in your aoe config
-   - Or add `aoe tmux status` to your tmux.conf manually
-
-### Status bar shows old info
-
-Renaming a session refreshes `@aoe_title` on its agent pane straight away. The
-paired terminal and container panes keep the old title, and `@aoe_branch` keeps
-the old branch after a tied worktree branch rename, until those sessions are
-restarted.
-
-### Branch not showing
-
-Branch is only displayed for worktree sessions (sessions created with `aoe add --worktree`). Regular sessions don't have a fixed branch.
-
-### Container not showing
-
-Container name is only displayed for sandboxed sessions (sessions created with `aoe add --sandbox`). The container name follows the pattern `aoe-sandbox-<session_id_first_8_chars>`.
+- **No status bar**: you have a tmux config, so `"auto"` stepped aside. Set `status_bar = "enabled"`, or add `aoe tmux status` to your own config.
+- **Stale info**: renaming a session refreshes `@aoe_title` on its agent pane immediately, but the paired terminal and container panes keep the old title, and `@aoe_branch` keeps the old branch after a tied branch rename, until those sessions restart.
+- **No branch or container**: those are shown only for worktree and sandboxed sessions. Container names follow `aoe-sandbox-<first 8 chars of session id>`.

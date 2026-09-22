@@ -6,16 +6,6 @@ use agent_client_protocol::schema::v1::SessionUpdate;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-/// Per-tool metadata stored in the silent-orphan watchdog's
-/// `tool_calls_in_flight` map. Lets the watchdog remember the original
-/// `run_in_background` flag observed at `ToolStarted` time so the
-/// completion path can flip `off_protocol_work_seen` even if the
-/// completion content marker is missing or reshaped. See #1401.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct ToolMetadata {
-    pub(super) is_background_task: bool,
-}
-
 pub(super) type ToolContextCache = Arc<std::sync::Mutex<ToolCallContextCache>>;
 
 pub(super) const TOOL_CONTEXT_CACHE_LIMIT: usize = 256;

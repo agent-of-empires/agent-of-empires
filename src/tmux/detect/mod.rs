@@ -1,14 +1,6 @@
-//! Manifest-driven pane status detection.
-//!
-//! Each agent's detection is a table of rules (`manifests/<agent>.toml`)
-//! rather than a hand-written chain of checks: a rule names its state, the
-//! screen [`region`] its evidence appears in, a priority, and a matcher.
-//! Highest matching priority wins.
-//!
-//! The hook file is a rule like any other, so its authority is declared next
-//! to the screen rules it competes with. A blocking prompt on screen outranks
-//! a `running` write, and a `running` write carries a freshness bound, so a
-//! lost terminating hook cannot pin a parked session on Running.
+//! Manifest-driven pane status detection: each agent's rules
+//! (`manifests/<agent>.toml`) name a state, a screen [`region`], a priority and
+//! a matcher; the highest matching priority wins. The hook file is a rule too.
 
 mod manifest;
 mod region;
@@ -21,8 +13,6 @@ pub use manifest::HookObservation;
 use manifest::Manifest;
 use region::Screen;
 
-/// Rule sources, embedded so a build carries its detection data. TOML is
-/// exempt from the `flake.nix` embedded-asset list, so these need no entry.
 const MANIFEST_SOURCES: &[(&str, &str)] = &[
     ("claude", include_str!("manifests/claude.toml")),
     ("cursor", include_str!("manifests/cursor.toml")),
@@ -42,18 +32,14 @@ const MANIFEST_SOURCES: &[(&str, &str)] = &[
 /// What one capture says about a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Detection {
-    /// `None` when the screen is an agent-owned viewer: the last known status
-    /// stands rather than being overwritten by what the pager happens to show.
+    /// `None` for an agent-owned viewer: the last known status stands.
     pub status: Option<Status>,
-    /// The matching rule read this state off the agent's own live chrome, so
-    /// it is worth publishing without waiting for a confirming poll.
+    /// Read off the agent's live chrome, so it can publish without a second poll.
     pub visible: bool,
-    /// The rule that decided, for the status-change log.
     pub rule: &'static str,
 }
 
 impl Detection {
-    /// Nothing matched: no evidence of work or of a prompt.
     pub(crate) fn idle_by_default() -> Self {
         Self {
             status: Some(Status::Idle),
@@ -73,9 +59,7 @@ fn manifests() -> &'static HashMap<&'static str, Manifest> {
                     debug_assert_eq!(&m.id, agent, "manifest id must match its file name");
                     map.insert(*agent, m);
                 }
-                // Unreachable in a tested build (`manifests_compile` covers
-                // every embedded file); losing one agent's rules to pane
-                // detection is better than refusing to start.
+                // Unreachable in a tested build (`manifests_compile`).
                 Err(e) => tracing::error!(target: "tmux.status",
                     "detection manifest for {agent} failed to compile, \
                      falling back to hookless idle: {e}"),
@@ -85,18 +69,12 @@ fn manifests() -> &'static HashMap<&'static str, Manifest> {
     })
 }
 
-/// Whether `agent` is detected from a manifest rather than a hand-written
-/// detector.
 pub fn has_manifest(agent: &str) -> bool {
     manifests().contains_key(agent)
 }
 
-/// Evaluate `agent`'s manifest against one capture.
-///
-/// `screen` must already be ANSI-stripped. `osc_title` is the terminal title
-/// the agent published (tmux's `#{pane_title}`), empty when unknown; `hook` is
-/// the session's status file, `None` when hooks are off or none has been
-/// written yet.
+/// Evaluate `agent`'s manifest. `screen` is ANSI-stripped; `osc_title` is empty
+/// when unknown; `hook` is `None` without a status file.
 pub fn detect(
     agent: &str,
     screen: &str,
@@ -110,19 +88,13 @@ pub fn detect(
     };
     tracing::trace!(target: "tmux.status", "{agent} detection: rule {} matched", rule.id);
     Some(Detection {
-        // A viewer rule carries no state: the caller holds what it had.
         status: (!rule.skip_state_update).then_some(rule.state).flatten(),
         visible: rule.visible,
-        // Manifests are parsed once into a process-lifetime map, so the log
-        // borrows the rule id rather than copying it per poll.
         rule: rule.id.as_str(),
     })
 }
 
-/// Whether one named rule matches, regardless of what else does. Fixture
-/// tests assert the shape they claim to exercise is actually present, so a
-/// fixture that stops carrying its signal fails loudly instead of passing on
-/// some other rule.
+/// Whether one named rule matches, so fixtures prove they carry their signal.
 #[cfg(test)]
 pub(crate) fn rule_matches(
     agent: &str,
@@ -136,8 +108,6 @@ pub(crate) fn rule_matches(
     manifest.rule_matches(rule_id, &parsed, hook)
 }
 
-/// A rule's declared freshness bound, so boundary tests derive it from the
-/// manifest instead of restating the number.
 #[cfg(test)]
 pub(crate) fn rule_max_age(agent: &str, rule_id: &str) -> Option<std::time::Duration> {
     manifests()

@@ -1,11 +1,7 @@
 import type { SettingsFieldDescriptor } from "../../lib/types";
 import type { TabId } from "../SettingsView";
 
-// Maps a schema section to the settings tab that renders it. Identity for most
-// sections; `web` lives under the Notifications tab and `acp` under the
-// Structured view tab (see renderTabContent in SettingsView). Sections absent
-// here have no web tab, so their fields are excluded from search: a hit must be
-// able to jump somewhere.
+// Section to settings tab; sections without a web tab are not searchable.
 export const SECTION_TO_TAB: Record<string, TabId> = {
   session: "session",
   sandbox: "sandbox",
@@ -25,16 +21,13 @@ export interface SettingsSearchHit {
   tab: TabId;
   label: string;
   description: string;
-  /** Settings tab label shown as a badge next to the hit. */
   category: string;
   advanced: boolean;
   /** Text the fuzzy filter matches against: label, description, section, field. */
   searchText: string;
 }
 
-// Build the searchable settings index from the schema. Skips fields the
-// dashboard cannot write (`local_only`, rejected by the server PATCH) and
-// sections with no web tab, mirroring what SchemaSection actually renders.
+// Mirrors what SchemaSection renders: no `local_only` fields or tab-less sections.
 export function buildSettingsSearchIndex(schema: SettingsFieldDescriptor[]): SettingsSearchHit[] {
   const hits: SettingsSearchHit[] = [];
   for (const d of schema) {

@@ -1,49 +1,42 @@
-//! Rate-limit classification, and the rejected-window reset time aoe
-//! reports from captured usage metadata.
+//! Rate-limit classification and the captured rejected-window reset time.
 
 use crate::acp::state::RateLimitInfo;
 use std::collections::HashMap;
 
-/// Classify a structured prompt error as a rate limit. Reset time comes only
-/// from a separately captured rejected-window epoch; localized message text is
-/// displayed verbatim but never parsed or guessed.
+/// Reset time comes only from a captured rejected-window epoch; the localized
+/// message is displayed verbatim, never parsed.
 pub(crate) fn classify_rate_limit_error(
     err: &agent_client_protocol::Error,
     captured_resets_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Option<RateLimitInfo> {
-    let data = err.data.as_ref()?;
-    let kind = data.get("errorKind").and_then(|v| v.as_str())?;
-    if kind != "rate_limit" {
-        return None;
-    }
-    Some(RateLimitInfo {
+    let kind = err.data.as_ref()?.get("errorKind")?.as_str()?;
+    (kind == "rate_limit").then(|| RateLimitInfo {
         status: err.message.clone(),
         resets_at: captured_resets_at,
         kind: kind.to_string(),
     })
 }
 
-/// Fallback for an outer error that preserved only the adapter's serialized
-/// `errorKind` fingerprint.
+/// Fallback for an outer error that kept only the serialized `errorKind`.
 pub(crate) fn classify_rate_limit_from_message(
     message: &str,
     captured_resets_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Option<RateLimitInfo> {
-    if !message.contains("\"errorKind\":\"rate_limit\"")
-        && !message.contains("\"errorKind\": \"rate_limit\"")
-    {
-        return None;
-    }
-    Some(RateLimitInfo {
+    let matched = [
+        "\"errorKind\":\"rate_limit\"",
+        "\"errorKind\": \"rate_limit\"",
+    ]
+    .iter()
+    .any(|fingerprint| message.contains(fingerprint));
+    matched.then(|| RateLimitInfo {
         status: message.to_string(),
         resets_at: captured_resets_at,
         kind: "rate_limit".to_string(),
     })
 }
 
-/// Recognize missing stored session IDs, not unsupported session features.
-/// A storage-origin session may be lost before any prompt. The caller resets
-/// its identity while preserving the transcript for replay.
+/// A stored session ID the agent no longer knows, as opposed to an
+/// unsupported session feature.
 pub(crate) fn is_unsupported_session_error(err: &agent_client_protocol::Error) -> bool {
     const PHRASES: &[&str] = &[
         "unsupported acp session",
@@ -56,26 +49,22 @@ pub(crate) fn is_unsupported_session_error(err: &agent_client_protocol::Error) -
     PHRASES.iter().any(|phrase| msg.contains(phrase))
 }
 
-/// One observation of the SDK's rate-limit state, as forwarded by
-/// claude-agent-acp under a `usage_update`'s
-/// `_meta["_claude/rateLimit"]` (an `SDKRateLimitInfo`).
+/// A rejected window from a `usage_update`'s `_meta["_claude/rateLimit"]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RateLimitRejection {
-    /// `rateLimitType` ("five_hour", "seven_day", ...), or empty when the
-    /// adapter omitted it. Used as the per-window map key so one window's
-    /// reset cannot overwrite another's.
+    /// `rateLimitType`, or empty; keys captures so windows cannot overwrite
+    /// each other.
     pub(super) window: String,
-    /// `resetsAt`, unix SECONDS.
     pub(super) resets_at_secs: i64,
 }
 
-/// Extract only rejected rate-limit windows. Warning epochs cannot be matched
-/// reliably to a later rejected window. Millisecond epochs are normalized.
+/// Only rejections are retained: a warning's epoch cannot be tied to the
+/// window that later rejects (#3152).
 pub(super) fn rate_limit_rejection_from_meta(
     meta: &Option<agent_client_protocol::schema::v1::Meta>,
 ) -> Option<RateLimitRejection> {
     let info = meta.as_ref()?.get("_claude/rateLimit")?;
-    if info.get("status").and_then(|v| v.as_str())? != "rejected" {
+    if info.get("status")?.as_str()? != "rejected" {
         return None;
     }
     let v = info.get("resetsAt")?;
@@ -83,8 +72,7 @@ pub(super) fn rate_limit_rejection_from_meta(
     if raw <= 0 {
         return None;
     }
-    // Anthropic reports unix seconds; anything past ~year 5138 in seconds
-    // is really milliseconds.
+    // Seconds past ~year 5138 are really milliseconds.
     let resets_at_secs = if raw > 100_000_000_000 {
         raw / 1000
     } else {
@@ -100,8 +88,7 @@ pub(super) fn rate_limit_rejection_from_meta(
     })
 }
 
-/// Return the latest future reset because every rejected window must clear.
-/// Expired observations are ignored and missing data remains unknown.
+/// The latest future reset, since every rejected window must clear.
 pub(super) fn captured_rate_limit_resets_at(
     captures: &std::sync::Mutex<HashMap<String, i64>>,
     now: chrono::DateTime<chrono::Utc>,
@@ -118,218 +105,137 @@ pub(super) fn captured_rate_limit_resets_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    // #3152: with no captured rejection epoch the reset is unknown, and an
-    // unknown reset must stay unknown. The old `now + 1h` fallback showed a
-    // fabricated clock time in the banner.
-    #[test]
-    fn classify_rate_limit_recognises_data_errorkind_without_inventing_a_reset() {
+    fn err(message: &str, data: Option<serde_json::Value>) -> agent_client_protocol::Error {
         let mut err = agent_client_protocol::Error::internal_error();
-        err.message = "You've hit your limit · resets 12:10pm (Europe/Paris)".into();
-        err.data = Some(serde_json::json!({ "errorKind": "rate_limit" }));
-        let info = classify_rate_limit_error(&err, None).expect("classified");
+        err.message = message.into();
+        err.data = data;
+        err
+    }
+
+    #[test]
+    fn classify_rate_limit_error_cases() {
+        let limit = json!({ "errorKind": "rate_limit" });
+        let captured = chrono::Utc::now() + chrono::Duration::minutes(10);
+
+        // #3152: no captured epoch means an unknown reset, never a guess.
+        let info =
+            classify_rate_limit_error(&err("You've hit your limit", Some(limit.clone())), None)
+                .unwrap();
         assert_eq!(info.kind, "rate_limit");
         assert!(info.status.contains("hit your limit"));
         assert_eq!(info.resets_at, None);
-    }
 
-    // The captured rejection epoch is the only source of a reset time. #3028.
-    #[test]
-    fn classify_rate_limit_uses_captured_resets_at() {
-        let mut err = agent_client_protocol::Error::internal_error();
-        err.message = "You've hit your limit".into();
-        err.data = Some(serde_json::json!({ "errorKind": "rate_limit" }));
-        let captured = chrono::Utc::now() + chrono::Duration::minutes(10);
-        let info = classify_rate_limit_error(&err, Some(captured)).expect("classified");
+        let info = classify_rate_limit_error(&err("limit", Some(limit)), Some(captured)).unwrap();
         assert_eq!(info.resets_at, Some(captured));
-    }
 
-    // The real adapter's error data is `{ errorKind }` only, so a reset in
-    // there is not parsed; the captured epoch decides. #3152.
-    #[test]
-    fn classify_rate_limit_ignores_reset_in_error_data() {
-        let mut err = agent_client_protocol::Error::internal_error();
-        err.message = "rate limited".into();
-        err.data = Some(serde_json::json!({
-            "errorKind": "rate_limit",
-            "resets_at": "2099-01-01T00:00:00Z",
-        }));
-        assert_eq!(
-            classify_rate_limit_error(&err, None)
-                .expect("classified")
-                .resets_at,
-            None
-        );
-    }
+        let with_reset = json!({ "errorKind": "rate_limit", "resets_at": "2099-01-01T00:00:00Z" });
+        let info = classify_rate_limit_error(&err("x", Some(with_reset)), None).unwrap();
+        assert_eq!(info.resets_at, None);
 
-    #[test]
-    fn classify_rate_limit_ignores_unrelated_errors() {
-        let mut err = agent_client_protocol::Error::internal_error();
-        err.message = "transport closed".into();
-        err.data = Some(serde_json::json!({ "errorKind": "internal" }));
-        assert!(classify_rate_limit_error(&err, None).is_none());
-
-        let err = agent_client_protocol::Error::invalid_params();
-        assert!(classify_rate_limit_error(&err, None).is_none());
+        let internal = json!({ "errorKind": "internal" });
+        assert!(classify_rate_limit_error(&err("closed", Some(internal)), None).is_none());
+        let invalid = agent_client_protocol::Error::invalid_params();
+        assert!(classify_rate_limit_error(&invalid, None).is_none());
     }
 
     #[test]
     fn classify_rate_limit_from_message_matches_acp_fingerprint() {
-        let msg = "ACP connection failed: Internal error: You've hit your limit · resets 12:10pm (Europe/Paris): {\n  \"errorKind\":\"rate_limit\"\n}";
-        let info = classify_rate_limit_from_message(msg, None).expect("classified");
-        assert_eq!(info.kind, "rate_limit");
-        // Spaced variant the adapter sometimes emits.
-        let info_spaced =
-            classify_rate_limit_from_message("{\n  \"errorKind\": \"rate_limit\"\n}", None)
-                .expect("classified");
-        assert_eq!(info_spaced.kind, "rate_limit");
+        let captured = chrono::Utc::now() + chrono::Duration::minutes(20);
+        for msg in [
+            "ACP connection failed: Internal error: limit: {\n  \"errorKind\":\"rate_limit\"\n}",
+            "{\n  \"errorKind\": \"rate_limit\"\n}",
+        ] {
+            let info = classify_rate_limit_from_message(msg, Some(captured)).unwrap();
+            assert_eq!(info.kind, "rate_limit");
+            assert_eq!(info.resets_at, Some(captured));
+        }
         assert!(classify_rate_limit_from_message("connection refused", None).is_none());
     }
 
     #[test]
-    fn classify_rate_limit_from_message_uses_captured_resets_at() {
-        let msg = "{\n  \"errorKind\":\"rate_limit\"\n}";
-        let captured = chrono::Utc::now() + chrono::Duration::minutes(20);
-        let info = classify_rate_limit_from_message(msg, Some(captured)).expect("classified");
-        assert_eq!(info.resets_at, Some(captured));
-    }
-
-    fn rate_limit_meta(
-        value: serde_json::Value,
-    ) -> Option<agent_client_protocol::schema::v1::Meta> {
-        let mut meta = serde_json::Map::new();
-        meta.insert("_claude/rateLimit".to_string(), value);
-        Some(meta)
-    }
-
-    // #3028: resetsAt from the usage_update `_meta` is unix seconds; a
-    // millisecond-scale value must be normalized so it can't resolve to a
-    // far-future year.
-    #[test]
-    fn rate_limit_rejection_from_meta_reads_window_and_guards_units() {
-        let secs = 4_102_444_800_i64; // 2100-01-01 in seconds
-        assert_eq!(
-            rate_limit_rejection_from_meta(&rate_limit_meta(serde_json::json!({
-                "status": "rejected",
-                "rateLimitType": "five_hour",
-                "resetsAt": secs,
-            }))),
-            Some(RateLimitRejection {
-                window: "five_hour".to_string(),
-                resets_at_secs: secs,
-            })
-        );
-
-        // Millisecond-scale value normalizes back to seconds; a missing
-        // window keys under the empty string.
-        assert_eq!(
-            rate_limit_rejection_from_meta(&rate_limit_meta(serde_json::json!({
-                "status": "rejected",
-                "resetsAt": secs * 1000,
-            }))),
-            Some(RateLimitRejection {
-                window: String::new(),
-                resets_at_secs: secs,
-            })
-        );
-
-        // No meta, or meta without the rate-limit key, yields nothing.
-        assert_eq!(rate_limit_rejection_from_meta(&None), None);
-        let mut other = serde_json::Map::new();
-        other.insert("claudeCode".to_string(), serde_json::json!({}));
-        assert_eq!(rate_limit_rejection_from_meta(&Some(other)), None);
-    }
-
-    // #3152: a warning carries a real epoch, but nothing ties it to the
-    // window that later rejects, so it must not be retained. Retaining it is
-    // what let a seven-day warning answer a five-hour rejection.
-    #[test]
-    fn rate_limit_rejection_from_meta_ignores_non_rejections() {
+    fn rate_limit_rejection_from_meta_cases() {
         let secs = 4_102_444_800_i64;
-        for status in ["allowed", "allowed_warning"] {
-            assert_eq!(
-                rate_limit_rejection_from_meta(&rate_limit_meta(serde_json::json!({
-                    "status": status,
-                    "rateLimitType": "seven_day",
-                    "resetsAt": secs,
-                }))),
+        let meta = |value| {
+            Some(serde_json::Map::from_iter([(
+                "_claude/rateLimit".to_string(),
+                value,
+            )]))
+        };
+        let rejection = |window: &str| {
+            Some(RateLimitRejection {
+                window: window.to_string(),
+                resets_at_secs: secs,
+            })
+        };
+        let cases = [
+            (
+                meta(
+                    json!({ "status": "rejected", "rateLimitType": "five_hour", "resetsAt": secs }),
+                ),
+                rejection("five_hour"),
+            ),
+            // #3028: millisecond epochs normalize to seconds.
+            (
+                meta(json!({ "status": "rejected", "resetsAt": secs * 1000 })),
+                rejection(""),
+            ),
+            (meta(json!({ "status": "allowed", "resetsAt": secs })), None),
+            (
+                meta(json!({ "status": "allowed_warning", "resetsAt": secs })),
                 None,
-                "status {status} must not be retained"
-            );
+            ),
+            (meta(json!({ "status": "rejected" })), None),
+            (meta(json!({ "status": "rejected", "resetsAt": 0 })), None),
+            (None, None),
+            (
+                Some(serde_json::Map::from_iter([(
+                    "claudeCode".to_string(),
+                    json!({}),
+                )])),
+                None,
+            ),
+        ];
+        for (meta, want) in cases {
+            assert_eq!(rate_limit_rejection_from_meta(&meta), want, "{meta:?}");
         }
-        // A rejection without a usable epoch is nothing to retain either.
-        assert_eq!(
-            rate_limit_rejection_from_meta(&rate_limit_meta(
-                serde_json::json!({ "status": "rejected" })
-            )),
-            None
-        );
-        assert_eq!(
-            rate_limit_rejection_from_meta(&rate_limit_meta(serde_json::json!({
-                "status": "rejected",
-                "resetsAt": 0,
-            }))),
-            None
-        );
     }
 
-    // #3152: every window that rejected has to clear before the session can
-    // run again, so the last reset still ahead of `now` is the answer.
-    // Windows that already rolled over are ignored.
     #[test]
     fn captured_rate_limit_resets_at_takes_the_last_future_window() {
-        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("now");
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
         let five_hour = now + chrono::Duration::hours(2);
         let seven_day = now + chrono::Duration::days(3);
-        let captures = std::sync::Mutex::new(HashMap::from([
-            ("five_hour".to_string(), five_hour.timestamp()),
-            ("seven_day".to_string(), seven_day.timestamp()),
-        ]));
-        assert_eq!(
-            captured_rate_limit_resets_at(&captures, now),
-            Some(seven_day)
-        );
-
-        // The seven-day window rolled over; only the five-hour one is live.
-        let stale = std::sync::Mutex::new(HashMap::from([
-            ("five_hour".to_string(), five_hour.timestamp()),
-            (
-                "seven_day".to_string(),
-                (now - chrono::Duration::days(1)).timestamp(),
-            ),
-        ]));
-        assert_eq!(captured_rate_limit_resets_at(&stale, now), Some(five_hour));
-
-        // Nothing captured, or everything already past, is an unknown reset.
-        assert_eq!(
-            captured_rate_limit_resets_at(&std::sync::Mutex::new(HashMap::new()), now),
-            None
-        );
-        let all_past = std::sync::Mutex::new(HashMap::from([(
-            "five_hour".to_string(),
-            (now - chrono::Duration::minutes(1)).timestamp(),
-        )]));
-        assert_eq!(captured_rate_limit_resets_at(&all_past, now), None);
+        let past = now - chrono::Duration::minutes(1);
+        let cases = [
+            (vec![five_hour, seven_day], Some(seven_day)),
+            (vec![five_hour, past], Some(five_hour)),
+            (vec![], None),
+            (vec![past], None),
+        ];
+        for (resets, want) in cases {
+            let captures = std::sync::Mutex::new(
+                resets
+                    .iter()
+                    .enumerate()
+                    .map(|(i, dt)| (i.to_string(), dt.timestamp()))
+                    .collect(),
+            );
+            assert_eq!(captured_rate_limit_resets_at(&captures, now), want);
+        }
     }
 
     #[test]
     fn is_unsupported_session_error_matches_only_stale_session_rejections() {
-        let classify = |m: &str| {
-            let mut err = agent_client_protocol::Error::internal_error();
-            err.message = m.into();
-            is_unsupported_session_error(&err)
-        };
         let cases = [
             ("Unsupported ACP session", true),
             ("Unknown session 01a040bb-...", true),
             ("session not found", true),
             ("no such session: abc", true),
             ("Session does not exist", true),
-            // Unrelated failures, including two that contain a phrase
-            // word next to "session", must stay ordinary errors.
             ("You've hit your limit", false),
             ("transport closed", false),
-            ("permission denied", false),
             ("unsupported model", false),
             ("unknown tool", false),
             ("Unsupported content block in session/prompt", false),
@@ -338,7 +244,11 @@ mod tests {
             ("Unsupported session capability: fork", false),
         ];
         for (msg, expected) in cases {
-            assert_eq!(classify(msg), expected, "{msg:?}");
+            assert_eq!(
+                is_unsupported_session_error(&err(msg, None)),
+                expected,
+                "{msg:?}"
+            );
         }
     }
 }

@@ -24,21 +24,21 @@ pub struct ProjectsDialog {
     items: Vec<Project>,
     selected: usize,
     mode: Mode,
-    /// Path input when adding
     add_input: Input,
-    /// Optional default base branch input when adding
     add_base_branch: Input,
-    /// Scope selection when adding (Global vs Profile)
     add_scope: ProjectScope,
     /// Allow registering even if path is already in the other scope.
     add_allow_override: bool,
-    /// Cursor field while adding: 0=path, 1=base-branch, 2=scope, 3=allow-override
+    /// Cycles None -> Some(true) -> Some(false) -> None; `None` inherits the configured default.
+    add_worktree_override: Option<bool>,
+    add_smart_rename_override: Option<bool>,
+    /// 0=path, 1=base-branch, 2=scope, 3=allow-override, 4=worktree-override,
+    /// 5=smart-rename-override.
     add_focused: usize,
     error: Option<String>,
     info: Option<String>,
-    /// One-time notice shown on top of the dialog after registering a non-git
-    /// directory, explaining that git features are unavailable. Gated by
-    /// `app_state.has_seen_non_git_project_warning` so it appears once.
+    /// One-time "git features unavailable" notice after registering a non-git
+    /// directory, latched by `app_state.has_seen_non_git_project_warning`.
     non_git_notice: Option<InfoDialog>,
     /// Close the dialog when Esc cancels the add form opened from a direct flow.
     close_on_add_cancel: bool,
@@ -55,6 +55,8 @@ impl ProjectsDialog {
             add_base_branch: Input::default(),
             add_scope: ProjectScope::Global,
             add_allow_override: false,
+            add_worktree_override: None,
+            add_smart_rename_override: None,
             add_focused: 0,
             error: None,
             info: None,
@@ -77,6 +79,8 @@ impl ProjectsDialog {
         self.add_base_branch = Input::default();
         self.add_scope = ProjectScope::Global;
         self.add_allow_override = false;
+        self.add_worktree_override = None;
+        self.add_smart_rename_override = None;
         self.add_focused = 0;
         self.error = None;
         self.close_on_add_cancel = close_on_cancel;
@@ -98,8 +102,7 @@ impl ProjectsDialog {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
-        // The one-time non-git notice sits on top of the dialog; while it is up,
-        // keys dismiss it rather than driving the list or add form.
+        // While the notice is up, keys dismiss it rather than driving the form.
         if let Some(notice) = &mut self.non_git_notice {
             if matches!(notice.handle_key(key), DialogResult::Cancel) {
                 self.non_git_notice = None;
@@ -158,11 +161,11 @@ impl ProjectsDialog {
                 DialogResult::Continue
             }
             KeyCode::Tab => {
-                self.add_focused = (self.add_focused + 1) % 4;
+                self.add_focused = (self.add_focused + 1) % 6;
                 DialogResult::Continue
             }
             KeyCode::BackTab => {
-                self.add_focused = (self.add_focused + 3) % 4;
+                self.add_focused = (self.add_focused + 5) % 6;
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.add_focused == 2 => {
@@ -176,6 +179,38 @@ impl ProjectsDialog {
                 self.add_allow_override = !self.add_allow_override;
                 DialogResult::Continue
             }
+            KeyCode::Right | KeyCode::Char(' ') if self.add_focused == 4 => {
+                self.add_worktree_override = match self.add_worktree_override {
+                    None => Some(true),
+                    Some(true) => Some(false),
+                    Some(false) => None,
+                };
+                DialogResult::Continue
+            }
+            KeyCode::Left if self.add_focused == 4 => {
+                self.add_worktree_override = match self.add_worktree_override {
+                    None => Some(false),
+                    Some(false) => Some(true),
+                    Some(true) => None,
+                };
+                DialogResult::Continue
+            }
+            KeyCode::Right | KeyCode::Char(' ') if self.add_focused == 5 => {
+                self.add_smart_rename_override = match self.add_smart_rename_override {
+                    None => Some(true),
+                    Some(true) => Some(false),
+                    Some(false) => None,
+                };
+                DialogResult::Continue
+            }
+            KeyCode::Left if self.add_focused == 5 => {
+                self.add_smart_rename_override = match self.add_smart_rename_override {
+                    None => Some(false),
+                    Some(false) => Some(true),
+                    Some(true) => None,
+                };
+                DialogResult::Continue
+            }
             KeyCode::Enter => {
                 let path = self.add_input.value().trim().to_string();
                 if path.is_empty() {
@@ -184,8 +219,7 @@ impl ProjectsDialog {
                 }
                 let path_buf = std::path::PathBuf::from(&path);
                 let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
-                // Non-git directories are allowed (sessions run in place); only
-                // reject paths that don't resolve to a directory.
+                // Non-git directories are allowed; sessions run in place.
                 if !canonical.is_dir() {
                     self.error = Some(format!(
                         "Path does not exist or is not a directory: {}",
@@ -193,10 +227,15 @@ impl ProjectsDialog {
                     ));
                     return DialogResult::Continue;
                 }
-                let name = canonical
+                let base_name = canonical
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "project".to_string());
+                let name = crate::session::projects::unique_name(
+                    &self.profile,
+                    self.add_scope,
+                    &base_name,
+                );
                 let base_branch = {
                     let b = self.add_base_branch.value().trim();
                     if b.is_empty() {
@@ -205,9 +244,14 @@ impl ProjectsDialog {
                         Some(b.to_string())
                     }
                 };
+                let overrides = crate::session::projects::ProjectOverrides {
+                    worktree_enabled: self.add_worktree_override,
+                    smart_rename: self.add_smart_rename_override,
+                };
                 let project =
                     Project::new(name.clone(), canonical.to_string_lossy(), self.add_scope)
-                        .with_base_branch(base_branch);
+                        .with_base_branch(base_branch)
+                        .with_overrides(overrides);
                 let is_git = project.is_git();
                 match projects::add(
                     &self.profile,
@@ -252,16 +296,11 @@ impl ProjectsDialog {
         }
     }
 
-    /// Show the one-time "not a git repository" notice, unless the user has
-    /// already seen it. Latches `app_state.has_seen_non_git_project_warning`
-    /// (in `state.toml`) so it never repeats.
-    ///
-    /// Reads the latch via `AppStateConfig::load()` directly rather than the
-    /// merged `Config::load()`, so a malformed `config.toml` can never block
-    /// reading (or writing) this latch: the two files are independent. If the
-    /// read fails (a corrupt `state.toml`), we show the notice again rather
-    /// than assume it was already seen, and `update_app_state` below then
-    /// declines to write, leaving the corrupt file for the user to fix.
+    /// Show the one-time "not a git repository" notice unless the latch in
+    /// `state.toml` says it was seen. Read through `AppStateConfig::load()`
+    /// rather than the merged config, so a malformed `config.toml` cannot
+    /// block it; a corrupt `state.toml` re-shows the notice and declines to
+    /// write, leaving the file for the user to fix.
     fn maybe_warn_non_git(&mut self, project_name: &str) {
         let state = crate::session::config::AppStateConfig::load().ok();
         if state.is_some_and(|s| s.has_seen_non_git_project_warning) {
@@ -284,28 +323,20 @@ impl ProjectsDialog {
         let dialog_width: u16 = 76;
         let list_height: u16 = (self.items.len() as u16).clamp(3, 12);
         let adding_extra: u16 = if matches!(self.mode, Mode::Adding) {
-            3
+            5
         } else {
             0
         };
         let dialog_height: u16 = list_height + 9 + adding_extra;
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(" Projects ")
-            .title_style(Style::default().fg(theme.title).bold());
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
+        let block = super::dialog_block(" Projects ", theme);
+        let (_, inner) =
+            super::render_dialog_frame(frame, area, dialog_width, dialog_height, block);
 
         let constraints = vec![
             Constraint::Length(list_height),
             Constraint::Length(1),
             Constraint::Length(if matches!(self.mode, Mode::Adding) {
-                7
+                9
             } else {
                 1
             }),
@@ -317,7 +348,6 @@ impl ProjectsDialog {
             .constraints(constraints)
             .split(inner);
 
-        // Project list
         if self.items.is_empty() {
             let p = Paragraph::new("No registered projects. Press 'a' to add one.")
                 .style(Style::default().fg(theme.dimmed));
@@ -358,14 +388,12 @@ impl ProjectsDialog {
             frame.render_widget(Paragraph::new(lines), chunks[0]);
         }
 
-        // Separator
         frame.render_widget(
             Paragraph::new("─".repeat(inner.width as usize))
                 .style(Style::default().fg(theme.dimmed)),
             chunks[1],
         );
 
-        // Add form or status line
         match self.mode {
             Mode::Browse => {
                 let mut spans = vec![];
@@ -449,7 +477,48 @@ impl ProjectsDialog {
                         Style::default().fg(theme.accent).bold(),
                     ),
                 ]);
-                let mut lines = vec![path_line, base_line, scope_line, override_line];
+                let worktree_label_style = if self.add_focused == 4 {
+                    Style::default().fg(theme.accent).underlined()
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                let worktree_value = match self.add_worktree_override {
+                    None => "(use global default)".to_string(),
+                    Some(true) => "on".to_string(),
+                    Some(false) => "off".to_string(),
+                };
+                let worktree_line = Line::from(vec![
+                    Span::styled("Worktree default: ", worktree_label_style),
+                    Span::styled(
+                        format!("< {} >", worktree_value),
+                        Style::default().fg(theme.accent).bold(),
+                    ),
+                ]);
+                let smart_rename_label_style = if self.add_focused == 5 {
+                    Style::default().fg(theme.accent).underlined()
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                let smart_rename_value = match self.add_smart_rename_override {
+                    None => "(use global default)".to_string(),
+                    Some(true) => "on".to_string(),
+                    Some(false) => "off".to_string(),
+                };
+                let smart_rename_line = Line::from(vec![
+                    Span::styled("Smart rename: ", smart_rename_label_style),
+                    Span::styled(
+                        format!("< {} >", smart_rename_value),
+                        Style::default().fg(theme.accent).bold(),
+                    ),
+                ]);
+                let mut lines = vec![
+                    path_line,
+                    base_line,
+                    scope_line,
+                    override_line,
+                    worktree_line,
+                    smart_rename_line,
+                ];
                 if let Some(err) = &self.error {
                     lines.push(Line::from(Span::styled(
                         err.clone(),
@@ -457,9 +526,8 @@ impl ProjectsDialog {
                     )));
                 }
                 frame.render_widget(Paragraph::new(lines), chunks[2]);
-                // The real terminal cursor follows the focused text field. Each
-                // field renders on its own row within chunks[2], so offset the
-                // 1-row cursor rect by the field's line index.
+                // Each field owns a row in chunks[2], so offset the cursor rect
+                // by the field's line index.
                 let row = |offset: u16| Rect {
                     y: chunks[2].y.saturating_add(offset),
                     height: 1,
@@ -478,7 +546,6 @@ impl ProjectsDialog {
             }
         }
 
-        // Hints
         let hint_spans: Vec<Span> = match self.mode {
             Mode::Browse => vec![
                 Span::styled("a", Style::default().fg(theme.hint)),
@@ -503,8 +570,7 @@ impl ProjectsDialog {
         };
         frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[3]);
 
-        // The one-time non-git notice renders last so it sits on top of the
-        // projects dialog body.
+        // Rendered last so the notice sits on top of the dialog body.
         if let Some(notice) = &mut self.non_git_notice {
             notice.render(frame, area, theme);
         }
@@ -522,20 +588,14 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    /// Point HOME/XDG_CONFIG_HOME at `temp` for the test body. Returns the
-    /// shared [`crate::session::test_support::HomeGuard`], which restores the
-    /// prior env on Drop and holds the process-global env lock for its
-    /// lifetime; the caller MUST bind it (`let _home = ...`) so the override
-    /// outlives the body instead of the previous fire-and-forget `set_var`
-    /// that leaked the tempdir HOME into sibling tests. The returned
-    /// `HomeGuard` is itself `#[must_use]`, so binding is enforced.
+    /// Point HOME/XDG_CONFIG_HOME at `temp` for the test body. The returned
+    /// guard holds the process-global env lock and restores the prior env on
+    /// Drop, so it must be bound for the whole body.
     fn isolate_home(temp: &std::path::Path) -> crate::session::test_support::HomeGuard {
         crate::session::test_support::isolate_home(temp)
     }
 
-    /// Drive the dialog through an add of `dir`: enter add mode, set the path
-    /// input directly (typing char-by-char is unnecessary for this logic), and
-    /// submit.
+    /// Add `dir`: enter add mode, set the path input directly, submit.
     fn add_dir(dialog: &mut ProjectsDialog, dir: &std::path::Path) {
         dialog.handle_key(key(KeyCode::Char('a')));
         dialog.add_input = Input::new(dir.to_string_lossy().to_string());
@@ -611,6 +671,56 @@ mod tests {
             dialog.non_git_notice.is_some(),
             "notice should show when the latch can't be read"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn add_form_sets_worktree_override_on_submit() {
+        let temp = tempdir().unwrap();
+        let _home = isolate_home(temp.path());
+        let repo = temp.path().join("overridden");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let mut dialog = ProjectsDialog::new("test");
+        dialog.handle_key(key(KeyCode::Char('a')));
+        dialog.add_input = Input::new(repo.to_string_lossy().to_string());
+        // Tab from path(0) -> base(1) -> scope(2) -> allow_override(3) -> worktree_override(4).
+        for _ in 0..4 {
+            dialog.handle_key(key(KeyCode::Tab));
+        }
+        assert_eq!(dialog.add_focused, 4);
+        dialog.handle_key(key(KeyCode::Right)); // None -> Some(true)
+        dialog.handle_key(key(KeyCode::Enter));
+
+        let saved = crate::session::projects::load_global().expect("load global");
+        let project = saved
+            .iter()
+            .find(|p| p.name == "overridden")
+            .expect("project should be saved");
+        assert_eq!(project.overrides.worktree_enabled, Some(true));
+        assert_eq!(project.overrides.smart_rename, None);
+    }
+
+    #[test]
+    #[serial]
+    fn add_form_worktree_override_left_cycles_opposite_of_right() {
+        // The rendered `< value >` chevrons promise Left/Right go opposite
+        // directions; Left from None must land on Some(false), the reverse of
+        // what Right/Space give (Some(true)).
+        let temp = tempdir().unwrap();
+        let _home = isolate_home(temp.path());
+        let repo = temp.path().join("left-cycle");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let mut dialog = ProjectsDialog::new("test");
+        dialog.handle_key(key(KeyCode::Char('a')));
+        dialog.add_input = Input::new(repo.to_string_lossy().to_string());
+        for _ in 0..4 {
+            dialog.handle_key(key(KeyCode::Tab));
+        }
+        assert_eq!(dialog.add_focused, 4);
+        dialog.handle_key(key(KeyCode::Left));
+        assert_eq!(dialog.add_worktree_override, Some(false));
     }
 
     #[test]

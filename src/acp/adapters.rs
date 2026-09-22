@@ -1,23 +1,3 @@
-//! On-demand install and resolution of the bundled ACP adapters: the pinned
-//! npm ones (`claude-agent-acp`, `codex-acp`, `pi-acp`) and the in-tree
-//! `aoe-agent`.
-//!
-//! Mirrors the bundled-Node pattern in [`crate::acp::node`]: a pinned
-//! manifest is embedded in the binary and installed into the data dir by
-//! `aoe acp doctor --fix` using the resolved Node's own npm, instead of
-//! `npm install -g` (no global prefix, no sudo, a version aoe controls).
-//! See issue #1017.
-//!
-//! Each adapter gets its own manifest and its own prefix,
-//! `$AOE_DATA_DIR/acp-worker/adapters/<binary>/node_modules/.bin/<binary>`,
-//! so installing one does not drag in the others: `codex-acp` pulls a
-//! ~336 MB `@openai/codex` tree that a claude-only user should not pay for.
-//!
-//! An install builds into a sibling temp dir and publishes by rename, so a
-//! concurrent reader never observes a half-built `node_modules`. A
-//! `.aoe-lock-digest` sidecar (SHA-256 of that adapter's embedded lockfile),
-//! written last, doubles as the completion marker and the upgrade trigger.
-
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -26,19 +6,14 @@ use tracing::{info, warn};
 use crate::acp::node::{NodeSource, ResolvedNode};
 
 /// One pinned adapter: the binary npm installs, plus its embedded manifest
-/// pair. Kept in lockstep with `acp-worker/adapters/<binary>/`.
+/// pair.
 pub struct BundledAdapter {
     pub binary: &'static str,
     package_json: &'static [u8],
     package_lock: &'static [u8],
     /// In-tree sources written beside the manifest before `npm ci`, as
-    /// `(relative path, bytes)`. Empty for adapters that are pure npm
-    /// dependencies.
+    /// `(relative path, bytes)`.
     sources: &'static [(&'static str, &'static [u8])],
-    /// Entry script for an in-tree agent, run as `node
-    /// --experimental-strip-types <entry>` through a wrapper the install
-    /// writes at `node_modules/.bin/<binary>`, so resolution and the doctor
-    /// treat it like any other bundled adapter (#3553).
     entry: Option<&'static str>,
 }
 
@@ -89,16 +64,12 @@ pub const BUNDLED_ADAPTERS: &[BundledAdapter] = &[
 ];
 
 /// The adapter `doctor --fix` installs when no `--adapter` is given.
-/// Claude is the flagship structured-view agent, and defaulting to just it
-/// keeps a bare `--fix` from spending ~343 MB on adapters the user may
-/// never launch.
 pub const DEFAULT_ADAPTER: &str = "claude-agent-acp";
 
 const DIGEST_FILE: &str = ".aoe-lock-digest";
 
 /// Staging and backup dirs older than this are assumed to be crash
-/// leftovers and swept. Anything younger may belong to an install running
-/// right now in another process, which must not be deleted underneath it.
+/// leftovers and swept.
 const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Error)]
@@ -147,7 +118,7 @@ fn bin_dir(app_dir: &Path, binary: &str) -> PathBuf {
 }
 
 /// Absolute path to a bundled adapter binary if it exists on disk, else
-/// `None`. npm writes a `.cmd` shim on Windows.
+/// `None`.
 pub fn bundled_adapter_bin(app_dir: &Path, binary: &str) -> Option<PathBuf> {
     let base = bin_dir(app_dir, binary).join(binary);
     let candidate = if cfg!(windows) {
@@ -187,8 +158,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// The Node an in-tree adapter would launch with, when it cannot run the
-/// adapter's sources: the version string, for the refusal message. `None`
-/// for npm adapters and for a Node that can.
+/// adapter's sources: the version string, for the refusal message.
 pub fn runtime_too_old_for(app_dir: &Path, binary: &str) -> Option<String> {
     ships_sources(binary).then_some(())?;
     let node = crate::acp::node::resolve_for("", app_dir, true).ok()?;
@@ -200,11 +170,6 @@ pub fn ships_sources(binary: &str) -> bool {
     lookup(binary).is_some_and(|a| !a.sources.is_empty())
 }
 
-/// An in-tree adapter (one that ships sources) whose installed copy no longer
-/// matches this binary's embedded sources. Resolution refuses it and the
-/// install hint names the reinstall; a spawn does not reinstall on its own,
-/// since publishing renames the install dir under any runner already using
-/// it (#3553).
 pub fn installed_copy_is_stale(app_dir: &Path, binary: &str) -> bool {
     lookup(binary).is_some_and(|adapter| {
         !adapter.sources.is_empty()
@@ -214,8 +179,7 @@ pub fn installed_copy_is_stale(app_dir: &Path, binary: &str) -> bool {
 }
 
 /// True when a complete, current install of `binary` is present: the digest
-/// sidecar matches its embedded lockfile AND the binary exists. Drives both
-/// the skip-reinstall path and the upgrade-after-aoe-bump path.
+/// sidecar matches its embedded lockfile AND the binary exists.
 pub fn installation_is_current(app_dir: &Path, binary: &str) -> bool {
     let Some(adapter) = lookup(binary) else {
         return false;
@@ -228,12 +192,8 @@ pub fn installation_is_current(app_dir: &Path, binary: &str) -> bool {
 }
 
 /// Install (or upgrade) one pinned adapter into the data dir using `node`'s
-/// npm. Idempotent: returns early when the current lockfile is already
-/// installed.
+/// npm.
 pub fn install(app_dir: &Path, node: &ResolvedNode, binary: &str) -> Result<(), AdapterError> {
-    // One install at a time in this process: the staging dir is per pid,
-    // and spawns resumed in parallel after an upgrade would otherwise wipe
-    // each other's `npm ci`. A waiter re-checks currency under the lock.
     static INSTALLING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _serialized = INSTALLING.lock().unwrap_or_else(|p| p.into_inner());
     let adapter = lookup(binary).ok_or_else(|| AdapterError::UnknownAdapter(binary.to_string()))?;
@@ -256,10 +216,6 @@ pub fn install(app_dir: &Path, node: &ResolvedNode, binary: &str) -> Result<(), 
 
     // Build in a sibling temp dir, then publish by rename so readers never
     // see a half-built node_modules.
-    // ponytail: no advisory lock, matching the existing non-atomic Node
-    // installer. Two concurrent installs of the same adapter both build in
-    // their own pid-scoped dir and the last publish wins, which is
-    // wasteful but not corrupting.
     let tmp = parent.join(format!("{binary}.tmp.{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
@@ -348,11 +304,7 @@ fn write_entry_wrapper(install_dir: &Path, binary: &str, entry: &str) -> std::io
     Ok(())
 }
 
-/// Build the argv for `npm ci`, run from the target dir. For a bundled
-/// Node, invoke its own `npm-cli.js` with that exact node (the official
-/// tarball ships it at `<root>/lib/node_modules/npm/bin/npm-cli.js`); for a
-/// host Node, use `npm` on PATH, because a host Node's npm layout is not
-/// something we can assume. `None` when no usable npm is found.
+/// Build the argv for `npm ci`, run from the target dir.
 pub fn npm_ci_argv(node: &ResolvedNode) -> Option<(PathBuf, Vec<String>)> {
     let ci_flags = || {
         vec![
@@ -381,15 +333,7 @@ pub fn npm_ci_argv(node: &ResolvedNode) -> Option<(PathBuf, Vec<String>)> {
     Some((npm, ci_flags()))
 }
 
-/// Move a completed staging dir into place. `rename` cannot replace a
-/// non-empty dir on Unix, so an existing install is moved aside first and
-/// restored if the swap fails.
-///
-/// This does cut a live session's adapter loose: an already-exec'd process
-/// keeps its open file descriptors, but Node resolves a lazy `require()`
-/// against the absolute `__dirname` that the rename just invalidated, so a
-/// running adapter can fail on its next deferred import. Acceptable for an
-/// explicit `doctor --fix`, the only path that publishes over an install.
+/// Move a completed staging dir into place.
 fn publish(tmp: &Path, final_dir: &Path) -> std::io::Result<()> {
     if !final_dir.exists() {
         return std::fs::rename(tmp, final_dir);
@@ -410,9 +354,7 @@ fn publish(tmp: &Path, final_dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Remove crash leftovers. Only touches dirs older than [`STALE_AFTER`]:
-/// a younger `*.tmp.*` may be the staging dir of an install running right
-/// now in another process, and deleting it would break that install.
+/// Remove crash leftovers.
 fn sweep_stale(parent: &Path) {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
@@ -557,8 +499,6 @@ mod tests {
         assert_eq!(&args[1..], &["ci", "--no-audit", "--no-fund"]);
     }
 
-    /// `publish` is the riskiest code here: fresh install, replacing an
-    /// existing one, and rollback when the swap fails.
     #[test]
     fn publish_handles_fresh_replace_and_rollback() {
         let tmp = tempfile::tempdir().unwrap();
@@ -573,8 +513,6 @@ mod tests {
         assert_eq!(std::fs::read(final_dir.join("marker")).unwrap(), b"new");
         assert!(!staging.exists());
 
-        // Replace: the existing dir is non-empty, so rename alone would
-        // fail with ENOTEMPTY. The old contents must be gone afterward.
         let staging2 = root.join("a.tmp.2");
         std::fs::create_dir_all(&staging2).unwrap();
         std::fs::write(staging2.join("marker"), b"newer").unwrap();
@@ -587,15 +525,11 @@ mod tests {
             .flatten()
             .any(|e| e.file_name().to_string_lossy().contains(".old.")));
 
-        // Rollback: a missing staging dir makes the second rename fail, so
-        // the existing install must be restored rather than lost.
         let missing = root.join("a.tmp.absent");
         assert!(publish(&missing, &final_dir).is_err());
         assert_eq!(std::fs::read(final_dir.join("marker")).unwrap(), b"newer");
     }
 
-    /// A young staging dir may belong to a concurrent install, so sweeping
-    /// must leave it alone and only reap genuine crash leftovers.
     #[test]
     fn sweep_stale_spares_fresh_dirs_and_unrelated_names() {
         let tmp = tempfile::tempdir().unwrap();
@@ -614,9 +548,6 @@ mod tests {
         assert!(installed.exists(), "the real install must never be swept");
     }
 
-    /// The pin is only meaningful if it satisfies the floor the startup gate
-    /// enforces; otherwise `doctor --fix` would install an adapter that
-    /// `initialize` then rejects. Mirrors `dockerfile_pin_matches_floor`.
     #[test]
     fn claude_pin_satisfies_startup_floor() {
         let manifest: serde_json::Value =

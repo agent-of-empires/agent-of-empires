@@ -54,7 +54,15 @@ async fn purge_session_artifacts(
                     teardown_started: false,
                 }),
                 DeletionDisposition::Busy => {
-                    Err(crate::session::LifecycleReservationError::Superseded.into())
+                    let operation = result
+                        .retained_instance
+                        .as_ref()
+                        .and_then(|row| row.lifecycle_reservation.as_ref())
+                        .map(|reservation| reservation.op);
+                    Err(operation
+                        .map(crate::session::LifecycleReservationError::Busy)
+                        .unwrap_or(crate::session::LifecycleReservationError::Superseded)
+                        .into())
                 }
                 DeletionDisposition::Failed | DeletionDisposition::Removed => {
                     Err(anyhow::anyhow!(result.errors.join("; ")))

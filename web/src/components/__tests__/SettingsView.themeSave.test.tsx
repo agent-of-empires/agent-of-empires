@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-//
-// The theme is a global preference: the Settings theme tab must route the
-// global-only fields (theme name, color mode) to the dedicated PATCH /api/theme
-// endpoint, while a profile-overridable row in the same tab (idle decay) still
-// writes the selected profile. Pins `saveThemeField`'s per-field routing so a
-// regression can't quietly send the theme back into a profile (the
-// empire->rose-pine flip). The end-to-end persist path lives in
-// web/tests/live/settings-persistence-theme.spec.ts.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -92,9 +84,7 @@ function renderThemeTab() {
   return render(<SettingsView onClose={() => {}} tab="theme" onSelectTab={vi.fn()} onServerAboutRefresh={() => {}} />);
 }
 
-/** A <select> that carries an <option> with this value. Labels in FormFields
- *  are not wired to their controls, so we locate by option value rather than
- *  accessible name (and dodge the duplicated mobile/desktop tab strips). */
+/** A <select> that carries an <option> with this value. */
 function selectWithOption(value: string): HTMLSelectElement {
   const found = Array.from(document.querySelectorAll<HTMLSelectElement>("select")).find((s) =>
     Array.from(s.options).some((o) => o.value === value),
@@ -132,11 +122,7 @@ describe("SettingsView theme tab save routing", () => {
     expect(updateProfileSettings).not.toHaveBeenCalled();
   });
 
-  // Ported from live settings-theme-color-mode.spec.ts (#1405). Color mode is
-  // a TUI-only palette setting: only the theme-name custom widget dispatches
-  // the dashboard repaint event after its save lands. A refactor that routes
-  // color mode through the same dispatch would re-fetch /api/themes/<name> and
-  // repaint the dashboard on every toggle of a setting the web never renders.
+  // Ported from live settings-theme-color-mode.spec.ts.
   it("color-mode change PATCHes but never dispatches the theme repaint event", async () => {
     renderThemeTab();
     await waitFor(() => selectWithOption("palette"));

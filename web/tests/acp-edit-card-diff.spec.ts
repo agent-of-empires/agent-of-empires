@@ -1,18 +1,12 @@
 import { test, expect } from "./helpers/mockedTest";
+import { mockStructuredSessionApis } from "./helpers/structuredSessionMocks";
 import { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
 
-// Mocked render of the structured view Edit tool card (#1768).
-//
-// The card's `+N −M` chip and its expandable body are both driven by
-// `diffPair` (web/src/lib/diffPair.ts), which runs an in-browser line
-// diff over the tool's `(old_string, new_string)`. `diffPair` has full
-// vitest coverage, but it is only ever *executed in a browser* through
-// this card, so without a mocked-Playwright spec the istanbul build
-// uploads it as 0/30 and codecov nets its patch coverage to ~0. This
-// spec drives a single `ToolCallStarted` edit frame over the structured view
-// WebSocket so the card renders, `diffPair` runs, and `StringDiff`
-// mounts on expand.
+// #1768: the Edit tool card's `+N -M` chip and expandable body are driven by
+// `diffPair`, which only ever executes in a browser through this card. One
+// `ToolCallStarted` edit frame over the structured-view WebSocket renders the
+// card, runs `diffPair`, and mounts `StringDiff` on expand.
 
 const SESSION_ID = "sess-1";
 const FILE_PATH = "src/example.ts";
@@ -55,68 +49,9 @@ function editRowDelta() {
 }
 
 async function setup(page: Page) {
-  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
-  for (const path of [
-    "settings",
-    "themes",
-    "agents",
-    "profiles",
-    "groups",
-    "devices",
-    "docker/status",
-    "about",
-    "system/update-status",
-  ]) {
-    await page.route(`**/api/${path}`, (r) =>
-      r.fulfill({
-        json:
-          path === "docker/status" || path === "about" || path === "settings" || path === "system/update-status"
-            ? {}
-            : [],
-      }),
-    );
-  }
-  await page.route("**/api/sessions", (r) => {
-    if (r.request().method() === "POST") return r.fulfill({ status: 400 });
-    return r.fulfill({
-      json: {
-        sessions: [
-          {
-            id: SESSION_ID,
-            title: "acp-edit-card",
-            project_path: "/tmp/acp-edit-card",
-            group_path: "/tmp",
-            tool: "claude",
-            status: "Running",
-            yolo_mode: false,
-            created_at: new Date().toISOString(),
-            last_accessed_at: null,
-            last_error: null,
-            branch: null,
-            main_repo_path: null,
-            is_sandboxed: false,
-            has_terminal: true,
-            profile: "default",
-            workspace_repos: [],
-            view: "structured",
-            acp_worker_state: "running",
-            claude_fullscreen: false,
-          },
-        ],
-        workspace_ordering: [],
-      },
-    });
-  });
-  await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
-  // Structured view REST endpoints (replay/snapshot/prompt): empty is fine, the
-  // tool frame arrives over the WebSocket below.
-  await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
-
-  // Terminal WS (only opened outside structured view mode): swallow it.
-  await page.routeWebSocket(/\/sessions\/[^/]+\/ws(\?|$)/, () => {
-    // no-op
-  });
-  // Structured view WS: push the server-folded edit row so the card renders.
+  await mockStructuredSessionApis(page, { id: SESSION_ID, title: "acp-edit-card" });
+  // Push the server-folded edit row so the card renders; registered after the
+  // helper's silent socket so it wins Playwright's reverse-order matching.
   await page.routeWebSocket(/\/sessions\/[^/]+\/acp\/ws/, (ws) => {
     ws.send(JSON.stringify(editRowDelta()));
   });

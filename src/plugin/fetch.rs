@@ -1,17 +1,4 @@
 //! Fetching an external plugin into a staging tree, ready to be moved into
-//! place by [`crate::plugin::install`].
-//!
-//! Two source kinds, selected by [`PluginSource`]:
-//!
-//! - A GitHub repo is `git clone`d (shallow when possible), the requested ref
-//!   is checked out, and the exact commit is resolved for the lockfile. The
-//!   `.git` directory is stripped; the working tree is the plugin.
-//! - A local directory is copied verbatim (minus `.git`).
-//!
-//! If the manifest declares a `release-binary` runtime, the matching release
-//! asset for the host platform is downloaded from the repo's GitHub releases
-//! and unpacked into the tree. The worker is not launched here; that is #2095.
-//! A local source never fetches a release: its binary must already be present.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -24,17 +11,11 @@ use crate::github::{GitHubClient, GitHubClientConfig, GitHubError, DEFAULT_USER_
 
 use super::source::PluginSource;
 
-/// A plugin fetched into a staging tree, not yet installed.
 pub struct FetchedPlugin {
-    /// Keeps the staging directory alive until the tree is moved into place.
     _staging: tempfile::TempDir,
-    /// The plugin tree to move to `<app_dir>/plugins/<id>/`.
     pub tree: PathBuf,
     pub manifest: PluginManifest,
-    /// Raw `aoe-plugin.toml` bytes, for hashing the grant against.
     pub manifest_bytes: Vec<u8>,
-    /// `sha256:<hex>` over the source tree, computed before any release-binary
-    /// is injected so it matches an author's `aoe plugin hash` of the checkout.
     pub tree_hash: String,
     pub source: PluginSource,
     pub requested_ref: Option<String>,
@@ -44,12 +25,10 @@ pub struct FetchedPlugin {
     pub asset_sha256: Option<String>,
 }
 
-/// Fetch a plugin from its source into a staging tree.
 pub async fn fetch(source: &PluginSource) -> Result<FetchedPlugin> {
     let plugins_root = super::plugins_dir()?;
     std::fs::create_dir_all(&plugins_root)
         .with_context(|| format!("creating {}", plugins_root.display()))?;
-    // Stage under the plugins dir so the final rename into place is same-filesystem.
     let staging = tempfile::Builder::new()
         .prefix(".staging-")
         .tempdir_in(&plugins_root)
@@ -81,9 +60,6 @@ pub async fn fetch(source: &PluginSource) -> Result<FetchedPlugin> {
 
     let (manifest, manifest_bytes) = read_manifest(&tree)?;
 
-    // The reserved build-output dir is excluded from the tree hash, so a source
-    // that ships it could hide files from the pin. It must only ever be created
-    // by build steps, never committed; refuse a source tree that contains it.
     if tree.join(super::integrity::BUILD_OUTPUT_DIR).exists() {
         bail!(
             "plugin source ships the reserved build-output directory {:?}; it must only be produced by build steps, not committed",
@@ -91,9 +67,7 @@ pub async fn fetch(source: &PluginSource) -> Result<FetchedPlugin> {
         );
     }
 
-    // Hash the source tree before any release-binary is injected below, so the
-    // value matches `aoe plugin hash` run on the author's checkout (which has
-    // no downloaded worker) and can be checked against the featured pin.
+    // Hash before any release binary is injected so it matches `aoe plugin hash` on the checkout.
     let tree_hash = super::integrity::tree_hash(&tree)?;
 
     let mut release_tag = None;
@@ -115,10 +89,7 @@ pub async fn fetch(source: &PluginSource) -> Result<FetchedPlugin> {
                 asset_name = Some(name);
                 asset_sha256 = Some(sha);
             }
-            PluginSource::Local(_) => {
-                // A local source ships its binary in the directory already; there
-                // is no release to pull from.
-            }
+            PluginSource::Local(_) => {}
         }
     }
 
@@ -141,11 +112,6 @@ fn read_manifest(tree: &Path) -> Result<(PluginManifest, Vec<u8>)> {
     let path = tree.join("aoe-plugin.toml");
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        // Discovery filters most of these out, but it fails open when the raw
-        // CDN is unreachable, so this stays the authoritative answer and leads
-        // with the likely cause rather than a staging path. Scoped to a real
-        // absence: a permission error or a directory at that path is an I/O
-        // problem, not a repo that turned out to be an Age of Empires mod.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
             "no aoe-plugin.toml at {}; this repository is not an installable plugin. \
              The GitHub `aoe-plugin` topic is also used by unrelated Age of Empires projects.",
@@ -158,9 +124,6 @@ fn read_manifest(tree: &Path) -> Result<(PluginManifest, Vec<u8>)> {
     Ok((manifest, bytes))
 }
 
-/// Run `git` with the given args, returning trimmed stdout. Surfaces stderr on
-/// failure and a clear hint when git is not installed.
-// ponytail: no explicit timeout; git fails on its own for unreachable remotes.
 fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
     let mut cmd = Command::new("git");
     cmd.args(args)
@@ -183,14 +146,6 @@ fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Resolve the commit a GitHub source's ref currently points at, without
-/// cloning, via `git ls-remote`. `reference` of `None` means the remote `HEAD`.
-/// Used by the update check to tell whether a newer commit exists.
-///
-/// A `reference` that is already a full commit sha is returned as-is: `ls-remote`
-/// cannot resolve a bare sha, and a commit-pinned install can never be outdated.
-/// For a branch or tag, an annotated tag's peeled (`^{}`) target is preferred so
-/// the result is the commit the install would actually check out.
 pub fn ls_remote(url: &str, reference: Option<&str>) -> Result<String> {
     if let Some(r) = reference {
         if is_full_commit_sha(r) {
@@ -198,21 +153,11 @@ pub fn ls_remote(url: &str, reference: Option<&str>) -> Result<String> {
         }
     }
     let target = reference.unwrap_or("HEAD");
-    // An annotated tag's peeled `^{}` commit is only emitted when the refspec
-    // asks for it; without it ls-remote returns the tag object, which never
-    // equals the commit the install checked out (a phantom "update available",
-    // #2646). Request both so parse_ls_remote can prefer the peeled commit. A
-    // branch or HEAD has no `^{}` to match, so the extra pattern is a no-op.
     let peeled = format!("{target}^{{}}");
     let out = run_git(&["ls-remote", url, target, &peeled], None)?;
     parse_ls_remote(&out, target)
 }
 
-/// The tag of the repo's latest stable GitHub release, or `None` when the repo
-/// has published no release. `GET /releases/latest` already excludes prereleases
-/// and drafts, so this is the stable channel; a 404 (no releases) maps to `None`
-/// while any other API error propagates. Used by the default install path
-/// (no `@ref`) and the rolling update check.
 pub async fn latest_release_tag(owner: &str, repo: &str) -> Result<Option<String>> {
     let client = GitHubClient::unauthenticated(GitHubClientConfig {
         api_base: github_api_base(),
@@ -230,8 +175,7 @@ fn is_full_commit_sha(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Pick the resolved commit from `git ls-remote` output (`<sha>\t<ref>` lines),
-/// preferring an annotated tag's peeled `^{}` target over the tag object itself.
+/// Prefers an annotated tag's peeled `^{}` commit, which is what the install checks out (#2646).
 fn parse_ls_remote(out: &str, target: &str) -> Result<String> {
     let mut first = None;
     for line in out.lines() {
@@ -251,15 +195,10 @@ fn path_arg(path: &Path) -> Result<&str> {
         .ok_or_else(|| anyhow!("non-UTF-8 path: {}", path.display()))
 }
 
-/// Clone `url` into `dest`, check out `reference` (if any), strip `.git`, and
-/// return the resolved commit. A shallow clone of the ref is tried first; an
-/// arbitrary commit ref falls back to a full clone plus checkout.
+/// `core.autocrlf=false` keeps the checkout byte-identical so tree hashes match across platforms.
 fn git_clone_checkout(url: &str, reference: Option<&str>, dest: &Path) -> Result<String> {
     let dest_str = path_arg(dest)?;
 
-    // `core.autocrlf=false` keeps the checkout byte-for-byte as committed, so
-    // the tree hash is the same on every platform; without it a Windows clone
-    // would rewrite line endings and never match a pin generated on Linux.
     let shallow = match reference {
         Some(reference) => run_git(
             &[
@@ -294,15 +233,12 @@ fn git_clone_checkout(url: &str, reference: Option<&str>, dest: &Path) -> Result
     };
 
     if !shallow {
-        // A partial clone may have created dest; clear it before retrying.
         let _ = std::fs::remove_dir_all(dest);
         run_git(
             &["-c", "core.autocrlf=false", "clone", "--", url, dest_str],
             None,
         )?;
         if let Some(reference) = reference {
-            // `--` separates the revision from pathspecs so a ref that begins
-            // with a dash is not parsed as a flag.
             run_git(
                 &[
                     "-c",
@@ -317,17 +253,11 @@ fn git_clone_checkout(url: &str, reference: Option<&str>, dest: &Path) -> Result
     }
 
     let sha = run_git(&["rev-parse", "HEAD"], Some(dest))?;
-    // The plugin is the working tree, not a git checkout; drop the history.
     let _ = std::fs::remove_dir_all(dest.join(".git"));
     Ok(sha)
 }
 
-/// Recursively copy `src` into `dst`, skipping `.git` and rejecting symlinks.
-///
-/// A symlink is a hard error rather than a silent skip: `integrity::tree_hash`
-/// also rejects symlinks, so skipping one here would make the install-time hash
-/// disagree with the `aoe plugin hash` an author runs on the same directory
-/// (and following one risks escaping the tree).
+/// Symlinks are an error, not skipped, so the install hash agrees with `integrity::tree_hash`.
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
     for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
@@ -359,8 +289,6 @@ pub(super) fn github_api_base() -> String {
         .unwrap_or_else(|_| crate::github::DEFAULT_GITHUB_API_BASE.to_string())
 }
 
-/// Resolve the release for the host platform, download the matching asset, and
-/// unpack it into `tree`. Returns `(release_tag, asset_name, asset_sha256)`.
 async fn download_release_binary(
     source: &PluginSource,
     manifest: &PluginManifest,
@@ -411,9 +339,6 @@ async fn download_release_binary(
     Ok((release.tag_name.clone(), asset.name.clone(), sha))
 }
 
-/// Substitute the platform tokens in an asset name template. Supported:
-/// `${os}` (e.g. `linux`, `macos`), `${arch}` (e.g. `x86_64`, `aarch64`), and
-/// `${version}` (the manifest version).
 fn render_asset_template(template: &str, version: &str) -> String {
     template
         .replace("${os}", std::env::consts::OS)
@@ -448,10 +373,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Place a downloaded asset into the plugin tree. A `.tar.gz` archive is
-/// unpacked and `bin` (required) names the executable within; any other asset
-/// is treated as a raw binary written as `bin` (or the asset name). The result
-/// is made executable.
 fn install_asset_into(
     tree: &Path,
     asset_name: &str,
@@ -475,10 +396,6 @@ fn install_asset_into(
     }
 }
 
-/// Join a manifest-provided relative path onto the plugin tree, rejecting
-/// anything that would escape it. `bin` is untrusted manifest input, so an
-/// absolute path or a `..` component must not turn install into an arbitrary
-/// write or chmod outside the staging dir.
 fn safe_tree_path(tree: &Path, rel: &str) -> Result<PathBuf> {
     use std::path::Component;
     let candidate = Path::new(rel);
@@ -522,26 +439,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_ls_remote_prefers_peeled_tag() {
-        let out = "1111111111111111111111111111111111111111\trefs/tags/v1\n\
-                   2222222222222222222222222222222222222222\trefs/tags/v1^{}";
+    fn parse_ls_remote_prefers_the_peeled_tag() {
+        let peeled = "1111111111111111111111111111111111111111\trefs/tags/v1\n\
+                      2222222222222222222222222222222222222222\trefs/tags/v1^{}";
         assert_eq!(
-            parse_ls_remote(out, "v1").unwrap(),
+            parse_ls_remote(peeled, "v1").unwrap(),
             "2222222222222222222222222222222222222222"
         );
-    }
-
-    #[test]
-    fn parse_ls_remote_takes_first_when_unpeeled() {
-        let out = "3333333333333333333333333333333333333333\tHEAD";
         assert_eq!(
-            parse_ls_remote(out, "HEAD").unwrap(),
+            parse_ls_remote("3333333333333333333333333333333333333333\tHEAD", "HEAD").unwrap(),
             "3333333333333333333333333333333333333333"
         );
-    }
-
-    #[test]
-    fn parse_ls_remote_errors_when_empty() {
         assert!(parse_ls_remote("", "nope").is_err());
     }
 
@@ -553,9 +461,6 @@ mod tests {
 
     #[test]
     fn ls_remote_peels_annotated_tag_to_commit() {
-        // `git ls-remote <url> v1` returns the annotated tag object, but the
-        // install checks out the peeled commit. ls_remote must resolve to the
-        // commit so the update check does not report a phantom update (#2646).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         let git = |args: &[&str]| {
@@ -569,7 +474,6 @@ mod tests {
                 .output()
                 .expect("run git")
         };
-        // git absent: nothing to test, skip rather than fail.
         if !git(&["init", "-q"]).status.success() {
             return;
         }
@@ -586,8 +490,6 @@ mod tests {
         };
         let commit = sha_of("HEAD");
         let tag_object = sha_of("v1");
-        // An annotated tag's object is distinct from the commit it points at;
-        // without that, this test would not distinguish the bug from the fix.
         assert_ne!(
             commit, tag_object,
             "annotated tag object should differ from the commit"

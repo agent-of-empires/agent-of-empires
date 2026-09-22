@@ -530,6 +530,23 @@ fn rendered_single_session_text(
         .expect("session row should render")
 }
 
+/// Live-send state targeting the agent pane with the default exit chord.
+pub(super) fn live_send_state(
+    session_id: &str,
+    title: &str,
+    tmux_name: &str,
+) -> super::live_send::LiveSendState {
+    super::live_send::LiveSendState {
+        session_id: session_id.to_string(),
+        title: title.to_string(),
+        tmux_name: tmux_name.to_string(),
+        target: super::live_send::LiveSendTarget::Agent,
+        exit_chords: super::live_send::parse_chord_list(super::live_send::DEFAULT_EXIT_CHORD),
+        leader: None,
+        remote: None,
+    }
+}
+
 /// Fixture for the creation tests: a temp home with a project directory and a
 /// `HomeView` bound to the `default` profile in manual-group mode.
 struct CreationTestEnv {

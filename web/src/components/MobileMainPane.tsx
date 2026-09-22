@@ -2,11 +2,13 @@ import { lazy, Suspense } from "react";
 
 import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane } from "./PairedTerminal";
+import { BackgroundAgentsPanel } from "./acp/BackgroundAgentsPanel";
+import { FilesPane } from "./FilesPane";
 import { DiffFileList } from "./diff/DiffFileList";
 import { DiffFileViewer } from "./diff/DiffFileViewer";
 import { CommentsBanner } from "./diff/comments/CommentsBanner";
 import { SendCommentsDialog } from "./diff/comments/SendCommentsDialog";
-import { PluginPaneBody } from "./plugin/PluginSlots";
+import { PluginPaneBody } from "./plugin/PluginPane";
 import type { RightPanelView } from "../lib/rightPanelView";
 import { isPluginPaneId, type PluginPane } from "../lib/pluginPanes";
 import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
@@ -19,6 +21,7 @@ interface Props {
   view: RightPanelView;
   pluginPanes: PluginPane[];
   onBackToAgent: () => void;
+  onOpenAgentsPane: () => void;
   pairedMounted: boolean;
   activeSession: SessionResponse | null;
   activeSessionId: string | null;
@@ -58,6 +61,7 @@ export function MobileMainPane({
   view,
   pluginPanes,
   onBackToAgent,
+  onOpenAgentsPane,
   pairedMounted,
   activeSession,
   activeSessionId,
@@ -87,7 +91,15 @@ export function MobileMainPane({
 }: Props) {
   const activePluginPane = isPluginPaneId(view) ? (pluginPanes.find((p) => p.id === view) ?? null) : null;
   const viewLabel =
-    view === "diff" ? "Diff" : view === "paired" ? "Paired terminal" : (activePluginPane?.title ?? "Plugin");
+    view === "diff"
+      ? "Diff"
+      : view === "files"
+        ? "Files"
+        : view === "paired"
+          ? "Paired terminal"
+          : view === "agents"
+            ? "Sub agents"
+            : (activePluginPane?.title ?? "Plugin");
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
@@ -120,6 +132,7 @@ export function MobileMainPane({
                 trashedAt={activeSession.trashed_at ?? null}
                 onOpenFileRef={onOpenFileRef}
                 fileRefSession={activeSession}
+                onOpenAgentsPane={onOpenAgentsPane}
                 isSandboxed={activeSession.is_sandboxed}
               />
             </Suspense>
@@ -199,10 +212,27 @@ export function MobileMainPane({
           </div>
         )}
 
+        {view === "agents" && (
+          <div
+            className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900"
+            style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+          >
+            <BackgroundAgentsPanel sessionId={activeSessionId} />
+          </div>
+        )}
+
+        {view === "files" && (
+          <div
+            className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900"
+            style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+          >
+            <FilesPane key={activeSessionId ?? "none"} sessionId={activeSessionId} />
+          </div>
+        )}
+
         {activePluginPane && (
-          // Reserve the bottom home-indicator inset here too (see the diff and
-          // paired wrappers); the App root no longer does. Collapses to 0 with
-          // the keyboard open and on desktop.
+          // Reserve the bottom home-indicator inset here too (see the diff and paired wrappers); the App root no
+          // longer does.
           <div
             className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900"
             data-testid="mobile-plugin-layer"

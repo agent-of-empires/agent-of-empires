@@ -1,15 +1,10 @@
 // @vitest-environment jsdom
-//
-// Covers the mobile single-pane container (#1452): the back header, the
-// agent / paired / diff layers with their inert + visibility toggling, the
-// structured view vs terminal agent branch, the diff list vs viewer branch, and the
-// send-comments dialog. Heavy children are stubbed; this asserts the
-// container's own branching, which the Playwright suite then exercises live.
 
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 
 import type { SessionResponse } from "../../lib/types";
+import { makeSession as baseSession } from "./fixtures";
 import type { useDiffComments } from "../../hooks/useDiffComments";
 
 vi.mock("../TerminalSessionStack", () => ({
@@ -37,30 +32,19 @@ vi.mock("../diff/comments/SendCommentsDialog", () => ({
 vi.mock("../acp/StructuredView", () => ({
   StructuredView: () => <div data-testid="acp-view" />,
 }));
+vi.mock("../acp/BackgroundAgentsPanel", () => ({
+  BackgroundAgentsPanel: ({ sessionId }: { sessionId: string | null }) => (
+    <div data-testid="background-agents-panel">{sessionId}</div>
+  ),
+}));
+vi.mock("../FilesPane", () => ({
+  FilesPane: ({ sessionId }: { sessionId: string | null }) => <div data-testid="files-pane">{sessionId}</div>,
+}));
 
 import { MobileMainPane } from "../MobileMainPane";
 
-function session(overrides: Partial<SessionResponse> = {}): SessionResponse {
-  return {
-    id: "s1",
-    title: "t",
-    project_path: "/tmp/t",
-    group_path: "/tmp",
-    tool: "claude",
-    status: "Running",
-    yolo_mode: false,
-    created_at: new Date().toISOString(),
-    last_accessed_at: null,
-    last_error: null,
-    branch: null,
-    main_repo_path: null,
-    is_sandboxed: false,
-    has_terminal: true,
-    profile: "default",
-    workspace_repos: [],
-    ...overrides,
-  } as SessionResponse;
-}
+const session = (overrides: Partial<SessionResponse> = {}) =>
+  baseSession({ id: "s1", title: "t", project_path: "/tmp/t", status: "Running", ...overrides });
 
 function makeStore(overrides: Partial<ReturnType<typeof useDiffComments>> = {}): ReturnType<typeof useDiffComments> {
   return {
@@ -85,6 +69,7 @@ function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
     view: "agent",
     pluginPanes: [],
     onBackToAgent,
+    onOpenAgentsPane: vi.fn(),
     pairedMounted: false,
     activeSession: session(),
     activeSessionId: "s1",
@@ -143,6 +128,20 @@ describe("MobileMainPane", () => {
   it("keeps the paired shell mounted after first activation", () => {
     setup({ view: "agent", pairedMounted: true });
     expect(screen.getByTestId("paired-shell")).toBeDefined();
+  });
+
+  it("shows the sub agents panel in agents view", () => {
+    setup({ view: "agents", activeSessionId: "s1" });
+    expect(screen.getByTestId("background-agents-panel").textContent).toBe("s1");
+    expect(screen.getByText("Sub agents")).toBeDefined();
+    expect(screen.getByTestId("mobile-back-to-agent")).toBeDefined();
+  });
+
+  it("shows the files pane in files view", () => {
+    setup({ view: "files", activeSessionId: "s1" });
+    expect(screen.getByTestId("files-pane").textContent).toBe("s1");
+    expect(screen.getByText("Files")).toBeDefined();
+    expect(screen.getByTestId("mobile-back-to-agent")).toBeDefined();
   });
 
   it("shows the diff file list in diff view", () => {

@@ -1,50 +1,29 @@
 // @vitest-environment jsdom
-//
-// Keyboard-affordance tests for DeleteSessionDialog. The dialog opens from
-// the workspace sidebar right-click menu; pressing Enter inside it should
-// confirm the delete without forcing the user to mouse over to the button
-// (issue #1260). Escape continues to cancel, and Enter should not fire a
-// second confirm while one is already in flight.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { DeleteSessionDialog } from "../DeleteSessionDialog";
-import type { CleanupDefaults } from "../../lib/types";
+import { expectRestoresFocus } from "./dialogTestUtils";
 
-const cleanupDefaults: CleanupDefaults = {
-  delete_worktree: true,
-  delete_branch: false,
-  delete_sandbox: false,
-  delete_to_trash: false,
+type Overrides = Partial<Omit<React.ComponentProps<typeof DeleteSessionDialog>, "onConfirm" | "onTrash">> & {
+  onConfirm?: ReturnType<typeof vi.fn>;
 };
 
-function setup(overrides?: {
-  affectedSessions?: Array<{ id: string; title: string; isSandboxed: boolean }>;
-  onConfirm?: () => Promise<void>;
-  onTrash?: () => Promise<void>;
-  onCancel?: () => void;
-  branchName?: string | null;
-  hasManagedWorktree?: boolean;
-  isSandboxed?: boolean;
-  isScratch?: boolean;
-  // Defaults to false so the existing suite exercises the permanent-delete
-  // path directly; the trash-first cases opt in explicitly.
-  defaultToTrash?: boolean;
-}) {
-  const onConfirm = overrides?.onConfirm ?? vi.fn().mockResolvedValue(undefined);
-  const onTrash = overrides?.onTrash ?? vi.fn().mockResolvedValue(undefined);
-  const onCancel = overrides?.onCancel ?? vi.fn();
+function setup(overrides: Overrides = {}) {
+  const onConfirm = overrides.onConfirm ?? vi.fn().mockResolvedValue(undefined);
+  const onTrash = vi.fn().mockResolvedValue(undefined);
+  const onCancel = overrides.onCancel ?? vi.fn();
   const utils = render(
     <DeleteSessionDialog
       sessionTitle="my-session"
-      branchName={overrides?.branchName === undefined ? "feature/foo" : overrides.branchName}
-      hasManagedWorktree={overrides?.hasManagedWorktree ?? true}
-      isSandboxed={overrides?.isSandboxed ?? false}
-      isScratch={overrides?.isScratch ?? false}
-      cleanupDefaults={cleanupDefaults}
-      defaultToTrash={overrides?.defaultToTrash ?? false}
-      affectedSessions={overrides?.affectedSessions}
+      branchName="feature/foo"
+      hasManagedWorktree
+      isSandboxed={false}
+      isScratch={false}
+      cleanupDefaults={{ delete_worktree: true, delete_branch: false, delete_sandbox: false, delete_to_trash: false }}
+      defaultToTrash={false}
+      {...overrides}
       onConfirm={onConfirm}
       onTrash={onTrash}
       onCancel={onCancel}
@@ -53,450 +32,188 @@ function setup(overrides?: {
   return { ...utils, onConfirm, onTrash, onCancel };
 }
 
-afterEach(() => {
-  cleanup();
+const box = (id: string) => screen.queryByTestId(id) as HTMLLabelElement | null;
+const toggle = (id: string) => fireEvent.click(box(id)!.querySelector("span")!);
+const enter = () => fireEvent.keyDown(document, { key: "Enter" });
+const cleanupBoxes = () => document.querySelectorAll('[data-testid^="delete-session-checkbox-"]');
+const body = (over: Record<string, boolean> = {}) => ({
+  delete_worktree: true,
+  delete_branch: false,
+  delete_sandbox: false,
+  force_delete: false,
+  ...over,
 });
+const twoSessions = (sandboxed: [boolean, boolean] = [false, false]) => [
+  { id: "sess-a", title: "agent-alpha", isSandboxed: sandboxed[0] },
+  { id: "sess-b", title: "agent-beta", isSandboxed: sandboxed[1] },
+];
 
-describe("DeleteSessionDialog keyboard affordances", () => {
-  it("focuses the Delete button on mount so Enter activates it natively", () => {
-    const { container } = setup();
-    const deleteBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.includes("Delete") && !b.textContent.includes("Deleting"),
-    );
-    expect(deleteBtn).toBeTruthy();
-    expect(document.activeElement).toBe(deleteBtn);
-  });
+afterEach(cleanup);
 
-  it("Enter pressed inside the dialog calls onConfirm", async () => {
-    const onConfirm = vi.fn().mockResolvedValue(undefined);
-    setup({ onConfirm });
-    fireEvent.keyDown(document, { key: "Enter" });
+describe("DeleteSessionDialog keyboard and a11y", () => {
+  it("focuses Delete, confirms on Enter once while in flight, and cancels on Escape", () => {
+    let resolve = () => {};
+    const onConfirm = vi.fn(() => new Promise<void>((r) => (resolve = r)));
+    const { onCancel } = setup({ onConfirm });
+    expect(document.activeElement).toBe(screen.getByTestId("delete-session-confirm"));
+    enter();
+    enter();
     expect(onConfirm).toHaveBeenCalledTimes(1);
-    expect(onConfirm).toHaveBeenCalledWith({
-      delete_worktree: true,
-      delete_branch: false,
-      delete_sandbox: false,
-      force_delete: false,
-    });
-  });
-
-  it("Escape pressed inside the dialog calls onCancel", () => {
-    const onCancel = vi.fn();
-    setup({ onCancel });
+    expect(onConfirm).toHaveBeenCalledWith(body());
     fireEvent.keyDown(document, { key: "Escape" });
     expect(onCancel).toHaveBeenCalledTimes(1);
+    resolve();
   });
 
-  it("Enter does not fire onConfirm a second time while delete is in flight", async () => {
-    // Keep the first confirm promise pending so the component stays in the
-    // "deleting" state; a second Enter should be ignored.
-    let resolveConfirm: (() => void) | null = null;
-    const onConfirm = vi.fn(
-      () =>
-        new Promise<void>((resolve) => {
-          resolveConfirm = () => resolve();
-        }),
-    );
-    setup({ onConfirm });
-    fireEvent.keyDown(document, { key: "Enter" });
-    fireEvent.keyDown(document, { key: "Enter" });
+  it("leaves Enter on a focused button to the native click", () => {
+    const { onConfirm, onCancel } = setup();
+    const confirm = screen.getByTestId("delete-session-confirm");
+    fireEvent.keyDown(confirm, { key: "Enter" });
+    fireEvent.click(confirm);
     expect(onConfirm).toHaveBeenCalledTimes(1);
-    resolveConfirm?.();
+    expect(onCancel).not.toHaveBeenCalled();
+    cleanup();
+    const second = setup();
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    cancel.focus();
+    fireEvent.keyDown(cancel, { key: "Enter" });
+    fireEvent.click(cancel);
+    expect(second.onConfirm).not.toHaveBeenCalled();
+    expect(second.onCancel).toHaveBeenCalledTimes(1);
   });
 
-  it("Enter while focus is on the Delete button does not double-fire onConfirm", () => {
-    // When the Delete button is focused (the default on mount), the
-    // browser already activates the button on Enter via a synthetic
-    // click. The document-level keydown handler must skip Enter when
-    // the event target is a button, or onConfirm would be called twice.
-    const onConfirm = vi.fn().mockResolvedValue(undefined);
-    const { container } = setup({ onConfirm });
-    const deleteBtn = Array.from(container.querySelectorAll("button")).find(
-      (b) => b.textContent?.includes("Delete") && !b.textContent.includes("Deleting"),
-    )!;
-    expect(document.activeElement).toBe(deleteBtn);
-    // Dispatch keydown from the focused button (bubbles up to document)
-    // and the native button activation (click) that the browser would emit.
-    fireEvent.keyDown(deleteBtn, { key: "Enter" });
-    fireEvent.click(deleteBtn);
-    expect(onConfirm).toHaveBeenCalledTimes(1);
+  it("is a modal dialog named by its title", () => {
+    expect(setup() && screen.getByRole("dialog", { name: /Delete Session/ }).getAttribute("aria-modal")).toBe("true");
   });
 
-  it("Enter while focus is on the Cancel button cancels rather than confirms", () => {
-    const onConfirm = vi.fn().mockResolvedValue(undefined);
-    const onCancel = vi.fn();
-    const { container } = setup({ onConfirm, onCancel });
-    const cancelBtn = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.trim() === "Cancel");
-    expect(cancelBtn).toBeTruthy();
-    cancelBtn!.focus();
-    // The keydown handler should skip Enter when focus is on a non-confirm
-    // button, leaving the browser's native button-Enter behavior to drive
-    // the Cancel click. Simulate that click here.
-    fireEvent.keyDown(cancelBtn!, { key: "Enter" });
-    fireEvent.click(cancelBtn!);
-    expect(onConfirm).not.toHaveBeenCalled();
-    expect(onCancel).toHaveBeenCalledTimes(1);
+  it("restores focus to the trigger on unmount", () => {
+    expectRestoresFocus(() => setup().unmount);
   });
+});
 
-  it("dialog has role=dialog, aria-modal, and aria-labelledby pointing at the title", () => {
-    const { container } = setup();
-    const dialog = container.querySelector('[role="dialog"]');
-    expect(dialog).toBeTruthy();
-    expect(dialog?.getAttribute("aria-modal")).toBe("true");
-    const labelId = dialog?.getAttribute("aria-labelledby");
-    expect(labelId).toBeTruthy();
-    const titleEl = container.querySelector(`#${labelId}`);
-    expect(titleEl?.textContent).toMatch(/Delete Session/);
-  });
-
+describe("DeleteSessionDialog presentation", () => {
   it("keeps the single-session presentation for one affected session", () => {
-    const { container } = setup({
-      affectedSessions: [{ id: "sess-a", title: "my-session", isSandboxed: false }],
-    });
-
-    expect(container.querySelector("#delete-session-dialog-title")?.textContent).toMatch(/Delete Session/);
+    const { container } = setup({ affectedSessions: [{ id: "sess-a", title: "my-session", isSandboxed: false }] });
+    expect(screen.getByRole("heading").textContent).toBe("Delete Session");
     expect(container.textContent).toMatch(/Delete my-session\?/);
-    expect(container.querySelector('[data-testid="delete-session-affected-count"]')).toBeNull();
-    expect(container.querySelector('[data-testid="delete-session-affected-list"]')).toBeNull();
+    expect(screen.queryByTestId("delete-session-affected-count")).toBeNull();
+    expect(screen.queryByTestId("delete-session-affected-list")).toBeNull();
   });
 
-  it("renders a workspace-shaped presentation for multi-session workspaces", () => {
-    const { container } = setup({
-      affectedSessions: [
-        { id: "sess-a", title: "agent-alpha", isSandboxed: true },
-        { id: "sess-b", title: "agent-beta", isSandboxed: true },
-      ],
-      isSandboxed: true,
-      isScratch: true,
-    });
+  it("renders workspace-shaped copy for multi-session workspaces", () => {
+    const { container } = setup({ affectedSessions: twoSessions([true, true]), isSandboxed: true, isScratch: true });
+    expect(screen.getByRole("heading").textContent).toBe("Delete Workspace");
+    expect(screen.getByTestId("delete-session-affected-count").textContent).toMatch(/all 2 sessions/);
+    expect(screen.getByTestId("delete-session-affected-list").textContent).toBe("agent-alphaagent-beta");
+    const text = container.textContent;
+    expect(text).not.toMatch(/Delete my-session\?/);
+    for (const copy of [
+      "Permanently delete this workspace?",
+      'Removes the workspace worktree for branch "feature/foo"',
+      'Removes the workspace branch "feature/foo"',
+      "Delete containers",
+      "Removes Docker sandbox containers, and any private agent store, for all sessions in this workspace",
+      "Keep scratch directories",
+      "Leaves scratch directories on disk; session records are still removed",
+    ]) {
+      expect(text).toContain(copy);
+    }
+  });
 
-    expect(container.querySelector("#delete-session-dialog-title")?.textContent).toMatch(/Delete Workspace/);
-    expect(container.textContent).toMatch(/Permanently delete this workspace\?/);
-    expect(container.querySelector('[data-testid="delete-session-affected-count"]')?.textContent).toMatch(
-      /all 2 sessions/,
+  it("describes sandbox cleanup for single, mixed-workspace, and branchless cases", () => {
+    setup({ hasManagedWorktree: false, isSandboxed: true });
+    expect(document.body.textContent).toContain(
+      "Removes the Docker sandbox container and any private agent store it has (including the saved agent login)",
     );
-    const affectedList = container.querySelector('[data-testid="delete-session-affected-list"]');
-    expect(affectedList?.textContent).toMatch(/agent-alpha/);
-    expect(affectedList?.textContent).toMatch(/agent-beta/);
-    expect(container.textContent).not.toMatch(/Delete my-session\?/);
-    expect(container.textContent).toMatch(/Removes the workspace worktree for branch "feature\/foo"/);
-    expect(container.textContent).toMatch(/Removes the workspace branch "feature\/foo"/);
-    expect(container.textContent).toMatch(/Delete containers/);
-    expect(container.textContent).toMatch(
-      /Removes Docker sandbox containers, and any private agent store, for all sessions in this workspace/,
+    cleanup();
+    setup({ affectedSessions: twoSessions([true, false]), isSandboxed: true });
+    expect(document.body.textContent).toContain(
+      "Removes Docker sandbox containers, and any private agent store, for 1 sandboxed session in this workspace",
     );
-    expect(container.textContent).toMatch(/Keep scratch directories/);
-    expect(container.textContent).toMatch(/Leaves scratch directories on disk; session records are still removed/);
+    cleanup();
+    setup({ branchName: null, affectedSessions: twoSessions() });
+    expect(box("delete-session-checkbox-branch")!.textContent).toBe("Delete branch");
+  });
+});
+
+describe("DeleteSessionDialog confirm body", () => {
+  it.each([
+    ["delete-worktree off hides force", "delete-session-checkbox-worktree", body({ delete_worktree: false })],
+    ["force delete", "delete-session-checkbox-force", body({ force_delete: true })],
+    ["delete branch", "delete-session-checkbox-branch", body({ delete_branch: true })],
+  ])("%s", (_name, id, expected) => {
+    const { onConfirm } = setup();
+    expect(box(id)!.dataset.checked).toBe(id.endsWith("worktree") ? "true" : "false");
+    toggle(id);
+    expect(box(id)!.dataset.checked).toBe(id.endsWith("worktree") ? "false" : "true");
+    if (id.endsWith("worktree")) expect(box("delete-session-checkbox-force")).toBeNull();
+    enter();
+    expect(onConfirm).toHaveBeenCalledWith(expected);
   });
 
-  it("describes mixed workspace sandbox cleanup by sandboxed session count", () => {
-    const { container } = setup({
-      affectedSessions: [
-        { id: "sess-a", title: "agent-alpha", isSandboxed: true },
-        { id: "sess-b", title: "agent-beta", isSandboxed: false },
-      ],
-      isSandboxed: true,
-    });
-
-    expect(container.textContent).toMatch(
-      /Removes Docker sandbox containers, and any private agent store, for 1 sandboxed session in this workspace/,
-    );
+  it("renders only the sandbox checkbox without a managed worktree", () => {
+    const { onConfirm } = setup({ hasManagedWorktree: false, isSandboxed: true });
+    expect(cleanupBoxes()).toHaveLength(1);
+    expect(box("delete-session-checkbox-sandbox")!.dataset.checked).toBe("false");
+    toggle("delete-session-checkbox-sandbox");
+    enter();
+    expect(onConfirm).toHaveBeenCalledWith(body({ delete_worktree: false, delete_sandbox: true }));
   });
 
-  it("does not invent branch cleanup detail when a workspace branch name is unavailable", () => {
-    const { container } = setup({
-      branchName: null,
-      affectedSessions: [
-        { id: "sess-a", title: "agent-alpha", isSandboxed: false },
-        { id: "sess-b", title: "agent-beta", isSandboxed: false },
-      ],
-    });
-
-    const branchBox = container.querySelector('[data-testid="delete-session-checkbox-branch"]');
-    expect(branchBox).toBeTruthy();
-    expect(branchBox?.textContent).toBe("Delete branch");
+  it("confirms an all-false body with no options", () => {
+    const { onConfirm } = setup({ hasManagedWorktree: false });
+    expect(cleanupBoxes()).toHaveLength(0);
+    enter();
+    expect(onConfirm).toHaveBeenCalledWith(body({ delete_worktree: false }));
+    expect(onConfirm.mock.calls[0]![0].keep_scratch).toBeUndefined();
   });
 
-  it("trash-first workspace copy switches when Delete permanently is checked", () => {
-    const onConfirm = vi.fn().mockResolvedValue(undefined);
-    const onTrash = vi.fn().mockResolvedValue(undefined);
-    const { container } = setup({
-      onConfirm,
-      onTrash,
-      defaultToTrash: true,
-      affectedSessions: [
-        { id: "sess-a", title: "agent-alpha", isSandboxed: false },
-        { id: "sess-b", title: "agent-beta", isSandboxed: false },
-      ],
-    });
-
-    expect(container.textContent).toMatch(/Move this workspace to Trash\?/);
-    expect(container.querySelectorAll('[data-testid^="delete-session-checkbox-"]')).toHaveLength(0);
-
-    const permanentBox = container.querySelector<HTMLLabelElement>('[data-testid="delete-session-permanent"]');
-    fireEvent.click(permanentBox!.querySelector("span")!);
-    expect(container.textContent).toMatch(/Permanently delete this workspace\?/);
-    expect(container.querySelector('[data-testid="delete-session-checkbox-worktree"]')).toBeTruthy();
-
-    fireEvent.keyDown(document, { key: "Enter" });
-    expect(onConfirm).toHaveBeenCalledTimes(1);
-    expect(onTrash).not.toHaveBeenCalled();
+  it("sends keep_scratch only for scratch sessions, false until checked", () => {
+    const { onConfirm } = setup({ hasManagedWorktree: false, isScratch: true });
+    expect(box("delete-session-checkbox-keep-scratch")!.dataset.checked).toBe("false");
+    enter();
+    expect(onConfirm.mock.calls[0]![0].keep_scratch).toBe(false);
+    cleanup();
+    const second = setup({ hasManagedWorktree: false, isScratch: true });
+    toggle("delete-session-checkbox-keep-scratch");
+    enter();
+    expect(second.onConfirm).toHaveBeenCalledWith({ ...body({ delete_worktree: false }), keep_scratch: true });
   });
+});
 
-  it("toggling delete-worktree off hides the force checkbox and sends a worktree=false body", () => {
-    const onConfirm = vi.fn().mockResolvedValue(undefined);
-    const { container } = setup({ onConfirm });
-
-    const worktreeBox = container.querySelector<HTMLLabelElement>('[data-testid="delete-session-checkbox-worktree"]');
-    expect(worktreeBox).toBeTruthy();
-    expect(worktreeBox!.dataset.checked).toBe("true");
-    // The force-delete checkbox is only rendered while delete-worktree is on.
-    expect(container.querySelector('[data-testid="delete-session-checkbox-force"]')).toBeTruthy();
-
-    fireEvent.click(worktreeBox!.querySelector("span")!);
-    expect(worktreeBox!.dataset.checked).toBe("false");
-    expect(container.querySelector('[data-testid="delete-session-checkbox-force"]')).toBeNull();
-
-    fireEvent.keyDown(document, { key: "Enter" });
-    expect(onConfirm).toHaveBeenCalledWith({
-      delete_worktree: false,
-      delete_branch: false,
-      delete_sandbox: false,
-      force_delete: false,
-    });
-  });
-
-  it("force checkbox flips force_delete in the confirm body when enabled", () => {
-    const onConfirm = vi.fn().mockResolvedValue(undefined);
-    const { container } = setup({ onConfirm });
-
-    const forceBox = container.querySelector<HTMLLabelElement>('[data-testid="delete-session-checkbox-force"]');
-    expect(forceBox).toBeTruthy();
-    expect(forceBox!.dataset.checked).toBe("false");
-
-    fireEvent.click(forceBox!.querySelector("span")!);
-    expect(forceBox!.dataset.checked).toBe("true");
-
-    fireEvent.keyDown(document, { key: "Enter" });
-    expect(onConfirm).toHaveBeenCalledWith({
-      delete_worktree: true,
-      delete_branch: false,
-      delete_sandbox: false,
-      force_delete: true,
-    });
-  });
-
-  it("enabling delete-branch flips delete_branch in the confirm body", () => {
-    const onConfirm = vi.fn().mockResolvedValue(undefined);
-    const { container } = setup({ onConfirm });
-
-    const branchBox = container.querySelector<HTMLLabelElement>('[data-testid="delete-session-checkbox-branch"]');
-    expect(branchBox).toBeTruthy();
-    expect(branchBox!.dataset.checked).toBe("false");
-
-    fireEvent.click(branchBox!.querySelector("span")!);
-    expect(branchBox!.dataset.checked).toBe("true");
-
-    fireEvent.keyDown(document, { key: "Enter" });
-    expect(onConfirm).toHaveBeenCalledWith({
-      delete_worktree: true,
-      delete_branch: true,
-      delete_sandbox: false,
-      force_delete: false,
-    });
-  });
-
-  it("sandbox checkbox is the only one rendered when the session has no managed worktree", () => {
-    const onConfirm = vi.fn().mockResolvedValue(undefined);
-    const { container } = setup({
-      onConfirm,
-      hasManagedWorktree: false,
-      isSandboxed: true,
-    });
-
-    expect(container.querySelector('[data-testid="delete-session-checkbox-worktree"]')).toBeNull();
-    expect(container.querySelector('[data-testid="delete-session-checkbox-branch"]')).toBeNull();
-    expect(container.querySelector('[data-testid="delete-session-checkbox-force"]')).toBeNull();
-
-    const sandboxBox = container.querySelector<HTMLLabelElement>('[data-testid="delete-session-checkbox-sandbox"]');
-    expect(sandboxBox).toBeTruthy();
-    // Sandbox default flips on automatically because cleanupDefaults.delete_sandbox
-    // is false but the dialog re-derives off isSandboxed. Here cleanupDefaults
-    // has delete_sandbox=false, so it should start off.
-    expect(sandboxBox!.dataset.checked).toBe("false");
-
-    fireEvent.click(sandboxBox!.querySelector("span")!);
-    fireEvent.keyDown(document, { key: "Enter" });
-    expect(onConfirm).toHaveBeenCalledWith({
-      delete_worktree: false,
-      delete_branch: false,
-      delete_sandbox: true,
-      force_delete: false,
-    });
-  });
-
-  it("says the sandbox checkbox removes the agent store, not just the container", () => {
-    const { container } = setup({ hasManagedWorktree: false, isSandboxed: true });
-
-    expect(container.textContent).toMatch(
-      /Removes the Docker sandbox container and any private agent store it has \(including the saved agent login\)/,
-    );
-  });
-
-  it("no-options session (no worktree, no sandbox) confirms with an all-false body", () => {
-    const onConfirm = vi.fn().mockResolvedValue(undefined);
-    const { container } = setup({
-      onConfirm,
-      hasManagedWorktree: false,
-      isSandboxed: false,
-    });
-
-    expect(container.querySelectorAll('[data-testid^="delete-session-checkbox-"]')).toHaveLength(0);
-
-    fireEvent.keyDown(document, { key: "Enter" });
-    expect(onConfirm).toHaveBeenCalledWith({
-      delete_worktree: false,
-      delete_branch: false,
-      delete_sandbox: false,
-      force_delete: false,
-    });
-  });
-
-  it("scratch session shows a Keep scratch directory checkbox that omits the field by default", () => {
-    // The checkbox is only meaningful for scratch sessions; non-scratch
-    // confirms must not carry a stray `keep_scratch` key.
-    const onConfirm = vi.fn().mockResolvedValue(undefined);
-    setup({
-      onConfirm,
-      hasManagedWorktree: false,
-      isSandboxed: false,
-      isScratch: true,
-    });
-
-    const keepCheckbox = document.querySelector('[data-testid="delete-session-checkbox-keep-scratch"]');
-    expect(keepCheckbox).toBeTruthy();
-    expect(keepCheckbox?.getAttribute("data-checked")).toBe("false");
-
-    fireEvent.keyDown(document, { key: "Enter" });
-    expect(onConfirm).toHaveBeenCalledTimes(1);
-    const body = onConfirm.mock.calls[0][0];
-    expect(body.keep_scratch).toBe(false);
-  });
-
-  it("checking Keep scratch directory sends keep_scratch=true in the confirm body", () => {
-    const onConfirm = vi.fn().mockResolvedValue(undefined);
-    setup({
-      onConfirm,
-      hasManagedWorktree: false,
-      isSandboxed: false,
-      isScratch: true,
-    });
-
-    const keepCheckbox = document.querySelector(
-      '[data-testid="delete-session-checkbox-keep-scratch"] span',
-    ) as HTMLElement;
-    expect(keepCheckbox).toBeTruthy();
-    fireEvent.click(keepCheckbox);
-
-    fireEvent.keyDown(document, { key: "Enter" });
-    expect(onConfirm).toHaveBeenCalledTimes(1);
-    expect(onConfirm.mock.calls[0][0]).toMatchObject({
-      delete_worktree: false,
-      delete_branch: false,
-      delete_sandbox: false,
-      force_delete: false,
-      keep_scratch: true,
-    });
-  });
-
-  it("non-scratch session does NOT include keep_scratch in the confirm body", () => {
-    const onConfirm = vi.fn().mockResolvedValue(undefined);
-    setup({
-      onConfirm,
-      hasManagedWorktree: false,
-      isSandboxed: false,
-      isScratch: false,
-    });
-
-    fireEvent.keyDown(document, { key: "Enter" });
-    expect(onConfirm).toHaveBeenCalledTimes(1);
-    expect(onConfirm.mock.calls[0][0].keep_scratch).toBeUndefined();
-  });
-
-  it("trash-first: a bare Delete calls onTrash, with the cleanup options hidden", () => {
-    const onConfirm = vi.fn().mockResolvedValue(undefined);
-    const onTrash = vi.fn().mockResolvedValue(undefined);
-    const { container } = setup({ onConfirm, onTrash, defaultToTrash: true });
-
-    // The modal looks the same as a normal delete: static "Delete Session"
-    // title, plus a "Delete permanently" opt-in checkbox (unchecked).
-    expect(container.querySelector("#delete-session-dialog-title")?.textContent).toMatch(/Delete Session/);
-    const permanentBox = container.querySelector<HTMLLabelElement>('[data-testid="delete-session-permanent"]');
-    expect(permanentBox).toBeTruthy();
-    expect(permanentBox!.dataset.checked).toBe("false");
-    // While "Delete permanently" is unchecked the cleanup options stay hidden
-    // (trash keeps the worktree/branch/container).
-    expect(container.querySelectorAll('[data-testid^="delete-session-checkbox-"]')).toHaveLength(0);
-
-    fireEvent.keyDown(document, { key: "Enter" });
+describe("DeleteSessionDialog trash-first", () => {
+  it("a bare Delete trashes with the cleanup options hidden", () => {
+    const { onConfirm, onTrash } = setup({ defaultToTrash: true });
+    expect(screen.getByRole("heading").textContent).toBe("Delete Session");
+    expect(box("delete-session-permanent")!.dataset.checked).toBe("false");
+    expect(cleanupBoxes()).toHaveLength(0);
+    enter();
     expect(onTrash).toHaveBeenCalledTimes(1);
     expect(onConfirm).not.toHaveBeenCalled();
   });
 
-  it("trash-first: checking 'Delete permanently' reveals options and routes to onConfirm", () => {
-    const onConfirm = vi.fn().mockResolvedValue(undefined);
-    const onTrash = vi.fn().mockResolvedValue(undefined);
-    const { container } = setup({ onConfirm, onTrash, defaultToTrash: true });
-
-    const permanentBox = container.querySelector<HTMLLabelElement>('[data-testid="delete-session-permanent"]');
-    fireEvent.click(permanentBox!.querySelector("span")!);
-    expect(permanentBox!.dataset.checked).toBe("true");
-
-    // Cleanup options now appear; the title and button are unchanged.
-    expect(container.querySelector("#delete-session-dialog-title")?.textContent).toMatch(/Delete Session/);
-    expect(container.querySelector('[data-testid="delete-session-checkbox-worktree"]')).toBeTruthy();
-
-    fireEvent.keyDown(document, { key: "Enter" });
-    expect(onConfirm).toHaveBeenCalledTimes(1);
-    expect(onTrash).not.toHaveBeenCalled();
-    expect(onConfirm).toHaveBeenCalledWith({
-      delete_worktree: true,
-      delete_branch: false,
-      delete_sandbox: false,
-      force_delete: false,
-    });
-  });
-
-  it("already-trashed (defaultToTrash=false): no permanent checkbox, Delete purges directly", () => {
-    const onConfirm = vi.fn().mockResolvedValue(undefined);
-    const onTrash = vi.fn().mockResolvedValue(undefined);
-    const { container } = setup({ onConfirm, onTrash, defaultToTrash: false });
-
-    // No opt-in checkbox: this is the permanent path (e.g. deleting again
-    // from the Trash section). Cleanup options are shown immediately.
-    expect(container.querySelector('[data-testid="delete-session-permanent"]')).toBeNull();
-    expect(container.querySelector('[data-testid="delete-session-checkbox-worktree"]')).toBeTruthy();
-
-    fireEvent.keyDown(document, { key: "Enter" });
-    expect(onConfirm).toHaveBeenCalledTimes(1);
+  it.each([
+    ["session", undefined, "Delete Session"],
+    ["workspace", twoSessions(), "Delete Workspace"],
+  ])("checking Delete permanently reveals options and confirms (%s)", (kind, affectedSessions, title) => {
+    const { onConfirm, onTrash, container } = setup({ defaultToTrash: true, affectedSessions });
+    if (kind === "workspace") expect(container.textContent).toMatch(/Move this workspace to Trash\?/);
+    toggle("delete-session-permanent");
+    expect(box("delete-session-permanent")!.dataset.checked).toBe("true");
+    expect(screen.getByRole("heading").textContent).toBe(title);
+    if (kind === "workspace") expect(container.textContent).toMatch(/Permanently delete this workspace\?/);
+    expect(box("delete-session-checkbox-worktree")).not.toBeNull();
+    enter();
+    expect(onConfirm).toHaveBeenCalledWith(body());
     expect(onTrash).not.toHaveBeenCalled();
   });
 
-  it("restores focus to the previously focused element when the dialog unmounts", () => {
-    // Create a trigger button outside the dialog and focus it before mount,
-    // mirroring how the sidebar context-menu item is focused when the user
-    // chooses Delete. After the dialog unmounts, focus should return there.
-    const trigger = document.createElement("button");
-    trigger.textContent = "trigger";
-    document.body.appendChild(trigger);
-    trigger.focus();
-    expect(document.activeElement).toBe(trigger);
-
-    const { unmount } = setup();
-    // Dialog mount steals focus to the Delete button.
-    expect(document.activeElement).not.toBe(trigger);
-    unmount();
-    expect(document.activeElement).toBe(trigger);
-    trigger.remove();
+  it("without trash-first there is no opt-in and Delete purges directly", () => {
+    const { onConfirm, onTrash } = setup();
+    expect(box("delete-session-permanent")).toBeNull();
+    expect(box("delete-session-checkbox-worktree")).not.toBeNull();
+    enter();
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    expect(onTrash).not.toHaveBeenCalled();
   });
 });

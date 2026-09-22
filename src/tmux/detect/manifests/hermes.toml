@@ -9,8 +9,8 @@ region = "whole_recent"
 visible = true
 line_regex = ['[\x{25DC}\x{25E0}\x{2727}]']
 
-# While running, Hermes replaces its input prompt with `❯ Ctrl+C to
-# interrupt…`, so this has to outrank the parked-prompt rule below.
+# While running, Hermes replaces its input prompt with `❯ Ctrl+C to interrupt…`,
+# so this has to outrank the parked-prompt rule below.
 [[rules]]
 id = "interrupt_hint"
 state = "running"
@@ -20,9 +20,7 @@ visible = true
 contains = ["ctrl+c to interrupt"]
 
 # The input prompt on its own (`❯` default skin, `⚡` cyberpunk) means the turn
-# is over. Idle, not Waiting: Waiting here means a dangerous command needs
-# approval. Ranked above the activity words so a previous turn's scrollback
-# cannot flip a parked pane back to Running.
+# is over.
 [[rules]]
 id = "ready_prompt"
 state = "idle"

@@ -54,7 +54,7 @@ jobs:
           token: ${{ secrets.RELEASE_TOKEN }}
 
       - name: Install release tools
-        uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff # v2.87.8
+        uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
         with:
           tool: cargo-edit,git-cliff
 

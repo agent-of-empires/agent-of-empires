@@ -4,32 +4,22 @@
 use std::process::{Command, Stdio};
 use tracing::warn;
 
-/// Resolve a bare agent command name to an absolute path, scanning common
-/// node-version-manager bin dirs (nvm, fnm, mise, asdf, Volta) plus the
-/// usual system locations. Returns the absolute binary path and the bin
-/// dir we found it in; the caller prepends that dir to the agent's PATH
-/// so the adapter's own subprocesses (`node`, `npx`) can still resolve.
-///
-/// Re-runs per spawn (no cache) so an `nvm use <other-version>` after the
-/// daemon started picks up immediately without a daemon restart. Returns
-/// None when the command is already a path, contains a `${placeholder}`,
-/// or isn't found anywhere we know to look.
-/// A resolved agent binary plus the directories to prepend to the child's
-/// PATH before spawning it.
+/// A resolved agent binary plus the dirs to prepend to the child's PATH, so
+/// the adapter's own `node` / `npx` subprocesses resolve against the same
+/// install.
 pub struct ResolvedAgentCommand {
     pub path: std::path::PathBuf,
     pub prepend_paths: Vec<std::path::PathBuf>,
 }
 
-/// Resolve an agent adapter's binary. PATH first, so a user's explicit
-/// install wins, EXCEPT when that copy is below the version floor the
-/// startup gate enforces and a pinned bundled copy is available: spawning a
-/// binary we know `initialize` will reject, while a compliant one sits in
-/// the data dir, helps nobody. Then the bundled adapter aoe installs on
-/// demand (see #1017), then the legacy node-version-manager scan.
+/// PATH first, so a user's explicit install wins, unless it is below the
+/// startup gate's version floor and a pinned bundled copy exists; then the
+/// on-demand bundled adapter (#1017), then the node-version-manager scan.
+/// Uncached, so an `nvm use` after daemon start takes effect immediately.
+/// `None` for a path, a `${placeholder}`, or a binary found nowhere.
 ///
-/// `app_dir` is optional so a failure to resolve the data dir degrades to
-/// PATH plus the node-manager scan (see #1048) instead of no resolution.
+/// `app_dir` is optional so a `get_app_dir` failure degrades to PATH plus the
+/// node-manager scan rather than resolving nothing (#1048).
 pub fn resolve_agent_command(
     command: &str,
     app_dir: Option<&std::path::Path>,
@@ -40,8 +30,7 @@ pub fn resolve_agent_command(
 
     if let Some(path) = find_in_path_env(command) {
         let bundled = app_dir.and_then(|d| crate::acp::adapters::bundled_adapter_bin(d, command));
-        // Only probe the version when there is actually a bundle to fall
-        // back to; otherwise the PATH copy is the only option anyway.
+        // Probe only when a bundle exists to fall back to.
         match bundled {
             Some(bundled_path) if path_copy_below_floor(command, &path) => {
                 warn!(
@@ -103,10 +92,8 @@ pub fn resolve_agent_command(
     None
 }
 
-/// The npm `.bin` shim is `#!/usr/bin/env node`, so resolving it is not
-/// enough: a Node interpreter must be reachable at spawn time. Add the same
-/// Node aoe uses for the adapter (the bundled one when the host has none) to
-/// the child PATH.
+/// The npm `.bin` shim is `#!/usr/bin/env node`, so the interpreter must also
+/// be reachable: add the Node aoe uses for the adapter to the child PATH.
 pub(super) fn bundled_resolution(
     path: std::path::PathBuf,
     app_dir: Option<&std::path::Path>,
@@ -128,9 +115,8 @@ pub(super) fn bundled_resolution(
     }
 }
 
-/// True when `path` reports a version below the adapter's startup floor.
-/// Conservative: any probe failure or unparseable output returns false, so
-/// an unknown version keeps the user's own copy rather than overriding it.
+/// Conservative: a failed probe or unparseable output reads as false, so an
+/// unknown version keeps the user's own copy.
 pub(super) fn path_copy_below_floor(command: &str, path: &std::path::Path) -> bool {
     let Some(gate) = crate::acp::agent_compat::version_gate_for(
         crate::acp::agent_compat::ExpectedAgent::from_command(command),
@@ -146,8 +132,7 @@ pub(super) fn path_copy_below_floor(command: &str, path: &std::path::Path) -> bo
     crate::acp::version_probe::whitespace_token_below_floor(&raw, min)
 }
 
-/// Run a version command with the synchronous spawn path's two-second budget.
-/// Failure keeps the user's own adapter rather than replacing it.
+/// Bounded to the synchronous spawn path's budget.
 fn probe_version_bounded(command: &mut Command) -> Option<String> {
     const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
@@ -192,9 +177,7 @@ pub(super) fn find_in_path_env(binary: &str) -> Option<std::path::PathBuf> {
     which::which(binary).ok()
 }
 
-/// Best-effort enumeration of node bin dirs the user is likely to have
-/// the adapter installed into. Order matters only for tie-breaking; the
-/// first hit wins, but in practice each binary only lives in one place.
+/// Node bin dirs the adapter is likely installed into. First hit wins.
 pub(super) fn node_search_dirs() -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     if let Some(home) = dirs::home_dir() {
@@ -242,19 +225,20 @@ pub(super) fn push_subdirs(out: &mut Vec<std::path::PathBuf>, root: &std::path::
 mod tests {
     use super::*;
 
+    /// A path or a `${placeholder}` is already resolved, so it is left alone.
     #[test]
-    fn resolve_agent_command_returns_none_for_absolute_path() {
+    fn resolve_agent_command_skips_paths_and_placeholders() {
         let app = std::path::Path::new("/nonexistent-app-dir");
-        assert!(resolve_agent_command("/usr/local/bin/claude-agent-acp", Some(app)).is_none());
-        assert!(resolve_agent_command("./relative/path", Some(app)).is_none());
-    }
-
-    #[test]
-    fn resolve_agent_command_returns_none_for_placeholder() {
-        let app = std::path::Path::new("/nonexistent-app-dir");
-        assert!(
-            resolve_agent_command("${aoe_data_dir}/acp-worker/dist/aoe-agent", Some(app)).is_none()
-        );
+        for command in [
+            "/usr/local/bin/claude-agent-acp",
+            "./relative/path",
+            "${aoe_data_dir}/acp-worker/dist/aoe-agent",
+        ] {
+            assert!(
+                resolve_agent_command(command, Some(app)).is_none(),
+                "{command}"
+            );
+        }
     }
 
     #[test]
@@ -280,47 +264,37 @@ mod tests {
         assert_eq!(resolved.prepend_paths.first(), Some(&bin_dir));
     }
 
-    /// An entered, hanging adapter must not block the version probe.
+    /// The probe reads a version off a cooperative binary and abandons one
+    /// that hangs, proving through `entered` that it really did start.
     #[cfg(unix)]
     #[test]
-    fn probe_version_bounded_gives_up_on_a_hanging_binary() {
+    fn probe_version_bounded_reads_output_and_gives_up_on_a_hang() {
         let dir = tempfile::TempDir::new().unwrap();
-        let script = dir.path().join("hangs");
-        let entered = dir.path().join("entered");
-        std::fs::write(&script, "printf entered > \"$1\"\nexec /bin/sleep 30\n").unwrap();
-
-        let started = std::time::Instant::now();
-        assert!(
-            probe_version_bounded(Command::new("/bin/sh").arg(&script).arg(&entered)).is_none()
-        );
-        assert_eq!(std::fs::read(&entered).unwrap(), b"entered");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_secs(10),
-            "probe should abandon a hanging binary, took {elapsed:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn probe_version_bounded_reads_version_output() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let script = dir.path().join("prints");
-        std::fs::write(&script, "echo 0.61.0\n").unwrap();
+        let prints = dir.path().join("prints");
+        std::fs::write(&prints, "echo 0.61.0\n").unwrap();
         // Reproduce a concurrent fork retaining the fixture writer.
         let _writer = std::fs::OpenOptions::new()
             .write(true)
-            .open(&script)
+            .open(&prints)
             .unwrap();
-
-        let out = probe_version_bounded(Command::new("/bin/sh").arg(&script))
+        let out = probe_version_bounded(Command::new("/bin/sh").arg(&prints))
             .expect("should capture stdout");
         assert_eq!(out.trim(), "0.61.0");
+
+        let hangs = dir.path().join("hangs");
+        let entered = dir.path().join("entered");
+        std::fs::write(&hangs, "printf entered > \"$1\"\nexec /bin/sleep 30\n").unwrap();
+        let started = std::time::Instant::now();
+        assert!(probe_version_bounded(Command::new("/bin/sh").arg(&hangs).arg(&entered)).is_none());
+        assert_eq!(std::fs::read(&entered).unwrap(), b"entered");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "probe should abandon a hanging binary"
+        );
     }
 
-    /// Without an app dir (a `get_app_dir` failure) resolution must still
-    /// fall through to PATH and the node-manager scan, not collapse to
-    /// nothing. Regression guard for #1048.
+    /// #1048: without an app dir, resolution still falls through to PATH and
+    /// the node-manager scan rather than collapsing to nothing.
     #[test]
     #[serial_test::serial]
     fn resolve_agent_command_without_app_dir_still_uses_path() {
@@ -334,7 +308,6 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn resolve_agent_command_finds_binary_in_path_env() {
-        // Build a temp dir with a fake binary, point PATH at it.
         let dir = tempfile::TempDir::new().unwrap();
         let bin = dir.path().join("aoe-test-resolver-fake");
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();

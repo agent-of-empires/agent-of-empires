@@ -1,60 +1,33 @@
-//! Migration v028: settle the live-interaction status frozen onto archived
-//! sessions by builds shipped before `archive()` learned to degrade it.
+//! Migration v028: settle archived sessions still persisted at a
+//! live-interaction status (`running`, `waiting`, `starting`) to Idle, the
+//! resting state v016 chose.
 //!
-//! Archiving tears down the session's tmux (#1868), and the status poller
-//! deliberately never touches archived rows (#2206), so whatever status the
-//! row happened to hold at archive time is persisted verbatim and never
-//! revisited. A session archived while `Waiting` (agent blocked on a
-//! permission prompt) therefore kept rendering as a pending-permission row
-//! in the TUI, `aoe ps`, and the web dashboard indefinitely, with no pane
-//! and no process behind it, and no CLI verb able to clear it
-//! (`session stop` refuses: the session is not running).
-//!
-//! This one-shot migration walks every sessions.json and settles any
-//! archived row still persisted at a live-interaction status
-//! (`running`/`waiting`/`starting`) to `idle`, the same resting state v016
-//! chose for archived rows. `archive()` and the poller's archived
-//! short-circuit now degrade in-process, so this cleans up only the rows
-//! older builds left behind.
-//!
-//! ## Failure policy
-//!
-//! Per `AGENTS.md > Data Migrations`, a returned `Err` aborts boot. A
-//! sessions.json that fails to parse is logged and skipped (a corrupt file
-//! must not block boot or spam every launch). Only `get_app_dir` and
-//! directory-read failures propagate.
+//! Archiving tears down tmux and the poller never revisits archived rows, so
+//! older builds persisted whatever status held at archive time; a row archived
+//! while Waiting rendered as a pending permission prompt forever with nothing
+//! behind it. `archive()` and the poller now degrade in-process. A
+//! sessions.json that fails to parse is logged and skipped.
 
+use super::sessions_file;
 use anyhow::{anyhow, Result};
 use std::fs;
 use std::path::Path;
-use tracing::{debug, info};
+use tracing::info;
 
-/// Migration entry point: settle archived live statuses under the app dir.
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
     run_in(&app_dir)
 }
 
-/// Walk every profile's `sessions.json` plus the legacy top-level one under
-/// `app_dir`. Split from `run` so tests can point it at a temp dir.
+/// Walk every profile's `sessions.json` plus the legacy top-level one. Split
+/// from `run` so tests can point it at a temp dir.
 pub(crate) fn run_in(app_dir: &Path) -> Result<()> {
-    let profiles_dir = app_dir.join("profiles");
-    if profiles_dir.exists() {
-        for entry in fs::read_dir(&profiles_dir)? {
-            let entry = entry?;
-            if entry.path().is_dir() {
-                clear_archived_live_status(&entry.path().join("sessions.json"))?;
-            }
-        }
+    for path in sessions_file::session_files(app_dir)? {
+        clear_archived_live_status(&path)?;
     }
-    // Legacy top-level sessions.json (pre-profiles layout).
-    clear_archived_live_status(&app_dir.join("sessions.json"))?;
     Ok(())
 }
 
-/// Settle any archived session still persisted at a live-interaction status
-/// (`running`/`waiting`/`starting`) to `idle`. Leaves non-archived rows and
-/// archived rows in any other status untouched.
 fn clear_archived_live_status(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -65,37 +38,18 @@ fn clear_archived_live_status(path: &Path) -> Result<()> {
     // The lock `Storage::update` holds, kept across read and write so a
     // concurrent update is neither lost nor able to undo the settle.
     let _flock = crate::session::acquire_storage_flock(dir, crate::session::STORAGE_LOCK_FILENAME)?;
-    let content = fs::read_to_string(path)?;
-    let mut value: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(e) => {
-            debug!("v028: failed to parse {}: {e}, skipping", path.display());
-            return Ok(());
+    let healed = sessions_file::heal_rows(path, &fs::read_to_string(path)?, |row| {
+        let frozen = sessions_file::is_archived(row)
+            && matches!(
+                sessions_file::status(row),
+                Some("running" | "waiting" | "starting")
+            );
+        if frozen {
+            sessions_file::settle_to_idle(row);
         }
-    };
-
-    let mut healed = 0usize;
-    if let Some(array) = value.as_array_mut() {
-        for instance in array.iter_mut() {
-            if let Some(obj) = instance.as_object_mut() {
-                let archived = obj.get("archived_at").is_some_and(|v| !v.is_null());
-                let live = matches!(
-                    obj.get("status").and_then(|v| v.as_str()),
-                    Some("running" | "waiting" | "starting")
-                );
-                if archived && live {
-                    obj.insert(
-                        "status".to_string(),
-                        serde_json::Value::String("idle".to_string()),
-                    );
-                    healed += 1;
-                }
-            }
-        }
-    }
-
+        frozen
+    })?;
     if healed > 0 {
-        crate::session::atomic_write(path, serde_json::to_string_pretty(&value)?.as_bytes())?;
         info!(
             "v028: settled frozen live status on {healed} archived session(s) in {}",
             path.display()

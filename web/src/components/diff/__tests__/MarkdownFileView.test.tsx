@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-//
-// MarkdownFileView contract (#3088): renders a Markdown file to formatted
-// HTML. Verifies it
-//   - renders standard Markdown (headings, lists, links, GFM tables),
-//   - escapes raw HTML rather than injecting it (no rehype-raw / no
-//     dangerouslySetInnerHTML), so a hostile file cannot run script.
 
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render } from "@testing-library/react";

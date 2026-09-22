@@ -1,12 +1,10 @@
 //! Browser-side log relay.
 //!
-//! POST /api/client-log accepts a batch of structured entries and
-//! re-emits them through `tracing` under target `web.client`, with
-//! the client-side module name preserved as the `client_target` field.
-//!
-//! Caps and truncation are enforced server-side because the frontend
-//! throttle is best-effort: a broken or malicious client can POST
-//! directly. We also reject the batch outright if it's too large.
+//! `POST /api/client-log` accepts a batch of structured entries and re-emits
+//! them through `tracing` under target `web.client`, with the client-side module
+//! name preserved as the `client_target` field. Caps and truncation are enforced
+//! server-side because the frontend throttle is best-effort: a broken or
+//! malicious client can POST directly.
 
 use std::sync::Arc;
 
@@ -97,10 +95,9 @@ fn emit_event(e: ClientLogEntry) {
     let dropped = e.dropped;
     let ts = e.ts;
 
-    // Tracing macros require a static target; we use a fixed
-    // "web.client" and carry the dynamic client module name as a
-    // field. EnvFilter still scopes by `web.client` and downstream
-    // filters can match the `client_target` field.
+    // Tracing macros need a static target, so `web.client` is fixed and the
+    // dynamic client module name rides as a field that downstream filters can
+    // match.
     match e.level.as_str() {
         "error" => tracing::error!(
             target: "web.client",

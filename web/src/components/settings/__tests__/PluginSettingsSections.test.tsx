@@ -1,10 +1,4 @@
 // @vitest-environment jsdom
-//
-// Contract test for plugin settings rendering (#2094). PluginSettingsSections
-// turns the virtual `plugin:<id>` schema sections into the generic
-// SchemaSection rows, seeds the manifest default until a value is stored, and
-// saves through the global PATCH (`updateSettings`) with the `plugin:<id>`
-// section the server folds into `plugins.<id>.settings`.
 
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";

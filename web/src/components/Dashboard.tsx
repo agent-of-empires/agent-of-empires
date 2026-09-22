@@ -7,6 +7,7 @@ import { AOE_BRAND_MARK_COLORS, AOE_BRAND_MARK_TEXT_SHADOW } from "../lib/brandM
 import { TOUR_ANCHORS, type TourAnchorId } from "../lib/tourSteps";
 import { PluginCards, PluginHomePanes } from "./plugin/PluginSlots";
 import { StatusGlyph } from "./StatusGlyph";
+import { StrokeIcon } from "./icons";
 
 interface Props {
   sessions: SessionResponse[];
@@ -38,10 +39,9 @@ export function Dashboard({
     let waiting = 0;
     let errors = 0;
     for (const s of sessions) {
-      // Trashed sessions are conceptually deleted (the sidebar buckets them
-      // into a dedicated Trash section, out of the active/archived buckets), so
-      // they must not skew this summary: a session left in an Error state does
-      // not matter once it is in the trash. See #2489.
+      // Trashed sessions are conceptually deleted (the sidebar buckets them into a dedicated Trash section, out of
+      // the active/archived buckets), so they must not skew this summary: a session left in an Error state does
+      // not matter once it is in the trash.
       if (s.trashed_at) continue;
       total++;
       projects.add(s.main_repo_path || s.project_path);
@@ -140,9 +140,7 @@ export function Dashboard({
         </div>
       )}
 
-      {/* The desktop sidebar is always available, but mobile starts at this
-          dashboard. Keep a small, direct route back into the sessions the user
-          was just working with instead of making them open the full picker. */}
+      {/* The desktop sidebar is always available, but mobile starts at this dashboard. */}
       {!isWideViewport && recentSessions.length > 0 && (
         <section className="md:hidden mb-4 w-full max-w-md" aria-labelledby="recent-sessions-heading">
           <h2
@@ -192,20 +190,10 @@ export function Dashboard({
         onClick={onToggleSidebar}
         className="md:hidden mb-4 w-full max-w-md px-4 py-2.5 rounded-lg bg-surface-900 border border-surface-700/40 text-text-secondary text-sm flex items-center justify-center gap-2 cursor-pointer hover:bg-surface-850 active:bg-surface-800 transition-colors"
       >
-        <svg
-          width="16"
-          height="16"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-        >
+        <StrokeIcon size={16} strokeWidth="2" hidden>
           <rect x="3" y="3" width="18" height="18" rx="2" />
           <line x1="9" y1="3" x2="9" y2="21" />
-        </svg>
+        </StrokeIcon>
         Show sessions
       </button>
 
@@ -285,57 +273,24 @@ function ActionPane({
 }) {
   const iconSvg = {
     folder: (
-      <svg
-        width="24"
-        height="24"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        className="text-brand-500"
-        aria-hidden="true"
-      >
+      <StrokeIcon size={24} strokeWidth="1.5" className="text-brand-500" hidden>
         <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-      </svg>
+      </StrokeIcon>
     ),
     git: (
-      <svg
-        width="24"
-        height="24"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        className="text-brand-500"
-        aria-hidden="true"
-      >
+      <StrokeIcon size={24} strokeWidth="1.5" className="text-brand-500" hidden>
         <circle cx="12" cy="18" r="3" />
         <circle cx="6" cy="6" r="3" />
         <circle cx="18" cy="6" r="3" />
         <path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9" />
         <line x1="12" y1="12" x2="12" y2="15" />
-      </svg>
+      </StrokeIcon>
     ),
     book: (
-      <svg
-        width="24"
-        height="24"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        className="text-brand-500"
-        aria-hidden="true"
-      >
+      <StrokeIcon size={24} strokeWidth="1.5" className="text-brand-500" hidden>
         <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
         <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
-      </svg>
+      </StrokeIcon>
     ),
   };
 

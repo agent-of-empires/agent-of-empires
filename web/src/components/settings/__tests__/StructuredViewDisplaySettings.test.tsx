@@ -1,11 +1,4 @@
 // @vitest-environment jsdom
-//
-// Contract test for the structured-view conversation font-size controls. Like
-// DiffSettings / TerminalSettings these are dashboard preferences persisted
-// through useWebSettings + localStorage (key `aoe-web-settings`, which
-// webUiSync mirrors server-side), never PATCH /api/settings, so the contract is
-// the JSON shape written to that key plus the defaulting/clamping applied when
-// reading it back.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";

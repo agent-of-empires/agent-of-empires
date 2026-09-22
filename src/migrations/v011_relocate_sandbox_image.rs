@@ -10,80 +10,49 @@
 //! config to point at the new namespace. Idempotent: re-running on already-migrated configs
 //! is a no-op.
 
+use super::config_file;
 use anyhow::Result;
-use std::fs;
-use std::path::PathBuf;
-use tracing::{debug, info};
+use std::path::Path;
+use tracing::info;
 
 const OLD_NAMESPACE: &str = "ghcr.io/njbrake/";
 const NEW_NAMESPACE: &str = "ghcr.io/agent-of-empires/";
 
 pub fn run() -> Result<()> {
     let app_dir = crate::session::get_app_dir()?;
-
-    let global_config = app_dir.join("config.toml");
-    migrate_config_file(&global_config)?;
-
-    let profiles_dir = app_dir.join("profiles");
-    if profiles_dir.exists() {
-        for entry in fs::read_dir(&profiles_dir)? {
-            let entry = entry?;
-            if entry.path().is_dir() {
-                let profile_config = entry.path().join("config.toml");
-                migrate_config_file(&profile_config)?;
-            }
-        }
+    for path in config_file::all_configs(&app_dir)? {
+        migrate_config_file(&path)?;
     }
-
     Ok(())
 }
 
-fn migrate_config_file(path: &PathBuf) -> Result<()> {
-    if !path.exists() {
-        debug!("Config file {} does not exist, skipping", path.display());
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(path)?;
-    let mut doc: toml::Table = match content.parse() {
-        Ok(table) => table,
-        Err(e) => {
-            debug!("Failed to parse {}: {}, skipping", path.display(), e);
-            return Ok(());
-        }
-    };
-
-    let Some(sandbox) = doc.get_mut("sandbox").and_then(|s| s.as_table_mut()) else {
-        return Ok(());
-    };
-
-    let Some(value) = sandbox.get("default_image").and_then(|v| v.as_str()) else {
-        return Ok(());
-    };
-
-    if !value.starts_with(OLD_NAMESPACE) {
-        return Ok(());
-    }
-
-    let new_value = format!("{}{}", NEW_NAMESPACE, &value[OLD_NAMESPACE.len()..]);
-    info!(
-        "Relocating sandbox default_image: {} -> {} in {}",
-        value,
-        new_value,
-        path.display()
-    );
-
-    sandbox.insert("default_image".to_string(), toml::Value::String(new_value));
-
-    let new_content = toml::to_string_pretty(&doc)?;
-    crate::session::atomic_write(path, new_content.as_bytes())?;
-
-    Ok(())
+fn migrate_config_file(path: &Path) -> Result<()> {
+    config_file::rewrite(path, |doc| {
+        let Some(sandbox) = doc.get_mut("sandbox").and_then(|s| s.as_table_mut()) else {
+            return false;
+        };
+        let Some(value) = sandbox.get("default_image").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let Some(rest) = value.strip_prefix(OLD_NAMESPACE) else {
+            return false;
+        };
+        let new_value = format!("{NEW_NAMESPACE}{rest}");
+        info!(
+            "Relocating sandbox default_image: {} -> {} in {}",
+            value,
+            new_value,
+            path.display()
+        );
+        sandbox.insert("default_image".to_string(), toml::Value::String(new_value));
+        true
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn test_rewrites_aoe_sandbox() {
