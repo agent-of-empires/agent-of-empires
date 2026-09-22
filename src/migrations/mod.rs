@@ -40,12 +40,13 @@ mod v025_reenable_confirm_delete;
 mod v026_repoint_acp_default_agent;
 pub(crate) mod v027_isolate_sandbox_stores;
 mod v028_clear_archived_live_status;
-mod v029_core_daemon_launch;
-mod v030_serve_passphrase_policy;
-mod v031_pending_purge_owners;
-mod v032_capture_purge_runners;
-mod v033_canonical_sidebar;
-mod v034_fold_pending_initial_turn;
+mod v029_fold_pending_initial_turn;
+mod v030_global_only_profile_settings;
+mod v031_core_daemon_launch;
+mod v032_serve_passphrase_policy;
+mod v033_pending_purge_owners;
+mod v034_capture_purge_runners;
+mod v035_canonical_sidebar;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -86,7 +87,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 34;
+const CURRENT_VERSION: u32 = 35;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -238,33 +239,38 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 29,
-        name: "core_daemon_launch",
-        run: v029_core_daemon_launch::run,
+        name: "fold_pending_initial_turn",
+        run: v029_fold_pending_initial_turn::run,
     },
     Migration {
         version: 30,
-        name: "serve_passphrase_policy",
-        run: v030_serve_passphrase_policy::run,
+        name: "global_only_profile_settings",
+        run: v030_global_only_profile_settings::run,
     },
     Migration {
         version: 31,
-        name: "pending_purge_owners",
-        run: v031_pending_purge_owners::run,
+        name: "core_daemon_launch",
+        run: v031_core_daemon_launch::run,
     },
     Migration {
         version: 32,
-        name: "capture_purge_runners",
-        run: v032_capture_purge_runners::run,
+        name: "serve_passphrase_policy",
+        run: v032_serve_passphrase_policy::run,
     },
     Migration {
         version: 33,
-        name: "canonical_sidebar",
-        run: v033_canonical_sidebar::run,
+        name: "pending_purge_owners",
+        run: v033_pending_purge_owners::run,
     },
     Migration {
         version: 34,
-        name: "fold_pending_initial_turn",
-        run: v034_fold_pending_initial_turn::run,
+        name: "capture_purge_runners",
+        run: v034_capture_purge_runners::run,
+    },
+    Migration {
+        version: 35,
+        name: "canonical_sidebar",
+        run: v035_canonical_sidebar::run,
     },
 ];
 

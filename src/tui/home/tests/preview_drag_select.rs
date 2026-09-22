@@ -6,6 +6,7 @@
 //! terminal-native drag-select from reaching the preview.
 
 use super::*;
+use crate::session::config::{update_config, SidebarPosition};
 use crate::tui::home::{live_send::LiveSendState, DragKind, PreviewSelection, PreviewTextView};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Text};
@@ -82,6 +83,29 @@ fn drag_start_outside_live_mode_installs_selection() {
     assert_eq!(to_abs(100, sel.anchor), (10, 10));
     assert_eq!(to_abs(100, sel.extent), (10, 10));
     assert!(!sel.finalized);
+}
+
+/// Moving the preview cancels an unfinished selection without publishing clipboard text.
+#[test]
+#[serial]
+fn changing_sidebar_position_cancels_preview_gesture_without_copying() {
+    let mut env = create_test_env_empty();
+    stage_pane(&mut env, Rect::new(40, 0, 60, 20), 0, 100);
+    assert!(env.view.handle_drag_start(50, 10));
+    assert!(env.view.handle_drag_move(55, 11));
+    env.view.try_refresh_from_config_watcher().unwrap();
+    assert!(env.view.is_preview_select_dragging());
+    assert!(env.view.preview_selection.is_some());
+
+    update_config(|config| config.session.sidebar_position = SidebarPosition::Right).unwrap();
+    env.view.try_refresh_from_config_watcher().unwrap();
+    assert!(env.view.drag_state.is_none());
+    assert!(env.view.preview_selection.is_none());
+    assert!(env.view.preview_drag_pos.is_none());
+    assert!(!env.view.handle_drag_move(56, 11));
+    assert!(!env.view.handle_drag_end());
+    assert!(!env.view.preview_copy_pending);
+    assert!(env.view.take_preview_copy_text().is_none());
 }
 
 #[test]
@@ -670,12 +694,10 @@ fn screen_flow_rects_fully_offscreen_returns_empty() {
     assert!(rects.is_empty());
 }
 
+/// Finalizing a rendered selection copies the chosen text with the sidebar on either side.
 #[test]
 #[serial]
 fn full_render_pipeline_captures_copy_text_after_finalize() {
-    // Drives the real render path: render seeds the text-view snapshot, the drag handlers
-    // map against it, and paint_preview_selection captures the lines from the parsed cache
-    // into preview_copy_text.
     use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -714,56 +736,60 @@ fn full_render_pipeline_captures_copy_text_after_finalize() {
     env.view.preview_cache.session_id = Some(session_id);
     env.view.preview_cache.capture_target = Some(tmux_name);
 
-    terminal
-        .draw(|f| {
-            let area = f.area();
-            env.view.render(f, area, &theme, None, None, None);
-        })
-        .unwrap();
+    for position in [SidebarPosition::Left, SidebarPosition::Right] {
+        env.view.sidebar_position = position;
+        env.view.clear_preview_selection();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
 
-    let pane = env.view.preview_text_view.pane;
-    assert!(pane.width > 4, "preview pane was not set by render");
-    assert!(
-        env.view.preview_text_view.total_lines > 0,
-        "render should have parsed scrollback into the text view"
-    );
+        let pane = env.view.preview_text_view.pane;
+        assert!(pane.width > 4, "preview pane was not set by render");
+        assert!(
+            env.view.preview_text_view.total_lines > 0,
+            "render should have parsed scrollback into the text view"
+        );
 
-    let initial_buf = terminal.backend().buffer().clone();
-    let mut content_cell = None;
-    for r in pane.y..pane.bottom() {
-        let mut row_text = String::new();
-        for c in pane.x..pane.right() {
-            row_text.push_str(initial_buf[(c, r)].symbol());
+        let initial_buf = terminal.backend().buffer().clone();
+        let mut content_cell = None;
+        for r in pane.y..pane.bottom() {
+            let mut row_text = String::new();
+            for c in pane.x..pane.right() {
+                row_text.push_str(initial_buf[(c, r)].symbol());
+            }
+            if let Some(offset) = row_text.find("alpha") {
+                content_cell = Some((pane.x + offset as u16, r));
+                break;
+            }
         }
-        if let Some(offset) = row_text.find("alpha") {
-            content_cell = Some((pane.x + offset as u16, r));
-            break;
-        }
+        let (start_col, row) = content_cell.expect("preview must paint seeded cache text");
+        let end_col = start_col + "alpha".len() as u16 - 1;
+        assert!(env.view.handle_drag_start(start_col, row));
+        assert!(env.view.handle_drag_move(end_col, row));
+        assert!(env.view.handle_drag_end());
+        assert!(
+            env.view.preview_copy_pending,
+            "drag_end should arm a pending capture"
+        );
+
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+
+        assert!(
+            !env.view.preview_copy_pending,
+            "render should consume the pending flag"
+        );
+        let copied = env
+            .view
+            .take_preview_copy_text()
+            .expect("render should have captured selection text");
+        assert_eq!(copied, "alpha");
     }
-    let (start_col, row) = content_cell.expect("preview must paint seeded cache text");
-    let end_col = start_col + "alpha".len() as u16 - 1;
-    assert!(env.view.handle_drag_start(start_col, row));
-    assert!(env.view.handle_drag_move(end_col, row));
-    assert!(env.view.handle_drag_end());
-    assert!(
-        env.view.preview_copy_pending,
-        "drag_end should arm a pending capture"
-    );
-
-    terminal
-        .draw(|f| {
-            let area = f.area();
-            env.view.render(f, area, &theme, None, None, None);
-        })
-        .unwrap();
-
-    assert!(
-        !env.view.preview_copy_pending,
-        "render should consume the pending flag"
-    );
-    let copied = env
-        .view
-        .take_preview_copy_text()
-        .expect("render should have captured selection text");
-    assert_eq!(copied, "alpha");
 }

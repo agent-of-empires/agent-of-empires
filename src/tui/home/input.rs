@@ -12,7 +12,7 @@ use super::{
 };
 use crate::session::config::repo_config;
 use crate::session::config::{
-    load_config, update_app_state, update_config, GroupByMode, SortOrder,
+    load_config, update_app_state, update_config, GroupByMode, SidebarPosition, SortOrder,
 };
 use crate::session::{list_profiles_for_display, Item, Status};
 use crate::tui::app::Action;
@@ -660,14 +660,25 @@ impl HomeView {
         hit
     }
 
-    /// True when `(col, row)` lands on the side-by-side list/preview
-    /// divider. The divider is the preview's left border column (one
-    /// past `list_area.right()` is exclusive, so this *is* a valid hit
-    /// target that hit_list / hit_preview both miss by design). Returns
-    /// `false` in stacked mode, in the diff/settings/serve takeover
-    /// views (which clear `divider_col`), and while any modal dialog is
-    /// open, so a dialog over the divider swallows stray clicks rather
-    /// than starting a hidden drag.
+    /// Cancel gestures tied to old screen coordinates before moving the sidebar.
+    pub(super) fn set_sidebar_position(&mut self, position: SidebarPosition) {
+        if self.sidebar_position == position {
+            return;
+        }
+        match self.drag_state {
+            Some(DragKind::ListDivider) => {
+                self.handle_drag_end();
+            }
+            Some(DragKind::PreviewSelect) => {
+                self.clear_preview_selection();
+            }
+            _ => {}
+        }
+        self.sidebar_position = position;
+    }
+
+    /// Hit the preview border shared with the list, on either side.
+    /// Stacked and takeover views clear `divider_col`; modals block drags.
     pub fn hit_divider(&self, col: u16, row: u16) -> bool {
         if self.has_dialog() {
             return false;
@@ -696,10 +707,7 @@ impl HomeView {
     /// mobile clients where Shift-bypass does nothing.
     pub fn handle_drag_start(&mut self, col: u16, row: u16) -> bool {
         if self.hit_divider(col, row) {
-            self.drag_state = Some(DragKind::ListDivider {
-                start_col: col,
-                start_width: self.list_width,
-            });
+            self.drag_state = Some(DragKind::ListDivider);
             return true;
         }
         // Modals that aren't live-send sit over the preview, so a
@@ -729,13 +737,8 @@ impl HomeView {
         false
     }
 
-    /// Apply a drag-in-progress event. For the list divider, recompute
-    /// the requested width from `(start_width + delta)` and clamp to
-    /// `[10, main_area_width - PREVIEW_MIN_WIDTH]` so the preview keeps
-    /// its usability floor and the value never wraps `u16`. For a
-    /// preview-pane text selection, clamp the extent to the preview
-    /// area and stash it on `preview_selection`; the renderer reads it
-    /// each frame to paint the highlight.
+    /// Resize the list within the preview's minimum width, or update a
+    /// text selection within the preview's content bounds.
     ///
     /// Returns true when state actually changed (so the caller
     /// redraws). The drag does NOT persist on every tick; the divider
@@ -786,18 +789,17 @@ impl HomeView {
             return false;
         }
         match self.drag_state {
-            Some(DragKind::ListDivider {
-                start_col,
-                start_width,
-            }) => {
-                // i32 arithmetic so a leftward drag past the start column doesn't
-                // underflow u16 before the clamp.
-                let delta = col as i32 - start_col as i32;
-                let proposed = start_width as i32 + delta;
+            Some(DragKind::ListDivider) => {
+                if self.divider_col.is_none() {
+                    self.handle_drag_end();
+                    return false;
+                }
+                let proposed = match self.sidebar_position {
+                    SidebarPosition::Left => col as i32 - self.list_area.x as i32,
+                    SidebarPosition::Right => self.list_area.right() as i32 - 1 - col as i32,
+                };
 
-                // Clamp ceiling tracks the live viewport width; if the user
-                // resized the terminal mid-drag, the new width is honored. The
-                // floor of 10 matches the keyboard `<` shrink limit.
+                // Match the keyboard shrink limit and reserve preview space.
                 let ceiling = self
                     .main_area_width
                     .saturating_sub(responsive::PREVIEW_MIN_WIDTH);
@@ -975,7 +977,7 @@ impl HomeView {
         self.preview_drag_pos = None;
         self.preview_autoscroll_at = None;
         match state {
-            DragKind::ListDivider { .. } => {
+            DragKind::ListDivider => {
                 self.save_list_width();
             }
             DragKind::PreviewSelect => {

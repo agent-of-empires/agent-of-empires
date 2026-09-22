@@ -84,7 +84,7 @@ pub(super) enum DragKind {
     /// column where the user pressed; `start_width` is the requested
     /// `list_width` at that moment. The new requested width is
     /// `start_width + (current_col - start_col)`, clamped on apply.
-    ListDivider { start_col: u16, start_width: u16 },
+    ListDivider,
     /// Drag-selecting text inside the preview pane. Available whenever
     /// the pane is on screen (in or out of live-send mode). The anchor
     /// cell is where the user pressed; `preview_selection` on
@@ -439,6 +439,7 @@ pub struct HomeView {
     /// (`leader b`). Persisted to `app_state.home_sidebar_collapsed` so the
     /// choice survives restarts.
     pub(super) sidebar_collapsed: bool,
+    pub(super) sidebar_position: crate::session::config::SidebarPosition,
     /// Per-session record of the last NON-live passive resize the worker
     /// applied, so neither the selected-session sync nor the fleet reconcile
     /// SIGWINCH-storms a pane that already matches. A session's entry is

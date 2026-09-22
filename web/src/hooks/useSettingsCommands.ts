@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchProfiles, fetchSettings, getSettingsSchema, updateProfileSettings } from "../lib/api";
+import { fetchProfiles, fetchSettings, getSettingsSchema, updateProfileSettings, updateSettings } from "../lib/api";
 import { reportError, reportInfo } from "../lib/toastBus";
 import type { CommandAction } from "../components/command-palette/types";
 import type { SettingsFieldDescriptor } from "../lib/types";
@@ -21,24 +21,29 @@ export function useSettingsCommands({ open, readOnly, onOpenSettingsTab }: Args)
   const [values, setValues] = useState<Record<string, unknown>>({});
   const [defaultProfile, setDefaultProfile] = useState("default");
   const [reloadNonce, setReloadNonce] = useState(0);
+  const request = useMemo(() => ({ open, reloadNonce }), [open, reloadNonce]);
+  const [loadedRequest, setLoadedRequest] = useState<typeof request | null>(null);
 
   useEffect(() => {
-    if (!open) return;
+    if (!request.open) return;
     let cancelled = false;
     void (async () => {
       const [s, profiles] = await Promise.all([getSettingsSchema(), fetchProfiles()]);
       if (cancelled) return;
       if (s) setSchema(s);
       const profile = profiles.find((p) => p.is_default)?.name ?? "default";
-      setDefaultProfile(profile);
       const settings = await fetchSettings(profile);
       if (cancelled) return;
-      if (settings) setValues(settings as Record<string, unknown>);
+      if (settings) {
+        setDefaultProfile(profile);
+        setValues(settings as Record<string, unknown>);
+        setLoadedRequest(request);
+      }
     })();
     return () => {
       cancelled = true;
     };
-  }, [open, reloadNonce]);
+  }, [request]);
 
   return useMemo(() => {
     const actions: CommandAction[] = [];
@@ -50,7 +55,14 @@ export function useSettingsCommands({ open, readOnly, onOpenSettingsTab }: Args)
       const keywords = [f.section, f.field, f.category, f.label, f.widget.kind, "setting", "config"];
       const id = `setting:${f.section}.${f.field}`;
 
-      const inlineToggle = f.widget.kind === "toggle" && f.web_write.policy === "allow" && !readOnly;
+      // Telemetry must use its dedicated consent flow.
+      const inlineToggle =
+        f.section !== "telemetry" &&
+        f.widget.kind === "toggle" &&
+        f.web_write.policy === "allow" &&
+        loadedRequest === request &&
+        typeof current === "boolean" &&
+        !readOnly;
 
       if (inlineToggle) {
         const isOn = current === true;
@@ -64,7 +76,10 @@ export function useSettingsCommands({ open, readOnly, onOpenSettingsTab }: Args)
           perform: () => {
             const next = !isOn;
             void (async () => {
-              const ok = await updateProfileSettings(defaultProfile, { [f.section]: { [f.field]: next } });
+              const patch = { [f.section]: { [f.field]: next } };
+              const ok = f.profile_overridable
+                ? await updateProfileSettings(defaultProfile, patch)
+                : await updateSettings(patch);
               if (!ok) {
                 reportError(`Failed to update ${f.label}`);
                 return;
@@ -88,5 +103,5 @@ export function useSettingsCommands({ open, readOnly, onOpenSettingsTab }: Args)
       });
     }
     return actions;
-  }, [schema, values, defaultProfile, readOnly, onOpenSettingsTab]);
+  }, [schema, values, defaultProfile, readOnly, onOpenSettingsTab, loadedRequest, request]);
 }

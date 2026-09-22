@@ -92,9 +92,8 @@ pub fn session_id_poller_max_threads() -> u32 {
     current_budget().max()
 }
 
-/// The configured ceiling for a process launched under `profile`: the global `[session]
-/// session_id_poller_max_threads` with that profile's override applied, the way every other
-/// global-only session field is consumed.
+/// Resolve the global ceiling for a process launched under `profile`.
+/// Applied once at startup; changes require a restart.
 pub fn configured_session_id_poller_max_threads(profile: &str) -> u32 {
     crate::session::resolve_config_or_warn(profile)
         .session
@@ -804,7 +803,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn configured_ceiling_is_the_launch_profiles_effective_value() {
+    fn configured_ceiling_ignores_profile_overrides() {
         let home = tempfile::tempdir().unwrap();
         let _app_dir = crate::session::test_support::isolate_app_dir_at(home.path());
         let app = crate::session::get_app_dir().unwrap();
@@ -821,7 +820,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(configured_session_id_poller_max_threads("tuned"), 9);
+        assert_eq!(configured_session_id_poller_max_threads("tuned"), 7);
         assert_eq!(
             configured_session_id_poller_max_threads("untouched"),
             7,

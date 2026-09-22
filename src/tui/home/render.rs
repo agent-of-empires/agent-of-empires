@@ -14,7 +14,7 @@ use super::{
     ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
-use crate::session::config::{GroupByMode, RowTagMode, SortOrder};
+use crate::session::config::{GroupByMode, RowTagMode, SidebarPosition, SortOrder};
 use crate::session::{Item, Status};
 use crate::tui::components::preview::{self, CachedPreview};
 use crate::tui::components::{
@@ -62,39 +62,45 @@ fn compose_list_title(
     format!(" {}{}{} ", prefix, profile_tag, suffix)
 }
 
-/// Source of truth for the pane-arrangement passed to `render_list` /
-/// `render_preview`, so their border masks honor DESIGN.md's single-shared-
-/// separator invariant.
+/// Pane arrangement used to keep one shared separator between list and preview.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum PaneLayout {
-    Collapsed,
+enum ListLayout {
+    Horizontal(SidebarPosition),
     Stacked,
-    SideBySide,
 }
 
-impl PaneLayout {
-    /// Border mask for the list block, per DESIGN.md's single-shared-separator
-    /// invariant. Stacked (and defensively Collapsed) drop BOTTOM because the
-    /// preview's TOP is the shared horizontal seam, but keep RIGHT since the
-    /// pane spans full width. SideBySide keeps BOTTOM and drops RIGHT because
-    /// the preview's LEFT is the shared vertical seam.
+impl ListLayout {
+    /// The preview owns the shared separator; omit the adjacent list border.
     fn list_borders(self) -> Borders {
         match self {
-            PaneLayout::Stacked | PaneLayout::Collapsed => {
-                Borders::TOP | Borders::LEFT | Borders::RIGHT
+            Self::Stacked => Borders::TOP | Borders::LEFT | Borders::RIGHT,
+            Self::Horizontal(SidebarPosition::Left) => {
+                Borders::TOP | Borders::LEFT | Borders::BOTTOM
             }
-            PaneLayout::SideBySide => Borders::TOP | Borders::LEFT | Borders::BOTTOM,
+            Self::Horizontal(SidebarPosition::Right) => {
+                Borders::TOP | Borders::RIGHT | Borders::BOTTOM
+            }
         }
     }
+}
 
-    /// Border mask for the preview block. All arms yield `Borders::ALL` today
-    /// because the preview always owns the full box; the match is kept
-    /// exhaustive so a future asymmetric change stays type-checked instead of
-    /// silently regressing.
-    fn preview_borders(self) -> Borders {
-        match self {
-            PaneLayout::Collapsed | PaneLayout::Stacked | PaneLayout::SideBySide => Borders::ALL,
-        }
+/// Return `(list, preview)` rectangles in logical order for either screen position.
+fn sidebar_areas(
+    area: Rect,
+    list_width: u16,
+    preview_min: u16,
+    position: SidebarPosition,
+) -> (Rect, Rect) {
+    let list = Constraint::Length(list_width);
+    let preview = Constraint::Min(preview_min);
+    let constraints = match position {
+        SidebarPosition::Left => [list, preview],
+        SidebarPosition::Right => [preview, list],
+    };
+    let chunks = Layout::horizontal(constraints).split(area);
+    match position {
+        SidebarPosition::Left => (chunks[0], chunks[1]),
+        SidebarPosition::Right => (chunks[1], chunks[0]),
     }
 }
 
@@ -856,6 +862,7 @@ fn activity_column_padding(
 }
 
 impl HomeView {
+    /// Lay out the active view and refresh the hit regions for the next input event.
     pub fn render(
         &mut self,
         frame: &mut Frame,
@@ -989,32 +996,21 @@ impl HomeView {
         let content_area = main_chunks[0];
         let available_width = content_area.width;
         self.main_area_width = available_width;
-        // Collapsed sidebar: the list shrinks to a narrow click-to-expand
-        // strip on the left and the preview takes the rest of the width
-        // (in live mode the resize loop then reflows the agent pane). This
-        // path is width-independent: a collapsed list is narrow enough that
-        // re-imposing the stacked breakpoint would only waste space.
+        // A collapsed strip leaves enough preview space even on narrow terminals.
         if self.sidebar_collapsed {
             self.divider_col = None;
             let strip_width = responsive::COLLAPSED_STRIP_WIDTH.min(available_width);
-            let chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(strip_width), Constraint::Min(0)])
-                .split(content_area);
-            // The full list isn't drawn, so its hit-test rects would
-            // otherwise keep last frame's values and a click in the now-
-            // preview area could resolve to an invisible list row (and
-            // switch the live target). Zero them so mouse hit-testing can't
-            // target the hidden sidebar; `render` already cleared the
-            // collapse button rect, and the strip sets its own.
+            let (strip_area, preview_area) =
+                sidebar_areas(content_area, strip_width, 0, self.sidebar_position);
+            // Clear hidden list hit targets before drawing the strip.
             self.list_area = Rect::default();
             self.list_inner_area = Rect::default();
             self.shelf_inner_area = Rect::default();
             // Preview keeps full height; the strip docks under the collapsed
             // list column.
-            let strip_col = self.diagnostics_dock(frame, chunks[0], theme);
+            let strip_col = self.diagnostics_dock(frame, strip_area, theme);
             self.render_collapsed_strip(frame, strip_col, theme);
-            self.render_preview(frame, chunks[1], theme, PaneLayout::Collapsed);
+            self.render_preview(frame, preview_area, theme);
         } else if available_width < responsive::STACKED_BREAKPOINT {
             let main_height = content_area.height;
             let list_height = responsive::stacked_list_height(main_height);
@@ -1034,8 +1030,8 @@ impl HomeView {
             // list column to dock under; the strip spans the list's width above
             // the preview.
             let list_rect = self.diagnostics_dock(frame, chunks[0], theme);
-            self.render_list(frame, list_rect, theme, PaneLayout::Stacked);
-            self.render_preview(frame, chunks[1], theme, PaneLayout::Stacked);
+            self.render_list(frame, list_rect, theme, ListLayout::Stacked);
+            self.render_preview(frame, chunks[1], theme);
         } else {
             // Side-by-side: cap list width so the preview pane keeps its
             // usability floor (PREVIEW_MIN_WIDTH).
@@ -1043,24 +1039,23 @@ impl HomeView {
                 .list_width
                 .min(available_width.saturating_sub(responsive::PREVIEW_MIN_WIDTH))
                 .max(10);
-            let chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Length(effective_list_width),
-                    Constraint::Min(responsive::PREVIEW_MIN_WIDTH),
-                ])
-                .split(content_area);
+            let (list_area, preview_area) = sidebar_areas(
+                content_area,
+                effective_list_width,
+                responsive::PREVIEW_MIN_WIDTH,
+                self.sidebar_position,
+            );
 
-            // Layout chunks are contiguous, so chunks[1].x is the first
-            // column of the preview block, i.e. the visible left border
-            // that the user perceives as the divider. Hit-test uses the
-            // list's y-range (matches preview's y-range in side-by-side).
-            self.divider_col = Some(chunks[1].x);
+            self.divider_col = Some(match self.sidebar_position {
+                SidebarPosition::Left => preview_area.x,
+                SidebarPosition::Right => preview_area.right().saturating_sub(1),
+            });
 
             // Strip docks under the list column; the preview keeps full height.
-            let list_rect = self.diagnostics_dock(frame, chunks[0], theme);
-            self.render_list(frame, list_rect, theme, PaneLayout::SideBySide);
-            self.render_preview(frame, chunks[1], theme, PaneLayout::SideBySide);
+            let list_rect = self.diagnostics_dock(frame, list_area, theme);
+            let layout = ListLayout::Horizontal(self.sidebar_position);
+            self.render_list(frame, list_rect, theme, layout);
+            self.render_preview(frame, preview_area, theme);
         }
         self.render_status_bar(frame, main_chunks[1], theme);
 
@@ -1206,22 +1201,15 @@ impl HomeView {
         Block::default().borders(Borders::ALL).inner(panes[1])
     }
 
-    /// Render the collapsed sidebar: a narrow bordered strip standing in
-    /// for the full list. The whole strip is the click target (stored in
-    /// `expand_strip_area`) and re-expands the sidebar. A `»` glyph hints
-    /// the expand direction; the session count sits below it so the strip
-    /// still conveys "there are N sessions here".
+    /// Click-to-expand strip showing the expansion direction and session count.
     fn render_collapsed_strip(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         self.expand_strip_area = area;
         let border_color = match self.view_mode {
             ViewMode::Structured => theme.border,
             ViewMode::Terminal | ViewMode::Tool(_) => theme.terminal_border,
         };
-        // Drop the right border so the preview's left border is the single
-        // shared seam, matching the expanded list and DESIGN.md's
-        // "eliminate the double-border between list and preview" rule.
         let block = Block::default()
-            .borders(Borders::TOP | Borders::LEFT | Borders::BOTTOM)
+            .borders(ListLayout::Horizontal(self.sidebar_position).list_borders())
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color));
         let inner = block.inner(area);
@@ -1231,7 +1219,10 @@ impl HomeView {
         }
         let mut lines = vec![
             Line::from(Span::styled(
-                "\u{00BB}",
+                match self.sidebar_position {
+                    SidebarPosition::Left => "\u{00BB}",
+                    SidebarPosition::Right => "\u{00AB}",
+                },
                 Style::default().fg(theme.hint).bold(),
             )),
             Line::from(""),
@@ -1247,7 +1238,8 @@ impl HomeView {
         frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
     }
 
-    fn render_list(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, layout: PaneLayout) {
+    /// Paint list rows and record hit regions, leaving the shared border to the preview.
+    fn render_list(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, layout: ListLayout) {
         self.list_area = area;
         let profile = self.active_profile_display();
         let mut title = match &self.view_mode {
@@ -1315,20 +1307,21 @@ impl HomeView {
         self.shelf_inner_area = Rect::default();
         frame.render_widget(block, area);
 
-        // Collapse affordance on the top-right border. Clicking it shrinks
-        // the list to the click-to-expand strip. Drawn as an overlay on the
-        // border (after the block) so its clickable rect is known exactly,
-        // and skipped on a list too narrow to spare the columns without
-        // colliding with the title (`render` already zeroed the rect, so the
-        // narrow case needs no else).
-        const COLLAPSE_LABEL: &str = " \u{00AB} ";
+        // Keep the collapse button inside the outer border when one is present.
+        let collapse_label = match self.sidebar_position {
+            SidebarPosition::Left => " « ",
+            SidebarPosition::Right => " » ",
+        };
+
         const COLLAPSE_LABEL_WIDTH: u16 = 3;
         // Columns kept clear for the title that shares this top border row, so
         // the collapse affordance only draws when it won't collide with it.
         const COLLAPSE_LABEL_TITLE_RESERVE: u16 = 6;
         if area.width > COLLAPSE_LABEL_WIDTH + COLLAPSE_LABEL_TITLE_RESERVE {
             let btn_rect = Rect {
-                x: area.right() - COLLAPSE_LABEL_WIDTH,
+                x: area.right()
+                    - COLLAPSE_LABEL_WIDTH
+                    - u16::from(borders.contains(Borders::RIGHT)),
                 y: area.y,
                 width: COLLAPSE_LABEL_WIDTH,
                 height: 1,
@@ -1336,7 +1329,7 @@ impl HomeView {
             self.collapse_button_area = btn_rect;
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    COLLAPSE_LABEL,
+                    collapse_label,
                     Style::default().fg(theme.hint).bold(),
                 )),
                 btn_rect,
@@ -2748,7 +2741,8 @@ impl HomeView {
         self.active_preview_cache().captured_lines
     }
 
-    fn render_preview(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, layout: PaneLayout) {
+    /// Paint the preview and refresh geometry used by selection and live-send.
+    fn render_preview(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if self.system_health_open {
             self.preview_outer_area = area;
             self.preview_area = area;
@@ -2787,7 +2781,7 @@ impl HomeView {
         };
 
         let mut block = Block::default()
-            .borders(layout.preview_borders())
+            .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color))
             .padding(Padding::horizontal(1));
@@ -2907,10 +2901,8 @@ impl HomeView {
 
         let inner = block.inner(area);
         self.preview_area = inner;
-        // `area` is the OUTER preview rect (the block + borders + content).
-        // Stash it so `App::draw_preview_only` can call back into
-        // `render_preview` with the right rect on `%output` wakes; passing
-        // the inner there draws a nested block.
+        // Keep the outer rect for partial redraws; using `inner` would nest the block.
+
         self.preview_outer_area = area;
         self.diff_area = Rect::default();
         // The agent-pane sub-rect of `inner`: full inner when the info
@@ -5349,54 +5341,5 @@ mod tests {
         // Defensive: prefix near usize::MAX must not wrap. The checked_add
         // returns None which we map to "doesn't fit".
         assert_eq!(activity_column_padding(usize::MAX, 1000, 0), None);
-    }
-
-    #[test]
-    fn stacked_list_drops_bottom_border() {
-        assert!(!PaneLayout::Stacked.list_borders().contains(Borders::BOTTOM));
-    }
-
-    #[test]
-    fn collapsed_list_drops_bottom_border() {
-        assert!(!PaneLayout::Collapsed
-            .list_borders()
-            .contains(Borders::BOTTOM));
-    }
-
-    #[test]
-    fn side_by_side_list_keeps_bottom_border() {
-        assert!(PaneLayout::SideBySide
-            .list_borders()
-            .contains(Borders::BOTTOM));
-    }
-
-    #[test]
-    fn stacked_list_keeps_right_border() {
-        assert!(PaneLayout::Stacked.list_borders().contains(Borders::RIGHT));
-    }
-
-    #[test]
-    fn collapsed_list_keeps_right_border() {
-        assert!(PaneLayout::Collapsed
-            .list_borders()
-            .contains(Borders::RIGHT));
-    }
-
-    #[test]
-    fn side_by_side_list_drops_right_border() {
-        assert!(!PaneLayout::SideBySide
-            .list_borders()
-            .contains(Borders::RIGHT));
-    }
-
-    #[test]
-    fn preview_always_owns_full_box() {
-        for layout in [
-            PaneLayout::Collapsed,
-            PaneLayout::Stacked,
-            PaneLayout::SideBySide,
-        ] {
-            assert_eq!(layout.preview_borders(), Borders::ALL);
-        }
     }
 }

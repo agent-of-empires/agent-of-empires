@@ -1,4 +1,4 @@
-//! Migration v034: fold `pending_initial_turn` + `pending_initial_turn_attachments`
+//! Migration v029: fold `pending_initial_turn` + `pending_initial_turn_attachments`
 //! into one `pending_initial_turn` record.
 //!
 //! The two flat fields tracked one queued turn (a session's create-time
@@ -57,7 +57,7 @@ fn fold_pending_initial_turn(path: &Path) -> Result<()> {
     let mut value: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
-            debug!("v034: failed to parse {}: {e}, skipping", path.display());
+            debug!("v029: failed to parse {}: {e}, skipping", path.display());
             return Ok(());
         }
     };
@@ -93,7 +93,7 @@ fn fold_pending_initial_turn(path: &Path) -> Result<()> {
     if folded > 0 {
         crate::session::atomic_write(path, serde_json::to_string_pretty(&value)?.as_bytes())?;
         info!(
-            "v034: folded pending_initial_turn on {folded} session(s) in {}",
+            "v029: folded pending_initial_turn on {folded} session(s) in {}",
             path.display()
         );
     }

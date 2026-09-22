@@ -55,7 +55,7 @@ fn write_runtime_filter(app_dir: &std::path::Path, directive: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial_test::parallel]
+#[serial_test::serial]
 async fn watch_runtime_filter_byte_identical_behavior() {
     install_subscriber_once("off");
     let tmp = tempfile::TempDir::new().expect("tempdir");

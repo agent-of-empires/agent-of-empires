@@ -72,9 +72,8 @@ validate_extra() {
       cwdstat_values=${1#cwdstat }
       cwdstat_dev=${cwdstat_values%% *}
       cwdstat_ino=${cwdstat_values#* }
-      [ "$cwdstat_ino" != "$cwdstat_values" ]         && [ -n "$cwdstat_dev" ] && [ -n "$cwdstat_ino" ] || exit 0
+      [ "$cwdstat_ino" != "$cwdstat_values" ] && [ -n "$cwdstat_dev" ] && [ -n "$cwdstat_ino" ] || exit 0
       case "$cwdstat_dev$cwdstat_ino" in *[!0-9]*) exit 0 ;; esac
-      case "$cwdstat_ino" in *' '*) exit 0 ;; esac
       cwdstat_seen=1
       ;;
     *) exit 0 ;;
@@ -342,78 +341,26 @@ mod tests {
         );
         for (extras, accepted) in [
             ("", true),
-            (
-                "fresh
-", true,
-            ),
-            (
-                "cwdstat 12 34
-",
-                true,
-            ),
-            (
-                "fresh
-cwdstat 12 34
-",
-                true,
-            ),
-            (
-                "cwdstat 12 34
-fresh
-",
-                true,
-            ),
-            (
-                "unknown
-", false,
-            ),
-            (
-                "cwdstat 12
-",
-                false,
-            ),
-            (
-                "cwdstat 12 34 56
-",
-                false,
-            ),
-            (
-                "fresh
-fresh
-",
-                false,
-            ),
-            (
-                "cwdstat 12 34
-cwdstat 12 34
-",
-                false,
-            ),
+            ("fresh\n", true),
+            ("cwdstat 12 34\n", true),
+            ("fresh\ncwdstat 12 34\n", true),
+            ("cwdstat 12 34\nfresh\n", true),
+            ("unknown\n", false),
+            ("cwdstat 12\n", false),
+            ("cwdstat 12 34 56\n", false),
+            ("fresh\nfresh\n", false),
+            ("cwdstat 12 34\ncwdstat 12 34\n", false),
         ] {
             std::fs::write(
                 &breadcrumb,
-                format!(
-                    "{cwd}
-{}
-{extras}",
-                    session.display()
-                ),
+                format!("{cwd}\n{}\n{extras}", session.display()),
             )
             .unwrap();
             set_mtime_ms(&breadcrumb, 4_000_000_000_000);
             let output = run_container_script(&meta, &marker);
             assert_eq!(!output.is_empty(), accepted, "{extras:?}");
         }
-        std::fs::write(
-            &breadcrumb,
-            format!(
-                "{cwd}
-{}
-",
-                session.display()
-            ),
-        )
-        .unwrap();
+        std::fs::write(&breadcrumb, format!("{cwd}\n{}\n", session.display())).unwrap();
         set_mtime_ms(&breadcrumb, 4_000_000_000_000);
         let output = run_container_script(&meta, &marker);
         assert_eq!(

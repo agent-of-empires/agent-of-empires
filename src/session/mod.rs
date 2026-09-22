@@ -552,7 +552,7 @@ impl Drop for FailNextListProfilesGuard {
 /// profile and the session list multiplies (the original "three of every
 /// folder" symptom). Extracted from `list_profiles` so tests can drive it
 /// against a tempdir.
-fn list_profile_names_in(profiles_dir: &std::path::Path) -> Result<Vec<String>> {
+pub(crate) fn list_profile_names_in(profiles_dir: &std::path::Path) -> Result<Vec<String>> {
     let mut profiles = Vec::new();
     for entry in fs::read_dir(profiles_dir)? {
         let entry = entry?;
