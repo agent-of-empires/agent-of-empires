@@ -172,6 +172,7 @@ pub fn hook_display_groups(
 #[derive(Debug, Clone)]
 pub struct ResolvedHooks {
     hooks: HooksConfig,
+    profile: String,
     /// Set only when trusted repo hooks were merged in.
     repo_root: Option<PathBuf>,
 }
@@ -188,6 +189,7 @@ impl ResolvedHooks {
     pub fn global(profile: &str) -> Option<Self> {
         resolve_global_profile_hooks(profile).map(|hooks| Self {
             hooks,
+            profile: profile.to_string(),
             repo_root: None,
         })
     }
@@ -197,6 +199,7 @@ impl ResolvedHooks {
     pub fn with_repo(profile: &str, repo_root: &Path, repo_hooks: HooksConfig) -> Option<Self> {
         merge_hooks_with_config(profile, repo_hooks).map(|hooks| Self {
             hooks,
+            profile: profile.to_string(),
             repo_root: Some(repo_root.to_path_buf()),
         })
     }
@@ -204,7 +207,8 @@ impl ResolvedHooks {
     /// Names the config file that declared this set's `hook_type` commands.
     /// Each layer's own declaration is matched against the commands, most
     /// specific first; `None` when none matches.
-    pub fn origin_hint(&self, profile: &str, hook_type: &str) -> Option<String> {
+    pub fn origin_hint(&self, hook_type: &str) -> Option<String> {
+        let profile = self.profile.as_str();
         let of_type = |h: HooksConfig| match hook_type {
             "on_create" => Some(h.on_create),
             "on_launch" => Some(h.on_launch),
@@ -1003,6 +1007,7 @@ mod tests {
                         on_create: cmds(&["ghost"]),
                         ..Default::default()
                     },
+                    profile: "default".into(),
                     repo_root: None,
                 },
                 "on_create",
@@ -1010,14 +1015,15 @@ mod tests {
             ),
         ];
         for (label, run, hook_type, expected) in cases {
-            assert_eq!(run.origin_hint("default", hook_type), expected, "{label}");
+            assert_eq!(run.origin_hint(hook_type), expected, "{label}");
         }
 
         let work = ResolvedHooks::global("work").unwrap();
-        assert_eq!(work.origin_hint("work", "on_create"), named(&profile));
+        assert_eq!(work.origin_hint("on_create"), named(&profile));
 
         let unseen = crate::session::get_profile_dir_path("unseen").unwrap();
-        assert_eq!(work.origin_hint("unseen", "on_create"), None);
+        let unseen_run = ResolvedHooks::global("unseen").unwrap();
+        assert_eq!(unseen_run.origin_hint("on_create"), named(&global));
         assert!(!unseen.exists(), "the hint must not create a profile dir");
     }
 

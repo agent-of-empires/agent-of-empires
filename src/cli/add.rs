@@ -893,7 +893,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     ),
                     None => repo_config::execute_hooks(&hooks.on_create, &path, &hook_env),
                 };
-                ran.map_err(|e| match hooks.origin_hint(profile, "on_create") {
+                ran.map_err(|e| match hooks.origin_hint("on_create") {
                     Some(hint) => e.context(format!("on_create hook failed; {hint}")),
                     None => e,
                 })?;

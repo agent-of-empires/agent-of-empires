@@ -74,9 +74,9 @@ pub struct CreationPoller {
 }
 
 /// Appends which config file declared the failing `on_create` commands.
-fn on_create_error(e: &anyhow::Error, hooks: &ResolvedHooks, profile: &str) -> String {
+fn on_create_error(e: &anyhow::Error, hooks: &ResolvedHooks) -> String {
     let msg = format!("on_create hook failed: {e:#}");
-    match hooks.origin_hint(profile, "on_create") {
+    match hooks.origin_hint("on_create") {
         Some(hint) => format!("{msg}\n{hint}"),
         None => msg,
     }
@@ -192,7 +192,7 @@ impl CreationPoller {
                             &created_workspace_worktrees,
                             None,
                         );
-                        return CreationResult::Error(on_create_error(&e, hooks, &profile));
+                        return CreationResult::Error(on_create_error(&e, hooks));
                     }
                 }
             } else if let Err(e) = repo_config::execute_hooks_streamed(
@@ -207,7 +207,7 @@ impl CreationPoller {
                     &created_workspace_worktrees,
                     None,
                 );
-                return CreationResult::Error(on_create_error(&e, hooks, &profile));
+                return CreationResult::Error(on_create_error(&e, hooks));
             }
         }
 
