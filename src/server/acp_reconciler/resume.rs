@@ -15,8 +15,9 @@ use crate::process::worker_registry;
 use crate::server::session_service::SessionService;
 use crate::session::Instance;
 
-/// A structured view session that needs a worker, snapshotted so resume tasks
-/// need not hold the instances lock.
+/// A structured view session that needs a worker, snapshotted at the tick so
+/// resume tasks need not re-scan the instance list. Anything that a later pick
+/// can change is re-read in `build_spawn_request`, not carried here.
 #[derive(Clone)]
 pub(super) struct ResumeTarget {
     pub(super) id: String,
@@ -312,9 +313,11 @@ async fn build_spawn_request(
 ) -> Result<SpawnRequest, ()> {
     let supervisor = &service.acp_supervisor;
     let inst_lock = service.instance_lock(&target.id).await;
-    // Re-read under the session lock: a worktree rename holds it across the
-    // move, so a snapshotted path could be stale (#2260). Released before
-    // ensure_container, which takes the same lock.
+    // Re-read under the session lock, for two reasons. A worktree rename holds
+    // it across the move, so a snapshotted path could be stale (#2260); and the
+    // three persisted selectors can be re-picked after the tick snapshotted
+    // this target, which the handshake then re-asserts at the agent. Released
+    // before ensure_container, which takes the same lock.
     let (cwd, seed_history_replay, fork_from, acp_mode_id, acp_effort, agent_model) = {
         let _guard = inst_lock.lock().await;
         let instances = service.instances.read().await;

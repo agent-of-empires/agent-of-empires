@@ -210,36 +210,6 @@ async fn pinned_model_skipped_when_already_current() {
     }
 }
 
-/// The model is applied before the effort: the adapter rebuilds its option set
-/// after a model switch, so the effort must be resolved from that response.
-#[tokio::test]
-#[serial_test::parallel]
-async fn pinned_model_applied_before_effort() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-    let temp = tempfile::tempdir().expect("tempdir");
-    let record_path = temp.path().join("config-option-calls.log");
-    let config = spawn_config(
-        shim_path(),
-        shim_env(&record_path, true, true),
-        Some("stored-model-session".into()),
-        Some("opus".into()),
-        Some("high".into()),
-    );
-    run(config, "model-then-effort").await;
-
-    let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
-    let lines: Vec<&str> = recorded.lines().collect();
-    let model_at = lines.iter().position(|line| *line == "model=opus");
-    let effort_at = lines.iter().position(|line| *line == "thought_level=high");
-    assert!(
-        matches!((model_at, effort_at), (Some(m), Some(e)) if m < e),
-        "model must be applied before the effort (recorded: {recorded:?})"
-    );
-}
-
 /// A value the agent rejects (a stale alias after an upgrade, a pick persisted
 /// from another agent's namespace) warns and never fails the spawn: the session
 /// still comes up and answers, on the agent's own model, and the user is told.
@@ -288,12 +258,18 @@ async fn reset_reapplies_the_live_model_pick() {
     }
     let temp = tempfile::tempdir().expect("tempdir");
     let record_path = temp.path().join("config-option-calls.log");
+    // The reset path re-reads the effort id from the model switch's response
+    // exactly as the handshake does, so it is driven with an effort pin and the
+    // renaming shim: the post-reset effort must land on the id that response
+    // advertised, not the one the pre-reset option list carried.
+    let mut env = shim_env(&record_path, false, true);
+    env.push(("SHIM_RENUMBER_ON_MODEL".into(), "1".into()));
     let config = spawn_config(
         shim_path(),
-        shim_env(&record_path, false, false),
+        env,
         None,
         Some("sonnet".into()),
-        None,
+        Some("high".into()),
     );
     let mut client = AcpClient::spawn(config, AcpSessionId("model-reset".into()))
         .await
@@ -304,9 +280,25 @@ async fn reset_reapplies_the_live_model_pick() {
     let _ = client.shutdown().await;
 
     let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
+    let models: Vec<&str> = recorded
+        .lines()
+        .filter(|line| line.starts_with("model="))
+        .collect();
     assert_eq!(
-        recorded, "model=sonnet\nmodel=opus\nmodel=opus\n",
-        "a reset must re-apply the live pick, not the spawn-time model"
+        models,
+        ["model=sonnet", "model=opus", "model=opus"],
+        "a reset must re-apply the live pick, not the spawn-time model (recorded: {recorded:?})"
+    );
+    // `session/new` restores the default id, so the pre-reset rename is undone
+    // and the reset's own switch renames it again: the last effort line is the
+    // one the reset applied.
+    assert_eq!(
+        recorded
+            .lines()
+            .rfind(|line| line.starts_with("thought_level")),
+        Some("thought_level_v2=high"),
+        "the reset must resolve the effort id from its own model switch \
+         (recorded: {recorded:?})"
     );
 }
 
@@ -339,5 +331,17 @@ async fn effort_id_is_re_read_from_the_model_switch_response() {
     assert!(
         recorded.lines().any(|line| line == "thought_level_v2=high"),
         "the effort must use the id the switch response advertised (recorded: {recorded:?})"
+    );
+    // The ordering this depends on, asserted here rather than in a second
+    // session: the effort can only carry the post-switch id if the model went
+    // first, so a reversal shows up as `thought_level=high` above.
+    let lines: Vec<&str> = recorded.lines().collect();
+    let model_at = lines.iter().position(|line| *line == "model=opus");
+    let effort_at = lines
+        .iter()
+        .position(|line| line.starts_with("thought_level"));
+    assert!(
+        matches!((model_at, effort_at), (Some(m), Some(e)) if m < e),
+        "model must be applied before the effort (recorded: {recorded:?})"
     );
 }

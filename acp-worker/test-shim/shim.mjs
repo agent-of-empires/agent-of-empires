@@ -191,10 +191,11 @@ async function handleNewSession(params) {
   if (recordFile) await writeFile(recordFile, JSON.stringify(params?.mcpServers ?? []));
   const sessionId = "shim-" + crypto.randomUUID();
   sessions.set(sessionId, {});
-  // A fresh session starts on the default model and the default option ids, as
-  // real adapters do. Both are process-wide here, so without the reset a second
-  // session in the same shim would inherit the first one's renamed id and the
-  // suite would depend on test order.
+  // A fresh session starts on the default model, effort and option ids, as real
+  // adapters do. One process serves one connection, so this is not about test
+  // isolation: a conversation reset runs session/new on the SAME connection, so
+  // a renamed option id or a carried-over pick would otherwise survive into the
+  // fresh session and the reset path would be testing the old one.
   model = "default";
   thoughtLevel = "medium";
   thoughtLevelId = "thought_level";
