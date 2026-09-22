@@ -1726,7 +1726,7 @@ impl HomeView {
                                     }
                                     None
                                 }
-                                RepoTrustAction::Skip { .. } => {
+                                RepoTrustAction::Skip => {
                                     self.request_creation(data, Some(false));
                                     None
                                 }
@@ -2148,7 +2148,7 @@ impl HomeView {
                                 self.request_creation(data, Some(true));
                                 return None;
                             }
-                            RepoTrustAction::Skip { .. } => {
+                            RepoTrustAction::Skip => {
                                 self.request_creation(data, Some(false));
                                 return None;
                             }
@@ -6888,20 +6888,6 @@ impl HomeView {
             TrustSurface::Absent => Vec::new(),
         };
 
-        // Hooks to run if approved (repo hooks, else global) vs skipped
-        // (already-trusted repo hooks still run; newly-prompted hooks fall back
-        // to the global set, matching the prior TUI skip behavior).
-        let hooks_on_trust = match &repo_hooks {
-            Some(h) => repo_config::merge_hooks_with_config(&data.profile, h.clone()),
-            None => repo_config::resolve_global_profile_hooks(&data.profile),
-        };
-        let hooks_on_skip = match &trust.hooks {
-            TrustSurface::Trusted(h) => {
-                repo_config::merge_hooks_with_config(&data.profile, h.clone())
-            }
-            _ => repo_config::resolve_global_profile_hooks(&data.profile),
-        };
-
         if !trust.needs_prompt() {
             // Already-trusted repository hooks are approved explicitly so the
             // daemon runs them; an absent repository surface approves nothing.
@@ -6922,8 +6908,6 @@ impl HomeView {
             merged_hooks,
             repo_hooks.unwrap_or_default(),
             mcp_servers,
-            hooks_on_trust,
-            hooks_on_skip,
             hooks_hash,
             mcp_hash,
             data.path.clone(),

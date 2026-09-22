@@ -17,6 +17,7 @@ pub enum ApiErrorCode {
     CreationTrustChanged,
     CreationCancelled,
     CreationNotPending,
+    CreateHookFailed,
 }
 
 impl ApiErrorCode {
@@ -33,6 +34,7 @@ impl ApiErrorCode {
             Self::CreationTrustChanged => "creation_trust_changed",
             Self::CreationCancelled => "creation_cancelled",
             Self::CreationNotPending => "creation_not_pending",
+            Self::CreateHookFailed => "create_hook_failed",
         }
     }
 
@@ -47,6 +49,7 @@ impl ApiErrorCode {
             | Self::CreationNotPending => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
+            Self::CreateHookFailed => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -77,6 +80,7 @@ impl ApiErrorCode {
             b"creation_trust_changed" => Self::CreationTrustChanged,
             b"creation_cancelled" => Self::CreationCancelled,
             b"creation_not_pending" => Self::CreationNotPending,
+            b"create_hook_failed" => Self::CreateHookFailed,
             _ => return None,
         };
         (status == code.status()).then_some(code)
@@ -117,6 +121,12 @@ mod tests {
                 "runtime_epoch_mismatch",
                 false,
                 Some(ApiErrorCode::RuntimeEpochMismatch),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "create_hook_failed",
+                false,
+                Some(ApiErrorCode::CreateHookFailed),
             ),
         ] {
             let mut headers = HeaderMap::new();

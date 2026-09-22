@@ -28,6 +28,7 @@ async fn create_receipts_include_published_rows_and_idempotent_retries() -> anyh
         let response = create_session(
             State(state.clone()),
             axum::extract::Query(create::CreateSessionQuery { wait: None }),
+            None,
             Ok(Json(body)),
         )
         .await
@@ -91,6 +92,7 @@ async fn canonical_fork_refusals_do_not_create_sessions() -> anyhow::Result<()> 
         create_session(
             State(state),
             axum::extract::Query(create::CreateSessionQuery { wait: None }),
+            None,
             Ok(Json(create_body_from_json(body))),
         )
         .await
@@ -2600,6 +2602,29 @@ fn from_instance_surfaces_hook_urgent_flag() {
     assert!(
         !plain_resp.urgent,
         "session with no hook file must not be urgent"
+    );
+}
+
+#[tokio::test]
+async fn create_hook_failure_details_are_local_owner_only() {
+    let error = anyhow::Error::new(CreateHookFailed::new(
+        anyhow::anyhow!("command exited with status 1"),
+        Some("Defined in /tmp/project/.agent-of-empires.yml"),
+    ));
+    assert!(local_create_hook_error_response(&error, false).is_none());
+
+    let response = local_create_hook_error_response(&error, true).expect("local response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers().get(crate::daemon::ERROR_CODE_HEADER),
+        Some(&axum::http::HeaderValue::from_static("create_hook_failed"))
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        body,
+        "on_create hook failed: command exited with status 1\nDefined in /tmp/project/.agent-of-empires.yml"
     );
 }
 

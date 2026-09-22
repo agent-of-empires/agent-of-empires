@@ -538,6 +538,11 @@ impl DaemonClient {
         Ok(MutationReceipt { cursor, outcome })
     }
 
+    fn should_read_error_body(&self, code: Option<ApiErrorCode>) -> bool {
+        self.authorization.is_none()
+            && (self.unix_path.is_none() || code == Some(ApiErrorCode::CreateHookFailed))
+    }
+
     async fn request_response(
         &self,
         mut request: reqwest::RequestBuilder,
@@ -563,7 +568,7 @@ impl DaemonClient {
                     truncated: false,
                 });
             }
-            if self.authorization.is_some() || self.unix_path.is_some() {
+            if !self.should_read_error_body(code) {
                 return Err(DaemonClientError::Status {
                     status,
                     code,
@@ -834,6 +839,17 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn error_body_policy_exposes_hook_failures_only_to_local_owner() {
+        let unix = DaemonClient::new_unix("/tmp/aoe-test.sock").expect("unix client");
+        let bearer = DaemonClient::new("http://localhost", Some("token")).expect("bearer client");
+        let anonymous = DaemonClient::new("http://localhost", None).expect("anonymous client");
+
+        assert!(unix.should_read_error_body(Some(ApiErrorCode::CreateHookFailed)));
+        assert!(!unix.should_read_error_body(None));
+        assert!(!bearer.should_read_error_body(Some(ApiErrorCode::CreateHookFailed)));
+        assert!(anonymous.should_read_error_body(None));
+    }
     #[test]
     fn mutation_receipt_requires_an_unambiguous_current_cursor() {
         let mut headers = reqwest::header::HeaderMap::new();

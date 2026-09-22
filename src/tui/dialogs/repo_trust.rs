@@ -22,9 +22,6 @@ pub struct RepoTrustDialog {
     repo_hooks: HooksConfig,
     /// Redacted project MCP servers; empty when there is no `.mcp.json`.
     mcp_servers: Vec<ProjectMcpServer>,
-    hooks_on_trust: Option<HooksConfig>,
-    /// Hooks to run on a skip: already-trusted ones only.
-    hooks_on_skip: Option<HooksConfig>,
     /// Hashes to record on approval; `Some` only for a surface needing trust.
     hooks_hash: Option<String>,
     mcp_hash: Option<String>,
@@ -43,21 +40,15 @@ pub enum RepoTrustAction {
         hooks_hash: Option<String>,
         mcp_hash: Option<String>,
         project_path: String,
-        hooks: Option<HooksConfig>,
     },
-    Skip {
-        hooks: Option<HooksConfig>,
-    },
+    Skip,
 }
 
 impl RepoTrustDialog {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         merged_hooks: HooksConfig,
         repo_hooks: HooksConfig,
         mcp_servers: Vec<ProjectMcpServer>,
-        hooks_on_trust: Option<HooksConfig>,
-        hooks_on_skip: Option<HooksConfig>,
         hooks_hash: Option<String>,
         mcp_hash: Option<String>,
         project_path: String,
@@ -66,8 +57,6 @@ impl RepoTrustDialog {
             merged_hooks,
             repo_hooks,
             mcp_servers,
-            hooks_on_trust,
-            hooks_on_skip,
             hooks_hash,
             mcp_hash,
             project_path,
@@ -85,14 +74,11 @@ impl RepoTrustDialog {
             hooks_hash: self.hooks_hash.clone(),
             mcp_hash: self.mcp_hash.clone(),
             project_path: self.project_path.clone(),
-            hooks: self.hooks_on_trust.clone(),
         }
     }
 
     fn skip_action(&self) -> RepoTrustAction {
-        RepoTrustAction::Skip {
-            hooks: self.hooks_on_skip.clone(),
-        }
+        RepoTrustAction::Skip
     }
 
     pub fn handle_click(&self, col: u16, row: u16) -> Option<DialogResult<RepoTrustAction>> {
@@ -313,8 +299,6 @@ mod tests {
             hooks.clone(),
             hooks,
             mcp,
-            None,
-            None,
             Some("hh".to_string()),
             Some("mh".to_string()),
             "/home/user/project".to_string(),
@@ -352,7 +336,7 @@ mod tests {
         let mut dialog = dialog_with(HooksConfig::default(), sample_mcp());
         assert!(matches!(
             dialog.handle_key(key(KeyCode::Char('n'))),
-            DialogResult::Submit(RepoTrustAction::Skip { .. })
+            DialogResult::Submit(RepoTrustAction::Skip)
         ));
     }
 

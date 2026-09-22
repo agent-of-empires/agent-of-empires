@@ -463,10 +463,13 @@ pub(crate) async fn spawn_structured_session(
                         let hint = hook_plan
                             .hooks
                             .as_ref()
-                            .and_then(|hooks| hooks.origin_hint("on_create"))
-                            .map(|hint| format!("\n{hint}"))
-                            .unwrap_or_default();
-                        anyhow::anyhow!("on_create hook failed: {error:#}{hint}")
+                            .and_then(|hooks| hooks.origin_hint("on_create"));
+                        anyhow::Error::new(
+                            crate::server::api::sessions::CreateHookFailed::new(
+                                error,
+                                hint.as_deref(),
+                            ),
+                        )
                     })
                 })
                 .and_then(|()| creation_guard.check().map_err(anyhow::Error::from)),

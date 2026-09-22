@@ -2,6 +2,19 @@
 
 use super::*;
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct CreateHookFailed(String);
+
+impl CreateHookFailed {
+    pub(crate) fn new(error: anyhow::Error, origin_hint: Option<&str>) -> Self {
+        let hint = origin_hint
+            .map(|hint| format!("\n{hint}"))
+            .unwrap_or_default();
+        Self(format!("on_create hook failed: {error:#}{hint}"))
+    }
+}
+
 /// Hard cap on a single `idempotency_key`'s length, so one request cannot
 /// persist an arbitrarily large string onto its instance. This bounds key
 /// SIZE, not the number of distinct keys; entry count is bounded separately
@@ -594,8 +607,13 @@ pub(super) async fn wait_until_left_starting(
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<CreateSessionQuery>,
+    local: Option<axum::Extension<crate::server::auth::LocalAuthorization>>,
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    let local_owner = matches!(
+        local.as_deref(),
+        Some(crate::server::auth::LocalAuthorization::UnixOwner(_))
+    );
     if state.read_only {
         return crate::server::api::read_only_response();
     }
@@ -1149,6 +1167,9 @@ pub async fn create_session(
                     .into_response();
             }
             tracing::warn!(target: "http.api.sessions", "Session creation failed: {}", e);
+            if let Some(response) = local_create_hook_error_response(&e, local_owner) {
+                return response;
+            }
             (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "create_failed", "message": public_create_session_error(&e)})),
@@ -1157,6 +1178,26 @@ pub async fn create_session(
         }
     }
 }
+pub(super) fn local_create_hook_error_response(
+    error: &anyhow::Error,
+    local_owner: bool,
+) -> Option<axum::response::Response> {
+    if !local_owner {
+        return None;
+    }
+    let hook_failed = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CreateHookFailed>())?;
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            crate::daemon::ApiErrorCode::CreateHookFailed.header(),
+            hook_failed.to_string(),
+        )
+            .into_response(),
+    )
+}
+
 async fn created_session_response(
     state: &Arc<AppState>,
     id: &str,

@@ -93,7 +93,7 @@ pub fn resolve_global_profile_hooks(profile: &str) -> Option<HooksConfig> {
 }
 
 /// Trusted repo hooks replace global ones per type (not append).
-pub fn merge_hooks_with_config(profile: &str, repo_hooks: HooksConfig) -> Option<HooksConfig> {
+fn merge_hooks_with_config(profile: &str, repo_hooks: HooksConfig) -> Option<HooksConfig> {
     let mut base = profile_config::resolve_config_or_warn(profile).hooks;
     if !repo_hooks.on_create.is_empty() {
         base.on_create = repo_hooks.on_create;
