@@ -15,6 +15,8 @@ pub const MAX_SESSIONS: usize = 200;
 
 /// A discovered Claude Code session, summarized for the import picker.
 #[derive(Debug, Clone, Serialize, PartialEq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct ClaudeSessionSummary {
     /// The on-disk session id (filename stem). Fed to `session/load`.
     pub session_id: String,
@@ -26,6 +28,7 @@ pub struct ClaudeSessionSummary {
     pub title: Option<String>,
     /// File modification time as a unix epoch millisecond stamp, for
     /// recent-first sorting and "last used" display.
+    #[cfg_attr(test, ts(type = "number"))]
     pub last_modified_ms: u64,
     /// Whether `cwd` still exists. A resumed session needs its original cwd;
     /// the picker flags missing ones.

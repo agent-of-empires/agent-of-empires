@@ -10,9 +10,106 @@
  */
 export type AcpWorkerState = "absent" | "resuming" | "running" | "stopping";
 
+export type AgentInfo = { kind: AgentKind, name: string, binary: string, host_only: boolean, installed: boolean, install_hint: string, 
+/**
+ * True when this agent has a one-shot mode (a `oneshot_flag`), so it can
+ * be used for the smart-rename title call. The settings smart-rename agent
+ * picker filters on this together with `installed`. Always false for
+ * custom agents (no built-in one-shot contract).
+ */
+oneshot_capable: boolean, 
+/**
+ * True when this agent can run in the structured acp UI: a
+ * built-in with an ACP adapter, or a custom agent that declares a
+ * valid `agent_acp_cmd`. The web wizard reads this to decide
+ * whether a session created for the agent runs in acp or tmux.
+ */
+acp_capable: boolean, 
+/**
+ * True when the agent's ACP adapter binary (`acp_command`) is actually
+ * resolvable on this host, not just registered. Distinct from
+ * `installed` (the agent's own CLI binary) and `acp_capable` (registry
+ * knows an adapter exists). The wizard's "Import from Claude" tab gates
+ * on this so it never shows when claude-agent-acp is missing. See #2276.
+ */
+acp_installed: boolean, 
+/**
+ * True when `[acp] allowed_agents` permits this agent in the structured
+ * view. Deliberately separate from `acp_capable`, which states an intrinsic
+ * fact (an ACP adapter exists for this agent) that an operator policy does
+ * not change. Folding policy into `acp_capable` would hide a disallowed
+ * agent from the settings surfaces that enumerate this endpoint to edit
+ * per-agent structured-view defaults, which is a legitimate thing to do for
+ * an agent that is currently off the allowlist. The wizard gates its
+ * structured-view option on this in addition to `acp_capable`. See #3241.
+ */
+acp_allowed: boolean, 
+/**
+ * The ACP command a built-in agent launches in acp, e.g.
+ * `claude-agent-acp` for claude or `opencode` for opencode. This is
+ * the registry command (post `${aoe_data_dir}` substitution), which
+ * can differ from `binary`; the wizard previews it so the user sees
+ * the real launch command before starting. Omitted for custom
+ * agents, whose command values are never serialized here (see the
+ * custom-agent serialization tests below).
+ */
+acp_command?: string, 
+/**
+ * The registry args appended to `acp_command` (e.g. `["acp"]`
+ * for opencode, `["--acp"]` for gemini). Empty when there are none
+ * or for custom agents.
+ */
+acp_args?: Array<string>, 
+/**
+ * Registry lifecycle state. Omitted while Active so the common wire
+ * shape is unchanged; the dashboard mirrors the shape in
+ * `web/src/lib/types.ts` (`AgentLifecycleInfo`) and renders a
+ * deprecated badge in the wizard picker and switch-agent modal.
+ */
+lifecycle?: AgentLifecycle, };
+
+export type AgentKind = "builtin" | "custom";
+
+/**
+ * Data-only lifecycle state. A new variant needs an arm in `AgentDef::lifecycle_label`
+ * and in the TS mirrors (`web/src/lib/types.ts`, `web/src/lib/agentProfiles.ts`).
+ */
+export type AgentLifecycle = { "state": "active" } | { "state": "deprecated", since: string, note: string, replacement: string | null, };
+
 export type AuxiliaryObservation = { target: AuxiliaryTarget, state: PanePresence, tmux_session: string | null, };
 
 export type AuxiliaryTarget = { "kind": "host", index: number, } | { "kind": "container", index: number, } | { "kind": "tool", tool_name: string, };
+
+export type BrowseResponse = { entries: Array<DirEntry>, has_more: boolean, };
+
+/**
+ * A discovered Claude Code session, summarized for the import picker.
+ */
+export type ClaudeSessionSummary = { 
+/**
+ * The on-disk session id (filename stem). Fed to `session/load`.
+ */
+session_id: string, 
+/**
+ * The working directory recorded in the transcript. The structured
+ * session must run here for `claude --resume` to resolve the file.
+ */
+cwd: string, 
+/**
+ * First human-authored prompt, truncated, for display. `None` when the
+ * transcript has no readable user message yet.
+ */
+title: string | null, 
+/**
+ * File modification time as a unix epoch millisecond stamp, for
+ * recent-first sorting and "last used" display.
+ */
+last_modified_ms: number, 
+/**
+ * Whether `cwd` still exists. A resumed session needs its original cwd;
+ * the picker flags missing ones.
+ */
+cwd_exists: boolean, };
 
 export type CleanupDefaults = { delete_worktree: boolean, delete_branch: boolean, delete_sandbox: boolean, 
 /**
@@ -32,6 +129,93 @@ export type ContextResumeIndeterminateReason = "runtime_check_required" | "agent
 
 export type ContextResumeUnavailableReason = "agent_unsupported" | "sandbox_unsupported" | "command_unsupported" | "forced_fresh" | "invalid_target" | "fork_pending" | "previous_failure" | "no_target";
 
+export type CreateSessionBody = { title?: string | null, size?: TerminalSize | null, path: string, tool: string, group?: string, yolo_mode?: boolean, 
+/**
+ * An explicit branch also opts into worktree creation.
+ */
+worktree_enabled?: boolean, worktree_branch?: string | null, create_new_branch?: boolean, 
+/**
+ * Used only for new branches; empty selects the repository default.
+ */
+base_branch?: string | null, sandbox?: boolean, extra_args?: string, sandbox_image?: string | null, extra_env?: Array<string>, extra_repo_paths?: Array<string>, 
+/**
+ * Repository names or paths override the shared base_branch.
+ */
+repo_bases?: Array<RepoBaseInput>, command_override?: string, custom_instruction?: string | null, profile?: string | null, 
+/**
+ * Structured view requires an ACP-capable agent.
+ */
+view?: View, agent_name?: string | null, agent_model?: string | null, agent_effort?: string | null, 
+/**
+ * Provision a scratch directory instead of path; excludes worktrees and extra repos.
+ */
+scratch?: boolean, 
+/**
+ * Omit to refuse unapproved hooks, false to skip untrusted hooks/MCP, true to approve.
+ * Skipping preserves already-trusted repository hooks and MCP.
+ */
+trust_hooks?: boolean | null, 
+/**
+ * Require the reviewed configuration to remain unchanged before provisioning.
+ */
+trust_review?: CreationTrustFingerprint | null, 
+/**
+ * Resume a Claude conversation through ACP; path must be its original cwd.
+ */
+import_acp_session_id?: string | null, 
+/**
+ * Provider conversation ID to fork, mutually exclusive with other sources.
+ */
+fork_from?: string | null, 
+/**
+ * Canonical AoE row to fork without supplying its provider conversation ID.
+ */
+fork_session_id?: string | null, 
+/**
+ * Completion callback; private and loopback destinations are refused.
+ */
+callback_url?: string | null, 
+/**
+ * Persisted replay key, retained until the created row is hard-deleted.
+ */
+idempotency_key?: string | null, };
+
+/**
+ * Captured configuration, rechecked before approval or provisioning.
+ */
+export type CreationTrustFingerprint = { project_path: string, base_hooks_hash: string, hooks_hash: string | null, mcp_hash: string | null, };
+
+export type DirEntry = { name: string, path: string, is_dir: boolean, is_git_repo: boolean, };
+
+export type DockerStatus = { available: boolean, runtime: string | null, };
+
+/**
+ * One configurable field, emitted by the `SettingsSection` derive.
+ */
+export type FieldDescriptor = { 
+/**
+ * The `[section]` table in `config.toml` and the profile override key.
+ */
+section: string, field: string, 
+/**
+ * TUI tab.
+ */
+category: string, label: string, description: string, widget: WidgetKind, web_write: WebWritePolicy, 
+/**
+ * `false` for global-only fields.
+ */
+profile_overridable: boolean, validation: ValidationKind, 
+/**
+ * Shown under an "Advanced" fold on both surfaces.
+ */
+advanced: boolean, 
+/**
+ * Manifest default for plugin fields; core fields always have a value in `Config`.
+ */
+default?: unknown, };
+
+export type GroupInfo = { path: string, session_count: number, };
+
 /**
  * One durable ownership protocol for every session lifecycle transition.
  *
@@ -50,6 +234,21 @@ export type ContextResumeUnavailableReason = "agent_unsupported" | "sandbox_unsu
 export type LifecycleOperation = "launch" | "capture" | "stop" | "purge" | "restore" | "trash";
 
 export type LifecycleReservation = { op: LifecycleOperation, generation: number, at: string, };
+
+/**
+ * A field of a [`WidgetKind::ObjectList`] item.
+ */
+export type ObjectFieldDescriptor = { field: string, label: string, description?: string, required: boolean, widget: ObjectFieldWidget, validation: ValidationKind, default?: unknown, };
+
+/**
+ * A subset of [`WidgetKind`] without object lists, keeping the schema non-recursive.
+ */
+export type ObjectFieldWidget = { "kind": "toggle" } | { "kind": "text", multiline: boolean, mono: boolean, } | { "kind": "number", min?: number, max?: number, } | { "kind": "select", options: Array<SelectOption>, } | { "kind": "dynamic_select", source: OptionSource, depends_on?: Array<string>, } | { "kind": "dynamic_multi_select", source: OptionSource, depends_on?: Array<string>, } | { "kind": "cron" };
+
+/**
+ * Mirrors `aoe_plugin_api::OptionSource`.
+ */
+export type OptionSource = "acp_agents" | "acp_models" | "acp_modes" | "projects" | "groups";
 
 /**
  * Native handoff requires Alive and the same name as the preparation receipt.
@@ -89,6 +288,33 @@ completed: number,
  * Total step count.
  */
 total: number, };
+
+export type ProfileInfo = { name: string, is_default: boolean, description?: string, };
+
+/**
+ * Per-project overrides for otherwise-global settings. Every field is
+ * `None` when the project doesn't override that setting, so resolution
+ * falls through to the global/profile default. Add a field here to make
+ * a new global toggle project-overridable; existing call sites that
+ * resolve overrides (`find_by_canonical_path`, `resolve_smart_rename_config`)
+ * don't need to change shape, only the new call site that consults the
+ * new field.
+ */
+export type ProjectOverrides = { 
+/**
+ * Overrides `worktree.enabled` (create-worktree-by-default) for new
+ * sessions launched against this project.
+ */
+worktree_enabled?: boolean, 
+/**
+ * Overrides `session.smart_rename` (agent-driven auto-naming) for
+ * sessions launched against this project.
+ */
+smart_rename?: boolean, };
+
+export type ProjectResponse = { name: string, path: string, scope: ProjectScope, default_base_branch?: string, pinned: boolean, overrides?: ProjectOverrides, };
+
+export type ProjectScope = "global" | "profile";
 
 /**
  * Which ACP `ContentBlock` an attachment maps to. The string form
@@ -149,15 +375,72 @@ origin_device?: string | null, };
 
 export type RateLimitInfo = { status: string, 
 /**
- * When the quota window clears, or `None` when the agent never
- * reported one. Only a reset the adapter attributed to a window it
- * rejected lands here; the alternative was a `now + 1h` guess the UI
- * presented as fact (#3152). Consumers show `status` (which usually
- * names the reset in words) instead of inventing a time. Events
- * written before #3152 carry their fabricated value and still
- * deserialize as `Some`.
+ * When the quota window clears, if the agent reported it.
  */
 resets_at: string | null, kind: string, };
+
+export type RepoBase = { 
+/**
+ * None for single-repo sessions; Some for each workspace member.
+ */
+repo_name?: string, base_branch: string, 
+/**
+ * Worktree path this entry's diff was computed in. The web base picker
+ * queries it so a workspace member's typeahead lists its own branches
+ * rather than the launch repo's (#3329).
+ */
+repo_path: string, 
+/**
+ * This entry's explicit override, when set. Absent means `base_branch`
+ * came from the creation base, the profile default, or auto-detection, so
+ * the client hides its reset affordance (#3329).
+ */
+base_override?: string, };
+
+/**
+ * One repository's branch base in a creation request.
+ */
+export type RepoBaseInput = { repo: string, base_branch: string, };
+
+export type RichDiffFileInfo = { path: string, old_path?: string, status: RichDiffStatus, additions: number, deletions: number, 
+/**
+ * Workspace repo this file belongs to, `None` for single-repo sessions.
+ * The frontend groups the sidebar list by it and uses it to disambiguate
+ * path collisions across repos (#1047).
+ */
+repo_name?: string, };
+
+export type RichDiffFilesResponse = { files: Array<RichDiffFileInfo>, 
+/**
+ * One entry per repo whose diff was computed: one element with
+ * `repo_name: None` for single-repo sessions, one per member for workspace
+ * sessions, since each member can have a different default (#1047).
+ */
+per_repo_bases: Array<RepoBase>, warning?: string, };
+
+/**
+ * [`crate::git::diff::FileStatus`] plus `unchanged`, which the full-file fallback
+ * reports for an in-repo path with no diff against the base.
+ */
+export type RichDiffStatus = "added" | "modified" | "deleted" | "renamed" | "copied" | "untracked" | "conflicted" | "unchanged";
+
+/**
+ * Contents-based diff response: raw old/new text that the web client parses
+ * and renders itself via `@pierre/diffs`. See [`MAX_CONTENTS_BYTES`].
+ */
+export type RichFileContentsResponse = { file: RichDiffFileInfo, old_content: string, new_content: string, 
+/**
+ * Server-computed unified diff of old to new. The client parses it as
+ * text rather than re-diffing, which would block the main thread on large
+ * files. Empty for binary files.
+ */
+patch: string, is_binary: boolean, 
+/**
+ * True if the file was too large to send inline; contents are omitted.
+ */
+truncated: boolean, };
+
+export type SelectOption = { value: string, label: string, };
 
 /**
  * One session from the daemon. Only `id` is required when decoding.
@@ -493,6 +776,13 @@ monitor_description: string | null, };
  */
 export type SmartRenameState = "inactive" | "pending" | "running";
 
+export type TerminalSize = { cols: number, rows: number, };
+
+/**
+ * Server-authoritative validation applied before a value is merged.
+ */
+export type ValidationKind = { "rule": "none" } | { "rule": "range_u64", min: number, max: number | null, } | { "rule": "non_empty_string" } | { "rule": "str" } | { "rule": "str_list" } | { "rule": "bool" } | { "rule": "range_i64", min: number | null, max: number | null, } | { "rule": "memory_limit" } | { "rule": "volume_list" } | { "rule": "env_list" } | { "rule": "port_mapping_list" } | { "rule": "capability_list" } | { "rule": "security_opt_list" } | { "rule": "network" } | { "rule": "one_of", options: Array<string>, } | { "rule": "cron" } | { "rule": "object_list", id_field: string, fields: Array<ObjectFieldDescriptor>, min_items: number | null, max_items: number | null, };
+
 /**
  * How a session is rendered. `Structured` uses the ACP-based native
  * rendering (plan panels, tool-call cards, approvals); `Terminal` streams
@@ -500,5 +790,9 @@ export type SmartRenameState = "inactive" | "pending" | "running";
  * deserialization default; session creation sets the value explicitly.
  */
 export type View = "terminal" | "structured";
+
+export type WebWritePolicy = { "policy": "allow" } | { "policy": "requires_elevation", reason: string, } | { "policy": "local_only", reason: string, };
+
+export type WidgetKind = { "kind": "toggle" } | { "kind": "text", multiline: boolean, mono: boolean, } | { "kind": "optional_text", mono: boolean, } | { "kind": "number", min?: number, max?: number, } | { "kind": "slider", min: number, max: number, step: number, } | { "kind": "select", options: Array<SelectOption>, } | { "kind": "list" } | { "kind": "dynamic_select", source: OptionSource, depends_on?: Array<string>, } | { "kind": "object_list", id_field: string, fields: Array<ObjectFieldDescriptor>, min_items?: number, max_items?: number, } | { "kind": "cron" } | { "kind": "custom", id: string, };
 
 export type WorkspaceRepoSummary = { name: string, source_path: string, branch: string, worktree_path: string, main_repo_path: string, managed_by_aoe: boolean, branch_preexisting: boolean, base_branch?: string | null, base_branch_override?: string | null, };

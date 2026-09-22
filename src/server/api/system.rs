@@ -54,9 +54,20 @@ pub async fn post_dashboard_presence(
 
 // --- Agents ---
 
+#[derive(Debug, Serialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
+pub enum AgentKind {
+    Builtin,
+    Custom,
+}
+
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct AgentInfo {
-    pub kind: String,
+    pub kind: AgentKind,
     pub name: String,
     pub binary: String,
     pub host_only: bool,
@@ -95,17 +106,19 @@ pub struct AgentInfo {
     /// agents, whose command values are never serialized here (see the
     /// custom-agent serialization tests below).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub acp_command: Option<String>,
     /// The registry args appended to `acp_command` (e.g. `["acp"]`
     /// for opencode, `["--acp"]` for gemini). Empty when there are none
     /// or for custom agents.
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<Vec<String>>", optional))]
     pub acp_args: Vec<String>,
     /// Registry lifecycle state. Omitted while Active so the common wire
-    /// shape is unchanged; the dashboard mirrors the shape in
-    /// `web/src/lib/types.ts` (`AgentLifecycleInfo`) and renders a
-    /// deprecated badge in the wizard picker and switch-agent modal.
+    /// shape is unchanged; the dashboard renders a deprecated badge in the
+    /// wizard picker and switch-agent modal.
     #[serde(skip_serializing_if = "crate::agents::AgentLifecycle::is_active")]
+    #[cfg_attr(test, ts(as = "Option<crate::agents::AgentLifecycle>", optional))]
     pub lifecycle: crate::agents::AgentLifecycle,
 }
 
@@ -148,7 +161,7 @@ fn build_custom_agent_infos(
         })
         .map(|(name, _command)| AgentInfo {
             lifecycle: crate::agents::AgentLifecycle::Active,
-            kind: "custom".to_string(),
+            kind: AgentKind::Custom,
             name: name.clone(),
             binary: name.clone(),
             host_only: false,
@@ -199,7 +212,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                 let (acp_command, acp_args) =
                     acp_command_fields(acp_registry.get(a.name), data_dir.as_deref());
                 AgentInfo {
-                    kind: "builtin".to_string(),
+                    kind: AgentKind::Builtin,
                     name: a.name.to_string(),
                     binary: a.binary.to_string(),
                     host_only: a.host_only,
@@ -1180,10 +1193,13 @@ pub async fn get_current_theme(
 // --- Wizard support ---
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct ProfileInfo<'a> {
     pub name: &'a str,
     pub is_default: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub description: Option<&'a str>,
 }
 
@@ -1226,6 +1242,8 @@ pub struct BrowseQuery {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct DirEntry {
     pub name: String,
     pub path: String,
@@ -1234,6 +1252,8 @@ pub struct DirEntry {
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 struct BrowseResponse {
     entries: Vec<DirEntry>,
     has_more: bool,
@@ -1368,6 +1388,8 @@ pub async fn browse_filesystem(
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct GroupInfo {
     pub path: String,
     pub session_count: usize,
@@ -1474,6 +1496,8 @@ pub async fn system_health(State(state): State<Arc<AppState>>) -> axum::response
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct DockerStatus {
     pub available: bool,
     pub runtime: Option<String>,
@@ -2720,7 +2744,7 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         let agent = &entries[0];
-        assert_eq!(agent.kind, "custom");
+        assert_eq!(agent.kind, AgentKind::Custom);
         assert_eq!(agent.name, "remote-claude");
         assert_eq!(agent.binary, "remote-claude");
         assert!(!agent.host_only);
@@ -2772,12 +2796,11 @@ mod tests {
     #[test]
     fn agent_info_lifecycle_wire_shape() {
         // The /api/agents contract: lifecycle omitted for Active agents,
-        // full metadata for deprecated ones. Mirrored by
-        // web/src/lib/types.ts (AgentLifecycleInfo).
+        // full metadata for deprecated ones.
         let mk = |name: &str| {
             let def = crate::agents::get_agent(name).unwrap();
             AgentInfo {
-                kind: "builtin".to_string(),
+                kind: AgentKind::Builtin,
                 name: def.name.to_string(),
                 binary: def.binary.to_string(),
                 host_only: def.host_only,
@@ -2818,7 +2841,7 @@ mod tests {
 
         let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(names, vec!["remote-codex"]);
-        assert!(entries.iter().all(|entry| entry.kind == "custom"));
+        assert!(entries.iter().all(|entry| entry.kind == AgentKind::Custom));
     }
 
     #[test]

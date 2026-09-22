@@ -135,17 +135,21 @@ pub struct RuntimeInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct ProjectResponse {
     pub name: String,
     pub path: String,
     pub scope: crate::session::ProjectScope,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub default_base_branch: Option<String>,
     pub pinned: bool,
     #[serde(
         default,
         skip_serializing_if = "crate::session::ProjectOverrides::is_empty"
     )]
+    #[cfg_attr(test, ts(as = "Option<crate::session::ProjectOverrides>", optional))]
     pub overrides: crate::session::ProjectOverrides,
 }
 

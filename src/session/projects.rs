@@ -45,6 +45,8 @@ impl From<serde_json::Error> for RegistryError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[serde(rename_all = "lowercase")]
 pub enum ProjectScope {
     Global,
@@ -68,14 +70,18 @@ impl ProjectScope {
 /// don't need to change shape, only the new call site that consults the
 /// new field.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct ProjectOverrides {
     /// Overrides `worktree.enabled` (create-worktree-by-default) for new
     /// sessions launched against this project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub worktree_enabled: Option<bool>,
     /// Overrides `session.smart_rename` (agent-driven auto-naming) for
     /// sessions launched against this project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub smart_rename: Option<bool>,
 }
 

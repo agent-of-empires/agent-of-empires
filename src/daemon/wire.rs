@@ -6,6 +6,8 @@ use crate::session::SessionScope;
 
 /// One repository's branch base in a creation request.
 #[derive(Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct RepoBaseInput {
     pub repo: String,
     pub base_branch: String,
@@ -21,6 +23,8 @@ pub struct CreationTrustRequest {
 
 /// Captured configuration, rechecked before approval or provisioning.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct CreationTrustFingerprint {
     pub project_path: String,
     pub base_hooks_hash: String,
@@ -39,75 +43,106 @@ pub struct CreationTrustReview {
 }
 
 #[derive(Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct CreateSessionBody {
+    #[cfg_attr(test, ts(optional = nullable))]
     pub title: Option<String>,
+    #[cfg_attr(test, ts(optional = nullable))]
     pub size: Option<TerminalSize>,
     pub path: String,
     pub tool: String,
     #[serde(default)]
+    #[cfg_attr(test, ts(as = "Option<String>", optional))]
     pub group: String,
     #[serde(default)]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
     pub yolo_mode: bool,
     /// An explicit branch also opts into worktree creation.
     #[serde(default)]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
     pub worktree_enabled: bool,
+    #[cfg_attr(test, ts(optional = nullable))]
     pub worktree_branch: Option<String>,
     #[serde(default)]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
     pub create_new_branch: bool,
     /// Used only for new branches; empty selects the repository default.
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub base_branch: Option<String>,
     #[serde(default)]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
     pub sandbox: bool,
     #[serde(default)]
+    #[cfg_attr(test, ts(as = "Option<String>", optional))]
     pub extra_args: String,
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub sandbox_image: Option<String>,
     #[serde(default)]
+    #[cfg_attr(test, ts(as = "Option<Vec<String>>", optional))]
     pub extra_env: Vec<String>,
     #[serde(default)]
+    #[cfg_attr(test, ts(as = "Option<Vec<String>>", optional))]
     pub extra_repo_paths: Vec<String>,
     /// Repository names or paths override the shared base_branch.
     #[serde(default)]
+    #[cfg_attr(test, ts(as = "Option<Vec<RepoBaseInput>>", optional))]
     pub repo_bases: Vec<RepoBaseInput>,
     #[serde(default)]
+    #[cfg_attr(test, ts(as = "Option<String>", optional))]
     pub command_override: String,
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub custom_instruction: Option<String>,
+    #[cfg_attr(test, ts(optional = nullable))]
     pub profile: Option<String>,
     /// Structured view requires an ACP-capable agent.
     #[serde(default)]
+    #[cfg_attr(test, ts(as = "Option<crate::session::View>", optional))]
     pub view: crate::session::View,
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub agent_name: Option<String>,
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub agent_model: Option<String>,
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub agent_effort: Option<String>,
     /// Provision a scratch directory instead of path; excludes worktrees and extra repos.
     #[serde(default)]
+    #[cfg_attr(test, ts(as = "Option<bool>", optional))]
     pub scratch: bool,
     /// Omit to refuse unapproved hooks, false to skip untrusted hooks/MCP, true to approve.
     /// Skipping preserves already-trusted repository hooks and MCP.
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub trust_hooks: Option<bool>,
     /// Require the reviewed configuration to remain unchanged before provisioning.
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub trust_review: Option<CreationTrustFingerprint>,
     /// Resume a Claude conversation through ACP; path must be its original cwd.
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub import_acp_session_id: Option<String>,
     /// Provider conversation ID to fork, mutually exclusive with other sources.
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub fork_from: Option<String>,
     /// Canonical AoE row to fork without supplying its provider conversation ID.
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub fork_session_id: Option<String>,
     /// Completion callback; private and loopback destinations are refused.
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub callback_url: Option<String>,
     /// Persisted replay key, retained until the created row is hard-deleted.
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub idempotency_key: Option<String>,
 }
 
@@ -197,8 +232,12 @@ pub struct CreateProjectBody {
 }
 
 #[derive(Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct TerminalSize {
+    #[cfg_attr(test, ts(type = "number"))]
     pub cols: std::num::NonZeroU16,
+    #[cfg_attr(test, ts(type = "number"))]
     pub rows: std::num::NonZeroU16,
 }
 
