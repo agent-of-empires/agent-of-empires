@@ -889,10 +889,10 @@ struct PiHelpProbe {
 impl PiHelpProbe {
     fn help(
         &mut self,
-        now: std::time::Instant,
+        clock: impl Fn() -> std::time::Instant,
         probe: impl FnOnce(std::time::Duration) -> Option<String>,
     ) -> &str {
-        if self.help.is_none() && self.retry_at.is_none_or(|at| now >= at) {
+        if self.help.is_none() && self.retry_at.is_none_or(|at| clock() >= at) {
             let timeout = if self.retry_at.is_some() {
                 PI_HELP_RETRY_TIMEOUT
             } else {
@@ -902,7 +902,8 @@ impl PiHelpProbe {
             if self.help.is_none() {
                 tracing::warn!(target: "session.create", timeout_secs = timeout.as_secs(),
                     "pi --help did not answer; launching without session-id capture until a retry succeeds");
-                self.retry_at = Some(now + PI_HELP_RETRY_COOLDOWN);
+                // Timed from the answer, so a probe that ran to its deadline still cools down.
+                self.retry_at = Some(clock() + PI_HELP_RETRY_COOLDOWN);
             }
         }
         self.help.as_deref().unwrap_or_default()
@@ -925,10 +926,12 @@ fn pi_help_advertises(flag: &str) -> bool {
         help: None,
         retry_at: None,
     });
+    // Held across the probe: launches racing it wait for the answer instead of starting
+    // without session-id capture.
     let mut probe = PROBE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    help_advertises_flag(probe.help(std::time::Instant::now(), run_pi_help), flag)
+    help_advertises_flag(probe.help(std::time::Instant::now, run_pi_help), flag)
 }
 
 pub(crate) fn pi_supports_extension_flag() -> bool {
@@ -1255,30 +1258,39 @@ mod tests {
     fn pi_help_probe_retries_an_inconclusive_answer_and_keeps_a_confirmed_one() {
         let help = "  --session-id <id>\n  --extension, -e <path>\n";
         let start = std::time::Instant::now();
+        let now = std::cell::Cell::new(start);
         let mut probe = PiHelpProbe::default();
         let mut timeouts = Vec::new();
 
-        let first = probe.help(start, |timeout| {
-            timeouts.push(timeout);
-            None
-        });
+        // The first probe runs to its deadline before failing.
+        let first = probe.help(
+            || now.get(),
+            |timeout| {
+                timeouts.push(timeout);
+                now.set(now.get() + timeout);
+                None
+            },
+        );
         assert_eq!(first, "", "a timed-out probe advertises nothing");
+        let failed_at = now.get();
+        now.set(failed_at + PI_HELP_RETRY_COOLDOWN - std::time::Duration::from_millis(1));
         assert_eq!(
-            probe.help(start, |_| unreachable!("cooling down")),
+            probe.help(|| now.get(), |_| unreachable!("cooling down")),
             "",
-            "no reprobe on every launch"
+            "the cooldown runs from the failed answer, not from when the probe began"
         );
 
-        let retry = start + PI_HELP_RETRY_COOLDOWN;
-        let retried = probe.help(retry, |timeout| {
-            timeouts.push(timeout);
-            Some(help.to_string())
-        });
-        assert_eq!(retried, help, "the process is not stuck on the failure");
-        assert_eq!(
-            probe.help(retry + PI_HELP_RETRY_COOLDOWN, |_| unreachable!("cached")),
-            help
+        now.set(failed_at + PI_HELP_RETRY_COOLDOWN);
+        let retried = probe.help(
+            || now.get(),
+            |timeout| {
+                timeouts.push(timeout);
+                Some(help.to_string())
+            },
         );
+        assert_eq!(retried, help, "the process is not stuck on the failure");
+        now.set(now.get() + PI_HELP_RETRY_COOLDOWN);
+        assert_eq!(probe.help(|| now.get(), |_| unreachable!("cached")), help);
         assert_eq!(timeouts, [PI_HELP_PROBE_TIMEOUT, PI_HELP_RETRY_TIMEOUT]);
     }
 
