@@ -241,7 +241,6 @@ pub(super) fn log_wrapper_substitution(session_id: &str, tool: &str, wrapper: &s
 mod tests {
     use super::super::test_support::*;
     use super::*;
-    use tracing_test::traced_test;
 
     fn spec(command: &str, args: &[&str]) -> AgentSpec {
         AgentSpec {
@@ -489,12 +488,11 @@ mod tests {
         }
     }
 
-    #[traced_test]
     #[tokio::test]
     #[serial_test::serial]
     async fn spawn_path_emits_the_wrapper_warning() {
         let (_home, tmp) = isolate_home();
-        tracing::callsite::rebuild_interest_cache();
+        let logs = crate::session::test_support::LogCapture::start();
         let sup = Supervisor::new(VecSink::new());
         std::fs::write(
             crate::session::get_app_dir().unwrap().join("config.toml"),
@@ -510,8 +508,9 @@ mod tests {
             sup.spawn(req).await.is_err(),
             "launch into a missing working directory must fail"
         );
+        let logs = logs.contents();
         assert!(
-            logs_contain("s-wire") && logs_contain("will not be executed"),
+            logs.contains("s-wire") && logs.contains("will not be executed"),
             "spawn path must emit the wrapper warning before the launch fails"
         );
     }

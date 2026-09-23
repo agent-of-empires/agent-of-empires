@@ -375,6 +375,54 @@ pub(crate) fn isolate_home(temp: &Path) -> HomeGuard {
     ])
 }
 
+/// Captures every event emitted on the current thread until dropped.
+///
+/// Scoped on purpose: a process-global capture subscriber serializes every
+/// thread's logging behind one lock, stalling unrelated tests.
+pub(crate) struct LogCapture {
+    buf: std::sync::Arc<Mutex<Vec<u8>>>,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+#[derive(Clone)]
+struct LogCaptureWriter(std::sync::Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl LogCapture {
+    pub(crate) fn start() -> Self {
+        use tracing_subscriber::layer::SubscriberExt;
+        let buf = std::sync::Arc::default();
+        let writer = LogCaptureWriter(std::sync::Arc::clone(&buf));
+        let subscriber = tracing_subscriber::Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false),
+        );
+        let guard = tracing::subscriber::set_default(subscriber);
+        // Callsites cached as disabled by another subscriber must be re-evaluated.
+        tracing::callsite::rebuild_interest_cache();
+        Self { buf, _guard: guard }
+    }
+
+    pub(crate) fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.buf.lock().unwrap_or_else(PoisonError::into_inner))
+            .into_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

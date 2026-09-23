@@ -199,17 +199,15 @@ fn redact(arg: &OsStr) -> String {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use tracing_test::traced_test;
 
     /// The same failing command is a WARN through `run_git_with_timeout` and a
     /// DEBUG through `run_git_quiet_with_timeout`; the quiet variant must not
     /// drop the record entirely, since the stderr summary is what makes a
     /// surprise diagnosable.
-    #[traced_test]
     #[test]
     fn run_git_quiet_demotes_expected_failure_to_debug() {
         let tmp = tempfile::tempdir().unwrap();
-        tracing::callsite::rebuild_interest_cache();
+        let logs = crate::session::test_support::LogCapture::start();
         // Not a repository, so `git worktree unlock` exits non-zero: the
         // shape `unlock_worktree` classifies as a harmless no-op.
         let args = ["worktree", "unlock", "/nonexistent"];
@@ -223,20 +221,17 @@ mod tests {
         assert!(!loud.status.success());
         assert!(!quiet.status.success());
 
-        logs_assert(|lines: &[&str]| {
-            let failures = |level: &str| {
-                lines
-                    .iter()
-                    .filter(|l| l.contains(level) && l.contains("git command failed"))
-                    .count()
-            };
-            match (failures("WARN"), failures("DEBUG")) {
-                (1, 1) => Ok(()),
-                (w, d) => Err(format!(
-                    "expected 1 warn and 1 debug failure line, got {w}/{d}"
-                )),
-            }
-        });
+        let logs = logs.contents();
+        let failures = |level: &str| {
+            logs.lines()
+                .filter(|l| l.contains(level) && l.contains("git command failed"))
+                .count()
+        };
+        assert_eq!(
+            (failures("WARN"), failures("DEBUG")),
+            (1, 1),
+            "expected 1 warn and 1 debug failure line: {logs}"
+        );
     }
 
     #[cfg(unix)]
