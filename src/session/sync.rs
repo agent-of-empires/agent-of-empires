@@ -267,7 +267,7 @@ fn drain_and_persist_session_ids_inner(
             Ok(_) => match &update.guard {
                 // Same CAS as an unguarded write; the guard only records that the observation named
                 // this pane, which the Pi rule below reads.
-                SessionIdGuard::Unguarded | SessionIdGuard::InstanceSidecar => {
+                SessionIdGuard::Unguarded | SessionIdGuard::InstanceSidecar { .. } => {
                     persist_session_to_storage(
                         &update.profile,
                         &update.id,
