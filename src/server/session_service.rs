@@ -203,8 +203,32 @@ pub(crate) enum SendTurnError {
     ResumeFailed(crate::acp::supervisor::SupervisorError),
     /// Pre-publish.
     WorkerNotReady,
+    /// Pre-publish: `no_revive` was set and delivering this turn would have
+    /// required resuming a worker that is not currently running.
+    RevivalRefused,
     /// Post-publish: the forward to the agent failed.
     Send(crate::acp::supervisor::SupervisorError),
+}
+
+/// Outcome of [`SessionService::touch_and_wake_on_prompt`].
+pub(crate) enum PromptTouch {
+    /// Touched (and woken, if archived/snoozed/idle-dormant); carries
+    /// whether this specifically was the idle-dormant wake, the flag
+    /// `prompt_dispatch_under_submission` and `send_turn` need.
+    Touched { idle_dormant: bool },
+    /// `no_revive` was set and the session needed archived/snoozed/
+    /// idle-dormant revival to accept this prompt; refused before any
+    /// mutation.
+    RevivalRefused,
+}
+
+impl PromptTouch {
+    /// The idle-dormant flag for a `Touched` outcome. Only meaningful when
+    /// the caller passed `no_revive: false`, which never produces
+    /// `RevivalRefused`.
+    pub(crate) fn idle_dormant(&self) -> bool {
+        matches!(self, PromptTouch::Touched { idle_dormant: true })
+    }
 }
 
 /// Everything [`SessionService::send_turn`] needs beyond the caller and
@@ -221,6 +245,13 @@ pub(crate) struct SendTurnRequest<'a> {
     /// continuation) rather than the user typing it just now, so the
     /// transcript model can skip rendering a duplicate row for it.
     pub synthesized: bool,
+    /// Refuse rather than resume a worker that is not currently running
+    /// (#4081 review: the `WorkerDown`-only check in `acp_prompt` misses a
+    /// rate-limit-exhausted park, where dispatch is `Sent` but no worker is
+    /// alive). Enforced here, at the same `is_running` check that decides
+    /// whether to resume, rather than by a separate liveness probe that
+    /// would race it.
+    pub no_revive: bool,
 }
 
 impl std::fmt::Display for SendTurnError {
@@ -231,6 +262,7 @@ impl std::fmt::Display for SendTurnError {
             Self::ModeApplication(e) => write!(f, "mode application failed: {e}"),
             Self::ResumeFailed(e) => write!(f, "worker resume failed: {e}"),
             Self::WorkerNotReady => write!(f, "worker not ready"),
+            Self::RevivalRefused => write!(f, "no_revive: reviving a stopped worker is required"),
             Self::Send(e) => write!(f, "prompt forward failed: {e}"),
         }
     }
@@ -399,17 +431,26 @@ impl SessionService {
         }
     }
 
-    /// Record that a prompt is arriving.
-    pub(crate) async fn touch_and_wake_on_prompt(&self, id: &str) -> bool {
+    /// Record that a prompt is arriving. `no_revive` refuses atomically,
+    /// under the same per-session lock, rather than waking an
+    /// archived/snoozed/idle-dormant session (#4081 review: a client-side
+    /// liveness check before this call would race a concurrent archive,
+    /// snooze, or wake).
+    pub(crate) async fn touch_and_wake_on_prompt(&self, id: &str, no_revive: bool) -> PromptTouch {
         let inst_lock = self.instance_lock(id).await;
         let _guard = inst_lock.lock().await;
         let (profile, wake, woke_idle_dormant) = {
             let mut instances = self.instances.write().await;
             let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-                return false;
+                return PromptTouch::Touched {
+                    idle_dormant: false,
+                };
             };
             let was_idle_dormant = inst.is_idle_dormant();
             let wake = inst.is_archived() || inst.is_snoozed() || was_idle_dormant;
+            if no_revive && wake {
+                return PromptTouch::RevivalRefused;
+            }
             inst.touch_last_accessed();
             self.invalidate_disk_snapshots();
             if was_idle_dormant {
@@ -446,7 +487,9 @@ impl SessionService {
                 ),
             }
         }
-        woke_idle_dormant
+        PromptTouch::Touched {
+            idle_dormant: woke_idle_dormant,
+        }
     }
 
     /// Deliver a turn to a structured session.
@@ -462,6 +505,7 @@ impl SessionService {
             woke_idle_dormant,
             prompt_id,
             synthesized,
+            no_revive,
         } = turn;
         use crate::server::acp_reconciler::ResumeTrigger;
         // Ownership gate, before ANY side effect (no wake, resume, publish, or forward for
@@ -480,6 +524,9 @@ impl SessionService {
         };
         // Resume a worker that is not currently live.
         let needs_resume = woke_idle_dormant || !self.acp_supervisor.is_running(id).await;
+        if no_revive && needs_resume {
+            return Err(SendTurnError::RevivalRefused);
+        }
         if needs_resume {
             match crate::server::acp_reconciler::trigger_resume_background(self, id).await {
                 Ok(ResumeTrigger::NotFound) => return Err(SendTurnError::SessionNotFound),
@@ -618,6 +665,7 @@ impl SessionService {
                     woke_idle_dormant: false,
                     prompt_id: None,
                     synthesized,
+                    no_revive: false,
                 },
             )
             .await
@@ -1091,6 +1139,7 @@ impl SessionService {
                     woke_idle_dormant: false,
                     prompt_id: None,
                     synthesized: false,
+                    no_revive: false,
                 },
             )
             .await
@@ -1675,6 +1724,7 @@ mod tests {
                         woke_idle_dormant: false,
                         prompt_id: None,
                         synthesized: false,
+                        no_revive: false,
                     },
                 )
                 .await,
@@ -1691,6 +1741,7 @@ mod tests {
                         woke_idle_dormant: false,
                         prompt_id: None,
                         synthesized: false,
+                        no_revive: false,
                     },
                 )
                 .await,
@@ -1707,6 +1758,7 @@ mod tests {
                         woke_idle_dormant: false,
                         prompt_id: None,
                         synthesized: false,
+                        no_revive: false,
                     },
                 )
                 .await,
@@ -1727,6 +1779,7 @@ mod tests {
                         woke_idle_dormant: false,
                         prompt_id: None,
                         synthesized: false,
+                        no_revive: false,
                     },
                 )
                 .await,
@@ -1743,6 +1796,7 @@ mod tests {
                         woke_idle_dormant: false,
                         prompt_id: None,
                         synthesized: false,
+                        no_revive: false,
                     },
                 )
                 .await,
@@ -2330,7 +2384,7 @@ mod tests {
                 true,
                 |s| {
                     Box::pin(async move {
-                        s.touch_and_wake_on_prompt("s").await;
+                        s.touch_and_wake_on_prompt("s", false).await;
                     })
                 },
                 |i| !i.is_idle_dormant(),

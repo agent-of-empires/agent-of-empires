@@ -10,7 +10,7 @@ use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::{
     ApprovalDecisionWire, DiffCommentsPromptRequest, PromptRequest, ResolveApprovalRequest,
 };
-use crate::server::session_service::{SendTurnError, SendTurnRequest, SessionCaller};
+use crate::server::session_service::{PromptTouch, SendTurnError, SendTurnRequest, SessionCaller};
 
 use super::*;
 
@@ -42,6 +42,19 @@ fn worker_not_ready() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
 }
 
+/// `no_revive` refused: reviving (archived/snoozed/idle-dormant wake, or a
+/// stopped worker) was required to accept this prompt and the caller asked
+/// not to. Distinct from `worker_not_ready`, which is transient and worth
+/// retrying; this is a standing precondition until something else revives
+/// the session.
+fn no_revive_refused() -> Response {
+    (
+        StatusCode::CONFLICT,
+        "no_revive: reviving the session is required to accept this prompt",
+    )
+        .into_response()
+}
+
 pub async fn acp_prompt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -61,7 +74,14 @@ pub async fn acp_prompt(
     else {
         return session_not_found();
     };
-    let woke_idle_dormant = state.session_service.touch_and_wake_on_prompt(&id).await;
+    let woke_idle_dormant = match state
+        .session_service
+        .touch_and_wake_on_prompt(&id, req.no_revive)
+        .await
+    {
+        PromptTouch::Touched { idle_dormant } => idle_dormant,
+        PromptTouch::RevivalRefused => return no_revive_refused(),
+    };
     // Validated before publishing or resuming, so a rejected prompt leaves no
     // trace in the transcript and spawns no worker.
     let attachments = match validate_attachments(&state, &id, &req.attachments) {
@@ -74,9 +94,23 @@ pub async fn acp_prompt(
         .session_service
         .prompt_dispatch_under_submission(&id, woke_idle_dormant)
         .await;
-    // A fresh prompt supersedes a queued rate-limit continuation (#3028).
-    state.session_service.clear_pending_initial_turn(&id).await;
+    // Refused before touching the pending-turn/queue state below, so a
+    // rejected prompt leaves both untouched (#4081 review).
+    if req.no_revive
+        && matches!(
+            dispatch,
+            PromptDispatch::Queued {
+                reason: QueueReason::WorkerDown
+            }
+        )
+    {
+        return no_revive_refused();
+    }
     if let PromptDispatch::Queued { reason } = dispatch {
+        // A fresh prompt supersedes a queued rate-limit continuation (#3028).
+        // Only once queueing is certain: a `no_revive` refusal above must
+        // leave it in place (#4081 review).
+        state.session_service.clear_pending_initial_turn(&id).await;
         let prompt_id = req
             .prompt_id
             .clone()
@@ -122,9 +156,16 @@ pub async fn acp_prompt(
                 woke_idle_dormant,
                 prompt_id: req.prompt_id.clone(),
                 synthesized: false,
+                no_revive: req.no_revive,
             },
         )
         .await;
+    // A fresh prompt supersedes a queued rate-limit continuation (#3028),
+    // but only once delivery is certain: a `no_revive` refusal must leave
+    // the pending turn in place (#4081 review).
+    if !matches!(outcome, Err(SendTurnError::RevivalRefused)) {
+        state.session_service.clear_pending_initial_turn(&id).await;
+    }
     match outcome {
         Ok(()) => (
             StatusCode::ACCEPTED,
@@ -137,6 +178,7 @@ pub async fn acp_prompt(
         Err(SendTurnError::SessionNotFound) => session_not_found(),
         Err(SendTurnError::ResumeFailed(e)) => resume_failed_response(&e),
         Err(SendTurnError::WorkerNotReady) => worker_not_ready(),
+        Err(SendTurnError::RevivalRefused) => no_revive_refused(),
         // Unreachable for a User caller.
         Err(SendTurnError::NotOwner) => {
             (StatusCode::FORBIDDEN, "session not owned by caller").into_response()
@@ -188,7 +230,11 @@ pub async fn acp_prompt_diff_comments(
     else {
         return session_not_found();
     };
-    let woke_idle_dormant = state.session_service.touch_and_wake_on_prompt(&id).await;
+    let woke_idle_dormant = state
+        .session_service
+        .touch_and_wake_on_prompt(&id, false)
+        .await
+        .idle_dormant();
     let dispatch = state
         .session_service
         .prompt_dispatch_under_submission(&id, woke_idle_dormant)
