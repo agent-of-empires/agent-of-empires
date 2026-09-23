@@ -296,7 +296,7 @@ impl Instance {
         }
     }
 
-    /// A directly verified host Pi launch with an unmodified PATH may pin `--session-id`.
+    /// A host Pi launch that can carry selectors may pin `--session-id`.
     pub(super) fn pi_session_id_pinnable(&self) -> bool {
         self.is_pi()
             && !self.is_sandboxed()

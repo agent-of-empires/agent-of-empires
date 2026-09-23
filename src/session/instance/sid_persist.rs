@@ -517,6 +517,32 @@ mod tests {
 
     #[test]
     #[serial]
+    fn captured_foreign_sid_cannot_replace_a_pinned_conversation() {
+        const OTHER_SID: &str = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
+        let profile = "capture-pinned-foreign";
+        let mut inst = make_inst(profile, "pinned");
+        inst.agent_session_id = Some(VALID_SID.into());
+        inst.resume_intent = ResumeIntent::Use(VALID_SID.into());
+        let (_temp, _home, storage) = seeded(profile, &[&inst]);
+        let expected = inst.conversation_state();
+
+        assert_eq!(
+            persist_session_with_storage(&storage, &inst.id, &observation(OTHER_SID), &expected),
+            SidWrite::PinnedForeign
+        );
+        let disk = storage.load().unwrap();
+        assert_eq!(disk[0].agent_session_id.as_deref(), Some(VALID_SID));
+        assert_eq!(disk[0].resume_intent, ResumeIntent::Use(VALID_SID.into()));
+
+        assert_eq!(
+            persist_session_with_storage(&storage, &inst.id, &observation(VALID_SID), &expected),
+            SidWrite::Applied,
+            "the pin must still accept its own conversation"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn foreign_and_parked_owners_guard_published_sid_by_namespace() {
         use crate::session::instance::{ActiveExecution, PriorToolSession};
         use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
@@ -812,6 +838,37 @@ mod tests {
 
     #[test]
     #[serial]
+    fn finalize_cas_loss_preserves_peer_repin_instead_of_promoting_it() {
+        const PEER_SID: &str = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
+        let profile = "finalize-peer-repin";
+        let mut inst = make_inst(profile, "pinned Claude");
+        inst.tool = "claude".into();
+        inst.agent_session_id = Some(VALID_SID.into());
+        inst.resume_intent = ResumeIntent::Use(VALID_SID.into());
+        let (_temp, _home, storage) = seeded(profile, &[&inst]);
+        let expected = inst.conversation_state();
+
+        // A peer changes only the intent while this launch is in flight. A
+        // SID-only CAS would consume the peer's new pin as if this launch won.
+        storage
+            .update(|instances, _| {
+                instances[0].resume_intent = ResumeIntent::Use(PEER_SID.into());
+                Ok(())
+            })
+            .unwrap();
+        inst.identity_publisher_launched = true;
+        assert_eq!(
+            inst.persist_session_id_with_storage(&storage, &expected),
+            SidPersistOutcome::Published
+        );
+        let disk = storage.load().unwrap();
+        assert_eq!(disk[0].resume_intent, ResumeIntent::Use(PEER_SID.into()));
+        assert_eq!(inst.resume_intent, disk[0].resume_intent);
+        assert_eq!(inst.agent_session_id, disk[0].agent_session_id);
+    }
+
+    #[test]
+    #[serial]
     fn capture_backed_use_promotes_so_a_later_conversation_can_be_adopted() {
         let profile = "use-capture-promote";
         let mut inst = make_inst(profile, "Pinned Claude");
@@ -835,6 +892,13 @@ mod tests {
             storage.load().unwrap()[0].resume_intent,
             ResumeIntent::Default
         );
+        let next_sid = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
+        let expected = storage.load().unwrap()[0].conversation_state();
+        assert_eq!(
+            persist_session_with_storage(&storage, &inst.id, &observation(next_sid), &expected),
+            SidWrite::Applied
+        );
+        assert_eq!(disk_sid(profile, &inst.id).as_deref(), Some(next_sid));
     }
 
     mod publish_captured_sid {

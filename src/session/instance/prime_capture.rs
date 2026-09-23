@@ -695,6 +695,80 @@ mod tests {
     }
     #[test]
     #[serial_test::serial]
+    fn prime_unmaterialized_root_never_resumes_previous_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = tool_instance("prime-agent", project.to_str().unwrap());
+        inst.sandbox_info = Some(test_sandbox("prime-empty", Some("/workspace/project")));
+        let plan = inst
+            .prime_agent_capture_plan(inst.prime_agent_capture_options().unwrap())
+            .unwrap();
+        let sessions = plan.store.join(&plan.session_dir);
+        std::fs::create_dir_all(&sessions).unwrap();
+        let old = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
+        let new = "018f47a6-7b80-7cc3-98a2-37b5f486b2a2";
+        let header = |id: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "session", "id": id, "cwd": "/workspace/project", "rlmDepth": 0
+                })
+            )
+        };
+        std::fs::write(sessions.join("old.jsonl"), header(old)).unwrap();
+        let record = plan
+            .store
+            .join("aoe-session")
+            .join(&inst.id)
+            .join("root_session");
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        std::fs::write(
+            &record,
+            serde_json::json!({
+                "id": new,
+                "path": plan.container_session_dir.join("new.jsonl"),
+                "cwd": "/workspace/project",
+                "rlmDepth": 0
+            })
+            .to_string(),
+        )
+        .unwrap();
+        inst.agent_session_id = Some(old.to_string());
+
+        assert_eq!(
+            inst.prime_root_publication(),
+            Some(PrimeRootPublication::Pending(new.to_string()))
+        );
+        let persisted = serde_json::to_string(&inst).unwrap();
+        let mut command = "prime-agent".to_string();
+        let agent = inst.resolved_agent();
+        assert!(!inst
+            .apply_session_flags(&mut command, "test", agent, None)
+            .unwrap());
+        assert_eq!(command, "prime-agent");
+        assert_eq!(inst.agent_session_id, None);
+
+        let mut restarted: Instance = serde_json::from_str(&persisted).unwrap();
+        let mut command = "prime-agent".to_string();
+        assert!(!restarted
+            .apply_session_flags(&mut command, "test", agent, None)
+            .unwrap());
+        assert_eq!(command, "prime-agent");
+
+        // Materialization makes the new root resumable, never the unrelated old transcript.
+        std::fs::write(sessions.join("new.jsonl"), header(new)).unwrap();
+        let mut restarted: Instance = serde_json::from_str(&persisted).unwrap();
+        let mut command = "prime-agent".to_string();
+        assert!(restarted
+            .apply_session_flags(&mut command, "test", agent, None)
+            .unwrap());
+        assert_eq!(command, format!("prime-agent --resume {new}"));
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn prime_root_publisher_rejects_child_and_resumes_parent() {
         if which::which("node").is_err() {
             eprintln!("skipping: node not found");

@@ -799,8 +799,7 @@ impl Instance {
             &fallback_profile
         };
         let mut env_prefix = status_hook_env_prefix(profile, &self.id, self.status_agent());
-        // A verified direct Pi command publishes through the same extension
-        // whether it came from the built-in command or an exact alias.
+        // The publisher is pane-scoped, including for safe Default wrappers.
         self.pi_extension_launched = false;
         if let Some((_, ref env)) = identity_extension {
             env_prefix.push_str(env);

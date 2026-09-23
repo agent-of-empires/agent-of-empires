@@ -156,7 +156,7 @@ impl Instance {
         tmux::status_rules::effective_detect_as(&self.source_profile, &self.tool, &self.detect_as)
     }
 
-    /// Native execution identity; status aliases never authorize conversation access.
+    /// Native execution identity; explicit targets never trust status aliases.
     pub(crate) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
         self.execution_agent().ok()
     }
@@ -268,7 +268,7 @@ impl Instance {
     /// Whether this launch shape leaves Claude user hooks enabled.
     pub(crate) fn hook_session_publisher_allowed_by_argv(&self) -> bool {
         if !self
-            .resolved_agent()
+            .default_selector_agent()
             .is_some_and(|agent| agent.name == "claude")
         {
             return true;
@@ -321,7 +321,8 @@ impl Instance {
         &'static crate::agents::SessionCaptureSpec,
         crate::agents::SessionCaptureContext,
     )> {
-        let agent = self.resolved_agent()?;
+        let native = self.resolved_agent();
+        let agent = native.or_else(|| self.legacy_default_selector_agent())?;
         let support = agent.session_support.as_ref()?;
         let capture = support.capture.as_ref()?;
         let context = if self.is_sandboxed() {
@@ -332,8 +333,7 @@ impl Instance {
         if context == crate::agents::SessionCaptureContext::Unsupported {
             return None;
         }
-        // These backends publish under this pane's own `AOE_INSTANCE_ID`, so the write proves its
-        // own attribution and a renamed wrapper cannot claim another pane's conversation.
+        // Pane-scoped publishers let Default wrappers capture only their own conversation.
         let self_attributing = matches!(
             capture.backend,
             crate::agents::SessionCaptureBackend::Claude
@@ -341,9 +341,9 @@ impl Instance {
                 | crate::agents::SessionCaptureBackend::Pi
         );
         let authorized = if self_attributing {
-            self.launch_can_carry_resume_selector(agent)
+            native.is_none() || self.launch_can_carry_resume_selector(agent)
         } else {
-            self.launch_invokes_resolved_agent_directly(agent)
+            native.is_some() && self.launch_invokes_resolved_agent_directly(agent)
         };
         authorized.then_some((capture, context))
     }

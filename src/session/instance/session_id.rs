@@ -874,7 +874,10 @@ mod tests {
         )
         .unwrap();
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
-        let _home = EnvGuard::set(&[("HOME", root.path().to_str().unwrap())]);
+        let _home = EnvGuard::set(&[
+            ("HOME", root.path().to_path_buf()),
+            ("CLAUDE_CONFIG_DIR", root.path().join(".claude")),
+        ]);
         let mut inst = tool_instance("work-claude", root.path().to_str().unwrap());
         inst.source_profile = PROFILE.into();
         inst.command = "work-claude".into();
@@ -953,6 +956,110 @@ mod tests {
             .command
             .unwrap()
             .contains(&format!("work-claude --resume {launched_sid}")));
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn default_detect_as_wrappers_capture_published_conversations() {
+        const PROFILE: &str = "default-wrapper-capture";
+        const SID: &str = "11111111-2222-4333-8444-555555555555";
+        let root = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&root.path().join("app"));
+        let profile_path =
+            crate::session::config::profile_config::get_profile_config_path(PROFILE).unwrap();
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            profile_path,
+            r#"[session.agent_detect_as]
+work-claude = "claude"
+work-cursor = "cursor"
+work-pi = "pi"
+work-opencode = "opencode"
+"#,
+        )
+        .unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
+        let _home = EnvGuard::set(&[
+            ("HOME", root.path().to_path_buf()),
+            ("CLAUDE_CONFIG_DIR", root.path().join(".claude")),
+        ]);
+        let (_hooks, _base, _hook_temp) = crate::hooks::test_support::BaseGuard::ready();
+        let project = std::fs::canonicalize(root.path()).unwrap();
+        let claude_project = root.path().join(".claude/projects").join(
+            crate::session::capture::encode_claude_project_path(&project.to_string_lossy()),
+        );
+        std::fs::create_dir_all(&claude_project).unwrap();
+        std::fs::write(claude_project.join(format!("{SID}.jsonl")), "{}\n").unwrap();
+        let pi_path = root
+            .path()
+            .join("pi")
+            .join(format!("2026-01-01T00-00-00-000Z_{SID}.jsonl"));
+        std::fs::create_dir_all(pi_path.parent().unwrap()).unwrap();
+
+        for tool in ["work-claude", "work-cursor", "work-pi"] {
+            let mut inst = tool_instance(tool, root.path().to_str().unwrap());
+            inst.source_profile = PROFILE.into();
+            inst.command = tool.into();
+            inst.agent_session_id = Some("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa".into());
+            assert!(inst.execution_agent().is_err(), "{tool}");
+            let sidecar = write_sidecar(&inst.id, SID);
+            if tool == "work-pi" {
+                std::fs::write(sidecar.join("session_path"), pi_path.to_str().unwrap()).unwrap();
+            }
+            assert!(inst.supports_session_poller(), "{tool} lost its publisher");
+            assert_eq!(
+                inst.acquire_session_id(None),
+                (Some(SID.into()), true),
+                "{tool}"
+            );
+            assert_eq!(inst.agent_session_id.as_deref(), Some(SID), "{tool}");
+            if tool == "work-claude" {
+                let mut command = tool.to_string();
+                assert!(inst
+                    .apply_session_flags(&mut command, "test", None, None)
+                    .unwrap());
+                assert_eq!(command, format!("{tool} --resume {SID}"));
+            }
+            if tool == "work-pi" && crate::agents::pi_supports_session_id_flag() {
+                let mut fresh = tool_instance(tool, root.path().to_str().unwrap());
+                fresh.source_profile = PROFILE.into();
+                fresh.command = tool.into();
+                let mut command = tool.to_string();
+                assert!(!fresh
+                    .apply_session_flags(&mut command, "test", None, None)
+                    .unwrap());
+                assert!(
+                    command.starts_with(&format!("{tool} --session-id ")),
+                    "{command}"
+                );
+            }
+        }
+
+        let mut explicit = tool_instance("work-claude", root.path().to_str().unwrap());
+        explicit.source_profile = PROFILE.into();
+        explicit.command = "work-claude".into();
+        for intent in [
+            ResumeIntent::Use(SID.into()),
+            ResumeIntent::Fork { from: SID.into() },
+        ] {
+            explicit.resume_intent = intent;
+            assert!(
+                !explicit.supports_session_poller(),
+                "Use/Fork cannot trust a status alias"
+            );
+        }
+        explicit.resume_intent = ResumeIntent::Default;
+        explicit.extra_args = "--setting-sources project".into();
+        assert!(!explicit.hook_session_publisher_allowed_by_argv());
+
+        let mut shared = tool_instance("work-opencode", root.path().to_str().unwrap());
+        shared.source_profile = PROFILE.into();
+        shared.command = "work-opencode".into();
+        assert!(shared.execution_agent().is_err());
+        assert!(
+            shared.resolved_session_support().is_none(),
+            "an unscoped store cannot be claimed through detect_as"
+        );
     }
     #[test]
     fn cleared_intent_launches_fresh() {
