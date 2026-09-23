@@ -99,8 +99,9 @@ test.describe("Session trash flow", () => {
 // split across user groups; trash, restore and delete act on the whole workspace.
 test.describe("Multi-session workspace trash", () => {
   // The group axis slices the workspace by group_path; the repo axis cannot reproduce #2533.
-  const workspace = (...parts: Array<{ id: string; groupPath: string; trashed: boolean; deleteToTrash?: boolean }>) =>
-    parts.map((p) => ({ ...p, projectPath: "/tmp/repo", mainRepoPath: "/tmp/repo", branch: "feat/x" }));
+  const workspace = (
+    ...parts: Array<{ id: string; groupPath: string; trashed: boolean; deleteToTrash?: boolean; status?: string }>
+  ) => parts.map((p) => ({ ...p, projectPath: "/tmp/repo", mainRepoPath: "/tmp/repo", branch: "feat/x" }));
   const install = (page: Page, sessions: ReturnType<typeof workspace>, failDeleteIds?: string[]) =>
     installTrashMocks(page, sessions, { groupAxis: true, ownerLast: true, failDeleteIds });
 
@@ -143,6 +144,49 @@ test.describe("Multi-session workspace trash", () => {
     const dialog = await openDeleteDialogFromRow(page, sessionRows(page).first());
     await expect(dialog).toContainText("Move this workspace to Trash?", { timeout: 5_000 });
     await expect(dialog.locator('[data-testid="delete-session-permanent"]')).toBeVisible();
+  });
+
+  test("stop, start, and delete on a group slice act only on that row's sessions (#4019)", async ({ page }) => {
+    const handle = await install(
+      page,
+      workspace(
+        { id: "sess-a", groupPath: "alpha", trashed: false, status: "Stopped" },
+        { id: "sess-b", groupPath: "beta", trashed: false },
+        { id: "sess-c", groupPath: "gamma", trashed: false, status: "Stopped" },
+        { id: "sess-d", groupPath: "gamma", trashed: false, status: "Stopped" },
+      ),
+    );
+    const lifecycle: string[] = [];
+    await page.route(/\/api\/sessions\/[^/]+\/(stop|start)$/, (r) => {
+      const [, id, verb] = new URL(r.request().url()).pathname.match(/sessions\/([^/]+)\/(\w+)$/)!;
+      lifecycle.push(`${verb} ${id}`);
+      return r.fulfill({ json: { id } });
+    });
+    await page.goto("/");
+    // A two-session row is labelled by its branch, so gamma is the row naming neither single session.
+    const beta = sessionRows(page).filter({ hasText: "sess-b" });
+    const gamma = sessionRows(page).filter({ hasNotText: /sess-[ab]/ });
+    const menu = async (row: Locator, item: string) => {
+      await expect(row).toBeVisible({ timeout: 10_000 });
+      await row.click({ button: "right" });
+      await page.locator(`[data-testid="sidebar-context-menu-${item}"]`).click();
+    };
+
+    await menu(beta, "stop");
+    await page
+      .locator('[data-testid="stop-session-dialog"]')
+      .getByRole("button", { name: /^Stop$/ })
+      .click();
+    await menu(gamma, "start");
+    await expect.poll(() => lifecycle, { timeout: 10_000 }).toEqual(["stop sess-b", "start sess-c"]);
+
+    const dialog = await openDeleteDialogFromRow(page, gamma);
+    await expect(affected(dialog).list).not.toContainText("sess-a");
+    await page.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+
+    await confirmDelete(await openDeleteDialogFromRow(page, gamma));
+    await expect.poll(() => [...handle.trashedIds].sort(), { timeout: 10_000 }).toEqual(["sess-c", "sess-d"]);
   });
 
   test("a workspace trashed in only one group slice does not appear in Trash (#2533)", async ({ page }) => {

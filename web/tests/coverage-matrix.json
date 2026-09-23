@@ -1363,9 +1363,9 @@
     },
     {
       "id": "sidebar.group-slice-row-actions",
-      "kind": "vitest",
+      "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx"],
+      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx", "tests/session-trash.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SessionRow.tsx"]
     },
     {
