@@ -13,6 +13,8 @@ interface BlockProps {
   block: Obj;
   pluginId: string;
   sessionId?: string;
+  /** Set by `BlockColumns`: a narrow column breaks long row text instead of ellipsizing it. */
+  wrap?: boolean;
 }
 
 // Forwarded verbatim with the action; the host injects the authoritative session_id.
@@ -73,7 +75,7 @@ function usePaneActionRunner(pluginId: string, sessionId?: string) {
 }
 
 /** A compact tone-tinted glyph or token for a row's second line, without a pill. */
-function RowSignal({ badge }: { badge: Obj }) {
+function RowSignal({ badge, wrap }: { badge: Obj; wrap?: boolean }) {
   const text = str(badge, "text");
   const icon = lucideIcon(str(badge, "icon"));
   const accent = accentStyle(badge.color);
@@ -81,7 +83,7 @@ function RowSignal({ badge }: { badge: Obj }) {
   if (!text && !icon) return null;
   return (
     <span
-      className={`inline-flex items-center gap-0.5 font-mono text-[10px] ${accent ? "" : toneTextClass(validTone(badge.tone))}`}
+      className={`inline-flex items-center gap-0.5 font-mono text-[10px] ${wrap ? "min-w-0 wrap-anywhere" : ""} ${accent ? "" : toneTextClass(validTone(badge.tone))}`}
       style={accent}
       title={tooltip || text || undefined}
       aria-label={text ? undefined : tooltip || undefined}
@@ -94,7 +96,7 @@ function RowSignal({ badge }: { badge: Obj }) {
 
 /** Up to two lines. A `method` makes the body a button, with any `href` as a
  *  separate trailing link; with `href` alone the whole row is the link. */
-function BlockRow({ block, pluginId, sessionId }: BlockProps) {
+function BlockRow({ block, pluginId, sessionId, wrap }: BlockProps) {
   const label = str(block, "label");
   const value = str(block, "value");
   const prefix = str(block, "prefix");
@@ -114,9 +116,14 @@ function BlockRow({ block, pluginId, sessionId }: BlockProps) {
   if (!label && !value && !prefix && !icon && !avatar) return null;
   const ariaLabel = [prefix, label, value, sublabel].filter(Boolean).join(" · ") || undefined;
   const toneText = accent ? "" : toneTextClass(tone);
+  // wrap-anywhere (not break-words): break-word doesn't shrink a flex item's
+  // automatic min size, so an unbroken token (a session id, a branch name)
+  // would still blow out the column.
+  const textClamp = wrap ? "wrap-anywhere" : "truncate";
+  const align = wrap ? "items-start" : "items-center";
   const inner = (
     <span className="flex min-w-0 flex-col gap-0.5">
-      <span className="flex min-w-0 items-center gap-2">
+      <span className={`flex min-w-0 ${align} gap-2`}>
         {avatar ? (
           <span
             className="flex size-5 shrink-0 items-center justify-center rounded-full bg-surface-700 font-mono text-[9px] text-text-secondary"
@@ -128,18 +135,18 @@ function BlockRow({ block, pluginId, sessionId }: BlockProps) {
           renderIcon(icon, `size-4 shrink-0 ${toneText}`, accent)
         )}
         {prefix && (
-          <span className={`shrink-0 font-mono ${toneText}`} style={accent}>
+          <span className={`${wrap ? "min-w-0 wrap-anywhere" : "shrink-0"} font-mono ${toneText}`} style={accent}>
             {prefix}
           </span>
         )}
         {label && (
-          <span className={`min-w-0 truncate ${mono} ${selected ? "text-text-bright" : "text-text-primary"}`}>
+          <span className={`min-w-0 ${textClamp} ${mono} ${selected ? "text-text-bright" : "text-text-primary"}`}>
             {label}
           </span>
         )}
         {value && (
           <span
-            className={`ml-auto shrink-0 font-mono text-[11px] ${accent && !valueTone ? "" : toneTextClass(valueTone ?? tone)}`}
+            className={`ml-auto ${wrap ? "min-w-0 wrap-anywhere" : "shrink-0"} font-mono text-[11px] ${accent && !valueTone ? "" : toneTextClass(valueTone ?? tone)}`}
             style={valueTone ? undefined : accent}
           >
             {value}
@@ -147,12 +154,12 @@ function BlockRow({ block, pluginId, sessionId }: BlockProps) {
         )}
       </span>
       {(sublabel || badges.length > 0) && (
-        <span className="flex min-w-0 items-center gap-2">
-          {sublabel && <span className={`min-w-0 truncate font-mono text-[10px] text-text-dim`}>{sublabel}</span>}
+        <span className={`flex min-w-0 ${align} gap-2`}>
+          {sublabel && <span className={`min-w-0 ${textClamp} font-mono text-[10px] text-text-dim`}>{sublabel}</span>}
           {badges.length > 0 && (
-            <span className="ml-auto flex shrink-0 items-center gap-1.5">
+            <span className={`ml-auto flex items-center gap-1.5 ${wrap ? "min-w-0 shrink flex-wrap" : "shrink-0"}`}>
               {badges.map((b, i) => (
-                <RowSignal key={i} badge={b} />
+                <RowSignal key={i} badge={b} wrap={wrap} />
               ))}
             </span>
           )}
@@ -452,26 +459,29 @@ function BlockComment({ block }: { block: Obj }) {
   );
 }
 
-function BlockColumns({ block, pluginId, sessionId }: BlockProps) {
+function BlockColumns({ block, pluginId, sessionId, wrap }: BlockProps) {
   const kids = children(block);
   if (kids.length === 0) return null;
+  // A lone child spans full width here, but it may still sit inside an
+  // outer column narrow enough to need the inherited wrap.
+  const childWrap = wrap || kids.length > 1;
   return (
     <div
-      className={`grid gap-1.5 ${kids.length > 1 ? "grid-cols-1 sm:grid-cols-2" : "grid-cols-1"}`}
+      className={`grid gap-1.5 ${kids.length > 1 ? "grid-cols-2" : "grid-cols-1"}`}
       data-testid="plugin-pane-columns"
     >
       {kids.map((c, i) => (
-        <DetailBlock key={i} block={c} pluginId={pluginId} sessionId={sessionId} />
+        <DetailBlock key={i} block={c} pluginId={pluginId} sessionId={sessionId} wrap={childWrap} />
       ))}
     </div>
   );
 }
 
 /** A titled group; `boxed` draws a card, `scroll` caps height, `collapsible` folds it. */
-function BlockSection({ block, pluginId, sessionId }: BlockProps) {
+function BlockSection({ block, pluginId, sessionId, wrap }: BlockProps) {
   const title = str(block, "title");
   const body = children(block).map((c, i) => (
-    <DetailBlock key={i} block={c} pluginId={pluginId} sessionId={sessionId} />
+    <DetailBlock key={i} block={c} pluginId={pluginId} sessionId={sessionId} wrap={wrap} />
   ));
   const tone = validTone(block.tone);
   const icon = lucideIcon(str(block, "icon"));
@@ -479,9 +489,11 @@ function BlockSection({ block, pluginId, sessionId }: BlockProps) {
   const badges = objectList(block, "badges") ?? [];
   const titleClass = `text-[11px] font-semibold uppercase tracking-wide ${icon || tone ? toneTextClass(tone) : "text-text-dim"}`;
   const summary = (value || badges.length > 0) && (
-    <span className="ml-auto flex shrink-0 items-center gap-1.5">
+    <span className={`ml-auto flex items-center gap-1.5 ${wrap ? "min-w-0 shrink flex-wrap" : "shrink-0"}`}>
       {value && (
-        <span className={`font-mono text-[10px] normal-case ${toneTextClass(validTone(block.value_tone))}`}>
+        <span
+          className={`font-mono text-[10px] normal-case ${toneTextClass(validTone(block.value_tone))} ${wrap ? "wrap-anywhere" : ""}`}
+        >
           {value}
         </span>
       )}
