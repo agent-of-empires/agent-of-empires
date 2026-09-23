@@ -1127,6 +1127,18 @@ fn runner_load_uses_requested_id_and_caches_response() {
         assert!(ready["result"].get("sessionId").is_none());
 
         write_frame(&mut ctl, &serde_json::json!({"kind": "cancel"}));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let methods = std::fs::read_to_string(&agent_log).unwrap_or_default();
+            if methods.contains("session/cancel sessionId=existing-session") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancel must address the loaded session: {methods:?}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     // Reattach and repeat the handshake inputs. Both responses must come from
@@ -1153,16 +1165,7 @@ fn runner_load_uses_requested_id_and_caches_response() {
         assert!(ready["result"].get("sessionId").is_none());
     }
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let methods = loop {
-        let methods = std::fs::read_to_string(&agent_log).unwrap_or_default();
-        if methods.contains("session/cancel sessionId=existing-session")
-            || Instant::now() >= deadline
-        {
-            break methods;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    };
+    let methods = std::fs::read_to_string(&agent_log).unwrap();
     assert_eq!(
         methods
             .lines()
@@ -1176,12 +1179,6 @@ fn runner_load_uses_requested_id_and_caches_response() {
             .filter(|line| line.contains("handleRequest method=session/new"))
             .count(),
         0
-    );
-    assert!(
-        methods
-            .lines()
-            .any(|line| line.contains("session/cancel sessionId=existing-session")),
-        "cancel must address the loaded session: {methods:?}"
     );
 }
 
