@@ -76,7 +76,7 @@ fn drain_and_persist_session_ids_inner(
 ) -> SessionIdSyncOutcome {
     let mut updates: Vec<Update> = Vec::with_capacity(instances.len());
     let mut filtered_ids: HashSet<String> = HashSet::with_capacity(instances.len());
-    let mut already_current: Vec<String> = Vec::new();
+    let mut already_current: Vec<(String, SessionIdObservation)> = Vec::new();
 
     // Frozen pre-update ownership snapshot.
     let mut sid_owners: HashMap<String, String> = HashMap::with_capacity(instances.len());
@@ -163,9 +163,8 @@ fn drain_and_persist_session_ids_inner(
             }
         }
         if inst.agent_session_id.as_deref() == Some(sid.as_str()) && !confirms_omp_pin {
-            acknowledge_poller_observation(inst, &observation);
             // The pane published the id this row already holds, so there is no sid to write.
-            already_current.push(inst.id.clone());
+            already_current.push((inst.id.clone(), observation));
             continue;
         }
         updates.push(Update {
@@ -204,9 +203,12 @@ fn drain_and_persist_session_ids_inner(
         }
     });
 
-    for id in &already_current {
+    for (id, observation) in &already_current {
         if let Some(inst) = instances.iter_mut().find(|i| i.id == *id) {
-            inst.absorb_published_pi_session();
+            // Unacknowledged, a transcript path whose write failed is retried on the next drain.
+            if inst.absorb_published_pi_session() {
+                acknowledge_poller_observation(inst, observation);
+            }
         }
     }
 
@@ -371,6 +373,7 @@ fn drain_and_persist_session_ids_inner(
         }
     }
 
+    let mut unstored_paths = Vec::new();
     for (id, sid, confirms_omp_pin) in &to_apply {
         if let Some(inst) = instances.iter_mut().find(|i| i.id == *id) {
             inst.agent_session_id = Some(sid.clone());
@@ -380,8 +383,13 @@ fn drain_and_persist_session_ids_inner(
                 inst.resume_probe_failed_sid = None;
             }
             // The transcript path belongs with the id it names.
-            inst.absorb_published_pi_session();
+            if !inst.absorb_published_pi_session() {
+                unstored_paths.push(id.clone());
+            }
         }
+    }
+    for id in &unstored_paths {
+        request_poller_retry(instances, id);
     }
     for rb in &to_rollback {
         if let Some(inst) = instances.iter_mut().find(|i| i.id == rb.id) {

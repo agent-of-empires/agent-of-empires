@@ -239,39 +239,56 @@ impl Instance {
         )
     }
 
-    pub(crate) fn absorb_published_pi_session(&mut self) {
-        let Some(path) = self.pi_published_session_path() else {
-            return;
-        };
-        if self.pi_session_path.as_deref() == Some(path.as_str()) {
-            return;
-        }
-        self.pi_session_path = Some(path.clone());
-        // The sidecar lives in a temp dir a reboot clears; only the durable copy survives.
-        if let Ok(storage) = crate::session::storage::Storage::new(
+    /// Persist a transcript path the pane published; false while it is not yet durable, so the
+    /// caller keeps the observation for a retry.
+    pub(crate) fn absorb_published_pi_session(&mut self) -> bool {
+        match crate::session::storage::Storage::new(
             &self.effective_profile(),
             self.resolve_file_watch(),
         ) {
-            self.store_pi_session_path(&storage, &path);
+            Ok(storage) => self.absorb_published_pi_session_into(&storage),
+            Err(_) => self.pi_published_session_path().is_none(),
         }
+    }
+
+    pub(super) fn absorb_published_pi_session_into(
+        &mut self,
+        storage: &crate::session::storage::Storage,
+    ) -> bool {
+        let Some(path) = self.pi_published_session_path() else {
+            return true;
+        };
+        if self.pi_session_path.as_deref() == Some(path.as_str()) {
+            return true;
+        }
+        // The sidecar lives in a temp dir a reboot clears; only the durable copy survives.
+        let stored = self.store_pi_session_path(storage, &path);
+        if stored {
+            self.pi_session_path = Some(path);
+        }
+        stored
     }
 
     pub(super) fn store_pi_session_path(
         &self,
         storage: &crate::session::storage::Storage,
         path: &str,
-    ) {
-        if let Err(error) = storage.update(|instances, _| {
+    ) -> bool {
+        match storage.update(|instances, _| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) {
                 inst.pi_session_path = Some(path.to_string());
             }
             Ok(())
         }) {
-            tracing::warn!(
-                target: "session.store",
-                instance = %self.id,
-                "could not persist the Pi transcript path the pane published: {error}",
-            );
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.store",
+                    instance = %self.id,
+                    "could not persist the Pi transcript path the pane published: {error}",
+                );
+                false
+            }
         }
     }
 
@@ -688,6 +705,52 @@ pi = "~/.pi-personal"
         let mut cmd = "pi".to_string();
         assert!(inst.apply_session_flags(&mut cmd, "test").unwrap());
         assert_eq!(cmd, format!("pi --session '{}'", transcript.display()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_failed_transcript_path_write_stays_retryable() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
+        let profile = "pi-path-retry";
+        let sid = "01a05234-8889-72e2-a7c9-7ebc27b25b78";
+        let mut inst = Instance::new("pipathretry00001", "/tmp/pi-path-retry");
+        inst.source_profile = profile.to_string();
+        inst.tool = "pi".to_string();
+        inst.sandbox_info = Some(test_sandbox("aoe-pi-path-retry", None));
+        inst.agent_session_id = Some(sid.to_string());
+        inst.mark_pi_extension_launched_for_test();
+        let mut storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _| {
+                *instances = vec![seed.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let Some(SessionSidecarSource::SandboxDir(dir)) = inst.pi_sidecar_source() else {
+            panic!("a sandboxed pane publishes under its bind");
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        let published =
+            format!("/root/.pi/agent/sessions/--proj--/2026-01-01T00-00-00-000Z_{sid}.jsonl");
+        std::fs::write(dir.join("session_path"), format!("{published}\n")).unwrap();
+        let stored = |storage: &crate::session::storage::Storage| {
+            storage.load().unwrap()[0].pi_session_path.clone()
+        };
+
+        storage.set_fail_writes_for_test(true);
+        assert!(!inst.absorb_published_pi_session_into(&storage));
+        assert_eq!(
+            inst.pi_session_path, None,
+            "a path that is not durable must not look current"
+        );
+
+        storage.set_fail_writes_for_test(false);
+        assert_eq!(stored(&storage), None);
+        assert!(inst.absorb_published_pi_session_into(&storage));
+        assert_eq!(stored(&storage), Some(published.clone()));
+        assert_eq!(inst.pi_session_path, Some(published));
     }
 
     #[test]
