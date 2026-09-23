@@ -703,8 +703,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
         let store = tmp.path().join("store");
+        std::fs::create_dir_all(store.join("sessions")).unwrap();
+        let store = std::fs::canonicalize(store).unwrap();
         let sessions = store.join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
         let mut inst = tool_instance("prime-agent", tmp.path().to_str().unwrap());
         inst.sandbox_info = Some(test_sandbox("prime-root", Some("/workspace/project")));
         let parent = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";

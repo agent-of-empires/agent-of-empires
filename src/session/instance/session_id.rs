@@ -886,7 +886,10 @@ mod tests {
         let sid = inst.agent_session_id.clone().expect("fresh Claude pin");
         assert_eq!(first, format!("work-claude --session-id {sid}"));
 
-        let encoded = crate::session::capture::encode_claude_project_path(&inst.project_path);
+        let canonical_project = std::fs::canonicalize(&inst.project_path).unwrap();
+        let encoded = crate::session::capture::encode_claude_project_path(
+            &canonical_project.to_string_lossy(),
+        );
         let project = root.path().join(".claude/projects").join(encoded);
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join(format!("{sid}.jsonl")), "{}\n").unwrap();
