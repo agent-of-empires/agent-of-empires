@@ -1188,7 +1188,7 @@ function AppContent({
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
   // deliberately KEEPS the per-session acp cache, draft, and stored comments
   // so a restore is faithful; only purge clears them. Trashes every session
-  // in the row so a multi-session workspace sinks as a whole.
+  // in the row together.
   const handleConfirmTrash = async () => {
     const ids = deletingSessions.map((s) => s.id);
     if (ids.length === 0) return;
