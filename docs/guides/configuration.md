@@ -152,7 +152,7 @@ agent_detect_as = { "lenovo-claude" = "claude" }
 - **`custom_agents`** maps a display name to the command AoE runs in a tmux pane.
 - **`agent_detect_as`** reuses built-in status detection and ACP adapter inheritance. It never proves which native CLI owns a terminal conversation.
 - **`agent_execution_as`** declares the native agent actually invoked by an opaque wrapper, together with its `agent_config_dir` store contract. This is required for managed resume and fork through such a wrapper.
-  Bare, non-path wrappers can receive Default resume flags and pane-scoped capture without this contract; see [Execution identity and wrappers](session-resume.md#execution-identity-and-wrappers).
+  Bare, non-path wrappers can receive Default automatic resume flags and pane-scoped capture without this contract. Cleared launches selected by a failed-resume marker or disabled `auto_resume_on_restart` start fresh, mint and pass fresh-session flags where supported, and capture the new pane-scoped ID; explicit resume and fork remain unavailable. See [Execution identity and wrappers](session-resume.md#execution-identity-and-wrappers).
 - **`agent_acp_cmd`** gives the agent its own ACP command (see below).
 - **`agent_config_dir`** names the config directory the wrapper points its CLI at (see below).
 

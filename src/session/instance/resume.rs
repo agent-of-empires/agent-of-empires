@@ -420,6 +420,82 @@ mod tests {
     use crate::session::instance::test_helpers::install_aliases;
     use serial_test::serial;
     use tempfile::tempdir;
+    #[test]
+    #[serial]
+    fn cleared_bare_wrapper_launch_replaces_persisted_identity() {
+        let temp = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("CLAUDE_CONFIG_DIR", temp.path().join(".claude")),
+        ]);
+        let old = "11111111-2222-4333-8444-555555555555";
+        for (label, failed_probe) in [("loop-breaker", true), ("policy", false)] {
+            let profile = format!("bare-wrapper-cleared-{label}");
+            let path =
+                crate::session::config::profile_config::get_profile_config_path(&profile).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path,
+                "[session]\nauto_resume_on_restart = false\n[session.agent_detect_as]\nwork-claude = \"claude\"\n"
+            ).unwrap();
+            let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+            let mut inst = Instance::new(label, temp.path().to_str().unwrap());
+            inst.source_profile = profile.clone();
+            inst.tool = "work-claude".into();
+            inst.command = "work-claude".into();
+            inst.agent_session_id = Some(old.into());
+            inst.resume_probe_failed_sid = failed_probe.then(|| old.into());
+            assert!(inst.execution_agent().is_err());
+            let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(inst.clone());
+                    Ok(())
+                })
+                .unwrap();
+
+            assert_eq!(
+                inst.apply_resume_policy(ResumeAttemptPolicy::HonorAutoResumeSetting),
+                failed_probe.then(|| old.into())
+            );
+            let expected = inst.apply_fresh_launch_intent();
+            let prepared = inst.prepare_launch_command(expected.clone()).unwrap();
+            let fresh = inst
+                .agent_session_id
+                .clone()
+                .expect("fresh wrapper session id");
+            assert_ne!(fresh, old);
+            assert!(!prepared.is_existing);
+            assert!(prepared
+                .command
+                .unwrap()
+                .contains(&format!("work-claude --session-id {fresh}")));
+            assert_eq!(
+                inst.persist_session_id(&profile, &expected),
+                SidPersistOutcome::Published
+            );
+            let row = storage
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == inst.id)
+                .unwrap();
+            assert_eq!(row.agent_session_id.as_deref(), Some(fresh.as_str()));
+            assert_eq!(row.resume_probe_failed_sid, None);
+            assert_eq!(row.resume_intent, ResumeIntent::Default);
+
+            for intent in [
+                ResumeIntent::Use(old.into()),
+                ResumeIntent::Fork { from: old.into() },
+            ] {
+                let mut explicit = row.clone();
+                explicit.resume_intent = intent;
+                assert!(explicit
+                    .prepare_launch_command(explicit.conversation_state())
+                    .is_err());
+            }
+        }
+    }
 
     /// Pins the order inside `stop_carry_and_prepare`: the launch command is
     /// built from whether the incoming account's transcript exists, so the

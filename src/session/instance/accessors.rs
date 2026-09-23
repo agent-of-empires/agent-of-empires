@@ -333,7 +333,7 @@ impl Instance {
         if context == crate::agents::SessionCaptureContext::Unsupported {
             return None;
         }
-        // Pane-scoped publishers let Default wrappers capture only their own conversation.
+        // Pane-scoped publishers confine Default/Cleared wrapper capture to this pane.
         let self_attributing = matches!(
             capture.backend,
             crate::agents::SessionCaptureBackend::Claude
@@ -379,9 +379,12 @@ impl Instance {
             .map(|(capture, _)| capture.backend)
     }
 
-    /// Bare legacy wrappers may receive Default selectors, but do not prove execution identity.
+    /// Bare wrappers can receive automatic selectors, without proving execution identity.
     pub(super) fn legacy_default_selector_agent(&self) -> Option<&'static crate::agents::AgentDef> {
-        if !matches!(self.resume_intent, ResumeIntent::Default) {
+        if matches!(
+            self.resume_intent,
+            ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
+        ) {
             return None;
         }
         let agent = resolved_agent_for(&self.effective_profile(), &self.tool, &self.detect_as)?;
@@ -905,6 +908,7 @@ mod tests {
     fn handoff_accepts_a_session_home_store() {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _config_dir = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         let _claude = crate::session::test_support::install_login_shell_path_command(
             temp.path(),
             "claude",

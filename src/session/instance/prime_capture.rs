@@ -886,4 +886,106 @@ process.stdout.write(readFileSync(normal, 'utf8'));
             .unwrap());
         assert_eq!(command, format!("prime-agent --resume {parent}"));
     }
+    #[test]
+    #[serial_test::serial]
+    fn prepared_prime_launch_refreshes_resident_root_without_overwriting_peer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = tool_instance("prime-agent", project.to_str().unwrap());
+        inst.source_profile = "prime-resident-root-refresh".into();
+        inst.sandbox_info = Some(test_sandbox("prime-resident", Some("/workspace/project")));
+        let plan = inst
+            .prime_agent_capture_plan(inst.prime_agent_capture_options().unwrap())
+            .unwrap();
+        let sessions = plan.store.join(&plan.session_dir);
+        std::fs::create_dir_all(&sessions).unwrap();
+        let record = plan
+            .store
+            .join("aoe-session")
+            .join(&inst.id)
+            .join("root_session");
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        let parent = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
+        let newer = "018f47a6-7b80-7cc3-98a2-37b5f486b2a3";
+        let publish = |id: &str, name: &str| {
+            std::fs::write(sessions.join(format!("{name}.jsonl")), format!("{}\n",
+                serde_json::json!({"type": "session", "id": id, "rlmDepth": 0, "cwd": plan.container_cwd}))).unwrap();
+            std::fs::write(
+                &record,
+                serde_json::json!({
+                    "id": id, "path": plan.container_session_dir.join(format!("{name}.jsonl")),
+                    "cwd": plan.container_cwd, "rlmDepth": 0
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        publish(parent, "parent");
+        let storage =
+            crate::session::storage::Storage::new_unwatched(&inst.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .unwrap();
+        assert!(prepared.command.as_deref().unwrap().contains(parent));
+
+        publish(newer, "newer");
+        let mut excluded = inst.clone();
+        excluded
+            .retroactive_capture_excludes
+            .insert(ConversationBinding::unknown(newer));
+        let prior = excluded.conversation_state();
+        let prepared_excluded = excluded.prepare_launch_command(prior).unwrap();
+        let excluded_prepared = excluded
+            .refresh_prepared_prime_launch_after_pane_stop(prepared_excluded)
+            .unwrap();
+        assert!(!excluded_prepared
+            .command
+            .as_deref()
+            .unwrap()
+            .contains(newer));
+
+        let refreshed = inst
+            .refresh_prepared_prime_launch_after_pane_stop(prepared)
+            .unwrap();
+        assert!(refreshed.command.as_deref().unwrap().contains(newer));
+        assert_eq!(
+            inst.persist_session_id(
+                &inst.source_profile.clone(),
+                &refreshed.expected_conversation
+            ),
+            SidPersistOutcome::Published
+        );
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(newer)
+        );
+
+        let peer = "018f47a6-7b80-7cc3-98a2-37b5f486b2a2";
+        storage
+            .update(|rows, _| {
+                rows[0].agent_session_id = Some(peer.into());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            inst.persist_session_id(
+                &inst.source_profile.clone(),
+                &refreshed.expected_conversation,
+            ),
+            SidPersistOutcome::Published
+        );
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(peer)
+        );
+        assert_eq!(inst.agent_session_id.as_deref(), Some(peer));
+    }
 }

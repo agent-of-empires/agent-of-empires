@@ -620,4 +620,47 @@ mod tests {
             ResumeIntent::Use(sid.into())
         );
     }
+    #[test]
+    #[serial_test::serial]
+    fn stop_cleans_foreign_publication_evidence_without_changing_pin() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        let profile = "stop-pinned-foreign";
+        let published = "01a0538e-5868-7c22-84bc-40cfd7a09ab1";
+        let pinned = "22f13307-461c-4161-908e-95a247fac750";
+        let mut inst = Instance::new("pi-pinned", home.path().to_str().unwrap());
+        inst.source_profile = profile.into();
+        inst.tool = "pi".into();
+        inst.agent_session_id = Some(pinned.into());
+        inst.resume_intent = ResumeIntent::Use(pinned.into());
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let _transcript = crate::session::instance::test_helpers::publish_host_pi_transcript(
+            &inst.id,
+            published,
+            home.path(),
+        );
+        let sidecar = crate::hooks::ensure_instance_dir_path(&inst.id)
+            .unwrap()
+            .join("session_id");
+        assert!(sidecar.exists());
+        assert_eq!(inst.final_publication_observation().unwrap().sid, published);
+        inst.stop().unwrap();
+        let row = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == inst.id)
+            .unwrap();
+        assert_eq!(row.agent_session_id.as_deref(), Some(pinned));
+        assert_eq!(row.resume_intent, ResumeIntent::Use(pinned.into()));
+        assert_eq!(row.status, Status::Stopped);
+        assert!(!sidecar.exists());
+    }
 }
