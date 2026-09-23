@@ -457,69 +457,64 @@ async fn turn_on_a_park_resumes_instead_of_queueing() {
     }
 }
 
-/// #4081 review: an exhausted rate-limit park dispatches `Sent`, not
-/// `Queued { WorkerDown }` (see `turn_on_an_exhausted_park_resumes_instead_of_queueing`
-/// above), so the handler's `WorkerDown`-only check misses it. `no_revive`
-/// has to be enforced in `send_turn`'s own resume decision to catch this
-/// case too.
+/// #4081 review: a prompt into either park dispatches `Sent` (see
+/// `turn_on_a_park_resumes_instead_of_queueing`), so `no_revive` is enforced
+/// by `send_turn`'s resume decision. The refusal must start no worker and
+/// leave the park, the queue, and a pending initial turn as they were.
 #[tokio::test]
-async fn no_revive_refuses_a_prompt_on_an_exhausted_rate_limit_park() {
-    let _app_dir = crate::session::test_support::isolate_app_dir();
-    let id = "sess-no-revive-exhausted-park".to_string();
-    let state = structured_state(&id, false);
-    park_on_exhausted_rate_limit(&state, &id);
+async fn no_revive_refuses_a_prompt_on_a_rate_limit_park() {
+    for (park, seed) in PARKS {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let id = format!("sess-no-revive-{park}-park");
+        let (state, launches) = failing_start_state(&id, true);
+        seed(&state, &id);
+        state.instances.write().await[0].pending_initial_turn =
+            Some(crate::session::PendingInitialTurn {
+                text: "queued before the park".to_string(),
+                attachments: Vec::new(),
+                synthesized: true,
+            });
 
-    let response = acp_prompt(
-        State(Arc::clone(&state)),
-        Path(id.clone()),
-        no_revive_prompt_req("hello"),
-    )
-    .await
-    .into_response();
+        let response = acp_prompt(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            no_revive_prompt_req("hello"),
+        )
+        .await
+        .into_response();
 
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert!(!published(&state, &id, |e| matches!(
-        e,
-        Event::AgentStartupError { .. }
-    )));
-    assert!(!published(&state, &id, |e| matches!(
-        e,
-        Event::UserPromptSent { .. }
-    )));
-}
-
-/// #4081 review: the exhausted-park refusal above is a *late* one — dispatch
-/// already returned `Sent` and `clear_pending_initial_turn` runs on the way
-/// to `send_turn` for every other `Sent`/`Steered` outcome. It must still
-/// not fire when `send_turn` itself refuses via `RevivalRefused`.
-#[tokio::test]
-async fn no_revive_refusal_on_exhausted_park_preserves_a_pending_initial_turn() {
-    let _app_dir = crate::session::test_support::isolate_app_dir();
-    let id = "sess-no-revive-exhausted-park-pending".to_string();
-    let state = structured_state(&id, false);
-    park_on_exhausted_rate_limit(&state, &id);
-    state.instances.write().await[0].pending_initial_turn =
-        Some(crate::session::PendingInitialTurn {
-            text: "queued before the park".to_string(),
-            attachments: Vec::new(),
-            synthesized: true,
-        });
-
-    let response = acp_prompt(
-        State(Arc::clone(&state)),
-        Path(id.clone()),
-        no_revive_prompt_req("hello"),
-    )
-    .await
-    .into_response();
-
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert!(
-        state.instances.read().await[0]
-            .pending_initial_turn
-            .is_some(),
-        "no_revive refusal must not clear the pending initial turn"
-    );
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{park}");
+        assert_eq!(
+            launches.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{park}: no_revive must not start a worker"
+        );
+        assert!(
+            state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .is_empty(),
+            "{park}"
+        );
+        assert!(
+            !published(&state, &id, |e| matches!(
+                e,
+                Event::UserPromptSent { .. } | Event::AgentStartupError { .. }
+            )),
+            "{park}"
+        );
+        assert!(
+            state.acp_event_store.rate_limit_park(&id).is_some(),
+            "{park}: the park must stand"
+        );
+        assert!(
+            state.instances.read().await[0]
+                .pending_initial_turn
+                .is_some(),
+            "{park}: no_revive refusal must not clear the pending initial turn"
+        );
+    }
 }
 
 /// #4081 review: refusing a `no_revive` prompt to a stopped worker must not
