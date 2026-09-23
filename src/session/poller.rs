@@ -8,7 +8,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Default ceiling on concurrent session-id poller threads.
-pub const DEFAULT_SESSION_ID_POLLER_MAX_THREADS: u32 = 200;
+pub const DEFAULT_SESSION_ID_POLLER_MAX_THREADS: u32 = 50;
 
 /// A budget of session-id poller threads: how many are running and the ceiling they may not exceed.
 #[derive(Debug)]

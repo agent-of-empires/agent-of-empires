@@ -1240,7 +1240,7 @@ pub struct SessionConfig {
     /// ids stop refreshing until another session stops. Process-wide:
     /// applied once at startup from the effective config of the profile the
     /// process was launched with, so a change takes effect on the next
-    /// start. 0 keeps the default (200).
+    /// start. 0 keeps the default (50).
     #[serde(default = "default_session_id_poller_max_threads")]
     #[setting(
         label = "Session-id poller threads (restart req.)",
@@ -3996,7 +3996,7 @@ mod tests {
     #[test]
     fn session_id_poller_max_threads_defaults_and_parses() {
         let config: Config = toml::from_str("").unwrap();
-        assert_eq!(config.session.session_id_poller_max_threads, 200);
+        assert_eq!(config.session.session_id_poller_max_threads, 50);
         let config: Config =
             toml::from_str("[session]\nsession_id_poller_max_threads = 400\n").unwrap();
         assert_eq!(config.session.session_id_poller_max_threads, 400);
