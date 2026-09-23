@@ -132,7 +132,12 @@ describe("toolbar and send", () => {
     [null, 50_000, "25%", false],
   ])("explains usage on hover (cost %o)", (cost, used, pct, mentionsSpend) => {
     mount({ sessionUsage: { used, size: 200_000, cost } });
-    fireEvent.mouseEnter(screen.getByLabelText(/Context window:/).parentElement!);
+    const hint = screen.getByLabelText(/Context window:/);
+    // The compact form (percent and cost) is not breakpoint-hidden (#3916).
+    expect(hint.classList.contains("hidden")).toBe(false);
+    expect(hint.textContent).toContain(pct);
+    expect(hint.textContent?.includes("· $0.42")).toBe(mentionsSpend);
+    fireEvent.mouseEnter(hint.parentElement!);
     const tip = screen.getByRole("tooltip").textContent ?? "";
     expect(tip).toContain(`${used.toLocaleString()} of ${(200_000).toLocaleString()} tokens used (${pct})`);
     expect(tip.includes("cumulative session spend since the last /clear or /compact")).toBe(mentionsSpend);
