@@ -624,11 +624,19 @@ impl SessionPoller {
     }
 
     #[cfg(test)]
-    pub(crate) fn inject_test_sidecar_update(&self, instance_id: &str, session_id: &str) {
+    pub(crate) fn inject_test_sidecar_update(
+        &self,
+        instance_id: &str,
+        session_id: &str,
+        transcript: Option<&str>,
+    ) {
         self.result_tx
             .send((
                 instance_id.to_string(),
-                SessionIdObservation::instance_sidecar(session_id.to_string(), None),
+                SessionIdObservation::instance_sidecar(
+                    session_id.to_string(),
+                    transcript.map(str::to_owned),
+                ),
             ))
             .expect("inject_test_sidecar_update: result channel disconnected");
     }

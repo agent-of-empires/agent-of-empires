@@ -12,7 +12,7 @@ impl Instance {
         if self.pi_session_path.as_deref() == Some(path.as_str()) {
             return;
         }
-        self.store_pi_session_path(storage, &path);
+        self.store_pi_session_path(storage, self.agent_session_id.as_deref(), &path);
     }
 
     /// Call [`Self::flush_pi_sidecar_conversation`] using this session's storage.

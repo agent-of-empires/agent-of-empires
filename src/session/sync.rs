@@ -206,7 +206,7 @@ fn drain_and_persist_session_ids_inner(
     for (id, observation) in &already_current {
         if let Some(inst) = instances.iter_mut().find(|i| i.id == *id) {
             // Unacknowledged, a transcript path whose write failed is retried on the next drain.
-            if inst.absorb_published_pi_session() {
+            if inst.persist_observed_pi_transcript(observation) {
                 acknowledge_poller_observation(inst, observation);
             }
         }
@@ -383,7 +383,13 @@ fn drain_and_persist_session_ids_inner(
                 inst.resume_probe_failed_sid = None;
             }
             // The transcript path belongs with the id it names.
-            if !inst.absorb_published_pi_session() {
+            let observation = updates
+                .iter()
+                .find(|update| update.id == *id)
+                .map(|update| &update.observation);
+            if observation
+                .is_some_and(|observation| !inst.persist_observed_pi_transcript(observation))
+            {
                 unstored_paths.push(id.clone());
             }
         }
@@ -1241,7 +1247,7 @@ mod tests {
         seed_instance_on_disk(profile, &inst);
 
         let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
-        poller.inject_test_sidecar_update(&inst.id, "pi-new-conversation");
+        poller.inject_test_sidecar_update(&inst.id, "pi-new-conversation", None);
         inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
 
         let file_watch = FileWatchService::noop();
@@ -1276,12 +1282,9 @@ mod tests {
         seed_instance_on_disk(profile, &inst);
 
         let published = "/home/u/.pi/agent/sessions/--proj--/2026-01-01T00-00-00-000Z_01a05234-8889-72e2-a7c9-7ebc27b25b78.jsonl";
-        crate::hooks::write_session_id_via_guard(&inst.id, sid).unwrap();
-        let dir = crate::hooks::ensure_instance_dir_path(&inst.id).unwrap();
-        std::fs::write(dir.join("session_path"), format!("{published}\n")).unwrap();
-
+        // The sidecar is already gone: only the observation carries the path.
         let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
-        poller.inject_test_sidecar_update(&inst.id, sid);
+        poller.inject_test_sidecar_update(&inst.id, sid, Some(published));
         inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
 
         let file_watch = FileWatchService::noop();
