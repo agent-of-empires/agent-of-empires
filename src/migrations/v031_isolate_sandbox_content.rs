@@ -940,7 +940,7 @@ fn ordinary_mount_masks_bind(inspected: &crate::containers::InspectedContainer) 
     inspected.ordinary_mounts.iter().any(|ordinary| {
         inspected.bind_mounts.iter().any(|bind| {
             let bind = Path::new(&bind.container_path);
-            ordinary.container_path.starts_with(bind) || bind.starts_with(&ordinary.container_path)
+            bind.starts_with(&ordinary.container_path)
         })
     })
 }
@@ -2017,8 +2017,15 @@ thread_local! {
 }
 
 pub(crate) fn reconcile_pending(move_stores: bool) -> Result<()> {
+    reconcile_pending_with_home(move_stores, dirs::home_dir())
+}
+
+fn reconcile_pending_with_home(move_stores: bool, home: Option<PathBuf>) -> Result<()> {
+    // Match run(): startup may reconcile an already-current schema without HOME.
+    let Some(home) = home else {
+        return Ok(());
+    };
     let app = crate::session::get_app_dir()?;
-    let home = dirs::home_dir().context("home directory unavailable for content isolation")?;
     #[cfg(test)]
     if let Some(probes) = TEST_RECONCILE_PROBES.get() {
         return reconcile_in(
@@ -2422,6 +2429,32 @@ mod tests {
         assert!(!ordinary_mount_masks_bind(&inspected));
         inspected.ordinary_mounts[0].container_path = "/workspace".into();
         assert!(ordinary_mount_masks_bind(&inspected));
+        inspected.ordinary_mounts[0].container_path = "/workspace/cache".into();
+        assert!(!ordinary_mount_masks_bind(&inspected));
+        inspected.ordinary_mounts[0].container_path = "/".into();
+        assert!(ordinary_mount_masks_bind(&inspected));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unavailable_home_preserves_pending_content_for_later_reconciliation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let app = crate::session::get_app_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        let version = super::super::current_schema_version().to_string();
+        fs::write(app.join(".schema_version"), &version).unwrap();
+        let registry = br#"[{"id":"1111111111111111","tool":"codex","sandbox_store_generation":2,"sandbox_info":{"enabled":true}}]"#;
+        fs::write(app.join("sessions.json"), registry).unwrap();
+
+        // Linux falls back to passwd when HOME is unset; inject the genuinely
+        // unavailable result instead of changing process-wide user identity.
+        reconcile_pending_with_home(false, None).unwrap();
+        assert_eq!(fs::read(app.join("sessions.json")).unwrap(), registry);
+        assert_eq!(
+            fs::read(app.join(".schema_version")).unwrap(),
+            version.as_bytes()
+        );
     }
 
     /// A named volume or a relative source is not a host path, so it is dropped
