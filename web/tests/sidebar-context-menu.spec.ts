@@ -258,6 +258,20 @@ test.describe("Sidebar Switch view (#2252)", () => {
     await page.locator("[data-testid='switch-view-confirm']").click();
     await expect(page.getByText("Failed to switch to terminal")).toBeVisible();
   });
+  test("a failed switch to structured view keeps the terminal available", async ({ page }) => {
+    await installSidebarMocks(page, {
+      sessions: [session("sess-9", "Cannot enable", "terminal", true)],
+    });
+    await page.route("**/api/sessions/*/acp/enable", (r) => r.fulfill({ status: 500 }));
+
+    await openSwitchMenu(page, "Cannot enable");
+    await page.locator("[data-testid='switch-view-confirm']").click();
+    await expect(page.getByText("Failed to switch to structured view")).toBeVisible();
+    await expect(page.locator("[data-testid='switch-view-dialog']")).toBeHidden();
+
+    await rows(page).filter({ hasText: "Cannot enable" }).first().click({ button: "right" });
+    await expect(page.locator("[data-testid='sidebar-context-menu-switch-view']")).toContainText("structured");
+  });
   test("a refused handoff displays the complete recovery guidance", async ({ page }) => {
     await installSidebarMocks(page, {
       sessions: [session("sess-9", "Refused handoff", "structured", true)],
