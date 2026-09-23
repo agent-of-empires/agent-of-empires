@@ -100,7 +100,14 @@ test.describe("Session trash flow", () => {
 test.describe("Multi-session workspace trash", () => {
   // The group axis slices the workspace by group_path; the repo axis cannot reproduce #2533.
   const workspace = (
-    ...parts: Array<{ id: string; groupPath: string; trashed: boolean; deleteToTrash?: boolean; status?: string }>
+    ...parts: Array<{
+      id: string;
+      groupPath: string;
+      trashed: boolean;
+      deleteToTrash?: boolean;
+      status?: string;
+      cleanableWorktree?: boolean;
+    }>
   ) => parts.map((p) => ({ ...p, projectPath: "/tmp/repo", mainRepoPath: "/tmp/repo", branch: "feat/x" }));
   const install = (page: Page, sessions: ReturnType<typeof workspace>, failDeleteIds?: string[]) =>
     installTrashMocks(page, sessions, { groupAxis: true, ownerLast: true, failDeleteIds });
@@ -187,6 +194,27 @@ test.describe("Multi-session workspace trash", () => {
 
     await confirmDelete(await openDeleteDialogFromRow(page, gamma));
     await expect.poll(() => [...handle.trashedIds].sort(), { timeout: 10_000 }).toEqual(["sess-c", "sess-d"]);
+  });
+
+  test("permanently deleting one slice keeps the worktree another slice still uses (#4084)", async ({ page }) => {
+    const handle = await install(
+      page,
+      workspace(
+        { id: "sess-a", groupPath: "alpha", trashed: false, deleteToTrash: false, cleanableWorktree: true },
+        { id: "sess-b", groupPath: "beta", trashed: false },
+      ),
+    );
+    await page.goto("/");
+
+    const dialog = await openDeleteDialogFromRow(page, sessionRows(page).filter({ hasText: "sess-a" }));
+    await expect(dialog.locator('[data-testid="delete-session-shared-worktree"]')).toContainText(
+      'Worktree and branch are kept: "sess-b" still uses it.',
+    );
+    await expect(dialog.locator('[data-testid="delete-session-checkbox-worktree"]')).toHaveCount(0);
+    await confirmDelete(dialog);
+    await expect
+      .poll(() => handle.deleteBodies, { timeout: 10_000 })
+      .toEqual([expect.objectContaining({ session_ids: ["sess-a"], delete_worktree: false, delete_branch: false })]);
   });
 
   test("a workspace trashed in only one group slice does not appear in Trash (#2533)", async ({ page }) => {

@@ -58,6 +58,7 @@ import {
   restoreSessions,
   trashedWorkspaceRestoreIds,
   trashSessions,
+  sessionsSharingWorktree,
   workspaceCleanupDefaults,
 } from "./lib/trashActions";
 import {
@@ -1103,6 +1104,10 @@ function AppContent({
         ...workspaceCleanupDefaults(deletingSessions),
       }
     : null;
+  const deletingWorktreeSharedWith = useMemo(
+    () => sessionsSharingWorktree(deletingSessions, sessions).map((session) => session.title),
+    [deletingSessions, sessions],
+  );
   const deletingBranchName =
     deletingSessions.find((session) => session.branch)?.branch ?? deletingSession?.branch ?? null;
 
@@ -2382,6 +2387,7 @@ function AppContent({
               title: session.title,
               isSandboxed: session.is_sandboxed,
             }))}
+            worktreeSharedWith={deletingWorktreeSharedWith}
             onConfirm={handleConfirmDelete}
             onTrash={handleConfirmTrash}
             onCancel={() => setDeletingSessionIds(null)}
