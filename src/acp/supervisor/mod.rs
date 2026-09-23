@@ -43,7 +43,7 @@ const RESPAWN_BACKOFF: Duration = Duration::from_millis(500);
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Builds the client for a spawn; swapped in tests to drive lifecycles without a runner.
-type Launcher = Arc<
+pub(crate) type Launcher = Arc<
     dyn Fn(
             SpawnConfig,
             AcpSessionId,

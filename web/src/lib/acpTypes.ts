@@ -547,6 +547,10 @@ export interface AcpState {
   workerIdleStopped: boolean;
   /** Auto-resume gave up re-delivering the interrupted prompt and parked the session. */
   rateLimitRetriesExhausted: boolean;
+  /** Parked on a rate limit, cap not yet reached. The daemon sends a prompt into this park
+   *  rather than queueing it (the reconciler holds the respawn, so a queue row would wait on a
+   *  worker nothing starts), so the composer must treat a worker-down 503 here as re-queueable. */
+  rateLimitParked: boolean;
   /** Prompts submitted while a turn was running; the head is dispatched on `Stopped`. */
   queuedPrompts: QueuedPrompt[];
   nextWakeupAt: string | null;
@@ -793,6 +797,7 @@ export function emptyAcpState(): AcpState {
     thinking: false,
     rateLimit: null,
     rateLimitRetriesExhausted: false,
+    rateLimitParked: false,
     sessionUsage: null,
     usageBaseline: null,
     compactionReminderDismissed: null,
@@ -850,6 +855,7 @@ function applyNewTurnResets(next: AcpState): void {
   next.workerRestarting = false;
   next.workerIdleStopped = false;
   next.rateLimitRetriesExhausted = false;
+  next.rateLimitParked = false;
   next.rejectedPrompts = [];
   next.agentUnresponsive = false;
   next.agentOrphaned = false;
@@ -1003,6 +1009,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.workerRestarting = false;
     } else if (event.Stopped.reason === "rate_limit_exhausted_retries") {
       next.rateLimitRetriesExhausted = true;
+    } else if (event.Stopped.reason === "rate_limited") {
+      next.rateLimitParked = true;
     }
     return next;
   }
@@ -1067,9 +1075,13 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.agentUnresponsive = false;
     next.agentOrphaned = false;
     next.rateLimit = null;
+    next.rateLimitParked = false;
     return next;
   }
   if ("RateLimitAutoResumed" in event) {
+    // Only the cap park ends here. The armed park outlives an auto-resume attempt: the daemon's
+    // `rate_limit_park` does not treat this event as superseding it, so a failed respawn leaves
+    // the session parked and a prompt still has to wake it.
     next.rateLimitRetriesExhausted = false;
     return next;
   }
@@ -1115,6 +1127,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.workerRestarting = false;
     next.agentUnresponsive = false;
     next.rateLimitRetriesExhausted = false;
+    next.rateLimitParked = false;
     next.configOptions = [];
     next.configOptionSwitchFailed = null;
     next.pendingConfigOption = null;

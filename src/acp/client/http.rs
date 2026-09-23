@@ -272,6 +272,7 @@ impl HttpClient {
         &self,
         session_id: &str,
         text: &str,
+        no_revive: bool,
     ) -> Result<PromptDispatchWire, HttpError> {
         let url = format!(
             "{}/api/sessions/{}/acp/prompt",
@@ -282,6 +283,7 @@ impl HttpClient {
             text: text.to_string(),
             attachments: Vec::new(),
             prompt_id: None,
+            no_revive,
         };
         let res = self.execute(self.http.post(&url).json(&body)).await?;
         let res = check_status(res, session_id)?;

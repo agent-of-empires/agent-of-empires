@@ -1616,7 +1616,7 @@ async fn send_prompt_now(
 ) {
     use crate::acp::client::http::PromptDispositionWire;
     state.in_flight = true;
-    match state.http.prompt(&state.session_id, text).await {
+    match state.http.prompt(&state.session_id, text, false).await {
         Ok(dispatch) => match dispatch.disposition {
             PromptDispositionWire::Queued => {
                 // A queued prompt starts no turn, so nothing will clear the

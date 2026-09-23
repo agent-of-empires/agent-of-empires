@@ -1196,7 +1196,7 @@ async fn workspace_purge_retains_shared_files_when_structured_shutdown_is_unprov
         (sibling_id.clone(), DeleteSessionBody::default()),
         (owner_id.clone(), DeleteSessionBody::default()),
     ];
-    let (deleted, _, failed, _) =
+    let (deleted, _, failed, _, _) =
         purge_workspace_artifacts(&state, owner_id.clone(), plan, false).await;
     assert_eq!(std::fs::read(root.join("payload"))?, b"live workspace");
     assert_eq!(deleted, vec![sibling_id.clone()]);
@@ -1334,8 +1334,8 @@ async fn overlapping_workspace_purges_complete_without_lock_inversion() -> anyho
     }
     let (left, right) =
         completed.expect("overlapping purge commands must not hold each other indefinitely");
-    let (mut deleted, _, left_failed, _) = left?;
-    let (right_deleted, _, right_failed, _) = right?;
+    let (mut deleted, _, left_failed, _, _) = left?;
+    let (right_deleted, _, right_failed, _, _) = right?;
     assert!(left_failed.is_empty() && right_failed.is_empty());
     deleted.extend(right_deleted);
     deleted.sort();
@@ -5517,4 +5517,144 @@ fn native_runtime_frame_stays_readable_with_a_valid_full_text_queue() {
         "native WS frame is {} bytes",
         frame.len()
     );
+}
+
+/// A dirty checkout survives while an outside session uses it; deleting all
+/// its users rejects the dirty owner before touching a sibling.
+#[tokio::test]
+#[serial_test::serial]
+async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
+    use axum::body::to_bytes;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    for (workspace_endpoint, surviving_peer) in [(false, true), (true, true), (true, false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let main_repo = tmp.path().join("main");
+        let checkout = tmp.path().join("shared");
+        std::fs::create_dir_all(&main_repo).unwrap();
+        git(&main_repo, &["init", "-b", "main"]);
+        git(&main_repo, &["commit", "--allow-empty", "-m", "init"]);
+        git(
+            &main_repo,
+            &["worktree", "add", "-b", "feat", checkout.to_str().unwrap()],
+        );
+        std::fs::write(checkout.join("untracked.txt"), b"survivor data").unwrap();
+
+        let profile = "shared-worktree-4084";
+        let mk = |title: &str, managed: bool| {
+            let mut inst = Instance::new(title, checkout.to_str().unwrap());
+            inst.source_profile = profile.to_string();
+            inst.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "feat".into(),
+                main_repo_path: main_repo.to_string_lossy().into_owned(),
+                managed_by_aoe: managed,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+            inst
+        };
+        let owner = mk("owner", true);
+        let peer = mk(
+            if surviving_peer {
+                "survivor"
+            } else {
+                "sibling"
+            },
+            false,
+        );
+        let rows = vec![owner.clone(), peer.clone()];
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances.extend(rows.clone());
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(rows);
+        *state.canonical_metadata.write().await =
+            crate::server::reload::load_all_profiles(&state.file_watch)
+                .unwrap()
+                .metadata;
+
+        let resp = if workspace_endpoint {
+            delete_workspace(
+                State(state.clone()),
+                Some(Json(DeleteWorkspaceBody {
+                    session_ids: if surviving_peer {
+                        vec![owner.id.clone()]
+                    } else {
+                        vec![peer.id.clone(), owner.id.clone()]
+                    },
+                    delete_worktree: true,
+                    delete_branch: true,
+                    ..Default::default()
+                })),
+            )
+            .await
+            .into_response()
+        } else {
+            delete_session(
+                State(state.clone()),
+                Path(owner.id.clone()),
+                Some(Json(DeleteSessionBody {
+                    delete_worktree: true,
+                    delete_branch: true,
+                    ..Default::default()
+                })),
+            )
+            .await
+            .into_response()
+        };
+        if !surviving_peer {
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                storage.load().unwrap().len(),
+                2,
+                "dirty preflight must spare the sibling"
+            );
+            assert!(checkout.join("untracked.txt").exists());
+            continue;
+        }
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "endpoint {workspace_endpoint}"
+        );
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["messages"].to_string().contains("another session"),
+            "the kept worktree must be reported: {body}"
+        );
+
+        assert!(
+            checkout.join(".git").exists(),
+            "shared worktree was removed"
+        );
+        let branches = std::process::Command::new("git")
+            .args(["branch", "--list", "feat"])
+            .current_dir(&main_repo)
+            .output()
+            .unwrap();
+        assert!(!branches.stdout.is_empty(), "shared branch was deleted");
+        let stored: Vec<String> = storage.load().unwrap().into_iter().map(|i| i.id).collect();
+        assert_eq!(stored, vec![peer.id.clone()]);
+        assert!(state
+            .instances
+            .read()
+            .await
+            .iter()
+            .all(|i| i.id != owner.id));
+    }
 }

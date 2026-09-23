@@ -101,6 +101,7 @@ pub(crate) struct PurgeTransaction<S: SessionStore + 'static> {
     generation: u64,
     lifecycle_lock: Option<StorageFlock>,
     active: bool,
+    additional_protection: Option<CleanupProtection>,
 }
 
 /// A purge whose durable row has already been removed. The same lifecycle
@@ -110,6 +111,7 @@ pub(crate) struct CommittedPurge<S: SessionStore> {
     store: S,
     request: DeletionRequest,
     owner: super::purge_owners::PurgeOwner,
+    additional_protection: Option<CleanupProtection>,
     _lifecycle_lock: StorageFlock,
 }
 
@@ -312,11 +314,16 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
             generation,
             lifecycle_lock: Some(lifecycle_lock),
             active: true,
+            additional_protection: None,
         };
         transaction.capture = Some(super::purge_owners::PurgeCapture::new(
             &transaction.request().instance,
         )?);
         Ok(PurgeReservation::Reserved(transaction))
+    }
+    pub(crate) fn with_additional_protection(mut self, protection: CleanupProtection) -> Self {
+        self.additional_protection = Some(protection);
+        self
     }
 
     /// Run best-effort hooks without a lifecycle or storage flock held.
@@ -390,6 +397,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                 self.selection.as_ref(),
                 self.store().storage().profile(),
             );
+
             outcome = Some((gate, Some(stored.clone())));
             Ok(())
         })?;
@@ -505,6 +513,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                 .request
                 .take()
                 .expect("committed purge owns its request"),
+            additional_protection: self.additional_protection.take(),
             _lifecycle_lock: self
                 .lifecycle_lock
                 .take()
@@ -557,8 +566,12 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                 .flatten();
             return DeletionResult::rejected(id, DeletionDisposition::Failed, error, retained);
         }
-        let mut result =
-            perform_deletion_teardown_lifecycle_locked(self.request(), self.store(), None);
+        let mut result = perform_deletion_teardown_lifecycle_locked(
+            self.request(),
+            self.store(),
+            None,
+            self.additional_protection.as_ref(),
+        );
         if !result.success {
             result.retained_instance = self.release_reservation(&result.errors).ok().flatten();
             result.disposition = DeletionDisposition::Failed;
@@ -715,6 +728,7 @@ impl<S: SessionStore> CommittedPurge<S> {
             &self.request,
             &self.store,
             Some(self.owner.token()),
+            self.additional_protection.as_ref(),
         );
         result.disposition = DeletionDisposition::Removed;
         if result.success {
@@ -837,7 +851,6 @@ pub(crate) fn cleanup_abandoned_session(instance: Instance) {
         }
     }
 }
-
 #[cfg(test)]
 pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     let config = crate::session::config::profile_config::resolve_config_or_warn(
@@ -861,6 +874,7 @@ fn perform_deletion_teardown_lifecycle_locked(
     request: &DeletionRequest,
     store: &dyn SessionStore,
     except_owner: Option<&str>,
+    additional_protection: Option<&CleanupProtection>,
 ) -> DeletionResult {
     let config = match store.configuration(Some(store.storage().profile())) {
         Ok(config) => config,
@@ -895,9 +909,10 @@ fn perform_deletion_teardown_lifecycle_locked(
             )
         }
     };
-    let mut protections = Vec::with_capacity(pending.len() + 1);
+    let mut protections = Vec::with_capacity(pending.len() + 2);
     protections.push(&live);
     protections.extend(pending.iter());
+    protections.extend(additional_protection);
     perform_deletion_core(
         request,
         true,
@@ -1096,6 +1111,16 @@ fn stage_collect_preserved_worktrees(
 ) -> std::collections::HashSet<PathBuf> {
     let mut preserved_worktree_paths: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
+    let root_referenced = request.delete_worktree
+        && request
+            .instance
+            .workspace_info
+            .as_ref()
+            .is_some_and(|workspace| {
+                protection
+                    .iter()
+                    .any(|owner| owner.references_ancestor_of(Path::new(&workspace.workspace_dir)))
+            });
 
     if request.delete_worktree {
         let primary = request
@@ -1110,9 +1135,10 @@ fn stage_collect_preserved_worktrees(
                 .filter(|repo| repo.managed_by_aoe)
                 .map(|repo| repo.worktree_path.as_str()),
         ) {
-            if protection
-                .iter()
-                .any(|owner| owner.references_path(Path::new(path)))
+            if root_referenced
+                || protection
+                    .iter()
+                    .any(|owner| owner.references_path(Path::new(path)))
             {
                 preserved_worktree_paths.insert(PathBuf::from(path));
                 messages.push(format!("Worktree kept; another session references {path}"));
@@ -3193,7 +3219,7 @@ mod tests {
         }
         #[test]
         #[serial_test::serial]
-        fn purge_protects_shared_resources_without_retaining_unshared_worktrees() {
+        fn purge_preserves_workspace_repos_referenced_by_surviving_sessions() {
             let _home = crate::session::test_support::isolate_app_dir();
             crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap())
                 .unwrap();
@@ -3295,25 +3321,30 @@ mod tests {
                     "{reference}: {:?}",
                     result.errors
                 );
-                assert!(!Path::new(&repos[1].worktree_path).exists());
-                assert!(git2::Repository::open(&repos[1].main_repo_path)
+                assert_eq!(
+                    Path::new(&repos[1].worktree_path).exists(),
+                    reference == "workspace root"
+                );
+                let second_branch = git2::Repository::open(&repos[1].main_repo_path)
                     .unwrap()
                     .find_branch("work", git2::BranchType::Local)
-                    .is_err());
+                    .is_ok();
+                assert_eq!(second_branch, reference == "workspace root");
                 if reference == "checkout" {
                     assert_eq!(
                         std::fs::read(Path::new(&repos[0].worktree_path).join("peer-data"))
                             .unwrap(),
                         b"keep"
                     );
-                } else {
-                    assert!(!Path::new(&repos[0].worktree_path).exists());
                 }
-                let first_branch = git2::Repository::open(&repos[0].main_repo_path)
+                assert_eq!(
+                    Path::new(&repos[0].worktree_path).exists(),
+                    reference != "branch"
+                );
+                assert!(git2::Repository::open(&repos[0].main_repo_path)
                     .unwrap()
                     .find_branch("work", git2::BranchType::Local)
-                    .is_ok();
-                assert_eq!(first_branch, reference != "workspace root");
+                    .is_ok());
                 if reference != "branch" {
                     assert!(workspace.is_dir());
                 }

@@ -204,6 +204,9 @@ impl CleanupProtection {
     ) -> anyhow::Result<()> {
         for owner in owners {
             self.add_path(&owner.project_path)?;
+            if let Some(path) = owner.pre_trash_project_path.as_deref() {
+                self.add_path(path)?;
+            }
             if let Some(worktree) = &owner.worktree_info {
                 self.add_branch(&worktree.main_repo_path, &worktree.branch)?;
             }
@@ -241,6 +244,20 @@ impl CleanupProtection {
                 target
                     .spellings()
                     .any(|target| reference.starts_with(target))
+            })
+        })
+    }
+
+    pub(crate) fn references_ancestor_of(&self, target: &Path) -> bool {
+        if self.paths.is_empty() {
+            return false;
+        }
+        let target = PathIdentity::new(target);
+        self.paths.iter().any(|path| {
+            path.spellings().any(|reference| {
+                target
+                    .spellings()
+                    .any(|target| target.starts_with(reference))
             })
         })
     }
@@ -285,6 +302,8 @@ mod tests {
             Instance::new("missing", missing_alias.join("child").to_str().unwrap()),
             Instance::new("live", live_alias.to_str().unwrap()),
         ];
+        owners[0].pre_trash_project_path =
+            Some(real.join("pre-trash").to_string_lossy().into_owned());
         owners[2].worktree_info = Some(crate::session::WorktreeInfo {
             branch: "work".into(),
             main_repo_path: live_alias.to_str().unwrap().into(),
@@ -301,6 +320,7 @@ mod tests {
             protection.references_path(&real.join("missing")),
             "missing descendant lost its resolved ancestor"
         );
+        assert!(protection.references_path(&real.join("pre-trash")));
         let traversal_owner = Instance::new(
             "traversal",
             lexical.join("missing/../link/../missing").to_str().unwrap(),

@@ -451,8 +451,13 @@ pub(crate) async fn trigger_resume_background(
                 return;
             };
             let agent = req.agent.clone();
-            if let Err(e) = service.acp_supervisor.spawn_inner(req, reservation).await {
-                report_spawn_failure(&service, &target.id, &agent, &e).await;
+            match service.acp_supervisor.spawn_inner(req, reservation).await {
+                // The supervisor already parked the session; a startup error would bury it,
+                // and a prompt into a live limit lands here by design now that one can wake a
+                // parked session. Same exemption `resume_one` makes.
+                Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::RateLimited(_)))
+                | Ok(()) => {}
+                Err(e) => report_spawn_failure(&service, &target.id, &agent, &e).await,
             }
         },
     );

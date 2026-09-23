@@ -1362,6 +1362,20 @@
       "components": ["web/src/lib/sidebarSort.ts", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.group-slice-row-actions",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx", "tests/session-trash.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SessionRow.tsx"]
+    },
+    {
+      "id": "session.delete-shared-worktree-kept",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/session-trash.spec.ts", "src/components/__tests__/DeleteSessionDialog.test.tsx"],
+      "components": ["web/src/App.tsx", "web/src/components/DeleteSessionDialog.tsx", "web/src/lib/trashActions.ts"]
+    },
+    {
       "id": "sidebar.new-session-tooltips",
       "kind": "mocked-playwright",
       "risk": "low",
@@ -3284,6 +3298,13 @@
       "risk": "medium",
       "specs": ["tests/acp-structured-view.spec.ts"],
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/Markdown.tsx"]
+    },
+    {
+      "id": "acp.story.composer-mobile-usage",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-structured-view.spec.ts"],
+      "components": ["web/src/components/acp/ComposerControls.tsx"]
     },
     {
       "id": "acp.story.composer-mobile-footer-actions",

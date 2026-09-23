@@ -369,8 +369,12 @@ impl Instance {
         &mut self,
         storage: &dyn crate::session::SessionStore,
     ) -> Result<PreparedLaunch> {
-        if let Some(path) = self.published_pi_session_path_update() {
-            self.store_pi_session_path(storage, path)?;
+        if let Some(sid) = self.pi_published_session_id(true) {
+            if self.agent_session_id.as_deref() == Some(sid.as_str()) {
+                if let Some(path) = self.published_pi_session_path_update() {
+                    self.store_pi_session_path(storage, &sid, &path)?;
+                }
+            }
         }
         let expected_prior_sid = self.agent_session_id.clone();
         let expected_prior_intent = self.resume_intent.clone();

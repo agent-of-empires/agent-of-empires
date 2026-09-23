@@ -1650,6 +1650,33 @@ impl Storage {
         &self,
         current: &Instance,
     ) -> Result<super::path_identity::CleanupProtection> {
+        self.cleanup_protection_inner(std::slice::from_ref(current), false)
+    }
+
+    pub(crate) fn cleanup_protection_excluding(
+        &self,
+        excluded: &[Instance],
+    ) -> Result<super::path_identity::CleanupProtection> {
+        self.cleanup_protection_inner(excluded, true)
+    }
+
+    fn cleanup_protection_inner(
+        &self,
+        excluded: &[Instance],
+        require_match: bool,
+    ) -> Result<super::path_identity::CleanupProtection> {
+        let exclusions = excluded
+            .iter()
+            .map(|row| {
+                let path = if row.source_profile.is_empty() {
+                    self.sessions_path.clone()
+                } else {
+                    get_profile_dir(&row.source_profile)?.join("sessions.json")
+                };
+                Ok((path, row.id.as_str(), row.lifecycle_generation))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut matched = require_match.then(|| vec![false; exclusions.len()]);
         let profile_dir = self
             .sessions_path
             .parent()
@@ -1675,13 +1702,20 @@ impl Storage {
             let rows: Vec<Instance> = serde_json::from_str(&content).with_context(|| {
                 format!("Reading complete resource owners in {}", path.display())
             })?;
-            let selected = path == self.sessions_path;
             protection.extend(rows.iter().filter(|row| {
-                !selected
-                    || row.id != current.id
-                    || row.lifecycle_generation != current.lifecycle_generation
+                let index = exclusions.iter().position(|(registry, id, generation)| {
+                    path == *registry && row.id == *id && row.lifecycle_generation == *generation
+                });
+                if let (Some(matched), Some(index)) = (&mut matched, index) {
+                    matched[index] = true;
+                }
+                index.is_none()
             }))?;
         }
+        anyhow::ensure!(
+            matched.is_none_or(|matched| matched.into_iter().all(|found| found)),
+            "Selected batch member changed before cleanup"
+        );
         protection.validate()?;
         Ok(protection)
     }

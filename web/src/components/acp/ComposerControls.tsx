@@ -291,19 +291,27 @@ export function UsageHint({ usage }: { usage: AcpState["sessionUsage"] }) {
     `Context window: ${usage.used.toLocaleString()} of ${usage.size.toLocaleString()} tokens used (${pct}%). ` +
     `Color warns as the window fills.` +
     (cost ? ` ${cost} is cumulative session spend since the last /clear or /compact.` : "");
+  // Last in the wrapping cluster: on a narrow footer it takes its own row
+  // instead of pushing Stop and Send off screen.
   return (
-    <Tooltip text={explanation} multiline>
-      <span
-        className={`hidden sm:inline-flex items-center gap-1 text-[11px] tabular-nums ${tone}`}
-        aria-label={explanation}
-      >
-        <span>
-          {formatTokens(usage.used)}/{formatTokens(usage.size)}
+    <span className="ml-auto pl-2">
+      <Tooltip text={explanation} multiline>
+        <span
+          data-testid="composer-usage"
+          className={`inline-flex items-center gap-1 text-[11px] tabular-nums ${tone}`}
+          aria-label={explanation}
+        >
+          <span className="hidden sm:inline">
+            {formatTokens(usage.used)}/{formatTokens(usage.size)}
+          </span>
+          <span className="opacity-70">
+            <span className="hidden sm:inline">(</span>
+            {pct}%<span className="hidden sm:inline">)</span>
+          </span>
+          {cost ? <span className="opacity-70">· {cost}</span> : null}
         </span>
-        <span className="opacity-70">({pct}%)</span>
-        {cost ? <span className="opacity-70">· {cost}</span> : null}
-      </span>
-    </Tooltip>
+      </Tooltip>
+    </span>
   );
 }
 

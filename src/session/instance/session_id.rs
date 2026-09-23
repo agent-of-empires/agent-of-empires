@@ -6,6 +6,19 @@ use crate::session::config::container_config::PRIME_AGENT_DIR_IN_CONTAINER;
 const SESSION_SIDECAR_MAX_BYTES: usize = 4096;
 const PRIME_AGENT_HEADER_MAX_BYTES: u64 = 64 * 1024;
 const PRIME_AGENT_SETTINGS_MAX_BYTES: usize = 64 * 1024;
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_PI_PATH_WRITES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn pi_transcript_names(path: &str, sid: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.rsplit_once('_'))
+        .and_then(|(_, tail)| tail.strip_suffix(".jsonl"))
+        .is_some_and(|uuid| uuid == sid)
+}
 
 #[derive(Default)]
 pub(super) struct PrimeAgentLaunchOptions {
@@ -1012,18 +1025,34 @@ impl Instance {
     pub(crate) fn store_pi_session_path(
         &mut self,
         storage: &dyn crate::session::SessionStore,
-        path: String,
-    ) -> Result<()> {
-        storage.update(|instances, _| {
-            let inst = instances
-                .iter_mut()
-                .find(|i| i.id == self.id)
-                .ok_or(LifecycleReservationError::Superseded)?;
-            inst.pi_session_path = Some(path.clone());
-            Ok(())
+        expected_sid: &str,
+        path: &str,
+    ) -> Result<bool> {
+        if self.agent_session_id.as_deref() != Some(expected_sid)
+            || !pi_transcript_names(path, expected_sid)
+        {
+            return Ok(false);
+        }
+        let stored = storage.update(|instances, _| {
+            #[cfg(test)]
+            anyhow::ensure!(
+                !FAIL_PI_PATH_WRITES.with(std::cell::Cell::get),
+                "injected transcript path write failure"
+            );
+            let row = instances.iter_mut().find(|row| {
+                row.id == self.id && row.agent_session_id.as_deref() == Some(expected_sid)
+            });
+            if let Some(row) = row {
+                row.pi_session_path = Some(path.to_owned());
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         })?;
-        self.pi_session_path = Some(path);
-        Ok(())
+        if stored {
+            self.pi_session_path = Some(path.to_owned());
+        }
+        Ok(stored)
     }
 
     fn prime_root_publication(&self, stores: CaptureStorage<'_>) -> Option<PrimeRootPublication> {

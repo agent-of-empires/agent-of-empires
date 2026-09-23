@@ -45,7 +45,9 @@ impl Instance {
         }
         // The final read has no freshness window: an idle pane's /new may be old.
         let published = self.pi_published_session_id(true)?;
-        let path = self.pi_published_session_path();
+        let path = self
+            .pi_published_session_path()
+            .filter(|path| super::session_id::pi_transcript_names(path, &published));
         if self.agent_session_id.as_deref() == Some(published.as_str()) {
             if path.is_none() || path == self.pi_session_path {
                 return None;

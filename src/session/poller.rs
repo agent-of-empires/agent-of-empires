@@ -263,8 +263,11 @@ pub(crate) enum SessionIdGuard {
     OmpLegacy,
     OmpGeneration(String),
     /// Read from a per-instance sidecar the agent itself wrote (Pi's extension), so the observation
-    /// names this pane rather than being inferred from a store.
-    InstanceSidecar,
+    /// names this pane rather than being inferred from a store. The transcript path published
+    /// beside the id is part of it, so a path written after the id is reported too.
+    InstanceSidecar {
+        transcript: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -284,10 +287,10 @@ impl SessionIdObservation {
         }
     }
 
-    pub(crate) fn instance_sidecar(sid: String) -> Self {
+    pub(crate) fn instance_sidecar(sid: String, transcript: Option<String>) -> Self {
         Self {
             sid,
-            guard: SessionIdGuard::InstanceSidecar,
+            guard: SessionIdGuard::InstanceSidecar { transcript },
         }
     }
 
@@ -621,11 +624,19 @@ impl SessionPoller {
     }
 
     #[cfg(test)]
-    pub(crate) fn inject_test_sidecar_update(&self, instance_id: &str, session_id: &str) {
+    pub(crate) fn inject_test_sidecar_update(
+        &self,
+        instance_id: &str,
+        session_id: &str,
+        transcript: Option<&str>,
+    ) {
         self.result_tx
             .send((
                 instance_id.to_string(),
-                SessionIdObservation::instance_sidecar(session_id.to_string()),
+                SessionIdObservation::instance_sidecar(
+                    session_id.to_string(),
+                    transcript.map(str::to_owned),
+                ),
             ))
             .expect("inject_test_sidecar_update: result channel disconnected");
     }

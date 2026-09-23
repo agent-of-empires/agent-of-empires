@@ -74,6 +74,8 @@ pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservati
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome};
 pub(crate) use resume::{LaunchReservation, ResumeAttemptPolicy, ResumeLaunchOptions};
+#[cfg(test)]
+pub(crate) use session_id::FAIL_PI_PATH_WRITES;
 pub(crate) use sid_persist::{
     persist_session_to_storage, persist_session_to_store_guarded, SidPersistOutcome, SidWrite,
 };

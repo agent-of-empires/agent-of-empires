@@ -21,6 +21,8 @@ interface Props {
   defaultToTrash: boolean;
   /** Sessions sharing the workspace worktree; more than one switches to workspace copy. */
   affectedSessions?: AffectedSession[];
+  /** Titles of unselected sessions using the worktree, which the server then keeps with its branch. */
+  worktreeSharedWith?: string[];
   onConfirm: (options: DeleteSessionOptions) => Promise<void>;
   onTrash: () => Promise<void>;
   onCancel: () => void;
@@ -35,6 +37,7 @@ export function DeleteSessionDialog({
   cleanupDefaults,
   defaultToTrash,
   affectedSessions,
+  worktreeSharedWith = [],
   onConfirm,
   onTrash,
   onCancel,
@@ -48,6 +51,7 @@ export function DeleteSessionDialog({
   const confirmButtonRef = useRef<HTMLButtonElement | null>(null);
 
   const hasOptions = hasManagedWorktree || isSandboxed || isScratch;
+  const worktreeShared = hasManagedWorktree && worktreeSharedWith.length > 0;
   const sessions = affectedSessions?.length ? affectedSessions : [{ id: "primary", title: sessionTitle, isSandboxed }];
   const workspace = sessions.length > 1;
   const sandboxedCount = sessions.filter((session) => session.isSandboxed).length;
@@ -73,14 +77,25 @@ export function DeleteSessionDialog({
     () =>
       permanent
         ? onConfirm({
-            delete_worktree: deleteWorktree,
-            delete_branch: deleteBranch,
+            delete_worktree: deleteWorktree && !worktreeShared,
+            delete_branch: deleteBranch && !worktreeShared,
             delete_sandbox: deleteSandbox,
             force_delete: forceDelete,
             keep_scratch: isScratch ? keepScratch : undefined,
           })
         : onTrash(),
-    [permanent, onConfirm, onTrash, deleteWorktree, deleteBranch, deleteSandbox, forceDelete, isScratch, keepScratch],
+    [
+      permanent,
+      onConfirm,
+      onTrash,
+      deleteWorktree,
+      deleteBranch,
+      worktreeShared,
+      deleteSandbox,
+      forceDelete,
+      isScratch,
+      keepScratch,
+    ],
   );
   const [deleting, handleConfirm] = useBusyAction(confirm);
   useDialogFocus(confirmButtonRef);
@@ -146,7 +161,16 @@ export function DeleteSessionDialog({
 
       {permanent && hasOptions && (
         <div className="space-y-2 pt-1">
-          {hasManagedWorktree && (
+          {worktreeShared && (
+            <p className="text-[12px] text-text-dim" data-testid="delete-session-shared-worktree">
+              Worktree and branch are kept:{" "}
+              {worktreeSharedWith.length === 1
+                ? `"${worktreeSharedWith[0]}" still uses it`
+                : `${worktreeSharedWith.length} other sessions still use it`}
+              .
+            </p>
+          )}
+          {hasManagedWorktree && !worktreeShared && (
             <>
               <Checkbox
                 checked={deleteWorktree}

@@ -27,7 +27,15 @@ pub fn build_test_app_state(prior: Vec<Instance>) -> Arc<AppState> {
 /// Like [`build_test_app_state`] but with CityHall client mode on, so route
 /// tests can assert the mode's 403/400 guards fire (#7).
 pub fn build_test_app_state_cityhall(prior: Vec<Instance>) -> Arc<AppState> {
-    build_test_app_state_impl(prior, Vec::new(), Vec::new(), None, true, |_| {})
+    build_test_app_state_impl(
+        prior,
+        Vec::new(),
+        Vec::new(),
+        None,
+        true,
+        |_| {},
+        std::convert::identity,
+    )
 }
 
 /// Like [`build_test_app_state`] but seeds the DNS-rebinding allowlist and,
@@ -39,7 +47,15 @@ pub fn build_test_app_state_with_policy(
     allowed_origins: Vec<String>,
     token: Option<String>,
 ) -> Arc<AppState> {
-    build_test_app_state_impl(prior, allowed_hosts, allowed_origins, token, false, |_| {})
+    build_test_app_state_impl(
+        prior,
+        allowed_hosts,
+        allowed_origins,
+        token,
+        false,
+        |_| {},
+        std::convert::identity,
+    )
 }
 
 pub fn build_test_app_state_with_policy_configured(
@@ -56,6 +72,7 @@ pub fn build_test_app_state_with_policy_configured(
         token,
         false,
         configure,
+        std::convert::identity,
     )
 }
 
@@ -63,7 +80,33 @@ pub fn build_test_app_state_configured(
     prior: Vec<Instance>,
     configure: impl FnOnce(&mut AppState),
 ) -> Arc<AppState> {
-    build_test_app_state_impl(prior, Vec::new(), Vec::new(), None, false, configure)
+    build_test_app_state_impl(
+        prior,
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        configure,
+        std::convert::identity,
+    )
+}
+
+/// Like [`build_test_app_state`] but every worker start goes through
+/// `launcher`, so a test decides how a start ends.
+#[cfg(test)]
+pub(crate) fn build_test_app_state_with_launcher(
+    prior: Vec<Instance>,
+    launcher: crate::acp::supervisor::Launcher,
+) -> Arc<AppState> {
+    build_test_app_state_impl(
+        prior,
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |s| s.with_launcher(launcher),
+    )
 }
 
 fn build_test_app_state_impl(
@@ -73,6 +116,10 @@ fn build_test_app_state_impl(
     token: Option<String>,
     cityhall_mode: bool,
     configure: impl FnOnce(&mut AppState),
+    customize: impl FnOnce(
+        crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
+    )
+        -> crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
 ) -> Arc<AppState> {
     let app_dir = tempfile::tempdir().expect("tempdir");
     let acp_db = app_dir.path().join("acp_events.db");
@@ -85,8 +132,9 @@ fn build_test_app_state_impl(
         event_store: event_store.clone(),
         control_cache: acp_control_cache.clone(),
     });
-    let supervisor =
-        std::sync::Arc::new(crate::acp::supervisor::Supervisor::with_capacity(sink, 1));
+    let supervisor = std::sync::Arc::new(customize(
+        crate::acp::supervisor::Supervisor::with_capacity(sink, 1),
+    ));
     let instances = Arc::new(RwLock::new(prior));
     let instance_locks = Arc::new(RwLock::new(HashMap::new()));
     let idempotency_locks = Arc::new(RwLock::new(HashMap::new()));

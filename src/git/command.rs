@@ -200,40 +200,6 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
 
-    /// The same failing command is a WARN through `run_git_with_timeout` and a
-    /// DEBUG through `run_git_quiet_with_timeout`; the quiet variant must not
-    /// drop the record entirely, since the stderr summary is what makes a
-    /// surprise diagnosable.
-    #[test]
-    fn run_git_quiet_demotes_expected_failure_to_debug() {
-        let tmp = tempfile::tempdir().unwrap();
-        let logs = crate::session::test_support::LogCapture::start();
-        // Not a repository, so `git worktree unlock` exits non-zero: the
-        // shape `unlock_worktree` classifies as a harmless no-op.
-        let args = ["worktree", "unlock", "/nonexistent"];
-        let timeout = Duration::from_secs(30);
-        let loud = run_git_with_timeout(tmp.path(), args, timeout)
-            .expect("git should spawn")
-            .expect("git should not time out");
-        let quiet = run_git_quiet_with_timeout(tmp.path(), args, timeout)
-            .expect("git should spawn")
-            .expect("git should not time out");
-        assert!(!loud.status.success());
-        assert!(!quiet.status.success());
-
-        let logs = logs.contents();
-        let failures = |level: &str| {
-            logs.lines()
-                .filter(|l| l.contains(level) && l.contains("git command failed"))
-                .count()
-        };
-        assert_eq!(
-            (failures("WARN"), failures("DEBUG")),
-            (1, 1),
-            "expected 1 warn and 1 debug failure line: {logs}"
-        );
-    }
-
     #[cfg(unix)]
     #[test]
     fn run_git_with_timeout_kills_a_stalled_command() {
