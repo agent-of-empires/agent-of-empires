@@ -44,9 +44,10 @@ export interface SessionRowProps {
   isActive: boolean;
   isSelected: boolean;
   onActivate: RowActivate;
-  onDelete?: (workspaceId: string) => void;
-  onStop?: (workspaceId: string) => void;
-  onStart?: (workspaceId: string) => void;
+  /** Receives the row's sessions, which a group slice narrows to a subset of the workspace. */
+  onDelete?: (sessionIds: string[]) => void;
+  onStop?: (sessionId: string) => void;
+  onStart?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   /** Opens the wizard prefilled from this row's project, like the group header's "+". */
   onCreateSession?: (repoPath: string) => void;
@@ -311,8 +312,8 @@ function buildRowActions(
       if (result.ok) reportInfo("Summarizing the conversation so far…");
       else reportError(result.message ?? "Could not start the summary. Please try again.");
     }),
-    stop: after(() => props.onStop?.(workspace.id)),
-    start: after(() => props.onStart?.(workspace.id)),
+    stop: after(() => first && props.onStop?.(first.id)),
+    start: after(() => first && props.onStart?.(first.id)),
     notify: (preset) =>
       after(async () => {
         if (!sessionId || preset === model.notifyPreset) return;
@@ -334,7 +335,7 @@ function buildRowActions(
       props.onSnooze(workspace, null);
     }),
     unread: after(() => props.onUnreadToggle(workspace, !model.effectiveUnread)),
-    remove: after(() => props.onDelete?.(workspace.id)),
+    remove: after(() => props.onDelete?.(workspace.sessions.map((s) => s.id))),
   };
 }
 
