@@ -482,18 +482,25 @@ impl Instance {
             .acp_session_id
             .clone()
             .context("ACP conversation ID is unavailable")?;
-        let binding = self
+        let asserted = self
             .resume_binding
             .as_ref()
             .filter(|binding| {
                 matches!(&self.resume_intent, ResumeIntent::Use(target) if target == &sid)
                     && binding.session_id == sid
                     && binding.provenance == ConversationProvenance::Asserted
-                    && binding.execution.as_ref().is_some_and(|execution| execution.agent == "claude")
+                    && binding
+                        .execution
+                        .as_ref()
+                        .is_some_and(|execution| execution.agent == "claude")
             })
-            .cloned()
-            .or_else(|| self.resolved_handoff_binding(&sid, worker?))
-            .context("ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal")?;
+            .cloned();
+        let binding = if asserted.is_some() {
+            asserted
+        } else {
+            worker.map_or(Ok(None), |worker| self.resolved_handoff_binding(&sid, worker))?
+        }
+        .context("ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal")?;
         self.adopt_conversation_state(ConversationState {
             session_id: Some(sid.clone()),
             binding: Some(binding.clone()),
@@ -526,9 +533,9 @@ impl Instance {
         &self,
         sid: &str,
         worker: &ExecutionBinding,
-    ) -> Option<ConversationBinding> {
+    ) -> Result<Option<ConversationBinding>> {
         if worker.agent != "claude" || self.is_sandboxed() || worker.filesystem != "host" {
-            return None;
+            return Ok(None);
         }
         let binding = ConversationBinding {
             session_id: sid.to_owned(),
@@ -536,10 +543,8 @@ impl Instance {
             provenance: ConversationProvenance::Observed,
             transcript_path: None,
         };
-        let execution = self
-            .resolve_native_execution(Some((sid, Some(&binding), true)))
-            .ok()?;
-        Self::execution_identity_matches(worker, &execution.binding).then_some(binding)
+        let execution = self.resolve_native_execution(Some((sid, Some(&binding), true)))?;
+        Ok(Self::execution_identity_matches(worker, &execution.binding).then_some(binding))
     }
 }
 
@@ -878,6 +883,29 @@ mod tests {
 
         let error = inst.switch_to_terminal_keep_context(None).unwrap_err();
         assert!(error.to_string().contains("set-session-id"));
+        assert_eq!(inst.view, View::Structured);
+        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+    }
+    #[test]
+    #[serial_test::serial]
+    fn handoff_reports_native_resolution_failure_without_losing_acp_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let mut inst = Instance::new("claude-handoff-error", "/tmp");
+        inst.view = View::Structured;
+        inst.acp_session_id = Some("sid-abc".into());
+        let worker = inst.resolve_native_execution(None).unwrap().binding;
+        inst.extra_args = "--mcp-config /tmp/unattested.json".into();
+
+        let error = inst
+            .switch_to_terminal_keep_context(Some(&worker))
+            .unwrap_err();
+        assert!(error.to_string().contains("--mcp-config"), "{error:#}");
         assert_eq!(inst.view, View::Structured);
         assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
     }

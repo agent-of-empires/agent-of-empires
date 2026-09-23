@@ -268,7 +268,7 @@ fn fork_from_refusals_persist_nothing() {
         Case {
             parent: Parent::Seeded("claude"),
             args: &["--worktree", "wt-branch"],
-            expect: "",
+            expect: "--worktree",
         },
         Case {
             parent: Parent::Seeded("claude"),
@@ -278,7 +278,7 @@ fn fork_from_refusals_persist_nothing() {
         Case {
             parent: Parent::Seeded("claude"),
             args: &["--sandbox"],
-            expect: "",
+            expect: "--sandbox",
         },
         Case {
             // A terminal fork cannot carry its state onto a structured session.
