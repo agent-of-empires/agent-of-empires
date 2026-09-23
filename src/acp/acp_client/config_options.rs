@@ -384,14 +384,12 @@ pub(super) fn dispatch_set_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tracing_test::traced_test;
 
     /// #3403: `ModelConfig` maps explicitly, without the unknown-variant warning.
-    #[traced_test]
     #[test]
     fn model_config_category_maps_without_the_unknown_variant_warning() {
         use agent_client_protocol::schema::v1::SessionConfigSelectOption;
-        tracing::callsite::rebuild_interest_cache();
+        let logs = crate::session::test_support::LogCapture::start();
         let mapped = map_acp_config_option(
             SessionConfigOption::select(
                 "reasoning-effort",
@@ -406,7 +404,9 @@ mod tests {
             mapped.category,
             ConfigOptionCategory::Other("model_config".to_string())
         );
-        assert!(!logs_contain("unknown SessionConfigOptionCategory"));
+        assert!(!logs
+            .contents()
+            .contains("unknown SessionConfigOptionCategory"));
     }
 
     #[test]

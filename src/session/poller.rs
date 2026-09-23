@@ -754,7 +754,6 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::sync::{Arc, Mutex, MutexGuard};
-    use tracing_test::traced_test;
 
     fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         mutex
@@ -1176,10 +1175,9 @@ mod tests {
         );
     }
 
-    #[traced_test]
     #[test]
     fn test_budget_exhaustion_leaves_the_warning_to_the_repair_path() {
-        tracing::callsite::rebuild_interest_cache();
+        let logs = crate::session::test_support::LogCapture::start();
         let _budget = test_support::IsolatedBudget::exhausted();
 
         let mut poller = SessionPoller::new("test-session".to_string());
@@ -1191,17 +1189,14 @@ mod tests {
         );
         assert_eq!(outcome, PollerSpawn::BudgetExhausted);
 
-        logs_assert(|lines: &[&str]| {
-            let warned = lines
-                .iter()
-                .filter(|l| l.contains("WARN"))
-                .filter(|l| l.contains("test-budget-quiet"))
-                .count();
-            match warned {
-                0 => Ok(()),
-                n => Err(format!("start warned {n} time(s) on an exhausted budget")),
-            }
-        });
+        let logs = logs.contents();
+        let lines = || logs.lines().filter(|l| l.contains("test-budget-quiet"));
+        assert_eq!(lines().filter(|l| l.contains("DEBUG")).count(), 1, "{logs}");
+        assert_eq!(
+            lines().filter(|l| l.contains("WARN")).count(),
+            0,
+            "start warned on an exhausted budget: {logs}"
+        );
     }
 
     #[test]

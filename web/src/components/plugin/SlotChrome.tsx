@@ -33,7 +33,7 @@ export function BadgeChip({ item, slot, pluginId }: { item: Obj; slot: string; p
     </>
   );
   return safe ? (
-    <a {...common} href={safe} target="_blank" rel="noopener noreferrer">
+    <a {...common} href={safe} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()}>
       {inner}
     </a>
   ) : (

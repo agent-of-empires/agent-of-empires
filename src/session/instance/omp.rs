@@ -918,9 +918,11 @@ mod tests {
         std::fs::set_permissions(&tty, std::fs::Permissions::from_mode(0o700)).unwrap();
         let real_sh = which::which("sh").unwrap();
         let sh = bin.join("sh");
-        // breadcrumb_tmp is unset during the size probe and assigned only for the atomic write.
+        // Fail a selected breadcrumb write: only it runs after `breadcrumb_tmp` is set and
+        // before `marker_tmp` is. `-ef` on /dev/fd cannot match the file on macOS.
         let injected_shell = r#"printf() {
-  if [ -n "${AOE_TEST_FAIL_WRITE-}" ] && [ -n "${breadcrumb_tmp-}" ]; then
+      if [ -n "${AOE_TEST_FAIL_WRITE-}" ] && [ -n "${breadcrumb_tmp-}" ] \
+    && [ -z "${marker_tmp-}" ]; then
     write_count=$(( ${write_count:-0} + 1 ))
     if [ "$write_count" -eq "$AOE_TEST_FAIL_WRITE" ]; then
       command printf partial
@@ -928,10 +930,10 @@ mod tests {
       command printf '%s' "$@" >&-
       return $?
     fi
-  fi
-  command printf "$@"
-}
-. /dev/fd/3"#;
+      fi
+      command printf "$@"
+    }
+    . /dev/fd/3"#;
         let injected_script = root.join("inject-write-failure.sh");
         std::fs::write(&injected_script, injected_shell).unwrap();
         std::fs::write(

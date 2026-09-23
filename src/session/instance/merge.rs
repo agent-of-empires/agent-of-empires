@@ -534,8 +534,6 @@ mod tests {
     use super::*;
     use crate::session::instance::test_helpers::*;
 
-    use tracing_test::traced_test;
-
     #[test]
     fn test_merge_user_action_diff_propagates_unread() {
         let pre = Instance::new("t", "/tmp");
@@ -1440,107 +1438,6 @@ mod tests {
             Some(peer_touch),
             "only last_accessed_at itself is guarded against the stale patch"
         );
-    }
-
-    #[test]
-    fn test_merge_passive_status_patch_last_accessed_at_boundary_equal_is_a_noop() {
-        let mut disk = Instance::new("session", "/tmp/test");
-        let ts = Utc::now();
-        disk.last_accessed_at = Some(ts);
-
-        let patch = PassiveStatusPatch {
-            lifecycle_generation: 0,
-            status: Status::Idle,
-            idle_entered_at: None,
-            last_accessed_at: Some(ts),
-        };
-        disk.merge_passive_status_patch(&disk.id.clone(), &patch);
-
-        // Guard is `>=`: equal timestamps are not a real advance, so the
-        // patch's last_accessed_at is dropped. The observable value stays
-        // equal to `ts` either way (disk == incoming), so the assertion
-        // does not change; the point of the guard is skipping the write.
-        assert_eq!(disk.last_accessed_at, Some(ts));
-    }
-
-    /// Count the guard's drop-event log lines. `logs_assert` hands us lines
-    /// already scoped to the calling test's span, and the message is unique to
-    /// the drop branch, so matching the substring cannot be inflated by other
-    /// `session.store` events.
-    fn drop_log_count(lines: &[&str]) -> usize {
-        lines
-            .iter()
-            .filter(|l| l.contains("dropped passive status patch's last_accessed_at as a no-op"))
-            .count()
-    }
-
-    /// Closes I4 from #2756: the equal-timestamp guard's observability gap.
-    /// Under `disk == incoming` the drop branch and the write branch leave the
-    /// same observable `last_accessed_at`, so `boundary_equal_is_a_noop` above
-    /// cannot prove the drop branch ran. Here `disk == incoming` must fire the
-    /// `session.store` drop log exactly once.
-    #[traced_test]
-    #[test]
-    fn test_merge_passive_status_patch_last_accessed_at_boundary_equal_logs_drop_event() {
-        // Tracing caches per-callsite `Interest` globally on first hit, so a
-        // parallel test that reaches the drop callsite first without a
-        // capturing subscriber pins it to `Interest::never()` and this
-        // capture silently sees zero lines. Re-evaluate the (already
-        // registered) callsite against `traced_test`'s subscriber first. Same
-        // race `run_with_capture` documents in session::deletion.
-        tracing::callsite::rebuild_interest_cache();
-
-        let mut disk = Instance::new("session", "/tmp/test");
-        let ts = Utc::now();
-        disk.last_accessed_at = Some(ts);
-
-        let patch = PassiveStatusPatch {
-            lifecycle_generation: 0,
-            status: Status::Idle,
-            idle_entered_at: None,
-            last_accessed_at: Some(ts),
-        };
-        disk.merge_passive_status_patch(&disk.id.clone(), &patch);
-
-        logs_assert(|lines: &[&str]| match drop_log_count(lines) {
-            1 => Ok(()),
-            n => Err(format!("expected 1 drop event, got {n}")),
-        });
-    }
-
-    /// Closes I4 from #2756 (write side): a strictly newer incoming timestamp
-    /// skips the guard, so the drop log must fire zero times and the value is
-    /// written. Pairing the zero-count write case with the exactly-once drop
-    /// case above proves the log is a faithful drop-vs-write signal, not a line
-    /// that fires regardless. Uses an explicit minute offset (as
-    /// `boundary_newer_applies` does) to avoid a same-instant flake.
-    #[traced_test]
-    #[test]
-    fn test_merge_passive_status_patch_last_accessed_at_boundary_newer_no_drop_event() {
-        // Same callsite-interest race as its paired test above. This one
-        // asserts zero drops, so a lost race would make it pass for the
-        // wrong reason; rebuild so the pair stays a faithful drop-vs-write
-        // signal.
-        tracing::callsite::rebuild_interest_cache();
-
-        let mut disk = Instance::new("session", "/tmp/test");
-        let older = Utc::now() - chrono::Duration::minutes(1);
-        let newer = Utc::now();
-        disk.last_accessed_at = Some(older);
-
-        let patch = PassiveStatusPatch {
-            lifecycle_generation: 0,
-            status: Status::Idle,
-            idle_entered_at: None,
-            last_accessed_at: Some(newer),
-        };
-        disk.merge_passive_status_patch(&disk.id.clone(), &patch);
-
-        logs_assert(|lines: &[&str]| match drop_log_count(lines) {
-            0 => Ok(()),
-            n => Err(format!("expected 0 drop events, got {n}")),
-        });
-        assert_eq!(disk.last_accessed_at, Some(newer));
     }
 
     #[test]

@@ -1547,6 +1547,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/plugin/PluginSlots.tsx"]
     },
     {
+      "id": "sidebar.plugin-row-badge-link",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/plugin/__tests__/PluginSlots.test.tsx"],
+      "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/plugin/SlotChrome.tsx"]
+    },
+    {
       "id": "sidebar.group-axis-pure",
       "kind": "vitest",
       "risk": "high",
