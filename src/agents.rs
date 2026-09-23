@@ -877,33 +877,71 @@ fn help_advertises_flag(help: &str, flag: &str) -> bool {
     })
 }
 
-fn pi_help_text() -> &'static str {
-    static HELP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    HELP.get_or_init(|| {
-        let Some(agent) = get_agent("pi") else {
-            return String::new();
-        };
-        let mut cmd = std::process::Command::new(agent.binary);
-        cmd.arg("--help");
-        crate::process::run_with_timeout(&mut cmd, PI_HELP_PROBE_TIMEOUT)
-            .ok()
-            .flatten()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-            .unwrap_or_default()
-    })
+/// `pi --help`, cached once it succeeds. A timeout or failure reports no flags for now and is
+/// retried after a cooldown with a longer deadline, since a cold start with many extensions can
+/// outlast the first one.
+#[derive(Default)]
+struct PiHelpProbe {
+    help: Option<String>,
+    retry_at: Option<std::time::Instant>,
+}
+
+impl PiHelpProbe {
+    fn help(
+        &mut self,
+        now: std::time::Instant,
+        probe: impl FnOnce(std::time::Duration) -> Option<String>,
+    ) -> &str {
+        if self.help.is_none() && self.retry_at.is_none_or(|at| now >= at) {
+            let timeout = if self.retry_at.is_some() {
+                PI_HELP_RETRY_TIMEOUT
+            } else {
+                PI_HELP_PROBE_TIMEOUT
+            };
+            self.help = probe(timeout);
+            if self.help.is_none() {
+                tracing::warn!(target: "session.create", timeout_secs = timeout.as_secs(),
+                    "pi --help did not answer; launching without session-id capture until a retry succeeds");
+                self.retry_at = Some(now + PI_HELP_RETRY_COOLDOWN);
+            }
+        }
+        self.help.as_deref().unwrap_or_default()
+    }
+}
+
+fn run_pi_help(timeout: std::time::Duration) -> Option<String> {
+    let agent = get_agent("pi")?;
+    let mut cmd = std::process::Command::new(agent.binary);
+    cmd.arg("--help");
+    crate::process::run_with_timeout(&mut cmd, timeout)
+        .ok()
+        .flatten()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn pi_help_advertises(flag: &str) -> bool {
+    static PROBE: std::sync::Mutex<PiHelpProbe> = std::sync::Mutex::new(PiHelpProbe {
+        help: None,
+        retry_at: None,
+    });
+    let mut probe = PROBE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    help_advertises_flag(probe.help(std::time::Instant::now(), run_pi_help), flag)
 }
 
 pub(crate) fn pi_supports_extension_flag() -> bool {
-    help_advertises_flag(pi_help_text(), "--extension")
+    pi_help_advertises("--extension")
 }
 
-/// Probed once per process; any failure reports `false`.
 pub(crate) fn pi_supports_session_id_flag() -> bool {
-    help_advertises_flag(pi_help_text(), "--session-id")
+    pi_help_advertises("--session-id")
 }
 
 const PI_HELP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const PI_HELP_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const PI_HELP_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
     AGENTS.iter().find(|a| a.name == name)
@@ -1211,6 +1249,37 @@ mod tests {
             }
             assert_eq!(agent.oneshot_cheap_model().is_some(), name == "claude");
         }
+    }
+
+    #[test]
+    fn pi_help_probe_retries_an_inconclusive_answer_and_keeps_a_confirmed_one() {
+        let help = "  --session-id <id>\n  --extension, -e <path>\n";
+        let start = std::time::Instant::now();
+        let mut probe = PiHelpProbe::default();
+        let mut timeouts = Vec::new();
+
+        let first = probe.help(start, |timeout| {
+            timeouts.push(timeout);
+            None
+        });
+        assert_eq!(first, "", "a timed-out probe advertises nothing");
+        assert_eq!(
+            probe.help(start, |_| unreachable!("cooling down")),
+            "",
+            "no reprobe on every launch"
+        );
+
+        let retry = start + PI_HELP_RETRY_COOLDOWN;
+        let retried = probe.help(retry, |timeout| {
+            timeouts.push(timeout);
+            Some(help.to_string())
+        });
+        assert_eq!(retried, help, "the process is not stuck on the failure");
+        assert_eq!(
+            probe.help(retry + PI_HELP_RETRY_COOLDOWN, |_| unreachable!("cached")),
+            help
+        );
+        assert_eq!(timeouts, [PI_HELP_PROBE_TIMEOUT, PI_HELP_RETRY_TIMEOUT]);
     }
 
     #[test]
