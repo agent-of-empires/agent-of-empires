@@ -749,6 +749,25 @@
       "components": ["web/src/components/TopBar.tsx"]
     },
     {
+      "id": "app-shell.topbar-attention-badges",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/__tests__/TopBar.test.tsx",
+        "src/lib/__tests__/session.test.ts",
+        "src/hooks/useAttentionCounts.test.tsx",
+        "src/lib/__tests__/contrastColor.test.ts",
+        "src/lib/__tests__/attentionBadgeColors.test.ts"
+      ],
+      "components": [
+        "web/src/components/TopBar.tsx",
+        "web/src/lib/session.ts",
+        "web/src/hooks/useAttentionCounts.ts",
+        "web/src/lib/contrastColor.ts",
+        "web/src/lib/attentionBadgeColors.ts"
+      ]
+    },
+    {
       "id": "app-shell.activity-bar",
       "kind": "vitest",
       "risk": "low",

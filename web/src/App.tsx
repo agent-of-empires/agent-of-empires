@@ -14,6 +14,7 @@ import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
+import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
@@ -35,6 +36,8 @@ import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups"
 import { useProjects } from "./hooks/useProjects";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useResolvedTheme } from "./hooks/useResolvedTheme";
+import type { ResolvedTheme } from "./lib/theme";
+import { getAttentionBadgeColors } from "./lib/attentionBadgeColors";
 import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
@@ -177,7 +180,7 @@ export default function App() {
   // The pre-React /theme-bootstrap.js (referenced from index.html)
   // paints the cached theme before hydration; this hook keeps it in
   // sync with the server's view.
-  useResolvedTheme();
+  const resolvedTheme = useResolvedTheme();
   const [loginRequired, setLoginRequired] = useState<boolean | null>(null);
   const [loginAuthenticated, setLoginAuthenticated] = useState(true);
   const [tokenExpired, setTokenExpired] = useState(false);
@@ -287,6 +290,7 @@ export default function App() {
                   loginRequired={loginRequired}
                   onLogout={handleLogout}
                   onSettingsRefresh={refreshAppSettings}
+                  resolvedTheme={resolvedTheme}
                 />
               </PluginUiProvider>
               <ElevationPrompt />
@@ -318,10 +322,12 @@ function AppContent({
   loginRequired,
   onLogout,
   onSettingsRefresh,
+  resolvedTheme,
 }: {
   loginRequired: boolean;
   onLogout: () => void;
   onSettingsRefresh: () => Promise<void> | void;
+  resolvedTheme: ResolvedTheme | null;
 }) {
   useDashboardPresence();
   // Wire the localStorage write chokepoint and pull the server-side UI-state
@@ -365,6 +371,9 @@ function AppContent({
   // every one of its sessions is trashed, and Restore/Delete then cover all of
   // them. See #2533.
   const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
+
+  const { unreadCount, waitingCount } = useAttentionCounts(sessions, activeSessionId);
+  const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103).
   useLastSessionRestore({ activeSessionId, sessions, sessionsLoaded });
@@ -2252,6 +2261,9 @@ function AppContent({
             onOpenHelp={handleOpenHelp}
             onOpenAbout={handleOpenAbout}
             onStartTutorial={tour.startTour}
+            unreadCount={unreadCount}
+            waitingCount={waitingCount}
+            attentionBadgeColors={attentionBadgeColors}
             onLogout={onLogout}
             loginRequired={loginRequired}
             isOffline={!!error}
