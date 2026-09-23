@@ -379,12 +379,82 @@ impl Instance {
             .map(|(capture, _)| capture.backend)
     }
 
+    /// Bare legacy wrappers may receive Default selectors, but do not prove execution identity.
+    pub(super) fn legacy_default_selector_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+        if !matches!(self.resume_intent, ResumeIntent::Default) {
+            return None;
+        }
+        let agent = resolved_agent_for(&self.effective_profile(), &self.tool, &self.detect_as)?;
+        if crate::session::config::profile_config::resolve_config_or_warn(&self.effective_profile())
+            .session
+            .agent_execution_as
+            .contains_key(&self.tool)
+        {
+            return None;
+        }
+        let command = self.get_tool_command();
+        if Self::contains_active_shell_syntax(command)
+            || Self::contains_active_shell_syntax(&self.extra_args)
+        {
+            return None;
+        }
+        let parsed = parse_launch_command(command)?;
+        let [program] = parsed.words.as_slice() else {
+            return None;
+        };
+        if program.contains('/')
+            || shell_words::split(&self.extra_args)
+                .ok()?
+                .iter()
+                .any(|arg| arg == "--")
+        {
+            return None;
+        }
+        if crate::agents::AGENTS
+            .iter()
+            .any(|other| other.binary == program && other.name != agent.name)
+        {
+            return None;
+        }
+        let capture = agent.session_support.as_ref()?.capture.as_ref()?;
+        if (if self.is_sandboxed() {
+            capture.sandbox
+        } else {
+            capture.host
+        }) == crate::agents::SessionCaptureContext::Unsupported
+        {
+            return None;
+        }
+        Some(agent)
+    }
+
+    pub(super) fn default_selector_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+        self.resolved_agent()
+            .or_else(|| self.legacy_default_selector_agent())
+    }
+
+    /// A selector backend is only for minting and native flags, not conversation capture.
+    pub(super) fn default_selector_backend(&self) -> Option<crate::agents::SessionCaptureBackend> {
+        self.resolved_capture_backend().or_else(|| {
+            self.legacy_default_selector_agent()?
+                .session_support
+                .as_ref()?
+                .capture
+                .as_ref()
+                .map(|capture| capture.backend)
+        })
+    }
+
     pub fn supports_native_resume(&self) -> bool {
-        let Some(agent) = self.resolved_agent() else {
+        let native = self.resolved_agent();
+        let Some(agent) = native.or_else(|| self.legacy_default_selector_agent()) else {
             return false;
         };
         if agent.session_support.is_none() {
             return false;
+        }
+        if native.is_none() {
+            return true;
         }
         let implicit = self.can_attempt_default_resume(agent);
         if !implicit && !self.launch_can_carry_resume_selector(agent) {

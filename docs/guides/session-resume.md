@@ -27,6 +27,8 @@ Sandbox config and conversation stores are staged per AoE instance, including cu
 
 A conflicting built-in tool and command, such as tool `claude` with command `codex`, is rejected for managed resume and fork. An opaque wrapper requires both `session.agent_execution_as` and `session.agent_config_dir` in trusted global or profile configuration. This asserts that the wrapper invokes that native agent, forwards native arguments unchanged, and uses only the declared store and working-directory/filesystem context. Repository overrides are refused because a repository must not grant itself access to another native conversation store.
 
+A Default start or restart may pass native resume flags to a bare, non-path wrapper mapped by `agent_detect_as`, even without that contract. This is an opportunistic native attempt, not proof of the wrapper's execution identity or conversation store; shell-active commands, remote launchers, paths, a different built-in command, and explicit resume or fork do not gain this exception. A known conversation can also be tried after an external working-directory or store move on Default; its old binding stays authoritative until a qualified observation updates it. Explicit operations still require a matching known binding before launch.
+
 Shell pipelines, remote launchers, redirections, expansion, and unrecognized context-changing arguments are not supported managed invocations. The program, routing environment, and native namespace arguments are fixed from one validated launch snapshot and restored after the login shell. If shell startup changes a pinned routing value, AoE refuses the launch instead of dispatching against the wrong store.
 
 ## Supported managed contexts

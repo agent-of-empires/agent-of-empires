@@ -46,7 +46,7 @@ impl Instance {
         execution: Option<&super::execution::NativeExecution>,
     ) -> (Option<String>, bool) {
         let backend = execution.map_or_else(
-            || self.resolved_capture_backend(),
+            || self.default_selector_backend(),
             |execution| {
                 execution
                     .agent
@@ -127,7 +127,7 @@ impl Instance {
         mint_fresh_id: &dyn Fn(&str) -> Option<String>,
     ) -> (Option<String>, bool) {
         let backend = execution.map_or_else(
-            || self.resolved_capture_backend(),
+            || self.default_selector_backend(),
             |execution| {
                 execution
                     .agent
@@ -207,6 +207,16 @@ impl Instance {
                     || !self.is_sandboxed(),
                     |execution| execution.inputs.container.is_none(),
                 )
+                && !self.agent_session_binding.as_ref().is_some_and(|binding| {
+                    binding.session_id == stored
+                        && binding.is_known()
+                        && execution.is_some_and(|execution| {
+                            binding.execution.as_ref().is_some_and(|bound| {
+                                bound.agent == execution.binding.agent
+                                    && !Self::execution_identity_matches(bound, &execution.binding)
+                            })
+                        })
+                })
                 && match execution {
                     Some(execution) => execution.binding.stores.first().is_some_and(|root| {
                         crate::session::capture::claude_host_transcript_confirmed_absent(
@@ -430,12 +440,14 @@ impl Instance {
     /// Why this row can never resume; mirrors what `apply_session_flags` refuses.
     fn terminal_resume_static_unavailable(&self) -> Option<ResumeStaticUnavailable> {
         let Some(agent) = self
-            .resolved_agent()
+            .default_selector_agent()
             .filter(|agent| agent.session_support.is_some())
         else {
             return Some(ResumeStaticUnavailable::Agent);
         };
-        if !self.launch_can_carry_resume_selector(agent) && !self.can_attempt_default_resume(agent)
+        if !self.launch_can_carry_resume_selector(agent)
+            && !self.can_attempt_default_resume(agent)
+            && self.legacy_default_selector_agent().is_none()
         {
             return Some(ResumeStaticUnavailable::Command);
         }
@@ -496,9 +508,9 @@ impl Instance {
 
     /// A native session selector the command already carries, if any.
     fn existing_session_selector(&self, words: &[String]) -> Option<String> {
-        let agent = self.resolved_agent()?;
+        let agent = self.default_selector_agent()?;
         let strategy = agent.session_support.as_ref()?.resume;
-        if words.first().map(String::as_str) != Some(agent.binary) {
+        if words.first() != parse_launch_command(self.get_tool_command())?.words.first() {
             return None;
         }
         let flag_present = |flag: &str| {
@@ -543,7 +555,10 @@ impl Instance {
         agent: Option<&'static crate::agents::AgentDef>,
         execution: Option<&super::execution::NativeExecution>,
     ) -> Result<bool> {
-        let agent = execution.map(|execution| execution.agent).or(agent);
+        let agent = execution
+            .map(|execution| execution.agent)
+            .or(agent)
+            .or_else(|| self.default_selector_agent());
         let Some(parsed_command) = parse_launch_command(cmd) else {
             return Ok(false);
         };
@@ -844,6 +859,98 @@ mod tests {
             .unwrap());
     }
 
+    #[test]
+    #[serial]
+    fn default_bare_alias_pins_and_resumes_without_execution_attestation() {
+        const PROFILE: &str = "legacy-default-claude-wrapper";
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&root.path().join("app"));
+        let profile_path =
+            crate::session::config::profile_config::get_profile_config_path(PROFILE).unwrap();
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            profile_path,
+            "[session.agent_detect_as]\nwork-claude = \"claude\"\n",
+        )
+        .unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(PROFILE);
+        let _home = EnvGuard::set(&[("HOME", root.path().to_str().unwrap())]);
+        let mut inst = tool_instance("work-claude", root.path().to_str().unwrap());
+        inst.source_profile = PROFILE.into();
+        inst.command = "work-claude".into();
+        assert!(inst.execution_agent().is_err());
+        let mut first = inst.command.clone();
+        assert!(!inst
+            .apply_session_flags(&mut first, "test", None, None)
+            .unwrap());
+        let sid = inst.agent_session_id.clone().expect("fresh Claude pin");
+        assert_eq!(first, format!("work-claude --session-id {sid}"));
+
+        let encoded = crate::session::capture::encode_claude_project_path(&inst.project_path);
+        let project = root.path().join(".claude/projects").join(encoded);
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+        let mut resumed = inst.command.clone();
+        assert!(inst
+            .apply_session_flags(&mut resumed, "test", None, None)
+            .unwrap());
+        assert_eq!(resumed, format!("work-claude --resume {sid}"));
+        for intent in [
+            ResumeIntent::Use(sid.clone()),
+            ResumeIntent::Fork { from: sid.clone() },
+        ] {
+            inst.resume_intent = intent;
+            let mut command = inst.command.clone();
+            assert!(inst
+                .apply_session_flags(&mut command, "test", None, None)
+                .is_err());
+            assert_eq!(command, "work-claude");
+        }
+        inst.resume_intent = ResumeIntent::Default;
+        for unsafe_command in [
+            "ssh -t host claude",
+            "/opt/work-claude",
+            "work-claude | cat",
+            "work-claude --",
+        ] {
+            inst.command = unsafe_command.into();
+            assert!(!inst.supports_native_resume(), "{unsafe_command}");
+            let mut command = unsafe_command.to_string();
+            assert!(!inst
+                .apply_session_flags(&mut command, "test", None, None)
+                .unwrap());
+            assert_eq!(command, unsafe_command);
+        }
+        inst.command = "codex".into();
+        assert!(inst.legacy_default_selector_agent().is_none());
+        inst.command = "work-claude".into();
+        inst.extra_args = "--resume external".into();
+        let mut conflict = "work-claude --resume external".to_string();
+        assert!(inst
+            .apply_session_flags(&mut conflict, "test", None, None)
+            .is_err());
+        let mut launched = tool_instance("work-claude", root.path().to_str().unwrap());
+        launched.source_profile = PROFILE.into();
+        launched.command = "work-claude".into();
+        let fresh = launched
+            .prepare_launch_command(launched.conversation_state())
+            .unwrap();
+        let launched_sid = launched.agent_session_id.clone().unwrap();
+        assert!(!fresh.is_existing);
+        assert!(fresh
+            .command
+            .unwrap()
+            .contains(&format!("work-claude --session-id {launched_sid}")));
+        std::fs::write(project.join(format!("{launched_sid}.jsonl")), "{}\n").unwrap();
+        let restart = launched
+            .prepare_launch_command(launched.conversation_state())
+            .unwrap();
+        assert!(restart.is_existing);
+        assert!(restart
+            .command
+            .unwrap()
+            .contains(&format!("work-claude --resume {launched_sid}")));
+    }
     #[test]
     fn cleared_intent_launches_fresh() {
         let mut claude = tool_instance("claude", "/tmp/x");

@@ -1073,6 +1073,113 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial]
+    fn moved_known_default_restart_probes_sid_without_rebinding_history() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("skipping: tmux unavailable");
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let _env = isolate_resume_environment(temp.path());
+        let _claude = install_fake_claude(temp.path(), "#!/bin/sh\nexit 1\n");
+        let before = temp.path().join("before");
+        let after = temp.path().join("after");
+        std::fs::create_dir_all(&before).unwrap();
+        std::fs::create_dir_all(&after).unwrap();
+        let profile = "moved-known-default-restart";
+        let sid = "11111111-2222-4333-8444-555555555555";
+        let mut inst = Instance::new("moved-known", before.to_str().unwrap());
+        inst.source_profile = profile.into();
+        inst.tool = "claude".into();
+        inst.command = "claude".into();
+        seed_claude_transcript(&mut inst, sid);
+        let known = inst.agent_session_binding.clone();
+        inst.project_path = after.to_str().unwrap().into();
+        for intent in [
+            ResumeIntent::Use(sid.into()),
+            ResumeIntent::Fork { from: sid.into() },
+        ] {
+            let mut explicit = inst.clone();
+            explicit.resume_intent = intent;
+            explicit.resume_binding = known.clone();
+            assert!(explicit
+                .prepare_launch_command(explicit.conversation_state())
+                .is_err());
+        }
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+        let outcome = inst
+            .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
+            .unwrap();
+        assert_eq!(outcome, StartOutcome::ResumeFailed { sid: sid.into() });
+        assert_eq!(inst.agent_session_binding, known);
+        assert_eq!(inst.resume_probe_failed_sid.as_deref(), Some(sid));
+        let saved = storage.load().unwrap();
+        assert_eq!(saved[0].agent_session_binding, known);
+        assert_eq!(saved[0].agent_session_id.as_deref(), Some(sid));
+        assert_eq!(saved[0].resume_probe_failed_sid.as_deref(), Some(sid));
+    }
+
+    #[test]
+    #[serial]
+    fn restart_auto_resume_setting_only_blocks_honor_policy() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("skipping: tmux unavailable");
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let _env = isolate_resume_environment(temp.path());
+        let sid = "44444444-4444-4444-4444-444444444444";
+        let script = format!("#!/bin/sh\ncase \"$*\" in *{sid}*) exit 1 ;; esac\nexec sleep 30\n");
+        let _claude = install_fake_claude(temp.path(), &script);
+        for (policy, expected_resume) in [
+            (ResumeAttemptPolicy::HonorAutoResumeSetting, false),
+            (ResumeAttemptPolicy::Allow, true),
+        ] {
+            let project = temp.path().join(format!("project-{expected_resume}"));
+            std::fs::create_dir_all(&project).unwrap();
+            let profile = format!("restart-policy-{expected_resume}");
+            let config =
+                crate::session::config::profile_config::get_profile_config_path(&profile).unwrap();
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            std::fs::write(config, "[session]\nauto_resume_on_restart = false\n").unwrap();
+            let mut inst = Instance::new("policy", project.to_str().unwrap());
+            inst.source_profile = profile.clone();
+            inst.tool = "claude".into();
+            inst.command = "claude".into();
+            seed_claude_transcript(&mut inst, sid);
+            let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(inst.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+            let outcome = inst.start_with_resume_fallback(None, true, policy).unwrap();
+            if expected_resume {
+                assert_eq!(outcome, StartOutcome::ResumeFailed { sid: sid.into() });
+                assert_eq!(
+                    storage.load().unwrap()[0].agent_session_id.as_deref(),
+                    Some(sid)
+                );
+            } else {
+                assert_eq!(outcome, StartOutcome::Fresh);
+                assert_ne!(inst.agent_session_id.as_deref(), Some(sid));
+            }
+            inst.kill_clean().unwrap();
+        }
+    }
+
     /// A sid whose resume probe already failed is never retried automatically (#2609).
     #[test]
     #[serial]

@@ -584,7 +584,7 @@ impl Instance {
         }
         let agent = execution
             .map(|execution| execution.agent)
-            .or_else(|| self.resolved_agent());
+            .or_else(|| self.default_selector_agent());
 
         let (cmd, is_existing, omp_capture_plan, launch_env) = if self.is_sandboxed() {
             let image = self
@@ -1302,6 +1302,72 @@ mod tests {
             );
         }
     }
+    #[test]
+    #[serial_test::serial]
+    fn default_known_target_attempts_moved_context_without_rebinding() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", root.path().to_str().unwrap()),
+            ("CODEX_HOME", root.path().join("codex-a").to_str().unwrap()),
+        ]);
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let _codex = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "codex",
+            "#!/bin/sh\nexit 1\n",
+        );
+        for name in ["codex-a", "codex-b"] {
+            let home = root.path().join(name);
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(home.join("auth.json"), r#"{"OPENAI_API_KEY":"test"}"#).unwrap();
+        }
+        let sid = "11111111-2222-4333-8444-555555555555";
+        for agent in ["claude", "codex"] {
+            let before = root.path().join(format!("{agent}-before"));
+            let after = root.path().join(format!("{agent}-after"));
+            std::fs::create_dir_all(&before).unwrap();
+            std::fs::create_dir_all(&after).unwrap();
+            let mut inst = tool_instance(agent, before.to_str().unwrap());
+            inst.command = agent.into();
+            let known = inst.asserted_resume_binding(sid, None).unwrap();
+            inst.set_agent_conversation(Some(sid.into()), Some(known.clone()), None);
+            if agent == "claude" {
+                inst.project_path = after.to_str().unwrap().into();
+            }
+            let _changed = (agent == "codex").then(|| {
+                crate::session::test_support::EnvGuard::set(&[(
+                    "CODEX_HOME",
+                    root.path().join("codex-b").to_str().unwrap(),
+                )])
+            });
+            let prepared = inst
+                .prepare_launch_command(inst.conversation_state())
+                .unwrap();
+            let flag = if agent == "codex" {
+                "resume "
+            } else {
+                "--resume "
+            };
+            assert!(prepared.command.unwrap().contains(&format!("{flag}{sid}")));
+            assert_eq!(inst.agent_session_binding.as_ref(), Some(&known));
+            for intent in [
+                ResumeIntent::Use(sid.into()),
+                ResumeIntent::Fork { from: sid.into() },
+            ] {
+                inst.resume_intent = intent;
+                inst.resume_binding = Some(known.clone());
+                assert!(inst
+                    .prepare_launch_command(inst.conversation_state())
+                    .is_err());
+            }
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn sandboxed_assertion_keeps_the_native_container_store() {

@@ -334,7 +334,13 @@ impl Instance {
             } else if let Some(sid) = self.agent_session_id.clone() {
                 let existing = self.agent_session_binding.as_ref().filter(|binding| {
                     binding.session_id == sid
-                        && binding.execution.as_ref() == Some(&execution.binding)
+                        && (binding.execution.as_ref() == Some(&execution.binding)
+                            || (matches!(self.resume_intent, ResumeIntent::Default)
+                                && binding.is_known()
+                                && binding
+                                    .execution
+                                    .as_ref()
+                                    .is_some_and(|prior| prior.agent == execution.binding.agent)))
                 });
                 let binding =
                     if matches!(prepared.expected_conversation.intent, ResumeIntent::Use(_)) {
@@ -352,7 +358,14 @@ impl Instance {
             }
         } else {
             self.active_execution = None;
-            self.agent_session_binding = None;
+            if !matches!(self.resume_intent, ResumeIntent::Default)
+                || self.agent_session_binding.as_ref().is_none_or(|binding| {
+                    self.agent_session_id.as_deref() != Some(binding.session_id.as_str())
+                        || !binding.is_known()
+                })
+            {
+                self.agent_session_binding = None;
+            }
         }
         if !prepared.is_existing {
             if let Some(prior_sid) = prepared.expected_conversation.session_id.clone() {

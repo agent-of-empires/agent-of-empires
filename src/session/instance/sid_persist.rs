@@ -515,6 +515,222 @@ mod tests {
         }
     }
 
+    #[test]
+    #[serial]
+    fn foreign_and_parked_owners_guard_published_sid_by_namespace() {
+        use crate::session::instance::{ActiveExecution, PriorToolSession};
+        use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
+        let sid = VALID_SID;
+        for (namespace, expected) in [
+            ("same", SidWrite::Skipped),
+            ("unknown", SidWrite::Skipped),
+            ("different", SidWrite::Applied),
+        ] {
+            let profile = "sid-parked-owner-namespace";
+            let mut claimant = make_inst(profile, "claimant");
+            let source = ExecutionBinding {
+                agent: "omp".into(),
+                stores: vec!["/tmp/sessions/bucket".into()],
+                configuration: Vec::new(),
+                cwd: "/tmp/x".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            };
+            claimant.active_execution = Some(ActiveExecution {
+                launch_id: "qualified".into(),
+                binding: source.clone(),
+                capture: None,
+                container: None,
+            });
+            let mut parked = make_inst(profile, "parked");
+            let mut other = source.clone();
+            other.stores = vec!["/tmp/other-store/bucket".into()];
+            let binding = if namespace == "unknown" {
+                ConversationBinding::unknown(sid)
+            } else {
+                ConversationBinding {
+                    session_id: sid.into(),
+                    execution: Some(if namespace == "same" {
+                        source.clone()
+                    } else {
+                        other
+                    }),
+                    provenance: ConversationProvenance::Observed,
+                    transcript_path: None,
+                }
+            };
+            parked.prior_tool_session_ids.insert(
+                "omp".into(),
+                PriorToolSession {
+                    agent_session_id: Some(sid.into()),
+                    agent_session_binding: Some(binding),
+                    ..Default::default()
+                },
+            );
+            let (_tmp, _home, storage) = seeded(profile, &[&parked, &claimant]);
+            let mut observed = observation(sid);
+            observed.execution = claimant.active_execution.clone();
+            observed.source = Some(source);
+            assert_eq!(
+                persist_session_to_storage(
+                    profile,
+                    &claimant.id,
+                    &observed,
+                    &claimant.conversation_state(),
+                    &FileWatchService::noop()
+                ),
+                expected,
+                "{namespace}"
+            );
+            assert_eq!(
+                disk_sid(profile, &claimant.id).as_deref(),
+                (expected == SidWrite::Applied).then_some(sid),
+                "{namespace}"
+            );
+            assert_eq!(
+                storage.load().unwrap()[0].prior_tool_session_ids["omp"]
+                    .agent_session_id
+                    .as_deref(),
+                Some(sid)
+            );
+        }
+        let profile = "sid-foreign-on-disk";
+        let mut owner = make_inst(profile, "owner");
+        owner.agent_session_id = Some(sid.into());
+        let claimant = make_inst(profile, "claimant");
+        let (_tmp, _home, _) = seeded(profile, &[&owner, &claimant]);
+        assert_eq!(
+            persist_session_to_storage(
+                profile,
+                &claimant.id,
+                &observation(sid),
+                &claimant.conversation_state(),
+                &FileWatchService::noop()
+            ),
+            SidWrite::Skipped
+        );
+        assert_eq!(disk_sid(profile, &claimant.id), None);
+        assert_eq!(disk_sid(profile, &owner.id).as_deref(), Some(sid));
+    }
+
+    #[test]
+    #[serial]
+    fn known_pin_transfers_all_compatible_owners_but_not_stale_or_unknown_ones() {
+        use crate::session::instance::PriorToolSession;
+        use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
+        let profile = "sid-pin-owner-transfer";
+        let sid = VALID_SID;
+        let binding = ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec!["/tmp/claude-store".into()],
+                configuration: Vec::new(),
+                cwd: "/tmp/x".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            }),
+            provenance: ConversationProvenance::Asserted,
+            transcript_path: None,
+        };
+        let mut first = make_inst(profile, "first");
+        first.set_agent_conversation(Some(sid.into()), Some(binding.clone()), None);
+        let mut second = make_inst(profile, "second");
+        second.set_agent_conversation(Some(sid.into()), Some(binding.clone()), None);
+        let mut parked = make_inst(profile, "parked");
+        parked.prior_tool_session_ids.insert(
+            "claude".into(),
+            PriorToolSession {
+                agent_session_id: Some(sid.into()),
+                agent_session_binding: Some(binding.clone()),
+                acp_session_id: Some("unrelated-acp".into()),
+                ..Default::default()
+            },
+        );
+        let mut pinned = make_inst(profile, "pinned");
+        pinned.resume_intent = ResumeIntent::Use(sid.into());
+        pinned.resume_binding = Some(binding.clone());
+        let expected = pinned.conversation_state();
+        let (_tmp, _home, storage) = seeded(profile, &[&first, &second, &parked, &pinned]);
+        let mut live = pinned.clone();
+        live.set_agent_conversation(Some(sid.into()), Some(binding.clone()), None);
+        live.identity_publisher_launched = true;
+        assert_eq!(
+            live.persist_session_id_with_storage(&storage, &expected),
+            SidPersistOutcome::Published
+        );
+        let disk = storage.load().unwrap();
+        assert_eq!(
+            disk.iter()
+                .find(|row| row.id == pinned.id)
+                .unwrap()
+                .agent_session_id
+                .as_deref(),
+            Some(sid)
+        );
+        for owner in [&first, &second] {
+            assert_eq!(
+                disk.iter()
+                    .find(|row| row.id == owner.id)
+                    .unwrap()
+                    .agent_session_id,
+                None
+            );
+        }
+        let parked_state = &disk
+            .iter()
+            .find(|row| row.id == parked.id)
+            .unwrap()
+            .prior_tool_session_ids["claude"];
+        assert_eq!(parked_state.agent_session_id, None);
+        assert_eq!(
+            parked_state.acp_session_id.as_deref(),
+            Some("unrelated-acp")
+        );
+
+        parked
+            .prior_tool_session_ids
+            .get_mut("claude")
+            .unwrap()
+            .agent_session_binding = None;
+        seed(profile, &[&parked, &pinned]);
+        let mut refused = pinned.clone();
+        refused.set_agent_conversation(Some(sid.into()), Some(binding.clone()), None);
+        assert_eq!(
+            refused.persist_session_id_with_storage(&storage, &expected),
+            SidPersistOutcome::Published
+        );
+        assert_eq!(disk_sid(profile, &pinned.id), None);
+        assert_eq!(
+            storage
+                .load()
+                .unwrap()
+                .iter()
+                .find(|row| row.id == parked.id)
+                .unwrap()
+                .prior_tool_session_ids["claude"]
+                .agent_session_id
+                .as_deref(),
+            Some(sid)
+        );
+
+        first.agent_session_id = Some(sid.into());
+        let launcher = make_inst(profile, "stale-launcher");
+        seed(profile, &[&first, &launcher]);
+        let mut stale = launcher.clone();
+        stale.agent_session_id = Some(sid.into());
+        let stale_expected = ConversationState {
+            intent: ResumeIntent::Use(sid.into()),
+            ..launcher.conversation_state()
+        };
+        assert_eq!(
+            stale.persist_session_id_with_storage(&storage, &stale_expected),
+            SidPersistOutcome::Published
+        );
+        assert_eq!(disk_sid(profile, &launcher.id), None);
+        assert_eq!(disk_sid(profile, &first.id).as_deref(), Some(sid));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn persist_session_to_storage_delivers_notification_to_in_process_subscriber() {

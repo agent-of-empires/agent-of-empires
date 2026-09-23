@@ -1796,16 +1796,21 @@ impl Instance {
             .context("conversation provenance is unknown; use aoe session set-session-id with an explicitly configured execution identity and store before resuming or forking")?;
         anyhow::ensure!(binding.is_known() || (!explicit && binding.provenance == ConversationProvenance::Preallocated),
             "conversation has not been observed or explicitly asserted; a preallocated ID is not a forkable conversation");
-        // An id AoE preallocated for this session has no conversation behind it
-        // yet, so a launch whose context moved (a worktree or workspace
-        // conversion) rebinds it instead of failing. A known conversation still
-        // has to match this launch exactly.
+        // Default may try a known ID after an external context move; only a qualified
+        // observation can rebind its historical execution identity. Explicit operations stay strict.
         anyhow::ensure!(
             binding
                 .execution
                 .as_ref()
                 .is_some_and(|bound| Self::execution_identity_matches(bound, execution))
-                || !binding.is_known(),
+                || !binding.is_known()
+                || (matches!(self.resume_intent, ResumeIntent::Default)
+                    && binding.is_known()
+                    && binding.execution.as_ref().is_some_and(|bound| {
+                        bound.agent == execution.agent
+                            && bound.filesystem == execution.filesystem
+                            && bound.cwd_filesystem == execution.cwd_filesystem
+                    })),
             "conversation execution identity, store or working directory differs from this launch; restore its context or explicitly rebind the intended conversation"
         );
         Ok(())

@@ -816,6 +816,44 @@ mod tests {
 
     #[test]
     #[serial]
+    fn omp_pin_requires_binding_and_current_typed_generation() {
+        let sid = "019342ab-1234-7def-8901-abcdef012340";
+        for case in ["unbound", "stale", "legacy"] {
+            let temp = tempdir().unwrap();
+            let _guard = storage_home_guard(&temp);
+            let profile = "sync-omp-pin-negative";
+            let mut inst = pinned_omp_instance(profile, sid, "launch-current");
+            if case == "unbound" {
+                inst.agent_session_binding = None;
+                inst.resume_binding = None;
+                inst.active_execution = None;
+            }
+            let expected = inst.conversation_state();
+            seed_instance_on_disk(profile, &inst);
+            match case {
+                "legacy" => attach_poller_with_legacy_omp_update(&mut inst, sid),
+                "stale" => attach_poller_with_omp_update(&mut inst, sid, "launch-stale"),
+                _ => attach_poller_with_omp_update(&mut inst, sid, "launch-current"),
+            }
+            let mut instances = vec![inst];
+            let outcome = drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
+            assert!(outcome.applied.is_empty(), "{case}");
+            assert_eq!(instances[0].conversation_state(), expected, "{case}");
+            assert_eq!(
+                Storage::new_unwatched(profile).unwrap().load().unwrap()[0].conversation_state(),
+                expected,
+                "{case}"
+            );
+            assert_eq!(
+                instances[0].resume_intent,
+                ResumeIntent::Use(sid.into()),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
     fn omp_pin_confirmation_cas_loss_retries_sticky_observation() {
         let temp = tempdir().unwrap();
         let _guard = storage_home_guard(&temp);

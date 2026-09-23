@@ -693,4 +693,121 @@ mod tests {
         });
         assert!(inst.prime_agent_capture_plan_with(&config, store).is_none());
     }
+    #[test]
+    #[serial_test::serial]
+    fn prime_root_publisher_rejects_child_and_resumes_parent() {
+        if which::which("node").is_err() {
+            eprintln!("skipping: node not found");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let store = tmp.path().join("store");
+        let sessions = store.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mut inst = tool_instance("prime-agent", tmp.path().to_str().unwrap());
+        inst.sandbox_info = Some(test_sandbox("prime-root", Some("/workspace/project")));
+        let parent = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
+        let child = "018f47a6-7b80-7cc3-98a2-37b5f486b2a2";
+        for (name, id, depth) in [("parent", parent, 0), ("child", child, 1)] {
+            std::fs::write(sessions.join(format!("{name}.jsonl")), format!("{}\n",
+                serde_json::json!({"type":"session", "id":id, "rlmDepth":depth, "cwd":"/workspace/project"}))).unwrap();
+        }
+        let sidecar = store.join("aoe-session").join(&inst.id).join("session_id");
+        let normal = store.join("pi-default/session_id");
+        let extension = store.join("extensions/aoe-session-id.js");
+        std::fs::create_dir_all(extension.parent().unwrap()).unwrap();
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/assets/session/aoe-session-id.js"
+            ),
+            &extension,
+        )
+        .unwrap();
+        let script = r#"
+import { readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+const extension = (await import(pathToFileURL(process.argv[1]).href)).default;
+process.chdir(process.argv[4]);
+async function emit(target, rootOnly, id, name, depth) {
+  process.env.AOE_SESSION_ID_FILE = target;
+  process.env.AOE_SESSION_ROOT_ONLY = rootOnly ? '1' : '0';
+  let onStart;
+  extension({ on(event, handler) { if (event === 'session_start') onStart = handler; } });
+  await onStart({}, { sessionManager: {
+    getSessionId: () => id,
+    getSessionFile: () => 'sessions/' + name + '.jsonl',
+    getHeader: () => ({ rlmDepth: depth, cwd: '/workspace/project' }),
+  } });
+}
+const [root, normal] = [process.argv[2], process.argv[3]];
+await emit(root, true, '018f47a6-7b80-7cc3-98a2-37b5f486b2a1', 'parent', 0);
+await emit(root, true, '018f47a6-7b80-7cc3-98a2-37b5f486b2a2', 'child', undefined);
+await emit(root, true, '018f47a6-7b80-7cc3-98a2-37b5f486b2a2', 'child', 1);
+await emit(normal, false, '018f47a6-7b80-7cc3-98a2-37b5f486b2a2', 'child', 1);
+process.stdout.write(readFileSync(normal, 'utf8'));
+"#;
+        let output = std::process::Command::new("node")
+            .args(["--input-type=module", "--eval", script])
+            .arg(&extension)
+            .arg(&sidecar)
+            .arg(&normal)
+            .arg(&store)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), child);
+        assert_eq!(
+            std::fs::read_to_string(normal.parent().unwrap().join("session_path"))
+                .unwrap()
+                .trim(),
+            "sessions/child.jsonl"
+        );
+        let plan = PrimeAgentCapturePlan {
+            store: store.clone(),
+            session_dir: "sessions".into(),
+            container_session_dir: sessions.clone(),
+            container_cwd: "/workspace/project".into(),
+        };
+        assert_eq!(
+            validated_prime_root_publication(&plan, &inst.id),
+            Some(PrimeRootPublication::Ready(parent.into()))
+        );
+        let record = sidecar.parent().unwrap().join("root_session");
+        std::fs::write(&record, serde_json::json!({
+            "id": child, "path": sessions.join("child.jsonl"), "cwd": "/workspace/project", "rlmDepth": 0
+        }).to_string()).unwrap();
+        assert_eq!(validated_prime_root_publication(&plan, &inst.id), None);
+        std::fs::write(&record, serde_json::json!({
+            "id": parent, "path": sessions.join("parent.jsonl"), "cwd": "/workspace/project", "rlmDepth": 0
+        }).to_string()).unwrap();
+        let binding = crate::session::ExecutionBinding {
+            agent: "prime-agent".into(),
+            stores: vec![store.clone()],
+            configuration: Vec::new(),
+            cwd: "/workspace/project".into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        inst.active_execution = Some(ActiveExecution {
+            launch_id: "root-launch".into(),
+            binding,
+            capture: Some(CaptureContext::Prime {
+                plan,
+                sidecar: Some(SessionSidecarSource::SandboxDir(store)),
+            }),
+            container: None,
+        });
+        let mut command = "prime-agent".to_string();
+        let agent = inst.resolved_agent();
+        assert!(inst
+            .apply_session_flags(&mut command, "test", agent, None)
+            .unwrap());
+        assert_eq!(command, format!("prime-agent --resume {parent}"));
+    }
 }
