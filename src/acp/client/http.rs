@@ -146,12 +146,32 @@ impl HttpClient {
         scope: Scope<'_>,
     ) -> Result<reqwest::Response, HttpError> {
         let res = self.send_authed(build).await?;
+        finish(res, scope).await
+    }
+
+    /// Like `send`, but retries once after a passphrase step-up if the
+    /// daemon reports `elevation_required`: plugin-mutation endpoints
+    /// (enable/disable, worker restart) require an elevated session whenever
+    /// the caller isn't loopback-trusted (e.g. a passphrase daemon reached
+    /// behind a proxy, or a remote one reached directly), and nothing else
+    /// in the CLI ever re-confirms the passphrase on its own.
+    async fn send_elevated(
+        &self,
+        build: impl Fn() -> reqwest::RequestBuilder,
+        scope: Scope<'_>,
+    ) -> Result<reqwest::Response, HttpError> {
+        let res = self.send_authed(&build).await?;
         let status = res.status();
         if status.is_success() {
             return Ok(res);
         }
         let body = res.text().await.unwrap_or_default();
-        Err(classify_error(status, &body, scope))
+        if !is_elevation_required(status, &body) {
+            return Err(classify_error(status, &body, scope));
+        }
+        passphrase_session::elevate(&self.endpoint, &self.passphrase_session).await?;
+        let res = self.send_authed(&build).await?;
+        finish(res, scope).await
     }
 
     async fn get_json<T: DeserializeOwned>(
@@ -345,7 +365,7 @@ impl HttpClient {
     ) -> Result<(), HttpError> {
         let path = format!("/api/plugins/{plugin_id}/enabled");
         let body = serde_json::json!({ "enabled": enabled });
-        self.send(
+        self.send_elevated(
             || self.request(Method::POST, &path).json(&body),
             Scope::Global,
         )
@@ -356,7 +376,7 @@ impl HttpClient {
     /// Reload plugins from disk and replace this plugin's worker.
     pub async fn restart_plugin_worker(&self, plugin_id: &str) -> Result<(), HttpError> {
         let path = format!("/api/plugins/{plugin_id}/worker/restart");
-        self.send(|| self.request(Method::POST, &path), Scope::Global)
+        self.send_elevated(|| self.request(Method::POST, &path), Scope::Global)
             .await?;
         Ok(())
     }
@@ -606,6 +626,28 @@ impl HttpClient {
     }
 }
 
+async fn finish(res: reqwest::Response, scope: Scope<'_>) -> Result<reqwest::Response, HttpError> {
+    let status = res.status();
+    if status.is_success() {
+        return Ok(res);
+    }
+    let body = res.text().await.unwrap_or_default();
+    Err(classify_error(status, &body, scope))
+}
+
+/// Whether a 403 names the `elevation_required` error: a plugin-mutation
+/// endpoint's signal that the caller is logged in but has not step-up
+/// confirmed the passphrase within the last 15 minutes (`src/server/login.rs`
+/// `ELEVATION_LIFETIME`). Checks the `error` field rather than substring
+/// matching so an unrelated body mentioning the same word never misfires.
+fn is_elevation_required(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::FORBIDDEN
+        && serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("error")?.as_str().map(|e| e == "elevation_required"))
+            .unwrap_or(false)
+}
+
 fn classify_error(status: StatusCode, body: &str, scope: Scope<'_>) -> HttpError {
     match (status, scope) {
         (StatusCode::UNAUTHORIZED, _) => HttpError::Unauthorized,
@@ -816,5 +858,30 @@ mod tests {
         // #1525: the 401 message must not blame a token env var.
         let rendered = HttpError::Unauthorized.to_string();
         assert!(!rendered.contains("AOE_DAEMON_TOKEN") && rendered.contains("401"));
+    }
+
+    #[test]
+    fn is_elevation_required_matches_only_the_named_error_on_403() {
+        assert!(is_elevation_required(
+            StatusCode::FORBIDDEN,
+            r#"{"error":"elevation_required","message":"Re-enter the passphrase to continue"}"#
+        ));
+        // Wrong status, right body shape.
+        assert!(!is_elevation_required(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"elevation_required"}"#
+        ));
+        // Right status, different error.
+        assert!(!is_elevation_required(
+            StatusCode::FORBIDDEN,
+            r#"{"error":"read_only","message":"Server is in read-only mode"}"#
+        ));
+        // The substring appears only inside `message`, not as the `error` value.
+        assert!(!is_elevation_required(
+            StatusCode::FORBIDDEN,
+            r#"{"error":"read_only","message":"see elevation_required docs"}"#
+        ));
+        // Malformed body.
+        assert!(!is_elevation_required(StatusCode::FORBIDDEN, "not json"));
     }
 }
