@@ -6147,24 +6147,16 @@ impl HomeView {
         self.start_live_send()
     }
 
-    /// Translate one key event in live-send mode and hand the result to
-    /// the background worker. The worker owns the tmux Session and runs
-    /// `send-keys` off the UI thread so a slow fork+exec never blocks
-    /// the redraw loop; literal-key runs coalesce into a single tmux
-    /// call so fast typing isn't N forks. Ctrl+q clears `live_send`
-    /// and drops the worker (which closes its channel, exiting the
-    /// thread cleanly on the next iteration).
-    ///
-    /// Before dispatching we re-verify that the target session still
-    /// exists at the same tmux name as it had at entry time. If a peer
-    /// process deleted the session or a rename diverged the name from
-    /// what the worker is targeting, the user would otherwise type
-    /// into the void with only a `tracing::warn!` for company. Auto-
-    /// exit + info dialog instead.
+    /// Forward keys off the UI thread only while the daemon grants native
+    /// interaction and the pane still matches the entry target.
     fn handle_live_send_key(&mut self, key: KeyEvent) {
         let Some(state) = self.live_send.clone() else {
             return;
         };
+        if !self.session_feed.native_interaction_available() {
+            self.teardown_live_send();
+            return;
+        }
 
         // Leader menu: a prior keystroke matched the configured leader
         // (tmux-style prefix, default Ctrl+B), so this key picks a
@@ -6335,14 +6327,10 @@ impl HomeView {
         // visible again (and so the agent reflows back to the previewed size).
         if let Some(id) = &live_session_id {
             self.clear_preview_pane_sync(id);
+            self.reseat_cursor_after_rebuild();
+            // Live-mode highlights no longer match the resized preview.
+            self.clear_preview_selection();
         }
-        self.reseat_cursor_after_rebuild();
-        // Preview selections also work outside live mode now, but a
-        // live-mode highlight pins to the live-resized pane coords,
-        // and exiting reflows the preview back to its normal size.
-        // Drop the selection so the highlight can't survive into a
-        // pane it no longer points at.
-        self.clear_preview_selection();
     }
 
     /// Detect deletion, a changed transport name, or confirmed pane disappearance.

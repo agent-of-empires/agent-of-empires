@@ -97,7 +97,6 @@ impl HomeView {
         }
 
         let stub_id = stub.id.clone();
-        let target_profile = data.profile.clone();
         self.creating_stub_id = Some(stub_id.clone());
         self.instances.insert(stub_id.clone(), stub);
         self.rebuild_group_trees();
@@ -119,7 +118,8 @@ impl HomeView {
         }
         self.new_dialog = None;
 
-        let body = wizard_create_body(&data, trust_hooks);
+        let mut body = wizard_create_body(&data, trust_hooks);
+        body.idempotency_key = Some(stub_id.clone());
         if let Err(error) = self.session_feed.create_session(stub_id.clone(), body) {
             self.pending_creation = None;
             self.discard_creating_stub();
@@ -131,9 +131,10 @@ impl HomeView {
         }
         self.pending_creation = Some(PendingCreation {
             daemon_id: None,
-            title: stub_title,
-            profile: target_profile,
+            request_key: stub_id,
             cancel_requested: false,
+            cancel_sent: false,
+            outcome_unknown: false,
         });
     }
 
@@ -153,10 +154,9 @@ impl HomeView {
             if let Some(id) = pending.daemon_id.clone() {
                 id
             } else {
-                let Some(row) = rows
-                    .iter()
-                    .find(|row| row.title == pending.title && row.profile == pending.profile)
-                else {
+                let Some(row) = rows.iter().find(|row| {
+                    row.idempotency_key.as_deref() == Some(pending.request_key.as_str())
+                }) else {
                     return false;
                 };
                 pending.daemon_id = Some(row.id.clone());
@@ -188,12 +188,11 @@ impl HomeView {
         }
     }
 
-    /// The token the feed keyed this creation under: the placeholder's id while
-    /// it is displayed, or the daemon's id once the placeholder is gone.
+    /// The command lane always keys the response by the original request key.
     fn creating_token(&self) -> Option<&str> {
-        self.creating_stub_id
-            .as_deref()
-            .or_else(|| self.pending_creation.as_ref()?.daemon_id.as_deref())
+        self.pending_creation
+            .as_ref()
+            .map(|pending| pending.request_key.as_str())
     }
 
     /// Remove the creating placeholder and its buffered progress. A creation
@@ -218,9 +217,12 @@ impl HomeView {
             return;
         };
         pending.cancel_requested = true;
-        if let Some(id) = pending.daemon_id.clone() {
-            if let Err(error) = self.session_feed.cancel_creation(id) {
-                tracing::warn!(target: "tui.home", %error, "creation cancellation was refused");
+        if let Some(id) = pending.daemon_id.clone().filter(|_| !pending.cancel_sent) {
+            match self.session_feed.cancel_creation(id) {
+                Ok(()) => pending.cancel_sent = true,
+                Err(error) => {
+                    tracing::warn!(target: "tui.home", %error, "creation cancellation was refused")
+                }
             }
         }
         self.discard_creating_stub();
@@ -243,7 +245,7 @@ impl HomeView {
             };
             let Some(entry) = progress.iter().find(|entry| match &pending.daemon_id {
                 Some(id) => entry.session_id == *id,
-                None => entry.title == pending.title && entry.profile == pending.profile,
+                None => entry.request_key.as_deref() == Some(pending.request_key.as_str()),
             }) else {
                 return false;
             };
@@ -252,7 +254,7 @@ impl HomeView {
                 changed = true;
                 bound = Some(entry.session_id.clone());
             }
-            if pending.cancel_requested {
+            if pending.cancel_requested && !pending.cancel_sent {
                 deferred_cancel = Some(entry.session_id.clone());
             }
             if let Some(buffer) = stub_id
@@ -282,78 +284,142 @@ impl HomeView {
         // A cancellation asked for before the daemon named the creation lands
         // here, once it can be addressed.
         if let Some(id) = deferred_cancel {
-            if let Err(error) = self.session_feed.cancel_creation(id) {
-                tracing::warn!(target: "tui.home", %error, "creation cancellation was refused");
+            match self.session_feed.cancel_creation(id) {
+                Ok(()) => self.pending_creation.as_mut().unwrap().cancel_sent = true,
+                Err(error) => {
+                    tracing::warn!(target: "tui.home", %error, "creation cancellation was refused")
+                }
             }
         }
         changed
     }
 
-    /// Apply any pending creation results from the daemon.
-    /// Returns Some(session_id) if creation succeeded and we should attach.
+    /// Attach only after a confirmed receipt or a matching canonical row.
     pub fn apply_creation_results(&mut self) -> Option<String> {
+        use crate::tui::session_feed::CommandFailure;
         let settled = self.session_feed.drain_creation_results();
-        let (stub_id, result) = settled
+        if let Some((stub_id, result)) = settled
             .into_iter()
-            .find(|(token, _)| self.creating_token() == Some(token.as_str()))?;
-        let cancelled = self
-            .pending_creation
-            .as_ref()
-            .is_some_and(|pending| pending.cancel_requested);
-        self.creating_stub_id = None;
-        self.pending_creation = None;
-        self.instances.shift_remove(&stub_id);
-        self.creating_hook_progress.remove(&stub_id);
-        if cancelled {
+            .find(|(token, _)| self.creating_token() == Some(token.as_str()))
+        {
+            if let Err(CommandFailure::Unknown(message)) = &result {
+                if let Some(pending) = self.pending_creation.as_mut() {
+                    pending.outcome_unknown = true;
+                }
+                self.info_dialog = Some(InfoDialog::sized_to_fit(
+                    "Creation outcome unknown",
+                    &format!("{message}\nThe daemon may still be creating this session. Wait for its canonical row or cancel; do not submit a second creation yet."),
+                ));
+                return self.resolve_unknown_creation();
+            }
+            let cancelled = self
+                .pending_creation
+                .as_ref()
+                .is_some_and(|pending| pending.cancel_requested);
+            self.clear_creation_tracking(&stub_id);
+            if cancelled {
+                return match result {
+                    Err(CommandFailure::Rejected(_)) => {
+                        self.flash_status("Creation was refused before commit");
+                        None
+                    }
+                    Ok(_) => {
+                        self.flash_status(
+                            "Creation had already committed; cancellation was too late",
+                        );
+                        self.reload().ok();
+                        None
+                    }
+                    Err(CommandFailure::Unknown(_)) => unreachable!(),
+                };
+            }
             return match result {
-                // Cancelled while the daemon still owned the creation: nothing
-                // was committed, so the placeholder is all that is left to drop.
-                Err(_) => {
-                    self.flash_status("Creation cancelled");
+                Ok(receipt) => self.commit_created_session(
+                    receipt.outcome.id,
+                    &receipt.outcome.profile,
+                    &receipt.outcome.warnings,
+                ),
+                Err(CommandFailure::Rejected(message)) => {
+                    self.rebuild_group_trees();
+                    self.rebuild_flat_items();
+                    self.update_selected();
+                    self.info_dialog = Some(InfoDialog::sized_to_fit("Creation Failed", &message));
                     None
                 }
-                // The daemon had already committed when the cancellation
-                // arrived, so the session stands and the user keeps it.
-                Ok(_) => {
-                    self.flash_status("Creation had already committed; cancellation was too late");
-                    self.reload().ok();
-                    None
-                }
+                Err(CommandFailure::Unknown(_)) => unreachable!(),
             };
         }
-        match result {
-            Ok(receipt) => {
-                let session_id = receipt.outcome.id.clone();
-                crate::tui::app::record_session_create();
-                let warnings = receipt.outcome.warnings.clone();
-                // The daemon committed before answering; load the row it
-                // published instead of rebuilding one from the response.
-                if let Err(error) = self.reload() {
-                    tracing::warn!(target: "tui.home", "reload after creation failed: {error}");
-                }
-                self.select_and_reveal_session(&session_id);
-                self.new_dialog = None;
-                if !warnings.is_empty() {
-                    self.info_dialog = Some(InfoDialog::sized_to_fit(
-                        "Session warnings",
-                        &format!(
-                            "Session was created, but the following warnings were emitted during setup:\n\n{}",
-                            warnings.join("\n\n")
-                        ),
-                    ));
-                }
-                Some(session_id)
-            }
-            Err(error) => {
-                self.rebuild_group_trees();
-                self.rebuild_flat_items();
-                self.update_selected();
-                // Hook failures carry multi-line output; size to fit so the
-                // actual error is not clipped at the default 50x9.
-                self.info_dialog = Some(InfoDialog::sized_to_fit("Creation Failed", &error));
-                None
-            }
+        self.resolve_unknown_creation()
+    }
+
+    fn resolve_unknown_creation(&mut self) -> Option<String> {
+        let pending = self
+            .pending_creation
+            .as_ref()
+            .filter(|pending| pending.outcome_unknown)?;
+        let id = pending.daemon_id.as_deref()?;
+        let row = self.session_feed.applied_session(id)?.clone();
+        if row.idempotency_key.as_deref() != Some(pending.request_key.as_str())
+            || matches!(row.status.as_str(), "Creating" | "Starting")
+        {
+            return None;
         }
+        let cancelled = pending.cancel_requested;
+        let stub_id = pending.request_key.clone();
+        self.clear_creation_tracking(&stub_id);
+        if cancelled {
+            self.flash_status("Creation committed before cancellation; session is retained");
+            self.reload().ok();
+            return None;
+        }
+        self.commit_created_session(row.id, &row.profile, &row.warnings)
+    }
+
+    fn clear_creation_tracking(&mut self, stub_id: &str) {
+        self.creating_stub_id = None;
+        self.pending_creation = None;
+        self.instances.shift_remove(stub_id);
+        self.creating_hook_progress.remove(stub_id);
+    }
+
+    fn commit_created_session(
+        &mut self,
+        session_id: String,
+        profile: &str,
+        warnings: &[String],
+    ) -> Option<String> {
+        crate::tui::app::record_session_create();
+        let loaded = if self
+            .active_profile
+            .as_deref()
+            .is_some_and(|active| active != profile)
+        {
+            self.switch_profile(Some(profile.to_owned()))
+        } else {
+            self.reload()
+        };
+        if let Err(error) = loaded {
+            self.info_dialog = Some(InfoDialog::sized_to_fit("Session created", &format!(
+                "The daemon created the session in profile {profile}, but its local view could not load: {error}"
+            )));
+            return None;
+        }
+        if self.get_instance(&session_id).is_none() {
+            self.info_dialog = Some(InfoDialog::new("Session created", "The session is committed but not visible yet; refresh its profile before attaching."));
+            return None;
+        }
+        self.select_and_reveal_session(&session_id);
+        self.new_dialog = None;
+        if !warnings.is_empty() {
+            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                "Session warnings",
+                &format!(
+                    "Session was created, but setup emitted warnings:\n\n{}",
+                    warnings.join("\n\n")
+                ),
+            ));
+        }
+        Some(session_id)
     }
 
     /// Clear the placeholder on quit. The daemon keeps admitted work, so this
@@ -362,7 +428,7 @@ impl HomeView {
         let Some(pending) = self.pending_creation.as_ref() else {
             return;
         };
-        if let Some(id) = pending.daemon_id.clone() {
+        if let Some(id) = pending.daemon_id.clone().filter(|_| !pending.cancel_sent) {
             if let Err(error) = self.session_feed.cancel_creation(id) {
                 tracing::warn!(target: "tui.home", %error, "creation cancellation at quit was refused");
             }

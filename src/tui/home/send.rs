@@ -22,31 +22,22 @@ impl HomeView {
         self.mutate_instance(id, |inst| inst.status = status);
     }
 
-    /// Stamp `last_accessed_at` on a session (user-initiated interaction).
-    ///
-    /// Sunk rows (archived or snoozed) take the heavier `apply_user_action`
-    /// path so the auto-unarchive/unsnooze side effect in `touch_last_accessed`
-    /// is persisted (merge_from_tui doesn't carry those fields; without this,
-    /// reload would resurrect the sink from disk) and the row leaves the
-    /// Archived section visually on the same frame. Non-sunk rows stay on
-    /// the cheap mutate_instance path; their only mutation is the timestamp,
-    /// which save() already mirrors via merge_from_tui.
+    /// Mark a user interaction. The daemon owns archive and snooze transitions;
+    /// ordinary activity only updates the local timestamp.
     pub fn stamp_last_accessed(&mut self, id: &str) {
         let was_sunk = self
             .instances
             .get(id)
-            .map(|i| i.is_archived() || i.snoozed_until.is_some())
-            .unwrap_or(false);
+            .is_some_and(|i| i.is_archived() || i.snoozed_until.is_some());
         if was_sunk {
-            if let Err(e) = self.apply_user_action(id, |inst| inst.touch_last_accessed()) {
-                tracing::warn!(
-                    target: "tui.home",
-                    session_id = %id,
-                    error = %e,
-                    "stamp_last_accessed: failed to persist auto-unsink"
-                );
+            if !self.session_feed.has_pending(id) && !self.session_feed.has_queued(id) {
+                if let Err(error) = self
+                    .session_feed
+                    .submit(id.to_owned(), crate::daemon::SessionMutation::Access)
+                {
+                    tracing::warn!(target: "tui.home", session_id = %id, %error, "access request refused");
+                }
             }
-            self.rebuild_flat_items();
         } else {
             self.mutate_instance(id, |inst| inst.touch_last_accessed());
         }
@@ -67,7 +58,18 @@ impl HomeView {
         tmux_name: &str,
         target: live_send::LiveSendTarget,
         message: &str,
+        lease: &crate::tui::session_feed::NativeLease,
     ) {
+        if !lease.is_valid() {
+            return;
+        }
+        if !self.session_feed.native_interaction_available() {
+            self.info_dialog = Some(InfoDialog::new(
+                "Send Failed",
+                "Native interaction is unavailable.",
+            ));
+            return;
+        }
         let Some(inst) = self.get_instance(session_id).cloned() else {
             self.info_dialog = Some(InfoDialog::new(
                 "Send Failed",
@@ -114,6 +116,13 @@ impl HomeView {
         session_id: &str,
         choice: crate::tui::dialogs::PermissionResponseChoice,
     ) {
+        if !self.session_feed.native_interaction_available() {
+            self.info_dialog = Some(InfoDialog::new(
+                "Respond Failed",
+                "Native interaction is unavailable.",
+            ));
+            return;
+        }
         let Some(inst) = self.get_instance(session_id) else {
             return;
         };

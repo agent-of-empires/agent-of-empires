@@ -62,6 +62,47 @@ fn install_live_orphan(env: &mut TestEnv) {
     });
 }
 
+#[test]
+#[serial]
+fn degraded_snapshot_closes_live_send_without_disconnecting_sidebar() {
+    use crate::tui::session_feed::{SessionFeedResult, SidebarSource};
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    let _command_driver = env.view.session_feed.terminal_driver_for_test();
+    env.view
+        .session_feed
+        .publish_for_test(super::session_feed_tests::daemon_snapshot(&id, "Running"));
+    env.view.apply_session_feed();
+    assert!(env.view.session_feed.native_interaction_available());
+    install_live_for_first_session(&mut env);
+    assert!(env.view.live_send.is_some());
+
+    let SessionFeedResult::Snapshot(snapshot) =
+        super::session_feed_tests::daemon_snapshot(&id, "Running")
+    else {
+        unreachable!()
+    };
+    let mut snapshot = (*snapshot).clone();
+    snapshot.cursor.revision += 1;
+    snapshot.contents.health = crate::daemon::RuntimeHealth::Degraded {
+        code: crate::daemon::ReloadFailureCode::ProfileData,
+        profiles: vec!["test".into()],
+    };
+    snapshot.contents.capabilities.native_interaction = false;
+    env.view.session_feed.set_native_permission_for_test(false);
+    env.view
+        .session_feed
+        .publish_for_test(SessionFeedResult::Snapshot(std::sync::Arc::new(snapshot)));
+    env.view.apply_session_feed();
+
+    assert_eq!(env.view.sidebar_source, SidebarSource::Daemon);
+    assert!(env.view.live_send.is_none());
+    assert!(!env.view.session_feed.native_interaction_available());
+    env.view
+        .execute_permission_response(&id, crate::tui::dialogs::PermissionResponseChoice::Allow);
+    assert!(env.view.info_dialog.is_some());
+}
+
 /// A lock-loss flag from the live-send worker (another surface stole
 /// the size-owner lock) exits live mode from the main-loop poll, with
 /// no keystroke needed, drops the worker, and explains the takeover in
@@ -72,8 +113,13 @@ fn install_live_orphan(env: &mut TestEnv) {
 fn poll_live_send_takeover_exits_live_mode_with_dialog() {
     use crate::tui::home::live_send::LiveSendWorker;
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     install_live_for_first_session(&mut env);
-    env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
+    env.view.live_send_worker = Some(LiveSendWorker::spawn(
+        "fake".to_string(),
+        None,
+        crate::tui::session_feed::NativeLease::valid_for_test(),
+    ));
 
     // Flag not set: the poll is a no-op and live mode stays.
     assert!(!env.view.poll_live_send_takeover());
@@ -104,6 +150,7 @@ fn poll_live_send_takeover_exits_live_mode_with_dialog() {
 #[serial]
 fn ctrl_q_exits_live_mode() {
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     install_live_for_first_session(&mut env);
     assert!(env.view.live_send.is_some());
 
@@ -122,6 +169,7 @@ fn ctrl_q_exits_even_when_session_has_drifted() {
     // even if the underlying session went away (so the user can
     // recover from a stuck live mode without an extra dialog).
     let mut env = create_test_env_empty();
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     install_live_orphan(&mut env);
     env.view.handle_key(
         KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
@@ -141,6 +189,7 @@ fn arbitrary_key_in_live_mode_does_not_emit_action() {
     // live state). Use bare `x` so the test doesn't collide with
     // the Ctrl+q exit chord.
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     install_live_for_first_session(&mut env);
     let action = env
         .view
@@ -158,6 +207,7 @@ fn drift_check_auto_exits_when_instance_missing() {
     // dialog explaining why (so the user isn't typing into the
     // void with no feedback).
     let mut env = create_test_env_empty();
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     install_live_orphan(&mut env);
     env.view
         .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
@@ -172,6 +222,7 @@ fn shift_page_up_scrolls_preview_instead_of_sending_to_agent() {
     // scrollback, not the inner program. Live mode honors that so
     // users can read agent history without exiting.
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     install_live_for_first_session(&mut env);
     env.view.preview_scroll_offset = 0;
 
@@ -190,6 +241,7 @@ fn shift_page_up_scrolls_preview_instead_of_sending_to_agent() {
 #[serial]
 fn shift_page_down_scrolls_preview_forward() {
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     install_live_for_first_session(&mut env);
     env.view.preview_scroll_offset = 50;
 
@@ -211,6 +263,7 @@ fn bare_page_up_still_passes_through_to_agent() {
     // agents that page their own UI (claude-code transcript, etc.)
     // keep responding.
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     install_live_for_first_session(&mut env);
     env.view.preview_scroll_offset = 25;
 
@@ -232,6 +285,7 @@ fn drift_check_auto_exits_when_session_renamed() {
     // Force the cache to the post-rename state (only the new name live) so
     // the id-anchored resolution has nothing stale to adopt.
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     let id = install_live_for_first_session(&mut env);
     env.view.mutate_instance(&id, |inst| {
         inst.title = "renamed-after-entry".to_string();
@@ -255,6 +309,7 @@ fn drift_check_stays_when_retitle_did_not_rename_the_tmux_session() {
     // pane, so that is not drift and live mode must survive; auto-exiting
     // here would kick the user out of a pane that is still correct.
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     let id = install_live_for_first_session(&mut env);
     let created = env.view.live_send.as_ref().unwrap().tmux_name.clone();
     env.view.mutate_instance(&id, |inst| {
@@ -277,6 +332,7 @@ fn drift_check_stays_when_retitle_did_not_rename_the_tmux_session() {
 fn drift_check_does_not_exit_for_tool_target_named_via_tool_session() {
     // A tool's transport name must not be confused with the agent-pane name.
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     let id = env
         .view
         .flat_items

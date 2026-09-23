@@ -588,6 +588,8 @@ pub struct PendingApproval {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionResponse {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -821,12 +823,6 @@ pub struct SessionResponse {
     /// available, replacing the hardcoded client-side tool list.
     #[serde(default)]
     pub acp_capable: bool,
-    /// The session's server-owned prompt queue (follow-ups the user lined up
-    /// while a turn was busy), ordered by `seq`. The daemon owns it, so it is
-    /// visible across the user's devices and survives a client reload; the
-    /// structured view renders it and drains happen server-side.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub queued_prompts: Vec<QueuedPromptEntry>,
     /// The session's captured ACP session id, present only once the
     /// structured-view worker has minted one. The web dashboard passes this
     /// as `fork_from` on a structured fork create and gates the "Fork" action

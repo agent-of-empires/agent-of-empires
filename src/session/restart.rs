@@ -89,7 +89,7 @@ pub fn perform_restart(request: RestartRequest) -> RestartResult {
     // rather than waiting out the up-to-3s pane-readiness probe.
     let should_wake = launched_agent(&outcome);
     if should_wake && !wake_message.is_empty() {
-        spawn_wake_worker(session_id.clone(), title, tool, wake_message);
+        spawn_wake_worker(session_id.clone(), title, tool, wake_message, None);
     }
 
     RestartResult {
@@ -113,7 +113,13 @@ pub(crate) fn launched_agent(outcome: &Result<StartOutcome, String>) -> bool {
 /// Wait for the restarted pane to become live and past its boot shell, then
 /// send the wake-up message. Best-effort: a failure to spawn or send is logged,
 /// never fatal.
-fn spawn_wake_worker(session_id: String, title: String, tool: String, wake_message: String) {
+pub(crate) fn spawn_wake_worker(
+    session_id: String,
+    title: String,
+    tool: String,
+    wake_message: String,
+    identity: Option<(String, u64)>,
+) {
     let spawn_result = std::thread::Builder::new()
         .name(format!("aoe-restart-wake/{}", session_id))
         .stack_size(128 * 1024)
@@ -141,6 +147,20 @@ fn spawn_wake_worker(session_id: String, title: String, tool: String, wake_messa
                 return;
             }
             let delay = crate::agents::send_keys_enter_delay(&tool);
+            if let Some((profile, generation)) = identity {
+                let current = crate::session::Storage::new_unwatched(&profile)
+                    .and_then(|storage| storage.load())
+                    .ok()
+                    .is_some_and(|rows| rows.iter().any(|row| {
+                        row.id == session_id
+                            && row.lifecycle_generation == generation
+                            && row.title == title
+                            && row.tool == tool
+                    }));
+                if !current {
+                    return;
+                }
+            }
             if let Err(e) = tmux_session.send_keys_with_delay(&wake_message, delay) {
                 tracing::warn!(target: "session.restart", "failed to send wake-up message after restart: {}", e);
             }

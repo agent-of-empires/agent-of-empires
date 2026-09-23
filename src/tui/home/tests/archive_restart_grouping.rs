@@ -722,7 +722,15 @@ fn project_attention_archive_selected_group_removes_empty_main_header() {
     env.view.update_selected();
     assert_eq!(env.view.selected_group.as_deref(), Some("beta"));
 
-    env.view.archive_selected_group().unwrap();
+    with_canonical_group_archive(&mut env, |env| {
+        env.view.archive_selected_group().unwrap();
+        assert!(env
+            .view
+            .instances
+            .values()
+            .filter(|row| crate::tui::home::project_group_key(row) == "beta")
+            .all(|row| !row.is_archived()));
+    });
 
     assert!(
         env.view
@@ -731,6 +739,16 @@ fn project_attention_archive_selected_group_removes_empty_main_header() {
             .filter(|i| crate::tui::home::project_group_key(i) == "beta")
             .all(|i| i.is_archived()),
         "all beta sessions must be archived"
+    );
+    let alpha: Vec<_> = env
+        .view
+        .instances
+        .values()
+        .filter(|row| crate::tui::home::project_group_key(row) == "alpha")
+        .collect();
+    assert!(
+        !alpha.is_empty() && alpha.iter().all(|row| !row.is_archived()),
+        "unselected project stays active"
     );
     assert!(
         !env.view.flat_items.iter().any(|item| matches!(

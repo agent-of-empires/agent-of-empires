@@ -1896,18 +1896,25 @@ impl App {
                         // The toast that covered the revive settles with the
                         // receipt, exactly as the blocking path used to.
                         self.update_status = None;
-                        match self
-                            .home
-                            .enter_live_send_with(&ready.id, &ready.tmux_name, target)
-                        {
+                        match self.home.enter_live_send_with(
+                            &ready.id,
+                            &ready.tmux_name,
+                            target,
+                            ready.lease,
+                        ) {
                             Ok(()) => self.draw(terminal)?,
                             Err(()) => self.draw(terminal)?,
                         }
                     }
                     PaneIntent::Send { message, target } => {
                         self.update_status = None;
-                        self.home
-                            .finish_send(&ready.id, &ready.tmux_name, target, &message);
+                        self.home.finish_send(
+                            &ready.id,
+                            &ready.tmux_name,
+                            target,
+                            &message,
+                            &ready.lease,
+                        );
                     }
                 }
                 refresh_needed = true;
@@ -3705,11 +3712,8 @@ impl App {
 
         let tmux_session = instance.tmux_session()?;
 
-        // Decide whether to restart: if hook status is available or the instance
-        // uses a custom command, trust that over shell detection. Wrapper scripts
-        // (Devbox, version managers, custom command overrides) run agents via a
-        // shell process, so is_pane_running_shell() returns true even when the
-        // agent is healthy.
+        // Hook status and wrapper commands are stronger than shell detection
+        // when deciding whether a running row needs an explicit restart.
         let exists = tmux_session.exists();
         let pane_dead = if exists {
             tmux_session.is_pane_dead()
@@ -3736,7 +3740,7 @@ impl App {
             needs_restart,
             "attach_session: restart decision"
         );
-        if needs_restart {
+        if needs_restart || instance.status == crate::session::Status::Stopped {
             // Show warning (once) if custom instruction is configured for an unsupported agent
             if instance.is_sandboxed() {
                 let has_instruction = instance
@@ -3787,14 +3791,12 @@ impl App {
                 return Ok(());
             }
 
-            // The terminal size is read inside `restart_then_attach`, which
-            // sizes the tmux session at creation instead of 80x24 default.
-
-            // The daemon runs on_launch on every start, matching the CLI, so a
-            // TUI start never suppresses them.
-            let skip_on_launch = false;
-            self.home
-                .restart_then_attach(session_id, crate::terminal::get_size(), skip_on_launch);
+            let size = crate::terminal::get_size();
+            if instance.status == crate::session::Status::Stopped {
+                self.home.start_then_attach(session_id, size);
+            } else {
+                self.home.restart_then_attach(session_id, size, false);
+            }
             return Ok(());
         }
 
@@ -3807,6 +3809,9 @@ impl App {
         session_id: &str,
         terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
+        if !self.home.session_feed.native_interaction_available() {
+            return Ok(());
+        }
         let tmux_session = match self.home.get_instance(session_id) {
             Some(inst) => inst.tmux_session()?,
             None => return Ok(()),

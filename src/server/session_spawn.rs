@@ -258,6 +258,7 @@ pub(crate) async fn spawn_structured_session(
             &instance.id,
             &instance.title,
             &instance.source_profile,
+            instance.idempotency_key.as_deref(),
         )?;
         let creation_progress = |event| creation_guard.hook_event(event);
         let generation = {

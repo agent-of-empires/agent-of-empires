@@ -398,7 +398,7 @@ impl HttpClient {
         );
         let res = self.execute(self.http.get(&url)).await?;
         let res = check_status(res, session_id)?;
-        Ok(crate::daemon::decode_json(res).await?)
+        Ok(crate::daemon::decode_json_bounded(res, 64 * 1024 * 1024).await?)
     }
 
     // No `queue_enqueue` here: since Tier 3 the native view never decides to

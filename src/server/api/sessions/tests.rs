@@ -607,6 +607,102 @@ async fn running_restart_respawns_while_start_remains_idempotent() -> anyhow::Re
 
 #[tokio::test]
 #[serial_test::serial]
+async fn restart_delivers_requested_wake_message_to_new_pane() -> anyhow::Result<()> {
+    if !crate::tmux::is_tmux_available() {
+        return Ok(());
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })?;
+    let project = tempfile::tempdir()?;
+    let marker = project.path().join("wake-received");
+    let mut row = Instance::new("wake-on-restart", project.path().to_str().unwrap());
+    row.source_profile = "wake-profile".into();
+    row.status = Status::Running;
+    row.command = format!(
+        r#"sh -c 'read message; printf "%s" "$message" > {}; sleep 60'"#,
+        marker.display(),
+    );
+    let id = row.id.clone();
+    let name = crate::tmux::Session::generate_name(&id, &row.title);
+    let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name.clone());
+    row.tmux_session()?.create(
+        project.path().to_str().unwrap(),
+        Some("sleep 60"),
+        "wake-profile",
+    )?;
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("wake-profile", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+
+    let response = restart_session(
+        State(state.clone()),
+        Path(id),
+        Ok(Some(Json(crate::daemon::RestartSessionBody {
+            wake_message: Some("wake-message-verified".into()),
+            ..Default::default()
+        }))),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if std::fs::read_to_string(&marker).ok().as_deref() == Some("wake-message-verified") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restart wake did not reach the new pane; marker={:?}; pane={:?}",
+            std::fs::read_to_string(&marker),
+            crate::tmux::Session::from_name(&name).capture_pane(30),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn archived_session_cannot_be_started_or_ensured() -> anyhow::Result<()> {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut row = Instance::new("archived launch", "/tmp/archived-launch");
+    row.source_profile = "archive-guard".into();
+    row.status = Status::Stopped;
+    row.archived_at = Some(chrono::Utc::now());
+    let id = row.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("archive-guard", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+
+    let start = start_session(State(state.clone()), Path(id.clone()), Ok(None))
+        .await
+        .into_response();
+    let ensure = ensure_session(State(state.clone()), Path(id.clone()), Ok(None))
+        .await
+        .into_response();
+    assert_eq!(start.status(), StatusCode::CONFLICT);
+    assert_eq!(ensure.status(), StatusCode::CONFLICT);
+    let saved = storage.load()?;
+    let saved = saved.iter().find(|row| row.id == id).unwrap();
+    assert!(saved.is_archived());
+    assert_eq!(saved.status, Status::Stopped);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn structured_stop_start_receipts_include_the_committed_peer_bundle() -> anyhow::Result<()> {
     let _guard = crate::session::test_support::isolate_app_dir();
     let mut row = Instance::new("lifecycle receipt", "/tmp/lifecycle-receipt");
@@ -752,6 +848,54 @@ async fn archive_receipts_publish_committed_status_and_peer_rows() -> anyhow::Re
     Ok(())
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn engagement_unsinks_archived_and_snoozed_row_in_one_canonical_commit() -> anyhow::Result<()>
+{
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut row = Instance::new("engagement", "/tmp/engagement");
+    row.source_profile = "receipt".into();
+    row.archive();
+    row.snooze(30);
+    row.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
+    let previous_access = row.last_accessed_at;
+    let id = row.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("receipt", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    state.runtime.publish(&state).await?;
+    let response = touch_session_access(State(state.clone()), Path(id.clone()))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let snapshot = state.runtime.snapshot(&state).await?;
+    assert_eq!(
+        response.headers()[crate::daemon::RUNTIME_REVISION_HEADER]
+            .to_str()?
+            .parse::<u64>()?,
+        snapshot.value.cursor.revision
+    );
+    let disk = storage.load()?;
+    let stored = disk.iter().find(|row| row.id == id).unwrap();
+    assert!(!stored.is_archived());
+    assert!(stored.snoozed_until.is_none());
+    assert!(stored.last_accessed_at > previous_access);
+    let published = snapshot
+        .value
+        .contents
+        .sessions
+        .iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert!(published.archived_at.is_none());
+    assert!(published.snoozed_until.is_none());
+    Ok(())
+}
 #[tokio::test]
 #[serial_test::serial]
 async fn archive_and_trash_receipts_discard_killed_auxiliary_observations() -> anyhow::Result<()> {
@@ -5329,4 +5473,48 @@ async fn list_sessions_applies_project_smart_rename_override_to_worktree_session
         .map(|s| s["smart_rename"].as_str().unwrap())
         .collect();
     assert_eq!(states, ["inactive", "inactive", "pending"]);
+}
+
+#[test]
+fn native_runtime_frame_stays_readable_with_a_valid_full_text_queue() {
+    use crate::daemon::{
+        QueuedPromptEntry, RuntimeCapabilities, RuntimeContents, RuntimeCursor, RuntimeFrame,
+        RuntimeHealth, RuntimeSnapshot,
+    };
+
+    let mut instance = Instance::new("queued", "/tmp/queued");
+    instance.queued_prompts = (0..64)
+        .map(|seq| QueuedPromptEntry {
+            id: format!("prompt-{seq}"),
+            seq,
+            text: "a".repeat(256 * 1024),
+            attachments: Vec::new(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            origin_device: None,
+        })
+        .collect();
+    let snapshot = RuntimeSnapshot {
+        cursor: RuntimeCursor {
+            epoch: "epoch".into(),
+            revision: 1,
+        },
+        contents: RuntimeContents {
+            health: RuntimeHealth::Healthy,
+            capabilities: RuntimeCapabilities {
+                mutations: true,
+                native_interaction: true,
+            },
+            default_profile: "default".into(),
+            sessions: vec![SessionResponse::from_instance(&instance, false)],
+            profiles: Vec::new(),
+            workspace_ordering: Vec::new(),
+            global_projects: Vec::new(),
+        },
+    };
+    let frame = serde_json::to_vec(&RuntimeFrame::Snapshot(&snapshot)).unwrap();
+    assert!(
+        frame.len() < 16 * 1024 * 1024,
+        "native WS frame is {} bytes",
+        frame.len()
+    );
 }

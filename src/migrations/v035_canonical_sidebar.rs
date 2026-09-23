@@ -22,14 +22,15 @@ fn migrate_config_file(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).with_context(|| format!("Reading {}", path.display())),
     };
-    let mut config: toml::Value =
-        toml::from_str(&content).with_context(|| format!("Parsing {}", path.display()))?;
+    let mut config: toml_edit::DocumentMut = content
+        .parse()
+        .with_context(|| format!("Parsing {}", path.display()))?;
     let removed = config
         .get_mut("session")
-        .and_then(toml::Value::as_table_mut)
+        .and_then(toml_edit::Item::as_table_mut)
         .and_then(|session| session.remove("daemon_sidebar"));
     if removed.is_some() {
-        crate::session::atomic_write(path, toml::to_string_pretty(&config)?.as_bytes())?;
+        crate::session::atomic_write(path, config.to_string().as_bytes())?;
         tracing::info!(path = %path.display(), "Removed session.daemon_sidebar");
     }
     Ok(())
@@ -45,12 +46,16 @@ mod tests {
         let path = root.path().join("config.toml");
         std::fs::write(
             &path,
-            "[session]\ndaemon_sidebar = false\ndefault_tool = 'codex'\n[status_hooks]\nenabled = true\n",
+            "# global comment\n[session] # session comment\ndaemon_sidebar = false\ndefault_tool = 'codex' # keep tool comment\n[status_hooks]\nenabled = true # keep hook comment\n",
         )
         .unwrap();
         migrate_config_file(&path).unwrap();
         let migrated = std::fs::read_to_string(&path).unwrap();
         let config: toml::Value = toml::from_str(&migrated).unwrap();
+        assert!(migrated.contains("# global comment"));
+        assert!(migrated.contains("[session] # session comment"));
+        assert!(migrated.contains("default_tool = 'codex' # keep tool comment"));
+        assert!(migrated.contains("enabled = true # keep hook comment"));
         assert!(config["session"].get("daemon_sidebar").is_none());
         assert_eq!(config["session"]["default_tool"].as_str(), Some("codex"));
         assert_eq!(config["status_hooks"]["enabled"].as_bool(), Some(true));

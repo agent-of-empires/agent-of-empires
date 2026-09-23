@@ -4,6 +4,7 @@ import type { AgentLifecycleInfo } from "./agentProfiles";
 
 export interface SessionResponse {
   id: string;
+  idempotency_key?: string | null;
   title: string;
   project_path: string;
   /** Host path of the session's managed artifact directory. */

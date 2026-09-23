@@ -697,57 +697,34 @@ fn test_reload_honors_peer_cleared_session_id() {
     );
 }
 
-/// `stamp_last_accessed` on a sunk row must auto-clear archived_at in memory and on disk
-/// and rebuild flat_items, so the row leaves the Archived section on the same frame. The old
-/// mutate_instance + save path left it stuck until `z`, because merge_from_tui doesn't carry
-/// archived_at and the next reload resurrected the sink.
+/// Engaging either sunk state sends one daemon mutation; the disk only changes
+/// once the server commits and publishes its receipt.
 #[test]
 #[serial]
-fn stamp_last_accessed_on_archived_row_unsinks_persistently() {
-    use crate::session::{is_archived_section_path, Item};
-
-    let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/grp");
-
-    view.apply_user_action(&id, |inst| inst.archive())
-        .expect("seed archive must persist");
-    view.flat_items = view.build_flat_items();
-    assert!(
-        view.get_instance(&id).unwrap().is_archived(),
-        "precondition: row archived in memory"
-    );
-    let archived_section_present = |items: &[Item]| {
-        items.iter().any(|it| match it {
-            Item::Group { path, .. } => is_archived_section_path(path),
-            _ => false,
+fn engaging_sunk_rows_requests_canonical_access_without_local_write() {
+    for archived in [true, false] {
+        let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/grp");
+        view.apply_user_action(&id, |row| {
+            if archived {
+                row.archive();
+            } else {
+                row.snooze(30);
+            }
         })
-    };
-
-    assert!(
-        archived_section_present(&view.flat_items),
-        "precondition: Archived section header rendered"
-    );
-
-    view.stamp_last_accessed(&id);
-
-    assert!(
-        !view.get_instance(&id).unwrap().is_archived(),
-        "stamp_last_accessed must clear archived_at in memory"
-    );
-    let disk_row = Storage::new_unwatched("test")
-        .unwrap()
-        .load()
-        .unwrap()
-        .into_iter()
-        .find(|i| i.id == id)
-        .expect("disk row present");
-    assert!(
-        disk_row.archived_at.is_none(),
-        "stamp_last_accessed must persist the auto-unarchive (merge_from_tui drops archived_at)"
-    );
-    assert!(
-        !archived_section_present(&view.flat_items),
-        "Archived section must disappear once the only archived row is unsunk"
-    );
+        .unwrap();
+        let mut respond = view.session_feed.command_driver_for_test();
+        view.stamp_last_accessed(&id);
+        let (_, mutation) = respond(Ok(crate::daemon::RuntimeCursor {
+            epoch: "test".into(),
+            revision: 2,
+        }))
+        .unwrap();
+        assert!(matches!(mutation, crate::daemon::SessionMutation::Access));
+        let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
+        let stored = disk.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(stored.is_archived(), archived);
+        assert_eq!(stored.snoozed_until.is_some(), !archived);
+    }
 }
 #[test]
 #[serial]
@@ -903,38 +880,4 @@ fn tied_cross_profile_collision_rejects_before_worktree_effects() {
     assert_eq!(source.title, "old-name");
     assert_eq!(source.project_path, old_path.to_string_lossy().to_string());
     assert_eq!(source.worktree_info.unwrap().branch, "old-name");
-}
-
-/// Snoozed sibling of the archive case: `snoozed_until` is also cleared by
-/// `touch_last_accessed` and also excluded from `merge_from_tui`, so the same persistence
-/// bug applied, with the same fix path.
-#[test]
-#[serial]
-fn stamp_last_accessed_on_snoozed_row_persistently_clears_snooze() {
-    let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/grp");
-
-    view.apply_user_action(&id, |inst| inst.snooze(30))
-        .expect("seed snooze must persist");
-    assert!(
-        view.get_instance(&id).unwrap().is_snoozed(),
-        "precondition: row snoozed in memory"
-    );
-
-    view.stamp_last_accessed(&id);
-
-    assert!(
-        !view.get_instance(&id).unwrap().is_snoozed(),
-        "stamp_last_accessed must clear snoozed_until in memory"
-    );
-    let disk_row = Storage::new_unwatched("test")
-        .unwrap()
-        .load()
-        .unwrap()
-        .into_iter()
-        .find(|i| i.id == id)
-        .expect("disk row present");
-    assert!(
-        disk_row.snoozed_until.is_none(),
-        "stamp_last_accessed must persist the auto-unsnooze (merge_from_tui drops snoozed_until)"
-    );
 }

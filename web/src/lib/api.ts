@@ -1532,10 +1532,8 @@ export async function acpDisable(sessionId: string): Promise<ViewSwitchResponse 
   });
 }
 
-// The daemon owns the structured-view prompt queue, so a follow-up queued
-// behind a busy turn survives a client reload / closed PWA and drains
-// server-side. These wrap the /queue endpoints; the queue itself reflects to
-// the client on `SessionResponse.queued_prompts`.
+// The daemon owns the structured-view prompt queue; /queue reads it on demand.
+// Queued follow-ups survive client reloads and drain server-side.
 
 /** Metadata-only view of one queued-prompt attachment. The bytes live
  *  server-side (the pending-attachment store) and are delivered on drain, so

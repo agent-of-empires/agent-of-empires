@@ -389,11 +389,13 @@ fn ctrl_c_in_live_mode_forwards_to_agent_and_flashes() {
     use crate::tui::home::live_send::{parse_chord_list, LiveSendState, LiveSendTarget};
 
     let mut env = create_test_env_with_sessions(1);
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     let inst = env.view.instance_at(0).clone();
 
     // Match the generated tmux name so the drift guard doesn't tear live mode
     // down before the key is translated.
     let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+    crate::tmux::test_inject_session_into_cache(&tmux_name);
     env.view.live_send = Some(LiveSendState {
         session_id: inst.id.clone(),
         title: inst.title.clone(),

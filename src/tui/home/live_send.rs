@@ -457,26 +457,8 @@ pub(super) enum WorkerMsg {
     Resize { cols: u16, rows: u16 },
 }
 
-/// Background dispatcher: drains a channel of `WorkerMsg`s and runs
-/// each via a one-shot `tmux send-keys` / `resize-window` subprocess
-/// after coalescing with `coalesce`. Spawned by `prepare_live_send` and
-/// dropped when the user exits live mode; dropping closes the channel,
-/// which makes the worker thread's `recv` return `Err` and exit on the
-/// next iteration. We deliberately do not `join` because the worker is
-/// idempotent and harmless if it survives a brief moment past the UI
-/// thread that owned it (e.g., the user toggles live mode rapidly).
-///
-/// Previously (#1485) this dispatched through a long-lived
-/// `tmux -C attach-session` connection to avoid one fork per
-/// keystroke. The connection turned out to be unstable on at least
-/// some macOS tmux 3.x builds (it would EOF within milliseconds of
-/// spawn), and the resulting fork-fallback path was hit ~100% of the
-/// time on those setups while still paying the spawn cost upfront.
-/// Ripping out control-mode entirely keeps the dispatch path simple
-/// (one fork per coalesced batch) and consistent across setups; the
-/// per-keystroke fork cost is bounded by user typing speed and is
-/// invisible on a laptop. Mobile/mosh users pay a few extra ms per
-/// keypress, which we accept as the cost of reliability.
+/// Coalesced one-shot tmux dispatcher. The grant lease is checked before
+/// acquiring size ownership and before each fork, including queued work.
 pub(in crate::tui) struct LiveSendWorker {
     tx: Sender<WorkerMsg>,
     /// Set (sticky) by the worker thread when the size-owner lock is
@@ -495,7 +477,11 @@ impl LiveSendWorker {
     /// batch, so the typed echo is captured immediately instead of waiting
     /// up to a full fast-cadence cycle. That ties echo latency to actual
     /// input rather than the background capture phase.
-    pub(super) fn spawn(tmux_name: String, capture_wake: Option<LiveCaptureWake>) -> Self {
+    pub(super) fn spawn(
+        tmux_name: String,
+        capture_wake: Option<LiveCaptureWake>,
+        lease: crate::tui::session_feed::NativeLease,
+    ) -> Self {
         let (tx, rx) = channel::<WorkerMsg>();
         let lock_lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_lock_lost = std::sync::Arc::clone(&lock_lost);
@@ -524,6 +510,9 @@ impl LiveSendWorker {
                 std::process::id(),
                 LIVE_SEND_WORKER_COUNTER.fetch_add(1, Ordering::Relaxed)
             );
+            if !lease.is_valid() {
+                return;
+            }
             let session = crate::tmux::Session::from_name(&tmux_name);
             // Entering live mode is explicit user intent, so entry forces the
             // lock even over a live holder. False means either the tmux
@@ -561,7 +550,12 @@ impl LiveSendWorker {
             // batches are the exception: geometry must not race another
             // owner's grid, so they keep the steal-before-dispatch ordering.
             let mut last_owner_maintenance = std::time::Instant::now();
+            // The sender may be revoked while a batch is queued.
+            // The dispatch path checks again before every fork.
             loop {
+                if !lease.is_valid() {
+                    break;
+                }
                 match rx.recv_timeout(crate::tmux::SIZE_OWNER_HEARTBEAT) {
                     Ok(first) => {
                         let mut batch = vec![first];
@@ -610,7 +604,7 @@ impl LiveSendWorker {
                             }
                         }
                         if !batch.is_empty() {
-                            match dispatch_batch(&tmux_name, &owner_id, batch) {
+                            match dispatch_batch(&tmux_name, &owner_id, batch, &lease) {
                                 ResizeDispatchResult::Failed => {
                                     owned = false;
                                     thread_resize_failed.store(true, Ordering::Relaxed);
@@ -2239,6 +2233,7 @@ fn dispatch_batch(
     tmux_name: &str,
     resize_owner: &str,
     batch: Vec<WorkerMsg>,
+    lease: &crate::tui::session_feed::NativeLease,
 ) -> ResizeDispatchResult {
     let actions = coalesce(batch);
     // A Paste can only go through tmux (paste-buffer -p decides whether the
@@ -2247,6 +2242,9 @@ fn dispatch_batch(
     let force_tmux = actions.iter().any(|a| matches!(a, TmuxAction::Paste(_)));
     let mut resize_result = ResizeDispatchResult::None;
     for action in actions {
+        if !lease.is_valid() {
+            break;
+        }
         let is_resize = matches!(action, TmuxAction::Resize { .. });
         match dispatch_via_fork(tmux_name, &action, force_tmux, Some(resize_owner)) {
             Ok(()) if is_resize => resize_result = ResizeDispatchResult::Succeeded,
@@ -2902,6 +2900,21 @@ fn mod_prefix(ctrl: bool, alt: bool, shift: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revoked_native_lease_discards_queued_worker_actions() {
+        let lease = crate::tui::session_feed::NativeLease::valid_for_test();
+        lease.revoke();
+        assert_eq!(
+            dispatch_batch(
+                "missing-native-session",
+                "owner",
+                vec![WorkerMsg::Resize { cols: 80, rows: 24 }],
+                &lease,
+            ),
+            ResizeDispatchResult::None,
+        );
+    }
 
     fn k(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -4142,7 +4155,11 @@ mod tests {
             "the bounded resize path must expose failure"
         );
 
-        let worker = LiveSendWorker::spawn(name.to_string(), None);
+        let worker = LiveSendWorker::spawn(
+            name.to_string(),
+            None,
+            crate::tui::session_feed::NativeLease::valid_for_test(),
+        );
         worker.resize(80, 24);
         wait_until(
             "live resize failure flag",
@@ -4210,7 +4227,11 @@ mod tests {
         crate::tmux::refresh_session_cache();
         let session = crate::tmux::Session::from_name(guard.name());
 
-        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        let worker = LiveSendWorker::spawn(
+            guard.name().to_string(),
+            None,
+            crate::tui::session_feed::NativeLease::valid_for_test(),
+        );
         wait_until(
             "worker entry steal",
             std::time::Duration::from_secs(5),
@@ -4283,7 +4304,11 @@ mod tests {
         crate::tmux::refresh_session_cache();
         let session = crate::tmux::Session::from_name(guard.name());
 
-        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        let worker = LiveSendWorker::spawn(
+            guard.name().to_string(),
+            None,
+            crate::tui::session_feed::NativeLease::valid_for_test(),
+        );
         wait_until(
             "worker entry steal",
             std::time::Duration::from_secs(5),
@@ -4312,7 +4337,11 @@ mod tests {
         }
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_late");
         // A failed resize acknowledges that the worker observed the absent session.
-        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        let worker = LiveSendWorker::spawn(
+            guard.name().to_string(),
+            None,
+            crate::tui::session_feed::NativeLease::valid_for_test(),
+        );
         worker.resize(60, 20);
         wait_until(
             "resize against absent session",
@@ -4385,7 +4414,11 @@ mod tests {
             return;
         }
         let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_vacant");
-        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        let worker = LiveSendWorker::spawn(
+            guard.name().to_string(),
+            None,
+            crate::tui::session_feed::NativeLease::valid_for_test(),
+        );
         worker.resize(60, 20);
         wait_until(
             "resize against absent session",

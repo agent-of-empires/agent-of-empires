@@ -373,6 +373,7 @@ impl SessionService {
         id: &str,
         title: &str,
         profile: &str,
+        request_key: Option<&str>,
     ) -> anyhow::Result<CreationGuard> {
         let entry = Arc::new(std::sync::Mutex::new(CreationEntry {
             lifecycle: CreationLifecycle::Running,
@@ -381,6 +382,7 @@ impl SessionService {
                 title: title.to_owned(),
                 profile: profile.to_owned(),
                 phase: CreationPhase::Reserving,
+                request_key: request_key.map(str::to_owned),
                 command: None,
                 output: Vec::new(),
                 cancelled: false,

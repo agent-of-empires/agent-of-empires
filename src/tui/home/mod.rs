@@ -150,10 +150,11 @@ pub(super) struct PendingCreation {
     /// The daemon's session id, known once a reservation or progress entry
     /// names this creation.
     pub(super) daemon_id: Option<String>,
-    pub(super) title: String,
-    pub(super) profile: String,
-    /// A cancellation was requested; it is sent as soon as the id is known.
+    /// Stable caller identity; never match another session by title/profile.
+    pub(super) request_key: String,
     pub(super) cancel_requested: bool,
+    pub(super) cancel_sent: bool,
+    pub(super) outcome_unknown: bool,
 }
 
 /// One applied passive resize: the preview geometry the dedup keys on, the

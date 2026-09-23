@@ -256,4 +256,20 @@ describe("ProjectStep saved-projects render (#2140)", () => {
     expect(await findByRole("button", { name: "Browse" })).toBeTruthy();
     expect(queryByText("Recent", asHeader)).toBeNull();
   });
+  it("keeps Browse and Clone available after a project registry failure and recovers on retry", async () => {
+    vi.mocked(fetchProjects)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce([savedProject({ name: "alpha", path: "/repo/alpha" })]);
+    vi.mocked(fetchSessions).mockResolvedValue({ sessions: [], workspace_ordering: [] });
+
+    const { findByRole, findByText, getByRole } = renderStep();
+    expect((await findByRole("alert")).textContent).toContain("Saved projects could not be loaded");
+    expect(getByRole("button", { name: "Browse" })).toBeTruthy();
+    fireEvent.click(getByRole("button", { name: "Clone URL" }));
+    expect(await findByRole("textbox", { name: "Repository URL" })).toBeTruthy();
+
+    fireEvent.click(getByRole("button", { name: "Retry" }));
+    fireEvent.click(await findByRole("button", { name: "Recent" }));
+    expect(await findByText("/repo/alpha")).toBeTruthy();
+  });
 });

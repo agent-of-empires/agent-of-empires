@@ -299,7 +299,7 @@ impl DaemonClient {
         let url = format!(
             "{}/{}/restart",
             self.sessions_url.as_str().trim_end_matches('/'),
-            session_id
+            transport::path_segment(session_id)?
         );
         self.request_mutation_with_outcome(self.http.post(url).json(body), epoch)
             .await
@@ -324,6 +324,7 @@ impl DaemonClient {
             SessionMutation::AbandonPurge(body) => self.http.post(url).json(body),
             SessionMutation::StopAuxiliary(target) => self.http.post(url).json(target),
             SessionMutation::Stop | SessionMutation::Restore => self.http.post(url),
+            SessionMutation::Access => self.http.patch(url),
             _ => self.http.patch(url).json(mutation),
         };
         self.request_mutation(request, epoch).await
@@ -681,9 +682,16 @@ async fn discard_bounded_body(response: &mut reqwest::Response) -> Result<(), Da
 }
 
 pub(crate) async fn decode_json<T: serde::de::DeserializeOwned>(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
 ) -> Result<T, DaemonClientError> {
-    let body = read_bounded_body(&mut response, MAX_SUCCESS_BODY_BYTES).await?;
+    decode_json_bounded(response, MAX_SUCCESS_BODY_BYTES).await
+}
+
+pub(crate) async fn decode_json_bounded<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<T, DaemonClientError> {
+    let body = read_bounded_body(&mut response, limit).await?;
     serde_json::from_slice(&body).map_err(|_| DaemonClientError::AuthenticatedDecode)
 }
 
@@ -1026,6 +1034,28 @@ mod tests {
         assert_eq!(body, serde_json::json!({}));
     }
 
+    #[tokio::test]
+    async fn restart_request_encodes_the_session_id_as_one_path_segment() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let base = serve_mutation_once(
+            "/api/sessions/{id}/restart",
+            200,
+            vec![
+                (RUNTIME_EPOCH_HEADER, "epoch-1"),
+                (RUNTIME_REVISION_HEADER, "2"),
+            ],
+            r#"{"lifecycle_generation":1,"profile":"default","target":null}"#,
+            tx,
+        )
+        .await;
+        let client = DaemonClient::new(&base, None).unwrap();
+        client
+            .restart_session("sess/a?b", &RestartSessionBody::default(), "epoch-1")
+            .await
+            .unwrap();
+        let captured = next_request(rx).await;
+        assert_eq!(captured.path, "/api/sessions/sess%2Fa%3Fb/restart");
+    }
     #[tokio::test]
     async fn conflict_lifecycle_locked_maps_without_reading_body() {
         let (tx, rx) = tokio::sync::oneshot::channel();

@@ -162,21 +162,129 @@ fn a_cancellation_before_the_daemon_names_the_creation_is_delivered_later() {
         "nothing can be addressed until the daemon names the session"
     );
 
-    // The daemon's progress names it, which delivers the owed cancellation.
+    let mut other = Instance::new("Delayed", project_dir.to_str().unwrap());
+    other.source_profile = "default".into();
+    let collision = crate::daemon::SessionResponse::from_instance(&other, false);
+    assert!(!view.reconcile_in_flight_creation(&[collision]));
+    assert!(view.pending_creation.as_ref().unwrap().daemon_id.is_none());
+    let progress = CreationProgress {
+        session_id: "daemon-session".into(),
+        request_key: Some(stub.clone()),
+        title: "Delayed".into(),
+        profile: "default".into(),
+        phase: CreationPhase::CreateHooks,
+        command: None,
+        output: Vec::new(),
+        cancelled: false,
+    };
     view.session_feed
         .publish_progress_for_test(vec![CreationProgress {
-            session_id: "daemon-session".into(),
-            title: "Delayed".into(),
-            profile: "default".into(),
-            phase: CreationPhase::CreateHooks,
-            command: None,
-            output: Vec::new(),
-            cancelled: false,
+            session_id: "other-session".into(),
+            request_key: Some("another-request".into()),
+            ..progress.clone()
         }]);
+    assert!(!view.apply_creation_progress());
+    assert!(driven().is_empty());
+    view.session_feed
+        .publish_progress_for_test(vec![progress.clone()]);
     assert!(view.apply_creation_progress());
     assert_eq!(driven(), vec!["cancel:daemon-session".to_string()]);
+    view.session_feed.publish_progress_for_test(vec![progress]);
+    view.apply_creation_progress();
+    assert!(
+        driven().is_empty(),
+        "a repeated progress frame must not retry cancellation"
+    );
 }
 
+#[test]
+#[serial]
+fn refused_create_after_early_cancel_settles_without_a_stub_or_daemon_id() {
+    let CreationTestEnv {
+        mut view,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+    let mut reject = view.session_feed.creation_rejection_driver_for_test();
+    view.request_creation(creation_data(&project_dir, "Delayed", "test"), None);
+    let key = view.creating_stub_id.clone().unwrap();
+    view.cancel_creation();
+    assert!(view.creating_stub_id.is_none());
+    assert_eq!(reject(), key);
+    assert!(view.apply_creation_results().is_none());
+    assert!(
+        !view.is_creation_pending(),
+        "the refusal must settle the cancelled request"
+    );
+}
+
+#[test]
+#[serial]
+fn unknown_create_outcome_waits_for_matching_canonical_row_across_profiles() {
+    use crate::daemon::{
+        RuntimeCapabilities, RuntimeContents, RuntimeCursor, RuntimeHealth, RuntimeSnapshot,
+    };
+    use crate::tui::session_feed::SessionFeedResult;
+    let CreationTestEnv {
+        mut view,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+    let mut driver = view.session_feed.creation_driver_for_test();
+    let mut data = creation_data(&project_dir, "Same title", "group");
+    data.profile = "other".into();
+    view.request_creation(data, None);
+    let key = view.creating_stub_id.clone().unwrap();
+    assert_eq!(driver(), vec![format!("create:{key}")]);
+    assert!(view.apply_creation_results().is_none());
+    assert!(view.pending_creation.as_ref().unwrap().outcome_unknown);
+    assert!(
+        view.get_instance(&key).is_some(),
+        "an unknown outcome must keep its placeholder"
+    );
+
+    let mut committed = Instance::new("Same title", project_dir.to_str().unwrap());
+    committed.source_profile = "other".into();
+    committed.idempotency_key = Some(key);
+    committed.status = Status::Idle;
+    let id = committed.id.clone();
+    Storage::new_unwatched("other")
+        .unwrap()
+        .update(|rows, _| {
+            rows.push(committed.clone());
+            Ok(())
+        })
+        .unwrap();
+    let snapshot = RuntimeSnapshot {
+        cursor: RuntimeCursor {
+            epoch: "test".into(),
+            revision: 2,
+        },
+        contents: RuntimeContents {
+            health: RuntimeHealth::Healthy,
+            capabilities: RuntimeCapabilities {
+                mutations: true,
+                native_interaction: true,
+            },
+            default_profile: "default".into(),
+            sessions: vec![crate::daemon::SessionResponse::from_instance(
+                &committed, false,
+            )],
+            profiles: Vec::new(),
+            workspace_ordering: Vec::new(),
+            global_projects: Vec::new(),
+        },
+    };
+    view.session_feed
+        .publish_for_test(SessionFeedResult::Snapshot(std::sync::Arc::new(snapshot)));
+    view.apply_session_feed();
+    assert_eq!(view.apply_creation_results(), Some(id.clone()));
+    assert_eq!(view.active_profile_display(), Some("other"));
+    assert_eq!(view.selected_session.as_deref(), Some(id.as_str()));
+    assert!(view.get_instance(&id).is_some());
+}
 /// `z` on a row parked inside the expanded Archived section must submit the
 /// unarchive through the native lane, exactly as it does for the active row.
 #[test]

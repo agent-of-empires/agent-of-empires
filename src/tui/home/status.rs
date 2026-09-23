@@ -279,6 +279,11 @@ impl HomeView {
                     }
                     metadata_changed |= self.apply_pending_archive_cursor();
                     metadata_changed |= self.session_feed.mark_snapshot_applied(snapshot);
+                    if !self.session_feed.native_interaction_available() {
+                        self.cancel_native_attachment();
+                        self.teardown_live_send();
+                        self.pending_paste = None;
+                    }
                     if unknown_row {
                         match self.reload() {
                             Ok(()) => metadata_changed = true,
