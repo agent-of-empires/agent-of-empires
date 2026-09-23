@@ -361,7 +361,7 @@ impl Instance {
                     events,
                     crate::hooks::HookInstallTarget::Host,
                 ) {
-                    Ok(()) => true,
+                    Ok(installed) => installed,
                     Err(error) => {
                         tracing::warn!(target: "session.store", "Failed to install Codex hooks: {}", error);
                         false

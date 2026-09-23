@@ -352,7 +352,16 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
 ];
 
 const CODEX_HOOK_EVENTS: &[HookEvent] = &[
-    hook("SessionStart", HookStatus::Idle),
+    // Codex's SessionStart payload carries a top-level string `session_id`
+    // (alongside `transcript_path`, `cwd`, `hook_event_name`), so the pane can
+    // publish its own conversation the way Claude's does instead of leaving
+    // host capture to a shared-store scan. The status writer stays: unlike
+    // Claude, whose SessionStart is identity-only, Codex has no other event
+    // that settles the pane to idle at launch.
+    HookEvent {
+        identity_field: Some(HookIdentityField::SessionId),
+        ..hook("SessionStart", HookStatus::Idle)
+    },
     hook("UserPromptSubmit", HookStatus::Running),
     hook("PreToolUse", HookStatus::Running),
     hook("PermissionRequest", HookStatus::Waiting),
@@ -1441,6 +1450,37 @@ mod tests {
         assert_eq!(map.get("session.idle"), Some(&HookStatus::Idle));
     }
 
+    /// Codex publishes a top-level string `session_id` on `SessionStart`, so
+    /// the pane can name its own conversation instead of leaving host capture
+    /// to a shared-store scan. The status writer has to survive alongside it:
+    /// `SessionStart` is Codex's only launch-time idle signal, unlike Claude's,
+    /// which is identity-only because `Stop` settles that pane.
+    #[test]
+    fn codex_session_start_publishes_identity_and_still_writes_status() {
+        let codex = get_agent("codex").unwrap();
+        let events = resolved_hook_events(codex, &crate::session::config::Config::default())
+            .expect("codex hook events resolve");
+        let start = events
+            .iter()
+            .find(|event| event.name == "SessionStart")
+            .expect("codex declares SessionStart");
+
+        assert_eq!(
+            start.identity_field,
+            Some(HookIdentityField::SessionId),
+            "host capture reads the payload's top-level session_id"
+        );
+        assert_eq!(
+            start.status,
+            Some(HookStatus::Idle),
+            "dropping the status writer would leave a launched pane with no idle signal"
+        );
+
+        // Identity hooks are mandatory for a resume-capable agent, so turning
+        // status hooks off must not stop the install.
+        assert!(hook_install_required(codex, false));
+    }
+
     #[test]
     fn test_resolve_tool_name() {
         let cases = [
@@ -1531,7 +1571,7 @@ mod tests {
     fn pane_hook_capture_agents_declare_their_native_identity_field() {
         for agent in AGENTS {
             let expected = match agent.name {
-                "claude" => Some(HookIdentityField::SessionId),
+                "claude" | "codex" => Some(HookIdentityField::SessionId),
                 "cursor" => Some(HookIdentityField::ConversationIdOrSessionId),
                 _ => None,
             };

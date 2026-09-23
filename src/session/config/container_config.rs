@@ -2892,6 +2892,7 @@ pub(crate) fn build_container_config(
                                 &events,
                                 crate::hooks::HookInstallTarget::Sandbox,
                             )
+                            .map(|_| ())
                         }
                         crate::agents::HookFormat::JsonSettings => crate::hooks::install_hooks(
                             &settings_file,
@@ -6817,14 +6818,17 @@ codex-work = "{}"
 
         let hook_dir =
             crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
-        // Lexical is correct here: hooks are disabled, the instance dir is
-        // never created, so canonicalize would fail and no mount can match.
+        // Codex publishes its conversation id from `SessionStart`, and an
+        // identity hook is not optional: disabling `agent_status_hooks` drops
+        // the status writers but keeps the identity publisher, which writes
+        // into this directory. So the mount stays even with hooks "disabled".
+        // Lexical comparison is still correct -- nothing canonicalizes here.
         assert!(
-            !config
+            config
                 .volumes
                 .iter()
                 .any(|v| v.host_path == hook_dir.to_string_lossy()),
-            "status hook directory should not be mounted when profile disables hooks"
+            "identity hooks survive a status-hook opt-out, so their directory is still mounted"
         );
         crate::hooks::cleanup_hook_status_dir(instance_id);
     }
