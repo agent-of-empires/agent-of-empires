@@ -344,7 +344,12 @@ fn validate_namespace(
             Err(error) => return Err(error).context("validating native-state namespace entry"),
         };
         if current != *expected {
-            bail!("native-state namespace changed during configuration seeding");
+            bail!(
+                "native-state namespace changed during configuration seeding at {}: expected {:?}, found {:?}",
+                path.display(),
+                expected,
+                current
+            );
         }
     }
     for (path, expected) in routes {
