@@ -11,6 +11,20 @@ use super::{canonical_expected_path, NativeStateBoundary, ReadAccess, StateOrigi
 use crate::session::anchored_fs::AnchoredDir;
 
 mod inventory;
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct Changed(String);
+
+fn source_io(error: std::io::Error) -> anyhow::Error {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    ) {
+        Changed("native source disappeared during seeding".into()).into()
+    } else {
+        error.into()
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Fingerprint {
@@ -43,13 +57,13 @@ pub(super) struct SourceRoot {
 
 impl SourceRoot {
     pub(super) fn new(path: &Path) -> Result<Self> {
-        let anchor = super::open_canonical_dir(&fs::canonicalize(path)?)?;
-        let metadata = fs::metadata(anchor.path())?;
+        let anchor = super::open_canonical_dir(&fs::canonicalize(path).map_err(source_io)?)?;
+        let metadata = fs::metadata(anchor.path()).map_err(source_io)?;
         let (device, inode) = anchor.identity()?;
         #[cfg(target_os = "macos")]
         let device = device as u64;
         if metadata.dev() != device || metadata.ino() != inode {
-            bail!("native source root changed before capture");
+            return Err(Changed("native source root changed before capture".into()).into());
         }
         Ok(Self {
             anchor,
@@ -63,10 +77,13 @@ impl SourceRoot {
     }
 
     pub(super) fn validate(&self) -> Result<()> {
-        if fs::canonicalize(&self.lookup)? != self.anchor.path()
-            || Fingerprint::from(&fs::metadata(&self.lookup)?) != self.fingerprint
+        if fs::canonicalize(&self.lookup).map_err(source_io)? != self.anchor.path()
+            || Fingerprint::from(&fs::metadata(&self.lookup).map_err(source_io)?)
+                != self.fingerprint
         {
-            bail!("native configuration source root changed during seeding");
+            return Err(
+                Changed("native configuration source root changed during seeding".into()).into(),
+            );
         }
         Ok(())
     }
@@ -177,8 +194,8 @@ impl<'a> ReadGuard<'a> {
     }
 
     pub(super) fn record_route(&mut self, lookup: &Path, canonical: &Path) -> Result<()> {
-        if fs::canonicalize(lookup)? != canonical {
-            bail!("configuration source alias changed before reading");
+        if fs::canonicalize(lookup).map_err(source_io)? != canonical {
+            return Err(Changed("configuration source alias changed before reading".into()).into());
         }
         if lookup != canonical {
             self.routes
@@ -283,8 +300,10 @@ impl<'a> ReadGuard<'a> {
             )?;
             validate_namespace(&entries, &routes)?;
             for (path, expected) in &directories {
-                if Fingerprint::from(&fs::metadata(path)?) != *expected {
-                    bail!("native-state inventory changed during validation");
+                if Fingerprint::from(&fs::metadata(path).map_err(source_io)?) != *expected {
+                    return Err(
+                        Changed("native-state inventory changed during validation".into()).into(),
+                    );
                 }
             }
             if self
@@ -300,11 +319,12 @@ impl<'a> ReadGuard<'a> {
         self.boundary.hermes.validate()?;
         self.access.validate()?;
         for (path, expected) in self.directories.iter().chain(&self.files) {
-            if Fingerprint::from(&fs::metadata(path)?) != *expected {
-                bail!(
+            if Fingerprint::from(&fs::metadata(path).map_err(source_io)?) != *expected {
+                return Err(Changed(format!(
                     "configuration source or native-state inventory changed during seeding: {}",
                     path.display()
-                );
+                ))
+                .into());
             }
         }
         Ok(())
@@ -344,17 +364,20 @@ fn validate_namespace(
             Err(error) => return Err(error).context("validating native-state namespace entry"),
         };
         if current != *expected {
-            bail!(
+            return Err(Changed(format!(
                 "native-state namespace changed during configuration seeding at {}: expected {:?}, found {:?}",
                 path.display(),
                 expected,
                 current
-            );
+            )).into());
         }
     }
     for (path, expected) in routes {
         if canonical_expected_path(path)? != *expected {
-            bail!("native-state boundary changed during configuration seeding");
+            return Err(Changed(
+                "native-state boundary changed during configuration seeding".into(),
+            )
+            .into());
         }
     }
     Ok(())

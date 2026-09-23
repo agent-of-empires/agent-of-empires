@@ -136,16 +136,22 @@ A session keeps the store it was given for as long as AoE can still prove it
 wrote that store. When it cannot, each of its content roots is moved intact
 under `.aoe-sandbox-recovery/<transaction>/<index>/original` beside the agent's
 config directory and a fresh store is seeded in its place, with the session's
-original left alone. AoE copies back native resume state that was already
-sandbox-only (Claude `projects/` and OpenCode `opencode.db*`) and keeps those
-agents' session IDs. Native history that could have been imported from the host
-stays in recovery. When an agent's native resume is isolated, its next start
-shows a notice naming the retained originals; that isolated history is not
+original left alone. AoE carries Claude `projects/`, Codex `sessions/` and
+`archived_sessions/`, and OpenCode `opencode.db`, `opencode.db-wal` and
+`opencode.db-shm` from a retired store, then retains their native session
+IDs. ACP continuation contexts are reset independently.
+Other agents' sandbox-only conversation directories may have come from an older
+shared store, so AoE cannot prove per-session ownership and leaves them in
+recovery along with host-importable native history. Their session IDs are
+reset. The next start names retained originals; isolated history is not
 replayed automatically.
 
 Sessions created under the older shared-store layout move to a private store the next time they start. Once every session that used the shared store has moved, AoE preserves that store intact under `.aoe-sandbox-recovery/v027-<transaction>/original` instead of deleting it. A session that already had a private store receives only the shared store's top-level configuration and credentials, not its directories of caches, logs, plugins, or unrelated conversation history. If a live sandbox can see the recovery directory, preservation is deferred until that mount is gone.
 
 The first start can therefore be slower; the TUI shows progress. `aoe migrate` moves every eligible session at once, and `AOE_DEFER_SANDBOX_MIGRATION=1` skips the move for one launch (a stopped session then cannot start until its store has moved). Trashed and archived sessions keep the shared store until they are started again.
+
+If native configuration changes throughout isolation, that session remains
+pending; `aoe migrate` continues with other sessions and retries later.
 
 ### Shared credentials
 

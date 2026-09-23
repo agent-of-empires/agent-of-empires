@@ -1154,24 +1154,30 @@ pub(crate) fn content_role_agent(role: &str) -> Option<&'static str> {
         .map(|mount| mount.tool_name)
 }
 
-/// Native state the pre-v031 denylist already kept sandbox-only, so it was
-/// never host-copied and holds the session's own resume. A retired original
-/// lends it back to the fresh store it seeds instead of isolating it, so the
-/// rows resolving that store keep their session ids.
+/// v027 copied shared stores for most agents, including sandbox-only dirs.
+/// Codex was already private; Claude and OpenCode keep their existing carry.
 fn carried_state(mount: &AgentConfigMount) -> &'static [&'static str] {
     match (mount.tool_name, mount.container_suffix) {
         ("claude", ".claude") => &["projects"],
-        ("opencode", ".local/share/opencode") => &["opencode.db*"],
+        ("opencode", ".local/share/opencode") => {
+            &["opencode.db", "opencode.db-wal", "opencode.db-shm"]
+        }
+        ("codex", ".codex") => &["sessions", "archived_sessions"],
         _ => &[],
     }
 }
 
-/// Whether a retired store keeps `agent`'s own resume state in place, so
-/// isolating that store must not clear the row's session ids.
+/// Only these carried formats retain an established native resume path.
 pub(crate) fn agent_retains_native_resume(agent: &str) -> bool {
-    AGENT_CONFIG_MOUNTS
-        .iter()
-        .any(|mount| mount.tool_name == agent && !carried_state(mount).is_empty())
+    matches!(agent, "claude" | "opencode" | "codex")
+}
+
+pub(crate) fn retry_source_change<T>(seed: impl FnMut() -> Result<T>) -> Result<T> {
+    seed::retry_source_change(seed)
+}
+
+pub(crate) fn source_changed(error: &anyhow::Error) -> bool {
+    seed::source_changed(error)
 }
 
 enum ContentSeedMode {
@@ -1265,43 +1271,63 @@ fn seed_content_roles(
         .filter(|mount| root.roles.iter().any(|role| role == mount.container_suffix))
     {
         if source.exists() {
-            let mut boundary = NativeStateBoundary::new(source, mount, home, session, destination)?;
-            let stopped = matches!(mode, ContentSeedMode::StoppedOriginal);
-            let files = if stopped {
-                boundary = boundary.for_stopped_original(&root.host, mount)?;
-                let mut files = mount.copy_files.to_vec();
-                files.extend(mount.home_seed_files.iter().map(|(name, _)| *name));
-                files.extend(mount.shared_credential_files.iter().copied());
-                std::borrow::Cow::Owned(files)
-            } else {
-                std::borrow::Cow::Borrowed(mount.copy_files)
+            let mut seed = || -> Result<()> {
+                let mut boundary =
+                    NativeStateBoundary::new(source, mount, home, session, destination)?;
+                let stopped = matches!(mode, ContentSeedMode::StoppedOriginal);
+                let files = if stopped {
+                    boundary = boundary.for_stopped_original(&root.host, mount)?;
+                    let mut files = mount.copy_files.to_vec();
+                    files.extend(mount.home_seed_files.iter().map(|(name, _)| *name));
+                    files.extend(mount.shared_credential_files.iter().copied());
+                    std::borrow::Cow::Owned(files)
+                } else {
+                    std::borrow::Cow::Borrowed(mount.copy_files)
+                };
+                let preserve = if matches!(mode, ContentSeedMode::OwnedExtension) {
+                    files.as_ref()
+                } else {
+                    mount.preserve_files
+                };
+                sync_agent_config(
+                    source,
+                    destination,
+                    &files,
+                    mount.seed_files,
+                    mount.copy_dirs,
+                    preserve,
+                    &boundary,
+                )?;
+                seed::seed_credential_pairs(
+                    source,
+                    destination,
+                    mount.credential_pairs,
+                    &boundary,
+                )?;
+                seed::seed_sqlite_files(source, destination, mount.sqlite_seed_files, &boundary)?;
+                seed::seed_configured_resources(
+                    mount,
+                    source,
+                    destination,
+                    home,
+                    workspace,
+                    &boundary,
+                )?;
+                if stopped {
+                    seed::carry_sandbox_state(
+                        source,
+                        destination,
+                        carried_state(mount),
+                        &boundary,
+                    )?;
+                }
+                boundary.validate_source()?;
+                Ok(())
             };
-            let preserve = if matches!(mode, ContentSeedMode::OwnedExtension) {
-                files.as_ref()
+            if matches!(mode, ContentSeedMode::OwnedExtension) {
+                seed::retry_source_change(&mut seed)?;
             } else {
-                mount.preserve_files
-            };
-            sync_agent_config(
-                source,
-                destination,
-                &files,
-                mount.seed_files,
-                mount.copy_dirs,
-                preserve,
-                &boundary,
-            )?;
-            seed::seed_credential_pairs(source, destination, mount.credential_pairs, &boundary)?;
-            seed::seed_sqlite_files(source, destination, mount.sqlite_seed_files, &boundary)?;
-            seed::seed_configured_resources(
-                mount,
-                source,
-                destination,
-                home,
-                workspace,
-                &boundary,
-            )?;
-            if stopped {
-                seed::carry_sandbox_state(source, destination, carried_state(mount), &boundary)?;
+                seed()?;
             }
         }
         for &(name, content) in mount.seed_files.iter().chain(mount.home_seed_files) {
@@ -1424,8 +1450,6 @@ fn seed_sandbox_dir_from(
     std::fs::create_dir_all(&sandbox_dir)?;
 
     if host_dir.exists() {
-        let boundary =
-            NativeStateBoundary::new(&host_dir, mount, home, session_config, &sandbox_dir)?;
         // Codex writes `trusted_hash` into `[hooks.state]` of the sandbox
         // copy of `config.toml` when the user accepts a hook hash inside
         // the container; that copy is overwritten on each
@@ -1451,25 +1475,36 @@ fn seed_sandbox_dir_from(
             None
         };
 
-        sync_agent_config(
-            &host_dir,
-            &sandbox_dir,
-            mount.copy_files,
-            mount.seed_files,
-            mount.copy_dirs,
-            mount.preserve_files,
-            &boundary,
-        )?;
-        seed::seed_credential_pairs(&host_dir, &sandbox_dir, mount.credential_pairs, &boundary)?;
-        seed::seed_sqlite_files(&host_dir, &sandbox_dir, mount.sqlite_seed_files, &boundary)?;
-        seed::seed_configured_resources(
-            mount,
-            &host_dir,
-            &sandbox_dir,
-            home,
-            workspace,
-            &boundary,
-        )?;
+        seed::retry_source_change(|| {
+            let boundary =
+                NativeStateBoundary::new(&host_dir, mount, home, session_config, &sandbox_dir)?;
+            sync_agent_config(
+                &host_dir,
+                &sandbox_dir,
+                mount.copy_files,
+                mount.seed_files,
+                mount.copy_dirs,
+                mount.preserve_files,
+                &boundary,
+            )?;
+            seed::seed_credential_pairs(
+                &host_dir,
+                &sandbox_dir,
+                mount.credential_pairs,
+                &boundary,
+            )?;
+            seed::seed_sqlite_files(&host_dir, &sandbox_dir, mount.sqlite_seed_files, &boundary)?;
+            seed::seed_configured_resources(
+                mount,
+                &host_dir,
+                &sandbox_dir,
+                home,
+                workspace,
+                &boundary,
+            )?;
+            boundary.validate_source()?;
+            Ok(())
+        })?;
 
         if mount.tool_name == "codex" {
             seed_legacy_codex_auth(&sandbox_dir, home);
@@ -2379,11 +2414,7 @@ pub(crate) fn stranded_named_ignore_volumes(
         .collect()
 }
 
-/// Build a full `ContainerConfig` for creating a sandboxed container.
-///
-/// `profile` selects which profile's overrides (volumes, mount_ssh, volume_ignores)
-/// are merged on top of the global config. An empty `profile` falls back to the
-/// user's globally configured default profile.
+/// Reject managed agent paths that would bypass the sandbox's private mounts.
 fn validate_managed_container_environment(
     environment: &[EnvEntry],
     active_agent: Option<&crate::agents::AgentDef>,
@@ -2418,6 +2449,8 @@ fn validate_managed_container_environment(
     Ok(())
 }
 
+/// Build a sandboxed container config with the selected profile's overrides.
+/// An empty profile uses the configured default.
 pub(crate) fn build_container_config(
     project_path_str: &str,
     sandbox_info: &SandboxInfo,
@@ -3085,11 +3118,37 @@ fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::hooks::test_support::BaseGuard;
+    use std::fs;
+    use tempfile::TempDir;
 
-    // The sandbox design rests on a bind that already exists: the Pi config
-    // dir at `/root/.pi`. Everything else follows from it, so assert the mount
-    // the builder actually produces rather than the one this branch intended.
-    // No container runs in CI, which is exactly why this has to be pinned here.
+    struct IsolatedHome {
+        _home: crate::session::test_support::HomeGuard,
+        home: TempDir,
+        _base_dir: TempDir,
+        _base: BaseGuard,
+    }
+
+    impl IsolatedHome {
+        fn new() -> Self {
+            let (base, _, base_dir) = BaseGuard::ready();
+            let home = TempDir::new().unwrap();
+            fs::create_dir_all(home.path().join(".local/share")).unwrap();
+            let home_guard = crate::session::test_support::isolate_home(home.path());
+            Self {
+                _home: home_guard,
+                home,
+                _base_dir: base_dir,
+                _base: base,
+            }
+        }
+
+        fn path(&self) -> &Path {
+            self.home.path()
+        }
+    }
+
     /// `build_container_config` with the arguments these tests rarely vary.
     struct Build<'a> {
         selection: ContainerAgentSelection<'a>,
@@ -3114,6 +3173,21 @@ mod tests {
             Self::select(ContainerAgentSelection::new(tool, None))
         }
 
+        fn info(mut self, info: SandboxInfo) -> Self {
+            self.info = info;
+            self
+        }
+
+        fn yolo(mut self, yolo: bool) -> Self {
+            self.yolo = yolo;
+            self
+        }
+
+        fn profile(mut self, profile: &'a str) -> Self {
+            self.profile = profile;
+            self
+        }
+
         fn instance(mut self, instance: &'a str) -> Self {
             self.instance = instance;
             self
@@ -3135,9 +3209,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn sandboxed_pi_config_mount_backs_the_sidecar_and_extension() {
-        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
-        let temp_home = TempDir::new().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        let _home = IsolatedHome::new();
 
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
@@ -3182,11 +3254,6 @@ mod tests {
             "no per-extension mount may be required"
         );
     }
-
-    use super::*;
-    use crate::hooks::test_support::BaseGuard;
-    use std::fs;
-    use tempfile::TempDir;
 
     /// The extension read must go through the anchored walk, not a stat of the
     /// pathname followed by a second open of it. With `agent/extensions`
@@ -4384,28 +4451,34 @@ mod tests {
         assert!(!dest.join("dangling").exists());
     }
 
-    /// Propagation writes into the user's agent config dirs, so nothing may be
-    /// written until they opt in. Also covers the sandbox reconcile actually
-    /// landing once they have.
     #[test]
     fn test_sandbox_skills_sync_requires_opt_in() {
         let dir = TempDir::new().unwrap();
         let app_dir = dir.path().join("app");
-        let sandbox = dir.path().join("sandbox");
         crate::session::skills_model::create_skill(&app_dir, "shared", Some("d")).unwrap();
-        let mount = AGENT_CONFIG_MOUNTS
-            .iter()
-            .find(|m| m.tool_name == "claude")
-            .unwrap();
-
-        sync_managed_skills_into_sandbox(mount, &sandbox, &app_dir, false);
-        assert!(
-            !sandbox.join("skills").exists(),
-            "must not write into an agent config dir before the user opts in"
-        );
-
-        sync_managed_skills_into_sandbox(mount, &sandbox, &app_dir, true);
-        assert!(sandbox.join("skills/shared/SKILL.md").is_file());
+        for (index, (tool, role, expected)) in [
+            ("claude", ".claude", true),
+            ("gemini", ".gemini", true),
+            ("opencode", ".config/opencode", true),
+            ("opencode", ".local/share/opencode", false),
+            ("kimi", ".kimi-code", true),
+            ("prime-agent", ".prime/agent", true),
+            ("codex", ".codex", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sandbox = dir.path().join(format!("sandbox-{index}"));
+            let mount = AGENT_CONFIG_MOUNTS
+                .iter()
+                .find(|mount| mount.tool_name == tool && mount.container_suffix == role)
+                .unwrap();
+            let skill = sandbox.join("skills/shared/SKILL.md");
+            sync_managed_skills_into_sandbox(mount, &sandbox, &app_dir, false);
+            assert!(!skill.exists(), "{tool} propagated without opt-in");
+            sync_managed_skills_into_sandbox(mount, &sandbox, &app_dir, true);
+            assert_eq!(skill.is_file(), expected, "{tool} at {role}");
+        }
     }
 
     #[test]
@@ -5702,36 +5775,19 @@ volume_ignores = ["node_modules"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_yolo_trusts_codex_project_only_in_yolo() {
-        let (_hg, _, _tmp_base) = BaseGuard::ready();
-        let temp_home = TempDir::new().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        let home = IsolatedHome::new();
 
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sandbox_info = crate::session::instance::SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test:latest".to_string(),
-            container_name: "test-container".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        };
         let instance_id = "codex-yolo-trust-test";
-        let config = build_container_config(
-            project_dir.path().to_str().unwrap(),
-            &sandbox_info,
-            ContainerAgentSelection::new("codex", None),
-            true,
-            instance_id,
-            None,
-            "",
-        )
-        .unwrap();
+        let config = Build::new("codex")
+            .yolo(true)
+            .instance(instance_id)
+            .run(project_dir.path())
+            .unwrap();
 
-        let codex_config = temp_home
+        let codex_config = home
             .path()
             .join(".codex")
             .join(SANDBOX_PRIVATE_SUBDIR)
@@ -6980,16 +7036,11 @@ trusted_hash = "keep"
             container_workdir: None,
         };
         let instance_id = "codex-sandbox-extra-env-hooks-test";
-        let config = build_container_config(
-            project_dir.path().to_str().unwrap(),
-            &sandbox_info,
-            ContainerAgentSelection::new("codex", None),
-            false,
-            instance_id,
-            None,
-            "",
-        )
-        .unwrap();
+        let config = Build::new("codex")
+            .info(sandbox_info)
+            .instance(instance_id)
+            .run(project_dir.path())
+            .unwrap();
 
         let codex_sandbox = temp_home
             .path()
@@ -7116,18 +7167,6 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
 
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
-        let project_path_str = project_dir.path().to_str().unwrap();
-
-        let sandbox_info = crate::session::instance::SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test:latest".to_string(),
-            container_name: "test-container".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        };
 
         let has_volume = |config: &crate::containers::container_interface::ContainerConfig,
                           host: &str,
@@ -7141,16 +7180,10 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
 
         // Passing "personal" must resolve the personal profile's extra_volumes
         // and NOT the default profile's.
-        let cfg_personal = build_container_config(
-            project_path_str,
-            &sandbox_info,
-            ContainerAgentSelection::new("claude", None),
-            false,
-            "test-instance-id",
-            None,
-            "personal",
-        )
-        .unwrap();
+        let cfg_personal = Build::new("claude")
+            .profile("personal")
+            .run(project_dir.path())
+            .unwrap();
         assert!(
             has_volume(
                 &cfg_personal,
@@ -7179,16 +7212,10 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
         );
 
         // Passing "default" must resolve the default profile's extra_volumes.
-        let cfg_default = build_container_config(
-            project_path_str,
-            &sandbox_info,
-            ContainerAgentSelection::new("claude", None),
-            false,
-            "test-instance-id",
-            None,
-            "default",
-        )
-        .unwrap();
+        let cfg_default = Build::new("claude")
+            .profile("default")
+            .run(project_dir.path())
+            .unwrap();
         assert!(
             has_volume(
                 &cfg_default,
@@ -7200,16 +7227,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
 
         // Empty profile must fall back to the user's globally configured default,
         // preserving prior behavior for callers without a profile in hand.
-        let cfg_empty = build_container_config(
-            project_path_str,
-            &sandbox_info,
-            ContainerAgentSelection::new("claude", None),
-            false,
-            "test-instance-id",
-            None,
-            "",
-        )
-        .unwrap();
+        let cfg_empty = Build::new("claude").run(project_dir.path()).unwrap();
         assert!(
             has_volume(&cfg_empty, "/host/default-only", "/container/default-only"),
             "empty profile must fall back to global default",

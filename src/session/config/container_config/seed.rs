@@ -19,6 +19,23 @@ mod guard;
 mod hermes;
 mod policy;
 use policy::{Exception, NativeRule, ReadAccess, StateOrigin};
+
+pub(super) fn source_changed(error: &anyhow::Error) -> bool {
+    error.is::<guard::Changed>()
+}
+
+pub(super) fn retry_source_change<T>(mut seed: impl FnMut() -> Result<T>) -> Result<T> {
+    for attempt in 0..5 {
+        match seed() {
+            Err(error) if source_changed(&error) => {
+                std::thread::sleep(std::time::Duration::from_millis(10 << attempt));
+            }
+            result => return result,
+        }
+    }
+    seed()
+}
+
 pub(super) struct NativeStateBoundary {
     source_root: guard::SourceRoot,
     origin_root: PathBuf,
@@ -43,6 +60,10 @@ impl NativeStateBoundary {
             routes: Vec::new(),
             hermes: hermes::Scopes::default(),
         })
+    }
+
+    pub(super) fn validate_source(&self) -> Result<()> {
+        self.source_root.validate()
     }
     #[cfg(test)]
     pub(super) fn for_fixture(
@@ -1459,6 +1480,62 @@ impl ResourceSeed<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_changed_native_source_is_reopened_before_publication() {
+        for change in ["directory", "replacement", "gap"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("source");
+            let active = temporary.path().join("active");
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(&active).unwrap();
+            fs::write(source.join("settings.json"), b"current settings").unwrap();
+            let mut attempts = 0;
+            retry_source_change(|| {
+                attempts += 1;
+                let boundary = NativeStateBoundary::for_source(&source, &active)?;
+                if attempts == 1 {
+                    match change {
+                        "replacement" => {
+                            fs::write(source.join("settings.tmp"), b"updated settings")?;
+                            fs::rename(source.join("settings.tmp"), source.join("settings.json"))?;
+                        }
+                        "gap" => {
+                            fs::rename(source.join("settings.json"), source.join("settings.old"))?
+                        }
+                        _ => fs::create_dir(source.join("new-project"))?,
+                    }
+                }
+                let result = sync_agent_config(
+                    &source,
+                    &active,
+                    &["settings.json"],
+                    &[],
+                    &[],
+                    &[],
+                    &boundary,
+                )
+                .and_then(|_| boundary.validate_source());
+                if attempts == 1 {
+                    assert!(result.is_err());
+                    assert!(!active.join("settings.json").exists());
+                    if change == "gap" {
+                        fs::rename(source.join("settings.old"), source.join("settings.json"))?;
+                    }
+                }
+                result
+            })
+            .unwrap();
+            assert_eq!(attempts, 2);
+            assert_eq!(
+                fs::read(active.join("settings.json")).unwrap(),
+                if change == "replacement" {
+                    b"updated settings".as_slice()
+                } else {
+                    b"current settings".as_slice()
+                },
+            );
+        }
+    }
 
     #[test]
     fn sqlite_seed_refuses_uncommitted_spilled_pages_and_retries_after_rollback() {

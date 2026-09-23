@@ -2296,6 +2296,28 @@ mod tests {
         serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap()
     }
 
+    fn write_rows(app: &Path, rows: &Value) {
+        fs::write(app.join("sessions.json"), serde_json::to_vec(rows).unwrap()).unwrap();
+    }
+
+    fn pin_agent_dir(app: &Path, root: &Path) {
+        fs::write(
+            app.join("config.toml"),
+            format!(
+                "[session.agent_config_dir]\ngemini = \"{}\"\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn seed_store(parent: &Path, rel: &str, data: &[u8]) -> PathBuf {
+        let root = parent.join(rel);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("data"), data).unwrap();
+        root
+    }
+
     /// Every runtime error that means "could not answer" must be classified
     /// as such. `InspectFailed` is the catch-all `classify_probe_failure`
     /// returns for an unrecognised stderr, which is what a timed-out probe on
@@ -2712,14 +2734,7 @@ mod tests {
         fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
 
         run_in(&app, &home, &|_| Ok(true)).unwrap();
-        fs::write(
-            app.join("config.toml"),
-            format!(
-                "[session.agent_config_dir]\ngemini = \"{}\"\n",
-                temp.path().join("changed-gemini").display()
-            ),
-        )
-        .unwrap();
+        pin_agent_dir(&app, &temp.path().join("changed-gemini"));
 
         let changed_destination = temp.path().join("changed-gemini/sandbox-v2/one");
         let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
@@ -2741,26 +2756,12 @@ mod tests {
         let custom_b = temp.path().join("custom-b");
         fs::create_dir_all(custom_a.join("sandbox/one")).unwrap();
         fs::write(custom_a.join("sandbox/one/data"), b"source").unwrap();
-        fs::write(
-            app.join("config.toml"),
-            format!(
-                "[session.agent_config_dir]\ngemini = \"{}\"\n",
-                custom_a.display()
-            ),
-        )
-        .unwrap();
+        pin_agent_dir(&app, &custom_a);
         fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
         run_in(&app, &home, &|_| Ok(true)).unwrap();
         fs::create_dir_all(custom_a.join("sandbox-v2/one")).unwrap();
         fs::write(custom_a.join("sandbox-v2/one/data"), b"published").unwrap();
-        fs::write(
-            app.join("config.toml"),
-            format!(
-                "[session.agent_config_dir]\ngemini = \"{}\"\n",
-                custom_b.display()
-            ),
-        )
-        .unwrap();
+        pin_agent_dir(&app, &custom_b);
 
         let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
 
@@ -3126,9 +3127,7 @@ gemini = "{}"
     #[serial_test::serial]
     fn parked_rows_are_not_copied_and_hold_the_shared_source() {
         let (_temp, _app_guard, app, home) = isolated();
-        let legacy = home.join(".gemini/sandbox");
-        fs::create_dir_all(&legacy).unwrap();
-        fs::write(legacy.join("data"), b"data").unwrap();
+        let legacy = seed_store(&home, ".gemini/sandbox", b"data");
         let rows = serde_json::json!([
             {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true},
              "trashed_at":"2026-09-05T00:00:00Z"},
@@ -3136,11 +3135,7 @@ gemini = "{}"
              "archived_at":"2026-09-05T00:00:00Z"},
             {"id":"3333333333333333","tool":"gemini","sandbox_info":{"enabled":true}}
         ]);
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&rows).unwrap(),
-        )
-        .unwrap();
+        write_rows(&app, &rows);
 
         run_in(&app, &home, &|_| Ok(false)).unwrap();
 
@@ -3184,32 +3179,19 @@ gemini = "{}"
         assert_eq!(sessions_on_shared_store().unwrap(), 2);
     }
 
-    /// Clearing `trashed_at` makes the row eligible again, and the start that
-    /// follows the restore moves its store.
-    /// Retirement is per root. A parked row holds its own root and nothing
-    /// else: every test above asserts a source *survives*, so nothing caught
-    /// a pass-wide flag suppressing retirement everywhere, which left the
-    /// transition unable to finish on any machine with one archived session.
+    /// A parked row holds only its own root; unrelated roots can retire.
     #[test]
     #[serial_test::serial]
     fn an_unrelated_parked_row_does_not_hold_a_ready_root() {
         let (_temp, _app_guard, app, home) = isolated();
-        let gemini = home.join(".gemini/sandbox");
-        fs::create_dir_all(&gemini).unwrap();
-        fs::write(gemini.join("data"), b"g").unwrap();
-        let claude = home.join(".claude/sandbox");
-        fs::create_dir_all(&claude).unwrap();
-        fs::write(claude.join("data"), b"c").unwrap();
+        let gemini = seed_store(&home, ".gemini/sandbox", b"g");
+        let claude = seed_store(&home, ".claude/sandbox", b"c");
         let rows = serde_json::json!([
             {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
             {"id":"3333333333333333","tool":"claude","sandbox_info":{"enabled":true},
              "archived_at":"2026-09-05T00:00:00Z"}
         ]);
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&rows).unwrap(),
-        )
-        .unwrap();
+        write_rows(&app, &rows);
 
         run_in(&app, &home, &|_| Ok(false)).unwrap();
 

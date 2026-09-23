@@ -1175,8 +1175,7 @@ fn record_retirement(
                     .iter()
                     .find_map(|role| container_config::content_role_agent(role))
                 {
-                    // A store whose own resume state is carried forward is not
-                    // reset, so the row keeps its session ids.
+                    // Carried history retains the native resume id, not the ACP context.
                     if !container_config::agent_retains_native_resume(agent) {
                         receipt.retired_tools.insert(tool.clone(), agent.to_owned());
                     }
@@ -1283,9 +1282,6 @@ fn stage_receipt(
         let parent = part.stage.parent().context("stage has no parent")?;
         let anchor = durable_stage_parent(parent)?;
         let leaf = Path::new(part.stage.file_name().context("stage has no leaf")?);
-        // Only this transaction owns the stage.
-        anchor.remove_staged_dir(leaf)?;
-        let stage = anchor.create_child(leaf)?;
         let source = if part.original.is_some() {
             &part.root.path
         } else {
@@ -1295,16 +1291,21 @@ fn stage_receipt(
             source,
             stopped_original: part.original.is_some(),
         };
-        container_config::seed_content_stage(
-            &capability,
-            &part.root,
-            stage.path(),
-            home,
-            &config.session,
-            workspace,
-        )?;
-        super::store_fs::barrier(&fs::File::open(stage.path())?)?;
-        part.staged = identity(stage.path())?;
+        part.staged = container_config::retry_source_change(|| {
+            // Only this transaction owns the stage. Never clear a published root.
+            anchor.remove_staged_dir(leaf)?;
+            let stage = anchor.create_child(leaf)?;
+            container_config::seed_content_stage(
+                &capability,
+                &part.root,
+                stage.path(),
+                home,
+                &config.session,
+                workspace,
+            )?;
+            super::store_fs::barrier(&fs::File::open(stage.path())?)?;
+            identity(stage.path())
+        })?;
     }
     receipt.phase = Phase::Staged;
     write_receipt(path, receipt)
@@ -1464,7 +1465,6 @@ fn reset_row(row: &mut Value, receipt: &Receipt) -> Result<()> {
         .filter(|part| part.original.is_some())
         .flat_map(|part| part.root.roles.iter())
         .filter_map(|role| container_config::content_role_agent(role))
-        .filter(|agent| !container_config::agent_retains_native_resume(agent))
         .collect();
     let mut additions = Vec::new();
     for tool in row_tools(snapshot) {
@@ -1694,7 +1694,7 @@ fn retired_receipt(
     let expected: BTreeSet<_> = roots.iter().map(|root| root.path.clone()).collect();
     Ok(receipts.into_iter().find(|receipt| {
         if receipt.phase != Phase::Committed
-            || receipt.retired_tools.is_empty()
+            || receipt.roots.iter().all(|part| part.original.is_none())
             || receipt.retired_identity.get("id") != row.get("id")
         {
             return false;
@@ -1724,7 +1724,7 @@ fn retired_receipt(
                         == Some(current)
                 })
         };
-        let terminal = matches_field("agent_session_id");
+        let terminal = !receipt.retired_tools.is_empty() && matches_field("agent_session_id");
         let structured = matches_field("acp_session_id")
             && row.get("fork_pending") == receipt.retired_identity.get("fork_pending");
         terminal || structured
@@ -1969,7 +1969,15 @@ fn reconcile_in(
     }
     for ((path, id, tool), ()) in targets {
         if move_stores || only.is_some() {
-            migrate_target(app, home, (&path, &id, &tool), running, reap, exposure)?;
+            if let Err(error) =
+                migrate_target(app, home, (&path, &id, &tool), running, reap, exposure)
+            {
+                if !container_config::source_changed(&error) {
+                    return Err(error);
+                }
+                tracing::warn!(target: "session.profile", %error, %id, %tool, "Native source kept changing during content isolation");
+                progress::notice(format!("sandbox {id}: native configuration kept changing; content isolation remains pending"));
+            }
         } else {
             let config = crate::session::config::profile_config::resolve_config(
                 &layout::profile_for_registry(app, &path),
@@ -2769,12 +2777,12 @@ mod tests {
         let app = crate::session::get_app_dir().unwrap();
         let project = temporary.path().join("project");
         fs::create_dir_all(&project).unwrap();
-        let mut instance = crate::session::Instance::new("codex", project.to_str().unwrap());
-        instance.tool = "codex".to_owned();
+        let mut instance = crate::session::Instance::new("pi", project.to_str().unwrap());
+        instance.tool = "pi".to_owned();
         instance.agent_session_id = Some("old-native-context".to_owned());
         let config = crate::session::Config::default();
         let roots = container_config::sandbox_content_roots(
-            "codex",
+            "pi",
             None,
             &config.session,
             &home,
@@ -2782,9 +2790,9 @@ mod tests {
         )
         .unwrap();
         let root = &roots[0].path;
-        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::create_dir_all(root.join("agent/sessions")).unwrap();
         fs::write(
-            root.join("sessions/original.jsonl"),
+            root.join("agent/sessions/original.jsonl"),
             b"PRIVATE_ORIGINAL_CONTEXT",
         )
         .unwrap();
@@ -2805,7 +2813,7 @@ mod tests {
                 migrate_target(
                     &app,
                     &home,
-                    (registry, &instance.id, "codex"),
+                    (registry, &instance.id, "pi"),
                     &|_| Ok(false),
                     &|_| Ok(true),
                     &|_| Ok(Vec::new()),
@@ -2829,6 +2837,126 @@ mod tests {
                 registry.display()
             );
         }
+    }
+    #[test]
+    #[serial_test::serial]
+    fn codex_private_sessions_survive_isolation_without_host_history() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("codex", project.to_str().unwrap());
+        instance.tool = "codex".to_owned();
+        instance.agent_session_id = Some("private-codex-session".to_owned());
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "codex",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = &roots[0];
+        fs::create_dir_all(root.path.join("sessions")).unwrap();
+        fs::write(root.path.join("sessions/private.jsonl"), b"PRIVATE_HISTORY").unwrap();
+        fs::create_dir_all(root.host.join("sessions")).unwrap();
+        fs::write(root.host.join("sessions/host.jsonl"), b"HOST_HISTORY").unwrap();
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({"enabled": true, "image": "img", "container_name": "aoe-sandbox-fixture"});
+        let registry = app.join("sessions.json");
+        fs::write(&registry, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
+
+        assert!(migrate_target(
+            &app,
+            &home,
+            (&registry, &instance.id, "codex"),
+            &|_| Ok(false),
+            &|_| Ok(true),
+            &|_| Ok(Vec::new()),
+        )
+        .unwrap());
+        assert_eq!(
+            fs::read(root.path.join("sessions/private.jsonl")).unwrap(),
+            b"PRIVATE_HISTORY"
+        );
+        assert!(!root.path.join("sessions/host.jsonl").exists());
+        let rows: Value = serde_json::from_slice(&fs::read(&registry).unwrap()).unwrap();
+        assert_eq!(rows[0]["agent_session_id"], "private-codex-session");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn opencode_carries_only_its_native_database_not_a_host_copyable_backup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut instance = crate::session::Instance::new("opencode", project.to_str().unwrap());
+        instance.tool = "opencode".to_owned();
+        instance.agent_session_id = Some("private-opencode-session".to_owned());
+        let config = crate::session::Config::default();
+        let roots = container_config::sandbox_content_roots(
+            "opencode",
+            None,
+            &config.session,
+            &home,
+            &instance.id,
+        )
+        .unwrap();
+        let root = roots
+            .iter()
+            .find(|root| {
+                root.roles
+                    .iter()
+                    .any(|role| role == ".local/share/opencode")
+            })
+            .unwrap();
+        fs::create_dir_all(&root.path).unwrap();
+        fs::create_dir_all(&root.host).unwrap();
+        let database = rusqlite::Connection::open(root.path.join("opencode.db")).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE history(value TEXT); INSERT INTO history VALUES ('private');",
+            )
+            .unwrap();
+        drop(database);
+        fs::write(
+            root.path.join("opencode.db.backup"),
+            b"POSSIBLY_HOST_COPIED",
+        )
+        .unwrap();
+        let host_db = rusqlite::Connection::open(root.host.join("opencode.db")).unwrap();
+        host_db
+            .execute_batch("CREATE TABLE history(value TEXT); INSERT INTO history VALUES ('host');")
+            .unwrap();
+        drop(host_db);
+        let mut row = serde_json::to_value(&instance).unwrap();
+        row["sandbox_info"] = serde_json::json!({"enabled": true, "image": "img", "container_name": "aoe-sandbox-fixture"});
+        let registry = app.join("sessions.json");
+        fs::write(&registry, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
+
+        assert!(migrate_target(
+            &app,
+            &home,
+            (&registry, &instance.id, "opencode"),
+            &|_| Ok(false),
+            &|_| Ok(true),
+            &|_| Ok(Vec::new()),
+        )
+        .unwrap());
+        let carried = rusqlite::Connection::open(root.path.join("opencode.db")).unwrap();
+        let value: String = carried
+            .query_row("SELECT value FROM history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "private");
+        assert!(!root.path.join("opencode.db.backup").exists());
+        let rows: Value = serde_json::from_slice(&fs::read(&registry).unwrap()).unwrap();
+        assert_eq!(rows[0]["agent_session_id"], "private-opencode-session");
     }
 
     /// A retired store keeps the resume the old denylist already held
@@ -3299,7 +3427,10 @@ mod tests {
             .unwrap()
         );
         assert!(roots_ready(&app, &instance.id, "codex", &roots).unwrap());
-        assert!(!root.join("sessions").exists());
+        assert_eq!(
+            fs::read(root.join("sessions/original.jsonl")).unwrap(),
+            b"PRIVATE_ORIGINAL_CONTEXT"
+        );
         assert!(
             !root.join("stale").exists(),
             "a stale stage is not published"
@@ -3579,7 +3710,10 @@ mod tests {
             install_test_reconcile_probes(|_| Ok(false), |_| Ok(true), |_| Ok(Vec::new()));
         super::super::run_migrations_announced(None).unwrap();
         assert!(roots_ready(&app, &instance.id, "codex", &roots).unwrap());
-        assert!(!root.join("sessions").exists());
+        assert_eq!(
+            fs::read(root.join("sessions/original.jsonl")).unwrap(),
+            b"PRIVATE_ORIGINAL_CONTEXT"
+        );
         let receipt = receipt_path(&app, &instance.id, "codex").unwrap();
         let archives: Vec<_> = fs::read_dir(receipt.parent().unwrap())
             .unwrap()
@@ -3604,10 +3738,7 @@ mod tests {
         );
         let rows: Vec<Value> =
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
-        assert!(rows[0]
-            .get("agent_session_id")
-            .and_then(Value::as_str)
-            .is_none());
+        assert_eq!(rows[0]["agent_session_id"], "old-native-context");
     }
 
     /// Startup never migrates content on its own: it must advance the schema,
@@ -3864,7 +3995,10 @@ mod tests {
         assert_eq!(rows[0]["sandbox_store_generation"], 2);
         assert!(roots_ready(&app, &instance.id, "codex", &roots).unwrap());
         assert!(!legacy.exists());
-        assert!(!roots[0].path.join("sessions").exists());
+        assert_eq!(
+            fs::read(roots[0].path.join("sessions/original.jsonl")).unwrap(),
+            b"LEGACY_PRIVATE_CONTEXT"
+        );
         assert_eq!(
             fs::read(roots[0].path.join("config.toml")).unwrap(),
             b"model = 'fixture-model'\n"
@@ -4049,7 +4183,10 @@ mod tests {
             fs::read(recovery.join("sessions/original.jsonl")).unwrap(),
             b"PRIVATE_ORIGINAL_CONTEXT"
         );
-        assert!(!root.join("sessions").exists());
+        assert_eq!(
+            fs::read(root.join("sessions/original.jsonl")).unwrap(),
+            b"PRIVATE_ORIGINAL_CONTEXT"
+        );
     }
 
     #[test]
@@ -4100,7 +4237,10 @@ mod tests {
             fs::read(root.join("config.toml")).unwrap(),
             b"model = 'fixture-model'\n"
         );
-        assert!(!root.join("sessions").exists());
+        assert_eq!(
+            fs::read(root.join("sessions/original.jsonl")).unwrap(),
+            b"PRIVATE_ORIGINAL_CONTEXT"
+        );
         assert!(!root.join("escaping-original-link").exists());
         let recovery = &receipt.roots[0].recovery;
         assert_eq!(
@@ -4113,22 +4253,17 @@ mod tests {
         );
         reset_row(&mut row, &receipt).unwrap();
         let restored: crate::session::Instance = serde_json::from_value(row.clone()).unwrap();
-        assert!(restored.agent_session_id.is_none());
+        assert_eq!(
+            restored.agent_session_id.as_deref(),
+            Some("old-native-context")
+        );
         assert_eq!(
             restored.acp_session_id.as_deref(),
             Some("independent-adapter-context")
         );
-        assert!(matches!(
-            restored.resume_intent,
-            crate::session::ResumeIntent::Cleared
-        ));
-        assert!(restored.capture_started_at.is_some());
         let reset = row.clone();
         reset_row(&mut row, &receipt).unwrap();
-        assert_eq!(
-            row, reset,
-            "recovery retry must not mint another reset or capture floor"
-        );
+        assert_eq!(row, reset, "recovery retry must not mint another reset");
         receipt.phase = Phase::Committed;
         write_receipt(&path, &receipt).unwrap();
         certify_receipt(&app, &receipt).unwrap();
