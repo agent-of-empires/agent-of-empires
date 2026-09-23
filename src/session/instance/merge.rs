@@ -392,8 +392,6 @@ mod tests {
     use super::*;
     use crate::session::instance::test_helpers::*;
 
-    use tracing_test::traced_test;
-
     fn inst() -> Instance {
         Instance::new("s", "/tmp/x")
     }
@@ -926,17 +924,9 @@ mod tests {
         }
     }
 
-    fn drop_log_count(lines: &[&str]) -> usize {
-        lines
-            .iter()
-            .filter(|l| l.contains("dropped passive status patch's last_accessed_at as a no-op"))
-            .count()
-    }
-
-    #[traced_test]
     #[test]
     fn passive_status_patch_logs_only_a_dropped_last_accessed_at() {
-        tracing::callsite::rebuild_interest_cache();
+        let logs = crate::session::test_support::LogCapture::start();
         let ts = Utc::now();
         let mut disk = inst();
         disk.last_accessed_at = Some(ts);
@@ -945,10 +935,13 @@ mod tests {
         let newer = ts + chrono::Duration::minutes(1);
         disk.merge_passive_status_patch(&disk.id.clone(), &patch(Status::Idle, None, Some(newer)));
         assert_eq!(disk.last_accessed_at, Some(newer));
-        logs_assert(|lines: &[&str]| match drop_log_count(lines) {
-            1 => Ok(()),
-            n => Err(format!("expected 1 drop event, got {n}")),
-        });
+        let logs = logs.contents();
+        assert_eq!(
+            logs.matches("dropped passive status patch's last_accessed_at as a no-op")
+                .count(),
+            1,
+            "{logs}"
+        );
     }
 
     #[test]

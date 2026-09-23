@@ -233,38 +233,10 @@ mod tests {
         assert!(codex_paths.contains(&codex_home.join("hooks.json")));
     }
 
-    #[derive(Clone, Default)]
-    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for CaptureWriter {
-        type Writer = CaptureWriter;
-        fn make_writer(&self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     fn capture_logs(f: impl FnOnce()) -> String {
-        use tracing_subscriber::layer::SubscriberExt;
-        let writer = CaptureWriter::default();
-        let subscriber = tracing_subscriber::Registry::default().with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(writer.clone())
-                .with_ansi(false)
-                .with_target(true),
-        );
-        tracing::subscriber::with_default(subscriber, f);
-        let bytes = writer.0.lock().unwrap().clone();
-        String::from_utf8_lossy(&bytes).into_owned()
+        let logs = crate::session::test_support::LogCapture::start();
+        f();
+        logs.contents()
     }
 
     #[test]
