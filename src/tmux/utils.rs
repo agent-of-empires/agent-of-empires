@@ -273,21 +273,9 @@ pub(crate) fn classify_pane_probe(succeeded: bool, stdout: &str, stderr: &[u8]) 
     match stdout {
         "1" => PaneProbe::Dead,
         "0" => PaneProbe::Alive,
-        "" if succeeded || tmux_no_server_running(stderr) || tmux_target_not_found(stderr) => {
-            PaneProbe::Missing
-        }
+        "" if succeeded || tmux_no_server_running(stderr) => PaneProbe::Missing,
         _ => PaneProbe::Unknown,
     }
-}
-
-/// tmux 3.6 answers an absent target with empty success; other versions may
-/// report it as an error, which must not keep a poller alive as `Unknown`.
-fn tmux_target_not_found(stderr: &[u8]) -> bool {
-    String::from_utf8_lossy(stderr).lines().any(|line| {
-        ["can't find session", "can't find window", "can't find pane"]
-            .iter()
-            .any(|prefix| line.trim().starts_with(prefix))
-    })
 }
 
 /// A missing session reads as not dead; callers pair this with `exists()`.
@@ -934,13 +922,6 @@ mod pane_probe_tests {
         );
         let enoent = b"error connecting to /tmp/tmux-501/default (No such file or directory)\n";
         assert_eq!(classify_pane_probe(false, "", enoent), PaneProbe::Missing);
-        for absent in [
-            &b"can't find session: aoe_gone\n"[..],
-            b"can't find window: ^\n",
-            b"can't find pane: 0\n",
-        ] {
-            assert_eq!(classify_pane_probe(false, "", absent), PaneProbe::Missing);
-        }
 
         let eacces = b"error connecting to /tmp/tmux-501/default (Permission denied)\n";
         assert_eq!(classify_pane_probe(false, "", eacces), PaneProbe::Unknown);
