@@ -6,8 +6,9 @@ import { ArrowUpRight, ChevronRight } from "lucide-react";
 import { invokePluginAction, type PluginUiTone } from "../../lib/api";
 import { usePluginUiPoke, usePluginUiRevision } from "../../lib/pluginUiContext";
 import { accentStyle, lucideIcon, toneTextClass, validTone } from "../../lib/pluginUi";
+import { isInternalHref } from "../../lib/pluginHref";
 import { BadgeChip, Spinner } from "./SlotChrome";
-import { isObject, objectList, renderIcon, safeHref, str, type Obj } from "./slotPayload";
+import { isObject, objectList, pluginLinkProps, renderIcon, safeHref, str, type Obj } from "./slotPayload";
 
 interface BlockProps {
   block: Obj;
@@ -22,6 +23,11 @@ function actionParams(block: Obj): Obj | undefined {
 
 function children(block: Obj): Obj[] {
   return Array.isArray(block.children) ? block.children.filter(isObject) : [];
+}
+
+/** `label`, suffixed with "externally" unless `href` stays inside aoe. */
+function linkSuffix(href: string, label: string): string {
+  return isInternalHref(href) ? label : `${label} externally`;
 }
 
 // Clears the spinner even if the worker never re-pushes state.
@@ -183,11 +189,9 @@ function BlockRow({ block, pluginId, sessionId }: BlockProps) {
         {safe && (
           <a
             className="flex w-7 shrink-0 items-center justify-center border-l border-surface-700/50 text-text-dim hover:bg-surface-700/40 hover:text-brand-500"
-            href={safe}
-            target="_blank"
-            rel="noopener noreferrer"
-            title="Open externally"
-            aria-label={ariaLabel ? `Open ${ariaLabel} externally` : "Open externally"}
+            {...pluginLinkProps(safe)}
+            title={linkSuffix(safe, "Open")}
+            aria-label={linkSuffix(safe, ariaLabel ? `Open ${ariaLabel}` : "Open")}
           >
             <ArrowUpRight className="size-3.5" aria-hidden />
           </a>
@@ -199,9 +203,7 @@ function BlockRow({ block, pluginId, sessionId }: BlockProps) {
   return safe ? (
     <a
       className="block rounded px-1 py-0.5 text-xs hover:bg-surface-700/40"
-      href={safe}
-      target="_blank"
-      rel="noopener noreferrer"
+      {...pluginLinkProps(safe)}
       title={tooltip}
       aria-label={ariaLabel}
     >
@@ -236,14 +238,7 @@ function BlockAction({ block, pluginId, sessionId, stretch = false }: BlockProps
   // A disabled action must not stay clickable through its href.
   if (safe && !method && !disabled) {
     return (
-      <a
-        href={safe}
-        target="_blank"
-        rel="noopener noreferrer"
-        title={tooltip}
-        data-testid="plugin-pane-action"
-        className={className}
-      >
+      <a {...pluginLinkProps(safe)} title={tooltip} data-testid="plugin-pane-action" className={className}>
         {leading}
         {label}
         <ArrowUpRight className="size-3" aria-hidden />
@@ -430,7 +425,7 @@ function BlockComment({ block }: { block: Obj }) {
   return (
     <div className="rounded-md bg-surface-700/30 p-2 text-xs">
       {safe ? (
-        <a className="block rounded-md hover:bg-surface-700/50" href={safe} target="_blank" rel="noopener noreferrer">
+        <a className="block rounded-md hover:bg-surface-700/50" {...pluginLinkProps(safe)}>
           {linkContent}
         </a>
       ) : (

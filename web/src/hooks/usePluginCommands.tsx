@@ -5,7 +5,7 @@ import type { CommandAction } from "../components/command-palette/types";
 import {
   buildPluginCommandActions,
   invokeActionlessCommand,
-  openExternal,
+  openPluginLink,
   pickKeybindEffect,
   type CommandLink,
 } from "../lib/pluginCommands";
@@ -46,7 +46,7 @@ export function usePluginCommands(
       if (!effect) return;
       e.preventDefault();
       if (effect.kind === "open") {
-        openExternal(effect.href);
+        openPluginLink(effect.href);
       } else if (effect.kind === "pick") {
         setPickerLinks(effect.links);
       } else if (activeSessionId) {

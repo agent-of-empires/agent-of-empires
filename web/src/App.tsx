@@ -98,7 +98,7 @@ import { fetchActiveProfileSettings } from "./lib/appSettings";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
-import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
+import { NAVIGATE_EVENT, OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
 import {
   clearMobileKeyboardProxyInput,
@@ -931,12 +931,12 @@ function AppContent({
   );
 
   const handleSelectSession = useCallback(
-    (sessionId: string) => {
+    (sessionId: string, path?: string) => {
       const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
       if (ws) {
         const picked = ws.sessions.find((s) => s.id === sessionId);
         transitionKeyboardProxy(sessionId, sessionId === activeSessionId && singlePane ? rightPanelView : "agent");
-        navigate(`/session/${encodeURIComponent(sessionId)}`);
+        navigate(path ?? `/session/${encodeURIComponent(sessionId)}`);
         // iOS does not permit a session's asynchronously mounted terminal
         // input to inherit this sidebar tap's keyboard authorization. The
         // persistent keyboard input keeps the gesture-authorized focus while
@@ -957,6 +957,12 @@ function AppContent({
           focusKeyboardProxy();
           focusAgentInput(picked);
         }
+        if (window.innerWidth < 768) setSidebarOpen(false);
+      } else if (path) {
+        // Not yet in the locally known workspace list (e.g. a session a
+        // plugin just created); the route itself resolves the session
+        // independently of this list, so a bare navigation still works.
+        navigate(path);
         if (window.innerWidth < 768) setSidebarOpen(false);
       }
     },
@@ -1007,14 +1013,28 @@ function AppContent({
   // the user taps it; navigate to the session that triggered the push.
   useEffect(() => {
     const onOpen = (e: Event) => {
-      const detail = (e as CustomEvent).detail as { sessionId?: string } | undefined;
+      const detail = (e as CustomEvent).detail as { sessionId?: string; path?: string } | undefined;
       if (detail?.sessionId) {
-        handleSelectSession(detail.sessionId);
+        handleSelectSession(detail.sessionId, detail.path);
       }
     };
     window.addEventListener(OPEN_SESSION_EVENT, onOpen);
     return () => window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
   }, [handleSelectSession]);
+
+  // A plugin-supplied link that resolves to aoe's own origin navigates via
+  // the router instead of opening a new tab.
+  useEffect(() => {
+    const onNavigate = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { path?: string } | undefined;
+      if (!detail?.path) return;
+      navigate(detail.path);
+      // See handleSelectSession: a mobile sidebar left open would cover the destination.
+      if (window.innerWidth < 768) setSidebarOpen(false);
+    };
+    window.addEventListener(NAVIGATE_EVENT, onNavigate);
+    return () => window.removeEventListener(NAVIGATE_EVENT, onNavigate);
+  }, [navigate]);
 
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
   const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
