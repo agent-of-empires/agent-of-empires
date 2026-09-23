@@ -435,7 +435,8 @@ impl Instance {
         else {
             return Some(ResumeStaticUnavailable::Agent);
         };
-        if !self.launch_can_carry_resume_selector(agent) {
+        if !self.launch_can_carry_resume_selector(agent) && !self.can_attempt_default_resume(agent)
+        {
             return Some(ResumeStaticUnavailable::Command);
         }
         // Copilot publishes no identity, so only an explicit pin names a sandbox conversation.

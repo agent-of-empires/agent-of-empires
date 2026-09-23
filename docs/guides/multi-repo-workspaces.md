@@ -60,7 +60,7 @@ That last row is why AoE never touches your own checkout: it creates a worktree 
 
 The session's branch name is a suggestion: if the added repo lacks that branch, AoE creates it from that repo's own base. If it already exists the attach is refused, since a same-named branch elsewhere can hold unrelated commits; pass `--attach-existing-branch` (or tick the box in the web modal) to check it out as-is, and AoE then leaves that branch alone when the session is deleted.
 
-Unless the session is already a workspace, its directory moves, so it is stopped for the move and restarted; a structured session resumes the same conversation. Attaching is refused mid-turn, and everything that can refuse it is checked before anything is stopped, so a refusal never costs you a running session. Scratch sessions cannot be attached to.
+Unless the session is already a workspace, its directory moves, so it is stopped for the move and restarted. A known conversation bound to the old directory blocks the move; other sessions may attempt to resume their stored ID, but continuity is not guaranteed. Attaching is refused mid-turn. Validation runs before stopping; if conversion later fails, AoE attempts to restore the worker. Scratch sessions cannot be attached to.
 
 A sandboxed session has its container recreated, since bind mounts are fixed at creation and the container mounts the common ancestor of the workspace and every repo. Build caches go with the container under the default [volume ignores strategy](sandbox.md#volume-ignores); under `"named"` they are keyed on their container path and survive an attach that leaves that path alone. Attaching a repo from outside the current common ancestor moves every mount, so those caches start cold and the volumes they leave behind need removing by hand.
 
@@ -94,5 +94,5 @@ Pin from the TUI project view (press `g`, pick Project grouping, then `p` on a h
 ## Limitations
 
 - One branch name per workspace: every repo gets the same `-w <branch>`.
-- The agent cannot add a repo to its own session; you add one, without losing the conversation.
+- The agent cannot add a repo to its own session; attaching may restart the agent without resuming its conversation.
 - No saved workspace templates, and no per-repo PR tracking.

@@ -3664,6 +3664,7 @@
       "id": "sidebar.add-project",
       "kind": "vitest",
       "risk": "high",
+      "description": "Attach eligibility, request, and worker outcomes; native conversation continuation is best-effort, not a modal guarantee.",
       "specs": ["src/components/__tests__/AddProjectAction.test.tsx"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",

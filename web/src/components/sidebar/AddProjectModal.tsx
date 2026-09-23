@@ -6,7 +6,7 @@ import { MODAL_CANCEL, MODAL_INPUT, MODAL_PRIMARY } from "./styles";
 function workerSummary(res: AttachProjectResult): string {
   switch (res.worker) {
     case "restarted":
-      return "The agent is restarting; your conversation is preserved.";
+      return "The agent is restarting with the attached repo.";
     case "restart_failed":
       return res.message
         ? `The repo is attached, but the session did not restart: ${res.message}`
@@ -109,8 +109,9 @@ export function AddProjectModal({
           </label>
           <div data-testid="add-project-modal-restart-warning" className="text-[11px] text-status-warning">
             Attaching turns this session into a multi-repo workspace. Unless it already is one, its working directory
-            moves, so the session and its agent worker are stopped for the move and started again. Your conversation is
-            kept.
+            moves, so the session and its agent worker are stopped for the move and started again. A conversation bound
+            to the old working directory blocks the move; an eligible session is not guaranteed to resume its
+            conversation.
           </div>
           {error && (
             <div data-testid="add-project-modal-error" className="text-[11px] text-status-error">

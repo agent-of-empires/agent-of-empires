@@ -67,12 +67,6 @@ pub enum StartOutcome {
     /// A resume was skipped, and the session started fresh instead, because `sid` already failed a
     /// resume probe once before.
     FreshAfterFailedResume { sid: String },
-    /// Automatic resume skipped an unqualified stored conversation.
-    /// The old transcript remains intact; callers must surface the notice.
-    FreshAfterUnavailableResume {
-        sid: String,
-        notice: super::launch_command::FreshLaunchNotice,
-    },
 }
 
 /// What `start_with_size_opts` did with the agent's session id this call.
@@ -86,9 +80,6 @@ pub enum LaunchSidOutcome {
         /// Set when the fresh launch pinned an id the session already had stored, rather than a
         /// UUID minted for a brand-new conversation.
         pinned_prior_sid: Option<String>,
-        /// Why the launch deliberately did not resume the stored
-        /// conversation, produced only by the plan actually spawned.
-        fresh_notice: Option<super::launch_command::FreshLaunchNotice>,
     },
     /// `start_with_size_opts` short-circuited before `apply_session_flags` ran: structured
     /// view-mode session, or a pre-existing tmux pane that is still alive (kill_clean cache race).
@@ -377,9 +368,6 @@ impl Instance {
                     }
                 }
             }
-            if let Some(abandoned) = prepared.abandoned_conversation.take() {
-                self.retroactive_capture_excludes.insert(abandoned);
-            }
         }
         #[cfg(test)]
         test_support::observe(self, test_support::FinalizePhase::Before);
@@ -396,10 +384,7 @@ impl Instance {
         test_support::observe(self, test_support::FinalizePhase::After);
         Ok(match launch_sid {
             Some(sid) => LaunchSidOutcome::Existing { sid },
-            None => LaunchSidOutcome::Fresh {
-                pinned_prior_sid,
-                fresh_notice: prepared.fresh_notice,
-            },
+            None => LaunchSidOutcome::Fresh { pinned_prior_sid },
         })
     }
 

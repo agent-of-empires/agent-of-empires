@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use crate::session::{
     acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, GroupTree,
-    Instance, LaunchSidOutcome, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
+    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
 };
 
 #[derive(Subcommand)]
@@ -762,7 +762,7 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
 
-    let launch_sid = working.start_with_size_opts(crate::terminal::get_size(), false)?;
+    let _ = working.start_with_size_opts(crate::terminal::get_size(), false)?;
 
     let file_watch = crate::file_watch::FileWatchService::noop();
     crate::session::sync::capture_launched_session_id_blocking(
@@ -798,13 +798,6 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         );
     }
 
-    if let LaunchSidOutcome::Fresh {
-        fresh_notice: Some(notice),
-        ..
-    } = launch_sid
-    {
-        eprintln!("{}", notice.warning_message());
-    }
     println!("✓ Started session: {}", title);
     Ok(())
 }
@@ -1178,10 +1171,6 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
                 fresh_after_failed_resume.push((title.clone(), sid));
                 succeeded.push((id, title));
             }
-            Ok(StartOutcome::FreshAfterUnavailableResume { notice, .. }) => {
-                eprintln!("{title}: {}", notice.warning_message());
-                succeeded.push((id, title));
-            }
             Ok(StartOutcome::Resumed | StartOutcome::Fresh) => succeeded.push((id, title)),
             Err(e) => failed.push((title, e.to_string())),
         }
@@ -1336,10 +1325,6 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
                 "✓ Restarted session: {} (started fresh; a prior resume attempt failed for sid {sid}, the old conversation is still reachable via the agent's own resume/history picker)",
                 title
             );
-        }
-        StartOutcome::FreshAfterUnavailableResume { notice, .. } => {
-            eprintln!("{}", notice.warning_message());
-            println!("Restarted session: {}", title);
         }
         StartOutcome::Resumed | StartOutcome::Fresh => {
             println!("✓ Restarted session: {}", title);
@@ -2684,11 +2669,7 @@ async fn add_project(profile: &str, args: AddProjectArgs) -> Result<()> {
     }
 
     if restarts {
-        if quiesced.worker_was_running {
-            println!("Restarting the agent so it comes up with the new repo; the conversation is preserved.");
-        } else {
-            println!("Restarting the session so it comes up with the new repo.");
-        }
+        println!("Restarting the session so it comes up with the new repo.");
     } else {
         println!("The agent is already working in this directory, so nothing was restarted.");
     }

@@ -14,38 +14,6 @@ pub(super) struct LaunchEnvironment {
     pub(super) container: Vec<(String, String)>,
 }
 
-/// Why a fresh launch deliberately did not resume the stored conversation.
-/// Describes the launch actually dispatched; never persisted on the row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FreshLaunchNotice {
-    /// The stored conversation id could not be qualified for automatic
-    /// resume after an upgrade; the conversation was not deleted.
-    UnqualifiedStoredConversation { sid: String },
-    /// The stored conversation cannot be qualified because the launch
-    /// context itself is unattested (auth, container identity, channel
-    /// build); the conversation was not deleted.
-    UnattestedContext { sid: String },
-}
-
-impl FreshLaunchNotice {
-    /// One-line user-facing explanation; never echoes argv, auth or config.
-    pub fn warning_message(&self) -> String {
-        match self {
-            FreshLaunchNotice::UnqualifiedStoredConversation { sid } => format!(
-                "starting fresh; the stored conversation id {sid} has unknown provenance \
-                 after upgrade and was not resumed. The previous conversation was not \
-                 deleted; point `aoe session set-session-id` at its store to resume it."
-            ),
-            FreshLaunchNotice::UnattestedContext { sid } => format!(
-                "starting fresh; the stored conversation id {sid} cannot be resumed \
-                 from this launch context and was not resumed. The previous \
-                 conversation was not deleted; fix the launch context or point \
-                 `aoe session set-session-id` at its store to resume it."
-            ),
-        }
-    }
-}
-
 pub(super) struct PreparedLaunch {
     pub(super) command: Option<String>,
     pub(super) is_existing: bool,
@@ -55,8 +23,6 @@ pub(super) struct PreparedLaunch {
     pub(super) canonical_conversation: Option<ConversationState>,
     pub(super) expected_prior_omp_generation: Option<String>,
     pub(super) execution: Option<super::execution::NativeExecution>,
-    pub(super) fresh_notice: Option<FreshLaunchNotice>,
-    pub(super) abandoned_conversation: Option<ConversationBinding>,
     /// A known conversation was physically relocated before this launch; the
     /// finalize step must confirm the durable row carries the relocated state
     /// before the restart can claim success.
@@ -470,58 +436,16 @@ impl Instance {
         let expected_prior_omp_generation = self.omp_capture_generation.clone();
         let prior_probe_failed_sid = self.resume_probe_failed_sid.clone();
         let preparation = (|| -> Result<_> {
-            let mut fresh_notice = None;
-            let mut abandoned_conversation = None;
             if matches!(self.resume_intent, ResumeIntent::Default) {
                 if let Some(observation) = self.capture_freshest_conversation() {
                     self.apply_conversation_observation(&observation);
                 }
-                // Migrated IDs cannot authorize resume until their store is qualified.
-                if let Some((sid, binding, _)) = self.conversation_target() {
-                    if binding.is_none_or(|binding| {
-                        !binding.is_known() && binding.provenance == ConversationProvenance::Unknown
-                    }) {
-                        abandoned_conversation = Some(
-                            binding
-                                .cloned()
-                                .unwrap_or_else(|| ConversationBinding::unknown(sid)),
-                        );
-                        fresh_notice = Some(FreshLaunchNotice::UnqualifiedStoredConversation {
-                            sid: sid.to_owned(),
-                        });
-                        tracing::warn!(
-                            target: "session.store",
-                            sid = %sid,
-                            "stored conversation id has unknown provenance; starting fresh"
-                        );
-                        self.set_agent_conversation(None, None, self.pi_session_path.clone());
-                    }
-                }
             }
-            // An unattested launch context (auth, container identity,
-            // channel build) cannot authorize resuming the stored
-            // conversation, but an ordinary start must not fail. Start fresh
-            // and say why; explicit Use/Fork still fail closed in
-            // validate_conversation_target.
-            let resolution_error = if matches!(self.resume_intent, ResumeIntent::Default)
-                && self.agent_session_id.is_some()
-            {
-                self.resolve_native_execution(self.conversation_target())
-                    .err()
-            } else {
-                None
-            };
-            if let Some(error) = resolution_error {
-                let sid = self.agent_session_id.clone().unwrap_or_default();
-                abandoned_conversation = Some(
-                    self.agent_session_binding
-                        .clone()
-                        .unwrap_or_else(|| ConversationBinding::unknown(&sid)),
-                );
-                fresh_notice = Some(FreshLaunchNotice::UnattestedContext { sid });
-                tracing::warn!(target: "session.store", error = %error, "stored conversation cannot be resumed from an unattested context; starting fresh");
-                self.set_agent_conversation(None, None, self.pi_session_path.clone());
-            }
+            let validate_target = !matches!(self.resume_intent, ResumeIntent::Default)
+                || self
+                    .conversation_target()
+                    .and_then(|(_, binding, _)| binding)
+                    .is_some_and(ConversationBinding::is_known);
             let managed = !matches!(self.resume_intent, ResumeIntent::Cleared)
                 && (self.agent_session_id.is_some()
                     || matches!(
@@ -530,15 +454,19 @@ impl Instance {
                     ));
             let execution = match self.resolve_native_execution(self.conversation_target()) {
                 Ok(execution) => {
-                    self.validate_conversation_target(
-                        &execution.binding,
-                        execution.target_session_id.as_deref(),
-                    )?;
+                    if validate_target {
+                        self.validate_conversation_target(
+                            &execution.binding,
+                            execution.target_session_id.as_deref(),
+                        )?;
+                    }
                     Some(execution)
                 }
-                Err(error) if managed => return Err(error),
-                Err(_) => {
-                    // Unattested arguments must not prevent an unmanaged launch.
+                Err(error) if managed && !matches!(self.resume_intent, ResumeIntent::Default) => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    tracing::debug!(target: "session.store", error = %error, "native execution unavailable; using native launch flags");
                     None
                 }
             };
@@ -566,45 +494,29 @@ impl Instance {
             } else {
                 None
             };
-            let parts = if fresh_notice.is_some() {
-                self.resume_intent = ResumeIntent::Cleared;
-                let result = self.build_launch_command(execution.as_ref());
-                self.resume_intent = ResumeIntent::Default;
-                result?
-            } else {
-                self.build_launch_command(execution.as_ref())?
-            };
-            if managed || parts.1 {
-                let execution = execution
-                    .as_ref()
-                    .context("conversation execution adapter is unavailable")?;
-                self.validate_conversation_target(
-                    &execution.binding,
-                    execution
-                        .resolved_target_session_id
-                        .as_deref()
-                        .or(execution.target_session_id.as_deref()),
-                )?;
+            let parts = self.build_launch_command(execution.as_ref())?;
+            if (managed || parts.1) && validate_target {
+                if let Some(execution) = execution.as_ref() {
+                    self.validate_conversation_target(
+                        &execution.binding,
+                        execution
+                            .resolved_target_session_id
+                            .as_deref()
+                            .or(execution.target_session_id.as_deref()),
+                    )?;
+                }
             }
             let canonical_conversation = prior_canonical.map(|prior| {
                 let canonical = self.conversation_state();
                 self.adopt_conversation_state(prior);
                 canonical
             });
-            Ok((
-                parts,
-                execution,
-                canonical_conversation,
-                fresh_notice,
-                abandoned_conversation,
-            ))
+            Ok((parts, execution, canonical_conversation))
         })();
         let (
             (command, is_existing, omp_capture_plan, mut launch_env),
             mut execution,
             canonical_conversation,
-            fresh_notice,
-            abandoned_conversation,
         ) = match preparation {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -637,8 +549,6 @@ impl Instance {
             canonical_conversation,
             expected_prior_omp_generation,
             execution,
-            fresh_notice,
-            abandoned_conversation,
             carry_relocated: false,
         })
     }

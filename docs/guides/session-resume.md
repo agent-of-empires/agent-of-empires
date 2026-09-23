@@ -1,6 +1,6 @@
 # Native Session Resume
 
-A terminal conversation resumes only when its native agent, physical store, working directory, and filesystem agree with the prepared launch. A status label or raw session ID does not establish that identity. Existing transcripts are never deleted to repair a mismatch.
+Explicit resume and fork require the native agent, physical store, working directory, and filesystem to agree with the prepared launch. Automatic start and restart also try a stored native ID when its binding cannot be attested, using the agent's normal resume selector and failed-resume probe. A status label or raw session ID does not qualify that ID for explicit use. Existing transcripts are never deleted to repair a mismatch.
 
 Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fresh pane generation rotate the recorded identity when the native agent publishes the change. The old identity and any artifact predating the launch boundary cannot be recaptured after an AoE process restart.
 
@@ -54,7 +54,7 @@ aoe session set-session-id <session-name-or-id> <native-session-id>
 
 This records an assertion about the intended native target, separately from any observed conversation. The pin is sticky. If the execution context changes, restore it or explicitly rebind the intended conversation before retrying. Legacy IDs and IDs from old unqualified publishers remain unknown after migration; current configuration does not relabel them.
 
-On automatic start or restart, an unknown stored conversation starts fresh with a warning and leaves the previous transcript intact. Explicit resume pins and forks require a qualified binding. To assert a store explicitly:
+Automatic start or restart attempts an unknown stored ID instead of discarding it. A capture from an attested launch can qualify the binding; without an attested launch it remains unknown even if native resume succeeds. If the native resume probe fails, AoE preserves the ID and starts fresh on the next automatic restart. Explicit resume pins and forks still require a qualified binding. To assert a store explicitly:
 
 ```sh
 aoe session set-session-id <session> <native-id> --store /absolute/native/store

@@ -35,13 +35,18 @@ fn assert_default_resume_intent(row: &Value) {
     );
 }
 
-fn install_fake_agent(h: &mut TuiTestHarness) -> PathBuf {
+fn install_fake_agent(h: &mut TuiTestHarness, reject_stale: bool) -> PathBuf {
     let bin = h.install_path_command(FAKE_AGENT);
     let log = h.home_path().join("resume-fallback-agent.log");
+    let rejection = if reject_stale {
+        format!("case \"$*\" in\n  *{STALE_SID}*) exit 42 ;;\nesac\n")
+    } else {
+        String::new()
+    };
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$*\" in\n  *{}*) exit 42 ;;\nesac\nexec sleep 30\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n{}exec sleep 30\n",
         sh_quote(&log),
-        STALE_SID,
+        rejection,
     );
     write_executable(&bin.join(FAKE_AGENT), &script);
     log
@@ -67,6 +72,21 @@ fn read_log_lines(path: &Path) -> Vec<String> {
         .lines()
         .map(str::to_owned)
         .collect()
+}
+
+fn wait_for_logged_args(path: &Path, sid: &str) -> Vec<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let lines = read_log_lines(path);
+        if lines.iter().any(|line| line.contains(sid)) {
+            return lines;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "agent never received {sid}: {lines:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Seed a Claude transcript at `$HOME/.claude/projects/<encoded project>/
@@ -104,11 +124,11 @@ impl Drop for StopSessionOnDrop<'_> {
 
 #[test]
 #[parallel]
-fn migrated_unknown_restart_warns_and_leaves_the_old_conversation_intact() {
+fn migrated_unknown_restart_resumes_the_stored_conversation() {
     require_tmux!();
-    let mut h = TuiTestHarness::new_in_tmp("resume_unknown_warning");
+    let mut h = TuiTestHarness::new_in_tmp("resume_unknown_restart");
     disable_restart_wake_message(&h);
-    let log = install_fake_agent(&mut h);
+    let log = install_fake_agent(&mut h, false);
     let project = h.project_path();
     let add = h.run_cli(&[
         "add",
@@ -139,40 +159,26 @@ fn migrated_unknown_restart_warns_and_leaves_the_old_conversation_intact() {
     });
     let restarted = h.run_cli(&["session", "restart", TITLE]);
     assert!(restarted.status.success(), "{restarted:?}");
-    let diagnostic = String::from_utf8_lossy(&restarted.stderr);
+    let lines = wait_for_logged_args(&log, STALE_SID);
     assert!(
-        diagnostic.contains("starting fresh") && diagnostic.contains("unknown provenance"),
-        "restart must explain why the previous conversation was not resumed: {restarted:?}"
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let lines = loop {
-        let lines = read_log_lines(&log);
-        if !lines.is_empty() {
-            break lines;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the agent was not invoked"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-    assert!(
-        lines.iter().all(|line| !line.contains(STALE_SID)),
-        "{lines:?}"
+        lines
+            .iter()
+            .any(|line| line.contains("--resume") && line.contains(STALE_SID)),
+        "restart must pass native resume flags: {lines:?}"
     );
     let sessions = h.read_sessions();
     let row = session_by_title(&sessions, TITLE);
-    assert_ne!(row["agent_session_id"].as_str(), Some(STALE_SID));
+    assert_eq!(row["agent_session_id"].as_str(), Some(STALE_SID));
     assert_default_resume_intent(row);
     assert_eq!(fs::read(&transcript).unwrap(), original);
 }
 
 #[test]
 #[parallel]
-fn migrated_unknown_start_warns_like_restart() {
+fn migrated_unknown_start_resumes_without_attested_context() {
     require_tmux!();
-    let mut h = TuiTestHarness::new_in_tmp("resume_unknown_start_warning");
-    install_fake_agent(&mut h);
+    let mut h = TuiTestHarness::new_in_tmp("resume_unknown_start");
+    let log = install_fake_agent(&mut h, false);
     let project = h.project_path();
     let add = h.run_cli(&[
         "add",
@@ -184,9 +190,15 @@ fn migrated_unknown_start_warns_like_restart() {
     ]);
     assert!(add.status.success(), "{add:?}");
     let _cleanup = StopSessionOnDrop { h: &h };
+    let stopped = h.run_cli(&["session", "stop", TITLE]);
+    assert!(stopped.status.success(), "{stopped:?}");
     let transcript = seed_claude_transcript(&h, &project, STALE_SID);
     let original = fs::read(&transcript).unwrap();
     patch_session(&h, TITLE, |row| {
+        row.insert(
+            "extra_args".into(),
+            Value::String("--mcp-config /tmp/unattested.json".into()),
+        );
         row.insert("agent_session_id".into(), Value::String(STALE_SID.into()));
         row.insert(
             "agent_session_binding".into(),
@@ -201,18 +213,18 @@ fn migrated_unknown_start_warns_like_restart() {
         row.remove("resume_binding");
         row.remove("active_execution");
     });
-    let started = h.run_cli(&["session", "stop", TITLE]);
-    assert!(started.status.success(), "{started:?}");
     let started = h.run_cli(&["session", "start", TITLE]);
     assert!(started.status.success(), "{started:?}");
-    let diagnostic = String::from_utf8_lossy(&started.stderr);
+    let lines = wait_for_logged_args(&log, STALE_SID);
     assert!(
-        diagnostic.contains("starting fresh") && diagnostic.contains("unknown provenance"),
-        "start must explain why the previous conversation was not resumed: {started:?}"
+        lines
+            .iter()
+            .any(|line| line.contains(STALE_SID) && line.contains("--mcp-config")),
+        "unattested launch must still try the stored ID: {lines:?}"
     );
     let sessions = h.read_sessions();
     let row = session_by_title(&sessions, TITLE);
-    assert_ne!(row["agent_session_id"].as_str(), Some(STALE_SID));
+    assert_eq!(row["agent_session_id"].as_str(), Some(STALE_SID));
     assert_eq!(fs::read(&transcript).unwrap(), original);
 }
 
@@ -223,7 +235,7 @@ fn stale_resume_failure_persists_loop_breaker_and_next_restart_starts_fresh() {
 
     let mut h = TuiTestHarness::new_in_tmp("resume_fallback_loop_breaker");
     disable_restart_wake_message(&h);
-    let log_path = install_fake_agent(&mut h);
+    let log_path = install_fake_agent(&mut h, true);
     let project = h.project_path();
 
     h.run_cli_ok(&[

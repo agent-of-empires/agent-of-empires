@@ -348,35 +348,26 @@ impl Instance {
         skipped_failed_resume_sid: Option<String>,
         profile: &str,
     ) -> Result<StartOutcome> {
-        let (attempted_sid, pinned_prior_sid, fresh_notice) = match launch_outcome {
+        let (attempted_sid, pinned_prior_sid) = match launch_outcome {
             LaunchSidOutcome::Existing { sid }
                 if is_valid_session_id(&sid) && self.supports_native_resume() =>
             {
-                (Some(sid), None, None)
+                (Some(sid), None)
             }
-            LaunchSidOutcome::Fresh {
-                pinned_prior_sid,
-                fresh_notice,
-            } if self.should_probe_pinned_fresh_launch(pinned_prior_sid.as_deref()) => {
-                (None, pinned_prior_sid, fresh_notice)
+            LaunchSidOutcome::Fresh { pinned_prior_sid }
+                if self.should_probe_pinned_fresh_launch(pinned_prior_sid.as_deref()) =>
+            {
+                (None, pinned_prior_sid)
             }
-            LaunchSidOutcome::Fresh { fresh_notice, .. } => (None, None, fresh_notice),
-            _ => (None, None, None),
+            _ => (None, None),
         };
         let Some(stale_sid) = attempted_sid else {
             if let Some(sid) = pinned_prior_sid {
                 self.probe_pinned_fresh_launch(&sid)?;
             }
-            return Ok(match (skipped_failed_resume_sid, fresh_notice) {
-                (Some(sid), _) => StartOutcome::FreshAfterFailedResume { sid },
-                (None, Some(notice)) => {
-                    let sid = match &notice {
-                        FreshLaunchNotice::UnqualifiedStoredConversation { sid }
-                        | FreshLaunchNotice::UnattestedContext { sid } => sid.clone(),
-                    };
-                    StartOutcome::FreshAfterUnavailableResume { sid, notice }
-                }
-                (None, None) => StartOutcome::Fresh,
+            return Ok(match skipped_failed_resume_sid {
+                Some(sid) => StartOutcome::FreshAfterFailedResume { sid },
+                None => StartOutcome::Fresh,
             });
         };
 
@@ -742,7 +733,6 @@ mod tests {
                     inst.finish_resume_launch(
                         LaunchSidOutcome::Fresh {
                             pinned_prior_sid: Some(sid.to_string()),
-                            fresh_notice: None,
                         },
                         None,
                         "test",

@@ -128,11 +128,7 @@ pub async fn send_message(
 
     match send_result {
         Ok(Ok((outcome, started))) => {
-            let mut body = serde_json::json!({"sent": true});
-            if let EnsureReadyOutcome::FreshAfterUnavailableResume { notice } = &outcome {
-                body["resume_outcome"] = serde_json::json!("fresh_after_unavailable_resume");
-                body["message"] = serde_json::Value::String(notice.warning_message());
-            }
+            let body = serde_json::json!({"sent": true});
             // ensure_pane_ready mutated `started` on the clone, so sync it back
             // or a rapid follow-up generates a fresh `agent_session_id` and
             // orphans the prior Claude conversation. See `apply_post_restart_sync`.

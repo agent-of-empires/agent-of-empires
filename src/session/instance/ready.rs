@@ -15,8 +15,6 @@ pub enum EnsureReadyOutcome {
     /// Resume failed ambiguously while trying to start or respawn the pane.
     /// The durable sid remains stored for an explicit retry.
     ResumeFailed { sid: String },
-    /// A fresh pane replaced an unqualified automatic resume.
-    FreshAfterUnavailableResume { notice: FreshLaunchNotice },
 }
 
 /// Errors `ensure_pane_ready` can return.
@@ -64,7 +62,6 @@ impl Instance {
         &mut self,
         size: Option<(u16, u16)>,
     ) -> Result<EnsureReadyOutcome, EnsureReadyError> {
-        let mut fresh_notice = None;
         if matches!(self.status, Status::Creating | Status::Deleting) {
             return Err(EnsureReadyError::Transient(self.status));
         }
@@ -80,18 +77,12 @@ impl Instance {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
                 }
-                StartOutcome::FreshAfterUnavailableResume { notice, .. } => {
-                    fresh_notice = Some(notice);
-                }
                 StartOutcome::Resumed
                 | StartOutcome::Fresh
                 | StartOutcome::FreshAfterFailedResume { .. } => {}
             }
             self.wait_for_pane_ready(&session);
-            return Ok(match fresh_notice {
-                Some(notice) => EnsureReadyOutcome::FreshAfterUnavailableResume { notice },
-                None => EnsureReadyOutcome::Started,
-            });
+            return Ok(EnsureReadyOutcome::Started);
         }
         if session.is_pane_dead() {
             let outcome = self
@@ -101,18 +92,12 @@ impl Instance {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
                 }
-                StartOutcome::FreshAfterUnavailableResume { notice, .. } => {
-                    fresh_notice = Some(notice);
-                }
                 StartOutcome::Resumed
                 | StartOutcome::Fresh
                 | StartOutcome::FreshAfterFailedResume { .. } => {}
             }
             self.wait_for_pane_ready(&session);
-            return Ok(match fresh_notice {
-                Some(notice) => EnsureReadyOutcome::FreshAfterUnavailableResume { notice },
-                None => EnsureReadyOutcome::Respawned,
-            });
+            return Ok(EnsureReadyOutcome::Respawned);
         }
         Ok(EnsureReadyOutcome::AlreadyAlive)
     }

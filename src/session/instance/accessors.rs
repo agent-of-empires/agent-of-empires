@@ -258,6 +258,13 @@ impl Instance {
             && self.managed_user_argv(agent).is_ok()
     }
 
+    /// A direct native launch can try its stored ID without attesting every argument.
+    pub(super) fn can_attempt_default_resume(&self, agent: &crate::agents::AgentDef) -> bool {
+        matches!(self.resume_intent, ResumeIntent::Default)
+            && self.agent_session_id.is_some()
+            && self.launch_invokes_resolved_agent_directly(agent)
+    }
+
     /// Whether this launch shape leaves Claude user hooks enabled.
     pub(crate) fn hook_session_publisher_allowed_by_argv(&self) -> bool {
         if !self
@@ -376,15 +383,15 @@ impl Instance {
         let Some(agent) = self.resolved_agent() else {
             return false;
         };
-        if !self.launch_can_carry_resume_selector(agent) {
-            return false;
-        }
         if agent.session_support.is_none() {
             return false;
         }
-        // Automatic capture in this environment, or an id the user named
-        // themselves, which stays authoritative where capture is unsupported.
-        self.resolved_session_support().is_some()
+        let implicit = self.can_attempt_default_resume(agent);
+        if !implicit && !self.launch_can_carry_resume_selector(agent) {
+            return false;
+        }
+        implicit
+            || self.resolved_session_support().is_some()
             || matches!(
                 self.resume_intent,
                 ResumeIntent::Use(_) | ResumeIntent::Fork { .. }

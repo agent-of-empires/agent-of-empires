@@ -7,7 +7,6 @@ import { test, expect } from "./helpers/mockedTest";
 import { iPhone13 } from "./helpers/viewports";
 import { installSidebarMocks, threeSessionsInOneRepo, type MockSessionInput } from "./helpers/sidebarMocks";
 import { openMobileSidebar } from "./helpers/sidebar";
-import { mockTerminalApis } from "./helpers/terminal-mocks";
 
 const ROW = "[data-testid='sidebar-session-row']";
 const MENU = "[data-testid='sidebar-context-menu']";
@@ -410,44 +409,6 @@ test.describe("Context resume badge", () => {
       await expect(page).toHaveURL(/\/session\/idle$/);
     });
   }
-  for (const retry of [false, true]) {
-    test(`shows the fresh conversation warning on ${retry ? "retry" : "initial attach"}`, async ({ page }) => {
-      const terminal = await mockTerminalApis(page);
-      const warning = "Stored conversation legacy-sid was not resumed. Its transcript is preserved.";
-      let refuse = retry;
-      await page.route("**/api/sessions/pinch-test/ensure", (route) => {
-        if (refuse) return route.fulfill({ status: 503, json: { message: "Try again" } });
-        return route.fulfill({
-          json: { status: "restarted", resume_outcome: "fresh_after_unavailable_resume", message: warning },
-        });
-      });
-
-      await page.goto("/");
-      await page.getByRole("link", { name: /pinch-test/ }).click();
-      if (retry) {
-        await expect(page.getByText("Try again", { exact: true })).toBeVisible();
-        refuse = false;
-        await page.getByRole("button", { name: "Retry", exact: true }).click();
-      }
-      await terminal.waitForLiveReady();
-      await expect(page.locator('[data-term="agent"]').getByText(warning, { exact: true })).toBeVisible();
-    });
-  }
-
-  test("shows the fresh conversation warning after Start", async ({ page }) => {
-    const warning = "Stored conversation legacy-sid was not resumed. Its transcript is preserved.";
-    await installSidebarMocks(page, {
-      sessions: [session("stopped", "Stopped session", { status: "Stopped" })],
-    });
-    await page.route("**/api/sessions/stopped/start", (route) =>
-      route.fulfill({ json: { id: "stopped", message: warning, resume_outcome: "fresh_after_unavailable_resume" } }),
-    );
-
-    await page.goto("/");
-    await page.getByRole("link", { name: /Stopped session/ }).click({ button: "right" });
-    await page.getByTestId("sidebar-context-menu-start").click();
-    await expect(page.getByText(warning, { exact: true })).toBeVisible();
-  });
 });
 
 // #3460: Android fires a native contextmenu after the long-press timer has
