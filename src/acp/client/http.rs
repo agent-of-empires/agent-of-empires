@@ -272,11 +272,13 @@ impl HttpClient {
         &self,
         session_id: &str,
         text: &str,
+        no_revive: bool,
     ) -> Result<PromptDispatchWire, HttpError> {
         let body = PromptRequest {
             text: text.to_string(),
             attachments: Vec::new(),
             prompt_id: None,
+            no_revive,
         };
         let path = format!("/api/sessions/{session_id}/acp/prompt");
         let request = self.request(Method::POST, &path).json(&body);

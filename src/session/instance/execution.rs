@@ -872,7 +872,7 @@ pub(super) fn hook_session_observation(
 ) -> Option<crate::session::poller::SessionIdObservation> {
     let Some(active) = active_execution else {
         return crate::hooks::read_hook_session_id_within(instance_id, "session_id", max_age)
-            .map(crate::session::poller::SessionIdObservation::instance_sidecar);
+            .map(|sid| crate::session::poller::SessionIdObservation::instance_sidecar(sid, None));
     };
     let CaptureContext::Hooks(source) = active.capture.as_ref()? else {
         return None;
@@ -892,7 +892,7 @@ pub(super) fn hook_session_observation(
     if !crate::session::capture::is_valid_session_id(&sid) {
         return None;
     }
-    let mut observation = crate::session::poller::SessionIdObservation::instance_sidecar(sid);
+    let mut observation = crate::session::poller::SessionIdObservation::instance_sidecar(sid, None);
     observation.execution = Some(active.clone());
     observation.source = Some(active.binding.clone());
     Some(observation)

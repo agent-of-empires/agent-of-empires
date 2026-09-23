@@ -26,7 +26,7 @@ export function TrashMenu({
   readOnly?: boolean;
   onOpen: RowActivate;
   onRestore: (sessionIds: string[]) => void;
-  onDelete: (workspaceId: string) => void;
+  onDelete: (sessionIds: string[]) => void;
   onEmptyTrash: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -147,7 +147,7 @@ export function TrashMenu({
                       onRestore={onRestore}
                       onDelete={() => {
                         setOpen(false);
-                        onDelete(ws.id);
+                        onDelete(ws.sessions.map((s) => s.id));
                       }}
                     />
                   ))}

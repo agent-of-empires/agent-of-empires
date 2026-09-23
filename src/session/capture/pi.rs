@@ -164,9 +164,12 @@ pub(crate) fn read_pi_session_observation(
     if read(&sid_leaf, !any_age)? != id_bytes {
         return None;
     }
-    let mut observation =
-        crate::session::poller::SessionIdObservation::instance_sidecar(sid.to_owned());
-    observation.pi_session_path = Some(native.to_str()?.to_owned());
+    let published_path = native.to_str()?.to_owned();
+    let mut observation = crate::session::poller::SessionIdObservation::instance_sidecar(
+        sid.to_owned(),
+        Some(published_path.clone()),
+    );
+    observation.pi_session_path = Some(published_path);
     if let Some(active) = active {
         let mut binding = active.binding.clone();
         binding.stores = vec![parent.to_path_buf()];
@@ -177,6 +180,8 @@ pub(crate) fn read_pi_session_observation(
     Some(observation)
 }
 
+/// Polls the Pi extension's pane-scoped sidecar for its conversation and transcript.
+/// The caller supplies where the pane publishes; a wrong source silently never observes.
 pub(crate) fn pi_sidecar_poll_fn(
     instance_id: String,
     source: crate::session::instance::SessionSidecarSource,

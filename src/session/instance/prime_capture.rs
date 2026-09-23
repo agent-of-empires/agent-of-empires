@@ -388,7 +388,8 @@ impl Instance {
         &self,
         sid: String,
     ) -> crate::session::poller::SessionIdObservation {
-        let mut observation = crate::session::poller::SessionIdObservation::instance_sidecar(sid);
+        let mut observation =
+            crate::session::poller::SessionIdObservation::instance_sidecar(sid, None);
         if let Some(active) = self.active_execution.as_ref().filter(|active| {
             matches!(
                 active.capture,

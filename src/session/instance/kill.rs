@@ -477,14 +477,23 @@ mod tests {
         let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
         let home = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(home.path());
-        for (tool, command) in [("pi", ""), ("company-pi", "pi")] {
-            let profile = format!("pi-old-sidecar-stop-{tool}");
+        let published = "01a0538e-5868-7c22-84bc-40cfd7a09ab1";
+        for (tool, command, already_current) in [
+            ("pi", "", false),
+            ("company-pi", "pi", false),
+            ("pi", "", true),
+        ] {
+            let profile = format!("pi-old-sidecar-stop-{tool}-{already_current}");
             let mut inst = Instance::new(tool, home.path().to_str().unwrap());
             inst.source_profile = profile.clone();
             inst.tool = tool.into();
             inst.command = command.into();
             inst.detect_as = "pi".into();
-            inst.agent_session_id = Some("22f13307-461c-4161-908e-95a247fac750".into());
+            inst.agent_session_id = Some(if already_current {
+                published.into()
+            } else {
+                "22f13307-461c-4161-908e-95a247fac750".into()
+            });
             let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
             storage
                 .update(|rows, _| {
@@ -492,8 +501,7 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
-            let published = "01a0538e-5868-7c22-84bc-40cfd7a09ab1";
-            crate::session::instance::test_helpers::publish_host_pi_transcript(
+            let transcript = crate::session::instance::test_helpers::publish_host_pi_transcript(
                 &inst.id,
                 published,
                 home.path(),
@@ -528,6 +536,19 @@ mod tests {
                     .as_deref(),
                 Some(published),
                 "{tool}"
+            );
+            assert_eq!(
+                disk.iter()
+                    .find(|row| row.id == inst.id)
+                    .unwrap()
+                    .pi_session_path
+                    .as_deref(),
+                transcript.to_str(),
+                "{tool}, already_current={already_current}"
+            );
+            assert!(
+                !sidecar.exists(),
+                "sidecar must be cleaned after path persists"
             );
         }
     }

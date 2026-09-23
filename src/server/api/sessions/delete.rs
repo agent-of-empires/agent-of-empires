@@ -531,11 +531,11 @@ pub async fn delete_session(
 
 // --- Delete workspace (atomic multi-session) ---
 
-/// Body for `DELETE /api/workspaces`. `session_ids` is the full set of sessions
-/// in one web-UI workspace, sharing a single git worktree and branch, ordered so
-/// the first id is the worktree owner. The cleanup flags mirror
-/// [`DeleteSessionBody`] and apply to the whole workspace; the shared
-/// worktree/branch is removed exactly once, on the owner.
+/// Body for `DELETE /api/workspaces`. `session_ids` are sessions of one web-UI
+/// workspace, sharing a git worktree and branch; they need not be all of them.
+/// The cleanup flags mirror [`DeleteSessionBody`]. The worktree and branch are
+/// cleaned up once, on the first listed session that manages a worktree, and
+/// kept with a message while any session outside the request still uses them.
 #[derive(Default, Deserialize)]
 pub struct DeleteWorkspaceBody {
     #[serde(default)]
@@ -755,14 +755,26 @@ pub async fn delete_workspace(
     let body = body.map(|Json(b)| b).unwrap_or_default();
     // Dedupe up front so a repeated id cannot have the owner deleted with
     // sibling flags and then skipped (#2536 review).
-    let session_ids = dedupe_session_ids(&body.session_ids);
-    let Some(owner_id) = session_ids.first().cloned() else {
+    let mut session_ids = dedupe_session_ids(&body.session_ids);
+    if session_ids.is_empty() {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "session_ids must not be empty",
         );
-    };
+    }
+    // The owner is whichever session manages the worktree, not the client's first id.
+    {
+        let instances = state.instances.read().await;
+        if let Some(index) = session_ids.iter().position(|id| {
+            instances
+                .iter()
+                .any(|i| &i.id == id && i.has_managed_worktree_or_workspace())
+        }) {
+            session_ids[..=index].rotate_right(1);
+        }
+    }
+    let owner_id = session_ids[0].clone();
 
     // CityHall: `purge_workspace_artifacts` tears down EVERY id, so every one
     // must be a structured session this mode created; otherwise a client could

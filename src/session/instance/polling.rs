@@ -439,8 +439,10 @@ impl Instance {
             );
             let poll_fn: crate::session::poller::SessionIdPollFn = Box::new(move |_| inner());
             let on_change = log_observed_session_id(&self.id);
-            let initial =
-                initial_known.map(crate::session::poller::SessionIdObservation::instance_sidecar);
+            // Seed without a path so the first published transcript is not suppressed.
+            let initial = initial_known.map(|sid| {
+                crate::session::poller::SessionIdObservation::instance_sidecar(sid, None)
+            });
             let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
             return self.install_poller(poller, spawn);
         }
@@ -460,8 +462,9 @@ impl Instance {
                 )
             });
             let on_change = log_observed_session_id(&self.id);
-            let initial =
-                initial_known.map(crate::session::poller::SessionIdObservation::instance_sidecar);
+            let initial = initial_known.map(|sid| {
+                crate::session::poller::SessionIdObservation::instance_sidecar(sid, None)
+            });
             let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
             return self.install_poller(poller, spawn);
         }
@@ -574,15 +577,15 @@ impl Instance {
         });
         let poll_fn: crate::session::poller::SessionIdPollFn = Box::new(move |_| {
             let mut observation =
-                crate::session::poller::SessionIdObservation::instance_sidecar(poll_fn()?);
+                crate::session::poller::SessionIdObservation::instance_sidecar(poll_fn()?, None);
             if let Some(active) = &active {
                 observation.source = Some(active.binding.clone());
                 observation.execution = Some(active.clone());
             }
             Some(observation)
         });
-        let initial =
-            initial_known.map(crate::session::poller::SessionIdObservation::instance_sidecar);
+        let initial = initial_known
+            .map(|sid| crate::session::poller::SessionIdObservation::instance_sidecar(sid, None));
         let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
         self.install_poller(poller, spawn)
     }
@@ -928,6 +931,68 @@ mod tests {
             inst.agent_session_id.as_deref(),
             Some(published),
             "and the in-memory row a restart reads moments later"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_live_pi_poller_records_a_transcript_path_published_after_its_id() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
+        let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
+
+        // A `--session-id` launch: the row holds the id before the pane publishes anything.
+        // Sandboxed, because the poller thread cannot see a test's host hook dir override.
+        let profile = "pi-late-path";
+        let sid = "01a05234-8889-72e2-a7c9-7ebc27b25b78";
+        let mut inst = Instance::new("pilatepath000001", "/tmp/pi-late-path");
+        inst.source_profile = profile.to_string();
+        inst.tool = "pi".to_string();
+        inst.sandbox_info = Some(test_sandbox("aoe-pi-late-path", None));
+        inst.agent_session_id = Some(sid.to_string());
+        inst.mark_pi_extension_launched_for_test();
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _| {
+                *instances = vec![seed.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let Some(crate::session::instance::SessionSidecarSource::SandboxDir(dir)) =
+            inst.pi_sidecar_source()
+        else {
+            panic!("a sandboxed pane publishes under its bind");
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("session_id"), format!("{sid}\n")).unwrap();
+        assert_eq!(inst.maybe_start_poller(), PollerStart::Started);
+
+        let published =
+            format!("/root/.pi/agent/sessions/--proj--/2026-01-01T00-00-00-000Z_{sid}.jsonl");
+        std::fs::create_dir_all(
+            dir.parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("agent/sessions/--proj--"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("session_path"), format!("{published}\n")).unwrap();
+
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        let mut instances = [inst];
+        let stored = || storage.load().unwrap()[0].pi_session_path.clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while stored().is_none() && std::time::Instant::now() < deadline {
+            crate::session::sync::drain_and_persist_session_ids(&mut instances, &file_watch);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        instances[0].stop_poller();
+        assert_eq!(
+            stored(),
+            Some(published),
+            "the path must be durable while the pane lives, not only at teardown"
         );
     }
 
