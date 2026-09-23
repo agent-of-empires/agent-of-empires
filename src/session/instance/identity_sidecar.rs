@@ -252,8 +252,8 @@ impl Instance {
         }
     }
 
-    /// Persist the transcript path a poller observation carried; false until it is durable, so
-    /// the caller keeps the observation for a retry.
+    /// Persist the transcript path a poller observation carried. False only while the write keeps
+    /// failing, so the caller holds the observation for a retry.
     pub(crate) fn persist_observed_pi_transcript(
         &mut self,
         observation: &crate::session::poller::SessionIdObservation,
@@ -264,9 +264,7 @@ impl Instance {
         else {
             return true;
         };
-        if !pi_transcript_names(path, &observation.sid)
-            || self.pi_session_path.as_deref() == Some(path.as_str())
-        {
+        if !pi_transcript_names(path, &observation.sid) {
             return true;
         }
         match crate::session::storage::Storage::new(
@@ -284,21 +282,31 @@ impl Instance {
         sid: &str,
         path: &str,
     ) -> bool {
-        let stored = self.store_pi_session_path(storage, Some(sid), path);
-        if stored {
-            self.pi_session_path = Some(path.to_owned());
+        match self.store_pi_session_path(storage, Some(sid), path) {
+            Some(true) => {
+                self.pi_session_path = Some(path.to_owned());
+                true
+            }
+            // The row moved to another id; the path is stale, not pending.
+            Some(false) => true,
+            None => false,
         }
-        stored
     }
 
-    /// Writes the path only to this row while it still holds `expected_sid`.
+    /// Writes the path only to this row while it still holds `expected_sid`. `None` when the
+    /// write failed; `Some(false)` when no row holds that id.
     pub(super) fn store_pi_session_path(
         &self,
         storage: &crate::session::storage::Storage,
         expected_sid: Option<&str>,
         path: &str,
-    ) -> bool {
+    ) -> Option<bool> {
         match storage.update(|instances, _| {
+            #[cfg(test)]
+            anyhow::ensure!(
+                !FAIL_PI_PATH_WRITES.with(std::cell::Cell::get),
+                "injected transcript path write failure"
+            );
             let row = instances
                 .iter_mut()
                 .find(|i| i.id == self.id && i.agent_session_id.as_deref() == expected_sid);
@@ -306,14 +314,14 @@ impl Instance {
                 .map(|row| row.pi_session_path = Some(path.to_string()))
                 .is_some())
         }) {
-            Ok(stored) => stored,
+            Ok(stored) => Some(stored),
             Err(error) => {
                 tracing::warn!(
                     target: "session.store",
                     instance = %self.id,
                     "could not persist the Pi transcript path the pane published: {error}",
                 );
-                false
+                None
             }
         }
     }
@@ -359,6 +367,13 @@ impl Instance {
             && !launch_command::environment_defines_path(&self.resolved_host_environment())
             && crate::agents::pi_supports_session_id_flag()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fails this thread's transcript-path writes while set.
+    pub(crate) static FAIL_PI_PATH_WRITES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Whether a Pi transcript file name (`<timestamp>_<id>.jsonl`) carries `sid`.
@@ -809,7 +824,12 @@ pi = "~/.pi-personal"
             })
             .unwrap();
         assert!(
-            !inst.persist_pi_transcript_into(&storage, sid, &moved_on),
+            inst.persist_pi_transcript_into(&storage, sid, &moved_on),
+            "a row that moved to another id makes the path stale, not pending"
+        );
+        assert_eq!(
+            stored(&storage),
+            before,
             "a row that no longer holds the id is not written"
         );
     }

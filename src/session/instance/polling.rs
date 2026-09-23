@@ -377,9 +377,10 @@ impl Instance {
             let inner = crate::session::capture::pi_sidecar_poll_fn(self.id.clone(), source);
             let poll_fn: crate::session::poller::SessionIdPollFn = Box::new(move |_| inner());
             let on_change = log_observed_session_id(&self.id);
-            let transcript = self.pi_session_path.clone();
+            // Seeded without the path, so the first poll re-delivers it and a write that failed
+            // at launch is retried.
             let initial = initial_known.map(|sid| {
-                crate::session::poller::SessionIdObservation::instance_sidecar(sid, transcript)
+                crate::session::poller::SessionIdObservation::instance_sidecar(sid, None)
             });
             let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
             return self.install_poller(poller, spawn);
