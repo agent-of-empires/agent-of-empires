@@ -1,9 +1,9 @@
 //! Adaptive polling interval and command channel for session monitoring
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,6 @@ pub const DEFAULT_SESSION_ID_POLLER_MAX_THREADS: u32 = 50;
 pub struct PollerBudget {
     active: AtomicU32,
     max: AtomicU32,
-    last_refusal: Mutex<Option<Instant>>,
 }
 
 impl PollerBudget {
@@ -23,23 +22,7 @@ impl PollerBudget {
         Self {
             active: AtomicU32::new(0),
             max: AtomicU32::new(max),
-            last_refusal: Mutex::new(None),
         }
-    }
-
-    fn note_refusal(&self) {
-        *self
-            .last_refusal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
-    }
-
-    /// Whether a session was refused a slot recently enough to still be waiting for one.
-    fn contended(&self) -> bool {
-        self.last_refusal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some_and(|at| at.elapsed() < CONTENTION_WINDOW)
     }
 
     /// Set the ceiling. 0 means "unset" and keeps the default, so an empty
@@ -66,7 +49,6 @@ impl PollerBudget {
         let mut current = self.active.load(Ordering::SeqCst);
         loop {
             if current >= self.max() {
-                self.note_refusal();
                 return None;
             }
             match self.active.compare_exchange_weak(
@@ -128,8 +110,6 @@ pub fn session_id_poller_budget() -> (u32, u32) {
 const POLLER_REPAIR_INITIAL_DELAY: Duration = Duration::from_secs(5);
 /// Longest retry delay; the schedule doubles up to this and then holds.
 const POLLER_REPAIR_MAX_DELAY: Duration = Duration::from_secs(60);
-/// Outlasts the longest repair delay, so a session still waiting keeps the budget contended.
-const CONTENTION_WINDOW: Duration = Duration::from_secs(2 * POLLER_REPAIR_MAX_DELAY.as_secs());
 /// At the capped delay, log a reminder every this many deferrals
 /// (60 s × 10 = one line per ten minutes per session).
 const POLLER_REPAIR_REMIND_EVERY: u32 = 10;
@@ -169,11 +149,6 @@ impl PollerRepairBackoff {
         (escalated || reminder).then_some(delay)
     }
 
-    /// After a poller gave up its slot: wait the longest delay, behind sessions already waiting.
-    pub fn rest(&mut self, now: Instant) {
-        self.next_attempt = Some(now + POLLER_REPAIR_MAX_DELAY);
-    }
-
     /// Clear the schedule after a successful start.
     pub fn reset(&mut self) {
         *self = Self::default();
@@ -210,14 +185,10 @@ impl Drop for PollerCountGuard {
     }
 }
 
-/// Whether a poller could be spawned right now. A `false` counts as a session waiting for a slot.
+/// Whether a poller could be spawned right now.
 pub(crate) fn session_id_poller_budget_available() -> bool {
     let budget = current_budget();
-    let available = budget.active() < budget.max();
-    if !available {
-        budget.note_refusal();
-    }
-    available
+    budget.active() < budget.max()
 }
 
 const POLL_INITIAL_INTERVAL: Duration = Duration::from_secs(2);
@@ -432,7 +403,6 @@ pub struct SessionPoller {
     result_rx: Option<mpsc::Receiver<(String, SessionIdObservation)>>,
     pending_observation: Option<(String, SessionIdObservation)>,
     handle: Option<JoinHandle<()>>,
-    yielded: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for SessionPoller {
@@ -458,7 +428,6 @@ impl SessionPoller {
             result_rx: Some(result_rx),
             pending_observation: None,
             handle: None,
-            yielded: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -516,8 +485,6 @@ impl SessionPoller {
         let initial_session_name = self.session_name.clone();
         let thread_label = format!("aoe-poller/{}", instance_id);
         let result_tx = self.result_tx.clone();
-        let budget = Arc::clone(&self.budget);
-        let yielded = Arc::clone(&self.yielded);
 
         let handle = std::thread::Builder::new()
             .name(thread_label.clone())
@@ -545,12 +512,8 @@ impl SessionPoller {
                                 result_tx.send((instance_id.clone(), observation.clone()));
                             *last = Some(observation);
                             interval.record_change();
-                            true
                         }
-                        _ => {
-                            interval.record_no_change();
-                            false
-                        }
+                        _ => interval.record_no_change(),
                     }
                 };
 
@@ -575,7 +538,7 @@ impl SessionPoller {
                 }
                 report(observation, &mut last_known, &mut interval);
                 loop {
-                    let timed_out = match cmd_rx.recv_timeout(interval.current()) {
+                    match cmd_rx.recv_timeout(interval.current()) {
                         Ok(PollCommand::Stop) => {
                             // Capture the pane's final observable state before the owner joins and
                             // drains this poller.
@@ -588,11 +551,10 @@ impl SessionPoller {
                         Ok(PollCommand::RetryLast) => {
                             last_known = None;
                             interval.record_change();
-                            false
                         }
-                        Err(RecvTimeoutError::Timeout) => true,
+                        Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => break,
-                    };
+                    }
 
                     let (target, should_stop, observation) = poll_tick();
                     if should_stop {
@@ -600,14 +562,7 @@ impl SessionPoller {
                         break;
                     }
 
-                    let changed = report(observation, &mut last_known, &mut interval);
-                    // Rotate the budget: the owner restarts this poller after the sessions
-                    // waiting for a slot have had one.
-                    if timed_out && !changed && budget.contended() {
-                        tracing::debug!(target: "session.create", "Poller for {} yielding its slot", instance_id);
-                        yielded.store(true, Ordering::SeqCst);
-                        break;
-                    }
+                    report(observation, &mut last_known, &mut interval);
                 }
             });
 
@@ -715,17 +670,6 @@ impl SessionPoller {
                 tracing::warn!(target: "session.create", "Poller thread panicked: {:?}", e);
             }
         }
-    }
-
-    /// Whether the thread exited to give its slot to a waiting session, reported once.
-    pub(crate) fn take_yielded(&self) -> bool {
-        self.yielded.swap(false, Ordering::SeqCst)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn force_yield_for_test(&mut self) {
-        self.stop();
-        self.yielded.store(true, Ordering::SeqCst);
     }
 
     /// Check if the poller thread is running
@@ -933,42 +877,6 @@ mod tests {
 
         first.stop();
         assert_eq!(budget.active(), 0, "the guard returns the isolated slot");
-    }
-
-    #[test]
-    fn a_settled_poller_yields_its_slot_to_a_waiting_session() {
-        let _budget = test_support::IsolatedBudget::with_ceiling(1);
-        let mut settled = SessionPoller::new("settled".to_string());
-        assert_eq!(
-            settled.start(
-                "settled".to_string(),
-                Box::new(|| Some("sid".to_string())),
-                Box::new(|_| {}),
-                Some("sid".to_string()),
-            ),
-            PollerSpawn::Spawned
-        );
-        let mut waiting = SessionPoller::new("waiting".to_string());
-        let mut start_waiting = || {
-            waiting.start(
-                "waiting".to_string(),
-                Box::new(|| None),
-                Box::new(|_| {}),
-                None,
-            )
-        };
-        assert_eq!(start_waiting(), PollerSpawn::BudgetExhausted);
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while settled.is_running() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(
-            !settled.is_running(),
-            "a poller with nothing new must not hold the only slot while another session waits"
-        );
-        assert_eq!(start_waiting(), PollerSpawn::Spawned);
-        waiting.stop();
     }
 
     #[test]

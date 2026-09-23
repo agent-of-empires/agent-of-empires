@@ -511,17 +511,7 @@ impl Instance {
         if !self.poller_repair.due(now) {
             return false;
         }
-        let yielded = self.session_id_poller.as_ref().is_some_and(|poller| {
-            poller
-                .lock()
-                .map(|guard| guard.take_yielded())
-                .unwrap_or_else(|poisoned| poisoned.into_inner().take_yielded())
-        });
         self.session_id_poller = None;
-        if yielded {
-            self.poller_repair.rest(now);
-            return false;
-        }
         match self.maybe_start_poller() {
             // `install_poller` cleared the schedule.
             PollerStart::Started => true,
@@ -673,21 +663,6 @@ mod tests {
         assert!(inst.repair_session_id_poller_if_needed(&live));
         assert!(inst.session_id_poller_is_running());
         assert_eq!(inst.poller_repair, Default::default());
-
-        // A poller that gave its slot away queues behind the waiting sessions.
-        let poller = inst.session_id_poller.clone().unwrap();
-        poller.lock().unwrap().force_yield_for_test();
-        assert!(!inst.repair_session_id_poller_if_needed(&live));
-        assert!(inst.session_id_poller.is_none());
-        let now = std::time::Instant::now();
-        assert!(!inst
-            .poller_repair
-            .due(now + std::time::Duration::from_secs(59)));
-        assert!(inst
-            .poller_repair
-            .due(now + std::time::Duration::from_secs(61)));
-        inst.poller_repair.expire();
-        assert!(inst.repair_session_id_poller_if_needed(&live));
         inst.stop_poller();
     }
 

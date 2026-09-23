@@ -1236,9 +1236,8 @@ pub struct SessionConfig {
 
     /// Ceiling on concurrent session-id poller threads in one aoe process
     /// (the daemon or a TUI). Each poller keeps one session's agent
-    /// session id live; with more live sessions than this, idle pollers
-    /// hand their thread to waiting sessions, so ids refresh about once a
-    /// minute instead of every status tick. Process-wide:
+    /// session id live; with more live sessions than this, the overflow's
+    /// ids stop refreshing until another session stops. Process-wide:
     /// applied once at startup from the effective config of the profile the
     /// process was launched with, so a change takes effect on the next
     /// start. 0 keeps the default (50).
