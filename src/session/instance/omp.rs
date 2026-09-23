@@ -910,10 +910,11 @@ mod tests {
         std::fs::set_permissions(&tty, std::fs::Permissions::from_mode(0o700)).unwrap();
         let real_sh = which::which("sh").unwrap();
         let sh = bin.join("sh");
-        // Fail a selected write to the actual temporary breadcrumb, not its size probe.
+        // Fail a selected breadcrumb write: only it runs after `breadcrumb_tmp` is set and
+        // before `marker_tmp` is. `-ef` on /dev/fd cannot match the file on macOS.
         let injected_shell = r#"printf() {
   if [ -n "${AOE_TEST_FAIL_WRITE-}" ] && [ -n "${breadcrumb_tmp-}" ] \
-    && [ /dev/fd/1 -ef "$breadcrumb_tmp" ]; then
+    && [ -z "${marker_tmp-}" ]; then
     write_count=$(( ${write_count:-0} + 1 ))
     if [ "$write_count" -eq "$AOE_TEST_FAIL_WRITE" ]; then
       command printf partial
