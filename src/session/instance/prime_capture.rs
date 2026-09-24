@@ -475,6 +475,7 @@ mod tests {
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
         let mut inst = tool_instance("prime-agent", "/tmp/test");
         inst.sandbox_info = Some(test_sandbox("test", Some("/workspace/test")));
+        admit_sandbox_fixture(&inst);
 
         assert_eq!(inst.try_retroactive_capture(), None);
         std::fs::create_dir_all(inst.sandbox_capture_store_dir().unwrap()).unwrap();
@@ -493,6 +494,7 @@ mod tests {
         std::fs::create_dir_all(project.join(".prime/agent")).unwrap();
         let mut inst = tool_instance("prime-agent", project.to_str().unwrap());
         inst.sandbox_info = Some(test_sandbox("prime-plan", Some("/workspace/project")));
+        admit_sandbox_fixture(&inst);
         let store = inst.sandbox_capture_store_dir().unwrap();
         std::fs::create_dir_all(&store).unwrap();
         let mut config = inst.build_container_config().unwrap();
@@ -703,6 +705,7 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let mut inst = tool_instance("prime-agent", project.to_str().unwrap());
         inst.sandbox_info = Some(test_sandbox("prime-empty", Some("/workspace/project")));
+        admit_sandbox_fixture(&inst);
         let plan = inst
             .prime_agent_capture_plan(inst.prime_agent_capture_options().unwrap())
             .unwrap();
@@ -778,10 +781,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
         let store = tmp.path().join("store");
-        std::fs::create_dir_all(store.join("sessions")).unwrap();
+        std::fs::create_dir_all(store.join("custom-sessions")).unwrap();
         let store = std::fs::canonicalize(store).unwrap();
-        let sessions = store.join("sessions");
+        let sessions = store.join("custom-sessions");
         let mut inst = tool_instance("prime-agent", tmp.path().to_str().unwrap());
+        inst.extra_args = "--session-dir /root/.prime/agent/custom-sessions".into();
         inst.sandbox_info = Some(test_sandbox("prime-root", Some("/workspace/project")));
         let parent = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
         let child = "018f47a6-7b80-7cc3-98a2-37b5f486b2a2";
@@ -802,28 +806,28 @@ mod tests {
         )
         .unwrap();
         let script = r#"
-import { readFileSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
-const extension = (await import(pathToFileURL(process.argv[1]).href)).default;
-process.chdir(process.argv[4]);
-async function emit(target, rootOnly, id, name, depth) {
-  process.env.AOE_SESSION_ID_FILE = target;
-  process.env.AOE_SESSION_ROOT_ONLY = rootOnly ? '1' : '0';
-  let onStart;
-  extension({ on(event, handler) { if (event === 'session_start') onStart = handler; } });
-  await onStart({}, { sessionManager: {
+    import { readFileSync } from 'node:fs';
+    import { pathToFileURL } from 'node:url';
+    const extension = (await import(pathToFileURL(process.argv[1]).href)).default;
+    process.chdir(process.argv[4]);
+    async function emit(target, rootOnly, id, name, depth) {
+      process.env.AOE_SESSION_ID_FILE = target;
+      process.env.AOE_SESSION_ROOT_ONLY = rootOnly ? '1' : '0';
+      let onStart;
+      extension({ on(event, handler) { if (event === 'session_start') onStart = handler; } });
+      await onStart({}, { sessionManager: {
     getSessionId: () => id,
-    getSessionFile: () => 'sessions/' + name + '.jsonl',
+    getSessionFile: () => 'custom-sessions/' + name + '.jsonl',
     getHeader: () => ({ rlmDepth: depth, cwd: '/workspace/project' }),
-  } });
-}
-const [root, normal] = [process.argv[2], process.argv[3]];
-await emit(root, true, '018f47a6-7b80-7cc3-98a2-37b5f486b2a1', 'parent', 0);
-await emit(root, true, '018f47a6-7b80-7cc3-98a2-37b5f486b2a2', 'child', undefined);
-await emit(root, true, '018f47a6-7b80-7cc3-98a2-37b5f486b2a2', 'child', 1);
-await emit(normal, false, '018f47a6-7b80-7cc3-98a2-37b5f486b2a2', 'child', 1);
-process.stdout.write(readFileSync(normal, 'utf8'));
-"#;
+      } });
+    }
+    const [root, normal] = [process.argv[2], process.argv[3]];
+    await emit(root, true, '018f47a6-7b80-7cc3-98a2-37b5f486b2a1', 'parent', 0);
+    await emit(root, true, '018f47a6-7b80-7cc3-98a2-37b5f486b2a2', 'child', undefined);
+    await emit(root, true, '018f47a6-7b80-7cc3-98a2-37b5f486b2a2', 'child', 1);
+    await emit(normal, false, '018f47a6-7b80-7cc3-98a2-37b5f486b2a2', 'child', 1);
+    process.stdout.write(readFileSync(normal, 'utf8'));
+    "#;
         let output = std::process::Command::new("node")
             .args(["--input-type=module", "--eval", script])
             .arg(&extension)
@@ -842,11 +846,11 @@ process.stdout.write(readFileSync(normal, 'utf8'));
             std::fs::read_to_string(normal.parent().unwrap().join("session_path"))
                 .unwrap()
                 .trim(),
-            "sessions/child.jsonl"
+            "custom-sessions/child.jsonl"
         );
         let plan = PrimeAgentCapturePlan {
             store: store.clone(),
-            session_dir: "sessions".into(),
+            session_dir: "custom-sessions".into(),
             container_session_dir: sessions.clone(),
             container_cwd: "/workspace/project".into(),
         };
@@ -896,6 +900,7 @@ process.stdout.write(readFileSync(normal, 'utf8'));
         let mut inst = tool_instance("prime-agent", project.to_str().unwrap());
         inst.source_profile = "prime-resident-root-refresh".into();
         inst.sandbox_info = Some(test_sandbox("prime-resident", Some("/workspace/project")));
+        admit_sandbox_fixture(&inst);
         let plan = inst
             .prime_agent_capture_plan(inst.prime_agent_capture_options().unwrap())
             .unwrap();

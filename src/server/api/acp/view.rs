@@ -27,6 +27,7 @@ fn internal_error(message: &'static str) -> Response {
 struct StructuredSeed {
     stored_acp_session_id: Option<String>,
     seed_history_replay: bool,
+    import_terminal: bool,
 }
 
 /// An existing `acp_session_id` is loaded (replayed only when importing).
@@ -44,6 +45,7 @@ fn resolve_structured_seed(
         return StructuredSeed {
             stored_acp_session_id: Some(id.to_string()),
             seed_history_replay: import_pending,
+            import_terminal: false,
         };
     }
     if crate::agents::acp_transcript_cli_resumable(tool, acp_agent) && transcript_present {
@@ -51,12 +53,14 @@ fn resolve_structured_seed(
             return StructuredSeed {
                 stored_acp_session_id: Some(id.to_string()),
                 seed_history_replay: true,
+                import_terminal: true,
             };
         }
     }
     StructuredSeed {
         stored_acp_session_id: None,
         seed_history_replay: import_pending,
+        import_terminal: false,
     }
 }
 
@@ -299,6 +303,11 @@ fn spawn_enabled_worker(
         let request = SpawnRequest {
             stored_acp_session_id: seed.stored_acp_session_id,
             seed_history_replay: seed.seed_history_replay,
+            sandbox_continuation: if seed.import_terminal {
+                crate::acp::supervisor::SandboxContinuation::ImportTerminal
+            } else {
+                crate::acp::supervisor::SandboxContinuation::Persisted
+            },
             claude_store_pin,
             ..spawn_request_for(&instance, agent_name.clone(), sandbox_info)
         };
@@ -639,6 +648,10 @@ mod tests {
             let s = resolve_structured_seed(tool, agent, acp, agent_sid, import, present);
             assert_eq!(s.stored_acp_session_id.as_deref(), expected);
             assert_eq!(s.seed_history_replay, replay);
+            assert_eq!(
+                s.import_terminal,
+                acp.is_none() && expected == agent_sid && replay,
+            );
         }
     }
 

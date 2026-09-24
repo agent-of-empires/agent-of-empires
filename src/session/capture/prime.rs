@@ -11,9 +11,23 @@ use super::canonicalize_or_raw;
 /// Strict launch floor: timestamp uncertainty fails closed.
 const PRIME_AGENT_MTIME_FLOOR_SLACK_MS: f64 = 0.0;
 /// Bounds the header allocation for one hostile line.
-const PRIME_AGENT_HEADER_SCAN_BYTES: u64 = 64 * 1024;
+pub(crate) const PRIME_AGENT_HEADER_SCAN_BYTES: u64 = 64 * 1024;
 /// A private store holds few files; above this the scan fails closed.
-const PRIME_AGENT_MAX_SESSION_FILES: usize = 256;
+pub(crate) const PRIME_AGENT_MAX_SESSION_FILES: usize = 256;
+
+pub(crate) fn root_session_header(bytes: &[u8]) -> Option<(String, String)> {
+    if bytes.is_empty() || u64::try_from(bytes.len()).ok()? > PRIME_AGENT_HEADER_SCAN_BYTES {
+        return None;
+    }
+    let header = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    if header.get("type")?.as_str()? != "session" || header.get("rlmDepth")?.as_u64()? != 0 {
+        return None;
+    }
+    Some((
+        header.get("id")?.as_str()?.to_owned(),
+        header.get("cwd")?.as_str()?.to_owned(),
+    ))
+}
 
 struct PrimeAgentSession {
     id: String,
@@ -52,22 +66,8 @@ fn scan_prime_agent_sessions(store: &Path, session_dir: &Path) -> Vec<PrimeAgent
                 .take(PRIME_AGENT_HEADER_SCAN_BYTES.saturating_add(1))
                 .read_until(b'\n', &mut header)
                 .ok()?;
-            if header.is_empty()
-                || u64::try_from(header.len()).unwrap_or(u64::MAX) > PRIME_AGENT_HEADER_SCAN_BYTES
-            {
-                return None;
-            }
-            let header = serde_json::from_slice::<serde_json::Value>(&header).ok()?;
-            if header.get("type").and_then(|value| value.as_str()) != Some("session")
-                || header.get("rlmDepth").and_then(|value| value.as_u64()) != Some(0)
-            {
-                return None;
-            }
-            Some(PrimeAgentSession {
-                id: header.get("id")?.as_str()?.to_string(),
-                cwd: header.get("cwd")?.as_str()?.to_string(),
-                mtime_ms,
-            })
+            let (id, cwd) = root_session_header(&header)?;
+            Some(PrimeAgentSession { id, cwd, mtime_ms })
         })
         .collect()
 }

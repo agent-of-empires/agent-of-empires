@@ -252,3 +252,16 @@ pub(super) fn tool_instance(tool: &str, path: &str) -> Instance {
     inst.tool = tool.to_string();
     inst
 }
+/// Mirror launch admission for hand-built sandbox fixtures without holding the
+/// transition lock across the behavior under test.
+pub(super) fn admit_sandbox_fixture(inst: &Instance) {
+    let app = crate::session::get_app_dir().unwrap();
+    for root in crate::migrations::v033_isolate_sandbox_content::instance_roots(inst).unwrap() {
+        std::fs::create_dir_all(&root.path).unwrap();
+        let roles: Vec<&str> = root.roles.iter().map(String::as_str).collect();
+        crate::migrations::v033_isolate_sandbox_content::certify_test_content(
+            &app, &inst.id, &root.path, &roles,
+        )
+        .unwrap();
+    }
+}

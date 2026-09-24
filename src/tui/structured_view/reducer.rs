@@ -1,19 +1,31 @@
 //! Server-fed view state for the native TUI structured view: the daemon's
-//! folded control state plus its ordered transcript rows.
+//! folded control state plus its ordered transcript rows. Nothing here
+//! reduces the raw event stream any more.
 //!
-//! The daemon owns the ordered transcript. It folds the event stream through
-//! `TranscriptModel` (`src/acp/transcript.rs`) and streams the built
-//! `TranscriptRow`s over the WS transcript channel and via
-//! `GET /acp/replay?view=rows`; this reducer holds them in `server_rows` and
-//! reconciles them by id, and `render.rs` projects them to text. Control state
-//! (turn flags, pending approvals / elicitations, usage, mode, commands, plan,
-//! compaction / cancel phases) arrives the same way, as a `reduced_state` frame
-//! that [`AcpTranscript::apply_reduced_state`] adopts wholesale.
+//! Since Tier 4 the ORDERED TRANSCRIPT (assistant messages, tool cards,
+//! dividers, elicitation answers) is owned by the daemon: it folds the
+//! event stream through `TranscriptModel` (`src/acp/transcript.rs`) once and
+//! streams the built `TranscriptRow`s over the WS transcript channel (a
+//! `transcript_snapshot` on connect, a `transcript_delta` per live event)
+//! and via `GET /acp/replay?view=rows`. This reducer holds those rows in
+//! `server_rows` and reconciles them by id; `render.rs` projects them to the
+//! TUI's text presentation. The web reducer (`web/src/hooks/useAcpSession.ts`)
+//! is the authoritative reference for this split.
 //!
-//! Approvals are control state rendered as the modal shelf, never interleaved
-//! into the transcript. The two `resolve_*_locally` helpers are the only
-//! optimism left: they hide a card the user just answered until the server's
-//! list catches up.
+//! CONTROL state (turn flags, pending approvals / elicitations, usage, mode,
+//! available commands, the plan snapshot, the compaction / cancel phases)
+//! arrives the same way since Tier 1.3: the daemon folds `AcpState` once and
+//! pushes it as a `reduced_state` frame, which
+//! [`AcpTranscript::apply_reduced_state`] adopts wholesale. Notes:
+//!
+//! - Approvals are pure control state (`pending_approvals`), rendered as the
+//!   modal approval shelf, not interleaved into the transcript. This matches
+//!   the migrated web, whose `ActivityRow` union carries no approval kind:
+//!   the tool card the approval gates already sits in `server_rows`.
+//! - The two `resolve_*_locally` helpers are the only optimism left: they hide
+//!   a card the user just answered until the server's list catches up.
+//! - The context-loss notice is derived from the rows rather than latched
+//!   from an event. See [`AcpTranscript::context_primer_pending`].
 
 use crate::acp::elicitations::ElicitationQuestion;
 use crate::acp::state::{
@@ -31,17 +43,19 @@ pub struct AcpTranscript {
     /// Resolved ACP registry key shown in the header. Updated when the backend
     /// switches mid-session.
     pub agent_name: Option<String>,
-    /// The daemon-owned ordered transcript, reconciled by row id. `render.rs`
-    /// projects these to text; nothing here builds them. See the module docs.
+    /// The daemon-owned ordered transcript, reconciled by row id from the WS
+    /// `transcript_snapshot` / `transcript_delta` channel and the
+    /// `?view=rows` replay. `render.rs` projects these to text; nothing here
+    /// builds them. See the module docs.
     pub server_rows: Vec<TranscriptRow>,
     pub pending_approvals: Vec<PendingApproval>,
-    /// Pending `AskUserQuestion` elicitations. The TUI surfaces a notice and
-    /// lets the user skip/cancel so the agent's turn never hangs; the answer
-    /// form is web-only.
+    /// Pending `AskUserQuestion` elicitations. The native TUI does not
+    /// render the answer form (that is web-only); it surfaces a notice and
+    /// lets the user skip/cancel so the agent's turn never hangs. See the
+    /// `ElicitationRequested` arm.
     pub pending_elicitations: Vec<PendingElicitation>,
-    /// Live status banner ("thinking…" / "compacting…"), shown while a turn
-    /// runs or a background sub-agent is active. Derived from the server's
-    /// phase in `apply_reduced_state`.
+    /// Live status banner ("thinking…" / "compacting…"), shown only while a
+    /// turn runs. Derived from the server's phase in `apply_reduced_state`.
     pub status_text: Option<String>,
     /// Id of the agent's currently selected mode. `None` until the agent
     /// advertises one.
@@ -52,8 +66,9 @@ pub struct AcpTranscript {
     /// Slash commands the agent has advertised. Drives the composer's
     /// `/` picker (followup #1018).
     pub available_commands: Vec<AvailableCommand>,
-    /// Nonces of approvals / elicitations resolved here, held until the daemon's
-    /// pending list stops carrying them.
+    /// Nonces of approvals / elicitations the user resolved here, held until
+    /// the daemon's own pending list stops carrying them. See
+    /// [`Self::apply_reduced_state`].
     locally_resolved: Vec<String>,
     /// Whether the agent is mid-turn. The composer reads it to decide whether
     /// Enter sends now or parks the prompt in the daemon's queue.
@@ -66,23 +81,29 @@ pub struct AcpTranscript {
     /// this field.
     pub background_agent_active: bool,
     /// Whether the agent accepts `_session/steering`. When true the composer
-    /// sends a mid-turn prompt straight through and the daemon injects it into
-    /// the running turn. Re-derived as `false` on a respawn onto an adapter
-    /// without the capability (#2805).
+    /// sends a mid-turn prompt straight through instead of parking it: the
+    /// daemon injects it into the running turn. Re-derived as `false` on a
+    /// respawn onto an adapter that lacks the capability, so it cannot go
+    /// stale. See #2805.
     pub steering: bool,
-    /// Whether a `/compact` cycle is running. The adapter goes silent for 90 to
-    /// 170 seconds, so the composer must park a send: a summarization turn has
-    /// nothing to steer (#3219).
+    /// Whether a `/compact` cycle is running. The adapter goes silent for 90
+    /// to 170 seconds in that window, so the composer must park a send rather
+    /// than steer it: a summarization turn has nothing to steer and never
+    /// answers the injected message. See #3219.
     pub compacting: bool,
-    /// Whether a `session/cancel` is in flight. The daemon reads a prompt
-    /// arriving mid-cancel as a wedged agent and escalates to a runner restart,
-    /// so even a steerable agent must park here (#2805 / #1727).
+    /// Whether a `session/cancel` is in flight. Only consulted by the
+    /// composer's park decision: the daemon reads a prompt arriving mid-cancel
+    /// as a wedged agent and escalates to a runner restart, so a steerable
+    /// agent must still park here rather than route Stop-then-type into that
+    /// path. See #2805 / #1727.
     pub cancelling: bool,
-    /// Latest context-window usage / cost snapshot, rendered as the status
-    /// line's token meter.
+    /// Latest context-window usage / cost snapshot the agent reported.
+    /// Rendered as a token meter in the status line, mirroring the web
+    /// composer's usage chip.
     pub usage: Option<SessionUsage>,
-    /// Latest plan snapshot, kept out of the append-only transcript so repeated
-    /// progress updates render as one sticky summary.
+    /// Latest plan snapshot. Kept separate from the append-only transcript so
+    /// repeated progress updates render as one sticky summary instead of a
+    /// growing stack of near-identical checklists.
     pub current_plan: Vec<PlanLine>,
     /// Set when the WS layer reports `{"kind":"lagged"}`; the view layer
     /// rebuilds the rows via `?view=rows`. See [`Self::drop_rows`].
@@ -92,16 +113,22 @@ pub struct AcpTranscript {
     pub last_seq: u64,
 }
 
-/// A tool card the renderer builds from a server `tool_start` row and its paired
-/// terminal row. A pure presentation view-model for `render::render_tool_lines`.
+/// A tool card the renderer builds from a server `tool_start` row (plus its
+/// paired terminal row). No longer produced by this reducer; it is a pure
+/// presentation view-model that `render::render_tool_lines` consumes, kept
+/// here so the render helpers keep their existing shape.
+#[derive(Debug, Clone)]
 pub struct ToolCallRow {
     pub name: String,
-    /// ACP `ToolKind` lowercased, forwarded from `ToolCall::kind`. Drives the
-    /// per-kind renderer; an empty string falls back to the generic one-liner.
+    /// ACP `ToolKind` lowercased (`read` / `edit` / `delete` / `execute`
+    /// / …), forwarded from `ToolCall::kind`. Drives the per-kind
+    /// renderer in `render_tool_lines`; empty string falls back to the
+    /// generic one-liner.
     pub kind: String,
     pub args: String,
-    /// Structured per-file diffs the agent attached. When non-empty the renderer
-    /// prefers these over the diff derived from `old_string`/`new_string`.
+    /// Structured per-file diffs the agent attached to the call (edit /
+    /// apply_patch tools). When non-empty the renderer prefers these over
+    /// the compact diff derived from `old_string`/`new_string` args.
     pub diffs: Vec<DiffPreview>,
     pub completed: Option<ToolCompletion>,
 }
@@ -114,8 +141,9 @@ pub struct ToolCompletion {
     pub content: String,
 }
 
-/// How a tool call ended. `Stopped` is not a failure: it is the turn-end sweep
-/// closing a call the adapter left open (#1646), so it reads neutral.
+/// How a tool call ended. `Stopped` is not a failure: it is the turn-end
+/// sweep closing a call the adapter left open (#1646), so it reads neutral,
+/// matching the web's third tool-card status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolOutcome {
     Ok,
@@ -129,9 +157,11 @@ pub struct PlanLine {
     pub status: PlanStepStatus,
 }
 
-/// A pending approval, control state driving the modal approval shelf. Carries
-/// the full request payload so the shelf renders without a transcript row: the
-/// gated tool card already sits in `server_rows`.
+/// A pending approval, control state that drives the modal approval shelf.
+/// Carries the full request payload (previously read off the inline
+/// `ApprovalRow`) so the shelf renders without an approval transcript row:
+/// the daemon transcript emits none, since the gated tool card already sits
+/// in `server_rows`.
 #[derive(Debug, Clone)]
 pub struct PendingApproval {
     pub nonce: String,
@@ -193,17 +223,20 @@ impl AcpTranscript {
         }
     }
 
-    /// Reconcile a batch of server-folded transcript rows into `server_rows` by
-    /// id. Idempotent, so a connect snapshot overlapping the replay is a no-op.
+    /// Reconcile a batch of server-folded transcript rows (a WS
+    /// `transcript_snapshot`, or a `?view=rows` replay) into `server_rows`
+    /// by id. Idempotent, so the connect snapshot overlapping the initial
+    /// replay is a no-op. See [`upsert_transcript_row`].
     pub fn merge_server_rows(&mut self, rows: Vec<TranscriptRow>) {
         for row in rows {
             upsert_transcript_row(&mut self.server_rows, row);
         }
     }
 
-    /// Apply one `transcript_delta`: `Append`/`Patch` upsert by id, `Remove`
-    /// drops the row. `Append` reconciles like the snapshot, so a live append
-    /// racing a replayed row does not double it.
+    /// Apply one incremental transcript row change (a WS `transcript_delta`):
+    /// `Append`/`Patch` upsert by id, `Remove` drops the row. `Append` uses
+    /// the same reconcile as the snapshot so a live append that raced a
+    /// replayed row does not double it.
     pub fn apply_transcript_delta(&mut self, delta: TranscriptDelta) {
         match delta {
             TranscriptDelta::Append(row) => upsert_transcript_row(&mut self.server_rows, row),
@@ -212,16 +245,20 @@ impl AcpTranscript {
         }
     }
 
-    /// Drop the transcript rows ahead of a `?view=rows` rebuild, for when the
-    /// daemon signals `lagged`. Control state is left alone: the daemon re-folds
-    /// it at the source and pushes a corrected `reduced_state`.
+    /// Drop the transcript rows ahead of a `?view=rows` rebuild, used when the
+    /// daemon signals `lagged` and rows we never saw may have been evicted.
+    /// Control state is left alone here because the daemon repairs it at the
+    /// source: on a lag it re-folds the session from the event store and
+    /// pushes a corrected `reduced_state`, so the next frame is authoritative.
     pub fn drop_rows(&mut self) {
         self.server_rows.clear();
     }
 
-    /// Optimistically clear an approval card by nonce once the resolve POST
-    /// succeeded (204) or the nonce was already gone (404), instead of waiting on
-    /// the `ApprovalResolved` broadcast the seq dedupe can swallow (#1821).
+    /// Optimistically clear an approval card by nonce after the resolve
+    /// POST succeeded (204) or the daemon reported the nonce already gone
+    /// (404), instead of waiting on the `ApprovalResolved` broadcast, which
+    /// the seq dedupe can swallow and leave the card stuck. Mirrors the
+    /// `ApprovalResolved` event arm. See #1821.
     pub fn resolve_approval_locally(&mut self, nonce: &str) {
         self.pending_approvals.retain(|p| p.nonce != nonce);
         self.locally_resolved.push(nonce.to_string());
@@ -234,19 +271,24 @@ impl AcpTranscript {
         self.locally_resolved.push(nonce.to_string());
     }
 
-    /// Mark `lagged = true`, so the view layer shows a banner and refetches
-    /// `?view=rows` to reseed `server_rows`.
+    /// Mark `lagged = true`. The view layer notices this (the status line
+    /// shows a "broadcast lagged" banner) and triggers a /replay refetch,
+    /// which reseeds `server_rows` via `?view=rows`.
     pub fn set_lagged(&mut self) {
         self.lagged = true;
     }
 
-    /// Adopt the daemon's folded control state from a `reduced_state` frame.
-    /// This is the whole control reduction: nothing here folds raw events.
+    /// Adopt the daemon's folded control state, carried by a WS
+    /// `reduced_state` frame on connect and after every event. This is the
+    /// whole control reduction now: nothing here folds raw events, so the
+    /// native view and the web render the same server-derived truth.
     ///
-    /// A frame older than the last applied is dropped, so a snapshot racing live
-    /// deltas cannot rewind the view. `unchanged` names cold fields the server
-    /// omitted because this connection already holds them; they arrive as empty
-    /// defaults, so adopting them blindly would blank the pickers.
+    /// A frame older than the last one applied is dropped, so a snapshot that
+    /// races live deltas cannot rewind the view.
+    ///
+    /// `unchanged` names cold fields the server omitted because this
+    /// connection already holds them; they arrive as empty defaults, so
+    /// adopting them blindly would blank the pickers.
     pub fn apply_reduced_state(&mut self, seq: u64, state: AcpState, unchanged: &[String]) {
         if seq < self.last_seq {
             tracing::debug!(
@@ -288,10 +330,11 @@ impl AcpTranscript {
             })
             .unwrap_or_default();
 
-        // The banner renders only while a turn runs or a background sub-agent is
-        // active, so the phases that end a turn never reach the screen.
-        // Compaction outranks thinking: the adapter goes silent for minutes and
-        // the user needs to know why.
+        // The status banner only renders while a turn is running or a
+        // background sub-agent is active, so the phases that end one
+        // (stopped, startup / prompt errors) never reach the screen.
+        // Compaction outranks thinking: the adapter goes silent for 90 to
+        // 170 seconds there and the user needs to know why.
         self.status_text = if state.compacting {
             Some("compacting…".to_string())
         } else if state.thinking.is_some() {
@@ -300,8 +343,10 @@ impl AcpTranscript {
             None
         };
 
-        // A locally-resolved card stays hidden until the daemon's list agrees;
-        // without this filter the next event's reduced state would paint it back.
+        // A locally-resolved card stays hidden until the daemon's own list
+        // agrees. The shelf clears on the resolve POST's 204/404 rather than
+        // waiting for the broadcast (#1821), and without this filter the very
+        // next event's reduced state would paint the card straight back.
         let still_pending: Vec<&str> = state
             .pending_approvals
             .iter()
@@ -342,19 +387,31 @@ impl AcpTranscript {
             .collect();
     }
 
-    /// Whether to show the context-loss notice until the next prompt. Derived
-    /// from the newest reset or prompt row, so it survives a reconnect without
-    /// client-side reduction.
+    /// Derived from the rows, so it survives a reconnect with no client-side
+    /// latch: a reset with no prompt after it means the context is gone. A
+    /// session that was never prompted has nothing to re-prime, so a pre-prompt
+    /// reset (an isolated native history, a refused fork) is a message without
+    /// a badge, which is what the dashboard's own gate does.
     pub fn context_primer_pending(&self) -> bool {
-        self.server_rows
-            .iter()
-            .rev()
-            .find_map(|row| match row.kind {
-                TranscriptRowKind::ContextReset => Some(true),
-                TranscriptRowKind::UserPrompt | TranscriptRowKind::UserDiffComments => Some(false),
-                _ => None,
-            })
-            .unwrap_or(false)
+        let prompted = self.server_rows.iter().any(|row| {
+            matches!(
+                row.kind,
+                TranscriptRowKind::UserPrompt | TranscriptRowKind::UserDiffComments
+            )
+        });
+        prompted
+            && self
+                .server_rows
+                .iter()
+                .rev()
+                .find_map(|row| match row.kind {
+                    TranscriptRowKind::ContextReset => Some(true),
+                    TranscriptRowKind::UserPrompt | TranscriptRowKind::UserDiffComments => {
+                        Some(false)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(false)
     }
 }
 
@@ -382,8 +439,10 @@ mod tests {
         }
     }
 
-    /// Build the server's transcript rows for a sequence of events, the way the
-    /// daemon does, so tests need not hand-write `TranscriptRow` literals.
+    /// Build the server's transcript rows for a sequence of events, the way
+    /// the daemon does before shipping them over the WS transcript channel /
+    /// `?view=rows`. Lets a test feed realistic rows without hand-writing
+    /// `TranscriptRow` literals.
     fn server_rows(events: &[Event]) -> Vec<TranscriptRow> {
         let mut m = TranscriptModel::new();
         for (i, e) in events.iter().enumerate() {
@@ -418,8 +477,9 @@ mod tests {
         }
     }
 
-    /// Every control field the view renders comes off the frame verbatim, so a
-    /// mapping slip here is the whole class of bug this tier can introduce.
+    /// Every control field the view renders comes off the frame verbatim: the
+    /// TUI holds no derivation of its own any more, so a mapping slip here is
+    /// the whole class of bug this tier can still introduce.
     #[test]
     fn reduced_state_maps_every_rendered_control_field() {
         let mut t = AcpTranscript::new("s-1");
@@ -511,7 +571,9 @@ mod tests {
         assert_eq!(t.pending_elicitations[0].message, "Which one?");
     }
 
-    /// The banner shows only inside a running turn; compaction outranks thinking.
+    /// The banner only shows inside a running turn, so the phases that end
+    /// one never reach it; compaction outranks thinking because the adapter
+    /// goes silent for minutes there.
     #[test]
     fn status_banner_follows_the_server_phase() {
         let cases: [(&str, Option<ThinkingSignal>, bool, Option<&str>); 4] = [
@@ -545,8 +607,9 @@ mod tests {
     }
 
     /// The server omits cold fields this connection already holds (a ~30 KB
-    /// command list re-sent after every event dominated the socket). They arrive
-    /// as empty defaults, so adopting them blindly would blank the pickers.
+    /// command list re-sent after every event dominated the socket). They
+    /// arrive as empty defaults, so adopting them blindly would blank the
+    /// slash and mode pickers mid-session.
     #[test]
     fn omitted_cold_fields_keep_their_current_value() {
         let mut t = AcpTranscript::new("s-1");
@@ -629,8 +692,9 @@ mod tests {
         assert!(!t.turn_active);
     }
 
-    /// The shelf clears on the resolve POST's 204/404 rather than the broadcast
-    /// (#1821); without the optimistic filter the next frame repaints the card.
+    /// The shelf clears on the resolve POST's 204/404 rather than waiting for
+    /// the broadcast (#1821). Without the optimistic filter the next event's
+    /// reduced state would paint the answered card straight back.
     #[test]
     fn locally_resolved_card_stays_hidden_until_the_server_agrees() {
         let mut t = AcpTranscript::new("s-1");
@@ -672,8 +736,13 @@ mod tests {
         let reset = || Event::SessionContextReset {
             reason: "worker restarted".into(),
         };
-        let cases: [(&str, Vec<Event>, bool); 4] = [
+        let cases: [(&str, Vec<Event>, bool); 5] = [
             ("empty", vec![], false),
+            (
+                "reset before any prompt has nothing to re-prime",
+                vec![reset()],
+                false,
+            ),
             ("reset with nothing after", vec![prompt(), reset()], true),
             (
                 "prompt dismisses the notice",
@@ -724,8 +793,9 @@ mod tests {
 
     #[test]
     fn merge_server_rows_upserts_by_id_and_guards_rich_tool_start() {
-        // The reconcile is idempotent by id and must not let a sparse synth
-        // `tool_start` clobber a richer one already buffered (#1713/#2711).
+        // The snapshot / `?view=rows` reconcile is idempotent by id and must
+        // not let a sparse synth `tool_start` clobber a richer one already
+        // buffered (the #1713/#2711 seam, mirrored from web `mergeServerRows`).
         let mut t = AcpTranscript::new("s-1");
         let rich = TranscriptModel::new();
         let mut m = rich;

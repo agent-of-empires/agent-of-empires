@@ -291,6 +291,15 @@ impl Instance {
                 metadata.launch_id.clone(),
             ));
         }
+        if let (Some((reason, _)), Some(command)) = (
+            prepared.sandbox_context_reset.as_ref(),
+            prepared.command.as_mut(),
+        ) {
+            *command = format!(
+                "{}\n{command}",
+                crate::session::environment::native_context_notice_command(reason)
+            );
+        }
         self.capture_started_at = Some(SystemTime::now());
         session.create_with_size_env_and_container_env(
             &self.project_path,
@@ -300,6 +309,16 @@ impl Instance {
             &prepared.launch_env.pane,
             &prepared.launch_env.container,
         )?;
+        if let Some((_, transactions)) = prepared.sandbox_context_reset.as_ref() {
+            crate::migrations::v033_isolate_sandbox_content::acknowledge_context_reset(
+                profile,
+                &self.id,
+                crate::migrations::v033_isolate_sandbox_content::NativeContextView::Terminal,
+                self.lifecycle_generation,
+                transactions,
+                None,
+            )?;
+        }
         if let Some(metadata) = omp_capture_metadata.as_ref() {
             let pane_generation =
                 crate::tmux::env::get_env(session.name(), crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY);

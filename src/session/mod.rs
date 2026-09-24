@@ -1,6 +1,6 @@
 //! Session management module
 
-mod anchored_fs;
+pub(crate) mod anchored_fs;
 pub mod artifacts;
 pub mod attach_project;
 pub mod builder;
