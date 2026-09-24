@@ -1457,6 +1457,60 @@ mod tests {
         }
     }
 
+    /// Claude reads `$CLAUDE_CONFIG_DIR/.claude.json` whenever the variable is
+    /// set, so a host launch into the default store must leave it unset (#4119).
+    #[test]
+    #[serial_test::serial]
+    fn host_claude_exports_its_store_only_when_it_is_not_the_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let default = temp.path().join(".claude");
+        let custom = temp.path().join("custom-claude");
+        let sid = "11111111-1111-4111-8111-111111111111";
+        for (exported, expected) in [
+            (None, None),
+            (Some(&default), Some(&default)),
+            (Some(&custom), Some(&custom)),
+        ] {
+            let _env = match exported {
+                Some(dir) => EnvGuard::set(&[("CLAUDE_CONFIG_DIR", dir)]),
+                None => EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]),
+            };
+            let mut inst = Instance::new("claude-host-store", "/tmp");
+            let routed = |inst: &Instance| {
+                let execution = inst
+                    .resolve_native_execution(inst.conversation_target())
+                    .unwrap();
+                let routed = execution
+                    .routing
+                    .iter()
+                    .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                    .map(|(_, value)| value.clone().map(std::path::PathBuf::from))
+                    .expect("Claude store is always routed");
+                (routed, execution)
+            };
+            let (fresh, execution) = routed(&inst);
+            assert_eq!(fresh.as_ref(), expected, "exported={exported:?}");
+            let (command, _, _, _) = inst.build_launch_command(Some(&execution)).unwrap();
+            let command = command.unwrap();
+            assert_eq!(
+                command.contains("unset CLAUDE_CONFIG_DIR"),
+                expected.is_none(),
+                "{command}"
+            );
+
+            // Resuming a conversation recorded in the default store keeps it unset.
+            inst.resume_binding = Some(inst.asserted_resume_binding(sid, None).unwrap());
+            inst.resume_intent = ResumeIntent::Use(sid.into());
+            assert_eq!(routed(&inst).0.as_ref(), expected, "exported={exported:?}");
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn sandboxed_assertion_keeps_the_native_container_store() {

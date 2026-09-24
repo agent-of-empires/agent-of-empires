@@ -1216,7 +1216,12 @@ impl Instance {
                     .or_else(|| declared.clone())
                     .or_else(|| value("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()).map(PathBuf::from))
                     .unwrap_or_else(|| home.join(".claude")));
-                routing.push(("CLAUDE_CONFIG_DIR".into(), Some(root.to_str().context("native store is not UTF-8")?.to_owned())));
+                let pinned = root.to_str().context("native store is not UTF-8")?.to_owned();
+                // Unset rather than export the default store, which Claude reads with `~/.claude.json` (#4119).
+                let export = inputs.container.is_some()
+                    || value("CLAUDE_CONFIG_DIR").is_some_and(|value| !value.is_empty())
+                    || !crate::session::capture::is_default_claude_store(&root, &home);
+                routing.push(("CLAUDE_CONFIG_DIR".into(), export.then_some(pinned)));
                 vec![root]
             }
             "codex" => {
