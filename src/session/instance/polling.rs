@@ -715,6 +715,14 @@ impl Instance {
                 std::slice::from_mut(self),
                 &file_watch,
             );
+            let retry_pi_path = crate::session::sync::pending_poller_observation(self)
+                .is_some_and(|observation| self.observation_is_current_pi_path(&observation));
+            if retry_pi_path {
+                let _ = crate::session::sync::drain_and_persist_session_ids_lifecycle_locked(
+                    std::slice::from_mut(self),
+                    &file_watch,
+                );
+            }
         }
         self.session_id_poller = None;
     }

@@ -267,6 +267,39 @@ impl Instance {
         })
     }
 
+    pub(crate) fn observation_is_current_pi_path(
+        &self,
+        observation: &crate::session::poller::SessionIdObservation,
+    ) -> bool {
+        let crate::session::poller::SessionIdGuard::InstanceSidecar {
+            transcript: Some(path),
+        } = &observation.guard
+        else {
+            return false;
+        };
+        pi_transcript_names(path, &observation.sid)
+            && self.agent_session_id.as_deref() == Some(observation.sid.as_str())
+            && self.active_execution.as_ref() == observation.execution.as_ref()
+            && self
+                .agent_session_binding
+                .as_ref()
+                .map_or(observation.source.is_none(), |binding| {
+                    binding.session_id == observation.sid
+                        && binding.execution.as_ref() == observation.source.as_ref()
+                })
+            && !self.is_capture_excluded(&observation.sid, observation.source.as_ref())
+            && match &self.resume_intent {
+                ResumeIntent::Fork { .. } | ResumeIntent::Cleared => false,
+                ResumeIntent::Use(pinned) => {
+                    pinned == &observation.sid
+                        && self.resume_binding.as_ref().is_none_or(|target| {
+                            target.execution.as_ref() == observation.source.as_ref()
+                        })
+                }
+                ResumeIntent::Default => true,
+            }
+    }
+
     /// Persist the transcript path a poller observation carried. False only while the write keeps
     /// failing, so the caller holds the observation for a retry.
     pub(crate) fn persist_observed_pi_transcript(
@@ -318,32 +351,13 @@ impl Instance {
         match storage.update(|instances, _| {
             #[cfg(test)]
             anyhow::ensure!(
-                !FAIL_PI_PATH_WRITES.with(std::cell::Cell::get),
+                !FAIL_PI_PATH_WRITES.with(std::cell::Cell::get)
+                    && !FAIL_NEXT_PI_PATH_WRITE.with(|fail| fail.replace(false)),
                 "injected transcript path write failure"
             );
-            let row = instances.iter_mut().find(|row| {
-                row.id == self.id
-                    && row.agent_session_id.as_deref() == Some(observation.sid.as_str())
-                    && row.active_execution.as_ref() == observation.execution.as_ref()
-                    && row.agent_session_binding.as_ref().map_or(
-                        observation.source.is_none(),
-                        |binding| {
-                            binding.session_id == observation.sid
-                                && binding.execution.as_ref() == observation.source.as_ref()
-                        },
-                    )
-                    && !row.is_capture_excluded(&observation.sid, observation.source.as_ref())
-                    && match &row.resume_intent {
-                        ResumeIntent::Fork { .. } | ResumeIntent::Cleared => false,
-                        ResumeIntent::Use(pinned) => {
-                            pinned == &observation.sid
-                                && row.resume_binding.as_ref().is_none_or(|target| {
-                                    target.execution.as_ref() == observation.source.as_ref()
-                                })
-                        }
-                        ResumeIntent::Default => true,
-                    }
-            });
+            let row = instances
+                .iter_mut()
+                .find(|row| row.id == self.id && row.observation_is_current_pi_path(observation));
             Ok(row
                 .map(|row| row.pi_session_path = Some(path.to_string()))
                 .is_some())
@@ -385,6 +399,11 @@ impl Instance {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_pi_path_write_for_test(&self) {
+        FAIL_NEXT_PI_PATH_WRITE.with(|fail| fail.set(true));
+    }
+
     /// A host Pi launch that can carry selectors may pin `--session-id`.
     pub(super) fn pi_session_id_pinnable(&self) -> bool {
         self.is_pi()
@@ -398,6 +417,8 @@ impl Instance {
 thread_local! {
     /// Fails this thread's transcript-path writes while set.
     pub(crate) static FAIL_PI_PATH_WRITES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_PI_PATH_WRITE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
