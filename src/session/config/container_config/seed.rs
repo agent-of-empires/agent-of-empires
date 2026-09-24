@@ -381,6 +381,13 @@ fn canonical_source(
     let canonical = match fs::canonicalize(path) {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // A linked or looped carried file is not carried, like a linked directory.
+        Err(error)
+            if matches!(access.exception, Exception::Carried { .. })
+                && matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) =>
+        {
+            return Ok(None);
+        }
         Err(error) if matches!(access.exception, Exception::Carried { .. }) => {
             return Err(error).context("resolving carried native state");
         }

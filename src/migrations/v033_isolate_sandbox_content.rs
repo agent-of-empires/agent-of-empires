@@ -3408,7 +3408,11 @@ mod tests {
             ("kimi", ".kimi-code"),
             ("prime-agent", ".prime/agent"),
         ] {
-            for internal in [false, true] {
+            // (internal link, Kimi index is a symlink loop)
+            for (internal, index_loop) in [(false, false), (true, false), (false, true)] {
+                if index_loop && tool != "kimi" {
+                    continue;
+                }
                 let temporary = tempfile::tempdir().unwrap();
                 let _environment =
                     crate::session::test_support::isolate_app_dir_at(temporary.path());
@@ -3447,8 +3451,14 @@ mod tests {
                 };
                 fs::create_dir_all(foreign.join("own")).unwrap();
                 fs::write(foreign.join("own/session.jsonl"), b"FOREIGN_HISTORY").unwrap();
-                symlink(&foreign, root.path.join(&linked)).unwrap();
-                if tool == "kimi" {
+                if index_loop {
+                    fs::create_dir_all(root.path.join("sessions/own")).unwrap();
+                    fs::write(root.path.join("sessions/own/session.jsonl"), b"OWN").unwrap();
+                    symlink("session_index.jsonl", root.path.join("session_index.jsonl")).unwrap();
+                } else {
+                    symlink(&foreign, root.path.join(&linked)).unwrap();
+                }
+                if tool == "kimi" && !index_loop {
                     fs::write(
                         root.path.join("session_index.jsonl"),
                         format!(
@@ -3481,7 +3491,7 @@ mod tests {
                         &|_| Ok(Vec::new()),
                     )
                     .unwrap(),
-                    "{tool} internal={internal}"
+                    "{tool} internal={internal} index_loop={index_loop}"
                 );
                 assert!(
                     !root.path.join(&linked).exists(),
@@ -3494,7 +3504,12 @@ mod tests {
                     .unwrap()
                     .path()
                     .join("0/original");
-                assert!(fs::symlink_metadata(recovery.join(&linked))
+                let retained = if index_loop {
+                    PathBuf::from("session_index.jsonl")
+                } else {
+                    linked.clone()
+                };
+                assert!(fs::symlink_metadata(recovery.join(retained))
                     .unwrap()
                     .file_type()
                     .is_symlink());
