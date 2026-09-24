@@ -1102,6 +1102,9 @@ pub async fn start_session(
             return session_not_found();
         };
 
+        if let Err(blocked) = inst.ensure_startable() {
+            return crate::server::api::start_blocked_response(blocked);
+        }
         let structured = inst.is_structured();
         (
             inst.source_profile.clone(),
@@ -1232,14 +1235,18 @@ pub async fn start_session(
         }
         Ok(Err(boxed)) => {
             let (started, e) = *boxed;
+            let blocked = e.downcast_ref::<crate::session::StartBlocked>().copied();
             let msg = e.to_string();
             tracing::warn!(target: "http.api.sessions", "start_session restart failed for {id}: {msg}");
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                if apply_post_restart_sync(inst, &sync_base, &started) {
+                if apply_post_restart_sync(inst, &sync_base, &started) && blocked.is_none() {
                     inst.status = Status::Error;
                     inst.last_error = Some(msg.clone());
                 }
+            }
+            if let Some(blocked) = blocked {
+                return crate::server::api::start_blocked_response(blocked);
             }
             api_error(StatusCode::INTERNAL_SERVER_ERROR, "restart_failed", msg)
         }

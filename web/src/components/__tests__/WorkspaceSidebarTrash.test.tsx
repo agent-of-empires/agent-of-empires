@@ -94,6 +94,43 @@ describe("WorkspaceSidebar Trash control", () => {
     expect(props.onDeleteSession).toHaveBeenCalledWith(["s1"]);
   });
 
+  // #4116: right-clicking a trashed row offers the same actions as its buttons.
+  it("right-click on a trashed row opens a menu with Open, Restore, and Delete permanently", () => {
+    const props = withTrash();
+    const openMenu = () => {
+      click("sidebar-trash-toggle");
+      fireEvent.contextMenu(screen.getByTestId("sidebar-trash-row"));
+    };
+
+    openMenu();
+    expect(
+      Array.from(screen.getByTestId("sidebar-trash-context-menu").querySelectorAll("button")).map((b) => b.textContent),
+    ).toEqual(["Open", "Restore", "Delete permanently"]);
+    // A press inside the portaled menu must not dismiss the panel first.
+    fireEvent.mouseDown(screen.getByTestId("sidebar-trash-context-menu-restore"));
+    click("sidebar-trash-context-menu-restore");
+    expect(props.onRestoreSession).toHaveBeenCalledWith(["s1"]);
+    expect(query("sidebar-trash-context-menu")).toBeNull();
+    expect(query("sidebar-trash-menu")).not.toBeNull();
+
+    fireEvent.contextMenu(screen.getByTestId("sidebar-trash-row"));
+    click("sidebar-trash-context-menu-delete");
+    expect(props.onDeleteSession).toHaveBeenCalledWith(["s1"]);
+    expect(query("sidebar-trash-menu")).toBeNull();
+
+    openMenu();
+    click("sidebar-trash-context-menu-open");
+    expect(props.onSelect).toHaveBeenCalledWith("trashed-ws", "s1");
+    expect(query("sidebar-trash-menu")).toBeNull();
+  });
+
+  it("offers only Open in the trashed-row menu when read-only", () => {
+    withTrash({ readOnly: true });
+    click("sidebar-trash-toggle");
+    fireEvent.contextMenu(screen.getByTestId("sidebar-trash-row"));
+    expect(screen.getByTestId("sidebar-trash-context-menu").textContent).toBe("Open");
+  });
+
   it("orders rows newest-trashed first", () => {
     const older = workspace("older-ws", [{ id: "o1", trashed_at: TRASHED }]);
     const newer = workspace("newer-ws", [{ id: "n1", trashed_at: "2026-06-01T00:00:00Z" }]);
@@ -200,5 +237,14 @@ describe("WorkspaceSidebar row actions on a group slice (#4019)", () => {
     expect(onStartSession).toHaveBeenCalledWith("a1");
     act("beta", "delete");
     expect(props.onDeleteSession).toHaveBeenCalledWith(["b1", "b2"]);
+  });
+
+  // #4116: an archived session must be unarchived before it can start.
+  it("offers Unarchive but not Start on a stopped archived row", () => {
+    renderSidebar([workspace("archived-ws", [{ id: "a1", archived_at: TRASHED }])], { onStartSession: vi.fn() });
+    fireEvent.click(screen.getByTestId("sidebar-sunk-toggle"));
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(query("sidebar-context-menu-start")).toBeNull();
+    expect(screen.getByTestId("sidebar-context-menu-archive").textContent).toBe("Unarchive");
   });
 });

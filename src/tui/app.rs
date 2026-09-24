@@ -2628,6 +2628,9 @@ impl App {
             needs_restart,
             "attach_session: restart decision"
         );
+        if needs_restart && self.home.refuse_start_if_shelved(session_id) {
+            return Ok(());
+        }
         if needs_restart {
             // Warn once when the agent can't take the sandbox's custom instruction.
             if instance.is_sandboxed() {

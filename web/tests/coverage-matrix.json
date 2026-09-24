@@ -1380,6 +1380,29 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/TrashMenu.tsx"]
     },
     {
+      "id": "sidebar.trash-row-context-menu",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx"],
+      "components": ["web/src/components/sidebar/TrashMenu.tsx"]
+    },
+    {
+      "id": "session.start-refused-when-archived-or-trashed",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/WorkspaceSidebarTrash.test.tsx",
+        "src/hooks/useAcpSession.test.ts",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/sidebar/rowModel.ts",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/lib/api.ts",
+        "web/src/App.tsx"
+      ]
+    },
+    {
       "id": "sidebar.trash-order",
       "kind": "vitest",
       "risk": "low",

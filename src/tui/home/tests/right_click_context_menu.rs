@@ -145,6 +145,43 @@ fn right_click_unarchive_action_restores_session() {
     );
 }
 
+/// A trashed row's menu offers Restore (#4116) instead of the live-row triage items.
+#[test]
+#[serial]
+fn right_click_trashed_row_offers_restore() {
+    let mut env = create_test_env_with_sessions(2);
+    setup_inner(&mut env);
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instance_at(0).id.clone();
+    env.view.trash_session_by_id(&id);
+    assert!(env.view.get_instance(&id).unwrap().is_trashed());
+
+    let idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|it| matches!(it, Item::Session { id: i, .. } if i == &id))
+        .expect("trashed row must be visible");
+    render_geometry(&mut env.view);
+    let row = shelf_row_for_idx(&env.view, idx);
+    assert!(env.view.handle_right_click(5, row));
+    let menu = env.view.context_menu.as_ref().expect("menu open");
+    assert_eq!(
+        menu.items_for_test(),
+        &[
+            (ContextMenuAction::Restore, "Restore"),
+            (ContextMenuAction::Delete, "Delete"),
+        ]
+    );
+
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(env.view.context_menu.is_none());
+    assert!(
+        !env.view.get_instance(&id).unwrap().is_trashed(),
+        "context-menu Restore must restore the session"
+    );
+}
+
 #[test]
 #[serial]
 fn right_click_fork_requires_provenance_not_a_tool_label() {

@@ -85,8 +85,8 @@ pub use instance::{
     EnsureReadyError, EnsureReadyOutcome, ExecutionBinding, ExecutionLocation, Instance,
     LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
     PendingInitialTurn, PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket,
-    StartOutcome, Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
-    SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
+    StartBlocked, StartOutcome, Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo,
+    WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
 };
 #[cfg(test)]
 pub(crate) use move_journal::{

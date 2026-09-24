@@ -5,7 +5,7 @@ use clap::Args;
 
 use crate::acp::client::http::PromptDispositionWire;
 use crate::acp::client::{require_daemon, HttpClient};
-use crate::session::{EnsureReadyError, EnsureReadyOutcome, Storage};
+use crate::session::{EnsureReadyOutcome, Storage};
 
 #[derive(Args)]
 pub struct SendArgs {
@@ -54,13 +54,7 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
                     bail!("Resume failed for sid {sid}; preserved for explicit retry")
                 }
                 Ok(EnsureReadyOutcome::AlreadyAlive) => {}
-                Err(EnsureReadyError::Transient(status)) => {
-                    bail!("Session is mid-lifecycle ({status:?}); cannot send right now")
-                }
-                Err(EnsureReadyError::StructuredView) => {
-                    bail!("Acp-mode sessions have no tmux pane; send is not supported")
-                }
-                Err(EnsureReadyError::Tmux(e)) => bail!("{}", e),
+                Err(e) => bail!("{e}"),
             }
         }
     }
@@ -120,4 +114,46 @@ async fn send_structured(
     };
     println!("{verb} message to '{session_title}'");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::Instance;
+    use serial_test::serial;
+
+    /// #4116: auto-revive refuses to start an archived or trashed session.
+    #[tokio::test]
+    #[serial]
+    async fn send_does_not_revive_archived_or_trashed_session() {
+        let dismissals: [(fn(&mut Instance), &str); 2] = [
+            (Instance::archive, "session is archived; unarchive it first"),
+            (Instance::trash, "session is in trash; restore it first"),
+        ];
+        for (dismiss, message) in dismissals {
+            let temp = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let profile = "send-blocked";
+            let mut inst = Instance::new("dismissed", "/tmp/x");
+            dismiss(&mut inst);
+            let id = inst.id.clone();
+            Storage::new_unwatched(profile)
+                .unwrap()
+                .update(|rows, _| {
+                    *rows = vec![inst.clone()];
+                    Ok(())
+                })
+                .unwrap();
+
+            let args = SendArgs {
+                identifier: id.clone(),
+                message: "hello".to_string(),
+                no_revive: false,
+            };
+            let err = run(profile, args).await.unwrap_err();
+            assert_eq!(err.to_string(), message);
+            let tmux = crate::tmux::Session::new(&id, &inst.title).unwrap();
+            assert!(!tmux.exists());
+        }
+    }
 }

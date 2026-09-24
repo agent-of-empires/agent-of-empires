@@ -5,7 +5,9 @@ import type { Workspace } from "../../lib/types";
 import { isSessionActive } from "../../lib/session";
 import { useIdleDecayWindowMs } from "../../lib/idleDecay";
 import { workspaceTrashedAtMs } from "../../lib/sidebarSort";
+import { ContextMenu, MenuItem } from "../ContextMenu";
 import { EmptyTrashConfirm } from "../EmptyTrashConfirm";
+import { useContextMenu } from "../useContextMenu";
 import { useOutsideDismiss } from "../useOutsideDismiss";
 import type { RowActivate } from "./types";
 
@@ -44,8 +46,32 @@ export function TrashMenu({
     setPanelPosition({ left, bottom: Math.max(gutter, window.innerHeight - rect.top + gutter), width });
   }, []);
 
-  // The Empty Trash confirm portals outside both refs and owns dismissal while it is up.
-  useOutsideDismiss(open && !confirmEmpty, [ref, panelRef], () => setOpen(false));
+  const idleDecayWindowMs = useIdleDecayWindowMs();
+  const { menu, menuRef, openMenu, closeMenu } = useContextMenu<{ x: number; y: number; ws: Workspace }>();
+
+  // The Empty Trash confirm portals outside both refs and owns dismissal while it is up; the
+  // row menu also portals, so it counts as inside.
+  useOutsideDismiss(open && !confirmEmpty, [ref, panelRef, menuRef], () => setOpen(false));
+
+  const sessionIds = (ws: Workspace) => ws.sessions.map((s) => s.id);
+  const openWorkspace = (ws: Workspace) => {
+    setOpen(false);
+    const target = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs)) ?? ws.sessions[0];
+    onOpen(ws.id, { metaKey: false, ctrlKey: false, shiftKey: false }, target?.id ?? null);
+  };
+  const restoreWorkspace = (ws: Workspace) => {
+    const ids = sessionIds(ws);
+    if (ids.length > 0) onRestore(ids);
+  };
+  const deleteWorkspace = (ws: Workspace) => {
+    setOpen(false);
+    onDelete(sessionIds(ws));
+  };
+  const fromMenu = (run: (ws: Workspace) => void) => () => {
+    if (!menu) return;
+    closeMenu();
+    run(menu.ws);
+  };
 
   useLayoutEffect(() => {
     if (!open) return;
@@ -140,15 +166,10 @@ export function TrashMenu({
                       key={ws.id}
                       ws={ws}
                       readOnly={readOnly}
-                      onOpen={(sessionId) => {
-                        setOpen(false);
-                        onOpen(ws.id, { metaKey: false, ctrlKey: false, shiftKey: false }, sessionId);
-                      }}
-                      onRestore={onRestore}
-                      onDelete={() => {
-                        setOpen(false);
-                        onDelete(ws.sessions.map((s) => s.id));
-                      }}
+                      onOpen={() => openWorkspace(ws)}
+                      onRestore={() => restoreWorkspace(ws)}
+                      onDelete={() => deleteWorkspace(ws)}
+                      onContextMenu={(x, y) => openMenu({ x, y, ws })}
                     />
                   ))}
               </div>
@@ -156,6 +177,32 @@ export function TrashMenu({
           </div>,
           document.body,
         )}
+      {open && menu && (
+        <ContextMenu menu={menu} menuRef={menuRef} testId="sidebar-trash-context-menu">
+          <MenuItem onClick={fromMenu(openWorkspace)} testId="sidebar-trash-context-menu-open">
+            Open
+          </MenuItem>
+          {!readOnly && (
+            <>
+              <MenuItem
+                onClick={fromMenu(restoreWorkspace)}
+                testId="sidebar-trash-context-menu-restore"
+                icon={<RotateCcw className="h-3.5 w-3.5 shrink-0" />}
+              >
+                Restore
+              </MenuItem>
+              <MenuItem
+                onClick={fromMenu(deleteWorkspace)}
+                testId="sidebar-trash-context-menu-delete"
+                icon={<X className="h-3.5 w-3.5 shrink-0" />}
+                className="text-status-error hover:bg-status-error/10"
+              >
+                Delete permanently
+              </MenuItem>
+            </>
+          )}
+        </ContextMenu>
+      )}
       {confirmEmpty &&
         createPortal(
           <EmptyTrashConfirm
@@ -180,18 +227,23 @@ function TrashRow({
   onOpen,
   onRestore,
   onDelete,
+  onContextMenu,
 }: {
   ws: Workspace;
   readOnly?: boolean;
-  onOpen: (sessionId: string | null) => void;
-  onRestore: (sessionIds: string[]) => void;
+  onOpen: () => void;
+  onRestore: () => void;
   onDelete: () => void;
+  onContextMenu: (x: number, y: number) => void;
 }) {
-  const idleDecayWindowMs = useIdleDecayWindowMs();
   const sessionCount = ws.sessions.length;
   return (
     <div
       data-testid="sidebar-trash-row"
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onContextMenu(e.clientX, e.clientY);
+      }}
       className="rounded-md border border-surface-700/30 bg-surface-900/20 px-3 py-2.5 text-[13px] text-text-secondary"
     >
       <div className="min-w-0">
@@ -213,10 +265,7 @@ function TrashRow({
       <div className="mt-2 flex flex-wrap items-center gap-2">
         <button
           type="button"
-          onClick={() => {
-            const target = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs)) ?? ws.sessions[0];
-            onOpen(target?.id ?? null);
-          }}
+          onClick={onOpen}
           data-testid="sidebar-trash-open"
           className={`${ACTION} border-surface-700/50 text-text-secondary hover:border-surface-600 hover:bg-surface-700/40 hover:text-text-primary`}
         >
@@ -226,10 +275,7 @@ function TrashRow({
           <>
             <button
               type="button"
-              onClick={() => {
-                const ids = ws.sessions.map((s) => s.id);
-                if (ids.length > 0) onRestore(ids);
-              }}
+              onClick={onRestore}
               data-testid="sidebar-trash-restore"
               title="Restore"
               aria-label="Restore"

@@ -81,6 +81,9 @@ pub async fn acp_prompt(
     {
         PromptTouch::Touched { idle_dormant } => idle_dormant,
         PromptTouch::RevivalRefused => return no_revive_refused(),
+        PromptTouch::Blocked(blocked) => {
+            return crate::server::api::start_blocked_response(blocked)
+        }
     };
     // Validated before publishing or resuming, so a rejected prompt leaves no
     // trace in the transcript and spawns no worker.
@@ -230,11 +233,15 @@ pub async fn acp_prompt_diff_comments(
     else {
         return session_not_found();
     };
-    let woke_idle_dormant = state
+    let woke_idle_dormant = match state
         .session_service
         .touch_and_wake_on_prompt(&id, false)
         .await
-        .idle_dormant();
+        .idle_dormant()
+    {
+        Ok(woke) => woke,
+        Err(blocked) => return crate::server::api::start_blocked_response(blocked),
+    };
     let dispatch = state
         .session_service
         .prompt_dispatch_under_submission(&id, woke_idle_dormant)

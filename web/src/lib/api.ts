@@ -1598,8 +1598,21 @@ export function stopSession(id: string): Promise<SessionResponse | null> {
   return sessionUpdate(id, "stop", jsonInit("POST"));
 }
 
-export function startSession(id: string): Promise<SessionResponse | null> {
-  return sessionUpdate(id, "start", jsonInit("POST"));
+export type StartSessionResult =
+  | { ok: true; session: SessionResponse }
+  | { ok: false; refused: boolean; message?: string };
+
+/** `refused` marks a 409 for an archived or trashed session, which the server left untouched. */
+export async function startSession(id: string): Promise<StartSessionResult> {
+  const reply = await send(`/api/sessions/${id}/start`, jsonInit("POST")).catch(() => null);
+  if (reply?.ok && reply.payload) return { ok: true, session: reply.payload as unknown as SessionResponse };
+  return {
+    ok: false,
+    refused:
+      reply?.status === 409 &&
+      ["session_archived", "session_trashed"].includes(stringField(reply.payload, "error") ?? ""),
+    message: stringField(reply?.payload, "message"),
+  };
 }
 
 /** `null` unsnoozes; otherwise 1..=43200 minutes, validated server-side. */

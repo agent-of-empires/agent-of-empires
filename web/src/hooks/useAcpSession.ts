@@ -18,7 +18,6 @@ import {
   listServerQueue,
   removeServerQueuedPrompt,
   reportAcpInteraction,
-  setSessionArchive,
   setSessionSnooze,
 } from "../lib/api";
 import { classifyResolveResponse, reducer, type Action } from "./acpSession/reducer";
@@ -261,18 +260,18 @@ export function useAcpSession(
   const sendPrompt = useCallback(
     async (text: string, attachments?: PromptAttachmentInput[]) => {
       if (!sessionId) return;
-      // The reconciler skips archived and snoozed sessions, so wake them before sending.
-      if (archivedAtRef.current || snoozedUntilRef.current) {
-        const woke = archivedAtRef.current
-          ? await setSessionArchive(sessionId, false)
-          : await setSessionSnooze(sessionId, null);
-        if (!woke) {
-          dispatch({
-            kind: "error",
-            message: "Could not wake this session. Please retry, or unarchive / unsnooze from the sidebar.",
-          });
-          return;
-        }
+      // An archived session never starts on a prompt; the daemon refuses it too.
+      if (archivedAtRef.current) {
+        dispatch({ kind: "error", message: "This session is archived; unarchive it first." });
+        return;
+      }
+      // The reconciler skips snoozed sessions, so wake them before sending.
+      if (snoozedUntilRef.current && !(await setSessionSnooze(sessionId, null))) {
+        dispatch({
+          kind: "error",
+          message: "Could not wake this session. Please retry, or unsnooze from the sidebar.",
+        });
+        return;
       }
       const result = await dispatchPromptNow(text, attachments);
       if (result.kind === "queued") {

@@ -539,7 +539,14 @@ async fn sessions_turn_send(
             .session_service
             .touch_and_wake_on_prompt(&req.session_id, false)
             .await
-            .idle_dormant();
+            .idle_dormant()
+            .map_err(|blocked| {
+                DispatchError::with_kind(
+                    codes::FAILED_PRECONDITION,
+                    blocked.code(),
+                    blocked.to_string(),
+                )
+            })?;
         let dispatch = deps
             .session_service
             .prompt_dispatch_under_submission(&req.session_id, woke_idle_dormant)
@@ -1039,7 +1046,6 @@ mod tests {
         type Park = (&'static str, fn(&mut Instance));
         let parks: Vec<Park> = vec![
             ("idle-dormant", |i| i.mark_idle_dormant()),
-            ("archived", |i| i.archived_at = Some(chrono::Utc::now())),
             ("snoozed", |i| {
                 i.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1))
             }),
@@ -1076,6 +1082,40 @@ mod tests {
                 "{label}: the turn clears the park"
             );
             assert!(inst.last_accessed_at.is_some(), "{label}");
+        }
+    }
+
+    /// #4116: a prompt never wakes an archived or trashed session.
+    #[tokio::test]
+    async fn turn_send_refuses_an_archived_or_trashed_session() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let dismissals: [(fn(&mut Instance), &str); 2] = [
+            (Instance::archive, "session_archived"),
+            (Instance::trash, "session_trashed"),
+        ];
+        for (dismiss, want) in dismissals {
+            let mut inst = Instance::new("dismissed-owned", "/tmp/aoe-4116-plugin");
+            inst.id = "sess-4116".to_string();
+            inst.view = crate::session::View::Structured;
+            inst.created_by_plugin = Some("cron".to_string());
+            dismiss(&mut inst);
+            let (deps, state, _dir) = test_deps_with_state(vec![inst.clone()]);
+
+            let err = dispatch(
+                &deps,
+                &ctx_with(&["session.prompt"]),
+                "sessions.turn.send",
+                &serde_json::json!({ "session_id": "sess-4116", "text": "wake up" }),
+            )
+            .await
+            .expect_err("a dismissed session must not be woken");
+            assert_eq!(kind(&err), want);
+            let instances = state.instances.read().await;
+            let after = &instances[0];
+            assert_eq!(after.archived_at, inst.archived_at, "{want}");
+            assert_eq!(after.trashed_at, inst.trashed_at, "{want}");
+            assert_eq!(after.last_accessed_at, inst.last_accessed_at, "{want}");
+            assert!(!state.acp_supervisor.is_running("sess-4116").await);
         }
     }
 }

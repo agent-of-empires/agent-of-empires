@@ -89,6 +89,11 @@ pub(crate) fn api_error(status: StatusCode, code: &str, message: impl Into<Strin
         .into_response()
 }
 
+/// 409 for a start or resume refused because the session is archived or trashed.
+pub(crate) fn start_blocked_response(blocked: crate::session::StartBlocked) -> Response {
+    api_error(StatusCode::CONFLICT, blocked.code(), blocked.to_string())
+}
+
 pub(super) fn session_not_found() -> Response {
     api_error(StatusCode::NOT_FOUND, "not_found", "Session not found")
 }

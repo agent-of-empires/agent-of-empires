@@ -24,6 +24,7 @@ enum SendKeysError {
     ResumeFailed(String),
     Transient(Status),
     StructuredView,
+    Blocked(crate::session::StartBlocked),
     Tmux(anyhow::Error),
 }
 
@@ -86,6 +87,7 @@ pub async fn send_message(
                     let mapped = match e {
                         EnsureReadyError::Transient(s) => SendKeysError::Transient(s),
                         EnsureReadyError::StructuredView => SendKeysError::StructuredView,
+                        EnsureReadyError::Blocked(b) => SendKeysError::Blocked(b),
                         EnsureReadyError::Tmux(e) => SendKeysError::Tmux(e),
                     };
                     // Tagged AlreadyAlive because ensure_pane_ready did not
@@ -223,6 +225,9 @@ pub async fn send_message(
                     Json(serde_json::json!({"error": "acp_mode_unsupported"})),
                 )
                     .into_response(),
+                SendKeysError::Blocked(blocked) => {
+                    crate::server::api::start_blocked_response(blocked)
+                }
                 SendKeysError::Tmux(e) => {
                     tracing::error!(target: "http.api.sessions", "send_message: tmux error for {id}: {e}");
                     let msg = e.to_string();

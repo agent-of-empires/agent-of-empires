@@ -2706,6 +2706,62 @@ async fn send_message_refreshes_instance_after_instance_lock() {
         StatusCode::NOT_FOUND
     );
 }
+/// #4116: the web start, attach-ensure and send-revive endpoints refuse to launch an archived or
+/// trashed session, and leave its status alone.
+#[tokio::test]
+async fn start_paths_refuse_archived_and_trashed_sessions() {
+    use axum::body::to_bytes;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let dismissals: [(fn(&mut Instance), &str, &str); 2] = [
+        (
+            Instance::archive,
+            "session_archived",
+            "session is archived; unarchive it first",
+        ),
+        (
+            Instance::trash,
+            "session_trashed",
+            "session is in trash; restore it first",
+        ),
+    ];
+    for (dismiss, code, message) in dismissals {
+        for which in ["start", "ensure", "send"] {
+            let mut inst = make_test_instance();
+            dismiss(&mut inst);
+            inst.status = Status::Stopped;
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let response = match which {
+                "start" => start_session(State(state.clone()), Path(id.clone()))
+                    .await
+                    .into_response(),
+                "ensure" => ensure_session(State(state.clone()), Path(id.clone()))
+                    .await
+                    .into_response(),
+                _ => send_message(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    Ok(Json(SendMessageRequest {
+                        message: "hello".into(),
+                        revive: true,
+                    })),
+                )
+                .await
+                .into_response(),
+            };
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{which} {code}");
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"], code, "{which}");
+            assert_eq!(body["message"], message, "{which}");
+            let after = &state.instances.read().await[0];
+            assert_eq!(after.status, Status::Stopped, "{which} {code}");
+            assert!(!after.tmux_session().unwrap().exists(), "{which} {code}");
+        }
+    }
+}
+
 // Regression for a path-traversal vulnerability in the first cut of
 // `/api/sessions/{id}/diff/file?path=...`, where any authenticated user could
 // pass `?path=/etc/passwd` and have the server dump it in a diff response.
