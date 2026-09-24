@@ -176,12 +176,33 @@ pub(crate) fn prepare_acp_context(
                 && reset.structured.pending
                 && reset.structured.generation.is_none()
         });
-        if matches!(usage, AcpContextUse::Attach) && pending {
+        let carried = || {
+            instance
+                .sandbox_content_resets
+                .iter()
+                .filter(|reset| reset.tool == instance.tool && !reset.structured.pending)
+        };
+        let foreign_adapter = carried().next().is_some()
+            && !carried().any(|reset| agent == Some(reset.agent.as_str()));
+        let unproven_old_id = foreign_adapter
+            && carried().any(|reset| {
+                instance
+                    .acp_session_id
+                    .as_ref()
+                    .into_iter()
+                    .chain(instance.fork_pending.as_ref())
+                    .any(|id| reset.retired_structured.contains(id))
+                    || (reset.retired_import && instance.import_pending == Some(true))
+            });
+        if matches!(usage, AcpContextUse::Attach) && (pending || unproven_old_id) {
             bail!("runner predates its sandbox content reset; a fresh launch is required");
         }
         let notice =
             claim_context_reset(instance, agent, NativeContextView::Structured, generation);
         let (stored_session_id, fork_from, seed_history_replay) = match continuation {
+            crate::acp::supervisor::SandboxContinuation::Persisted if unproven_old_id => {
+                (None, None, false)
+            }
             crate::acp::supervisor::SandboxContinuation::Persisted => (
                 instance.acp_session_id.clone(),
                 instance.fork_pending.clone(),
@@ -313,6 +334,8 @@ struct RootTransition {
     original: Option<Identity>,
     staged: Option<Identity>,
     published: Option<Identity>,
+    #[serde(default)]
+    carried_tools: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,10 +358,18 @@ struct Receipt {
     retired_tools: BTreeMap<String, String>,
 }
 
+pub(crate) struct ResumeCandidate {
+    pub(crate) tool: String,
+    pub(crate) agent: String,
+    pub(crate) id: String,
+}
+
 /// Only a stopped, journalled migration constructs a stage-seeding capability.
 pub(crate) struct ContentSeed<'a> {
     source: &'a Path,
     stopped_original: bool,
+    resumes: &'a [ResumeCandidate],
+    container_workdir: &'a str,
 }
 
 impl ContentSeed<'_> {
@@ -347,6 +378,12 @@ impl ContentSeed<'_> {
     }
     pub(crate) fn is_stopped_original(&self) -> bool {
         self.stopped_original
+    }
+    pub(crate) fn resumes(&self) -> &[ResumeCandidate] {
+        self.resumes
+    }
+    pub(crate) fn container_workdir(&self) -> &str {
+        self.container_workdir
     }
 }
 
@@ -1155,6 +1192,19 @@ fn ensure_private_recovery(
     }
 }
 
+fn carried_resume(receipt: &Receipt, tool: &str, agent: &str) -> bool {
+    container_config::agent_retains_native_resume(agent)
+        || receipt.roots.iter().any(|part| {
+            part.original.is_some()
+                && part.carried_tools.contains(tool)
+                && part
+                    .root
+                    .roles
+                    .iter()
+                    .any(|role| container_config::content_role_agent(role) == Some(agent))
+        })
+}
+
 fn record_retirement(
     receipt: &mut Receipt,
     row: &Value,
@@ -1175,8 +1225,7 @@ fn record_retirement(
                     .iter()
                     .find_map(|role| container_config::content_role_agent(role))
                 {
-                    // Carried history retains the native resume id, not the ACP context.
-                    if !container_config::agent_retains_native_resume(agent) {
+                    if !carried_resume(receipt, &tool, agent) {
                         receipt.retired_tools.insert(tool.clone(), agent.to_owned());
                     }
                 }
@@ -1215,6 +1264,7 @@ fn new_receipt(app: &Path, row: &Value, tool: &str, roots: &[ContentRoot]) -> Re
             original,
             staged: owned.clone(),
             published: owned,
+            carried_tools: BTreeSet::new(),
         });
     }
     Ok(Receipt {
@@ -1245,6 +1295,52 @@ fn durable_stage_parent(path: &Path) -> Result<AnchoredDir> {
     }
 }
 
+fn resume_candidates(
+    row: &Value,
+    root: &ContentRoot,
+    home: &Path,
+    config: &crate::session::Config,
+) -> Result<Vec<ResumeCandidate>> {
+    let mut candidates = Vec::new();
+    for tool in row_tools(row) {
+        let prior = if row.get("tool").and_then(Value::as_str) == Some(&tool) {
+            Some(row)
+        } else {
+            row.get("prior_tool_session_ids")
+                .and_then(|prior| prior.get(&tool))
+        };
+        let Some(id) = prior
+            .and_then(|prior| prior.get("agent_session_id"))
+            .and_then(Value::as_str)
+            .filter(|id| crate::session::capture::is_valid_session_id(id))
+        else {
+            continue;
+        };
+        for matching in row_roots(row, &tool, home, config)?
+            .into_iter()
+            .filter(|matching| matching.path == root.path)
+        {
+            for role in matching
+                .roles
+                .iter()
+                .filter(|role| root.roles.contains(role))
+            {
+                let Some(agent) = container_config::content_role_agent(role) else {
+                    continue;
+                };
+                if matches!(agent, "gemini" | "kimi" | "prime-agent") {
+                    candidates.push(ResumeCandidate {
+                        tool: tool.clone(),
+                        agent: agent.to_owned(),
+                        id: id.to_owned(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(candidates)
+}
+
 fn stage_receipt(
     app: &Path,
     receipt: &mut Receipt,
@@ -1256,6 +1352,15 @@ fn stage_receipt(
     if receipt.phase != Phase::Planned {
         return Ok(());
     }
+    let container_workdir = container_config::container_workdir_for(
+        workspace
+            .to_str()
+            .context("sandbox project path is not UTF-8")?,
+        receipt
+            .retired_identity
+            .pointer("/sandbox_info/container_workdir")
+            .and_then(Value::as_str),
+    );
     for part in &mut receipt.roots {
         if let Some(published) = &part.published {
             let certificate = owned_root(app, &receipt.instance, &part.root.path)?.context(
@@ -1287,15 +1392,22 @@ fn stage_receipt(
         } else {
             &part.root.host
         };
+        let resumes = if part.original.is_some() {
+            resume_candidates(&receipt.retired_identity, &part.root, home, config)?
+        } else {
+            Vec::new()
+        };
         let capability = ContentSeed {
             source,
             stopped_original: part.original.is_some(),
+            resumes: &resumes,
+            container_workdir: &container_workdir,
         };
-        part.staged = container_config::retry_source_change(|| {
+        let (staged, carried_tools) = container_config::retry_source_change(|| {
             // Only this transaction owns the stage. Never clear a published root.
             anchor.remove_staged_dir(leaf)?;
             let stage = anchor.create_child(leaf)?;
-            container_config::seed_content_stage(
+            let carried = container_config::seed_content_stage(
                 &capability,
                 &part.root,
                 stage.path(),
@@ -1304,8 +1416,10 @@ fn stage_receipt(
                 workspace,
             )?;
             super::store_fs::barrier(&fs::File::open(stage.path())?)?;
-            identity(stage.path())
+            Ok((identity(stage.path())?, carried))
         })?;
+        part.staged = staged;
+        part.carried_tools = carried_tools;
     }
     receipt.phase = Phase::Staged;
     write_receipt(path, receipt)
@@ -1513,7 +1627,8 @@ fn reset_row(row: &mut Value, receipt: &Receipt) -> Result<()> {
                     generation: None,
                 },
                 structured: ResetLane {
-                    pending: current || old_acp.is_some(),
+                    pending: (current || old_acp.is_some())
+                        && !carried_resume(receipt, &tool, agent),
                     generation: None,
                 },
                 retired_terminal: prior
@@ -1870,6 +1985,10 @@ fn migrate_target(
         return Ok(true);
     }
     discard_stage(app, &mut receipt, &path)?;
+    if receipt.phase == Phase::Planned {
+        receipt.retired_identity = row.clone();
+        write_receipt(&path, &receipt)?;
+    }
     drop(registries.take());
     drop(transition.take());
     let workspace = Path::new(
@@ -1896,6 +2015,16 @@ fn migrate_target(
     if current_roots != roots
         || !row_tools(current).contains(tool)
         || current.get("project_path") != row.get("project_path")
+        || [
+            "tool",
+            "detect_as",
+            "agent_session_id",
+            "prior_tool_session_ids",
+        ]
+        .iter()
+        .any(|field| current.get(*field) != row.get(*field))
+        || current.pointer("/sandbox_info/container_workdir")
+            != row.pointer("/sandbox_info/container_workdir")
     {
         // A container could have started after the stage was seeded, so the
         // seed is dropped with the plan it was made for.
@@ -2614,6 +2743,7 @@ mod tests {
                     }),
                     staged: None,
                     published: None,
+                    carried_tools: BTreeSet::new(),
                 })
                 .collect(),
             phase: Phase::Committed,
@@ -2975,6 +3105,7 @@ mod tests {
         let mut instance = crate::session::Instance::new("claude", project.to_str().unwrap());
         instance.tool = "claude".to_owned();
         instance.agent_session_id = Some("kept-native-context".to_owned());
+        instance.acp_session_id = Some("kept-structured-context".to_owned());
         let config = crate::session::Config::default();
         let roots = container_config::sandbox_content_roots(
             "claude",
@@ -3002,7 +3133,9 @@ mod tests {
             "image": "img",
             "container_name": "aoe-sandbox-fixture",
         });
-        let registry = app.join("sessions.json");
+        let registry = crate::session::get_profile_dir("default")
+            .unwrap()
+            .join("sessions.json");
         fs::write(&registry, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
 
         assert!(
@@ -3042,6 +3175,360 @@ mod tests {
             "a carried resume must keep its session id: {}",
             rows[0]
         );
+        let continuation = prepare_acp_context(
+            "default",
+            &instance.id,
+            Some("claude"),
+            1,
+            AcpContextUse::Launch,
+            crate::acp::supervisor::SandboxContinuation::Persisted,
+        )
+        .unwrap();
+        assert_eq!(
+            continuation.stored_session_id.as_deref(),
+            Some("kept-structured-context"),
+            "the native-backed ACP adapter must load its carried conversation"
+        );
+        for other_agent in [None, Some("external-acp")] {
+            let outside = prepare_acp_context(
+                "default",
+                &instance.id,
+                other_agent,
+                2,
+                AcpContextUse::Launch,
+                crate::acp::supervisor::SandboxContinuation::Persisted,
+            )
+            .unwrap();
+            assert!(
+                outside.stored_session_id.is_none(),
+                "an unproven adapter cannot load the retired ACP ID"
+            );
+        }
+        let native_again = prepare_acp_context(
+            "default",
+            &instance.id,
+            Some("claude"),
+            3,
+            AcpContextUse::Launch,
+            crate::acp::supervisor::SandboxContinuation::Persisted,
+        )
+        .unwrap();
+        assert_eq!(
+            native_again.stored_session_id.as_deref(),
+            Some("kept-structured-context")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn retired_gemini_kimi_and_prime_keep_only_their_own_native_conversation() {
+        use crate::acp::supervisor::SandboxContinuation;
+
+        for (tool, role) in [
+            ("gemini", ".gemini"),
+            ("kimi", ".kimi-code"),
+            ("prime-agent", ".prime/agent"),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+            let home = dirs::home_dir().unwrap();
+            let app = crate::session::get_app_dir().unwrap();
+            let project = temporary.path().join("project");
+            fs::create_dir_all(&project).unwrap();
+            let mut instance = crate::session::Instance::new(tool, project.to_str().unwrap());
+            instance.tool = tool.to_owned();
+            instance.agent_session_id = Some("own-context".into());
+            instance.acp_session_id = Some("own-acp-context".into());
+            let cwd = instance.container_workdir();
+            let roots = container_config::sandbox_content_roots(
+                tool,
+                None,
+                &crate::session::Config::default().session,
+                &home,
+                &instance.id,
+            )
+            .unwrap();
+            let root = roots
+                .iter()
+                .find(|root| root.roles.iter().any(|name| name == role))
+                .expect("a registered native agent has its sandbox content mount");
+            let (own, peer) =
+                match tool {
+                    "gemini" => {
+                        let chats = Path::new("tmp")
+                            .join(crate::session::capture::project_hash(&cwd))
+                            .join("chats");
+                        fs::create_dir_all(root.path.join(&chats)).unwrap();
+                        let own = chats.join("session-own.json");
+                        let peer = chats.join("session-peer.json");
+                        for (path, id) in [(&own, "own-context"), (&peer, "peer-context")] {
+                            fs::write(
+                                root.path.join(path),
+                                serde_json::to_vec(&serde_json::json!({
+                                    "sessionId": id,
+                                    "projectHash": crate::session::capture::project_hash(&cwd),
+                                    "messages": [id]
+                                }))
+                                .unwrap(),
+                            )
+                            .unwrap();
+                        }
+                        (own, peer)
+                    }
+                    "kimi" => {
+                        let own = PathBuf::from("sessions/own-dir/content");
+                        let peer = PathBuf::from("sessions/peer-dir/content");
+                        for (relative, content) in
+                            [(&own, &b"OWN_HISTORY"[..]), (&peer, &b"PEER_HISTORY"[..])]
+                        {
+                            fs::create_dir_all(root.path.join(relative).parent().unwrap()).unwrap();
+                            fs::write(root.path.join(relative), content).unwrap();
+                        }
+                        let records = [("own-context", "own-dir"), ("peer-context", "peer-dir")]
+                            .map(|(id, dir)| {
+                                serde_json::json!({
+                        "sessionId": id, "sessionDir": format!("/root/.kimi-code/sessions/{dir}"),
+                        "workDir": cwd
+                    }).to_string()
+                            })
+                            .join("\n");
+                        fs::write(
+                            root.path.join("session_index.jsonl"),
+                            format!("{records}\n"),
+                        )
+                        .unwrap();
+                        (own, peer)
+                    }
+                    "prime-agent" => {
+                        let own = PathBuf::from("sessions/first.jsonl");
+                        let peer = PathBuf::from("sessions/second.jsonl");
+                        fs::create_dir_all(root.path.join("sessions")).unwrap();
+                        for (relative, id) in [(&own, "own-context"), (&peer, "peer-context")] {
+                            fs::write(root.path.join(relative), format!(
+                            "{}\n{{\"message\":\"{id}\"}}\n",
+                            serde_json::json!({"type":"session","rlmDepth":0,"id":id,"cwd":cwd})
+                        )).unwrap();
+                        }
+                        (own, peer)
+                    }
+                    _ => unreachable!(),
+                };
+            let peer_bytes = fs::read(root.path.join(&peer)).unwrap();
+            let own_bytes = fs::read(root.path.join(&own)).unwrap();
+            fs::create_dir_all(root.host.join(&peer).parent().unwrap()).unwrap();
+            fs::write(root.host.join(&peer), b"HOST_HISTORY").unwrap();
+
+            let mut row = serde_json::to_value(&instance).unwrap();
+            row["sandbox_info"] = serde_json::json!({
+                "enabled": true, "image": "img", "container_name": "aoe-sandbox-fixture"
+            });
+            let registry = crate::session::get_profile_dir("default")
+                .unwrap()
+                .join("sessions.json");
+            fs::write(&registry, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
+            assert!(
+                migrate_target(
+                    &app,
+                    &home,
+                    (&registry, &instance.id, tool),
+                    &|_| Ok(false),
+                    &|_| Ok(true),
+                    &|_| Ok(Vec::new()),
+                )
+                .unwrap(),
+                "{tool} migration must publish"
+            );
+            assert_eq!(
+                fs::read(root.path.join(&own)).unwrap(),
+                own_bytes,
+                "{tool} own transcript"
+            );
+            assert!(
+                !root.path.join(&peer).exists(),
+                "{tool} copied a peer transcript"
+            );
+            if tool == "kimi" {
+                let index = fs::read_to_string(root.path.join("session_index.jsonl")).unwrap();
+                assert!(index.contains("own-context"));
+                assert!(!index.contains("peer-context"));
+            }
+            let recovery = fs::read_dir(recovery_root(&root.host).unwrap())
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path()
+                .join("0/original");
+            assert_eq!(fs::read(recovery.join(&peer)).unwrap(), peer_bytes);
+            let stored = read_row(&registry, &instance.id).unwrap().unwrap();
+            assert_eq!(
+                stored["agent_session_id"], "own-context",
+                "{tool} lost native resume"
+            );
+            let continuation = prepare_acp_context(
+                "default",
+                &instance.id,
+                Some(tool),
+                1,
+                AcpContextUse::Launch,
+                SandboxContinuation::Persisted,
+            )
+            .unwrap();
+            assert_eq!(
+                continuation.stored_session_id.as_deref(),
+                Some("own-acp-context")
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ambiguous_or_deleted_native_conversation_is_retained_only_in_recovery() {
+        use crate::acp::supervisor::SandboxContinuation;
+
+        for (tool, off_mount) in [
+            ("gemini", false),
+            ("kimi", false),
+            ("kimi", true),
+            ("prime-agent", false),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+            let app = crate::session::get_app_dir().unwrap();
+            let home = dirs::home_dir().unwrap();
+            let project = temporary.path().join("project");
+            fs::create_dir(&project).unwrap();
+            let mut instance = crate::session::Instance::new(tool, project.to_str().unwrap());
+            instance.tool = tool.to_owned();
+            instance.agent_session_id = Some("own-context".into());
+            instance.acp_session_id = Some("own-acp-context".into());
+            let cwd = instance.container_workdir();
+            let roots = container_config::sandbox_content_roots(
+                tool,
+                None,
+                &crate::session::Config::default().session,
+                &home,
+                &instance.id,
+            )
+            .unwrap();
+            let role = match tool {
+                "gemini" => ".gemini",
+                "kimi" => ".kimi-code",
+                _ => ".prime/agent",
+            };
+            let root = roots
+                .iter()
+                .find(|root| root.roles.iter().any(|name| name == role))
+                .unwrap();
+            let witness =
+                match tool {
+                    "gemini" => {
+                        let chats = Path::new("tmp")
+                            .join(crate::session::capture::project_hash(&cwd))
+                            .join("chats");
+                        fs::create_dir_all(root.path.join(&chats)).unwrap();
+                        for name in ["session-first.json", "session-second.json"] {
+                            fs::write(
+                                root.path.join(&chats).join(name),
+                                serde_json::to_vec(&serde_json::json!({
+                                    "sessionId":"own-context",
+                                    "projectHash":crate::session::capture::project_hash(&cwd)
+                                }))
+                                .unwrap(),
+                            )
+                            .unwrap();
+                        }
+                        chats.join("session-first.json")
+                    }
+                    "kimi" => {
+                        let witness = PathBuf::from("sessions/owner/content");
+                        fs::create_dir_all(root.path.join("sessions/owner")).unwrap();
+                        fs::write(root.path.join(&witness), b"OLD_SESSION").unwrap();
+                        let mut index = format!(
+                            "{}\n",
+                            serde_json::json!({
+                                "sessionId":"own-context",
+                                "sessionDir": if off_mount {
+                                    "/other-store/sessions/owner"
+                                } else {
+                                    "/root/.kimi-code/sessions/owner"
+                                },
+                                "workDir":cwd
+                            })
+                        );
+                        if !off_mount {
+                            index.push_str(&format!(
+                                "{}\n",
+                                serde_json::json!({
+                                    "sessionId":"own-context", "deleted":true
+                                })
+                            ));
+                        }
+                        fs::write(root.path.join("session_index.jsonl"), index).unwrap();
+                        witness
+                    }
+                    _ => {
+                        let sessions = Path::new("sessions");
+                        fs::create_dir_all(root.path.join(sessions)).unwrap();
+                        for name in ["first.jsonl", "second.jsonl"] {
+                            fs::write(root.path.join(sessions).join(name), format!(
+                            "{}\n", serde_json::json!({
+                                "type":"session", "rlmDepth":0, "id":"own-context", "cwd":cwd
+                            })
+                        )).unwrap();
+                        }
+                        sessions.join("first.jsonl")
+                    }
+                };
+            let original = fs::read(root.path.join(&witness)).unwrap();
+            let mut row = serde_json::to_value(&instance).unwrap();
+            row["sandbox_info"] = serde_json::json!({
+                "enabled":true,"image":"img","container_name":"aoe-sandbox-fixture"
+            });
+            let registry = crate::session::get_profile_dir("default")
+                .unwrap()
+                .join("sessions.json");
+            fs::write(&registry, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
+            assert!(migrate_target(
+                &app,
+                &home,
+                (&registry, &instance.id, tool),
+                &|_| Ok(false),
+                &|_| Ok(true),
+                &|_| Ok(Vec::new()),
+            )
+            .unwrap());
+            assert!(
+                !root.path.join(&witness).exists(),
+                "{tool} carried ambiguous history"
+            );
+            let recovery = fs::read_dir(recovery_root(&root.host).unwrap())
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path()
+                .join("0/original");
+            assert_eq!(fs::read(recovery.join(&witness)).unwrap(), original);
+            let stored = read_row(&registry, &instance.id).unwrap().unwrap();
+            assert!(
+                stored.get("agent_session_id").is_none(),
+                "{tool} retained an unproven ID"
+            );
+            let context = prepare_acp_context(
+                "default",
+                &instance.id,
+                Some(tool),
+                1,
+                AcpContextUse::Launch,
+                SandboxContinuation::Persisted,
+            )
+            .unwrap();
+            assert!(
+                context.stored_session_id.is_none(),
+                "{tool} reused an unproven ACP ID"
+            );
+        }
     }
 
     #[test]
@@ -3266,11 +3753,10 @@ mod tests {
         assert!(!reset_import.seed_history_replay);
     }
 
-    /// An adapter that names no native agent still has to answer for a pending
-    /// structured lane, or that row keeps resuming the retired conversation.
+    /// An adapter without a matching native store cannot load the retired ACP ID.
     #[test]
     #[serial_test::serial]
-    fn an_adapter_without_a_native_agent_still_claims_its_structured_lane() {
+    fn an_adapter_without_a_native_agent_cannot_reuse_carried_acp_id() {
         let temporary = tempfile::tempdir().unwrap();
         let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
         let home = dirs::home_dir().unwrap();
@@ -3340,8 +3826,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            context.notice.is_some(),
-            "the structured lane is claimed and announced"
+            context.notice.is_none(),
+            "carrying the native store is not a native reset"
         );
         assert!(
             context.stored_session_id.is_none(),

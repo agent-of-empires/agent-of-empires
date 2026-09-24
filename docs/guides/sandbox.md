@@ -137,14 +137,17 @@ wrote that store. When it cannot, each of its content roots is moved intact
 under `.aoe-sandbox-recovery/<transaction>/<index>/original` beside the agent's
 config directory and a fresh store is seeded in its place, with the session's
 original left alone. AoE carries Claude `projects/`, Codex `sessions/` and
-`archived_sessions/`, and OpenCode `opencode.db`, `opencode.db-wal` and
-`opencode.db-shm` from a retired store, then retains their native session
-IDs. ACP continuation contexts are reset independently.
-Other agents' sandbox-only conversation directories may have come from an older
-shared store, so AoE cannot prove per-session ownership and leaves them in
-recovery along with host-importable native history. Their session IDs are
-reset. The next start names retained originals; isolated history is not
-replayed automatically.
+`archived_sessions/`, and OpenCode `opencode.db` with its WAL and SHM
+from a retired store. It also carries only a uniquely attributable Gemini
+`tmp/<project>/chats` session file, Kimi session directory plus its live
+index entry, or Prime session file with a matching root header in the managed
+`sessions/` directory. Carried conversations keep their native IDs; an ACP
+adapter backed by that same store can keep its context, while an adapter
+without that provenance starts fresh. Missing, deleted or ambiguous matches
+remain in recovery and have their IDs reset. Pi, OMP, Hermes and other
+unverified conversation histories remain in recovery instead of being copied.
+Host native history is never imported. The next start names retained originals;
+isolated history is not replayed automatically.
 
 Sessions created under the older shared-store layout move to a private store the next time they start. Once every session that used the shared store has moved, AoE preserves that store intact under `.aoe-sandbox-recovery/v027-<transaction>/original` instead of deleting it. A session that already had a private store receives only the shared store's top-level configuration and credentials, not its directories of caches, logs, plugins, or unrelated conversation history. If a live sandbox can see the recovery directory, preservation is deferred until that mount is gone.
 

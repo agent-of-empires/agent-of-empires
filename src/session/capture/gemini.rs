@@ -9,13 +9,13 @@ use sha2::{Digest, Sha256};
 use super::MAX_SESSION_ID_LEN;
 use crate::session::AnchoredDir;
 
-const GEMINI_SESSION_MAX_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const GEMINI_SESSION_MAX_BYTES: usize = 8 * 1024 * 1024;
 const GEMINI_METADATA_MAX_BYTES: usize = 128 * 1024;
-const GEMINI_SCAN_MAX_CANDIDATES: usize = 4 * 1024;
+pub(crate) const GEMINI_SCAN_MAX_CANDIDATES: usize = 4 * 1024;
 const GEMINI_PROJECT_HASH_MAX_BYTES: usize = 128;
 
 /// `(sessionId, projectHash)` from a whole JSON file or, for JSONL, its first line.
-fn parse_gemini_session_json(content: &str) -> Option<(Option<String>, Option<String>)> {
+pub(crate) fn parse_gemini_session_json(content: &str) -> Option<(Option<String>, Option<String>)> {
     if content.len() > GEMINI_SESSION_MAX_BYTES {
         return None;
     }
@@ -61,7 +61,7 @@ fn extract_gemini_fields_anchored(
     Some((session_id, project_hash))
 }
 
-fn project_hash(cwd: &str) -> String {
+pub(crate) fn project_hash(cwd: &str) -> String {
     Sha256::digest(cwd.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))

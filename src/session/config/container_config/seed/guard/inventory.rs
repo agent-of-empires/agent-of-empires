@@ -3,11 +3,11 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use super::super::canonical_expected_path;
 use super::super::policy::Exception;
-use super::{Fingerprint, NativeStateBoundary, ReadAccess, StateOrigin};
+use super::{Changed, Fingerprint, NativeStateBoundary, ReadAccess, StateOrigin};
 use crate::session::anchored_fs::AnchoredDir;
 
 pub(super) struct Inventory<'a> {
@@ -138,7 +138,9 @@ impl<'a> Inventory<'a> {
             let child = directory.child(leaf)?;
             let (device, inode) = child.identity()?;
             if device != stat.st_dev || inode != stat.st_ino {
-                bail!("native state directory changed before inventory");
+                return Err(
+                    Changed("native state directory changed before inventory".into()).into(),
+                );
             }
             self.directory(&child, lookup, origin, linked)?;
         }

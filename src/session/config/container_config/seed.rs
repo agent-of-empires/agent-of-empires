@@ -1,8 +1,8 @@
 //! Positive native-config seeding, separated from container mount construction.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File, Permissions};
-use std::io::Read;
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 
 use crate::git::template::lexical_normalize;
 use crate::session::anchored_fs::AnchoredDir;
+use crate::session::capture;
 use crate::session::config::SessionConfig;
 
 use super::{AgentConfigMount, AGENT_CONFIG_MOUNTS, SANDBOX_PRIVATE_SUBDIR, SANDBOX_SUBDIR};
@@ -576,6 +577,339 @@ pub(super) fn carry_sandbox_state(
         }
     }
     Ok(())
+}
+
+fn visit_carried_file<T>(
+    source: &Path,
+    relative: &Path,
+    boundary: &NativeStateBoundary,
+    visit: impl FnOnce(&mut File, &guard::ReadGuard<'_>) -> Result<T>,
+) -> Result<Option<T>> {
+    let declared = boundary.source_root.path().join(relative);
+    let access = ReadAccess {
+        root: Some(&boundary.source_root),
+        exception: Exception::Carried { root: &declared },
+    };
+    let lookup = source.join(relative);
+    let Some(canonical) = canonical_source(&lookup, boundary, false, access)? else {
+        return Ok(None);
+    };
+    if canonical != declared {
+        return Ok(None);
+    }
+    let Some(mut file) = open_canonical_file(&canonical, access)? else {
+        return Ok(None);
+    };
+    let mut guard = guard::ReadGuard::new(boundary, access)?;
+    guard.record_route(&lookup, &canonical)?;
+    if !guard.record_file(&canonical, &file)? {
+        return Ok(None);
+    }
+    let result = visit(&mut file, &guard)?;
+    guard.validate()?;
+    Ok(Some(result))
+}
+
+fn bounded_carried_bytes(
+    source: &Path,
+    relative: &Path,
+    boundary: &NativeStateBoundary,
+    max: usize,
+) -> Result<Option<Vec<u8>>> {
+    Ok(visit_carried_file(source, relative, boundary, |file, _| {
+        let mut bytes = Vec::with_capacity(max.min(4096));
+        file.take(max.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)?;
+        Ok((bytes.len() <= max).then_some(bytes))
+    })?
+    .flatten())
+}
+
+fn copy_selected_file(
+    source: &Path,
+    destination: &Path,
+    relative: &Path,
+    boundary: &NativeStateBoundary,
+    max: usize,
+    matches: impl FnOnce(&[u8]) -> bool,
+) -> Result<bool> {
+    Ok(
+        visit_carried_file(source, relative, boundary, |file, guard| {
+            let mut bytes = Vec::with_capacity(max.min(4096));
+            Read::by_ref(file)
+                .take(max.saturating_add(1) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > max || !matches(&bytes) {
+                return Ok(false);
+            }
+            file.seek(SeekFrom::Start(0))?;
+            let output = AnchoredDir::open(destination)?;
+            let parent = output.create_child(relative.parent().unwrap_or(Path::new("")))?;
+            let leaf = Path::new(relative.file_name().context("selected file has no leaf")?);
+            let permissions = file.metadata()?.permissions();
+            publish_guarded_file(file, guard, &parent, leaf, permissions, true)
+        })?
+        .unwrap_or(false),
+    )
+}
+
+fn bounded_directory_names(
+    root: &AnchoredDir,
+    source: &Path,
+    relative: &Path,
+    max: usize,
+) -> Result<Option<Vec<std::ffi::OsString>>> {
+    match fs::symlink_metadata(source.join(relative)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    let names = root.read_dir(relative, max.saturating_add(1))?;
+    Ok((names.len() <= max).then_some(names))
+}
+
+fn carry_gemini_session(
+    root: &AnchoredDir,
+    source: &Path,
+    destination: &Path,
+    boundary: &NativeStateBoundary,
+    id: &str,
+    cwd: &str,
+) -> Result<bool> {
+    let hash = capture::project_hash(cwd);
+    let chats = Path::new("tmp").join(&hash).join("chats");
+    let Some(names) =
+        bounded_directory_names(root, source, &chats, capture::GEMINI_SCAN_MAX_CANDIDATES)?
+    else {
+        return Ok(false);
+    };
+    let mut selected = None;
+    for name in names {
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let relative = chats.join(&name);
+        if !name_str.starts_with("session-")
+            || !matches!(
+                relative
+                    .extension()
+                    .and_then(|extension| extension.to_str()),
+                Some("json" | "jsonl")
+            )
+        {
+            continue;
+        }
+        let Some(bytes) = root.read_regular(&relative, capture::GEMINI_SESSION_MAX_BYTES)? else {
+            continue;
+        };
+        let fields = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(capture::parse_gemini_session_json);
+        if fields.is_some_and(|(session, project)| {
+            session.as_deref() == Some(id) && project.as_deref() == Some(hash.as_str())
+        }) {
+            if selected.is_some() {
+                return Ok(false);
+            }
+            selected = Some(relative);
+        }
+    }
+    let Some(relative) = selected else {
+        return Ok(false);
+    };
+    copy_selected_file(
+        source,
+        destination,
+        &relative,
+        boundary,
+        capture::GEMINI_SESSION_MAX_BYTES,
+        |bytes| {
+            std::str::from_utf8(bytes)
+                .ok()
+                .and_then(capture::parse_gemini_session_json)
+                .is_some_and(|(session, project)| {
+                    session.as_deref() == Some(id) && project.as_deref() == Some(hash.as_str())
+                })
+        },
+    )
+}
+
+fn prime_header(file: &mut File) -> Result<Option<(String, String)>> {
+    let mut header = Vec::with_capacity(4096);
+    std::io::BufReader::new(Read::by_ref(file))
+        .take(capture::PRIME_AGENT_HEADER_SCAN_BYTES.saturating_add(1))
+        .read_until(b'\n', &mut header)?;
+    Ok(capture::root_session_header(&header))
+}
+
+fn carry_prime_session(
+    root: &AnchoredDir,
+    source: &Path,
+    destination: &Path,
+    boundary: &NativeStateBoundary,
+    id: &str,
+    cwd: &str,
+) -> Result<bool> {
+    let sessions = Path::new("sessions");
+    let Some(names) = bounded_directory_names(
+        root,
+        source,
+        sessions,
+        capture::PRIME_AGENT_MAX_SESSION_FILES,
+    )?
+    else {
+        return Ok(false);
+    };
+    let mut selected = None;
+    for name in names {
+        let relative = sessions.join(&name);
+        if relative
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("jsonl")
+        {
+            continue;
+        }
+        let Some(mut file) = root.open_regular(&relative, usize::MAX)? else {
+            continue;
+        };
+        if prime_header(&mut file)?
+            .is_some_and(|(session, workdir)| session == id && workdir == cwd)
+        {
+            if selected.is_some() {
+                return Ok(false);
+            }
+            selected = Some(relative);
+        }
+    }
+    let Some(relative) = selected else {
+        return Ok(false);
+    };
+    Ok(
+        visit_carried_file(source, &relative, boundary, |file, guard| {
+            if !prime_header(file)?
+                .is_some_and(|(session, workdir)| session == id && workdir == cwd)
+            {
+                return Ok(false);
+            }
+            file.seek(SeekFrom::Start(0))?;
+            let output = AnchoredDir::open(destination)?;
+            let parent = output.create_child(sessions)?;
+            let leaf = Path::new(
+                relative
+                    .file_name()
+                    .context("Prime session has no file name")?,
+            );
+            let permissions = file.metadata()?.permissions();
+            publish_guarded_file(file, guard, &parent, leaf, permissions, true)
+        })?
+        .unwrap_or(false),
+    )
+}
+
+fn carry_kimi_session(
+    source: &Path,
+    destination: &Path,
+    boundary: &NativeStateBoundary,
+    id: &str,
+    cwd: &str,
+    container_suffix: &str,
+) -> Result<Option<serde_json::Value>> {
+    let index = Path::new("session_index.jsonl");
+    let Some(bytes) =
+        bounded_carried_bytes(source, index, boundary, capture::KIMI_INDEX_MAX_BYTES)?
+    else {
+        return Ok(None);
+    };
+    let managed_sessions = Path::new("/root").join(container_suffix).join("sessions");
+    let Ok(Some((leaf, mut record))) =
+        capture::selected_index_record(&bytes, id, cwd, &managed_sessions)
+    else {
+        return Ok(None);
+    };
+    let relative = Path::new("sessions").join(&leaf);
+    match fs::symlink_metadata(source.join(&relative)) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(_) => return Ok(None),
+    }
+    let pattern = format!("sessions/{leaf}");
+    carry_sandbox_state(source, destination, &[pattern.as_str()], boundary)?;
+    if !destination.join(&relative).is_dir() {
+        return Ok(None);
+    }
+    if bounded_carried_bytes(source, index, boundary, capture::KIMI_INDEX_MAX_BYTES)?.as_deref()
+        != Some(bytes.as_slice())
+    {
+        return Err(guard::Changed("Kimi session index changed during carry".into()).into());
+    }
+    record["sessionDir"] = format!("/root/{container_suffix}/sessions/{leaf}").into();
+    Ok(Some(record))
+}
+
+pub(super) fn carry_selected_sandbox_state(
+    source: &Path,
+    destination: &Path,
+    mount: &AgentConfigMount,
+    resumes: &[crate::migrations::v031_isolate_sandbox_content::ResumeCandidate],
+    cwd: &str,
+    boundary: &NativeStateBoundary,
+) -> Result<BTreeSet<String>> {
+    let mut carried = BTreeSet::new();
+    if boundary.stopped_original.is_none()
+        || !resumes.iter().any(|resume| resume.agent == mount.tool_name)
+    {
+        return Ok(carried);
+    }
+    let root = AnchoredDir::open(source)?;
+    let mut kimi_records = Vec::new();
+    for resume in resumes
+        .iter()
+        .filter(|resume| resume.agent == mount.tool_name)
+    {
+        let succeeded = match mount.tool_name {
+            "gemini" => {
+                carry_gemini_session(&root, source, destination, boundary, &resume.id, cwd)?
+            }
+            "prime-agent" => {
+                carry_prime_session(&root, source, destination, boundary, &resume.id, cwd)?
+            }
+            "kimi" => {
+                if let Some(record) = carry_kimi_session(
+                    source,
+                    destination,
+                    boundary,
+                    &resume.id,
+                    cwd,
+                    mount.container_suffix,
+                )? {
+                    kimi_records.push((resume.tool.clone(), record));
+                }
+                false
+            }
+            _ => false,
+        };
+        if succeeded {
+            carried.insert(resume.tool.clone());
+        }
+    }
+    if !kimi_records.is_empty() {
+        let mut index = Vec::new();
+        for (_, record) in &kimi_records {
+            serde_json::to_writer(&mut index, record)?;
+            index.push(b'\n');
+        }
+        AnchoredDir::open(destination)?.publish_file(
+            Path::new("session_index.jsonl"),
+            &mut index.as_slice(),
+            Permissions::from_mode(0o600),
+            true,
+            None,
+        )?;
+        carried.extend(kimi_records.into_iter().map(|(tool, _)| tool));
+    }
+    Ok(carried)
 }
 
 fn seed_directory(

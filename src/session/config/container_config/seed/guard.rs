@@ -13,7 +13,7 @@ use crate::session::anchored_fs::AnchoredDir;
 mod inventory;
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
-pub(super) struct Changed(String);
+pub(super) struct Changed(pub(super) String);
 
 fn source_io(error: std::io::Error) -> anyhow::Error {
     if matches!(
@@ -272,7 +272,7 @@ impl<'a> ReadGuard<'a> {
         }
         if let Some(previous) = self.files.get(path) {
             if *previous != fingerprint {
-                bail!("configuration source changed between reads");
+                return Err(Changed("configuration source changed between reads".into()).into());
             }
         } else {
             self.files.insert(path.to_path_buf(), fingerprint);
@@ -420,9 +420,9 @@ fn watch_entry(
 }
 
 fn seal_directory(directories: &mut BTreeMap<PathBuf, Fingerprint>, path: &Path) -> Result<()> {
-    let metadata = fs::metadata(path)?;
+    let metadata = fs::metadata(path).map_err(source_io)?;
     if !metadata.is_dir() {
-        bail!("native-state directory changed type");
+        return Err(Changed("native-state directory changed type".into()).into());
     }
     directories
         .entry(path.to_path_buf())
@@ -434,12 +434,12 @@ fn pin_anchored_directory(
     directories: &mut BTreeMap<PathBuf, Fingerprint>,
     directory: &AnchoredDir,
 ) -> Result<()> {
-    let metadata = fs::metadata(directory.path())?;
+    let metadata = fs::metadata(directory.path()).map_err(source_io)?;
     let (device, inode) = directory.identity()?;
     #[cfg(target_os = "macos")]
     let device = device as u64;
     if metadata.dev() != device || metadata.ino() != inode {
-        bail!("configuration source directory changed before reading");
+        return Err(Changed("configuration source directory changed before reading".into()).into());
     }
     seal_directory(directories, directory.path())
 }
@@ -523,5 +523,32 @@ mod tests {
                 b"LOCAL_CONFIG"
             );
         }
+    }
+    #[test]
+    fn changed_file_between_reads_is_reopened_before_publication() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let active = temporary.path().join("active");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&active).unwrap();
+        let candidate = source.join("config.json");
+        fs::write(&candidate, b"OLD_SOURCE").unwrap();
+        let boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+        let mut attempts = 0;
+        let copied = super::super::retry_source_change(|| {
+            attempts += 1;
+            let mut guard = ReadGuard::new(&boundary, ReadAccess::default())?;
+            guard.record_file(&candidate, &File::open(&candidate)?)?;
+            let bytes = fs::read(&candidate)?;
+            if attempts == 1 {
+                fs::write(&candidate, b"NEW_SOURCE")?;
+            }
+            guard.record_file(&candidate, &File::open(&candidate)?)?;
+            guard.validate()?;
+            Ok(bytes)
+        })
+        .unwrap();
+        assert_eq!(copied, b"NEW_SOURCE");
+        assert_eq!(attempts, 2);
     }
 }

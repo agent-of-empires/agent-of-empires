@@ -4,6 +4,7 @@
 //! `ContainerConfig` structs. Includes sandbox directory sync, agent config
 //! mounting, and credential extraction.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -1193,12 +1194,7 @@ pub(crate) fn seed_content_stage(
     home: &Path,
     session: &super::SessionConfig,
     workspace: &Path,
-) -> Result<()> {
-    let mode = if input.is_stopped_original() {
-        ContentSeedMode::StoppedOriginal
-    } else {
-        ContentSeedMode::Fresh
-    };
+) -> Result<BTreeSet<String>> {
     seed_content_roles(
         input.path(),
         root,
@@ -1206,7 +1202,7 @@ pub(crate) fn seed_content_stage(
         home,
         session,
         workspace,
-        mode,
+        Some(input),
     )
 }
 
@@ -1218,15 +1214,7 @@ pub(crate) fn extend_owned_content(
     session: &super::SessionConfig,
     workspace: &Path,
 ) -> Result<()> {
-    seed_content_roles(
-        &root.host,
-        root,
-        &root.path,
-        home,
-        session,
-        workspace,
-        ContentSeedMode::OwnedExtension,
-    )
+    seed_content_roles(&root.host, root, &root.path, home, session, workspace, None).map(|_| ())
 }
 
 /// The bytes to publish when a JSON seed default meets a file carried forward
@@ -1262,10 +1250,16 @@ fn seed_content_roles(
     home: &Path,
     session: &super::SessionConfig,
     workspace: &Path,
-    mode: ContentSeedMode,
-) -> Result<()> {
+    input: Option<&crate::migrations::v031_isolate_sandbox_content::ContentSeed<'_>>,
+) -> Result<BTreeSet<String>> {
     use std::os::unix::fs::PermissionsExt;
+    let mode = match input {
+        Some(input) if input.is_stopped_original() => ContentSeedMode::StoppedOriginal,
+        Some(_) => ContentSeedMode::Fresh,
+        None => ContentSeedMode::OwnedExtension,
+    };
     let output = crate::session::anchored_fs::AnchoredDir::open(destination)?;
+    let mut carried = BTreeSet::new();
     for mount in AGENT_CONFIG_MOUNTS
         .iter()
         .filter(|mount| root.roles.iter().any(|role| role == mount.container_suffix))
@@ -1320,6 +1314,15 @@ fn seed_content_roles(
                         carried_state(mount),
                         &boundary,
                     )?;
+                    let capability = input.context("stopped original lacks seed capability")?;
+                    carried.extend(seed::carry_selected_sandbox_state(
+                        source,
+                        destination,
+                        mount,
+                        capability.resumes(),
+                        capability.container_workdir(),
+                        &boundary,
+                    )?);
                 }
                 boundary.validate_source()?;
                 Ok(())
@@ -1358,7 +1361,8 @@ fn seed_content_roles(
             }
         }
     }
-    output.sync()
+    output.sync()?;
+    Ok(carried)
 }
 
 /// Tool names with a config mount, deduplicated in table order.
@@ -1671,6 +1675,15 @@ pub(crate) enum MountResolve {
     /// paths. Also where a plain directory and a repo root legitimately land, but their
     /// workdir never moves, so nothing keys a decision on the difference.
     Fallthrough,
+}
+
+pub(crate) fn container_workdir_for(project_path: &str, pinned: Option<&str>) -> String {
+    if let Some(pinned) = pinned {
+        return pinned.to_owned();
+    }
+    compute_volume_paths(Path::new(project_path), project_path)
+        .map(|(_, wd)| wd)
+        .unwrap_or_else(|_| "/workspace".to_string())
 }
 
 pub(crate) fn compute_volume_paths(
@@ -6340,6 +6353,68 @@ codex-work = "{}"
             .path()
             .join(".cursor/sandbox-v2/cursor-home-override")
             .exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn every_sandboxable_agent_mounts_its_own_content_root() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let project = TempDir::new().unwrap();
+        git2::Repository::init(project.path()).unwrap();
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".into(),
+            container_name: "test-container".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        for agent in crate::agents::AGENTS
+            .iter()
+            .filter(|agent| !agent.host_only)
+        {
+            let mounts: Vec<_> = AGENT_CONFIG_MOUNTS
+                .iter()
+                .filter(|mount| mount.tool_name == agent.name)
+                .collect();
+            assert!(
+                !mounts.is_empty(),
+                "{} has no private content mount",
+                agent.name
+            );
+            let id = format!("{}-content-mount-test", agent.name);
+            let config = build_container_config(
+                project.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new(agent.name, None),
+                false,
+                &id,
+                None,
+                "",
+            )
+            .unwrap();
+            for mount in mounts {
+                let source = sandbox_dir_for(mount, home.path(), Some(&id)).unwrap();
+                let target = if agent.name == "codex" {
+                    Path::new("/root/.codex").join(&id)
+                } else {
+                    Path::new("/root").join(mount.container_suffix)
+                };
+                assert!(
+                    config.volumes.iter().any(|volume| {
+                        Path::new(&volume.host_path) == source
+                            && Path::new(&volume.container_path) == target
+                    }),
+                    "{} omitted private mount {}",
+                    agent.name,
+                    mount.container_suffix
+                );
+            }
+        }
     }
 
     // Regression guard for the trap in #958: a sidecar agent (settl TOML,

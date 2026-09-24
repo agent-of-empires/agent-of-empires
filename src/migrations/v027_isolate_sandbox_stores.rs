@@ -2848,6 +2848,12 @@ gemini = "{}"
         fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
 
         run_in(&app, &home, &|_| Ok(true)).unwrap();
+        let checkpoint: Value = read_rows(&app);
+        assert_eq!(checkpoint[0]["sandbox_store_generation"], 1);
+        assert_eq!(
+            checkpoint[0]["sandbox_store_transition_paths"][0]["source"],
+            serde_json::json!(custom_a.join("sandbox"))
+        );
         fs::write(
             app.join("config.toml"),
             format!(
@@ -2859,15 +2865,21 @@ gemini = "{}"
         )
         .unwrap();
 
-        let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("restore the previous session.agent_config_dir"));
+        run_in(&app, &home, &|_| Ok(false)).unwrap_err();
         assert_eq!(
             fs::read(custom_a.join("sandbox/one/data")).unwrap(),
             b"data"
         );
         assert!(!custom_b.join("sandbox-v2/one").exists());
+        let pending: Value = read_rows(&app);
+        assert_eq!(
+            pending[0]["sandbox_store_generation"],
+            checkpoint[0]["sandbox_store_generation"]
+        );
+        assert_eq!(
+            pending[0]["sandbox_store_transition_paths"],
+            checkpoint[0]["sandbox_store_transition_paths"]
+        );
     }
 
     #[test]

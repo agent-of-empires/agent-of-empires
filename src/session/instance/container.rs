@@ -387,16 +387,12 @@ impl Instance {
     /// session whose container has not been created yet, where there is nothing
     /// to pin to.
     pub fn container_workdir(&self) -> String {
-        if let Some(pinned) = self
-            .sandbox_info
-            .as_ref()
-            .and_then(|s| s.container_workdir.clone())
-        {
-            return pinned;
-        }
-        container_config::compute_volume_paths(Path::new(&self.project_path), &self.project_path)
-            .map(|(_, wd)| wd)
-            .unwrap_or_else(|_| "/workspace".to_string())
+        container_config::container_workdir_for(
+            &self.project_path,
+            self.sandbox_info
+                .as_ref()
+                .and_then(|info| info.container_workdir.as_deref()),
+        )
     }
 
     /// Kept out of `build_container_config` so the diagnostic fires once per
