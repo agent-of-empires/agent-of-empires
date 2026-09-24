@@ -25,6 +25,7 @@ enum SendKeysError {
     Transient(Status),
     StructuredView,
     Blocked(crate::session::StartBlocked),
+    Gone,
     Tmux(anyhow::Error),
 }
 
@@ -128,9 +129,12 @@ pub async fn send_message(
         let _input_lock = match inst_owned.lock_for_input() {
             Ok(lock) => lock,
             Err(e) => {
-                let err = match e.downcast_ref::<crate::session::StartBlocked>() {
-                    Some(blocked) => SendKeysError::Blocked(*blocked),
-                    None => SendKeysError::Tmux(e),
+                let err = if let Some(blocked) = e.downcast_ref::<crate::session::StartBlocked>() {
+                    SendKeysError::Blocked(*blocked)
+                } else if e.is::<crate::session::SessionGone>() {
+                    SendKeysError::Gone
+                } else {
+                    SendKeysError::Tmux(e)
                 };
                 return Err(Box::new((inst_owned, outcome, err)));
             }
@@ -241,8 +245,16 @@ pub async fn send_message(
                 )
                     .into_response(),
                 SendKeysError::Blocked(blocked) => {
+                    // A peer dismissed the row after a revive launched: keep the launch identity.
+                    if did_work {
+                        let mut instances = state.instances.write().await;
+                        if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
+                            apply_cascade_state_sync(i, &sync_base, &started);
+                        }
+                    }
                     crate::server::api::start_blocked_response(blocked)
                 }
+                SendKeysError::Gone => bare_not_found(),
                 SendKeysError::Tmux(e) => {
                     tracing::error!(target: "http.api.sessions", "send_message: tmux error for {id}: {e}");
                     let msg = e.to_string();
