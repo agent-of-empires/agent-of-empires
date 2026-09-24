@@ -42,11 +42,17 @@ pub(crate) struct SessionIdSyncOutcome {
     /// failed persist. The tmux env mirror is republished from the in-memory
     /// value for these so the on_change publish is overwritten.
     pub(crate) filtered: Vec<String>,
+    /// Instances whose Capture lifecycle reservation advanced the durable
+    /// generation and was released during this drain.
+    pub(crate) lifecycle_advanced: Vec<String>,
 }
 
 impl SessionIdSyncOutcome {
     pub(crate) fn touched(&self) -> bool {
-        !self.applied.is_empty() || !self.rolled_back.is_empty() || !self.filtered.is_empty()
+        !self.applied.is_empty()
+            || !self.rolled_back.is_empty()
+            || !self.filtered.is_empty()
+            || !self.lifecycle_advanced.is_empty()
     }
 }
 
@@ -303,6 +309,7 @@ fn drain_and_persist_session_ids_inner(
     let mut to_rollback: Vec<Rollback> = Vec::with_capacity(updates.len());
 
     let mut capture_generations: Vec<(String, u64)> = Vec::with_capacity(updates.len());
+    let mut lifecycle_advanced: Vec<String> = Vec::with_capacity(updates.len());
     for update in &updates {
         let ownership: anyhow::Result<_> = if lifecycle_already_locked || update.confirms_omp_pin {
             Ok(None)
@@ -359,7 +366,10 @@ fn drain_and_persist_session_ids_inner(
                 ))
             });
             match released {
-                Ok(true) => capture_generations.push((update.id.clone(), generation)),
+                Ok(true) => {
+                    lifecycle_advanced.push(update.id.clone());
+                    capture_generations.push((update.id.clone(), generation));
+                }
                 Ok(false) => {
                     tracing::warn!(
                         target: "session.sync",
@@ -476,6 +486,7 @@ fn drain_and_persist_session_ids_inner(
             .collect(),
         rolled_back: to_rollback.into_iter().map(|r| r.id).collect(),
         filtered: filtered_ids.into_iter().collect(),
+        lifecycle_advanced,
     }
 }
 
@@ -1273,6 +1284,7 @@ mod tests {
         assert!(outcome.rolled_back.is_empty());
         assert!(outcome.applied.is_empty());
         assert_eq!(instances[0].agent_session_id, None);
+        assert_eq!(outcome.lifecycle_advanced, vec![instances[0].id.clone()]);
 
         let storage = Storage::new_unwatched(profile).unwrap();
         let loaded = storage.load().unwrap();
@@ -1286,6 +1298,11 @@ mod tests {
             disk_claimant.agent_session_id, None,
             "claimant must not adopt a sid a disk peer already owns"
         );
+        assert_eq!(
+            instances[0].lifecycle_generation,
+            disk_claimant.lifecycle_generation
+        );
+        assert!(instances[0].lifecycle_reservation.is_none());
         let repeated = drain_and_persist_session_ids(&mut instances, &file_watch);
         assert!(!repeated.touched());
         assert!(instances[0]
