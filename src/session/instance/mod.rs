@@ -73,7 +73,7 @@ pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
 
 pub use polling::PollerStart;
-pub use ready::{EnsureReadyError, EnsureReadyOutcome};
+pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
 pub(crate) use resume::ResumeAttemptPolicy;
 pub(crate) use sid_persist::{persist_session_to_storage, SidPersistOutcome, SidWrite};
 pub use start::{LaunchSidOutcome, StartOutcome};

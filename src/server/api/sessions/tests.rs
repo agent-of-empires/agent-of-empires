@@ -2883,55 +2883,95 @@ async fn start_rechecks_the_stored_row() {
     }
 }
 
-/// #4116: web `/send` rechecks the stored row under the lifecycle lock, so a peer's archive
-/// of a session with a live pane refuses the keystrokes and survives the send.
+/// #4116: web `/send` rechecks the stored row under the lifecycle lock, so a peer's archive or
+/// purge of a session with a live pane refuses the keystrokes, and an archive survives the send.
 #[tokio::test]
 #[serial_test::serial]
-async fn send_refuses_a_live_pane_archived_by_a_peer() {
+async fn send_refuses_a_live_pane_a_peer_dismissed() {
     if crate::tmux::tmux_command().arg("-V").output().is_err() {
         eprintln!("tmux not available; skipping");
         return;
     }
     let _home = crate::session::test_support::isolate_app_dir();
     let profile = "default";
+    for (stored_row, want) in [(true, StatusCode::CONFLICT), (false, StatusCode::NOT_FOUND)] {
+        let mut inst = make_test_instance();
+        inst.source_profile = profile.to_string();
+        let id = inst.id.clone();
+        let mut peer = inst.clone();
+        peer.archive();
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = if stored_row { vec![peer] } else { Vec::new() };
+                Ok(())
+            })
+            .unwrap();
+        let pane = crate::tmux::Session::generate_name(&id, &inst.title);
+        let created = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &pane, "sleep", "60"])
+            .status();
+        if !created.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("tmux new-session failed; skipping");
+            return;
+        }
+        crate::tmux::refresh_session_cache();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let response = send_message(
+            State(state.clone()),
+            Path(id.clone()),
+            Ok(Json(SendMessageRequest {
+                message: "hello".into(),
+                revive: false,
+            })),
+        )
+        .await
+        .into_response();
+        let _ = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", &pane])
+            .output();
+        assert_eq!(response.status(), want, "stored_row={stored_row}");
+        if stored_row {
+            assert!(storage.load().unwrap()[0].is_archived());
+        }
+    }
+}
+
+/// #4116: web archive persists under the lifecycle lock `aoe send` holds while it types, so an
+/// archive cannot land mid-send; it waits for the send, then applies.
+#[test]
+#[serial_test::serial]
+fn archive_persist_waits_for_an_in_flight_send() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let profile = "default";
     let mut inst = make_test_instance();
     inst.source_profile = profile.to_string();
     let id = inst.id.clone();
-    let mut peer = inst.clone();
-    peer.archive();
     let storage = Storage::new_unwatched(profile).unwrap();
     storage
         .update(|rows, _| {
-            *rows = vec![peer];
+            *rows = vec![inst.clone()];
             Ok(())
         })
         .unwrap();
-    let pane = crate::tmux::Session::generate_name(&id, &inst.title);
-    let created = crate::tmux::tmux_command()
-        .args(["new-session", "-d", "-s", &pane, "sleep", "60"])
-        .status();
-    if !created.map(|s| s.success()).unwrap_or(false) {
-        eprintln!("tmux new-session failed; skipping");
-        return;
-    }
-    crate::tmux::refresh_session_cache();
-    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+    let stored_archived = || storage.load().unwrap()[0].is_archived();
 
-    let response = send_message(
-        State(state.clone()),
-        Path(id.clone()),
-        Ok(Json(SendMessageRequest {
-            message: "hello".into(),
-            revive: false,
-        })),
-    )
-    .await
-    .into_response();
-    let _ = crate::tmux::tmux_command()
-        .args(["kill-session", "-t", &pane])
-        .output();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert!(storage.load().unwrap()[0].is_archived());
+    let sending = inst.lock_for_input().unwrap();
+    let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+    let archive = std::thread::spawn(move || {
+        let _observer = crate::session::observe_lock_contention_for_test(contended_tx);
+        let storage = Storage::new_unwatched(profile).unwrap();
+        super::update::persist_blocking(&storage, Some(&id), |rows| rows[0].archive())
+    });
+    contended_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the archive must reach the lock the send holds");
+    assert!(!stored_archived(), "the archive must wait for the send");
+
+    drop(sending);
+    archive.join().unwrap().unwrap();
+    assert!(stored_archived());
 }
 
 // Regression for a path-traversal vulnerability in the first cut of

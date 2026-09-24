@@ -256,10 +256,12 @@ pub async fn update_session_archive(
 
     let archived = body.archived;
     let persist_id = id.clone();
-    if persist_session_update(
+    // Locked so an archive cannot land while `aoe send` types into a live pane.
+    if persist_session_update_locked(
         profile,
         "archive update",
         state.file_watch.clone(),
+        id.clone(),
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                 if archived {

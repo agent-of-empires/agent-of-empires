@@ -60,6 +60,11 @@ impl std::fmt::Display for EnsureReadyError {
 
 impl std::error::Error for EnsureReadyError {}
 
+/// A peer purged the stored row while a caller still held its cached copy.
+#[derive(Debug, thiserror::Error)]
+#[error("session no longer exists")]
+pub struct SessionGone;
+
 impl Instance {
     /// Smart-send precondition: bring this session's tmux pane to a state where
     /// `send_keys_with_delay` is safe.
@@ -122,9 +127,10 @@ impl Instance {
             self.resolve_file_watch(),
         )?;
         let lock = storage.acquire_instance_lifecycle_lock(&self.id)?;
-        if let Some(row) = storage.load()?.into_iter().find(|row| row.id == self.id) {
-            row.ensure_startable()?;
-        }
+        let Some(row) = storage.load()?.into_iter().find(|row| row.id == self.id) else {
+            return Err(SessionGone.into());
+        };
+        row.ensure_startable()?;
         Ok(lock)
     }
 
