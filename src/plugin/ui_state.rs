@@ -269,7 +269,7 @@ fn push_link(
     let Some(href) = href.and_then(Value::as_str) else {
         return;
     };
-    if !crate::util::is_http_url(href) || !seen.insert(href.to_string()) {
+    if !crate::util::is_allowed_href(href) || !seen.insert(href.to_string()) {
         return;
     }
     let label = label
@@ -480,9 +480,9 @@ impl UiStore {
             return Err(UiError::BadRequest("notification body too long".into()));
         }
         if let Some(href) = &href {
-            if !crate::util::is_http_url(href) {
+            if !crate::util::is_allowed_href(href) {
                 return Err(UiError::BadRequest(
-                    "notification href must be http/https".into(),
+                    "notification href must be http/https or a relative path".into(),
                 ));
             }
         }
@@ -690,6 +690,8 @@ mod tests {
                         {"href": "https://example.com/pr/1", "text": "dup"},
                         {"href": "javascript:alert(1)", "text": "evil"},
                         {"href": "https://example.com/pr/2", "text": "PR 2"},
+                        {"href": "/session/xyz", "text": "Session"},
+                        {"href": "//evil.com", "text": "scheme-relative"},
                     ]
                 }),
             )],
@@ -701,6 +703,7 @@ mod tests {
             vec![
                 ("https://example.com/pr/1".to_string(), "PR 1".to_string()),
                 ("https://example.com/pr/2".to_string(), "PR 2".to_string()),
+                ("/session/xyz".to_string(), "Session".to_string()),
             ]
         );
 
@@ -944,17 +947,22 @@ mod tests {
     #[test]
     fn notify_rejects_non_http_href() {
         let s = store();
-        assert!(matches!(
-            s.notify(
-                "acme.kit",
-                Tone::Info,
-                "Open".into(),
-                None,
-                None,
-                Some("javascript:alert(1)".into()),
-            ),
-            Err(UiError::BadRequest(_))
-        ));
+        for href in ["javascript:alert(1)", "//evil.com"] {
+            assert!(
+                matches!(
+                    s.notify(
+                        "acme.kit",
+                        Tone::Info,
+                        "Open".into(),
+                        None,
+                        None,
+                        Some(href.into()),
+                    ),
+                    Err(UiError::BadRequest(_))
+                ),
+                "{href}"
+            );
+        }
         let seq = s
             .notify(
                 "acme.kit",
@@ -968,6 +976,26 @@ mod tests {
         assert_eq!(
             s.snapshot().notifications[0].href.as_deref(),
             Some("https://example.com")
+        );
+        assert_eq!(seq, 1);
+    }
+
+    #[test]
+    fn notify_accepts_relative_path_href() {
+        let s = store();
+        let seq = s
+            .notify(
+                "acme.kit",
+                Tone::Info,
+                "Open".into(),
+                None,
+                None,
+                Some("/session/xyz".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            s.snapshot().notifications[0].href.as_deref(),
+            Some("/session/xyz")
         );
         assert_eq!(seq, 1);
     }

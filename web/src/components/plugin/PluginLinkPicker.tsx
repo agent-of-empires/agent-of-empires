@@ -1,12 +1,12 @@
 import { useEffect } from "react";
 
-import { openExternal, type CommandLink } from "../../lib/pluginCommands";
+import { openPluginLink, type CommandLink } from "../../lib/pluginCommands";
 
 /** Picker for an `open-ui-link` keybind that resolved to several links. Opens
  *  inside the key/click gesture so a remote dashboard is not popup-blocked. */
 export function PluginLinkPicker({ links, onClose }: { links: CommandLink[]; onClose: () => void }) {
   const open = (href: string) => {
-    openExternal(href);
+    openPluginLink(href);
     onClose();
   };
 
