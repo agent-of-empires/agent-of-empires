@@ -583,7 +583,12 @@ pub(super) fn carry_sandbox_state(
             };
             let canonical = match fs::canonicalize(&entry) {
                 Ok(canonical) => canonical,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        || matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) =>
+                {
+                    continue
+                }
                 Err(error) => return Err(error).context("resolving carried native state"),
             };
             let declared = boundary.source_root.path().join(relative);
@@ -2049,6 +2054,25 @@ mod tests {
             b"OWN_NATIVE_HISTORY"
         );
         assert_eq!(fs::read(&history).unwrap(), b"OWN_NATIVE_HISTORY");
+    }
+
+    #[test]
+    fn a_looped_carried_entry_is_not_carried() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let active = temporary.path().join("active");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir(&active).unwrap();
+        fs::write(source.join("opencode.db"), b"OWN_NATIVE_HISTORY").unwrap();
+        std::os::unix::fs::symlink("opencode.db-wal", source.join("opencode.db-wal")).unwrap();
+        let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+        boundary.stopped_original = Some(boundary.source_root.path().to_path_buf());
+        carry_sandbox_state(&source, &active, &["opencode.db*"], &boundary).unwrap();
+        assert_eq!(
+            fs::read(active.join("opencode.db")).unwrap(),
+            b"OWN_NATIVE_HISTORY"
+        );
+        assert!(fs::symlink_metadata(active.join("opencode.db-wal")).is_err());
     }
 
     #[test]
