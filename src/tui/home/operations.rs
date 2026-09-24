@@ -326,8 +326,8 @@ impl HomeView {
                 tree.create_group(&instance.group_path);
             }
         }
-        self.save()?;
         drop(identity_lock);
+        self.save_with_storage()?;
 
         self.reload()?;
         // reload()'s selection fallback lands on the nearest index, often the new
@@ -568,7 +568,7 @@ impl HomeView {
         // Persist profile/tool/command and the access timestamp while the durable row
         // still carries its prior lifecycle. The worker owns the Starting reservation;
         // publishing that status here would make it reject its own request.
-        self.save()?;
+        self.save_with_storage()?;
         // The canonical profile locks are already released; publish the final launch
         // edit while identity, title and lifecycle are still guarded.
         drop(profile_move_identity);
