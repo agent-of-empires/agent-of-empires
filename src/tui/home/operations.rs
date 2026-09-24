@@ -1826,10 +1826,17 @@ impl HomeView {
             return Ok(());
         }
 
-        // Tear down all tmux before flipping archived. #1868.
-        if let Some(inst) = self.instances.get(&id) {
-            inst.kill_all_tmux_sessions();
-        }
+        // Tear down all tmux before flipping archived (#1868), holding the lifecycle lock
+        // through the archive so `aoe send` cannot relaunch or type into the session between.
+        let lifecycle_lock = match self.instances.get(&id) {
+            Some(inst) => {
+                let storage = Storage::new(&inst.effective_profile(), self.file_watch.clone())?;
+                let lock = storage.acquire_instance_lifecycle_lock(&id)?;
+                inst.stop_all_tmux_sessions_locked(&storage);
+                Some(lock)
+            }
+            None => None,
+        };
 
         // Decide where the cursor lands before the row sinks, against the pre-archive
         // list. Only the non-Attention branch uses it; Attention re-picks from the top.
@@ -1838,6 +1845,7 @@ impl HomeView {
             .flatten();
 
         self.apply_user_action(&id, |inst| inst.archive())?;
+        drop(lifecycle_lock);
         if self.sort_order == crate::session::config::SortOrder::Attention {
             // Attention sort is a triage flow: the cursor advances to the next item
             // that needs attention, which is always a live row.
@@ -2169,19 +2177,29 @@ impl HomeView {
         }
     }
 
-    /// Archive every active session under the selected group: tmux teardown
-    /// runs off-thread, persist runs inline. Confirmation upstream. See #1868.
+    /// Archive every active session under the selected group: persist runs inline, then tmux
+    /// teardown runs off-thread. Confirmation upstream. See #1868.
     pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
         let ids = self.active_sessions_in_selected_group();
         if ids.is_empty() {
             return Ok(());
         }
-        // Off-thread tmux teardown so N x 4 shellouts don't block the input
-        // thread. Mirrors `force_remove_session`.
         let kill_targets: Vec<_> = ids
             .iter()
             .filter_map(|id| self.instances.get(id).cloned())
             .collect();
+        // Persist under every member's lifecycle lock so `aoe send` cannot relaunch or type
+        // into one mid-archive, and tear down only after: a send that won the lock finishes
+        // first and its pane is then killed.
+        let mut lifecycle_locks = Vec::with_capacity(kill_targets.len());
+        for inst in &kill_targets {
+            let storage = Storage::new(&inst.effective_profile(), self.file_watch.clone())?;
+            lifecycle_locks.push(storage.acquire_instance_lifecycle_lock(&inst.id)?);
+        }
+        self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
+        drop(lifecycle_locks);
+        // Off-thread tmux teardown so N x 4 shellouts don't block the input
+        // thread. Mirrors `force_remove_session`.
         std::thread::spawn(move || {
             for inst in kill_targets {
                 if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2196,7 +2214,6 @@ impl HomeView {
                 }
             }
         });
-        self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
         self.reveal_archived_section();
         self.rebuild_flat_items();
         // The project header vanishes once its last active member is archived, so the
