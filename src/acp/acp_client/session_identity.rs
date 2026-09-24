@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StateMutex;
 use tokio::sync::{oneshot, Mutex, MutexGuard, Notify};
 
+use super::control::PromptCompletedMarker;
 use super::errors::acp_internal_error;
 use crate::acp::control_protocol::{
     SessionReplayed, MAX_CONTROL_QUEUE_BYTES, MAX_CONTROL_QUEUE_FRAMES,
@@ -39,17 +40,22 @@ pub(super) enum SessionIngressNotification {
     Update(serde_json::Value),
     /// Runner-minted barrier marking the end of a session/load replay (#4016).
     Replayed(SessionReplayed),
+    /// Daemon-minted barrier releasing a local prompt's outcome.
+    PromptCompleted(PromptCompletedMarker),
 }
 
 impl JsonRpcMessage for SessionIngressNotification {
     fn matches_method(method: &str) -> bool {
-        SessionNotification::matches_method(method) || SessionReplayed::matches_method(method)
+        SessionNotification::matches_method(method)
+            || SessionReplayed::matches_method(method)
+            || PromptCompletedMarker::matches_method(method)
     }
 
     fn method(&self) -> &str {
         match self {
             Self::Update(_) => "session/update",
             Self::Replayed(marker) => marker.method(),
+            Self::PromptCompleted(marker) => marker.method(),
         }
     }
 
@@ -57,6 +63,7 @@ impl JsonRpcMessage for SessionIngressNotification {
         match self {
             Self::Update(params) => UntypedMessage::new(self.method(), params),
             Self::Replayed(marker) => marker.to_untyped_message(),
+            Self::PromptCompleted(marker) => marker.to_untyped_message(),
         }
     }
 
@@ -66,6 +73,11 @@ impl JsonRpcMessage for SessionIngressNotification {
     ) -> agent_client_protocol::Result<Self> {
         if SessionReplayed::matches_method(method) {
             return Ok(Self::Replayed(SessionReplayed::parse_message(
+                method, params,
+            )?));
+        }
+        if PromptCompletedMarker::matches_method(method) {
+            return Ok(Self::PromptCompleted(PromptCompletedMarker::parse_message(
                 method, params,
             )?));
         }

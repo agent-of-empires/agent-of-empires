@@ -216,6 +216,12 @@ pub(super) async fn run_connection_task<W, R>(
                                 }
                                 return Ok(());
                             }
+                            SessionIngressNotification::PromptCompleted(marker) => {
+                                if let Some(control) = control.as_ref() {
+                                    control.deliver_prompt_completion(marker);
+                                }
+                                return Ok(());
+                            }
                             SessionIngressNotification::Update(params) => params,
                         };
                         let (notification, wire_bytes) = SessionIngressNotification::decode_update(
