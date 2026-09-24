@@ -113,69 +113,87 @@ pub(crate) fn read_pi_session_observation(
     let id_bytes = read(&sid_leaf, !any_age)?;
     let sid = std::str::from_utf8(&id_bytes).ok()?.trim();
     Uuid::parse_str(sid).ok()?;
-    let path_bytes = read(&path_leaf, false)?;
-    let path = Path::new(std::str::from_utf8(&path_bytes).ok()?.trim());
-    if !path.is_absolute() || crate::git::template::lexical_normalize(path) != path {
-        return None;
-    }
-    let native = match active.and_then(|active| active.container.as_ref()) {
-        Some(container) => container.runtime.canonical_path(&container.id, path).ok()?,
-        None if matches!(source, SessionSidecarSource::HostHooks(_)) => {
-            super::canonicalize_or_raw(path.to_str()?)
-        }
-        None => path.to_path_buf(),
+    let path_bytes = read(&path_leaf, false);
+    let path = match path_bytes.as_deref() {
+        Some(bytes) => Some(Path::new(std::str::from_utf8(bytes).ok()?.trim())),
+        None => None,
     };
-    let physical = if let Some(active) = active {
-        let Some(CaptureContext::Pi { root, .. }) = &active.capture else {
-            return None;
-        };
-        if !native.starts_with(root) || native == *root {
+    let transcript = if let Some(path) = path {
+        if !path.is_absolute() || crate::git::template::lexical_normalize(path) != path {
             return None;
         }
-        match &active.container {
-            Some(container) => container.host_path(&native, true)?,
-            None => native.clone(),
+        // Pi writes the ID first and leaves the previous path until the new one exists.
+        if extract_pi_uuid_from_filename(path).is_some_and(|path_id| path_id != sid) {
+            None
+        } else {
+            let native = match active.and_then(|active| active.container.as_ref()) {
+                Some(container) => container.runtime.canonical_path(&container.id, path).ok()?,
+                None if matches!(source, SessionSidecarSource::HostHooks(_)) => {
+                    super::canonicalize_or_raw(path.to_str()?)
+                }
+                None => path.to_path_buf(),
+            };
+            let physical = if let Some(active) = active {
+                let Some(CaptureContext::Pi { root, .. }) = &active.capture else {
+                    return None;
+                };
+                if !native.starts_with(root) || native == *root {
+                    return None;
+                }
+                match &active.container {
+                    Some(container) => container.host_path(&native, true)?,
+                    None => native.clone(),
+                }
+            } else {
+                match source {
+                    SessionSidecarSource::HostHooks(_) => native.clone(),
+                    SessionSidecarSource::SandboxDir(directory) => directory
+                        .parent()?
+                        .parent()?
+                        .join(native.strip_prefix("/root/.pi").ok()?),
+                }
+            };
+            let parent = physical.parent()?;
+            let root = crate::session::AnchoredDir::open(parent).ok()?;
+            let leaf = Path::new(physical.file_name()?);
+            match root.regular_lookup(leaf).ok()? {
+                Some(true) => {
+                    if extract_pi_header_fields(&physical)?.0.as_deref() != Some(sid) {
+                        return None;
+                    }
+                }
+                None => {
+                    if leaf.to_str()?.rsplit_once('_')?.1.strip_suffix(".jsonl")? != sid {
+                        return None;
+                    }
+                }
+                Some(false) => return None,
+            }
+            Some((native, physical))
         }
     } else {
-        match source {
-            SessionSidecarSource::HostHooks(_) => native.clone(),
-            SessionSidecarSource::SandboxDir(directory) => directory
-                .parent()?
-                .parent()?
-                .join(native.strip_prefix("/root/.pi").ok()?),
-        }
+        None
     };
-    let parent = physical.parent()?;
-    let root = crate::session::AnchoredDir::open(parent).ok()?;
-    let leaf = Path::new(physical.file_name()?);
-    match root.regular_lookup(leaf).ok()? {
-        Some(true) => {
-            if extract_pi_header_fields(&physical)?.0.as_deref() != Some(sid) {
-                return None;
-            }
-        }
-        None => {
-            if leaf.to_str()?.rsplit_once('_')?.1.strip_suffix(".jsonl")? != sid {
-                return None;
-            }
-        }
-        Some(false) => return None,
-    }
     if read(&sid_leaf, !any_age)? != id_bytes {
         return None;
     }
-    let published_path = native.to_str()?.to_owned();
+    let published_path = match transcript.as_ref() {
+        Some((native, _)) => Some(native.to_str()?.to_owned()),
+        None => None,
+    };
     let mut observation = crate::session::poller::SessionIdObservation::instance_sidecar(
         sid.to_owned(),
-        Some(published_path.clone()),
+        published_path.clone(),
     );
-    observation.pi_session_path = Some(published_path);
+    observation.pi_session_path = published_path;
     if let Some(active) = active {
         let mut binding = active.binding.clone();
-        binding.stores = vec![parent.to_path_buf()];
+        if let Some((_, physical)) = transcript {
+            binding.stores = vec![physical.parent()?.to_path_buf()];
+            observation.transcript_path = Some(physical);
+        }
         observation.execution = Some(active.clone());
         observation.source = Some(binding);
-        observation.transcript_path = Some(physical);
     }
     Some(observation)
 }
@@ -214,6 +232,118 @@ mod tests {
             ))
             .as_deref(),
             Some("019342ab-1234-7def-8901-abcdef012345")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pi_sidecar_captures_id_before_its_transcript_is_published() {
+        let (_hooks, _base, _hooks_tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let tmp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let inst = crate::session::Instance::new("pi-path-later", tmp.path().to_str().unwrap());
+        let source = crate::session::instance::SessionSidecarSource::host_hooks(&inst.id);
+        let poll = pi_sidecar_poll_fn(inst.id.clone(), source, None);
+        let old = "11111111-2222-4333-8444-555555555555";
+        let current = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        crate::hooks::write_session_id_via_guard(&inst.id, current, None).unwrap();
+
+        let observation = poll().expect("the ID precedes Pi getSessionFile()");
+        assert_eq!(observation.sid, current);
+        assert!(observation.pi_session_path.is_none());
+        assert_eq!(
+            observation.guard,
+            crate::session::poller::SessionIdGuard::InstanceSidecar { transcript: None }
+        );
+
+        let sidecar = crate::hooks::ensure_instance_dir_path(&inst.id).unwrap();
+        let old_file = tmp
+            .path()
+            .join(format!("2026-01-01T00-00-00-000Z_{old}.jsonl"));
+        std::fs::write(
+            &old_file,
+            format!("{}\n", serde_json::json!({"type": "session", "id": old})),
+        )
+        .unwrap();
+        std::fs::write(sidecar.join("session_path"), old_file.to_str().unwrap()).unwrap();
+        let observation = poll().expect("an old transcript cannot hide a newer ID");
+        assert_eq!(observation.sid, current);
+        assert!(observation.pi_session_path.is_none());
+
+        let current_file = tmp
+            .path()
+            .join(format!("2026-01-01T00-00-00-000Z_{current}.jsonl"));
+        std::fs::write(
+            &current_file,
+            format!(
+                "{}\n",
+                serde_json::json!({"type": "session", "id": current})
+            ),
+        )
+        .unwrap();
+        std::fs::write(sidecar.join("session_path"), current_file.to_str().unwrap()).unwrap();
+        let observation = poll().expect("the matching transcript becomes available later");
+        assert_eq!(observation.sid, current);
+        assert_eq!(
+            observation.pi_session_path.as_deref(),
+            current_file.to_str()
+        );
+
+        let launch = "22222222-3333-4333-8444-555555555555";
+        let source = crate::session::instance::SessionSidecarSource::host_hooks(&inst.id);
+        let binding = crate::session::ExecutionBinding {
+            agent: "pi".into(),
+            stores: vec![tmp.path().join("store")],
+            configuration: Vec::new(),
+            cwd: tmp.path().to_path_buf(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        let active = crate::session::instance::ActiveExecution {
+            launch_id: launch.into(),
+            binding: binding.clone(),
+            capture: Some(crate::session::instance::CaptureContext::Pi {
+                source: source.clone(),
+                root: tmp.path().to_path_buf(),
+            }),
+            container: None,
+        };
+        crate::hooks::write_session_id_via_guard(&inst.id, current, Some(launch)).unwrap();
+        let scoped = pi_sidecar_poll_fn(inst.id.clone(), source, Some(active.clone()));
+        let observation = scoped().expect("a launch-scoped Pi ID is attributable without a path");
+        assert_eq!(observation.source.as_ref(), Some(&binding));
+        assert_eq!(observation.execution.as_ref(), Some(&active));
+        assert!(observation.transcript_path.is_none());
+        assert!(observation.pi_session_path.is_none());
+
+        let path_leaf = format!("session_path.{launch}");
+        std::fs::write(sidecar.join(&path_leaf), current_file.to_str().unwrap()).unwrap();
+        let observation = scoped().expect("the active launch publishes its path later");
+        assert_eq!(
+            observation.transcript_path.as_deref(),
+            Some(current_file.as_path())
+        );
+        assert_eq!(
+            observation.source.unwrap().stores,
+            vec![tmp.path().to_path_buf()]
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        let foreign = outside
+            .path()
+            .join(format!("2026-01-01T00-00-00-000Z_{current}.jsonl"));
+        std::fs::write(
+            &foreign,
+            format!(
+                "{}\n",
+                serde_json::json!({"type": "session", "id": current})
+            ),
+        )
+        .unwrap();
+        std::fs::write(sidecar.join(path_leaf), foreign.to_str().unwrap()).unwrap();
+        assert!(
+            scoped().is_none(),
+            "a path outside the launch root must fail closed"
         );
     }
 }
