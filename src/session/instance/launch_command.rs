@@ -1472,6 +1472,9 @@ mod tests {
         let default = temp.path().join(".claude");
         let custom = temp.path().join("custom-claude");
         let sid = "11111111-1111-4111-8111-111111111111";
+        let canonical = |path: &std::path::Path| {
+            crate::session::capture::canonicalize_allowing_missing_leaf(path).unwrap()
+        };
         for (exported, expected) in [
             (None, None),
             (Some(&default), Some(&default)),
@@ -1481,6 +1484,7 @@ mod tests {
                 Some(dir) => EnvGuard::set(&[("CLAUDE_CONFIG_DIR", dir)]),
                 None => EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]),
             };
+            let expected = expected.map(|path| canonical(path));
             let mut inst = Instance::new("claude-host-store", "/tmp");
             let routed = |inst: &Instance| {
                 let execution = inst
@@ -1490,12 +1494,12 @@ mod tests {
                     .routing
                     .iter()
                     .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
-                    .map(|(_, value)| value.clone().map(std::path::PathBuf::from))
+                    .map(|(_, value)| value.as_deref().map(|value| canonical(value.as_ref())))
                     .expect("Claude store is always routed");
                 (routed, execution)
             };
             let (fresh, execution) = routed(&inst);
-            assert_eq!(fresh.as_ref(), expected, "exported={exported:?}");
+            assert_eq!(fresh, expected, "exported={exported:?}");
             let (command, _, _, _) = inst.build_launch_command(Some(&execution)).unwrap();
             let command = command.unwrap();
             assert_eq!(
@@ -1507,7 +1511,7 @@ mod tests {
             // Resuming a conversation recorded in the default store keeps it unset.
             inst.resume_binding = Some(inst.asserted_resume_binding(sid, None).unwrap());
             inst.resume_intent = ResumeIntent::Use(sid.into());
-            assert_eq!(routed(&inst).0.as_ref(), expected, "exported={exported:?}");
+            assert_eq!(routed(&inst).0, expected, "exported={exported:?}");
         }
     }
 
