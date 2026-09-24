@@ -7,13 +7,13 @@ use anyhow::{Context, Result};
 
 use super::super::canonical_expected_path;
 use super::super::policy::Exception;
-use super::{Changed, Fingerprint, NativeStateBoundary, ReadAccess, StateOrigin};
+use super::{Changed, DirectoryIdentity, NativeStateBoundary, ReadAccess, StateOrigin};
 use crate::session::anchored_fs::AnchoredDir;
 
 pub(super) struct Inventory<'a> {
     boundary: &'a NativeStateBoundary,
     access: ReadAccess<'a>,
-    directories: &'a mut BTreeMap<PathBuf, Fingerprint>,
+    directories: &'a mut BTreeMap<PathBuf, DirectoryIdentity>,
     routes: &'a mut Vec<(PathBuf, PathBuf)>,
     entries: &'a mut BTreeMap<PathBuf, Option<(u64, u64, u32)>>,
     visited: HashSet<(u64, u64, StateOrigin, bool, bool)>,
@@ -26,7 +26,7 @@ impl<'a> Inventory<'a> {
     pub(super) fn new(
         boundary: &'a NativeStateBoundary,
         access: ReadAccess<'a>,
-        directories: &'a mut BTreeMap<PathBuf, Fingerprint>,
+        directories: &'a mut BTreeMap<PathBuf, DirectoryIdentity>,
         routes: &'a mut Vec<(PathBuf, PathBuf)>,
         entries: &'a mut BTreeMap<PathBuf, Option<(u64, u64, u32)>>,
     ) -> Self {
@@ -46,7 +46,7 @@ impl<'a> Inventory<'a> {
     pub(super) fn symlinks(
         boundary: &'a NativeStateBoundary,
         access: ReadAccess<'a>,
-        directories: &'a mut BTreeMap<PathBuf, Fingerprint>,
+        directories: &'a mut BTreeMap<PathBuf, DirectoryIdentity>,
         routes: &'a mut Vec<(PathBuf, PathBuf)>,
         entries: &'a mut BTreeMap<PathBuf, Option<(u64, u64, u32)>>,
     ) -> Self {
@@ -135,7 +135,17 @@ impl<'a> Inventory<'a> {
                 self.inodes.insert(identity(&stat));
             }
         } else if mode == libc::S_IFDIR {
-            let child = directory.child(leaf)?;
+            let child = directory.child(leaf).map_err(|error| {
+                if missing(&error) {
+                    Changed(format!(
+                        "native state directory changed before inventory: {}",
+                        lookup.display()
+                    ))
+                    .into()
+                } else {
+                    error
+                }
+            })?;
             let (device, inode) = child.identity()?;
             if device != stat.st_dev || inode != stat.st_ino {
                 return Err(

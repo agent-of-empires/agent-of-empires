@@ -653,6 +653,17 @@ fn copy_selected_file(
     )
 }
 
+fn unavailable_directory(error: &anyhow::Error) -> bool {
+    let unavailable = |code| matches!(code, libc::ENOENT | libc::ENOTDIR | libc::ELOOP);
+    error
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        .is_some_and(unavailable)
+        || error
+            .downcast_ref::<nix::errno::Errno>()
+            .is_some_and(|errno| unavailable(*errno as i32))
+}
+
 fn bounded_directory_names(
     root: &AnchoredDir,
     source: &Path,
@@ -660,12 +671,23 @@ fn bounded_directory_names(
     max: usize,
 ) -> Result<Option<Vec<std::ffi::OsString>>> {
     match fs::symlink_metadata(source.join(relative)) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
+            ) =>
+        {
+            return Ok(None)
+        }
         Err(error) => return Err(error.into()),
+        Ok(metadata) if !metadata.is_dir() => return Ok(None),
         Ok(_) => {}
     }
-    let names = root.read_dir(relative, max.saturating_add(1))?;
-    Ok((names.len() <= max).then_some(names))
+    match root.read_dir(relative, max.saturating_add(1)) {
+        Ok(names) => Ok((names.len() <= max).then_some(names)),
+        Err(error) if unavailable_directory(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn carry_gemini_session(
@@ -808,6 +830,7 @@ fn carry_prime_session(
 }
 
 fn carry_kimi_session(
+    root: &AnchoredDir,
     source: &Path,
     destination: &Path,
     boundary: &NativeStateBoundary,
@@ -828,11 +851,23 @@ fn carry_kimi_session(
         return Ok(None);
     };
     let relative = Path::new("sessions").join(&leaf);
-    match fs::symlink_metadata(source.join(&relative)) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    match root.child(&relative) {
+        Ok(_) => {}
+        Err(error) if unavailable_directory(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    match fs::canonicalize(source.join(&relative)) {
+        Ok(canonical) if canonical == boundary.source_root.path().join(&relative) => {}
         Ok(_) => return Ok(None),
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error.into()),
     }
     let pattern = format!("sessions/{leaf}");
     carry_sandbox_state(source, destination, &[pattern.as_str()], boundary)?;
@@ -877,6 +912,7 @@ pub(super) fn carry_selected_sandbox_state(
             }
             "kimi" => {
                 if let Some(record) = carry_kimi_session(
+                    &root,
                     source,
                     destination,
                     boundary,
@@ -1814,62 +1850,6 @@ impl ResourceSeed<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn a_changed_native_source_is_reopened_before_publication() {
-        for change in ["directory", "replacement", "gap"] {
-            let temporary = tempfile::tempdir().unwrap();
-            let source = temporary.path().join("source");
-            let active = temporary.path().join("active");
-            fs::create_dir(&source).unwrap();
-            fs::create_dir(&active).unwrap();
-            fs::write(source.join("settings.json"), b"current settings").unwrap();
-            let mut attempts = 0;
-            retry_source_change(|| {
-                attempts += 1;
-                let boundary = NativeStateBoundary::for_source(&source, &active)?;
-                if attempts == 1 {
-                    match change {
-                        "replacement" => {
-                            fs::write(source.join("settings.tmp"), b"updated settings")?;
-                            fs::rename(source.join("settings.tmp"), source.join("settings.json"))?;
-                        }
-                        "gap" => {
-                            fs::rename(source.join("settings.json"), source.join("settings.old"))?
-                        }
-                        _ => fs::create_dir(source.join("new-project"))?,
-                    }
-                }
-                let result = sync_agent_config(
-                    &source,
-                    &active,
-                    &["settings.json"],
-                    &[],
-                    &[],
-                    &[],
-                    &boundary,
-                )
-                .and_then(|_| boundary.validate_source());
-                if attempts == 1 {
-                    assert!(result.is_err());
-                    assert!(!active.join("settings.json").exists());
-                    if change == "gap" {
-                        fs::rename(source.join("settings.old"), source.join("settings.json"))?;
-                    }
-                }
-                result
-            })
-            .unwrap();
-            assert_eq!(attempts, 2);
-            assert_eq!(
-                fs::read(active.join("settings.json")).unwrap(),
-                if change == "replacement" {
-                    b"updated settings".as_slice()
-                } else {
-                    b"current settings".as_slice()
-                },
-            );
-        }
-    }
 
     #[test]
     fn sqlite_seed_refuses_uncommitted_spilled_pages_and_retries_after_rollback() {
@@ -2467,29 +2447,30 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_directory_churn_does_not_authorize_a_new_native_scope() {
+    fn native_directory_churn_preserves_config_but_new_alias_blocks_publication() {
         use std::io::Seek;
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");
         let active = temporary.path().join("active");
-        let native = temporary.path().join("not-yet-a-native-home");
-        fs::create_dir_all(&source).unwrap();
+        let native = source.join("projects");
+        fs::create_dir_all(&native).unwrap();
         fs::create_dir_all(&active).unwrap();
         let input = source.join("settings.json");
         fs::write(&input, b"APPROVED_CONFIGURATION").unwrap();
         let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
-        let mount = AGENT_CONFIG_MOUNTS
-            .iter()
-            .find(|mount| mount.tool_name == "hermes")
-            .unwrap();
-        boundary.add_root(&native, mount).unwrap();
+        boundary.add_classified_path(native.clone(), StateOrigin::Native);
         let mut guard = guard::ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
         let mut file = open_canonical_file(&input, ReadAccess::default())
             .unwrap()
             .unwrap();
         assert!(guard.record_file(&input, &file).unwrap());
         let output = AnchoredDir::open(&active).unwrap();
-        fs::create_dir(temporary.path().join("unrelated-directory")).unwrap();
+        fs::create_dir(native.join("new-project")).unwrap();
+        fs::write(
+            native.join("new-project/history.jsonl"),
+            b"UNRELATED_HISTORY",
+        )
+        .unwrap();
         let validate = || guard.validate();
         output
             .publish_file(
@@ -2508,8 +2489,7 @@ mod tests {
             b"APPROVED_CONFIGURATION"
         );
         fs::write(active.join("settings.json"), b"LOCAL_CONFIGURATION").unwrap();
-        fs::create_dir_all(native.join("sessions")).unwrap();
-        std::os::unix::fs::symlink(&input, native.join("sessions/new-native-state.jsonl")).unwrap();
+        std::os::unix::fs::symlink(&input, native.join("new-project/alias")).unwrap();
         file.rewind().unwrap();
         assert!(output
             .publish_file(

@@ -141,11 +141,13 @@ original left alone. AoE carries Claude `projects/`, Codex `sessions/` and
 from a retired store. It also carries only a uniquely attributable Gemini
 `tmp/<project>/chats` session file, Kimi session directory plus its live
 index entry, or Prime session file with a matching root header in the managed
-`sessions/` directory. Carried conversations keep their native IDs; an ACP
-adapter backed by that same store can keep its context, while an adapter
-without that provenance starts fresh. Missing, deleted or ambiguous matches
-remain in recovery and have their IDs reset. Pi, OMP, Hermes and other
-unverified conversation histories remain in recovery instead of being copied.
+`sessions/` directory. Carried conversations keep their native IDs. Claude,
+Codex and OpenCode can also continue a structured session backed by that store;
+Gemini, Kimi and Prime start a fresh ACP session because carrying the native
+conversation does not prove that `session/load` can recover the ACP ID. Missing,
+deleted or ambiguous matches remain in recovery and have their IDs reset. Pi,
+OMP, Hermes and other unverified conversation histories remain in recovery
+instead of being copied.
 Host native history is never imported. The next start names retained originals;
 isolated history is not replayed automatically.
 
@@ -153,8 +155,10 @@ Sessions created under the older shared-store layout move to a private store the
 
 The first start can therefore be slower; the TUI shows progress. `aoe migrate` moves every eligible session at once, and `AOE_DEFER_SANDBOX_MIGRATION=1` skips the move for one launch (a stopped session then cannot start until its store has moved). Trashed and archived sessions keep the shared store until they are started again.
 
-If native configuration changes throughout isolation, that session remains
-pending; `aoe migrate` continues with other sessions and retries later.
+A sandbox still running during an upgrade remains pending: transcript capture
+pauses until it is stopped, isolated and launched again. If native configuration
+changes throughout isolation, that session remains pending; `aoe migrate`
+continues with other sessions and retries later.
 
 ### Shared credentials
 

@@ -49,10 +49,25 @@ impl From<&Metadata> for Fingerprint {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl From<&Metadata> for DirectoryIdentity {
+    fn from(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
 pub(super) struct SourceRoot {
     anchor: AnchoredDir,
     lookup: PathBuf,
-    fingerprint: Fingerprint,
+    identity: DirectoryIdentity,
 }
 
 impl SourceRoot {
@@ -68,7 +83,7 @@ impl SourceRoot {
         Ok(Self {
             anchor,
             lookup: path.to_path_buf(),
-            fingerprint: Fingerprint::from(&metadata),
+            identity: DirectoryIdentity::from(&metadata),
         })
     }
 
@@ -78,8 +93,8 @@ impl SourceRoot {
 
     pub(super) fn validate(&self) -> Result<()> {
         if fs::canonicalize(&self.lookup).map_err(source_io)? != self.anchor.path()
-            || Fingerprint::from(&fs::metadata(&self.lookup).map_err(source_io)?)
-                != self.fingerprint
+            || DirectoryIdentity::from(&fs::metadata(&self.lookup).map_err(source_io)?)
+                != self.identity
         {
             return Err(
                 Changed("native configuration source root changed during seeding".into()).into(),
@@ -125,7 +140,7 @@ pub(super) struct ReadGuard<'a> {
     pub(super) access: ReadAccess<'a>,
     aliases: Vec<(PathBuf, StateOrigin)>,
     routes: Vec<(PathBuf, PathBuf)>,
-    directories: BTreeMap<PathBuf, Fingerprint>,
+    directories: BTreeMap<PathBuf, DirectoryIdentity>,
     files: BTreeMap<PathBuf, Fingerprint>,
     state_inodes: Option<HashSet<(u64, u64)>>,
     symlink_inodes: Option<HashSet<(u64, u64)>>,
@@ -287,20 +302,43 @@ impl<'a> ReadGuard<'a> {
 
     pub(super) fn validate(&self) -> Result<()> {
         if !self.files.is_empty() {
+            let current = Self::new(self.boundary, self.access)?;
+            if self.files.keys().any(|file| {
+                current.aliases.iter().any(|(state, origin)| {
+                    self.boundary
+                        .rejects_path(file, state, false, *origin, self.access)
+                })
+            }) {
+                bail!("configuration source became native state during seeding");
+            }
+            let aliases = current.aliases;
             let mut directories = BTreeMap::new();
             let mut routes = Vec::new();
             let mut entries = BTreeMap::new();
-            let inodes = scan_symlinks(
+            let mut inodes = scan_symlinks(
                 self.boundary,
                 self.access,
-                &self.aliases,
+                &aliases,
                 &mut directories,
                 &mut routes,
                 &mut entries,
             )?;
+            if self.files.values().any(|file| file.links > 1) {
+                for (state, origin) in &aliases {
+                    let mut walk = inventory::Inventory::new(
+                        self.boundary,
+                        self.access,
+                        &mut directories,
+                        &mut routes,
+                        &mut entries,
+                    );
+                    walk.root(state, *origin)?;
+                    inodes.extend(walk.finish());
+                }
+            }
             validate_namespace(&entries, &routes)?;
             for (path, expected) in &directories {
-                if Fingerprint::from(&fs::metadata(path).map_err(source_io)?) != *expected {
+                if DirectoryIdentity::from(&fs::metadata(path).map_err(source_io)?) != *expected {
                     return Err(
                         Changed("native-state inventory changed during validation".into()).into(),
                     );
@@ -318,10 +356,19 @@ impl<'a> ReadGuard<'a> {
         self.boundary.source_root.validate()?;
         self.boundary.hermes.validate()?;
         self.access.validate()?;
-        for (path, expected) in self.directories.iter().chain(&self.files) {
+        for (path, expected) in &self.directories {
+            if DirectoryIdentity::from(&fs::metadata(path).map_err(source_io)?) != *expected {
+                return Err(Changed(format!(
+                    "configuration source directory changed during seeding: {}",
+                    path.display()
+                ))
+                .into());
+            }
+        }
+        for (path, expected) in &self.files {
             if Fingerprint::from(&fs::metadata(path).map_err(source_io)?) != *expected {
                 return Err(Changed(format!(
-                    "configuration source or native-state inventory changed during seeding: {}",
+                    "configuration source file changed during seeding: {}",
                     path.display()
                 ))
                 .into());
@@ -335,7 +382,7 @@ fn scan_symlinks(
     boundary: &NativeStateBoundary,
     access: ReadAccess<'_>,
     aliases: &[(PathBuf, StateOrigin)],
-    directories: &mut BTreeMap<PathBuf, Fingerprint>,
+    directories: &mut BTreeMap<PathBuf, DirectoryIdentity>,
     routes: &mut Vec<(PathBuf, PathBuf)>,
     entries: &mut BTreeMap<PathBuf, Option<(u64, u64, u32)>>,
 ) -> Result<HashSet<(u64, u64)>> {
@@ -419,19 +466,22 @@ fn watch_entry(
     bail!("native-state boundary has no existing ancestor")
 }
 
-fn seal_directory(directories: &mut BTreeMap<PathBuf, Fingerprint>, path: &Path) -> Result<()> {
+fn seal_directory(
+    directories: &mut BTreeMap<PathBuf, DirectoryIdentity>,
+    path: &Path,
+) -> Result<()> {
     let metadata = fs::metadata(path).map_err(source_io)?;
     if !metadata.is_dir() {
         return Err(Changed("native-state directory changed type".into()).into());
     }
     directories
         .entry(path.to_path_buf())
-        .or_insert_with(|| Fingerprint::from(&metadata));
+        .or_insert_with(|| DirectoryIdentity::from(&metadata));
     Ok(())
 }
 
 fn pin_anchored_directory(
-    directories: &mut BTreeMap<PathBuf, Fingerprint>,
+    directories: &mut BTreeMap<PathBuf, DirectoryIdentity>,
     directory: &AnchoredDir,
 ) -> Result<()> {
     let metadata = fs::metadata(directory.path()).map_err(source_io)?;
@@ -524,6 +574,83 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn moving_a_hardlink_into_native_state_blocks_publication() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let active = temporary.path().join("active");
+        let state = temporary.path().join("state");
+        for path in [&source, &active, &state] {
+            fs::create_dir(path).unwrap();
+        }
+        let selected = source.join("settings.json");
+        let peer = temporary.path().join("authored-link");
+        fs::write(&selected, b"AUTHORED_CONFIG").unwrap();
+        fs::hard_link(&selected, &peer).unwrap();
+        fs::write(active.join("settings.json"), b"LOCAL_CONFIG").unwrap();
+        let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+        boundary.add_path(state.clone());
+        let mut guard = ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
+        let mut file = File::open(&selected).unwrap();
+        assert!(guard.record_file(&selected, &file).unwrap());
+
+        fs::rename(peer, state.join("native-link")).unwrap();
+        let error = super::super::publish_guarded_file(
+            &mut file,
+            &guard,
+            &AnchoredDir::open(&active).unwrap(),
+            Path::new("settings.json"),
+            fs::metadata(&selected).unwrap().permissions(),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("native state"));
+        assert_eq!(
+            fs::read(active.join("settings.json")).unwrap(),
+            b"LOCAL_CONFIG"
+        );
+    }
+
+    #[test]
+    fn new_globbed_native_scope_cannot_alias_a_selected_file() {
+        for direct in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("source");
+            let active = temporary.path().join("active");
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(&active).unwrap();
+            let selected = source.join("settings.json");
+            fs::write(&selected, b"APPROVED_CONFIG").unwrap();
+            let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+            boundary
+                .add_state_rule(
+                    &source,
+                    std::sync::Arc::new(
+                        super::super::policy::NativeRule::new("history-*", None).unwrap(),
+                    ),
+                    StateOrigin::Native,
+                )
+                .unwrap();
+            let mut guard = ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
+            assert!(guard
+                .record_file(&selected, &File::open(&selected).unwrap())
+                .unwrap());
+            let new_scope = source.join("history-new");
+            if direct {
+                symlink(&selected, &new_scope).unwrap();
+            } else {
+                fs::create_dir(&new_scope).unwrap();
+                symlink(&selected, new_scope.join("alias")).unwrap();
+            }
+            let error = guard.validate().unwrap_err();
+            assert!(
+                error.to_string().contains("native state"),
+                "direct={direct}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn changed_file_between_reads_is_reopened_before_publication() {
         let temporary = tempfile::tempdir().unwrap();

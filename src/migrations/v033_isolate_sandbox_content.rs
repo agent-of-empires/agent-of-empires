@@ -1691,7 +1691,8 @@ fn reset_row(row: &mut Value, receipt: &Receipt) -> Result<()> {
                 },
                 structured: ResetLane {
                     pending: (current || old_acp.is_some())
-                        && !carried_resume(receipt, &tool, agent),
+                        && (!carried_resume(receipt, &tool, agent)
+                            || matches!(*agent, "gemini" | "kimi" | "prime-agent")),
                     generation: None,
                 },
                 retired_terminal: prior
@@ -3399,6 +3400,114 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn linked_conversation_directories_do_not_block_content_migration() {
+        use std::os::unix::fs::symlink;
+
+        for (tool, role) in [
+            ("gemini", ".gemini"),
+            ("kimi", ".kimi-code"),
+            ("prime-agent", ".prime/agent"),
+        ] {
+            for internal in [false, true] {
+                let temporary = tempfile::tempdir().unwrap();
+                let _environment =
+                    crate::session::test_support::isolate_app_dir_at(temporary.path());
+                let home = dirs::home_dir().unwrap();
+                let app = crate::session::get_app_dir().unwrap();
+                let project = temporary.path().join("project");
+                fs::create_dir_all(&project).unwrap();
+                let mut instance = crate::session::Instance::new(tool, project.to_str().unwrap());
+                instance.tool = tool.into();
+                instance.agent_session_id = Some("own-context".into());
+                let cwd = instance.container_workdir();
+                let roots = container_config::sandbox_content_roots(
+                    tool,
+                    None,
+                    &crate::session::Config::default().session,
+                    &home,
+                    &instance.id,
+                )
+                .unwrap();
+                let root = roots
+                    .iter()
+                    .find(|root| root.roles.iter().any(|name| name == role))
+                    .unwrap();
+                let linked = if tool == "gemini" {
+                    Path::new("tmp")
+                        .join(crate::session::capture::project_hash(&cwd))
+                        .join("chats")
+                } else {
+                    PathBuf::from("sessions")
+                };
+                fs::create_dir_all(root.path.join(&linked).parent().unwrap()).unwrap();
+                let foreign = if internal {
+                    root.path.join("unrelated-native-state")
+                } else {
+                    temporary.path().join("foreign")
+                };
+                fs::create_dir_all(foreign.join("own")).unwrap();
+                fs::write(foreign.join("own/session.jsonl"), b"FOREIGN_HISTORY").unwrap();
+                symlink(&foreign, root.path.join(&linked)).unwrap();
+                if tool == "kimi" {
+                    fs::write(
+                        root.path.join("session_index.jsonl"),
+                        format!(
+                            "{}\n",
+                            serde_json::json!({
+                                "sessionId": "own-context",
+                                "sessionDir": "/root/.kimi-code/sessions/own",
+                                "workDir": cwd
+                            })
+                        ),
+                    )
+                    .unwrap();
+                }
+                let mut row = serde_json::to_value(&instance).unwrap();
+                row["sandbox_info"] = serde_json::json!({
+                    "enabled": true, "image": "img", "container_name": "aoe-sandbox-fixture"
+                });
+                let registry = crate::session::get_profile_dir("default")
+                    .unwrap()
+                    .join("sessions.json");
+                fs::write(&registry, serde_json::to_vec(&vec![row]).unwrap()).unwrap();
+
+                assert!(
+                    migrate_target(
+                        &app,
+                        &home,
+                        (&registry, &instance.id, tool),
+                        &|_| Ok(false),
+                        &|_| Ok(true),
+                        &|_| Ok(Vec::new()),
+                    )
+                    .unwrap(),
+                    "{tool} internal={internal}"
+                );
+                assert!(
+                    !root.path.join(&linked).exists(),
+                    "{tool} imported a linked directory"
+                );
+                let recovery = fs::read_dir(recovery_root(&root.host).unwrap())
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path()
+                    .join("0/original");
+                assert!(fs::symlink_metadata(recovery.join(&linked))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink());
+                assert!(read_row(&registry, &instance.id)
+                    .unwrap()
+                    .unwrap()
+                    .get("agent_session_id")
+                    .is_none_or(Value::is_null));
+            }
+        }
+    }
+    #[test]
+    #[serial_test::serial]
     fn retired_gemini_kimi_and_prime_keep_only_their_own_native_conversation() {
         use crate::acp::supervisor::SandboxContinuation;
 
@@ -3554,8 +3663,15 @@ mod tests {
             .unwrap();
             assert_eq!(
                 continuation.stored_session_id.as_deref(),
-                Some("own-acp-context")
+                None,
+                "{tool} has no proof that the ACP conversation was carried"
             );
+            assert!(
+                continuation.notice.is_some(),
+                "{tool} must report the ACP reset"
+            );
+            let stored = read_row(&registry, &instance.id).unwrap().unwrap();
+            assert!(stored.get("acp_session_id").is_none_or(Value::is_null));
         }
     }
 
