@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::Utc;
 use clap::Args;
 
-use crate::session::{Instance, LifecycleOperation, Storage};
+use crate::session::{acquire_session_identity_lock, Instance, LifecycleOperation, Storage};
 
 #[derive(Args)]
 pub struct RemoveArgs {
@@ -81,6 +81,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     );
 
     if config.session.delete_to_trash && !args.purge {
+        let _identity_lock = acquire_session_identity_lock()?;
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&removed_id)
             .map_err(|error| anyhow::anyhow!("failed to acquire instance trash lock: {error}"))?;

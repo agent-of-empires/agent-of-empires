@@ -394,8 +394,9 @@ pub async fn trash_session(
     let reserve_profile = profile.clone();
     let reserve_id = id.clone();
     let file_watch = state.file_watch.clone();
-    let (storage, lifecycle_lock, generation) = match tokio::task::spawn_blocking(
+    let (storage, identity_lock, lifecycle_lock, generation) = match tokio::task::spawn_blocking(
         move || -> anyhow::Result<_> {
+            let identity_lock = crate::session::acquire_session_identity_lock()?;
             let storage = Storage::new(&reserve_profile, file_watch)?;
             let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&reserve_id)?;
             let generation = storage.update(|instances, _groups| {
@@ -415,7 +416,7 @@ pub async fn trash_session(
                 instance.trash();
                 Ok(instance.lifecycle_generation)
             })?;
-            Ok((storage, lifecycle_lock, generation))
+            Ok((storage, identity_lock, lifecycle_lock, generation))
         },
     )
     .await
@@ -455,6 +456,7 @@ pub async fn trash_session(
     let work_id = id.clone();
     let kill_pane = body.kill_pane;
     let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let _identity_lock = identity_lock;
         let _lifecycle_lock = lifecycle_lock;
         let mut instance = snapshot;
         if kill_pane {
@@ -573,6 +575,8 @@ pub async fn restore_session(
     let restored = tokio::task::spawn_blocking(move || {
         let run = || -> Result<Instance, RestoreTransitionError> {
             let storage = Storage::new(&restore_profile, file_watch)
+                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+            let _identity_lock = crate::session::acquire_session_identity_lock()
                 .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
             let _lifecycle_lock = storage
                 .acquire_instance_lifecycle_lock(&restore_id)

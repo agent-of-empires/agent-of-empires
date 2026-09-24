@@ -11,6 +11,16 @@ use crate::session::config::repo_config::{self, HookProgress, ResolvedHooks};
 use crate::session::Instance;
 use crate::tui::dialogs::NewSessionData;
 
+pub(in crate::tui) struct IdentityGuard {
+    _lock: crate::session::StorageFlock,
+}
+
+impl std::fmt::Debug for IdentityGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("IdentityGuard")
+    }
+}
+
 pub struct CreationRequest {
     pub data: NewSessionData,
     pub existing_instances: Vec<Instance>,
@@ -30,6 +40,7 @@ pub enum CreationResult {
         /// Non-fatal warnings from worktree creation (e.g. post-checkout hook
         /// failures). Surfaced as a transient toast in the UI.
         warnings: Vec<String>,
+        identity_guard: Option<IdentityGuard>,
     },
     Error(String),
 }
@@ -117,6 +128,7 @@ impl CreationPoller {
         let hooks = request.hooks;
         let profile = data.profile.clone();
         let sandbox = data.sandbox;
+        let manages_worktree = !data.scratch;
 
         let existing_titles: Vec<&str> = request
             .existing_instances
@@ -268,6 +280,36 @@ impl CreationPoller {
             }
         }
 
+        let identity_guard = if manages_worktree {
+            match crate::session::acquire_session_identity_lock() {
+                Ok(lock) => {
+                    if !std::path::Path::new(&instance.project_path).exists() {
+                        builder::cleanup_instance(
+                            &instance,
+                            created_worktree.as_ref(),
+                            &created_workspace_worktrees,
+                            None,
+                        );
+                        return CreationResult::Error(
+                            "Project path disappeared before the session was persisted".to_string(),
+                        );
+                    }
+                    Some(IdentityGuard { _lock: lock })
+                }
+                Err(error) => {
+                    builder::cleanup_instance(
+                        &instance,
+                        created_worktree.as_ref(),
+                        &created_workspace_worktrees,
+                        None,
+                    );
+                    return CreationResult::Error(format!("{error:#}"));
+                }
+            }
+        } else {
+            None
+        };
+
         let created_worktree_info = created_worktree.as_ref().map(CreatedWorktreeInfo::from);
         let created_workspace_worktree_info = created_workspace_worktrees
             .iter()
@@ -281,6 +323,7 @@ impl CreationPoller {
             created_workspace_worktrees: created_workspace_worktree_info,
             on_launch_hooks_ran: has_on_launch,
             warnings,
+            identity_guard,
         }
     }
 

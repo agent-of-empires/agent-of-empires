@@ -966,6 +966,7 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
 
     let group = args.group.clone().unwrap_or_default();
     let storage = Storage::open_unwatched(profile)?;
+    let _identity_lock = acquire_session_identity_lock()?;
     let created_ids = storage.update(|all_instances, groups| {
         let mut ids = Vec::new();
         for s in &to_import {
@@ -983,6 +984,7 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
         }
         Ok(ids)
     })?;
+    drop(_identity_lock);
 
     println!("✓ Imported {} session(s).", created_ids.len());
 

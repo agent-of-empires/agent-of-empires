@@ -702,6 +702,7 @@ pub fn attach_planned(
     instance: &super::Instance,
     plan: AttachPlan,
 ) -> Result<AttachOutcome> {
+    let _identity_lock = crate::session::acquire_session_identity_lock()?;
     // A publication that has not been drained yet would be flushed after the
     // move with the stale cwd, re-qualifying the old directory after the
     // commit. Flush it first so the durable recheck sees the row as it will
@@ -716,7 +717,19 @@ pub fn attach_planned(
             ),
         }
     }
+    drop(_identity_lock);
     let prepared = execute(instance, plan)?;
+    let _identity_lock = match crate::session::acquire_session_identity_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            prepared.rollback();
+            return Err(error).context("could not reacquire identity lock to publish attach");
+        }
+    };
+    if !Path::new(&prepared.outcome.repo.worktree_path).exists() {
+        prepared.rollback();
+        anyhow::bail!("attached worktree disappeared before publication");
+    }
 
     let id = session_id.to_string();
     let workspace = prepared.workspace_info.clone();
@@ -727,6 +740,10 @@ pub fn attach_planned(
             .iter_mut()
             .find(|i| i.id == id)
             .with_context(|| format!("session not found: {id}"))?;
+        anyhow::ensure!(
+            inst.lifecycle_generation == instance.lifecycle_generation,
+            "session changed before attach could be recorded"
+        );
         anyhow::ensure!(
             !converted || !conversation_cannot_follow(inst),
             "'{}' now resumes a conversation bound to its current working directory; \

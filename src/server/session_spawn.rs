@@ -336,17 +336,31 @@ pub(crate) async fn spawn_structured_session(
             return Err(anyhow::anyhow!("on_create hook failed: {e:#}{hint}"));
         }
 
+        let storage = Storage::new(&profile, file_watch_for_create.clone())?;
+
+        let identity_lock = crate::session::acquire_session_identity_lock()?;
+        if !scratch && !std::path::Path::new(&instance.project_path).exists() {
+            builder::cleanup_instance(
+                &instance,
+                created_worktree.as_ref(),
+                &created_workspace_worktrees,
+                None,
+            );
+            return Err(anyhow::anyhow!(
+                "Project path disappeared before the session was persisted"
+            ));
+        }
         // Anything that fails between here and the final `Ok(..)` would otherwise orphan
         // the scratch directory `build_instance` already provisioned (Storage::new,
         // storage.update, instance.start). Wrap the tail in an IIFE-equivalent closure so
         // we can run cleanup on Err once, regardless of which step tripped.
-        let mut persist_and_start = || -> anyhow::Result<()> {
-            let storage = Storage::new(&profile, file_watch_for_create.clone())?;
+        let persist_and_start = || -> anyhow::Result<()> {
             let to_persist = instance.clone();
             storage.update(|all, _groups| {
                 all.push(to_persist);
                 Ok(())
             })?;
+            drop(identity_lock);
 
             // Acp-mode sessions are not backed by tmux; the structured view supervisor
             // spawns the ACP agent on demand.

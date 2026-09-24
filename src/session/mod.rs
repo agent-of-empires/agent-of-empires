@@ -320,6 +320,10 @@ pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
     };
     let dir = base.join("profiles").join(profile_name);
     if !dir.exists() {
+        let _identity_lock = acquire_session_identity_lock()?;
+        if dir.exists() {
+            return Ok(dir);
+        }
         // Only a name about to be created runs the strict grammar; an existing directory still
         // opens, so older malformed profiles stay listable and deletable.
         validate_new_profile_name(profile_name)?;
@@ -370,6 +374,35 @@ pub fn list_profiles() -> Result<Vec<String>> {
     }
 
     list_profile_names_in(&profiles_dir)
+}
+
+pub(crate) fn list_profiles_for_worktree_inventory() -> Result<Vec<String>> {
+    #[cfg(test)]
+    if FAIL_NEXT_LIST_PROFILES.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        anyhow::bail!("list_profiles failure injected for test");
+    }
+    let base = get_app_dir()?;
+    let profiles_dir = base.join("profiles");
+    if !profiles_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut profiles = Vec::new();
+    for entry in fs::read_dir(&profiles_dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            anyhow::bail!("profile directory contains a symlink");
+        }
+        if file_type.is_dir() {
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("profile directory has a non-UTF-8 name"))?;
+            profiles.push(name);
+        }
+    }
+    profiles.sort();
+    Ok(profiles)
 }
 
 /// Picker order: alphabetical, with a profile named `default` last.
@@ -608,18 +641,21 @@ fn validate_new_profile_name(name: &str) -> Result<()> {
 
 pub fn create_profile(name: &str) -> Result<()> {
     validate_new_profile_name(name)?;
+    let _identity_lock = acquire_session_identity_lock()?;
 
     let profiles = list_profiles()?;
     if profiles.contains(&name.to_string()) {
         anyhow::bail!("Profile '{}' already exists", name);
     }
 
-    get_profile_dir(name)?;
+    let dir = get_profile_dir_path(name)?;
+    fs::create_dir_all(&dir)?;
     Ok(())
 }
 
 pub fn delete_profile(name: &str) -> Result<()> {
     validate_profile_name(name)?;
+    let _identity_lock = acquire_session_identity_lock()?;
 
     let base = get_app_dir()?;
     let profile_dir = base.join("profiles").join(name);
@@ -643,6 +679,7 @@ pub fn delete_profile(name: &str) -> Result<()> {
 pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
     validate_profile_name(old_name)?;
     validate_new_profile_name(new_name)?;
+    let _identity_lock = acquire_session_identity_lock()?;
 
     let base = get_app_dir()?;
     let old_dir = base.join("profiles").join(old_name);

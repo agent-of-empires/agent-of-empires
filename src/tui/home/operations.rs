@@ -242,6 +242,7 @@ impl HomeView {
         // `structured` is applied post-build (mirrors the web create
         // handler); read it off before the params conversion consumes data.
         let structured = data.structured;
+        let is_scratch = data.scratch;
         let params = InstanceParams::from(data);
 
         let build_result = builder::build_instance(
@@ -251,11 +252,29 @@ impl HomeView {
             &target_profile,
         )?;
         let mut instance = build_result.instance;
+        let created_worktree = build_result.created_worktree;
+        let created_workspace_worktrees = build_result.created_workspace_worktrees;
         instance.source_profile = target_profile.clone();
         if structured {
             builder::structured::apply_structured_choice(&mut instance);
         }
         let session_id = instance.id.clone();
+        let identity_lock = if is_scratch {
+            None
+        } else {
+            Some(acquire_session_identity_lock()?)
+        };
+        if !is_scratch && !std::path::Path::new(&instance.project_path).exists() {
+            builder::cleanup_instance(
+                &instance,
+                created_worktree.as_ref(),
+                &created_workspace_worktrees,
+                None,
+            );
+            return Err(anyhow::anyhow!(
+                "Project path disappeared before the session was persisted"
+            ));
+        }
 
         // Ensure target profile storage exists
         if !self.storages.contains_key(&target_profile) {
@@ -273,6 +292,7 @@ impl HomeView {
             }
         }
         self.save()?;
+        drop(identity_lock);
 
         self.reload()?;
         // reload()'s selection fallback lands on the nearest index, often the new
@@ -1892,6 +1912,7 @@ impl HomeView {
             return;
         };
         let acquisition = (|| -> anyhow::Result<_> {
+            let _identity_lock = acquire_session_identity_lock()?;
             let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(id)?;
             storage.update(|instances, _groups| {
                 let stored = instances
@@ -2223,6 +2244,13 @@ fn restore_from_trash_with_storage(
     id: &str,
     owned_trash_generation: Option<u64>,
 ) -> RestoreFromTrash {
+    let _identity_lock = match acquire_session_identity_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore identity lock failed: {error}");
+            return RestoreFromTrash::PersistFailed;
+        }
+    };
     let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(id) {
         Ok(lock) => lock,
         Err(error) => {

@@ -252,7 +252,9 @@ impl HomeView {
                 created_workspace_worktrees,
                 on_launch_hooks_ran,
                 mut warnings,
+                identity_guard,
             } => {
+                let _identity_guard = identity_guard;
                 // Remove the stub instance
                 if let Some(id) = &stub_id {
                     self.remove_instance(id);
@@ -411,6 +413,7 @@ impl HomeView {
                 if on_launch_hooks_ran {
                     self.on_launch_hooks_ran.insert(session_id.clone());
                 }
+                drop(_identity_guard);
 
                 if let Err(e) = self.reload() {
                     tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");

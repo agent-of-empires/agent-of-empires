@@ -261,6 +261,7 @@ pub(crate) async fn reconcile_worktree_paths(state: &Arc<AppState>) {
                 "session has no source profile; refusing worktree path reconciliation"
             );
             let storage = crate::session::Storage::open_unwatched(&instance.source_profile)?;
+            let _identity_lock = crate::session::acquire_session_identity_lock()?;
             let resolution = crate::session::worktree_reconcile::reconcile_and_persist(
                 &storage,
                 &mut instance,

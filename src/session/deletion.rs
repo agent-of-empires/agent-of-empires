@@ -78,6 +78,7 @@ pub struct PurgeTransaction {
     was_trashed: bool,
     generation: u64,
     lifecycle_lock: Option<StorageFlock>,
+    identity_lock: Option<StorageFlock>,
     active: bool,
 }
 
@@ -87,6 +88,7 @@ pub struct PurgeTransaction {
 pub struct CommittedPurge {
     request: DeletionRequest,
     _lifecycle_lock: StorageFlock,
+    _identity_lock: Option<StorageFlock>,
 }
 
 #[derive(Clone, Copy)]
@@ -111,6 +113,11 @@ impl PurgeTransaction {
     pub fn reserve(storage: Storage, mut request: DeletionRequest) -> Result<PurgeReservation> {
         let id = request.session_id.clone();
         let was_trashed = request.instance.is_trashed();
+        let identity_lock = if request.delete_worktree {
+            Some(crate::session::acquire_session_identity_lock()?)
+        } else {
+            None
+        };
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&id)
             .context("failed to acquire instance purge lock")?;
@@ -174,6 +181,7 @@ impl PurgeTransaction {
             storage,
             request,
             was_trashed,
+            identity_lock,
             generation,
             lifecycle_lock: Some(lifecycle_lock),
             active: true,
@@ -190,11 +198,18 @@ impl PurgeTransaction {
         F: FnOnce(&Instance, bool),
     {
         self.lifecycle_lock = None;
+        self.identity_lock = None;
         run_hooks(&self.request.instance, self.request.detach_hooks);
         self
     }
 
     fn ensure_lifecycle_lock(&mut self) -> Result<()> {
+        if self.request.delete_worktree && self.identity_lock.is_none() {
+            self.identity_lock = Some(
+                crate::session::acquire_session_identity_lock()
+                    .context("failed to reacquire session identity lock after hooks")?,
+            );
+        }
         if self.lifecycle_lock.is_none() {
             self.lifecycle_lock = Some(
                 self.storage
@@ -356,6 +371,7 @@ impl PurgeTransaction {
                 detach_hooks: self.request.detach_hooks,
                 keep_scratch: self.request.keep_scratch,
             },
+            _identity_lock: self.identity_lock.take(),
             _lifecycle_lock: self
                 .lifecycle_lock
                 .take()
@@ -393,7 +409,7 @@ impl PurgeTransaction {
         if !matches!(gate, CompletionGate::Proceed) {
             return self.result_for_gate(gate, retained);
         }
-        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request);
+        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request, true);
         if !result.success && !commit_on_teardown_failure {
             result.retained_instance = self.release_reservation().ok().flatten();
             result.disposition = DeletionDisposition::Failed;
@@ -484,7 +500,7 @@ impl CommittedPurge {
     /// Clean up resources while retaining the lifecycle flock that covered the
     /// irreversible durable-row removal.
     pub fn finish(self) -> DeletionResult {
-        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request);
+        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request, true);
         result.disposition = DeletionDisposition::Removed;
         result
     }
@@ -610,8 +626,8 @@ impl PathsInUse {
 }
 
 fn all_profile_storages() -> std::result::Result<(Vec<String>, Vec<Storage>), String> {
-    let profiles =
-        crate::session::list_profiles().map_err(|error| format!("listing profiles: {error}"))?;
+    let profiles = crate::session::list_profiles_for_worktree_inventory()
+        .map_err(|error| format!("listing profiles: {error}"))?;
     let storages = profiles
         .iter()
         .map(|profile| {
@@ -654,14 +670,29 @@ thread_local! {
 
 /// Run `f` with the paths other sessions use while every profile's storage lock is held, so no
 /// session can adopt a path between the check and whatever `f` removes.
-fn with_paths_in_use_locked<R>(except_id: &str, f: impl FnOnce(&PathsInUse) -> R) -> R {
+fn with_paths_in_use_locked<R>(
+    except_id: &str,
+    identity_lock_held: bool,
+    f: impl FnOnce(&PathsInUse) -> R,
+) -> R {
+    let identity_lock = if identity_lock_held {
+        None
+    } else {
+        crate::session::acquire_session_identity_lock().ok()
+    };
+    if !identity_lock_held && identity_lock.is_none() {
+        return f(&PathsInUse::Unknown(
+            "could not acquire session identity lock".to_string(),
+        ));
+    }
+    let _identity_lock = identity_lock;
     let (profiles, storages) = match all_profile_storages() {
         Ok(found) => found,
         Err(reason) => return f(&PathsInUse::Unknown(reason)),
     };
     let mut f = Some(f);
     let locked = crate::session::storage::with_storages_locked(&storages, || {
-        let paths_in_use = match crate::session::list_profiles() {
+        let paths_in_use = match crate::session::list_profiles_for_worktree_inventory() {
             Ok(now) if now.iter().all(|profile| profiles.contains(profile)) => {
                 scan_paths_in_use(&storages, &[except_id])
             }
@@ -690,8 +721,11 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     })
 }
 
-fn perform_deletion_teardown_lifecycle_locked(request: &DeletionRequest) -> DeletionResult {
-    perform_deletion_core(request, true, |session_id| {
+fn perform_deletion_teardown_lifecycle_locked(
+    request: &DeletionRequest,
+    identity_lock_held: bool,
+) -> DeletionResult {
+    perform_deletion_core(request, true, identity_lock_held, |session_id| {
         DockerContainer::from_session_id(session_id).teardown(session_id)
     })
 }
@@ -703,13 +737,14 @@ fn perform_deletion_with(
     request: &DeletionRequest,
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
 ) -> DeletionResult {
-    perform_deletion_core(request, false, teardown)
+    perform_deletion_core(request, false, false, teardown)
 }
 
 /// `lifecycle_locked` is the production path, which also keeps any worktree another session uses.
 fn perform_deletion_core(
     request: &DeletionRequest,
     lifecycle_locked: bool,
+    identity_lock_held: bool,
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
 ) -> DeletionResult {
     let mut errors = Vec::new();
@@ -791,7 +826,7 @@ fn perform_deletion_core(
         )
     };
     let container_gone = if lifecycle_locked && removes_managed_worktree {
-        with_paths_in_use_locked(&request.session_id, stage)
+        with_paths_in_use_locked(&request.session_id, identity_lock_held, stage)
     } else {
         stage(&PathsInUse::Known(Vec::new()))
     };
@@ -1717,6 +1752,54 @@ mod tests {
                 assert!(branch_exists(&main_repo, "feature/shared"));
             }
         }
+    }
+
+    #[test]
+    #[serial]
+    fn profile_creation_waits_for_purge_scan() {
+        let (tmp, _main_repo, worktree, mut owner) = worktree_fixture("feature/profile-race");
+        let _home = isolate_app_dir_at(&tmp.path().join("home"));
+        let storage = Storage::new_unwatched("owner").unwrap();
+        owner.source_profile = "owner".to_string();
+        storage
+            .update(|instances, _groups| {
+                instances.push(owner.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let worktree_for_writer = worktree.clone();
+        AFTER_PATHS_IN_USE_SCAN.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                std::thread::spawn(move || {
+                    started_tx.send(()).unwrap();
+                    crate::session::create_profile("late-peer").unwrap();
+                    published_tx.send(worktree_for_writer.exists()).unwrap();
+                });
+                started_rx.recv().unwrap();
+            }));
+        });
+
+        let result = match PurgeTransaction::reserve(
+            storage,
+            DeletionRequest {
+                delete_worktree: true,
+                delete_branch: true,
+                ..request(owner)
+            },
+        )
+        .unwrap()
+        {
+            PurgeReservation::Reserved(transaction) => transaction.complete(),
+            PurgeReservation::Rejected(result) => result,
+        };
+        assert!(result.success, "{:?}", result.errors);
+        assert!(!published_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap());
+        assert!(!worktree.exists());
     }
 
     #[test]

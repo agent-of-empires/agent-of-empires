@@ -180,6 +180,13 @@ pub fn reconcile_and_persist(
 
 /// Reconcile every session in one profile against git's worktree listing.
 pub fn reconcile_profile(profile: &str) -> bool {
+    let _identity_lock = match crate::session::acquire_session_identity_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(target: "session.worktree", profile = %profile, "identity lock failed: {error}");
+            return false;
+        }
+    };
     let storage = match Storage::open_unwatched(profile) {
         Ok(storage) => storage,
         Err(error) => {

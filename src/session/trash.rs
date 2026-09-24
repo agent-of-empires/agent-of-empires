@@ -248,6 +248,10 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
         relocation: None,
         relocate_warning: Some(reason),
     };
+    let _identity_lock = match crate::session::acquire_session_identity_lock() {
+        Ok(lock) => lock,
+        Err(error) => return failed(format!("could not acquire identity lock: {error}")),
+    };
     let storage = match crate::session::Storage::open_unwatched(&request.instance.source_profile) {
         Ok(storage) => storage,
         Err(error) => return failed(format!("could not open lifecycle storage: {error}")),
@@ -539,6 +543,7 @@ pub fn reconcile_trashed_location(inst: &mut Instance) -> bool {
 
 /// Reconcile every trashed row in one profile, batched.
 pub fn reconcile_trashed_profile(profile: &str) -> anyhow::Result<Vec<Instance>> {
+    let _identity_lock = crate::session::acquire_session_identity_lock()?;
     let storage = crate::session::Storage::open_unwatched(profile)?;
     let mut cache = ProtectedBranchCache::default();
     let mut candidates: Vec<Instance> = storage
@@ -688,6 +693,7 @@ pub fn reconcile_trashed_transition(inst: &mut Instance) -> anyhow::Result<bool>
         !profile.is_empty(),
         "session has no source profile; refusing trash reconciliation"
     );
+    let _identity_lock = crate::session::acquire_session_identity_lock()?;
     let storage = crate::session::Storage::open_unwatched(&profile)?;
     let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&inst.id)?;
     let id = inst.id.clone();

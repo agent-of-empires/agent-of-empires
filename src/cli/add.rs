@@ -914,6 +914,17 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             return Err(error);
         }
     };
+    if !args.scratch && !path.exists() {
+        cleanup_partial_session(
+            &path,
+            instance.worktree_info.as_ref(),
+            instance.workspace_info.as_ref(),
+            args.create_branch,
+            None,
+            instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
+        );
+        bail!("Project path disappeared before the session was persisted");
+    }
 
     let persist_result = storage.update(|all_instances, groups| {
         if is_duplicate_session(
