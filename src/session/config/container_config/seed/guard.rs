@@ -622,6 +622,7 @@ mod tests {
             fs::create_dir(&active).unwrap();
             let selected = source.join("settings.json");
             fs::write(&selected, b"APPROVED_CONFIG").unwrap();
+            let selected = fs::canonicalize(selected).unwrap();
             let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
             boundary
                 .add_state_rule(
