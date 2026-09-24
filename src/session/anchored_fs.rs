@@ -142,6 +142,19 @@ impl ResolvedDataFile {
         )
     }
 
+    /// Remove this resolved regular-file slot without following its name.
+    pub(crate) fn remove(&self) -> Result<()> {
+        match unlinkat(
+            &self.parent.fd,
+            self.leaf.as_os_str(),
+            UnlinkatFlags::NoRemoveDir,
+        ) {
+            Ok(()) => Ok(()),
+            Err(Errno::ENOENT) => Ok(()),
+            Err(error) => Err(error).context("removing resolved data file"),
+        }
+    }
+
     pub(crate) fn replace_preserving_permissions(&self, content: &[u8]) -> Result<()> {
         let mode = match fstatat(
             &self.parent.fd,

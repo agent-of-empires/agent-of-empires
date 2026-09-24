@@ -53,6 +53,7 @@ enum SessionRequest {
     CancelCreation,
 }
 
+#[derive(Debug)]
 enum CommandReply {
     Mutation(RuntimeCursor),
     Terminal(MutationReceipt<TerminalTarget>),
@@ -78,7 +79,22 @@ pub(crate) enum CommandFailure {
 }
 
 impl CommandFailure {
+    /// Classify a creation before any HTTP request was submitted. Only local
+    /// client construction and definitive non-timeout 4xx responses prove a
+    /// refusal; every transport/server/2xx-decoding failure is indeterminate.
     fn creation(error: crate::daemon::DaemonClientError) -> Self {
+        Self::classify(error, false)
+    }
+
+    /// Classify an already-submitted mutation. A definitive 4xx (except 408)
+    /// is the only server response that proves it was refused. Timeouts,
+    /// transport failures, 5xx, receipt mismatches, and malformed 2xx bodies
+    /// all leave the outcome unknown.
+    fn submitted(error: crate::daemon::DaemonClientError) -> Self {
+        Self::classify(error, true)
+    }
+
+    fn classify(error: crate::daemon::DaemonClientError, submitted: bool) -> Self {
         use crate::daemon::DaemonClientError;
         let rejected = match &error {
             DaemonClientError::Status { status, .. } => {
@@ -88,8 +104,14 @@ impl CommandFailure {
             | DaemonClientError::InvalidPathSegment
             | DaemonClientError::InvalidBearerToken
             | DaemonClientError::InsecureBearerTransport
-            | DaemonClientError::ClientBuild => true,
-            _ => false,
+            | DaemonClientError::ClientBuild => !submitted,
+            DaemonClientError::Timeout
+            | DaemonClientError::Transport
+            | DaemonClientError::ResponseTooLarge { .. }
+            | DaemonClientError::Decode(_)
+            | DaemonClientError::AuthenticatedDecode
+            | DaemonClientError::InvalidMutationReceipt => false,
+            DaemonClientError::UnixTransport | DaemonClientError::PeerIdentity => false,
         };
         if rejected {
             Self::Rejected(error.to_string())
@@ -163,7 +185,9 @@ struct PendingCommand {
 }
 
 impl PendingCommand {
-    fn fail(&mut self, id: &str, message: String, errors: &mut Vec<SessionCommandError>) {
+    fn fail(&mut self, id: &str, failure: CommandFailure, errors: &mut Vec<SessionCommandError>) {
+        let unknown = matches!(&failure, CommandFailure::Unknown(_));
+        let message = failure.message();
         if let Some(terminal) = self.terminal.take() {
             let _ = terminal.result.send(Err(message));
         } else {
@@ -171,6 +195,7 @@ impl PendingCommand {
                 id: id.into(),
                 message,
                 marks_unread: self.marks_unread,
+                outcome_unknown: unknown,
             });
         }
     }
@@ -180,6 +205,7 @@ pub(crate) struct SessionCommandError {
     pub id: String,
     pub message: String,
     pub marks_unread: bool,
+    pub(crate) outcome_unknown: bool,
 }
 
 /// One in-flight daemon creation, correlated with the caller's own row by
@@ -308,7 +334,7 @@ async fn run_command_writer(
                 } => CommandFailure::Rejected(
                     "Resume failed; the conversation is preserved for explicit retry".into(),
                 ),
-                error => CommandFailure::Rejected(error.to_string()),
+                error => CommandFailure::submitted(error),
             })
         };
         let _ = request.result.send(result);
@@ -330,6 +356,10 @@ pub struct SessionFeed {
     bulk_queue: VecDeque<(String, SessionMutation)>,
     bulk_errors: Vec<SessionCommandError>,
     applied: Option<Arc<RuntimeSnapshot>>,
+    /// Sessions whose last submitted mutation had an unknown outcome. A
+    /// reconnect alone cannot prove the old request was or was not applied, so
+    /// the fence survives reconnect and is deliberately operator-resolved.
+    quarantined: HashSet<String>,
 }
 
 impl SessionFeed {
@@ -349,6 +379,7 @@ impl SessionFeed {
             pending_creations: HashMap::new(),
             applied: None,
             bulk_errors: Vec::new(),
+            quarantined: HashSet::new(),
             bulk_queue: VecDeque::new(),
         }
     }
@@ -443,6 +474,7 @@ impl SessionFeed {
 
     pub(crate) fn can_submit(&self, id: &str) -> bool {
         self.mutations_available()
+            && !self.quarantined.contains(id)
             && !self.pending.contains_key(id)
             && self.pending.len() < COMMAND_CAPACITY
             && !self.bulk_queue.iter().any(|(queued, _)| queued == id)
@@ -464,10 +496,13 @@ impl SessionFeed {
         let requests: Vec<_> = requests.into_iter().collect();
         let mut ids = HashSet::new();
         anyhow::ensure!(
-            requests.iter().all(|(id, _)| ids.insert(id.as_str())
-                && !self.pending.contains_key(id)
-                && !self.bulk_queue.iter().any(|(queued, _)| queued == id)),
-            "Selection contains a session with a pending runtime change"
+            requests.iter().all(|(id, _)| {
+                ids.insert(id.as_str())
+                    && !self.quarantined.contains(id)
+                    && !self.pending.contains_key(id)
+                    && !self.bulk_queue.iter().any(|(queued, _)| queued == id)
+            }),
+            "Selection contains a session with a pending or indeterminate runtime change"
         );
         self.bulk_queue.extend(requests);
         self.pump_batch();
@@ -484,6 +519,7 @@ impl SessionFeed {
                     id,
                     message: "Runtime permission revoked before bulk submission".into(),
                     marks_unread: false,
+                    outcome_unknown: false,
                 });
                 self.bulk_errors
                     .extend(
@@ -493,6 +529,7 @@ impl SessionFeed {
                                 id,
                                 message: "Runtime permission revoked before bulk submission".into(),
                                 marks_unread: false,
+                                outcome_unknown: false,
                             }),
                     );
                 break;
@@ -512,6 +549,7 @@ impl SessionFeed {
                     id,
                     message: error.to_string(),
                     marks_unread: false,
+                    outcome_unknown: false,
                 });
             }
         }
@@ -793,6 +831,10 @@ impl SessionFeed {
             "Runtime disconnected, read-only or unhealthy; no change submitted"
         );
         anyhow::ensure!(
+            !self.quarantined.contains(&id),
+            "The previous runtime change has an unknown outcome; reconnect and verify before retrying"
+        );
+        anyhow::ensure!(
             !self.pending.contains_key(&id),
             "This session already has a pending runtime change"
         );
@@ -856,18 +898,23 @@ impl SessionFeed {
     pub(crate) fn drain_command_errors(&mut self) -> Vec<SessionCommandError> {
         let snapshot = self.applied.as_ref();
         let mut errors = Vec::new();
+        let mut unknown_ids = Vec::new();
         self.pending.retain(|id, pending| {
             if pending.reply.is_none() {
                 match pending.result.try_recv() {
                     Ok(Ok(reply)) => pending.reply = Some(reply),
                     Ok(Err(error)) => {
-                        pending.fail(id, error.message(), &mut errors);
+                        if matches!(&error, CommandFailure::Unknown(_)) {
+                            unknown_ids.push(id.clone());
+                        }
+                        pending.fail(id, error, &mut errors);
                         return false;
                     }
                     Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        unknown_ids.push(id.clone());
                         pending.fail(
                             id,
-                            "runtime request interrupted; outcome unknown".into(),
+                            CommandFailure::Unknown("runtime request interrupted; outcome unknown".into()),
                             &mut errors,
                         );
                         return false;
@@ -881,9 +928,10 @@ impl SessionFeed {
                     .as_ref()
                     .is_some_and(|terminal| terminal.cancelled.load(Ordering::SeqCst))
             {
+                unknown_ids.push(id.clone());
                 pending.fail(
                     id,
-                    "runtime permission revoked; change not confirmed".into(),
+                    CommandFailure::Unknown("runtime permission changed before confirmation; outcome unknown".into()),
                     &mut errors,
                 );
                 return false;
@@ -906,10 +954,6 @@ impl SessionFeed {
                             .find(|row| row.id == *id)
                             .is_some_and(|row| {
                                 match &target {
-                                    // The agent observation lags the ensure it
-                                    // answers (the sampler publishes on its own
-                                    // cadence), so the receipt is the proof: it
-                                    // names the pane the daemon just ensured.
                                     None => match reply {
                                         CommandReply::Restart(receipt) => row.lifecycle_generation == receipt.outcome.lifecycle_generation
                                             && row.profile == receipt.outcome.profile
@@ -917,7 +961,28 @@ impl SessionFeed {
                                             && receipt.outcome.target.as_ref().is_some_and(|target|
                                                 row.agent_pane.tmux_session.as_deref() == Some(target.tmux_session.as_str()))
                                             && matches!(row.status.as_str(), "Running" | "Waiting" | "Idle"),
-                                        _ => true,
+                                        CommandReply::Terminal(receipt) => {
+                                            let identity_matches = row.lifecycle_generation
+                                                == receipt.outcome.lifecycle_generation
+                                                && row.profile == receipt.outcome.profile;
+                                            let status_ok = matches!(
+                                                row.status.as_str(),
+                                                "Running" | "Waiting" | "Idle" | "Starting"
+                                            );
+                                            let pane_ok = match row.agent_pane.state {
+                                                crate::session::PanePresence::Alive => {
+                                                    row.agent_pane.tmux_session.as_deref()
+                                                        == Some(receipt.outcome.tmux_session.as_str())
+                                                }
+                                                crate::session::PanePresence::Absent
+                                                | crate::session::PanePresence::Unknown => {
+                                                    row.status == "Starting"
+                                                }
+                                                crate::session::PanePresence::Dead => false,
+                                            };
+                                            identity_matches && status_ok && pane_ok
+                                        }
+                                        _ => false,
                                     },
                                     Some(target) => row
                                         .auxiliary
@@ -950,6 +1015,7 @@ impl SessionFeed {
             }
             true
         });
+        self.quarantined.extend(unknown_ids);
         self.pump_batch();
         errors.append(&mut self.bulk_errors);
         errors
@@ -1171,6 +1237,83 @@ mod tests {
             }),
             CommandFailure::Rejected(_),
         ));
+    }
+
+    #[test]
+    fn submitted_mutations_only_report_definitive_4xx_as_rejected() {
+        use crate::daemon::DaemonClientError;
+        for error in [
+            DaemonClientError::Timeout,
+            DaemonClientError::Transport,
+            DaemonClientError::Status {
+                status: reqwest::StatusCode::REQUEST_TIMEOUT,
+                code: None,
+                body: String::new(),
+                truncated: false,
+            },
+            DaemonClientError::Status {
+                status: reqwest::StatusCode::BAD_GATEWAY,
+                code: None,
+                body: String::new(),
+                truncated: false,
+            },
+            DaemonClientError::ResponseTooLarge { limit: 10 },
+            DaemonClientError::InvalidMutationReceipt,
+        ] {
+            assert!(matches!(
+                CommandFailure::submitted(error),
+                CommandFailure::Unknown(_)
+            ));
+        }
+        assert!(matches!(
+            CommandFailure::submitted(DaemonClientError::Status {
+                status: reqwest::StatusCode::CONFLICT,
+                code: None,
+                body: String::new(),
+                truncated: false,
+            }),
+            CommandFailure::Rejected(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn unknown_mutation_quarantine_survives_reconnect_but_refusal_releases_fence() {
+        let mut feed =
+            SessionFeed::seeded_for_test(SessionFeedResult::Snapshot(snapshot("test", 1)));
+        feed.mark_snapshot_applied(snapshot("test", 1));
+        let (commands, mut requests) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+        feed.commands = Some(commands);
+        set_grant(&feed.grant, true);
+
+        feed.submit("unknown".into(), SessionMutation::Stop)
+            .unwrap();
+        requests
+            .try_recv()
+            .unwrap()
+            .result
+            .send(Err(CommandFailure::Unknown("timeout".into())))
+            .unwrap();
+        let errors = feed.drain_command_errors();
+        assert!(errors[0].outcome_unknown);
+        assert!(!feed.can_submit("unknown"));
+        assert!(feed.can_submit("refused"));
+
+        feed.submit("refused".into(), SessionMutation::Stop)
+            .unwrap();
+        requests
+            .try_recv()
+            .unwrap()
+            .result
+            .send(Err(CommandFailure::Rejected("conflict".into())))
+            .unwrap();
+        let errors = feed.drain_command_errors();
+        assert!(!errors[0].outcome_unknown);
+        assert!(feed.can_submit("refused"));
+
+        feed.connect("test".into());
+        feed.task.take().unwrap().abort();
+        set_grant(&feed.grant, true);
+        assert!(!feed.can_submit("unknown"));
     }
 
     fn snapshot(epoch: &str, revision: u64) -> Arc<RuntimeSnapshot> {
@@ -1460,8 +1603,8 @@ mod tests {
         drop(pending);
     }
 
-    #[test]
-    fn acknowledged_change_waits_for_applied_snapshot_and_current_permission() {
+    #[tokio::test]
+    async fn acknowledged_change_waits_for_applied_snapshot_and_current_permission() {
         for receipt_first in [true, false] {
             for revoke in [false, true] {
                 let initial = snapshot("test", 1);
@@ -1524,12 +1667,110 @@ mod tests {
                 } else {
                     assert!(errors.is_empty());
                 }
-                feed.submit("session".into(), SessionMutation::Stop)
-                    .unwrap();
+                if revoke {
+                    assert!(!feed.can_submit("session"));
+                } else {
+                    assert!(feed.can_submit("session"));
+                    feed.submit("session".into(), SessionMutation::Stop)
+                        .unwrap();
+                }
             }
         }
     }
 
+    #[test]
+    fn ensure_agent_rejects_receipt_superseded_by_stop_or_restart() {
+        let row: crate::daemon::SessionResponse = serde_json::from_value(serde_json::json!({
+            "id": "session",
+            "profile": "test",
+            "lifecycle_generation": 4,
+            "status": "Running",
+            "agent_pane": {"state": "alive", "tmux_session": "agent-4"}
+        }))
+        .unwrap();
+        let mut initial = snapshot("test", 1);
+        Arc::make_mut(&mut initial).contents.sessions.push(row);
+        let mut feed = SessionFeed::seeded_for_test(SessionFeedResult::Snapshot(initial.clone()));
+        feed.mark_snapshot_applied(initial.clone());
+        let (commands, mut requests) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+        feed.commands = Some(commands);
+        set_grant(&feed.native_grant, true);
+        let mut prepared = feed.ensure_agent("session".into(), None).unwrap();
+        let command = requests.try_recv().unwrap();
+        assert!(matches!(
+            command.request,
+            SessionRequest::EnsureAgent { .. }
+        ));
+        command
+            .result
+            .send(Ok(CommandReply::Terminal(MutationReceipt {
+                cursor: RuntimeCursor {
+                    epoch: "test".into(),
+
+                    revision: 2,
+                },
+                outcome: TerminalTarget {
+                    tmux_session: "agent-3".into(),
+                    status: crate::daemon::TerminalTargetStatus::Alive,
+                    lifecycle_generation: 3,
+                    profile: "test".into(),
+                },
+            })))
+            .unwrap();
+        let mut next = initial;
+        Arc::make_mut(&mut next).cursor.revision = 2;
+        feed.publish_for_test(SessionFeedResult::Snapshot(next.clone()));
+        assert!(feed.drain_command_errors().is_empty());
+        feed.mark_snapshot_applied(next);
+        assert!(feed.drain_command_errors().is_empty());
+        assert!(matches!(prepared.result.try_recv(), Ok(Err(_))));
+    }
+
+    #[test]
+    fn ensure_agent_accepts_starting_snapshot_before_pane_observation() {
+        let row: crate::daemon::SessionResponse = serde_json::from_value(serde_json::json!({
+            "id": "session",
+            "profile": "test",
+            "lifecycle_generation": 4,
+            "status": "Starting"
+        }))
+        .unwrap();
+        let mut initial = snapshot("test", 1);
+        Arc::make_mut(&mut initial).contents.sessions.push(row);
+        let mut feed = SessionFeed::seeded_for_test(SessionFeedResult::Snapshot(initial.clone()));
+        feed.mark_snapshot_applied(initial.clone());
+        let (commands, mut requests) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+        feed.commands = Some(commands);
+        set_grant(&feed.native_grant, true);
+        let mut prepared = feed.ensure_agent("session".into(), None).unwrap();
+        let command = requests.try_recv().unwrap();
+        assert!(matches!(
+            command.request,
+            SessionRequest::EnsureAgent { .. }
+        ));
+        command
+            .result
+            .send(Ok(CommandReply::Terminal(MutationReceipt {
+                cursor: RuntimeCursor {
+                    epoch: "test".into(),
+                    revision: 2,
+                },
+                outcome: TerminalTarget {
+                    tmux_session: "agent-4".into(),
+                    status: crate::daemon::TerminalTargetStatus::Alive,
+                    lifecycle_generation: 4,
+                    profile: "test".into(),
+                },
+            })))
+            .unwrap();
+        let mut next = initial;
+        Arc::make_mut(&mut next).cursor.revision = 2;
+        feed.publish_for_test(SessionFeedResult::Snapshot(next.clone()));
+        assert!(feed.drain_command_errors().is_empty());
+        feed.mark_snapshot_applied(next);
+        assert!(feed.drain_command_errors().is_empty());
+        assert!(prepared.result.try_recv().unwrap().is_ok());
+    }
     #[test]
     fn native_preparation_requires_current_permission_and_an_applied_live_target() {
         use crate::session::PanePresence;
@@ -1606,6 +1847,15 @@ mod tests {
                 !feed.can_submit("session"),
                 "in-flight exclusion: {invalidation:?}"
             );
+            if matches!(
+                invalidation,
+                Invalidation::Cancel | Invalidation::Permission
+            ) {
+                feed.mark_snapshot_applied(next);
+                assert!(feed.drain_command_errors().is_empty());
+                assert!(!feed.can_submit("session"));
+                continue;
+            }
             respond(Ok(MutationReceipt {
                 cursor: RuntimeCursor {
                     epoch: "test".into(),
@@ -1614,19 +1864,16 @@ mod tests {
                 outcome: TerminalTarget {
                     tmux_session: "daemon-owned-target".into(),
                     status: crate::daemon::TerminalTargetStatus::Exists,
+                    lifecycle_generation: 0,
+                    profile: String::new(),
                 },
             }));
             feed.publish_for_test(SessionFeedResult::Snapshot(next.clone()));
             assert!(feed.drain_command_errors().is_empty());
-            if !matches!(
-                invalidation,
-                Invalidation::Cancel | Invalidation::Permission
-            ) {
-                assert!(matches!(
-                    prepared.result.try_recv(),
-                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-                ));
-            }
+            assert!(matches!(
+                prepared.result.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
             feed.mark_snapshot_applied(next);
             assert!(feed.drain_command_errors().is_empty());
             let ready = prepared.result.try_recv().unwrap();
@@ -1635,6 +1882,7 @@ mod tests {
                 matches!(invalidation, Invalidation::None),
                 "{invalidation:?}"
             );
+            assert!(feed.can_submit("session"));
             feed.submit("session".into(), SessionMutation::Stop)
                 .unwrap();
         }

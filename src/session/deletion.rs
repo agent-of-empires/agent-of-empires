@@ -1159,7 +1159,11 @@ fn perform_deletion_core(
     } else {
         stage(&PathsInUse::Known(Vec::new()))
     };
-    if !container_gone && errors.iter().any(|error| error.starts_with("Container:")) {
+    if !container_gone
+        && errors
+            .iter()
+            .any(|error| error.starts_with("Container:") || error.starts_with("Sandbox preclean:"))
+    {
         return DeletionResult {
             session_id: request.session_id.clone(),
             success: false,
@@ -1186,6 +1190,10 @@ fn perform_deletion_core(
         disposition: DeletionDisposition::Failed,
         retained_instance: None,
     }
+}
+
+fn preclean_blocks_container_removal(outcome: Option<crate::git::cleanup::SandboxCleanup>) -> bool {
+    outcome == Some(crate::git::cleanup::SandboxCleanup::Blocked)
 }
 
 /// Container and worktree teardown, which destroys checkout contents and so must run inside the
@@ -1226,9 +1234,32 @@ fn stage_teardown_worktrees(
                     .any(|owner| owner.references_path(Path::new(&workspace.workspace_dir)))
             });
 
-    if request.delete_worktree && is_sandboxed && root_cleanup_allowed {
+    let preclean = if request.delete_worktree && is_sandboxed && root_cleanup_allowed {
         tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "sandbox_worktree_preclean", "perform_deletion: stage");
-        let _ = crate::git::cleanup::cleanup_sandbox_worktree(&request.instance);
+        Some(crate::git::cleanup::cleanup_sandbox_worktree(
+            &request.instance,
+        ))
+    } else {
+        None
+    };
+    let preclean_blocked = preclean_blocks_container_removal(preclean);
+    let worktrees_removed_early = preclean_blocked && request.delete_sandbox;
+    if worktrees_removed_early {
+        // A stopped container cannot run the managed cleanup entrypoint. Try
+        // host-side worktree removal first; only tear the container down after
+        // that succeeds. A permission/root-owned failure leaves both intact.
+        stage_remove_worktrees_and_branches(
+            request,
+            repos,
+            &preserved_worktree_paths,
+            root_cleanup_allowed,
+            protection,
+            errors,
+            messages,
+        );
+        if !errors.is_empty() {
+            return false;
+        }
     }
 
     let mut container_gone = false;
@@ -1243,15 +1274,17 @@ fn stage_teardown_worktrees(
         }
     }
 
-    stage_remove_worktrees_and_branches(
-        request,
-        repos,
-        &preserved_worktree_paths,
-        root_cleanup_allowed,
-        protection,
-        errors,
-        messages,
-    );
+    if !worktrees_removed_early {
+        stage_remove_worktrees_and_branches(
+            request,
+            repos,
+            &preserved_worktree_paths,
+            root_cleanup_allowed,
+            protection,
+            errors,
+            messages,
+        );
+    }
     container_gone
 }
 
@@ -1861,6 +1894,19 @@ fn run_on_destroy_hooks(instance: &Instance, detach: bool, configured_hooks: &[S
 mod tests {
     use super::*;
 
+    #[test]
+    fn stopped_or_unreadable_sandbox_preclean_retains_container() {
+        assert!(preclean_blocks_container_removal(Some(
+            crate::git::cleanup::SandboxCleanup::Blocked
+        )));
+        assert!(!preclean_blocks_container_removal(Some(
+            crate::git::cleanup::SandboxCleanup::Cleaned
+        )));
+        assert!(!preclean_blocks_container_removal(Some(
+            crate::git::cleanup::SandboxCleanup::Absent
+        )));
+        assert!(!preclean_blocks_container_removal(None));
+    }
     fn create_test_instance() -> Instance {
         Instance::new("Test Session", "/tmp/test-project")
     }

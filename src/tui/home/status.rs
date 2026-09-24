@@ -305,6 +305,15 @@ impl HomeView {
             Err(TryRecvError::Disconnected) => false,
         };
         let errors = self.session_feed.drain_command_errors();
+        for error in &errors {
+            if self
+                .pending_archive_cursor
+                .as_ref()
+                .is_some_and(|pending| pending.id == error.id)
+            {
+                self.pending_archive_cursor = None;
+            }
+        }
         let command_error = !errors.is_empty();
         if command_error {
             if errors.iter().any(|error| {
@@ -316,7 +325,16 @@ impl HomeView {
                 "Runtime change",
                 &errors
                     .into_iter()
-                    .map(|error| format!("{}: {}", error.id, error.message))
+                    .map(|error| {
+                        if error.outcome_unknown {
+                            format!(
+                                "{}: outcome unknown; retry blocked until resolved: {}",
+                                error.id, error.message
+                            )
+                        } else {
+                            format!("{}: {}", error.id, error.message)
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join("\n"),
             ));

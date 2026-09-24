@@ -1703,6 +1703,8 @@ pub(super) async fn prepare_agent_session(
             Some(crate::daemon::TerminalTarget {
                 tmux_session: name.clone(),
                 status: crate::daemon::TerminalTargetStatus::Restarted,
+                lifecycle_generation: generation,
+                profile: profile.clone(),
             })
         };
         if matches!(

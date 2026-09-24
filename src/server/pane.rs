@@ -512,6 +512,10 @@ pub(crate) async fn ensure_native_container_terminal(
             &mut instance,
             crate::session::AuxiliaryTarget::Container { index },
         )?;
+        let identity = (
+            instance.lifecycle_generation,
+            instance.source_profile.clone(),
+        );
         let target = crate::daemon::TerminalTarget {
             tmux_session: terminal.name().to_owned(),
             status: if created {
@@ -519,6 +523,8 @@ pub(crate) async fn ensure_native_container_terminal(
             } else {
                 crate::daemon::TerminalTargetStatus::Exists
             },
+            lifecycle_generation: identity.0,
+            profile: identity.1,
         };
         let publication = handle.block_on(worker_state.publication.write());
         let mut rows = handle.block_on(worker_state.instances.write());

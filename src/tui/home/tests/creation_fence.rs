@@ -18,7 +18,7 @@ fn saving_during_creation_never_persists_the_display_placeholder() {
         _temp,
     } = setup_creation_test_env();
     let _driver = view.session_feed.command_driver_for_test();
-    view.request_creation(creation_data(&project_dir, "Pending", "test"), None);
+    view.request_creation(creation_data(&project_dir, "Pending", "test"), None, None);
     let stub = view.creating_stub_id.clone().unwrap();
     view.save().unwrap();
     let storage = Storage::new_unwatched("default").unwrap();
@@ -53,7 +53,7 @@ fn session_actions_refuse_the_creating_stub() {
     // The wizard refuses without a runtime that can take the creation, so drive
     // the feed's command lane the way a connected daemon would.
     let _driver = view.session_feed.command_driver_for_test();
-    view.request_creation(creation_data(&project_dir, "Fenced", "fenced"), None);
+    view.request_creation(creation_data(&project_dir, "Fenced", "fenced"), None, None);
     assert!(
         view.creating_stub_id.is_some(),
         "request_creation installs the stub"
@@ -139,7 +139,7 @@ fn a_cancellation_before_the_daemon_names_the_creation_is_delivered_later() {
         _temp,
     } = setup_creation_test_env();
     let mut driven = view.session_feed.creation_driver_for_test();
-    view.request_creation(creation_data(&project_dir, "Delayed", "test"), None);
+    view.request_creation(creation_data(&project_dir, "Delayed", "test"), None, None);
     let stub = view
         .creating_stub_id
         .clone()
@@ -207,7 +207,7 @@ fn refused_create_after_early_cancel_settles_without_a_stub_or_daemon_id() {
         _temp,
     } = setup_creation_test_env();
     let mut reject = view.session_feed.creation_rejection_driver_for_test();
-    view.request_creation(creation_data(&project_dir, "Delayed", "test"), None);
+    view.request_creation(creation_data(&project_dir, "Delayed", "test"), None, None);
     let key = view.creating_stub_id.clone().unwrap();
     view.cancel_creation();
     assert!(view.creating_stub_id.is_none());
@@ -235,7 +235,7 @@ fn unknown_create_outcome_waits_for_matching_canonical_row_across_profiles() {
     let mut driver = view.session_feed.creation_driver_for_test();
     let mut data = creation_data(&project_dir, "Same title", "group");
     data.profile = "other".into();
-    view.request_creation(data, None);
+    view.request_creation(data, None, None);
     let key = view.creating_stub_id.clone().unwrap();
     assert_eq!(driver(), vec![format!("create:{key}")]);
     assert!(view.apply_creation_results().is_none());

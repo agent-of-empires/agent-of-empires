@@ -22,16 +22,60 @@ enum RunnerCapture {
 }
 
 impl RunnerCapture {
-    fn ensure_stopped(&self) -> Result<()> {
-        match self {
-            Self::Captured { pid, .. } => anyhow::ensure!(
-                !crate::process::worker::is_process_group_alive(*pid),
+    fn ensure_stopped(&self, session_id: Option<&str>) -> Result<()> {
+        self.ensure_stopped_with(
+            session_id,
+            crate::process::worker_registry::load_strict,
+            crate::process::worker::is_process_group_alive,
+        )
+    }
+
+    fn ensure_stopped_with(
+        &self,
+        session_id: Option<&str>,
+        load: impl FnOnce(&str) -> Result<Option<crate::process::worker_registry::WorkerRecord>>,
+        process_group_alive: impl Fn(u32) -> bool,
+    ) -> Result<()> {
+        let Self::Captured {
+            pid, generation, ..
+        } = self
+        else {
+            return match self {
+                Self::Uncaptured => Ok(()),
+                Self::Unresolved { error } => {
+                    anyhow::bail!("Runner ownership unresolved; purge resources retained: {error}")
+                }
+                Self::Captured { .. } => unreachable!(),
+            };
+        };
+        let Some(session_id) = session_id else {
+            anyhow::bail!("Captured runner session identity is missing; purge resources retained");
+        };
+        let record = load(session_id)
+            .map_err(|error| anyhow::anyhow!("worker registry is unreadable: {error:#}"))?;
+        let alive = process_group_alive(*pid);
+        match record {
+            None => anyhow::ensure!(
+                !alive,
                 "Captured runner {pid} has not exited; purge resources retained"
             ),
-            Self::Unresolved { error } => {
-                anyhow::bail!("Runner ownership unresolved; purge resources retained: {error}")
+            Some(record) => {
+                let identity = crate::acp::runner_lifecycle::RunnerIdentity {
+                    pid: *pid,
+                    generation: *generation,
+                };
+                anyhow::ensure!(
+                    identity.matches_record(record.pid, record.generation)
+                        && identity.generation == record.generation,
+                    "Captured runner identity was replaced (pid {} generation {}); purge resources retained",
+                    record.pid,
+                    record.generation
+                );
+                anyhow::ensure!(
+                    !alive && !crate::process::worker_registry::is_record_live(&record),
+                    "Captured runner {pid} has not exited; purge resources retained"
+                );
             }
-            Self::Uncaptured => {}
         }
         Ok(())
     }
@@ -127,11 +171,13 @@ pub(crate) struct PurgeOwner {
     file: ResolvedDataFile,
     token: String,
     runner: RunnerCapture,
+    session_id: Option<String>,
 }
 
 pub(crate) struct PurgeCapture {
     protection: CleanupProtection,
     runner: RunnerCapture,
+    session_id: String,
 }
 
 impl PurgeCapture {
@@ -153,11 +199,15 @@ impl PurgeCapture {
         };
         let protection = CleanupProtection::new([row])?;
         protection.validate()?;
-        Ok(Self { protection, runner })
+        Ok(Self {
+            protection,
+            runner,
+            session_id: row.id.clone(),
+        })
     }
 
     pub(crate) fn ensure_captured_runner_stopped(&self) -> Result<()> {
-        self.runner.ensure_stopped()
+        self.runner.ensure_stopped(Some(&self.session_id))
     }
 }
 
@@ -187,6 +237,7 @@ impl PurgeOwner {
             file,
             token: recorded.token,
             runner: recorded.runner,
+            session_id: Some(row.id.clone()),
         })
     }
 
@@ -195,7 +246,7 @@ impl PurgeOwner {
     }
 
     pub(crate) fn ensure_captured_runner_stopped(&self) -> Result<()> {
-        self.runner.ensure_stopped()
+        self.runner.ensure_stopped(self.session_id.as_deref())
     }
 
     pub(crate) fn release(self) -> Result<()> {
@@ -291,49 +342,63 @@ mod tests {
         Ok(())
     }
 
-    /// The purge refuses shared cleanup until the captured runner is gone.
-    /// `deletion.rs:550` and `deletion.rs:705` both call this before teardown,
-    /// so an alive or unresolved runner must produce the retention error there
-    /// rather than losing stores or worktrees under a running process.
-    #[cfg(unix)]
+    /// A process-group check alone cannot distinguish a reaped child from a
+    /// replacement that reused its pid. The frozen pid+generation must still
+    /// match the strict registry, and ambiguous registry reads retain data.
     #[test]
-    fn a_live_or_unresolved_runner_retains_the_purge_resources() {
-        let live = RunnerCapture::Captured {
-            pid: std::process::id(),
-            generation: 1,
-        };
-        let error = live
-            .ensure_stopped()
-            .expect_err("an alive runner blocks cleanup");
-        assert!(
-            error.to_string().contains("has not exited"),
-            "the refusal must name the retention, got: {error}"
-        );
+    fn runner_cleanup_checks_reaped_replacement_and_unreadable_registry() -> Result<()> {
+        fn record(pid: u32, generation: u64) -> crate::process::worker_registry::WorkerRecord {
+            crate::process::worker_registry::WorkerRecord::new(
+                "session".into(),
+                pid,
+                std::path::PathBuf::from("unused.sock"),
+                String::new(),
+                String::new(),
+                std::path::PathBuf::new(),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            )
+            .with_generation(generation)
+        }
 
-        let unresolved = RunnerCapture::Unresolved {
+        let captured = RunnerCapture::Captured {
+            pid: 41,
+            generation: 7,
+        };
+        captured
+            .ensure_stopped_with(Some("session"), |_| Ok(Some(record(41, 7))), |_| false)
+            .expect("an exact, reaped registry identity releases cleanup");
+        let error = captured
+            .ensure_stopped_with(
+                Some("session"),
+                |_| Ok(Some(record(std::process::id(), 8))),
+                |_| true,
+            )
+            .expect_err("a live replacement must retain purge resources");
+        assert!(error.to_string().contains("identity was replaced"));
+        let error = captured
+            .ensure_stopped_with(
+                Some("session"),
+                |_| Err(anyhow::anyhow!("permission denied")),
+                |_| false,
+            )
+            .expect_err("an unreadable registry is ambiguous");
+        assert!(error.to_string().contains("unreadable"));
+        captured
+            .ensure_stopped_with(Some("session"), |_| Ok(None), |_| true)
+            .expect_err("a missing registry cannot prove a live captured process exited");
+
+        RunnerCapture::Unresolved {
             error: "worker record unreadable".into(),
-        };
-        let error = unresolved
-            .ensure_stopped()
-            .expect_err("unresolved ownership blocks cleanup");
-        assert!(
-            error.to_string().contains("unresolved"),
-            "an unreadable record is not proof of absence, got: {error}"
-        );
-
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("exit 0")
-            .spawn()
-            .expect("spawn a short-lived runner");
-        let pid = child.id();
-        child.wait().expect("reap the runner");
-        RunnerCapture::Captured { pid, generation: 1 }
-            .ensure_stopped()
-            .expect("a reaped runner no longer holds the purge back");
-
+        }
+        .ensure_stopped(None)
+        .expect_err("unresolved ownership blocks cleanup");
         RunnerCapture::Uncaptured
-            .ensure_stopped()
+            .ensure_stopped(None)
             .expect("nothing was captured, so nothing blocks cleanup");
+        Ok(())
     }
 }

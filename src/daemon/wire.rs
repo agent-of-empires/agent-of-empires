@@ -228,7 +228,7 @@ pub struct RestartSessionBody {
     pub wake_message: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RestartOutcome {
     pub lifecycle_generation: u64,
     pub profile: String,
@@ -243,7 +243,7 @@ pub struct EnsureToolBody {
     pub size: Option<TerminalSize>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TerminalTargetStatus {
     Created,
@@ -252,10 +252,16 @@ pub enum TerminalTargetStatus {
     Restarted,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TerminalTarget {
     pub tmux_session: String,
     pub status: TerminalTargetStatus,
+    /// Lifecycle generation observed under the session lock before publication.
+    #[serde(default)]
+    pub lifecycle_generation: u64,
+    /// Source profile observed under the same lock.
+    #[serde(default)]
+    pub profile: String,
 }
 
 #[derive(Serialize, Deserialize)]

@@ -410,64 +410,59 @@ pub fn is_permission_error(error: &str) -> bool {
         || lower.contains("access is denied")
 }
 
-/// Delete worktree contents from inside the sandbox container.
+/// Delete worktree contents from inside the sandbox container without ever
+/// starting its managed entrypoint.
 ///
-/// Starts the container if it exists but is stopped, then runs
-/// `find . -mindepth 1 -delete` to remove all contents (including
-/// root-owned files that the host user cannot delete directly).
-///
-/// The existence probe is fail-open with a `warn!`: on a transient runtime
-/// failure (daemon down, permission denied, or any other non-success stderr
-/// classified by `RuntimeBase::classify_probe_failure`) the cleanup is
-/// skipped and the failure surfaces in logs. The running-state probe warns
-/// on failure via `classify_probe_failure` and attempts `container.start()`
-/// (idempotent when running); cleanup only skips if the start itself fails.
-///
-/// Collapsing the existence probe to `unwrap_or(false)` re-introduces the
-/// swallowing-existence-probe class of bug (#2596 / #2652 / #2654).
-///
-/// Returns true if the container successfully deleted the contents.
-pub fn cleanup_sandbox_worktree(instance: &Instance) -> bool {
+/// The outcome distinguishes an absent container from a present stopped or
+/// uncleanable one. Callers that intend to destroy the container must fail
+/// closed on [`SandboxCleanup::Blocked`], rather than losing the only mounted
+/// view of the worktree and then removing its bind mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxCleanup {
+    Cleaned,
+    Absent,
+    Blocked,
+}
+
+pub fn cleanup_sandbox_worktree(instance: &Instance) -> SandboxCleanup {
     let container = DockerContainer::from_session_id(&instance.id);
     match container.exists() {
         Ok(true) => {}
-        Ok(false) => return false,
+        Ok(false) => return SandboxCleanup::Absent,
         Err(e) => {
             tracing::warn!(
                 target: "containers.runtime",
                 session = %instance.id,
                 error = %e,
-                "container existence probe failed during worktree cleanup; skipping best-effort cleanup"
+                "container existence probe failed during worktree cleanup; retaining worktree"
             );
-            return false;
+            return SandboxCleanup::Blocked;
         }
     }
-    // Cleanup never starts the container it is tearing down: a purge that
-    // boots the managed entrypoint executes the very workload it was asked to
-    // discard. A stopped container keeps its worktree until the host removes it.
     match container.probe_running() {
         crate::containers::Probe::Running => {}
         crate::containers::Probe::NotRunning => {
-            tracing::debug!(
+            tracing::warn!(
                 target: "containers.runtime",
                 session = %instance.id,
-                "container is not running; skipping the in-container worktree cleanup"
+                "container is stopped; retaining worktree because in-container cleanup is impossible"
             );
-            return false;
+            return SandboxCleanup::Blocked;
         }
         crate::containers::Probe::Unknown(e) => {
             tracing::warn!(
                 target: "containers.runtime",
                 session = %instance.id,
                 error = %e,
-                "container running-state probe failed during worktree cleanup; skipping best-effort cleanup"
+                "container running-state probe failed during worktree cleanup; retaining worktree"
             );
-            return false;
+            return SandboxCleanup::Blocked;
         }
     }
     match container.exec(&["find", ".", "-mindepth", "1", "-delete"]) {
-        Ok(output) => output.status.success(),
-        Err(_) => false,
+        Ok(output) if output.status.success() => SandboxCleanup::Cleaned,
+        Ok(_) => SandboxCleanup::Blocked,
+        Err(_) => SandboxCleanup::Blocked,
     }
 }
 
@@ -660,10 +655,10 @@ fn try_sandbox_dir_cleanup(
         return false;
     }
 
-    let cleaned = cleanup_sandbox_worktree(instance);
-    tracing::debug!(target: "git.worktree", cleaned, "container cleanup attempted");
-    if !cleaned {
-        return false;
+    match cleanup_sandbox_worktree(instance) {
+        crate::git::cleanup::SandboxCleanup::Cleaned => {}
+        crate::git::cleanup::SandboxCleanup::Absent => {}
+        crate::git::cleanup::SandboxCleanup::Blocked => return false,
     }
 
     let container = DockerContainer::from_session_id(&instance.id);

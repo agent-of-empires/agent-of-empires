@@ -38,13 +38,14 @@ pub(crate) fn norm_host(host: &str) -> String {
     bare.strip_suffix('.').unwrap_or(bare).to_ascii_lowercase()
 }
 
-/// True when a `norm_host`'d value is a routable IP literal we trust
-/// unconditionally. An IP literal is dialed directly and never DNS-resolved, so
-/// it cannot be the target of DNS rebinding: a browser only sends an IP as
-/// `Host`/`Origin` when the user navigated straight to that address. Trusting
-/// it restores `aoe serve --host 0.0.0.0` reachability by LAN/tailnet IP with
-/// no `--allowed-host` (Vite's "Pattern A"). Hostnames are NOT trusted here and
-/// still require an explicit allowlist entry. See #2735.
+/// True when a `norm_host`'d value is a routable IP literal accepted as a
+/// `Host` without an allowlist entry. An IP literal is dialed directly and
+/// never DNS-resolved, so it cannot be the target of DNS rebinding (see
+/// `is_trusted_ip_literal`). Restoring `aoe serve --host 0.0.0.0`
+/// reachability by LAN/tailnet IP with no `--allowed-host` does not trust an
+/// arbitrary browser `Origin`: that must still be allowlisted or have the
+/// exact same authority as `Host`. Hostnames always require an allowlist
+/// entry. See #2735.
 ///
 /// The excluded ranges are hygiene, not rebinding-necessity (IPs can't be
 /// rebound): the unspecified address (`0.0.0.0` / `::`, also a Linux/macOS
@@ -225,9 +226,9 @@ pub(super) enum AccessDecision {
 /// Pure DNS-rebinding decision: reject a missing `Host`; accept a `Host` that
 /// is allowlisted or a routable IP literal (IPs can't be rebound, see
 /// `is_trusted_ip_literal`); exempt requests with no `Origin` (curl / native
-/// TUI / non-browser WS); reject a present `Origin` that is neither allowlisted
-/// nor a routable IP literal. Comparisons are case-insensitive on the host and
-/// on the whole origin. See #2735.
+/// TUI / non-browser WS). A present `Origin` must either be allowlisted or
+/// have exactly the authority named by `Host`, including default-port and
+/// bracketed-IPv6 equivalence. See #2735.
 pub(super) fn evaluate_access(
     host_header: Option<&str>,
     origin_header: Option<&str>,
@@ -243,20 +244,77 @@ pub(super) fn evaluate_access(
     }
     if let Some(origin) = origin_header {
         let origin = norm_origin(origin);
-        // A by-IP dashboard (`http://<ip>:port`) sends `Origin: http://<ip>:port`
-        // on its own fetch/WS, so trust an IP-literal origin on the same basis
-        // as the Host. This is a deliberate relaxation: a cross-origin page
-        // served from a bare IP would also pass this check, but it cannot read
-        // the auth token, so auth remains the backstop; a per-origin allowlist
-        // is the deferred stricter posture. `host_from_url` strips
-        // scheme/port/brackets.
-        let origin_is_trusted_ip =
-            host_from_url(&origin).is_some_and(|h| is_trusted_ip_literal(&h));
-        if !allowed_origins.contains(&origin) && !origin_is_trusted_ip {
+        if !allowed_origins.contains(&origin) && !origin_has_host_authority(&origin, raw_host) {
             return AccessDecision::DenyOrigin;
         }
     }
     AccessDecision::Allow
+}
+
+/// Split an HTTP `Host` authority into its normalized host and explicit port.
+fn host_port(raw: &str) -> Option<(String, Option<u16>)> {
+    let raw = raw.trim();
+    let (host, port) = if let Some(end) = raw
+        .strip_prefix('[')
+        .and_then(|rest| rest.find(']'))
+        .map(|index| 1 + index)
+    {
+        let host = &raw[1..end];
+        let rest = &raw[end + 1..];
+        if rest.is_empty() {
+            (host, None)
+        } else {
+            (host, Some(rest.strip_prefix(':')?))
+        }
+    } else {
+        match raw.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (host, Some(port)),
+            _ => (raw, None),
+        }
+    };
+    let port = match port {
+        Some(value) => Some(value.parse().ok()?),
+        None => None,
+    };
+    let host = norm_host(host);
+    (!host.is_empty() && port != Some(0)).then_some((host, port))
+}
+
+/// Compare an Origin authority with Host. Host carries no scheme, so only the
+/// host and effective port are comparable; an Origin's default port matches
+/// an omitted Host port and an explicit default port.
+fn origin_has_host_authority(origin: &str, host: &str) -> bool {
+    let Some((scheme, authority)) = origin
+        .split_once("://")
+        .filter(|(scheme, _)| matches!(*scheme, "http" | "https"))
+    else {
+        return false;
+    };
+    if authority
+        .chars()
+        .any(|character| matches!(character, '/' | '?' | '#' | '@'))
+    {
+        return false;
+    }
+    let Some((origin_host, origin_port)) = host_port(authority) else {
+        return false;
+    };
+    let Some((request_host, request_port)) = host_port(host) else {
+        return false;
+    };
+    if origin_host != request_host {
+        return false;
+    }
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let origin_effective = origin_port.unwrap_or(default_port);
+    let request_effective = request_port.unwrap_or(default_port);
+    if origin_effective != request_effective {
+        return false;
+    }
+    // Host has no scheme. An explicit HTTPS non-default port is therefore
+    // ambiguous (it cannot be proven to be the Host authority), whereas HTTP
+    // same-port navigation is the normal dashboard path.
+    !(scheme == "https" && origin_port.is_some_and(|port| port != 443))
 }
 
 /// Uniform 403 for every DNS-rebinding rejection. Names both gates but not
@@ -912,26 +970,47 @@ mod tests {
     }
 
     #[test]
-    fn ip_literal_origin_allowed_without_flag() {
+    fn ip_literal_origin_requires_same_host_authority() {
         let allow = vecs(&["localhost"]);
-        assert_eq!(
-            evaluate_access(
-                Some("192.168.1.5:8080"),
-                Some("http://192.168.1.5:8080"),
-                &allow,
-                &[]
-            ),
-            AccessDecision::Allow
-        );
-        assert_eq!(
-            evaluate_access(
-                Some("[2001:db8::5]:8080"),
-                Some("http://[2001:db8::5]:8080"),
-                &allow,
-                &[]
-            ),
-            AccessDecision::Allow
-        );
+        for (host, origin) in [
+            ("192.168.1.5:8080", "http://192.168.1.5:8080"),
+            ("[2001:db8::5]:8080", "http://[2001:db8::5]:8080"),
+        ] {
+            assert_eq!(
+                evaluate_access(Some(host), Some(origin), &allow, &[]),
+                AccessDecision::Allow
+            );
+        }
+        for (host, origin) in [
+            ("192.168.1.5:8080", "http://192.168.1.6:8080"),
+            ("192.168.1.5:8080", "http://192.168.1.5:9090"),
+            ("192.168.1.5:8080", "https://192.168.1.5:8080"),
+            ("192.168.1.5", "http://192.168.1.5:8080"),
+            ("[2001:db8::5]:8080", "http://[2001:db8::6]:8080"),
+        ] {
+            assert_eq!(
+                evaluate_access(Some(host), Some(origin), &allow, &[]),
+                AccessDecision::DenyOrigin,
+                "host {host}, origin {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_authority_normalizes_default_ports_and_ipv6() {
+        let allow = vecs(&["example.com", "::1"]);
+        for (host, origin) in [
+            ("example.com", "https://example.com:443"),
+            ("example.com:80", "http://example.com"),
+            ("[::1]", "http://[::1]:80"),
+            ("[::1]:8080", "http://[::1]:8080"),
+        ] {
+            assert_eq!(
+                evaluate_access(Some(host), Some(origin), &allow, &[]),
+                AccessDecision::Allow,
+                "host {host}, origin {origin}"
+            );
+        }
     }
 
     #[test]
@@ -1134,6 +1213,29 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn access_policy_rejects_cross_authority_ip_origin_at_router() {
+        use tower::ServiceExt;
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost", "192.168.1.5"]),
+            vecs(&["http://192.168.1.5:8080"]),
+            None,
+        );
+        let app = test_support::build_router_for_test(state);
+        let mut req = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "192.168.1.5:8080")
+            .header("origin", "http://192.168.1.6:8080")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

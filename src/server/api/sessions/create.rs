@@ -280,23 +280,7 @@ fn creation_trust_fingerprint(
     base: &crate::session::HooksConfig,
     trust: &crate::session::config::repo_config::RepoTrust,
 ) -> crate::daemon::CreationTrustFingerprint {
-    use crate::session::config::repo_config::{compute_hooks_hash, TrustSurface};
-    crate::daemon::CreationTrustFingerprint {
-        project_path: trust.project_path.clone(),
-        base_hooks_hash: compute_hooks_hash(base),
-        hooks_hash: match &trust.hooks {
-            TrustSurface::Absent => None,
-            TrustSurface::Trusted(hooks) => Some(compute_hooks_hash(hooks)),
-            TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
-        },
-        mcp_hash: match &trust.mcp {
-            TrustSurface::Absent => None,
-            TrustSurface::Trusted(servers) => {
-                Some(crate::session::mcp::project_mcp::fingerprint(servers))
-            }
-            TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
-        },
-    }
+    crate::session::config::repo_config::creation_trust_fingerprint(base, trust)
 }
 
 pub async fn review_creation_trust(
@@ -409,6 +393,9 @@ pub(crate) fn resolve_create_hook_plan(
     let trust = read_creation_trust(project_path, scratch)?;
     if expected_review.is_some_and(|expected| *expected != creation_trust_fingerprint(base, &trust))
     {
+        return Err(CreationTrustChanged.into());
+    }
+    if trust_hooks_requested == Some(true) && expected_review.is_none() {
         return Err(CreationTrustChanged.into());
     }
 

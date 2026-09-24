@@ -1699,41 +1699,20 @@ impl HomeView {
                     DialogResult::Cancel => {
                         self.repo_trust_dialog = None;
                         self.pending_repo_trust_data = None;
+                        self.pending_repo_trust_fingerprint = None;
                     }
                     DialogResult::Submit(action) => {
                         self.repo_trust_dialog = None;
+                        let fingerprint = self.pending_repo_trust_fingerprint.take();
                         if let Some(data) = self.pending_repo_trust_data.take() {
-                            let emit = match action {
-                                RepoTrustAction::Trust {
-                                    hooks_hash,
-                                    mcp_hash,
-                                    project_path,
-                                    ..
-                                } => {
-                                    // If persisting trust fails, abort creation:
-                                    // launching anyway leaves a split state where
-                                    // hooks are treated as approved but project MCP
-                                    // stays gated off (it is read back from the
-                                    // unwritten hashes).
-                                    if let Err(e) = repo_config::trust_repo(
-                                        std::path::Path::new(&project_path),
-                                        hooks_hash.as_deref(),
-                                        mcp_hash.as_deref(),
-                                    ) {
-                                        tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
-                                    } else {
-                                        // The daemon persists the approval
-                                        // itself before provisioning.
-                                        self.request_creation(data, Some(true));
-                                    }
-                                    None
+                            match action {
+                                RepoTrustAction::Trust { .. } => {
+                                    self.request_creation(data, Some(true), fingerprint);
                                 }
                                 RepoTrustAction::Skip => {
-                                    self.request_creation(data, Some(false));
-                                    None
+                                    self.request_creation(data, Some(false), None);
                                 }
                             };
-                            self.pending_dialog_click_action = emit;
                         }
                     }
                 }
@@ -2125,33 +2104,19 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.repo_trust_dialog = None;
                     self.pending_repo_trust_data = None;
+                    self.pending_repo_trust_fingerprint = None;
                 }
                 DialogResult::Submit(action) => {
                     self.repo_trust_dialog = None;
+                    let fingerprint = self.pending_repo_trust_fingerprint.take();
                     if let Some(data) = self.pending_repo_trust_data.take() {
                         match action {
-                            RepoTrustAction::Trust {
-                                hooks_hash,
-                                mcp_hash,
-                                project_path,
-                                ..
-                            } => {
-                                // Abort creation if trust cannot be persisted, to
-                                // avoid a split state (hooks approved but project
-                                // MCP gated off the unwritten hashes).
-                                if let Err(e) = repo_config::trust_repo(
-                                    std::path::Path::new(&project_path),
-                                    hooks_hash.as_deref(),
-                                    mcp_hash.as_deref(),
-                                ) {
-                                    tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
-                                    return None;
-                                }
-                                self.request_creation(data, Some(true));
+                            RepoTrustAction::Trust { .. } => {
+                                self.request_creation(data, Some(true), fingerprint);
                                 return None;
                             }
                             RepoTrustAction::Skip => {
-                                self.request_creation(data, Some(false));
+                                self.request_creation(data, Some(false), None);
                                 return None;
                             }
                         }
@@ -6858,10 +6823,19 @@ impl HomeView {
                 tracing::warn!(target: "tui.input", "Failed to check repo trust: {}", e);
                 // The read failed, so nothing here can approve repository
                 // hooks: skip them and let the daemon keep the global set.
-                self.request_creation(data, Some(false));
+                self.request_creation(data, Some(false), None);
                 return None;
             }
         };
+        let base = match crate::session::config::profile_config::resolve_config(&data.profile) {
+            Ok(config) => config.hooks,
+            Err(error) => {
+                tracing::warn!(target: "tui.input", "Failed to resolve trust review base: {}", error);
+                self.request_creation(data, Some(false), None);
+                return None;
+            }
+        };
+        let fingerprint = repo_config::creation_trust_fingerprint(&base, &trust);
 
         let repo_hooks: Option<crate::session::HooksConfig> = match &trust.hooks {
             TrustSurface::Trusted(h) | TrustSurface::NeedsTrust { config: h, .. } => {
@@ -6889,7 +6863,7 @@ impl HomeView {
                 TrustSurface::Trusted(_) => Some(true),
                 TrustSurface::NeedsTrust { .. } | TrustSurface::Absent => None,
             };
-            self.request_creation(data, decision);
+            self.request_creation(data, decision, Some(fingerprint));
             return None;
         }
 
@@ -6907,6 +6881,7 @@ impl HomeView {
             data.path.clone(),
         ));
         self.pending_repo_trust_data = Some(data);
+        self.pending_repo_trust_fingerprint = Some(fingerprint);
         None
     }
 }

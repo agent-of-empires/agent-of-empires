@@ -5227,8 +5227,21 @@ fn resolve_hook_plan_distinguishes_approval_from_skip() {
     assert_eq!(skipped.on_create(), vec!["echo global"]);
     assert!(skipped.trust_write.is_none());
 
-    let plan = resolve_create_hook_plan("default", &base, project.path(), false, Some(true), None)
-        .expect("trust_hooks: true must approve");
+    assert!(
+        resolve_create_hook_plan("default", &base, project.path(), false, Some(true), None)
+            .is_err()
+    );
+    let trust = crate::session::config::repo_config::check_repo_trust(project.path()).unwrap();
+    let review = crate::session::config::repo_config::creation_trust_fingerprint(&base, &trust);
+    let plan = resolve_create_hook_plan(
+        "default",
+        &base,
+        project.path(),
+        false,
+        Some(true),
+        Some(&review),
+    )
+    .expect("a matching reviewed fingerprint approves trust");
     assert_eq!(plan.on_create(), vec!["echo hi".to_string()]);
     let (hooks_hash, mcp_hash) = plan
         .trust_write

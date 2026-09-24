@@ -46,6 +46,36 @@ fn archive_advances_cursor_to_next_session() {
     }
 }
 
+#[test]
+#[serial]
+fn rejected_archive_drops_only_its_pending_cursor_and_ignores_late_transition() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view
+        .select_session_by_id(&env.view.instance_at(0).id.clone());
+    let id = env.view.selected_session.clone().unwrap();
+    let mut respond = env.view.session_feed.command_driver_for_test();
+
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert!(env.view.pending_archive_cursor.is_some());
+    let (submitted, mutation) = respond(Err("archive refused".into())).unwrap();
+    assert_eq!(submitted, id);
+    assert!(matches!(
+        mutation,
+        crate::daemon::SessionMutation::Archive(_)
+    ));
+    assert!(env.view.apply_session_feed());
+    assert!(env.view.pending_archive_cursor.is_none());
+
+    // A delayed/retried server transition for the same id must not resurrect
+    // the old cursor intent. Other command errors are unaffected by the
+    // id-scoped cleanup in status handling.
+    env.view
+        .session_feed
+        .publish_for_test(super::session_feed_tests::archived_daemon_snapshot(&id));
+    assert!(env.view.apply_session_feed());
+    assert!(env.view.pending_archive_cursor.is_none());
+}
+
 /// Archiving the bottom session has no row below to advance to, so the
 /// cursor falls back to the nearest active session above.
 #[test]

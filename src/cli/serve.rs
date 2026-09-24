@@ -71,11 +71,13 @@ pub struct ServeArgs {
     pub behind_proxy: bool,
 
     /// Extra `Host` header value to accept (repeatable). The DNS-rebinding
-    /// gate trusts loopback, any routable IP literal (LAN/tailnet IPs can't be
-    /// rebound), and a non-wildcard `--host` by default; add a HOSTNAME or mDNS
-    /// name here when serving behind a reverse proxy, a custom tunnel, or by
-    /// name when binding `0.0.0.0` (access by IP needs no flag). Auto-injected
-    /// tunnel hosts (`--remote`) need no flag.
+    /// gate trusts loopback, any routable IP-literal `Host` (LAN/tailnet IPs
+    /// can't be rebound), and a non-wildcard `--host` by default. A browser
+    /// `Origin` is accepted without `--allowed-origin` only when it is
+    /// allowlisted or has the exact same authority as `Host`; add a HOSTNAME
+    /// or mDNS name here when serving behind a reverse proxy, a custom tunnel,
+    /// or by name when binding `0.0.0.0` (access by IP needs no flag).
+    /// Auto-injected tunnel hosts (`--remote`) need no flag.
     #[arg(long = "allowed-host", value_name = "HOST")]
     pub allowed_host: Vec<String>,
 
@@ -565,6 +567,33 @@ fn retain_rollback_launch(
     record.replace(&serde_json::to_vec_pretty(launch)?)
 }
 
+/// Consume the retained pair only after its replacement has reached readiness.
+/// The lifecycle transaction serializes this with both replacement commands;
+/// checking both slots before removing either prevents a partial pair from
+/// being reported as a successful rollback policy. Once secret removal starts,
+/// a later failure is fail-closed: the policy is no longer replayable and the
+/// caller is told rather than silently ignored.
+fn complete_rollback_after(result: Result<()>) -> Result<()> {
+    result?;
+    let launch = launch_file("serve.rollback.launch")?;
+    let secret = launch_file("serve.rollback.passphrase")?;
+    launch
+        .read()?
+        .context("Retained rollback launch disappeared before consumption")?;
+    secret
+        .read()?
+        .context("Retained rollback credentials disappeared before consumption")?;
+    secret
+        .remove()
+        .context("consuming retained rollback credentials")?;
+    launch
+        .remove()
+        .context("consuming retained rollback launch")?;
+    secret.sync_parent()?;
+    launch.sync_parent()?;
+    Ok(())
+}
+
 async fn rollback_daemon() -> Result<()> {
     let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
     let launch: ServeLaunch = serde_json::from_str(
@@ -599,7 +628,7 @@ async fn rollback_daemon() -> Result<()> {
         DaemonStatus::Unverified => bail!("Cannot verify the existing daemon; refusing rollback"),
         DaemonStatus::Absent => {}
     }
-    start_daemon(&launch.profile, &args, &transaction, true).await
+    complete_rollback_after(start_daemon(&launch.profile, &args, &transaction, true).await)
 }
 
 pub(crate) struct LaunchProfileUpdates(Vec<(crate::session::ResolvedDataFile, Vec<u8>)>);
@@ -1541,7 +1570,7 @@ pub async fn restart_daemon() -> Result<()> {
 
     println!("Restarting aoe serve daemon (PID {pid})…");
     stop_daemon_locked(&transaction).await?;
-    start_daemon(&launch.profile, &args, &transaction, true).await
+    complete_rollback_after(start_daemon(&launch.profile, &args, &transaction, true).await)
 }
 
 #[tracing::instrument(target = "serve.shutdown", skip_all)]
@@ -2032,6 +2061,42 @@ mod tests {
             allowed_origin: vec!["https://aoe.example.com:8443".to_string()],
             additional_fields: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn rollback_policy_is_private_and_consumed_only_after_readiness() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir()?;
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let launch = launch_file("serve.rollback.launch")?;
+        let secret = launch_file("serve.rollback.passphrase")?;
+        launch.replace(br#"{"schema":1}"#)?;
+        secret.replace(br#"{"passphrase":"secret"}"#)?;
+        assert_eq!(
+            std::fs::metadata(crate::session::get_app_dir()?.join("serve.rollback.passphrase"))?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let readiness = complete_rollback_after(Err(anyhow::anyhow!("not ready"))).unwrap_err();
+        assert!(readiness.to_string().contains("not ready"));
+        assert!(
+            launch.read()?.is_some(),
+            "failed readiness retains rollback launch"
+        );
+        assert!(
+            secret.read()?.is_some(),
+            "failed readiness retains credentials"
+        );
+
+        complete_rollback_after(Ok(()))?;
+        assert!(launch.read()?.is_none());
+        assert!(secret.read()?.is_none());
+        assert!(complete_rollback_after(Ok(())).is_err());
+        Ok(())
     }
 
     /// `command_is_aoe_serve` hand-parses the top-level globals to find the

@@ -110,17 +110,21 @@ pub async fn ensure_tool(
     };
     let result = match result {
         Ok((tool, created, instance, tool_name)) => {
+            let identity = (
+                instance.lifecycle_generation,
+                instance.source_profile.clone(),
+            );
             crate::server::pane::publish_auxiliary_after_ensure(
                 &state,
                 instance,
                 crate::session::AuxiliaryTarget::Tool { tool_name },
             )
             .await
-            .map(|cursor| (tool, created, cursor))
+            .map(|cursor| (tool, created, cursor, identity))
         }
         Err(error) => Err(error),
     };
-    let (tool, created, cursor) = match result {
+    let (tool, created, cursor, (lifecycle_generation, profile)) = match result {
         Ok(tool) => tool,
         Err(error) => {
             if let Some(response) = lifecycle_rejection(&state, &error) {
@@ -149,6 +153,8 @@ pub async fn ensure_tool(
             } else {
                 crate::daemon::TerminalTargetStatus::Exists
             },
+            lifecycle_generation,
+            profile,
         }),
     )
 }
@@ -297,7 +303,10 @@ pub(super) async fn agent_target_response(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     if !snapshot.value.contents.sessions.iter().any(|row| {
-        row.id == id && row.profile == instance.source_profile && row.title == instance.title
+        row.id == id
+            && row.lifecycle_generation == instance.lifecycle_generation
+            && row.profile == instance.source_profile
+            && row.title == instance.title
     }) {
         return agent_target_error(
             state,
@@ -305,6 +314,8 @@ pub(super) async fn agent_target_response(
         );
     }
     let mut body = serde_json::json!({
+        "lifecycle_generation": instance.lifecycle_generation,
+        "profile": instance.source_profile,
         "tmux_session": name,
         "status": if outcome.is_some() { "restarted" } else { "alive" },
     });
@@ -408,16 +419,22 @@ pub async fn ensure_terminal(
     drop(guard);
     drop(namespace);
     let result = match result {
-        Ok((terminal, created, instance)) => crate::server::pane::publish_auxiliary_after_ensure(
-            &state,
-            instance,
-            crate::session::AuxiliaryTarget::Host { index },
-        )
-        .await
-        .map(|cursor| (terminal, created, cursor)),
+        Ok((terminal, created, instance)) => {
+            let identity = (
+                instance.lifecycle_generation,
+                instance.source_profile.clone(),
+            );
+            crate::server::pane::publish_auxiliary_after_ensure(
+                &state,
+                instance,
+                crate::session::AuxiliaryTarget::Host { index },
+            )
+            .await
+            .map(|cursor| (terminal, created, cursor, identity))
+        }
         Err(error) => Err(error),
     };
-    let (terminal, created, cursor) = match result {
+    let (terminal, created, cursor, (lifecycle_generation, profile)) = match result {
         Ok(result) => result,
         Err(error) => {
             if let Some(response) = lifecycle_rejection(&state, &error) {
@@ -445,6 +462,8 @@ pub async fn ensure_terminal(
                 } else {
                     crate::daemon::TerminalTargetStatus::Exists
                 },
+                lifecycle_generation,
+                profile,
             }),
         ),
     )

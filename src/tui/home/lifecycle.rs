@@ -260,6 +260,7 @@ impl HomeView {
             group_rename_context: None,
             repo_trust_dialog: None,
             pending_repo_trust_data: None,
+            pending_repo_trust_fingerprint: None,
             hooks_install_dialog: None,
             pending_hooks_install_data: None,
             volume_ignores_glob_dialog: None,

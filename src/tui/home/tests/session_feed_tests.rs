@@ -133,6 +133,12 @@ pub(super) fn daemon_snapshot(id: &str, status: &str) -> SessionFeedResult {
     snapshot_of(vec![daemon_row(id, status)])
 }
 
+pub(super) fn archived_daemon_snapshot(id: &str) -> SessionFeedResult {
+    let mut row = daemon_row(id, "Stopped");
+    row.archived_at = Some(chrono::Utc::now().to_rfc3339());
+    snapshot_of(vec![row])
+}
+
 /// A snapshot whose rows carry their profile, which is what decides whether
 /// this view may act on them.
 fn snapshot_of(sessions: Vec<crate::daemon::SessionResponse>) -> SessionFeedResult {
@@ -266,6 +272,8 @@ fn native_attachment_never_survives_a_cancelled_context() {
                 outcome: TerminalTarget {
                     tmux_session: "daemon-owned-target".into(),
                     status: TerminalTargetStatus::Exists,
+                    lifecycle_generation: 0,
+                    profile: String::new(),
                 },
             })
         });
@@ -275,7 +283,11 @@ fn native_attachment_never_survives_a_cancelled_context() {
             matches!(change, Change::None),
             "{change:?}"
         );
-        assert!(env.view.session_feed.can_submit(&id));
+        assert_eq!(
+            env.view.session_feed.can_submit(&id),
+            matches!(change, Change::None | Change::Rejected),
+            "retry availability: {change:?}"
+        );
         if matches!(change, Change::Rejected) {
             assert!(env.view.info_dialog.is_some());
         }
@@ -1048,6 +1060,8 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
                 target: Some(TerminalTarget {
                     tmux_session: "restarted-agent".into(),
                     status: TerminalTargetStatus::Restarted,
+                    lifecycle_generation: 0,
+                    profile: String::new(),
                 }),
             },
         }))

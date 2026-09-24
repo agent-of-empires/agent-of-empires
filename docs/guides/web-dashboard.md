@@ -55,7 +55,7 @@ An explicit `aoe serve` request replaces an existing managed core under the daem
 
 `aoe serve --restart` replays the current managed launch. If a replacement fails after stopping the daemon, there is no automatic fallback. Run `aoe serve --rollback` to restore the retained launch explicitly. Rollback also works after `--stop`; it refuses missing or mismatched credentials instead of dropping authentication. The retained launch can still fail if its prerequisites are no longer available.
 
-The retained policy and any passphrase remain in private application storage until a later managed replacement overwrites them. Foreground and service-supervised processes must be stopped through their owning shell or service manager before rollback can replace them.
+The retained policy and any passphrase are one-shot recovery credentials: they remain private (`0600`) while a replacement is pending, then are consumed after the replacement reaches readiness. A failed replacement keeps them available for an explicit retry; a successful replacement makes that policy non-replayable. Foreground and service-supervised processes must be stopped through their owning shell or service manager before rollback can replace them.
 
 ### Retrieving the live URL
 
@@ -221,12 +221,12 @@ The server also sets `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
 
 ### DNS rebinding
 
-`aoe serve` validates the `Host` and `Origin` of every request before authentication: a request whose `Host` is unlisted, or whose browser `Origin` is present but unlisted, gets `403 Forbidden`. A request with no `Origin` header is exempt from the origin check; any `Origin` that is sent, including the opaque `Origin: null`, is rejected unless allowlisted, and since `--allowed-origin` requires a full `scheme://host[:port]`, `Origin: null` can never be allowlisted. This closes the DNS-rebinding vector: a page that rebinds its hostname to your machine's IP still sends that hostname as `Host`, which is not in the allowlist.
+`aoe serve` validates the `Host` and `Origin` of every request before authentication: a request whose `Host` is unlisted, or whose browser `Origin` is present but neither allowlisted nor on the exact same authority (host and effective port, including default ports and bracketed IPv6) as `Host`, gets `403 Forbidden`. A different routable IP is therefore rejected. A request with no `Origin` header is exempt from the origin check; any `Origin` that is sent, including the opaque `Origin: null`, is rejected unless allowlisted, and since `--allowed-origin` requires a full `scheme://host[:port]`, `Origin: null` can never be allowlisted. This closes the DNS-rebinding vector: a page that rebinds its hostname to your machine's IP still sends that hostname as `Host`, which is not in the allowlist.
 
 The allowlist is derived automatically:
 
 - `localhost`, `127.0.0.1`, and `::1` are always accepted, plus the value of `--host` when it is a concrete (non-wildcard) address.
-- Any routable **IP literal** `Host`/`Origin` (LAN, tailnet `100.x`, ULA, global) is accepted unconditionally: an IP is dialed directly and never DNS-resolved, so it cannot be rebound. The unspecified address (`0.0.0.0` / `::`), link-local (`169.254.0.0/16`, `fe80::/10`), and multicast are excluded from this automatic trust and cannot be allowlisted at all: `--allowed-host` / `--allowed-origin` reject them at startup, since allowlisting one would reopen the hole the gate closes.
+- Any routable **IP literal `Host`** (LAN, tailnet `100.x`, ULA, global) is accepted unconditionally: an IP is dialed directly and never DNS-resolved, so it cannot be rebound. A browser `Origin` is accepted without `--allowed-origin` only when its authority exactly matches that `Host`. The unspecified address (`0.0.0.0` / `::`), link-local (`169.254.0.0/16`, `fe80::/10`), and multicast are excluded from automatic trust and cannot be allowlisted at all: `--allowed-host` / `--allowed-origin` reject them at startup, since allowlisting one would reopen the hole the gate closes.
 - `--remote` tunnels (Cloudflare and Tailscale) inject their public hostname and its `https://` origin, so remote dashboards and the live terminal WebSocket work with no extra flag.
 - `--allowed-host` / `--allowed-origin` add operator-declared entries (see below).
 

@@ -17,7 +17,12 @@ impl HomeView {
     /// Request session creation from the daemon. The stub is a display-only
     /// placeholder: the daemon provisions, runs the hooks, and commits the row,
     /// which then lands through the canonical feed.
-    pub fn request_creation(&mut self, mut data: NewSessionData, trust_hooks: Option<bool>) {
+    pub fn request_creation(
+        &mut self,
+        mut data: NewSessionData,
+        trust_hooks: Option<bool>,
+        trust_review: Option<crate::daemon::CreationTrustFingerprint>,
+    ) {
         if self.pending_creation.is_some() {
             self.flash_status("A session is already being created");
             return;
@@ -118,7 +123,7 @@ impl HomeView {
         }
         self.new_dialog = None;
 
-        let mut body = wizard_create_body(&data, trust_hooks);
+        let mut body = wizard_create_body(&data, trust_hooks, trust_review);
         body.idempotency_key = Some(stub_id.clone());
         if let Err(error) = self.session_feed.create_session(stub_id.clone(), body) {
             self.pending_creation = None;
@@ -512,12 +517,12 @@ impl HomeView {
 }
 
 /// Wizard output as the daemon's create request. `trust_hooks` carries the
-/// wizard's own decision: `Some(true)` once the user approved the repository's
-/// hooks (the daemon then persists that approval before provisioning),
-/// `Some(false)` for a deliberate skip, `None` when there is nothing to approve.
+/// user's decision; approval is valid only with the fingerprint that the
+/// daemon recomputed for the exact configuration shown in the review.
 fn wizard_create_body(
     data: &NewSessionData,
     trust_hooks: Option<bool>,
+    trust_review: Option<crate::daemon::CreationTrustFingerprint>,
 ) -> crate::daemon::CreateSessionBody {
     crate::daemon::CreateSessionBody {
         title: Some(data.title.clone()),
@@ -551,7 +556,7 @@ fn wizard_create_body(
         agent_effort: None,
         scratch: data.scratch,
         trust_hooks,
-        trust_review: None,
+        trust_review,
         import_acp_session_id: None,
         // The wizard resolved the parent's provider conversation id; the daemon
         // rebuilds the seed from it and re-checks fork capability, choosing the
