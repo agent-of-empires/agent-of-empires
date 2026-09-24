@@ -117,13 +117,48 @@ Claude Code, Codex, and Gemini refuse to start in a directory they have not been
 
 Trust activates the repo's own `.claude/settings.json`, including its hooks, so a pre-trusted workspace runs them unprompted, while a repo's `.mcp.json` still asks per server. For host sessions, see `session.pre_trust_agent_folders` in the [configuration reference](configuration.md#session).
 
-For a custom agent whose wrapper points the CLI at another directory, name that host root in `session.agent_config_dir`; AoE stages a per-session child of it and mounts it at the agent's canonical container path. Do not add an `extra_volumes` entry for that path, which would shadow the managed mount (AoE warns when one does), and leave the config-dir variables AoE sets in place inside the container.
+For a custom agent whose wrapper points the CLI at another directory, name that host root in `session.agent_config_dir` and declare its native CLI with `session.agent_execution_as`; `agent_detect_as` selects status and ACP adapter behavior, not native-store ownership. A foreign declared root without a provable native identity is opaque during sandbox seeding. See [Custom agents](configuration.md#custom-agents). AoE stages a per-session child of that root and mounts it at the agent's canonical container path. Do not add an `extra_volumes` entry for that path, which would shadow the managed mount (AoE warns when one does), and leave the config-dir variables AoE sets in place inside the container.
 
 ## Per-session agent stores
 
-Each sandboxed session gets its own copy of the agent's config and history under `sandbox-v2/<instance-id>` in the agent's config directory (for example `~/.claude/sandbox-v2/<id>`), mounted at the agent's usual config path, so credentials, hooks and conversation history belong to one session.
+Each sandboxed session gets its own agent store on the host, under
+`sandbox-v2/<instance-id>` inside the agent's config directory (for example
+`~/.claude/sandbox-v2/<id>`). AoE builds that store from the configuration it
+declares for the agent: its config files, credentials and authored resources.
+The host's native history is never imported, so a session's transcripts,
+caches and logs start empty and belong to it alone. A host file AoE does not
+declare for that agent, such as one you wrote yourself, stays on the host
+instead of being copied. The container mounts the
+store at the agent's usual config path, so credentials, hooks and conversation
+history belong to one session and `aoe` can resume the right conversation.
 
-Sessions created under the older shared-store layout move to a private store the next time they start, which makes that first start slower; the TUI shows the progress. `aoe migrate` moves every eligible session at once, and `AOE_DEFER_SANDBOX_MIGRATION=1` skips the move for one launch (a session whose container is stopped then cannot start until its store has moved). Trashed and archived sessions keep the shared store until they are started again.
+A session keeps the store it was given for as long as AoE can still prove it
+wrote that store. When it cannot, each of its content roots is moved intact
+under `.aoe-sandbox-recovery/<transaction>/<index>/original` beside the agent's
+config directory and a fresh store is seeded in its place, with the session's
+original left alone. AoE carries Claude `projects/`, Codex `sessions/` and
+`archived_sessions/`, and OpenCode `opencode.db` with its WAL and SHM
+from a retired store. It also carries only a uniquely attributable Gemini
+`tmp/<project>/chats` session file, Kimi session directory plus its live
+index entry, or Prime session file with a matching root header in the managed
+`sessions/` directory. Carried conversations keep their native IDs. Claude,
+Codex and OpenCode can also continue a structured session backed by that store;
+Gemini, Kimi and Prime start a fresh ACP session because carrying the native
+conversation does not prove that `session/load` can recover the ACP ID. Missing,
+deleted or ambiguous matches remain in recovery and have their IDs reset. Pi,
+OMP, Hermes and other unverified conversation histories remain in recovery
+instead of being copied.
+Host native history is never imported. The next start names retained originals;
+isolated history is not replayed automatically.
+
+Sessions created under the older shared-store layout move to a private store the next time they start. Once every session that used the shared store has moved, AoE preserves that store intact under `.aoe-sandbox-recovery/v027-<transaction>/original` instead of deleting it. A session that already had a private store receives only the shared store's top-level configuration and credentials, not its directories of caches, logs, plugins, or unrelated conversation history. If a live sandbox can see the recovery directory, preservation is deferred until that mount is gone.
+
+The first start can therefore be slower; the TUI shows progress. `aoe migrate` moves every eligible session at once, and `AOE_DEFER_SANDBOX_MIGRATION=1` skips the move for one launch (a stopped session then cannot start until its store has moved). Trashed and archived sessions keep the shared store until they are started again.
+
+A sandbox still running during an upgrade remains pending: transcript capture
+pauses until it is stopped, isolated and launched again. If native configuration
+changes throughout isolation, that session remains pending; `aoe migrate`
+continues with other sessions and retries later.
 
 ### Shared credentials
 
@@ -133,7 +168,12 @@ A file holding no credential is seeded at the next start from the freshest of th
 
 ### Reclaiming stores
 
-Permanently deleting a sandboxed session removes its store with its container. Stores stranded otherwise (a delete that kept the container, or one that failed part-way) are found by their instance id resolving in no profile:
+Permanently deleting a sandboxed session removes its store along with its
+container, unless AoE cannot prove it wrote that store: an unproven original is
+preserved rather than deleted, so a delete cannot destroy content nothing could
+restore. Stores stranded before that, by a delete that kept the container, or
+by a delete that failed part-way and kept the session, are found by their
+instance id resolving in no profile:
 
 ```bash
 aoe sandbox reclaim            # report what would go, and how much it frees

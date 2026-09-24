@@ -25,6 +25,9 @@ impl Instance {
     pub(crate) fn try_retroactive_capture(
         &self,
     ) -> Option<crate::session::poller::SessionIdObservation> {
+        if !crate::migrations::v033_isolate_sandbox_content::instance_ready(self).ok()? {
+            return None;
+        }
         let (capture, context) = self.source_session_support()?;
         let backend = capture.backend;
         if matches!(

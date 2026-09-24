@@ -9,6 +9,34 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 pub(super) use super::unix::{
     configure_process_group, kill_process_group, terminate_process_group,
 };
+pub(super) fn rename_exclusive(
+    source_dir: &std::os::fd::OwnedFd,
+    source: &std::ffi::OsStr,
+    destination_dir: &std::os::fd::OwnedFd,
+    destination: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    use nix::NixPath;
+    use std::os::fd::AsRawFd;
+
+    let result = source.with_nix_path(|source| {
+        destination.with_nix_path(|destination| {
+            // SAFETY: both descriptors remain owned for the call and NixPath
+            // supplies live NUL-terminated names. The syscall also supports musl.
+            nix::errno::Errno::result(unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    source_dir.as_raw_fd(),
+                    source.as_ptr(),
+                    destination_dir.as_raw_fd(),
+                    destination.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            })
+            .map(|_| ())
+        })
+    })??;
+    result.map_err(std::io::Error::from)
+}
 
 pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
     let children_map = build_children_map();

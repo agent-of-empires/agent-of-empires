@@ -20,6 +20,7 @@ pub(super) struct PreparedLaunch {
     pub(super) omp_capture_plan: Option<OmpCapturePlan>,
     pub(super) launch_env: LaunchEnvironment,
     pub(super) expected_conversation: ConversationState,
+    pub(super) sandbox_context_reset: Option<(String, Vec<String>)>,
     pub(super) canonical_conversation: Option<ConversationState>,
     pub(super) expected_prior_omp_generation: Option<String>,
     pub(super) execution: Option<super::execution::NativeExecution>,
@@ -433,6 +434,19 @@ impl Instance {
         &mut self,
         expected_conversation: ConversationState,
     ) -> Result<PreparedLaunch> {
+        let sandbox_context_reset = match self.resolved_agent() {
+            Some(agent) => {
+                crate::migrations::v033_isolate_sandbox_content::prepare_terminal_launch_context(
+                    self, agent.name,
+                )?
+            }
+            None => None,
+        };
+        let expected_conversation = if sandbox_context_reset.is_some() {
+            self.conversation_state()
+        } else {
+            expected_conversation
+        };
         let expected_prior_omp_generation = self.omp_capture_generation.clone();
         let prior_probe_failed_sid = self.resume_probe_failed_sid.clone();
         let preparation = (|| -> Result<_> {
@@ -548,6 +562,7 @@ impl Instance {
             expected_conversation,
             canonical_conversation,
             expected_prior_omp_generation,
+            sandbox_context_reset,
             execution,
             carry_relocated: false,
         })
@@ -900,6 +915,73 @@ mod tests {
     fn host_command(inst: &mut Instance) -> String {
         let agent = crate::agents::get_agent(&inst.tool);
         inst.build_host_command(agent, None).unwrap().0.unwrap()
+    }
+    fn admit_fixture_content(inst: &Instance) {
+        let app = crate::session::get_app_dir().unwrap();
+        for root in crate::migrations::v033_isolate_sandbox_content::instance_roots(inst).unwrap() {
+            std::fs::create_dir_all(&root.path).unwrap();
+            let roles: Vec<&str> = root.roles.iter().map(String::as_str).collect();
+            crate::migrations::v033_isolate_sandbox_content::certify_test_content(
+                &app, &inst.id, &root.path, &roles,
+            )
+            .unwrap();
+        }
+    }
+
+    // The sidecar env var has to survive into the docker argv; no CI container would catch it.
+    #[test]
+    #[serial_test::serial]
+    fn sandboxed_pi_publishes_through_env_without_a_command_line_extension() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = tool_instance("pi", project.to_str().unwrap());
+        let mut sandbox = test_sandbox("aoe-pi-argv", Some("/workspace"));
+        sandbox.extra_env = Some(vec![
+            "AOE_SESSION_ROOT_ONLY=1".to_string(),
+            "PI_CODING_AGENT_SESSION_DIR=/root/.pi/agent/sessions".to_string(),
+        ]);
+        inst.sandbox_info = Some(sandbox);
+        admit_fixture_content(&inst);
+        let config = inst.build_container_config().unwrap();
+        let _transport =
+            install_container_transport(temp_home.path(), "aoe-pi-argv", &config.volumes);
+        std::fs::copy(
+            temp_home.path().join("native-bin/prime-agent"),
+            temp_home.path().join("native-bin/pi"),
+        )
+        .unwrap();
+        let sidecar = format!(
+            "AOE_SESSION_ID_FILE={}/{}/session_id",
+            crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
+            inst.id
+        );
+
+        // Native container launches carry the publisher through the exec environment file.
+        let execution = inst.resolve_native_execution(None).unwrap();
+        let docker_env = execution.inputs.docker_env.as_ref().unwrap();
+        let value = |key| {
+            docker_env
+                .env
+                .iter()
+                .rev()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(
+            value("AOE_SESSION_ID_FILE"),
+            Some(sidecar.split_once('=').unwrap().1)
+        );
+        assert_eq!(value("AOE_SESSION_ROOT_ONLY"), Some("0"));
+
+        let (cmd, _, _, _) = inst
+            .build_launch_command(Some(&execution))
+            .expect("a sandboxed launch line");
+        let cmd = cmd.expect("a command");
+        assert!(cmd.contains("--env-file"), "{cmd}");
+        assert!(!cmd.contains("aoe-session-id.js"), "{cmd}");
     }
 
     #[test]
@@ -1439,6 +1521,24 @@ mod tests {
                 .1
                 .as_deref(),
             Some("/root/.claude")
+        );
+        inst.resume_intent = ResumeIntent::Default;
+        inst.resume_binding = None;
+        inst.set_agent_conversation(
+            Some(sid.into()),
+            Some(crate::session::ConversationBinding::unknown(sid)),
+            None,
+        );
+        let carried = inst
+            .prepare_launch_command(inst.conversation_state())
+            .unwrap();
+        assert!(carried
+            .command
+            .unwrap()
+            .contains(&format!("--resume {sid}")));
+        assert_eq!(
+            inst.agent_session_binding,
+            Some(crate::session::ConversationBinding::unknown(sid))
         );
     }
 }

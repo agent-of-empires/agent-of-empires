@@ -48,6 +48,29 @@ pub mod runner;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PROCESS_GROUP_TERMINATION_GRACE: Duration = Duration::from_millis(250);
+/// Atomically publish a directory entry without replacing an existing entry.
+/// Both names are relative to retained directory descriptors; there is no
+/// check-then-rename fallback on platforms without an exclusive rename syscall.
+#[cfg(unix)]
+pub(crate) fn rename_exclusive(
+    source_dir: &std::os::fd::OwnedFd,
+    source: &std::ffi::OsStr,
+    destination_dir: &std::os::fd::OwnedFd,
+    destination: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::rename_exclusive(source_dir, source, destination_dir, destination)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (source_dir, source, destination_dir, destination);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "exclusive directory publication is unsupported on this platform",
+        ))
+    }
+}
 
 /// Only use this when output is not piped: a full pipe can wedge the child. Prefer
 /// [`run_with_timeout`].
@@ -267,6 +290,15 @@ pub fn boot_id() -> Option<String> {
     {
         None
     }
+}
+
+/// Whether a locally launched container can run on this host's own kernel, so
+/// the boot_id/inode mount proof in the sandbox content migration can be
+/// established. Only a Linux host runs containers on its own kernel; macOS and
+/// every other platform run them inside a VM whose kernel identity never
+/// matches the host's, so the proof is skipped and declared mounts are trusted.
+pub fn host_shares_container_kernel() -> bool {
+    cfg!(target_os = "linux")
 }
 
 pub fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {

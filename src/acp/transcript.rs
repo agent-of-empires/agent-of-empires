@@ -300,7 +300,9 @@ impl TranscriptModel {
                         TranscriptRowKind::UserPrompt | TranscriptRowKind::UserDiffComments
                     )
                 });
-                if !has_prior_prompt {
+                if !has_prior_prompt
+                    && (reason.is_empty() || reason.starts_with("session/load failed"))
+                {
                     return Vec::new();
                 }
                 let text = if reason.is_empty() {
@@ -1306,11 +1308,20 @@ mod tests {
     }
 
     #[test]
-    fn context_reset_divider_needs_a_prior_prompt() {
+    fn context_reset_divider_needs_a_reason_or_a_prior_prompt() {
         let reset = |reason: &str| Event::SessionContextReset {
             reason: reason.into(),
         };
-        assert!(fold([reset("load failed")]).rows().is_empty());
+        assert!(fold([reset("")]).rows().is_empty());
+        assert!(fold([reset("session/load failed: bad id")])
+            .rows()
+            .is_empty());
+
+        let isolated = fold([reset("Sandbox native history was isolated")]);
+        let last = isolated.rows().last().unwrap();
+        assert_eq!(last.kind, TranscriptRowKind::ContextReset);
+        assert!(last.text.contains("isolated"));
+
         let m = fold([prompt("hi"), reset("session/load failed: bad id")]);
         let last = m.rows().last().unwrap();
         assert_eq!(

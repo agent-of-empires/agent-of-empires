@@ -25,13 +25,19 @@ pub(crate) use claude::{
     claude_home_for_host_environment, claude_host_transcript_confirmed_absent,
 };
 pub(crate) use codex::codex_poll_fn_sandboxed_store;
-pub(crate) use gemini::gemini_poll_fn_sandboxed_store;
+pub(crate) use gemini::{
+    gemini_poll_fn_sandboxed_store, parse_gemini_session_json, project_hash,
+    GEMINI_SCAN_MAX_CANDIDATES, GEMINI_SESSION_MAX_BYTES,
+};
 pub(crate) use hermes::hermes_poll_fn_sandboxed_store;
-pub(crate) use kimi::kimi_poll_fn_sandboxed_store;
+pub(crate) use kimi::{kimi_poll_fn_sandboxed_store, selected_index_record, KIMI_INDEX_MAX_BYTES};
 pub(crate) use omp::*;
 pub(crate) use opencode::preassign_opencode_session_id;
 pub(crate) use pi::{extract_pi_header_fields, pi_sidecar_poll_fn, read_pi_session_observation};
-pub(crate) use prime::{prime_agent_poll_fn_sandboxed, PrimeRootPublication};
+pub(crate) use prime::{
+    prime_agent_poll_fn_sandboxed, root_session_header, PrimeRootPublication,
+    PRIME_AGENT_HEADER_SCAN_BYTES, PRIME_AGENT_MAX_SESSION_FILES,
+};
 
 /// Canonicalizes an existing path, else normalizes lexically so an unnormalized
 /// spelling of a deleted directory still compares equal.

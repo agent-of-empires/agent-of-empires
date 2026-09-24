@@ -111,6 +111,7 @@ fn spawn_request_for(
         effort_explicit: instance.acp_effort.is_some(),
         stored_acp_session_id: instance.acp_session_id.clone(),
         fork_from: instance.fork_pending.clone(),
+        sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
         sandbox_info,
         // Passed even without sandboxing so agent_acp_cmd and worker env
         // resolve from the session's profile.

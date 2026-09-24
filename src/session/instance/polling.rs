@@ -242,6 +242,10 @@ impl Instance {
         &mut self,
         omp_metadata: Option<OmpCaptureMetadata>,
     ) -> PollerStart {
+        if !crate::migrations::v033_isolate_sandbox_content::instance_ready(self).unwrap_or(false) {
+            self.session_id_poller = None;
+            return PollerStart::NotApplicable;
+        }
         if self.session_id_poller_is_running() {
             return PollerStart::Started;
         }
@@ -722,6 +726,18 @@ mod tests {
     use crate::session::instance::test_helpers::*;
     use crate::session::{Instance, Status};
 
+    fn admit_fixture_content(inst: &Instance) {
+        let app = crate::session::get_app_dir().unwrap();
+        for root in crate::migrations::v033_isolate_sandbox_content::instance_roots(inst).unwrap() {
+            std::fs::create_dir_all(&root.path).unwrap();
+            let roles: Vec<&str> = root.roles.iter().map(String::as_str).collect();
+            crate::migrations::v033_isolate_sandbox_content::certify_test_content(
+                &app, &inst.id, &root.path, &roles,
+            )
+            .unwrap();
+        }
+    }
+
     /// The 2026-09-04 fleet shape.
     #[test]
     fn repair_defers_with_backoff_while_the_poller_budget_is_spent() {
@@ -845,6 +861,7 @@ mod tests {
             "prime-repair",
             Some("/workspace/prime-repair"),
         ));
+        admit_fixture_content(&inst);
         let store = inst.sandbox_capture_store_dir().unwrap();
         std::fs::create_dir_all(&store).unwrap();
         let live = crate::tmux::LiveSessionSnapshot::from_parts(
@@ -951,6 +968,7 @@ mod tests {
         inst.sandbox_info = Some(test_sandbox("aoe-pi-late-path", None));
         inst.agent_session_id = Some(sid.to_string());
         inst.mark_pi_extension_launched_for_test();
+        admit_fixture_content(&inst);
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
         let seed = inst.clone();
         storage
@@ -1018,6 +1036,7 @@ mod tests {
         let mut sandboxed = Instance::new("pisandboxpoll001", "/tmp/pi-poll");
         sandboxed.tool = "pi".to_string();
         sandboxed.sandbox_info = Some(test_sandbox("aoe-pi-poll", None));
+        admit_fixture_content(&sandboxed);
         let dir = sandboxed
             .pi_sidecar_source()
             .and_then(|s| match s {
@@ -1090,6 +1109,7 @@ mod tests {
         inst.sandbox_info = Some(test_sandbox("test", Some("/workspace/gemini-backoff")));
         let name = inst.tmux_session().unwrap().name().to_string();
         let live = crate::tmux::LiveSessionSnapshot::from_parts(Some(vec![name]), None);
+        admit_fixture_content(&inst);
         inst.session_id_poller_retry_after =
             Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
 
@@ -1125,6 +1145,7 @@ mod tests {
         peer.source_profile = "capture-owner-b".into();
         let shared_store = app.path().join("shared");
         std::fs::create_dir_all(&shared_store).unwrap();
+        admit_fixture_content(&peer);
         std::fs::create_dir_all(peer.sandbox_capture_store_dir().unwrap()).unwrap();
         let bind = |instance: &mut Instance, store: &std::path::Path| {
             instance.active_execution = Some(super::ActiveExecution {

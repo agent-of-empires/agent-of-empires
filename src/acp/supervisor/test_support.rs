@@ -234,6 +234,7 @@ pub(super) fn spawn_request(session_id: &str) -> SpawnRequest {
         effort_explicit: false,
         stored_acp_session_id: None,
         fork_from: None,
+        sandbox_continuation: super::SandboxContinuation::Persisted,
         seed_history_replay: false,
         sandbox_info: None,
         source_profile: None,

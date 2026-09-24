@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use nix::dir::Dir;
 use nix::errno::Errno;
 use nix::fcntl::{open, openat, renameat, AtFlags, OFlag};
-use nix::sys::stat::{fstat, fstatat, mkdirat, Mode};
+use nix::sys::stat::{fstat, fstatat, mkdirat, FileStat, Mode};
 use nix::unistd::{linkat, unlinkat, UnlinkatFlags};
 use std::ffi::OsString;
 use std::fs::File;
@@ -16,6 +16,16 @@ use std::path::{Component, Path, PathBuf};
 pub(crate) struct AnchoredDir {
     root: PathBuf,
     fd: OwnedFd,
+}
+
+pub(crate) struct FilePublication<'a> {
+    pub(crate) staging: &'a AnchoredDir,
+    pub(crate) validate: &'a dyn Fn() -> Result<()>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_SYNC_ONCE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 impl AnchoredDir {
@@ -74,27 +84,73 @@ impl AnchoredDir {
     }
 
     pub(crate) fn ensure_dir(&self, relative: &Path) -> Result<PathBuf> {
+        self.ensure_dir_fd(relative)?;
+        Ok(self.root.join(relative))
+    }
+
+    pub(crate) fn child(&self, relative: &Path) -> Result<Self> {
+        Ok(Self {
+            root: self.root.join(relative),
+            fd: self.open_dir(relative)?,
+        })
+    }
+
+    pub(crate) fn create_child(&self, relative: &Path) -> Result<Self> {
+        Ok(Self {
+            root: self.root.join(relative),
+            fd: self.ensure_dir_fd(relative)?,
+        })
+    }
+
+    pub(crate) fn identity(&self) -> Result<(libc::dev_t, libc::ino_t)> {
+        let stat = fstat(&self.fd)?;
+        Ok((stat.st_dev, stat.st_ino))
+    }
+
+    pub(crate) fn sync(&self) -> Result<()> {
+        #[cfg(test)]
+        if FAIL_SYNC_ONCE.with(|path| {
+            let mut path = path.borrow_mut();
+            if path.as_deref() == Some(self.path()) {
+                path.take();
+                true
+            } else {
+                false
+            }
+        }) {
+            bail!("injected anchored directory sync failure");
+        }
+        nix::unistd::fsync(&self.fd).context("syncing anchored directory")
+    }
+
+    fn ensure_dir_fd(&self, relative: &Path) -> Result<OwnedFd> {
         let components = normal_components(relative)?;
-        let mut current = openat(
-            &self.fd,
-            ".",
-            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
-            Mode::empty(),
-        )?;
+        let mut current = Self {
+            root: self.root.clone(),
+            fd: openat(
+                &self.fd,
+                ".",
+                OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+                Mode::empty(),
+            )?,
+        };
         for component in &components {
-            match mkdirat(&current, component.as_os_str(), Mode::S_IRWXU) {
+            match mkdirat(&current.fd, component.as_os_str(), Mode::S_IRWXU) {
                 Ok(()) | Err(Errno::EEXIST) => {}
                 Err(error) => return Err(error).context("creating anchored directory"),
             }
-            current = openat(
-                &current,
+            let child = openat(
+                &current.fd,
                 component.as_os_str(),
                 OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
                 Mode::empty(),
             )
             .context("opening anchored directory component")?;
+            current.sync()?;
+            current.root.push(component);
+            current.fd = child;
         }
-        Ok(self.root.join(relative))
+        Ok(current.fd)
     }
 
     pub(crate) fn open_regular(&self, relative: &Path, max_bytes: usize) -> Result<Option<File>> {
@@ -243,6 +299,19 @@ impl AnchoredDir {
         self.remove_file(from)?;
         Ok(published)
     }
+    /// Stat one direct child without following a link at its leaf, so a caller
+    /// sees the entry the directory holds rather than what it resolves to.
+    pub(crate) fn entry_stat(&self, leaf: &Path) -> Result<Option<FileStat>> {
+        let components = normal_components(leaf)?;
+        let [name] = components.as_slice() else {
+            bail!("anchored entry is not a single component");
+        };
+        match fstatat(&self.fd, name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(stat) => Ok(Some(stat)),
+            Err(Errno::ENOENT) => Ok(None),
+            Err(error) => Err(error).context("inspecting anchored entry"),
+        }
+    }
 
     pub(crate) fn remove_file(&self, relative: &Path) -> Result<()> {
         let (parent, leaf) = self.open_parent(relative)?;
@@ -250,6 +319,141 @@ impl AnchoredDir {
             Ok(()) | Err(Errno::ENOENT) => Ok(()),
             Err(error) => Err(error).context("removing anchored file"),
         }
+    }
+
+    /// Publish a complete regular file. A seed never replaces any existing
+    /// entry; refresh replaces the leaf, never follows a link at that leaf.
+    /// Parent directories must already exist beneath this retained anchor.
+    pub(crate) fn publish_file(
+        &self,
+        relative: &Path,
+        reader: &mut impl Read,
+        permissions: std::fs::Permissions,
+        replace: bool,
+        publication: Option<FilePublication<'_>>,
+    ) -> Result<bool> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        let staging = publication
+            .as_ref()
+            .map_or(&parent, |publication| &publication.staging.fd);
+        let temporary = format!(".aoe-copy-{}", uuid::Uuid::new_v4());
+        let fd = openat(
+            staging,
+            temporary.as_str(),
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        )
+        .context("creating anchored file stage")?;
+        let mut file = File::from(fd);
+        let result = (|| -> Result<bool> {
+            std::io::copy(reader, &mut file).context("copying anchored file stage")?;
+            file.set_permissions(permissions)?;
+            file.sync_all()?;
+            if let Some(publication) = &publication {
+                (publication.validate)()?;
+            }
+            if replace {
+                nix::fcntl::renameat(staging, temporary.as_str(), &parent, leaf.as_os_str())?;
+            } else {
+                match crate::process::rename_exclusive(
+                    staging,
+                    temporary.as_ref(),
+                    &parent,
+                    leaf.as_os_str(),
+                ) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error).context("publishing anchored file seed"),
+                }
+            }
+            if publication.is_some() {
+                nix::unistd::fsync(staging)?;
+            }
+            nix::unistd::fsync(&parent)?;
+            Ok(true)
+        })();
+        if !matches!(result, Ok(true)) {
+            let _ = unlinkat(staging, temporary.as_str(), UnlinkatFlags::NoRemoveDir);
+        }
+        result
+    }
+
+    /// The fully built stage remains available when another writer wins.
+    pub(crate) fn publish_directory(
+        &self,
+        source: &AnchoredDir,
+        stage: &Path,
+        destination: &Path,
+    ) -> Result<bool> {
+        let (source_parent, source_leaf) = source.open_parent(stage)?;
+        let (target_parent, target_leaf) = self.open_parent(destination)?;
+        match crate::process::rename_exclusive(
+            &source_parent,
+            source_leaf.as_os_str(),
+            &target_parent,
+            target_leaf.as_os_str(),
+        ) {
+            Ok(()) => {
+                nix::unistd::fsync(&source_parent)?;
+                nix::unistd::fsync(&target_parent)?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error).context("publishing anchored directory stage"),
+        }
+    }
+
+    pub(crate) fn create_symlink(&self, relative: &Path, target: &Path) -> Result<bool> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        match nix::unistd::symlinkat(target, &parent, leaf.as_os_str()) {
+            Ok(()) => {
+                nix::unistd::fsync(&parent)?;
+                Ok(true)
+            }
+            Err(Errno::EEXIST) => Ok(false),
+            Err(error) => Err(error).context("creating anchored seed link"),
+        }
+    }
+
+    pub(crate) fn read_link(&self, relative: &Path) -> Result<Option<PathBuf>> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        match nix::fcntl::readlinkat(&parent, leaf.as_os_str()) {
+            Ok(target) => Ok(Some(target.into())),
+            Err(Errno::ENOENT | Errno::EINVAL) => Ok(None),
+            Err(error) => Err(error).context("reading anchored link"),
+        }
+    }
+
+    /// Remove only a caller-owned staging tree, without following its links.
+    pub(crate) fn remove_staged_dir(&self, relative: &Path) -> Result<()> {
+        let (parent, leaf) = self.open_parent(relative)?;
+        let child = match self.child(relative) {
+            Ok(child) => child,
+            Err(error) if missing_or_hostile(&error) => return self.remove_file(relative),
+            Err(error) => return Err(error),
+        };
+        child.remove_contents()?;
+        unlinkat(&parent, leaf.as_os_str(), UnlinkatFlags::RemoveDir)
+            .context("removing anchored staging directory")
+    }
+
+    /// Empty the pinned directory, never reopening its replaceable root path.
+    pub(crate) fn remove_contents(&self) -> Result<()> {
+        for name in self.read_dir(Path::new(""), usize::MAX)? {
+            let path = Path::new(&name);
+            match self.child(path) {
+                Ok(child) => {
+                    child.remove_contents()?;
+                    unlinkat(&self.fd, name.as_os_str(), UnlinkatFlags::RemoveDir)
+                        .context("removing emptied anchored child")?;
+                }
+                Err(error) if missing_or_hostile(&error) => self.remove_file(path)?,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     fn modified(&self, relative: &Path, directory: bool) -> Result<Option<std::time::SystemTime>> {
@@ -339,6 +543,38 @@ fn normal_components(path: &Path) -> Result<Vec<std::ffi::OsString>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn nested_directory_sync_failure_is_retryable() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FAIL_SYNC_ONCE.set(None);
+            }
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let root = AnchoredDir::open(temporary.path()).unwrap();
+        std::fs::write(temporary.path().join("original"), b"UNCHANGED").unwrap();
+        let _reset = Reset;
+        for _ in 0..2 {
+            FAIL_SYNC_ONCE.set(Some(temporary.path().join("tree")));
+            assert!(root.create_child(Path::new("tree/nested/leaf")).is_err());
+            assert!(!temporary.path().join("tree/nested/leaf").exists());
+            assert_eq!(
+                std::fs::read(temporary.path().join("original")).unwrap(),
+                b"UNCHANGED"
+            );
+        }
+        FAIL_SYNC_ONCE.set(None);
+        let directory = root.create_child(Path::new("tree/nested/leaf")).unwrap();
+        assert_eq!(
+            directory.identity().unwrap(),
+            root.child(Path::new("tree/nested/leaf"))
+                .unwrap()
+                .identity()
+                .unwrap()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn opens_through_a_symlinked_ancestor() {
@@ -414,5 +650,63 @@ mod tests {
         drop(pipe_guard);
         assert!(anchored.ensure_dir(Path::new("escape/child")).is_err());
         assert!(!outside.path().join("child").exists());
+    }
+
+    #[test]
+    fn rejected_file_stage_is_never_visible_in_the_active_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let active_path = directory.path().join("active");
+        let private_path = directory.path().join("private");
+        std::fs::create_dir(&active_path).unwrap();
+        std::fs::create_dir(&private_path).unwrap();
+        std::fs::write(active_path.join("config"), b"LOCAL_CONFIG").unwrap();
+        let active = AnchoredDir::open(&active_path).unwrap();
+        let private = AnchoredDir::open(&private_path).unwrap();
+        let reject = || {
+            let entries = std::fs::read_dir(&active_path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(entries, vec![std::ffi::OsString::from("config")]);
+            assert_eq!(
+                std::fs::read(active_path.join("config")).unwrap(),
+                b"LOCAL_CONFIG"
+            );
+            bail!("source changed before publication")
+        };
+        assert!(active
+            .publish_file(
+                Path::new("config"),
+                &mut &b"FOREIGN_CONTEXT"[..],
+                std::fs::Permissions::from_mode(0o600),
+                true,
+                Some(FilePublication {
+                    staging: &private,
+                    validate: &reject
+                })
+            )
+            .is_err());
+        assert_eq!(
+            std::fs::read(active_path.join("config")).unwrap(),
+            b"LOCAL_CONFIG"
+        );
+        let accept = || Ok(());
+        active
+            .publish_file(
+                Path::new("config"),
+                &mut &b"APPROVED_CONFIG"[..],
+                std::fs::Permissions::from_mode(0o600),
+                true,
+                Some(FilePublication {
+                    staging: &private,
+                    validate: &accept,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read(active_path.join("config")).unwrap(),
+            b"APPROVED_CONFIG"
+        );
     }
 }
