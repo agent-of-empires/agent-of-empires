@@ -10,6 +10,9 @@ pub(crate) enum SidWrite {
     /// Disk diverged (peer wrote between caller's read and this write);
     /// caller should reload the in-memory mirror from disk.
     Skipped,
+    /// A different durable row owns this SID in the observation namespace.
+    /// No write occurred; the capture observation can be acknowledged.
+    OwnershipConflict,
     /// I/O failure or row gone from disk; in-memory mirror is unchanged.
     Failed,
     /// Deterministic refusal, not a race: the row pins a different
@@ -117,6 +120,7 @@ pub(super) fn persist_session_with_storage(
                     session_id,
                 )
         };
+        let confirms_pin = observation.confirms_omp_pin(&instance.resume_intent);
         let conflict = instances.iter().any(|peer| {
             peer.id != instance_id
                 && (owns(
@@ -130,10 +134,13 @@ pub(super) fn persist_session_with_storage(
                 }))
         });
         if conflict {
-            return Ok(SidWrite::Skipped);
+            return Ok(if confirms_pin {
+                SidWrite::Skipped
+            } else {
+                SidWrite::OwnershipConflict
+            });
         }
         let instance = &mut instances[index];
-        let confirms_pin = observation.confirms_omp_pin(&instance.resume_intent);
         // A source-less observation of the id the row already holds is not
         // evidence that a conversation qualified, nor that a failed resume now
         // works; keep the binding and the loop breaker.
@@ -379,7 +386,9 @@ impl Instance {
                 }
                 SidPersistOutcome::Published
             }
-            Ok(SidWrite::Skipped) | Ok(SidWrite::PinnedForeign) => match storage.load() {
+            Ok(SidWrite::Skipped)
+            | Ok(SidWrite::OwnershipConflict)
+            | Ok(SidWrite::PinnedForeign) => match storage.load() {
                 Ok(insts) => match insts.into_iter().find(|i| i.id == self.id) {
                     Some(disk) => {
                         self.adopt_conversation_state(disk.conversation_state());
@@ -543,13 +552,69 @@ mod tests {
 
     #[test]
     #[serial]
+    fn omp_pin_confirmation_keeps_retrying_an_ownership_conflict() {
+        use crate::session::instance::ActiveExecution;
+        use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
+
+        let profile = "sid-omp-pin-conflict";
+        let generation = "019342ab-1234-7def-8901-999999999999";
+        let source = ExecutionBinding {
+            agent: "omp".into(),
+            stores: vec!["/tmp/omp-store".into()],
+            configuration: Vec::new(),
+            cwd: "/tmp/x".into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        let conversation = ConversationBinding {
+            session_id: VALID_SID.into(),
+            execution: Some(source.clone()),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        };
+        let mut owner = make_inst(profile, "owner");
+        owner.set_agent_conversation(Some(VALID_SID.into()), Some(conversation.clone()), None);
+        let mut claimant = make_inst(profile, "pin-confirmation");
+        claimant.tool = "omp".into();
+        claimant.agent_session_id = Some(VALID_SID.into());
+        claimant.agent_session_binding = Some(conversation.clone());
+        claimant.resume_intent = ResumeIntent::Use(VALID_SID.into());
+        claimant.resume_binding = Some(conversation);
+        claimant.omp_capture_generation = Some(generation.into());
+        claimant.active_execution = Some(ActiveExecution {
+            launch_id: generation.into(),
+            binding: source.clone(),
+            capture: None,
+            container: None,
+        });
+        let (_temp, _home, storage) = seeded(profile, &[&owner, &claimant]);
+        let mut observed =
+            crate::session::poller::SessionIdObservation::omp(VALID_SID.into(), generation.into());
+        observed.execution = claimant.active_execution.clone();
+        observed.source = Some(source);
+        assert!(observed.confirms_omp_pin(&claimant.resume_intent));
+
+        assert_eq!(
+            persist_session_with_storage(
+                &storage,
+                &claimant.id,
+                &observed,
+                &claimant.conversation_state(),
+            ),
+            SidWrite::Skipped,
+            "an unproven pin must remain retryable"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn foreign_and_parked_owners_guard_published_sid_by_namespace() {
         use crate::session::instance::{ActiveExecution, PriorToolSession};
         use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
         let sid = VALID_SID;
         for (namespace, expected) in [
-            ("same", SidWrite::Skipped),
-            ("unknown", SidWrite::Skipped),
+            ("same", SidWrite::OwnershipConflict),
+            ("unknown", SidWrite::OwnershipConflict),
             ("different", SidWrite::Applied),
         ] {
             let profile = "sid-parked-owner-namespace";
@@ -624,16 +689,15 @@ mod tests {
         let mut owner = make_inst(profile, "owner");
         owner.agent_session_id = Some(sid.into());
         let claimant = make_inst(profile, "claimant");
-        let (_tmp, _home, _) = seeded(profile, &[&owner, &claimant]);
+        let (_tmp, _home, storage) = seeded(profile, &[&owner, &claimant]);
         assert_eq!(
-            persist_session_to_storage(
-                profile,
+            persist_session_with_storage(
+                &storage,
                 &claimant.id,
                 &observation(sid),
                 &claimant.conversation_state(),
-                &FileWatchService::noop()
             ),
-            SidWrite::Skipped
+            SidWrite::OwnershipConflict
         );
         assert_eq!(disk_sid(profile, &claimant.id), None);
         assert_eq!(disk_sid(profile, &owner.id).as_deref(), Some(sid));
@@ -719,7 +783,7 @@ mod tests {
                     &observed,
                     &claimant.conversation_state(),
                 ),
-                SidWrite::Skipped,
+                SidWrite::OwnershipConflict,
                 "{case} must not change the one-owner decision"
             );
             assert_eq!(disk_sid(&profile, &owner.id).as_deref(), Some(sid));

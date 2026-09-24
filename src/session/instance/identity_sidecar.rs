@@ -253,7 +253,9 @@ impl Instance {
             &self.resolve_file_watch(),
         ) {
             SidWrite::Applied => self.apply_conversation_observation(&observation),
-            SidWrite::Skipped | SidWrite::PinnedForeign => self.reconcile_from_disk(),
+            SidWrite::Skipped | SidWrite::OwnershipConflict | SidWrite::PinnedForeign => {
+                self.reconcile_from_disk();
+            }
             SidWrite::Failed => {}
         }
     }

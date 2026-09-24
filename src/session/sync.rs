@@ -37,10 +37,10 @@ pub(crate) struct SessionIdSyncOutcome {
     /// Instances whose in-memory state was reloaded from disk after a
     /// CAS-Skipped persist (peer wrote a different sid first).
     pub(crate) rolled_back: Vec<String>,
-    /// Instances whose poller-observed sid was rejected (validation failed,
-    /// matched a cleared sid in the per-instance exclusion set, or the
-    /// persist returned Failed). The tmux env mirror is republished from
-    /// the in-memory value for these so the on_change publish is overwritten.
+    /// Instances whose poller-observed sid was rejected, including a terminal
+    /// durable ownership conflict, validation failure, matched exclusion, or
+    /// failed persist. The tmux env mirror is republished from the in-memory
+    /// value for these so the on_change publish is overwritten.
     pub(crate) filtered: Vec<String>,
 }
 
@@ -372,6 +372,10 @@ fn drain_and_persist_session_ids_inner(
             // Acknowledged once its transcript path is stored, in the loop below.
             SidWrite::Applied => {
                 to_apply.push(update);
+            }
+            SidWrite::OwnershipConflict => {
+                acknowledge_poller_observation_for(instances, &update.id, &update.observation);
+                filtered_ids.insert(update.id.clone());
             }
             SidWrite::Skipped | SidWrite::PinnedForeign => {
                 if let Some(mut rb) =
@@ -1255,7 +1259,8 @@ mod tests {
         let mut instances = vec![claimant];
         let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
 
-        assert_eq!(outcome.rolled_back, vec![instances[0].id.clone()]);
+        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
+        assert!(outcome.rolled_back.is_empty());
         assert!(outcome.applied.is_empty());
         assert_eq!(instances[0].agent_session_id, None);
 
@@ -1271,6 +1276,98 @@ mod tests {
             disk_claimant.agent_session_id, None,
             "claimant must not adopt a sid a disk peer already owns"
         );
+        let repeated = drain_and_persist_session_ids(&mut instances, &file_watch);
+        assert!(!repeated.touched());
+        assert!(instances[0]
+            .session_id_poller
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .latest_observation()
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn pi_id_only_claim_rejected_by_unseen_disk_owner_is_acknowledged() {
+        use crate::session::instance::{ActiveExecution, CaptureContext, SessionSidecarSource};
+        use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
+
+        let (_hooks, _base, _hooks_tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+        let profile = "sync-pi-id-only-disk-owner";
+        let sid = "019342ab-1234-7def-8901-eeeeeeeeeeee";
+        let launch = "22222222-3333-4333-8444-555555555555";
+        let root = temp.path().join("pi-root");
+        let transcript_parent = root.join("sessions/project");
+        let source = ExecutionBinding {
+            agent: "pi".into(),
+            stores: vec![root.clone()],
+            configuration: Vec::new(),
+            cwd: root.clone(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        let mut owner = Instance::new("disk-owner-title", "/tmp/x");
+        owner.source_profile = profile.to_string();
+        owner.set_agent_conversation(
+            Some(sid.into()),
+            Some(ConversationBinding {
+                session_id: sid.into(),
+                execution: Some(ExecutionBinding {
+                    stores: vec![transcript_parent],
+                    ..source.clone()
+                }),
+                provenance: ConversationProvenance::Observed,
+                transcript_path: None,
+            }),
+            None,
+        );
+        let mut claimant = Instance::new("pi-claimant-title", "/tmp/x");
+        claimant.source_profile = profile.to_string();
+        claimant.tool = "pi".into();
+        let sidecar_source = SessionSidecarSource::host_hooks(&claimant.id);
+        claimant.active_execution = Some(ActiveExecution {
+            launch_id: launch.into(),
+            binding: source,
+            capture: Some(CaptureContext::Pi {
+                source: sidecar_source.clone(),
+                root: root.clone(),
+            }),
+            container: None,
+        });
+        seed_instances_on_disk(profile, &[&owner, &claimant]);
+        crate::hooks::write_session_id_via_guard(&claimant.id, sid, Some(launch)).unwrap();
+        let observed = crate::session::capture::read_pi_session_observation(
+            &claimant.id,
+            &sidecar_source,
+            claimant.active_execution.as_ref(),
+            false,
+        )
+        .expect("the Pi sidecar publishes an ID-only observation");
+        assert!(observed.conversation_key().is_none());
+
+        let poller = SessionPoller::new(format!("test-tmux-{}", claimant.id));
+        poller.inject_test_observation(&claimant.id, observed);
+        claimant.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+        let file_watch = FileWatchService::noop();
+        let mut instances = vec![claimant];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
+        assert!(outcome.applied.is_empty());
+        assert!(outcome.rolled_back.is_empty());
+        assert!(instances[0].agent_session_id.is_none());
+        assert!(instances[0]
+            .session_id_poller
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .latest_observation()
+            .is_none());
+        assert!(!drain_and_persist_session_ids(&mut instances, &file_watch).touched());
     }
 
     #[test]

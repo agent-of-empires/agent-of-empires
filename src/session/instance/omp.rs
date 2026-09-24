@@ -472,7 +472,9 @@ impl Instance {
             }
             // A pinned-foreign publication is a deliberate non-write; like a
             // divergence skip, it carries no update worth reconciling.
-            SidWrite::Skipped | SidWrite::PinnedForeign => self.reconcile_from_disk(),
+            SidWrite::Skipped | SidWrite::OwnershipConflict | SidWrite::PinnedForeign => {
+                self.reconcile_from_disk();
+            }
             SidWrite::Failed => {}
         }
     }
