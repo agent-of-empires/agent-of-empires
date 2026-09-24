@@ -140,6 +140,7 @@ pub(super) fn persist_session_with_storage(
                 SidWrite::OwnershipConflict
             });
         }
+        let pi_session_path = instance.observed_pi_session_path(observation);
         let instance = &mut instances[index];
         // A source-less observation of the id the row already holds is not
         // evidence that a conversation qualified, nor that a failed resume now
@@ -147,11 +148,7 @@ pub(super) fn persist_session_with_storage(
         let establishes = binding.is_some();
         let new_conversation = instance.agent_session_id.as_deref() != Some(session_id);
         let binding = binding.or_else(|| instance.observed_binding(observation));
-        instance.set_agent_conversation(
-            Some(session_id.into()),
-            binding,
-            observation.pi_session_path.clone(),
-        );
+        instance.set_agent_conversation(Some(session_id.into()), binding, pi_session_path);
         if establishes || new_conversation {
             instance.resume_probe_failed_sid = None;
         }

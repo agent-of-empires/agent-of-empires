@@ -224,7 +224,7 @@ fn drain_and_persist_session_ids_inner(
     drop(sid_owners);
     let mut claims = HashMap::new();
     let mut raw_claims = HashMap::new();
-    let mut unknown_claims = HashSet::new();
+    let mut id_only_claims: HashMap<&str, usize> = HashMap::new();
     for update in &updates {
         if update.confirms_omp_pin {
             continue;
@@ -233,24 +233,34 @@ fn drain_and_persist_session_ids_inner(
         *claims.entry((update.sid.as_str(), key)).or_insert(0usize) += 1;
         *raw_claims.entry(update.sid.as_str()).or_insert(0usize) += 1;
         if key.is_none() {
-            unknown_claims.insert(update.sid.as_str());
+            *id_only_claims.entry(update.sid.as_str()).or_insert(0usize) += 1;
         }
     }
     let collisions: HashSet<String> = updates
         .iter()
         .filter(|update| {
-            !update.confirms_omp_pin
-                && (claims
-                    .get(&(update.sid.as_str(), update.observation.conversation_key()))
-                    .copied()
-                    .unwrap_or(0)
-                    > 1
-                    || (unknown_claims.contains(update.sid.as_str())
-                        && raw_claims.get(update.sid.as_str()).copied().unwrap_or(0) > 1))
+            if update.confirms_omp_pin {
+                return false;
+            }
+            let key = update.observation.conversation_key();
+            let same_key_claims = claims
+                .get(&(update.sid.as_str(), key))
+                .copied()
+                .unwrap_or(0);
+            let id_only_count = id_only_claims
+                .get(update.sid.as_str())
+                .copied()
+                .unwrap_or(0);
+            let raw_count = raw_claims.get(update.sid.as_str()).copied().unwrap_or(0);
+            if key.is_some() {
+                same_key_claims > 1
+            } else {
+                id_only_count > 1 || raw_count > id_only_count
+            }
         })
         .map(|update| update.id.clone())
         .collect();
-    drop((claims, raw_claims, unknown_claims));
+    drop((claims, raw_claims, id_only_claims));
     updates.retain(|update| {
         if collisions.contains(&update.id) {
             acknowledge_poller_observation_for(instances, &update.id, &update.observation);
@@ -1368,6 +1378,148 @@ mod tests {
             .latest_observation()
             .is_none());
         assert!(!drain_and_persist_session_ids(&mut instances, &file_watch).touched());
+    }
+
+    #[test]
+    #[serial]
+    fn pi_id_only_refresh_preserves_an_existing_transcript_path() {
+        use crate::session::instance::ActiveExecution;
+        use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
+
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+        let profile = "sync-pi-id-only-preserves-path";
+        let sid = "019342ab-1234-7def-8901-eeeeeeeeeeee";
+        let path = format!("/store/2026-01-01T00-00-00-000Z_{sid}.jsonl");
+        let source = ExecutionBinding {
+            agent: "pi".into(),
+            stores: vec!["/store".into()],
+            configuration: Vec::new(),
+            cwd: "/tmp/x".into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        let mut inst = Instance::new("pi-existing-path", "/tmp/x");
+        inst.source_profile = profile.to_string();
+        inst.tool = "pi".into();
+        inst.agent_session_id = Some(sid.into());
+        inst.agent_session_binding = Some(ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(source.clone()),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: Some(path.clone().into()),
+        });
+        inst.pi_session_path = Some(path.clone());
+        inst.active_execution = Some(ActiveExecution {
+            launch_id: "22222222-3333-4333-8444-555555555555".into(),
+            binding: source,
+            capture: None,
+            container: None,
+        });
+        seed_instance_on_disk(profile, &inst);
+
+        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        let mut observation =
+            crate::session::poller::SessionIdObservation::instance_sidecar(sid.into(), None);
+        observation.execution = inst.active_execution.clone();
+        poller.inject_test_observation(&inst.id, observation);
+        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+        let mut instances = vec![inst];
+        let outcome = drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
+        assert_eq!(outcome.applied, vec![instances[0].id.clone()]);
+        assert_eq!(instances[0].pi_session_path.as_deref(), Some(path.as_str()));
+        assert_eq!(
+            Storage::new_unwatched(profile).unwrap().load().unwrap()[0]
+                .pi_session_path
+                .as_deref(),
+            Some(path.as_str())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn qualified_pi_claim_survives_a_same_sid_id_only_claim_in_either_order() {
+        use crate::session::instance::ActiveExecution;
+        use crate::session::ExecutionBinding;
+
+        for qualified_first in [true, false] {
+            let temp = tempdir().unwrap();
+            let _guard = storage_home_guard(&temp);
+            let profile = format!("sync-pi-qualified-and-id-only-{qualified_first}");
+            let sid = "019342ab-1234-7def-8901-eeeeeeeeeeee";
+            let path = format!("/store/2026-01-01T00-00-00-000Z_{sid}.jsonl");
+            let source = ExecutionBinding {
+                agent: "pi".into(),
+                stores: vec![PathBuf::from("/store")],
+                configuration: Vec::new(),
+                cwd: "/tmp/x".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            };
+            let active = ActiveExecution {
+                launch_id: "22222222-3333-4333-8444-555555555555".into(),
+                binding: source.clone(),
+                capture: None,
+                container: None,
+            };
+            let mut qualified = Instance::new("qualified", "/tmp/x");
+            qualified.source_profile = profile.to_string();
+            qualified.tool = "pi".into();
+            qualified.active_execution = Some(active.clone());
+            let mut id_only = Instance::new("id-only", "/tmp/x");
+            id_only.source_profile = profile.to_string();
+            id_only.tool = "pi".into();
+            id_only.active_execution = Some(active);
+            seed_instances_on_disk(&profile, &[&qualified, &id_only]);
+
+            let qualified_poller = SessionPoller::new(format!("test-tmux-{}", qualified.id));
+            let mut qualified_observation =
+                crate::session::poller::SessionIdObservation::instance_sidecar(
+                    sid.into(),
+                    Some(path),
+                );
+            qualified_observation.execution = qualified.active_execution.clone();
+            qualified_observation.source = Some(source);
+            qualified_poller.inject_test_observation(&qualified.id, qualified_observation);
+            qualified.session_id_poller = Some(Arc::new(Mutex::new(qualified_poller)));
+
+            let id_only_poller = SessionPoller::new(format!("test-tmux-{}", id_only.id));
+            let mut id_only_observation =
+                crate::session::poller::SessionIdObservation::instance_sidecar(sid.into(), None);
+            id_only_observation.execution = id_only.active_execution.clone();
+            id_only_poller.inject_test_observation(&id_only.id, id_only_observation);
+            id_only.session_id_poller = Some(Arc::new(Mutex::new(id_only_poller)));
+
+            let qualified_id = qualified.id.clone();
+            let id_only_id = id_only.id.clone();
+            let mut instances = if qualified_first {
+                vec![qualified, id_only]
+            } else {
+                vec![id_only, qualified]
+            };
+            let outcome = drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
+            assert_eq!(outcome.applied, vec![qualified_id.clone()]);
+            assert_eq!(outcome.filtered, vec![id_only_id.clone()]);
+            assert!(outcome.rolled_back.is_empty());
+            assert_eq!(
+                instances
+                    .iter()
+                    .find(|instance| instance.id == qualified_id)
+                    .unwrap()
+                    .agent_session_id
+                    .as_deref(),
+                Some(sid)
+            );
+            assert!(instances
+                .iter()
+                .find(|instance| instance.id == id_only_id)
+                .unwrap()
+                .agent_session_id
+                .is_none());
+            assert!(
+                !drain_and_persist_session_ids(&mut instances, &FileWatchService::noop()).touched()
+            );
+        }
     }
 
     #[test]
