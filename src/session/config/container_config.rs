@@ -1062,14 +1062,14 @@ pub(crate) fn sandbox_store_dirs(
 
 pub(crate) fn sandbox_content_roots(
     tool: &str,
-    detect_as: Option<&str>,
+    command: Option<&str>,
     session: &super::SessionConfig,
     home: &Path,
     instance: &str,
 ) -> Result<Vec<crate::migrations::v033_isolate_sandbox_content::ContentRoot>> {
     use crate::migrations::v033_isolate_sandbox_content::{canonical_expected_path, ContentRoot};
     crate::session::validate_instance_id(instance)?;
-    let Some(agent) = resolve_active_agent(tool, detect_as, session) else {
+    let Some(agent) = resolve_active_agent(tool, command, session) else {
         return Ok(Vec::new());
     };
     let declared = session.agent_config_dir_for(tool, home);
@@ -2106,22 +2106,28 @@ pub(crate) fn resolve_active_agent(
     command: Option<&str>,
     session_config: &super::SessionConfig,
 ) -> Option<&'static crate::agents::AgentDef> {
+    resolve_executed_agent(tool, command, session_config).or_else(|| {
+        // Legacy status-only provisioning never grants native conversation authority.
+        if session_config.agent_execution_as.contains_key(tool) {
+            return None;
+        }
+        match session_config.agent_detect_as.get(tool) {
+            Some(name) => crate::agents::get_agent(name),
+            None => crate::agents::get_agent(tool),
+        }
+    })
+}
+
+fn resolve_executed_agent(
+    tool: &str,
+    command: Option<&str>,
+    session_config: &super::SessionConfig,
+) -> Option<&'static crate::agents::AgentDef> {
     let command = command
         .or_else(|| session_config.custom_agents.get(tool).map(String::as_str))
         .or_else(|| crate::agents::get_agent(tool).map(|agent| agent.binary))
         .unwrap_or(tool);
-    crate::session::Instance::execution_agent_for(tool, command, session_config)
-        .ok()
-        .or_else(|| {
-            // Legacy status-only provisioning never grants native conversation authority.
-            if session_config.agent_execution_as.contains_key(tool) {
-                return None;
-            }
-            match session_config.agent_detect_as.get(tool) {
-                Some(name) => crate::agents::get_agent(name),
-                None => crate::agents::get_agent(tool),
-            }
-        })
+    crate::session::Instance::execution_agent_for(tool, command, session_config).ok()
 }
 
 /// The identity a sandbox container's agent config mounts are built for. Mounts

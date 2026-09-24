@@ -117,7 +117,7 @@ Claude Code, Codex, and Gemini refuse to start in a directory they have not been
 
 Trust activates the repo's own `.claude/settings.json`, including its hooks, so a pre-trusted workspace runs them unprompted, while a repo's `.mcp.json` still asks per server. For host sessions, see `session.pre_trust_agent_folders` in the [configuration reference](configuration.md#session).
 
-For a custom agent whose wrapper points the CLI at another directory, name that host root in `session.agent_config_dir`; AoE stages a per-session child of it and mounts it at the agent's canonical container path. Do not add an `extra_volumes` entry for that path, which would shadow the managed mount (AoE warns when one does), and leave the config-dir variables AoE sets in place inside the container.
+For a custom agent whose wrapper points the CLI at another directory, name that host root in `session.agent_config_dir` and declare its native CLI with `session.agent_execution_as`; `agent_detect_as` selects status and ACP adapter behavior, not native-store ownership. A foreign declared root without a provable native identity is opaque during sandbox seeding. See [Custom agents](configuration.md#custom-agents). AoE stages a per-session child of that root and mounts it at the agent's canonical container path. Do not add an `extra_volumes` entry for that path, which would shadow the managed mount (AoE warns when one does), and leave the config-dir variables AoE sets in place inside the container.
 
 ## Per-session agent stores
 

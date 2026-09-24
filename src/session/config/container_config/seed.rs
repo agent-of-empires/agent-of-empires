@@ -92,10 +92,10 @@ impl NativeStateBoundary {
         for registered in AGENT_CONFIG_MOUNTS {
             boundary.add_root(&home.join(registered.host_rel), registered)?;
         }
-        boundary.add_declared_roots(config, home)?;
+        boundary.add_declared_roots(config, home, mount)?;
         for profile in crate::session::list_profiles()? {
             let registered = crate::session::config::profile_config::resolve_config(&profile)?;
-            boundary.add_declared_roots(&registered.session, home)?;
+            boundary.add_declared_roots(&registered.session, home, mount)?;
         }
         if mount.tool_name == "hermes" {
             hermes::register_source(&mut boundary, source)?;
@@ -159,20 +159,34 @@ impl NativeStateBoundary {
         self.stopped_original = Some(self.source_root.path().to_path_buf());
         Ok(self)
     }
-    fn add_declared_roots(&mut self, config: &SessionConfig, home: &Path) -> Result<()> {
+    fn add_declared_roots(
+        &mut self,
+        config: &SessionConfig,
+        home: &Path,
+        active_mount: &AgentConfigMount,
+    ) -> Result<()> {
         for tool in config.agent_config_dir.keys() {
             let Some(root) = config.agent_config_dir_for(tool, home) else {
                 continue;
             };
-            let detect_as = config.agent_detect_as.get(tool).map(String::as_str);
-            let Some(agent) = super::resolve_active_agent(tool, detect_as, config) else {
-                continue;
-            };
-            for mount in AGENT_CONFIG_MOUNTS
-                .iter()
-                .filter(|mount| mount.tool_name == agent.name)
+            let mut classified = false;
+            if let Some(agent) = super::resolve_executed_agent(tool, None, config) {
+                for mount in AGENT_CONFIG_MOUNTS
+                    .iter()
+                    .filter(|mount| mount.tool_name == agent.name)
+                {
+                    self.add_root(&root, mount)?;
+                    classified = true;
+                }
+            }
+            // The active mount already fences its own source, including status-only aliases.
+            if !classified
+                && !(super::resolve_active_agent(tool, None, config)
+                    .is_some_and(|agent| agent.name == active_mount.tool_name)
+                    && canonical_expected_path(&root)?
+                        == canonical_expected_path(self.source_root.path())?)
             {
-                self.add_root(&root, mount)?;
+                self.add_path(root);
             }
         }
         Ok(())
@@ -2364,6 +2378,106 @@ mod tests {
             "deduplicated native scope rules must not discard the declared route"
         );
         assert_eq!(fs::read(active.join("auth.json")).unwrap(), b"LOCAL_AUTH");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_status_alias_cannot_export_another_profiles_native_history() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = temporary.path().join("home");
+        let source = home.join(".claude");
+        let active = temporary.path().join("active");
+        let codex = home.join("private-codex");
+        let wrapped = home.join("private-wrapped-codex");
+        let unverified = home.join("private-remote-codex");
+        let host_only = home.join("private-settl");
+        for path in [&source, &active] {
+            fs::create_dir_all(path).unwrap();
+        }
+        for (resource, root) in [
+            ("skills", &codex),
+            ("hooks", &wrapped),
+            ("plugins", &unverified),
+        ] {
+            fs::create_dir_all(root.join("sessions")).unwrap();
+            fs::write(root.join("sessions/other.jsonl"), b"OTHER_PROFILE_HISTORY").unwrap();
+            symlink(root.join("sessions"), source.join(resource)).unwrap();
+        }
+        fs::create_dir_all(host_only.join("sessions")).unwrap();
+        fs::write(host_only.join("sessions/other.jsonl"), b"HOST_ONLY_HISTORY").unwrap();
+        symlink(
+            host_only.join("sessions/other.jsonl"),
+            source.join("settings.json"),
+        )
+        .unwrap();
+        fs::write(source.join("CLAUDE.md"), b"AUTHORED_RESOURCE").unwrap();
+        let profile = crate::session::get_profile_dir("native-owner").unwrap();
+        fs::write(
+            profile.join("config.toml"),
+            format!(
+                "[session]\nagent_detect_as = {{ codex = \"claude\", \"wrapped-codex\" = \"claude\", \"remote-codex\" = \"claude\" }}\nagent_execution_as = {{ \"wrapped-codex\" = \"codex\" }}\ncustom_agents = {{ \"wrapped-codex\" = \"wrapper --serve\", \"remote-codex\" = \"ssh remote codex\" }}\nagent_config_dir = {{ codex = {:?}, \"wrapped-codex\" = {:?}, \"remote-codex\" = {:?}, settl = {:?} }}\n",
+                codex.display().to_string(),
+                wrapped.display().to_string(),
+                unverified.display().to_string(),
+                host_only.display().to_string(),
+            ),
+        )
+        .unwrap();
+
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "claude")
+            .unwrap();
+        let boundary = NativeStateBoundary::new(
+            &source,
+            mount,
+            &home,
+            &crate::session::config::SessionConfig::default(),
+            &active,
+        )
+        .unwrap();
+        let destination = AnchoredDir::open(&active).unwrap();
+        for resource in ["skills", "hooks", "plugins"] {
+            seed_directory(
+                &source.join(resource),
+                &destination,
+                Path::new(resource),
+                &boundary,
+                false,
+                ReadAccess::default(),
+            )
+            .unwrap();
+            assert!(
+                !active.join(resource).exists(),
+                "{resource} exported another profile's native conversation"
+            );
+        }
+        assert!(!publish_source_file(
+            &source.join("settings.json"),
+            &destination,
+            Path::new("settings.json"),
+            &boundary,
+            false,
+            ReadAccess::default(),
+        )
+        .unwrap());
+        assert!(!active.join("settings.json").exists());
+        assert!(publish_source_file(
+            &source.join("CLAUDE.md"),
+            &destination,
+            Path::new("CLAUDE.md"),
+            &boundary,
+            false,
+            ReadAccess::default(),
+        )
+        .unwrap());
+        assert_eq!(
+            fs::read(active.join("CLAUDE.md")).unwrap(),
+            b"AUTHORED_RESOURCE"
+        );
     }
 
     #[test]
