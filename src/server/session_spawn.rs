@@ -1,5 +1,6 @@
 //! Domain core for creating a session.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::session::Instance;
@@ -336,9 +337,8 @@ pub(crate) async fn spawn_structured_session(
             return Err(anyhow::anyhow!("on_create hook failed: {e:#}{hint}"));
         }
 
-        let storage = Storage::new(&profile, file_watch_for_create.clone())?;
-
         let identity_lock = crate::session::acquire_session_identity_lock()?;
+        let storage = Storage::open(&profile, file_watch_for_create.clone())?;
         if !scratch && !std::path::Path::new(&instance.project_path).exists() {
             builder::cleanup_instance(
                 &instance,
@@ -348,6 +348,27 @@ pub(crate) async fn spawn_structured_session(
             );
             return Err(anyhow::anyhow!(
                 "Project path disappeared before the session was persisted"
+            ));
+        }
+        let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
+        candidate_paths.extend(
+            instance
+                .all_repos()
+                .iter()
+                .map(|repo| PathBuf::from(&repo.worktree_path)),
+        );
+        if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
+            &instance.id,
+            &candidate_paths,
+        ) {
+            builder::cleanup_instance(
+                &instance,
+                created_worktree.as_ref(),
+                &created_workspace_worktrees,
+                None,
+            );
+            return Err(anyhow::anyhow!(
+                "Session path is already claimed by another session: {error}"
             ));
         }
         // Anything that fails between here and the final `Ok(..)` would otherwise orphan

@@ -3,6 +3,7 @@
 //! This handles the potentially slow Docker operations (image pull, container creation)
 //! in a background thread so the UI remains responsive.
 
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
@@ -309,6 +310,28 @@ impl CreationPoller {
         } else {
             None
         };
+        if manages_worktree {
+            let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
+            candidate_paths.extend(
+                instance
+                    .all_repos()
+                    .iter()
+                    .map(|repo| PathBuf::from(&repo.worktree_path)),
+            );
+            if let Err(error) =
+                crate::session::deletion::ensure_unclaimed_paths(&instance.id, &candidate_paths)
+            {
+                builder::cleanup_instance(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return CreationResult::Error(format!(
+                    "Session path is already claimed by another session: {error}"
+                ));
+            }
+        }
 
         let created_worktree_info = created_worktree.as_ref().map(CreatedWorktreeInfo::from);
         let created_workspace_worktree_info = created_workspace_worktrees

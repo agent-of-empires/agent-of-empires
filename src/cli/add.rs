@@ -914,6 +914,24 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             return Err(error);
         }
     };
+    let storage = match Storage::open_unwatched(profile) {
+        Ok(storage) => storage,
+        Err(error) => {
+            cleanup_partial_session(
+                &path,
+                instance.worktree_info.as_ref(),
+                instance.workspace_info.as_ref(),
+                args.create_branch,
+                if instance.scratch {
+                    Some(std::path::Path::new(&instance.project_path))
+                } else {
+                    None
+                },
+                instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
+            );
+            return Err(error);
+        }
+    };
     if !args.scratch && !path.exists() {
         cleanup_partial_session(
             &path,
@@ -924,6 +942,26 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
         );
         bail!("Project path disappeared before the session was persisted");
+    }
+    let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
+    candidate_paths.extend(
+        instance
+            .all_repos()
+            .iter()
+            .map(|repo| PathBuf::from(&repo.worktree_path)),
+    );
+    if let Err(error) =
+        crate::session::deletion::ensure_unclaimed_paths(&instance.id, &candidate_paths)
+    {
+        cleanup_partial_session(
+            &path,
+            instance.worktree_info.as_ref(),
+            instance.workspace_info.as_ref(),
+            args.create_branch,
+            None,
+            instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
+        );
+        bail!("Session path is already claimed by another session: {error}");
     }
 
     let persist_result = storage.update(|all_instances, groups| {

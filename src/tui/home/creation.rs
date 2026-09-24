@@ -266,32 +266,28 @@ impl HomeView {
                         .clone()
                         .unwrap_or_else(crate::session::config::resolve_default_profile)
                 });
-                instance.source_profile = target_profile.clone();
-
-                if !self.storages.contains_key(&target_profile) {
-                    match Storage::new(&target_profile, self.file_watch.clone()) {
-                        Ok(storage) => {
-                            self.storages.insert(target_profile.clone(), storage);
-                        }
-                        Err(error) => {
-                            cleanup_creation_resources(
-                                &instance,
-                                created_worktree.as_ref(),
-                                &created_workspace_worktrees,
-                                None,
-                            );
-                            self.info_dialog = Some(InfoDialog::sized_to_fit(
-                                "Creation Failed",
-                                &format!("Failed to open profile storage: {error}"),
-                            ));
-                            self.new_dialog = None;
-                            self.rebuild_group_trees();
-                            self.rebuild_flat_items();
-                            self.update_selected();
-                            return None;
-                        }
+                self.storages.remove(&target_profile);
+                let storage = match Storage::open(&target_profile, self.file_watch.clone()) {
+                    Ok(storage) => storage,
+                    Err(error) => {
+                        cleanup_creation_resources(
+                            &instance,
+                            created_worktree.as_ref(),
+                            &created_workspace_worktrees,
+                            None,
+                        );
+                        self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            "Creation Failed",
+                            &format!("Failed to open profile storage: {error}"),
+                        ));
+                        self.new_dialog = None;
+                        self.rebuild_group_trees();
+                        self.rebuild_flat_items();
+                        self.update_selected();
+                        return None;
                     }
-                }
+                };
+                self.storages.insert(target_profile.clone(), storage);
 
                 let Some(storage) = self.storages.get(&target_profile) else {
                     // The block above found or inserted this profile's storage, so this is

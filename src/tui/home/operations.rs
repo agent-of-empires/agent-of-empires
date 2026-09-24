@@ -9,6 +9,7 @@ use crate::session::{
 use crate::tui::deletion_poller::DeletionRequest;
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
 use crate::tui::restart_poller::RestartRequest;
+use std::path::PathBuf;
 
 use super::HomeView;
 
@@ -275,14 +276,34 @@ impl HomeView {
                 "Project path disappeared before the session was persisted"
             ));
         }
-
-        // Ensure target profile storage exists
-        if !self.storages.contains_key(&target_profile) {
-            self.storages.insert(
-                target_profile.clone(),
-                Storage::new(&target_profile, self.file_watch.clone())?,
+        if !is_scratch {
+            let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
+            candidate_paths.extend(
+                instance
+                    .all_repos()
+                    .iter()
+                    .map(|repo| PathBuf::from(&repo.worktree_path)),
             );
+            if let Err(error) =
+                crate::session::deletion::ensure_unclaimed_paths(&instance.id, &candidate_paths)
+            {
+                builder::cleanup_instance(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return Err(anyhow::anyhow!(
+                    "Session path is already claimed by another session: {error}"
+                ));
+            }
         }
+
+        self.storages.remove(&target_profile);
+        self.storages.insert(
+            target_profile.clone(),
+            Storage::open(&target_profile, self.file_watch.clone())?,
+        );
 
         self.add_instance(instance.clone());
         self.rebuild_group_trees();
@@ -1913,6 +1934,8 @@ impl HomeView {
         };
         let acquisition = (|| -> anyhow::Result<_> {
             let _identity_lock = acquire_session_identity_lock()?;
+            let profile = storage.profile().to_string();
+            let storage = Storage::open_unwatched(&profile)?;
             let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(id)?;
             storage.update(|instances, _groups| {
                 let stored = instances
@@ -2248,6 +2271,14 @@ fn restore_from_trash_with_storage(
         Ok(lock) => lock,
         Err(error) => {
             tracing::warn!(target: "tui.home", id = %id, "restore identity lock failed: {error}");
+            return RestoreFromTrash::PersistFailed;
+        }
+    };
+    let profile = storage.profile().to_string();
+    let storage = match Storage::open_unwatched(&profile) {
+        Ok(storage) => storage,
+        Err(error) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore profile open failed: {error}");
             return RestoreFromTrash::PersistFailed;
         }
     };

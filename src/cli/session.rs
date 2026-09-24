@@ -498,6 +498,7 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
 }
 
 async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
+    let _identity_lock = acquire_session_identity_lock()?;
     let storage = Storage::open_unwatched(profile)?;
 
     let (instances, _groups) = storage.load_with_groups()?;
@@ -965,8 +966,8 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     }
 
     let group = args.group.clone().unwrap_or_default();
-    let storage = Storage::open_unwatched(profile)?;
     let _identity_lock = acquire_session_identity_lock()?;
+    let storage = Storage::open_unwatched(profile)?;
     let created_ids = storage.update(|all_instances, groups| {
         let mut ids = Vec::new();
         for s in &to_import {

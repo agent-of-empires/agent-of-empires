@@ -641,7 +641,7 @@ fn all_profile_storages() -> std::result::Result<(Vec<String>, Vec<Storage>), St
 fn scan_paths_in_use(storages: &[Storage], except_ids: &[&str]) -> PathsInUse {
     let mut paths = Vec::new();
     for storage in storages {
-        match storage.load() {
+        match storage.load_strict_for_worktree_ownership_locked() {
             Ok(instances) => paths.extend(other_sessions_paths(&instances, except_ids)),
             Err(error) => {
                 return PathsInUse::Unknown(format!(
@@ -659,6 +659,26 @@ pub(crate) fn paths_in_use_except(except_ids: &[&str]) -> PathsInUse {
     match all_profile_storages() {
         Ok((_, storages)) => scan_paths_in_use(&storages, except_ids),
         Err(reason) => PathsInUse::Unknown(reason),
+    }
+}
+
+pub(crate) fn ensure_unclaimed_paths(
+    session_id: &str,
+    candidates: &[PathBuf],
+) -> std::result::Result<(), String> {
+    let paths = paths_in_use_except(&[session_id]);
+    match paths {
+        PathsInUse::Unknown(reason) => Err(reason),
+        PathsInUse::Known(paths)
+            if paths.iter().any(|path| {
+                candidates.iter().any(|candidate| {
+                    Path::new(path).starts_with(candidate) || candidate.starts_with(path)
+                })
+            }) =>
+        {
+            Err("another session already claims one of the candidate paths".to_string())
+        }
+        PathsInUse::Known(_) => Ok(()),
     }
 }
 
@@ -1709,7 +1729,7 @@ mod tests {
                         Ok(())
                     })
                     .unwrap();
-                std::fs::write(other.sessions_path(), "not json").unwrap();
+                std::fs::write(other.sessions_path(), "[{\"id\":1}]").unwrap();
                 None
             };
 

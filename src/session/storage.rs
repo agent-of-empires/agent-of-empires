@@ -917,6 +917,49 @@ impl Storage {
         Ok(instances)
     }
 
+    /// Read all rows for a destructive ownership check without lossy quarantine.
+    pub(crate) fn load_strict_for_worktree_ownership_locked(&self) -> Result<Vec<Instance>> {
+        let quarantine_path = self.sessions_path.with_file_name("sessions.corrupt.jsonl");
+        match fs::metadata(&quarantine_path) {
+            Ok(metadata) if metadata.len() > 0 => {
+                anyhow::bail!(
+                    "session ownership inventory is quarantined at {}",
+                    quarantine_path.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("checking {}", quarantine_path.display()));
+            }
+        }
+        if !self.sessions_path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = fs::read_to_string(&self.sessions_path)
+            .with_context(|| format!("reading {}", self.sessions_path.display()))?;
+        if content.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&content)
+            .with_context(|| format!("parsing {}", self.sessions_path.display()))?;
+        rows.into_iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                let mut instance = <Instance as serde::Deserialize>::deserialize(&row)
+                    .with_context(|| {
+                        format!(
+                            "parsing session row {idx} in {}",
+                            self.sessions_path.display()
+                        )
+                    })?;
+                instance.set_file_watch(self.file_watch.clone());
+                Ok(instance)
+            })
+            .collect()
+    }
+
     fn quarantine_corrupt_rows(&self, rows: &[serde_json::Value]) {
         let path = self.sessions_path.with_file_name("sessions.corrupt.jsonl");
         Self::write_corrupt_rows_quarantine(&path, rows, "session");

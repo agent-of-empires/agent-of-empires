@@ -108,6 +108,17 @@ pub fn reconcile_and_persist(
             // Both guards below need the storage lock the git lookup ran
             // without, so they live inside the update rather than beside it.
             let mut claimed_by: Option<String> = None;
+            if let Err(error) =
+                crate::session::deletion::ensure_unclaimed_paths(&id, std::slice::from_ref(found))
+            {
+                tracing::warn!(
+                    target: "session.worktree",
+                    session = %id,
+                    candidate = %found.display(),
+                    "worktree ownership could not be verified; refusing to adopt it: {error}"
+                );
+                return Ok(WorktreePathResolution::Current);
+            }
             let applied = storage.update(|instances, _groups| {
                 // Never adopt a checkout another session already records.
                 if let Some(owner) = instances.iter().find(|c| {

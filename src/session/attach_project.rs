@@ -697,18 +697,19 @@ pub fn attach(
 
 /// Execute an already-validated plan and persist it.
 pub fn attach_planned(
-    storage: &Storage,
+    _storage: &Storage,
     session_id: &str,
     instance: &super::Instance,
     plan: AttachPlan,
 ) -> Result<AttachOutcome> {
     let _identity_lock = crate::session::acquire_session_identity_lock()?;
+    let storage = Storage::open_unwatched(&instance.source_profile)?;
     // A publication that has not been drained yet would be flushed after the
     // move with the stale cwd, re-qualifying the old directory after the
     // commit. Flush it first so the durable recheck sees the row as it will
     // stand at the commit.
     if plan.moves_session {
-        match instance.flush_published_conversation(storage) {
+        match instance.flush_published_conversation(&storage) {
             Some(crate::session::SidWrite::Applied) | None => {}
             Some(outcome) => anyhow::bail!(
                 "'{}' has an undrained conversation publication ({outcome:?}); drain it or \
@@ -729,6 +730,20 @@ pub fn attach_planned(
     if !Path::new(&prepared.outcome.repo.worktree_path).exists() {
         prepared.rollback();
         anyhow::bail!("attached worktree disappeared before publication");
+    }
+    let mut candidate_paths = vec![PathBuf::from(&prepared.workspace_info.workspace_dir)];
+    candidate_paths.extend(
+        prepared
+            .workspace_info
+            .repos
+            .iter()
+            .map(|repo| PathBuf::from(&repo.worktree_path)),
+    );
+    if let Err(error) =
+        crate::session::deletion::ensure_unclaimed_paths(session_id, &candidate_paths)
+    {
+        prepared.rollback();
+        anyhow::bail!("Attach path is already claimed by another session: {error}");
     }
 
     let id = session_id.to_string();
