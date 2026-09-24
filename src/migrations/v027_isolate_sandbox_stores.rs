@@ -2852,7 +2852,7 @@ gemini = "{}"
         assert_eq!(checkpoint[0]["sandbox_store_generation"], 1);
         assert_eq!(
             checkpoint[0]["sandbox_store_transition_paths"][0]["source"],
-            serde_json::json!(custom_a.join("sandbox"))
+            serde_json::json!(fs::canonicalize(custom_a.join("sandbox")).unwrap())
         );
         fs::write(
             app.join("config.toml"),
