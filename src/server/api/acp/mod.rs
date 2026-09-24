@@ -213,45 +213,52 @@ mod tests {
         }
     }
 
-    /// #4116: a peer can archive the stored row after the handler's memory check; the spawn
-    /// rechecks that row and refuses.
+    /// #4116: a peer can archive or purge the stored row after the handler's memory check; the
+    /// spawn rechecks that row and refuses.
     #[tokio::test]
     #[serial_test::serial]
-    async fn spawn_refuses_a_row_archived_on_disk() {
+    async fn spawn_refuses_a_row_archived_or_purged_on_disk() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = crate::session::Instance::new("acp-4116", "/tmp/aoe-4116-acp");
         inst.view = crate::session::View::Structured;
         inst.status = crate::session::Status::Idle;
         let id = inst.id.clone();
-        let mut peer = inst.clone();
-        peer.archive();
-        crate::session::Storage::new_unwatched(&inst.source_profile)
-            .unwrap()
-            .update(|rows, _| {
-                rows.push(peer);
-                Ok(())
-            })
-            .unwrap();
-        let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        let response = spawn_acp(
-            State(state.clone()),
-            Path(id.clone()),
-            Ok(Json(worker::SpawnAcpRequest {
-                agent: None,
-                model: None,
-                additional_dirs: Vec::new(),
-                provider_env: Vec::new(),
-            })),
-        )
-        .await
-        .into_response();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
+        for (stored_row, want_status, want_code) in [
+            (true, StatusCode::CONFLICT, "session_archived"),
+            (false, StatusCode::NOT_FOUND, ""),
+        ] {
+            let mut peer = inst.clone();
+            peer.archive();
+            crate::session::Storage::new_unwatched(&inst.source_profile)
+                .unwrap()
+                .update(|rows, _| {
+                    *rows = if stored_row { vec![peer] } else { Vec::new() };
+                    Ok(())
+                })
+                .unwrap();
+            let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+            let response = spawn_acp(
+                State(state.clone()),
+                Path(id.clone()),
+                Ok(Json(worker::SpawnAcpRequest {
+                    agent: None,
+                    model: None,
+                    additional_dirs: Vec::new(),
+                    provider_env: Vec::new(),
+                })),
+            )
             .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error"], "session_archived");
-        assert!(!state.acp_supervisor.is_running(&id).await);
+            .into_response();
+            assert_eq!(response.status(), want_status, "stored_row={stored_row}");
+            if stored_row {
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["error"], want_code);
+            }
+            assert!(!state.acp_supervisor.is_running(&id).await);
+        }
     }
 
     /// #3650: endpoints that tear the worker down wait for an in-flight
