@@ -300,9 +300,21 @@ impl HomeView {
                     .as_ref()
                     .is_some_and(|worktree| worktree.managed_by_aoe)
                     || instance.workspace_info.is_some();
+                let authoritative = match storage.load() {
+                    Ok(authoritative) => authoritative,
+                    Err(error) => {
+                        self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            "Creation Failed",
+                            &format!("Failed to read profile storage: {error}"),
+                        ));
+                        self.new_dialog = None;
+                        let _ = self.reload();
+                        return None;
+                    }
+                };
                 if manages_worktree
                     && crate::session::find_duplicate_session(
-                        storage.load().ok()?.iter(),
+                        authoritative.iter(),
                         &instance.title,
                         &instance.project_path,
                         None,

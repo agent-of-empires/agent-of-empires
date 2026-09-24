@@ -466,6 +466,26 @@ pub async fn trash_session(
                 instance.kill_all_tmux_sessions_locked();
             }
         }
+        if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
+            &work_id,
+            &[std::path::PathBuf::from(&instance.project_path)],
+        ) {
+            storage.update(|instances, _groups| {
+                if let Some(stored) = instances
+                    .iter_mut()
+                    .find(|candidate| candidate.id == work_id)
+                {
+                    stored.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Trash,
+                        generation,
+                    );
+                }
+                Ok(())
+            })?;
+            return Err(anyhow::anyhow!(
+                "trash skipped because worktree ownership is shared or unknown: {error}"
+            ));
+        }
         let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
         let relocation = match &outcome {
             crate::session::trash::RelocateOutcome::Relocated { .. } => {

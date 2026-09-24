@@ -278,6 +278,26 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
     if !owns {
         return failed("trash lifecycle reservation was superseded before teardown".to_string());
     }
+    if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
+        &request.session_id,
+        &[PathBuf::from(&request.instance.project_path)],
+    ) {
+        let _ = storage.update(|instances, _groups| {
+            if let Some(stored) = instances
+                .iter_mut()
+                .find(|instance| instance.id == request.session_id)
+            {
+                stored.release_lifecycle_reservation_if_owned(
+                    crate::session::LifecycleOperation::Trash,
+                    request.generation,
+                );
+            }
+            Ok(())
+        });
+        return failed(format!(
+            "trash skipped because worktree ownership is shared or unknown: {error}"
+        ));
+    }
 
     let mut inst = request.instance.clone();
     inst.kill_all_tmux_sessions_locked();
