@@ -1333,7 +1333,15 @@ mod tests {
             std::fs::create_dir_all(&after).unwrap();
             let mut inst = tool_instance(agent, before.to_str().unwrap());
             inst.command = agent.into();
-            let known = inst.asserted_resume_binding(sid, None).unwrap();
+            let asserted = inst.asserted_resume_binding(sid, None);
+            if agent == "codex" && crate::process::HAS_CODEX_MANAGED_PREFERENCES {
+                assert_eq!(
+                    asserted.unwrap_err().to_string(),
+                    "Codex managed preferences cannot be attested by the local file contract"
+                );
+                continue;
+            }
+            let known = asserted.unwrap();
             inst.set_agent_conversation(Some(sid.into()), Some(known.clone()), None);
             if agent == "claude" {
                 inst.project_path = after.to_str().unwrap().into();
