@@ -75,14 +75,17 @@ async fn rate_limit_resume_probe(state: &AppState, id: &str) -> Option<DateTime<
 }
 
 /// The memory check runs before the handler's awaits, during which a peer such as
-/// `aoe session archive` can dismiss the stored row, so recheck it right before spawning.
+/// `aoe session archive` or `aoe rm --purge` can dismiss or remove the stored row, so
+/// recheck it right before spawning.
 async fn refuse_if_stored_row_dismissed(
     state: &AppState,
     instance: &crate::session::Instance,
 ) -> Option<Response> {
     match super::view::load_persisted_instance(state, &instance.source_profile, &instance.id).await
     {
-        Ok(stored) => stored?
+        // A purge removes the row while the cache may still hold it.
+        Ok(None) => Some(session_not_found()),
+        Ok(Some(stored)) => stored
             .ensure_startable()
             .err()
             .map(crate::server::api::start_blocked_response),
