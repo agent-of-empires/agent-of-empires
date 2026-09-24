@@ -66,6 +66,11 @@ pub async fn send_message(
         return bare_not_found();
     };
 
+    // Covers `revive: false` and a live pane too; an archived session takes no input.
+    if let Err(blocked) = instance.ensure_startable() {
+        return crate::server::api::start_blocked_response(blocked);
+    }
+
     let sync_base = instance.clone();
     let tool = instance.tool.clone();
     let message = req.message;
@@ -120,6 +125,16 @@ pub async fn send_message(
         if !tmux_session.exists() {
             return Err(Box::new((inst_owned, outcome, SendKeysError::NotRunning)));
         }
+        let _input_lock = match inst_owned.lock_for_input() {
+            Ok(lock) => lock,
+            Err(e) => {
+                let err = match e.downcast_ref::<crate::session::StartBlocked>() {
+                    Some(blocked) => SendKeysError::Blocked(*blocked),
+                    None => SendKeysError::Tmux(e),
+                };
+                return Err(Box::new((inst_owned, outcome, err)));
+            }
+        };
         let delay = crate::agents::send_keys_enter_delay(&tool);
         if let Err(e) = tmux_session.send_keys_with_delay(&message, delay) {
             return Err(Box::new((inst_owned, outcome, SendKeysError::Tmux(e))));
@@ -140,7 +155,7 @@ pub async fn send_message(
                 if !matches!(outcome, EnsureReadyOutcome::AlreadyAlive) {
                     apply_post_restart_sync(i, &sync_base, &started);
                 }
-                i.touch_last_accessed();
+                i.touch_after_input();
                 i.source_profile.clone()
             } else {
                 // Deleted between the send and the stamp; nothing to persist.
@@ -162,7 +177,7 @@ pub async fn send_message(
                                     &started_for_save,
                                 );
                             }
-                            disk_inst.touch_last_accessed();
+                            disk_inst.touch_after_input();
                         }
                         Ok(())
                     }) {

@@ -112,6 +112,22 @@ impl Instance {
         Ok(EnsureReadyOutcome::AlreadyAlive)
     }
 
+    /// Keystrokes into a live pane are refused for an archived or trashed session, like a start.
+    /// Rechecks the stored row under the lifecycle lock, which CLI archive and trash also take;
+    /// hold the returned guard until the send lands. `ensure_pane_ready` takes the same lock, so
+    /// call this after it.
+    pub(crate) fn lock_for_input(&self) -> Result<crate::session::storage::StorageFlock> {
+        let storage = crate::session::storage::Storage::new(
+            &self.effective_profile(),
+            self.resolve_file_watch(),
+        )?;
+        let lock = storage.acquire_instance_lifecycle_lock(&self.id)?;
+        if let Some(row) = storage.load()?.into_iter().find(|row| row.id == self.id) {
+            row.ensure_startable()?;
+        }
+        Ok(lock)
+    }
+
     /// Best-effort wait for a freshly-started pane to settle past its initial shell/splash so
     /// subsequent `send-keys` land in the agent instead of a boot prompt.
     fn wait_for_pane_ready(&self, session: &tmux::Session) {
