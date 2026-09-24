@@ -1388,9 +1388,10 @@
     },
     {
       "id": "session.start-refused-when-archived-or-trashed",
-      "kind": "vitest",
+      "kind": "mocked-playwright",
       "risk": "high",
       "specs": [
+        "tests/acp-structured-view.spec.ts",
         "src/components/__tests__/WorkspaceSidebarTrash.test.tsx",
         "src/hooks/useAcpSession.test.ts",
         "src/lib/api.test.ts"
@@ -1398,6 +1399,8 @@
       "components": [
         "web/src/components/sidebar/rowModel.ts",
         "web/src/hooks/useAcpSession.ts",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/LiveTerminalView.tsx",
         "web/src/lib/api.ts",
         "web/src/App.tsx"
       ]

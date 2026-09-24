@@ -42,7 +42,7 @@ fn worker_not_ready() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
 }
 
-/// `no_revive` refused: reviving (archived/snoozed/idle-dormant wake, or a
+/// `no_revive` refused: reviving (snoozed/idle-dormant wake, or a
 /// stopped worker) was required to accept this prompt and the caller asked
 /// not to. Distinct from `worker_not_ready`, which is transient and worth
 /// retrying; this is a standing precondition until something else revives

@@ -330,9 +330,9 @@ function AcpChrome({
           )}
         </div>
 
-        {/* Always mounted: the scroll observers need it even for a read-only trashed session. */}
+        {/* Always mounted: the scroll observers need it even for a read-only trashed or archived session. */}
         <div ref={belowViewportRef}>
-          {!view.trashedAt && (
+          {!view.trashedAt && !view.archivedAt && (
             <ComposerDock
               view={view}
               ctx={ctx}
