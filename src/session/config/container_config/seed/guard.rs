@@ -412,7 +412,7 @@ fn validate_namespace(
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
+                ) || unresolvable(&error) =>
             {
                 None
             }
@@ -470,11 +470,12 @@ fn watch_entry(
                 }
                 return Ok(());
             }
+            // Below a looped ancestor, watch the loop itself.
             Err(error)
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
+                ) || unresolvable(&error) =>
             {
                 missing = Some(candidate.to_path_buf());
                 cursor = candidate.parent();
@@ -692,6 +693,33 @@ mod tests {
             if swap {
                 fs::remove_file(&native).unwrap();
                 symlink("config.json", &native).unwrap();
+            }
+            assert_eq!(guard.validate().is_err(), swap, "swap={swap}");
+        }
+    }
+
+    #[test]
+    fn a_native_path_below_a_looped_ancestor_fails_validation_once_it_resolves() {
+        for swap in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("source");
+            let active = temporary.path().join("active");
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(&active).unwrap();
+            let ancestor = source.join("agent");
+            symlink("agent", &ancestor).unwrap();
+            let candidate = source.join("config.json");
+            fs::write(&candidate, b"{}").unwrap();
+            let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+            boundary.add_path(ancestor.join("sessions"));
+            let mut guard = ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
+            assert!(guard
+                .record_file(&candidate, &File::open(&candidate).unwrap())
+                .unwrap());
+            if swap {
+                fs::remove_file(&ancestor).unwrap();
+                fs::create_dir(&ancestor).unwrap();
+                symlink("../config.json", ancestor.join("sessions")).unwrap();
             }
             assert_eq!(guard.validate().is_err(), swap, "swap={swap}");
         }
