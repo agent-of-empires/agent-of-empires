@@ -1004,6 +1004,10 @@ pub async fn stop_session(
         if is_structured {
             inst.status = Status::Stopped;
             inst.mark_idle_dormant();
+            // A direct stop bypasses apply_status_intent, which normally releases this on
+            // reaching a terminal status; do the same here, on the live in-memory row (the
+            // disk-persisted copy above is a fresh load, so this field is always false there).
+            inst.plugin_revival_pending = false;
         }
         inst.clone()
     };

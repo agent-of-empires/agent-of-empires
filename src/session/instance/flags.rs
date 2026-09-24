@@ -94,6 +94,26 @@ impl Instance {
         self.trashed_at.is_some()
     }
 
+    /// Whether this session currently occupies a slot in its owning plugin's
+    /// `MAX_ACTIVE_PLUGIN_SESSIONS` cap: actively running, or not parked by the user and not
+    /// in one of the counted statuses. `is_trashed()` is checked first and wins outright: a
+    /// trashed row never reaches `apply_status_intent` (which returns early on it), so nothing
+    /// would ever clear a pending mark that outlived a trash. `plugin_revival_pending` then
+    /// counts unconditionally ahead of the remaining archived/snoozed checks:
+    /// `sessions.turn.send` sets it before waking a resting session, and the wake that follows
+    /// clears those park flags moments later, so a target caught mid-wake by a concurrent
+    /// count must not read as unparked-and-thus-uncounted.
+    pub(crate) fn counts_toward_plugin_session_cap(&self) -> bool {
+        !self.is_trashed()
+            && (self.plugin_revival_pending
+                || (!self.is_archived()
+                    && !self.is_snoozed()
+                    && matches!(
+                        self.status,
+                        Status::Creating | Status::Starting | Status::Running | Status::Waiting
+                    )))
+    }
+
     /// The mutually-exclusive lifecycle bucket a session renders in. Precedence is `Trashed >
     /// Archived > Active`.
     pub fn effective_bucket(&self) -> SessionBucket {
@@ -245,6 +265,46 @@ mod tests {
 
     fn inst() -> Instance {
         Instance::new("test", "/tmp/test")
+    }
+
+    #[test]
+    fn plugin_revival_pending_counts_unconditionally() {
+        let mut i = inst();
+        i.status = Status::Idle;
+        assert!(!i.counts_toward_plugin_session_cap());
+
+        i.plugin_revival_pending = true;
+        assert!(i.counts_toward_plugin_session_cap());
+
+        // `sessions.turn.send` marks pending before the wake that follows clears these; a
+        // concurrent count caught in that gap must still see it as occupying a slot.
+        i.archived_at = Some(Utc::now());
+        assert!(i.counts_toward_plugin_session_cap());
+        i.archived_at = None;
+        i.snoozed_until = Some(Utc::now() + chrono::Duration::hours(1));
+        assert!(i.counts_toward_plugin_session_cap());
+        i.snoozed_until = None;
+
+        i.plugin_revival_pending = false;
+        i.status = Status::Running;
+        assert!(i.counts_toward_plugin_session_cap());
+
+        i.status = Status::Idle;
+        assert!(!i.counts_toward_plugin_session_cap());
+    }
+
+    /// A trashed row never reaches `apply_status_intent` (which returns early on it), so
+    /// nothing would ever clear a pending mark that outlived a trash; `is_trashed()` must win
+    /// outright rather than being masked by an unconditional pending check.
+    #[test]
+    fn trashed_wins_over_a_pending_plugin_revival() {
+        let mut i = inst();
+        i.status = Status::Idle;
+        i.plugin_revival_pending = true;
+        assert!(i.counts_toward_plugin_session_cap());
+
+        i.trashed_at = Some(Utc::now());
+        assert!(!i.counts_toward_plugin_session_cap());
     }
 
     #[test]
