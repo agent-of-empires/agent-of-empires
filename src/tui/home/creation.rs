@@ -320,12 +320,6 @@ impl HomeView {
                         &instance.id,
                         &candidate_paths,
                     ) {
-                        cleanup_creation_resources(
-                            &instance,
-                            created_worktree.as_ref(),
-                            &created_workspace_worktrees,
-                            None,
-                        );
                         self.info_dialog = Some(InfoDialog::sized_to_fit(
                             "Creation Failed",
                             &format!("Session path is already claimed: {error}"),

@@ -728,6 +728,14 @@ pub fn attach_planned(
             return Err(error).context("could not reacquire identity lock to publish attach");
         }
     };
+    let profile = storage.profile().to_string();
+    let storage = match Storage::open_unwatched(&profile) {
+        Ok(storage) => storage,
+        Err(error) => {
+            prepared.rollback();
+            return Err(error).context("could not reopen attach profile before publication");
+        }
+    };
     if !Path::new(&prepared.outcome.repo.worktree_path).exists() {
         prepared.rollback();
         anyhow::bail!("attached worktree disappeared before publication");

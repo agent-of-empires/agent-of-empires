@@ -337,8 +337,30 @@ pub(crate) async fn spawn_structured_session(
             return Err(anyhow::anyhow!("on_create hook failed: {e:#}{hint}"));
         }
 
-        let identity_lock = crate::session::acquire_session_identity_lock()?;
-        let storage = Storage::open(&profile, file_watch_for_create.clone())?;
+        let identity_lock = match crate::session::acquire_session_identity_lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                builder::cleanup_instance(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return Err(error);
+            }
+        };
+        let storage = match Storage::open(&profile, file_watch_for_create.clone()) {
+            Ok(storage) => storage,
+            Err(error) => {
+                builder::cleanup_instance(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return Err(error);
+            }
+        };
         if !scratch && !std::path::Path::new(&instance.project_path).exists() {
             builder::cleanup_instance(
                 &instance,

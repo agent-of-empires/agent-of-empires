@@ -265,7 +265,18 @@ impl HomeView {
             .as_ref()
             .is_some_and(|worktree| worktree.managed_by_aoe)
             || instance.workspace_info.is_some();
-        let identity_lock = acquire_session_identity_lock()?;
+        let identity_lock = match acquire_session_identity_lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                builder::cleanup_instance(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return Err(error);
+            }
+        };
         if !is_scratch && !std::path::Path::new(&instance.project_path).exists() {
             builder::cleanup_instance(
                 &instance,
