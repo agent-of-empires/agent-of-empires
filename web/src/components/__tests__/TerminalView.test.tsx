@@ -100,6 +100,23 @@ describe("TerminalView early-return states", () => {
     expect(screen.queryByRole("button", { name: /retry/i })).toBeNull();
   });
 
+  it("re-runs ensure once a refused session is unarchived", async () => {
+    ensureSession.mockResolvedValueOnce({
+      ok: false,
+      error: "session_archived",
+      message: "session is archived; unarchive it first",
+    });
+    const { rerender } = render(<TerminalView session={makeSession({ archived_at: "2026-01-01T00:00:00Z" })} />);
+    await waitFor(() => {
+      expect(screen.getByText("session is archived; unarchive it first")).toBeDefined();
+    });
+    rerender(<TerminalView session={makeSession({ archived_at: null })} />);
+    await waitFor(() => {
+      expect(screen.queryByText("session is archived; unarchive it first")).toBeNull();
+    });
+    expect(ensureSession).toHaveBeenCalledTimes(2);
+  });
+
   it("re-runs ensureSession when Retry is clicked", async () => {
     ensureSession.mockResolvedValueOnce({ ok: false, message: "first fail" });
     const { container } = render(<TerminalView session={makeSession()} />);

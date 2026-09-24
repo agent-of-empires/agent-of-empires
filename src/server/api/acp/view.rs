@@ -456,7 +456,7 @@ pub async fn acp_disable(
     view_response(id, View::Terminal)
 }
 
-async fn load_persisted_instance(
+pub(super) async fn load_persisted_instance(
     state: &AppState,
     profile: &str,
     id: &str,
@@ -475,11 +475,11 @@ async fn load_persisted_instance(
     match persisted {
         Ok(Ok(found)) => Ok(found),
         Ok(Err(error)) => {
-            tracing::error!(target: "acp.switch", session = %id, "load before disable: {error:#}");
+            tracing::error!(target: "acp.switch", session = %id, "load persisted session: {error:#}");
             Err(internal_error("failed to read session state"))
         }
         Err(join_error) => {
-            tracing::error!(target: "acp.switch", session = %id, "load before disable panicked: {join_error}");
+            tracing::error!(target: "acp.switch", session = %id, "load persisted session panicked: {join_error}");
             Err(internal_error("failed to read session state"))
         }
     }

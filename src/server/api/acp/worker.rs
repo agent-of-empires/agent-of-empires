@@ -74,6 +74,22 @@ async fn rate_limit_resume_probe(state: &AppState, id: &str) -> Option<DateTime<
     })
 }
 
+/// The memory check runs before the handler's awaits, during which a peer such as
+/// `aoe session archive` can dismiss the stored row, so recheck it right before spawning.
+async fn refuse_if_stored_row_dismissed(
+    state: &AppState,
+    instance: &crate::session::Instance,
+) -> Option<Response> {
+    match super::view::load_persisted_instance(state, &instance.source_profile, &instance.id).await
+    {
+        Ok(stored) => stored?
+            .ensure_startable()
+            .err()
+            .map(crate::server::api::start_blocked_response),
+        Err(resp) => Some(resp),
+    }
+}
+
 pub async fn spawn_acp(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -138,6 +154,9 @@ pub async fn spawn_acp(
         model: req.model.or_else(|| instance.agent_model.clone()),
         ..spawn_request_for(&instance, agent.clone(), sandbox_info)
     };
+    if let Some(resp) = refuse_if_stored_row_dismissed(&state, &instance).await {
+        return resp;
+    }
     match state.acp_supervisor.spawn(request).await {
         Ok(()) => {}
         Err(SupervisorError::AlreadyRunning(_)) if rate_limit_resume_resets_at.is_some() => {}
@@ -403,6 +422,9 @@ pub async fn switch_acp_agent(
         claude_store_pin: None,
         ..spawn_request_for(&instance, target.clone(), sandbox_info)
     };
+    if let Some(resp) = refuse_if_stored_row_dismissed(&state, &instance).await {
+        return resp;
+    }
     if let Err(e) = state.acp_supervisor.spawn(request).await {
         return supervisor_error_response("spawn failed", &e);
     }

@@ -1133,12 +1133,19 @@ pub async fn start_session(
         // reconciler's next tick respawns the worker against the preserved
         // transcript.
         let persist_id = id.clone();
+        let blocked = Arc::new(std::sync::OnceLock::new());
+        let blocked_on_disk = Arc::clone(&blocked);
         if persist_session_update(
             profile,
             "start session",
             state.file_watch.clone(),
             move |instances| {
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                    // A peer may have archived or trashed the row since the memory check.
+                    if let Err(refusal) = inst.ensure_startable() {
+                        let _ = blocked_on_disk.set(refusal);
+                        return;
+                    }
                     inst.idle_dormant_since = None;
                     inst.status = Status::Idle;
                     inst.last_error = None;
@@ -1149,6 +1156,9 @@ pub async fn start_session(
         .is_err()
         {
             return persist_failed_response();
+        }
+        if let Some(refusal) = blocked.get() {
+            return crate::server::api::start_blocked_response(*refusal);
         }
         {
             let mut instances = state.instances.write().await;

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { WorkspaceSidebar } from "../WorkspaceSidebar";
 import { buildSessionGroups } from "../../lib/sidebarGroups";
@@ -122,6 +122,21 @@ describe("WorkspaceSidebar Trash control", () => {
     click("sidebar-trash-context-menu-open");
     expect(props.onSelect).toHaveBeenCalledWith("trashed-ws", "s1");
     expect(query("sidebar-trash-menu")).toBeNull();
+  });
+
+  it("a second right-click moves the menu to the other row", async () => {
+    const a = trashed("a-ws", "a1");
+    const b = trashed("b-ws", "b1");
+    const props = renderSidebar([a, b], { trashedWorkspaces: [a, b] });
+    click("sidebar-trash-toggle");
+    const [first, second] = screen.getAllByTestId("sidebar-trash-row");
+    fireEvent.contextMenu(first!);
+    // The menu arms its document listeners on the next frame.
+    await act(() => new Promise((resolve) => requestAnimationFrame(resolve)));
+    fireEvent.contextMenu(second!);
+    click("sidebar-trash-context-menu-restore");
+    expect(props.onRestoreSession).toHaveBeenCalledTimes(1);
+    expect(props.onRestoreSession).toHaveBeenCalledWith([second!.textContent?.startsWith("a-ws") ? "a1" : "b1"]);
   });
 
   it("offers only Open in the trashed-row menu when read-only", () => {

@@ -2762,6 +2762,70 @@ async fn start_paths_refuse_archived_and_trashed_sessions() {
     }
 }
 
+/// #4116: a peer (e.g. `aoe session archive`) can dismiss the stored row after the daemon's
+/// memory check. Structured start and prompt-wake recheck that row inside their write, refuse,
+/// and leave `archived_at` in place.
+#[tokio::test]
+#[serial_test::serial]
+async fn structured_start_and_prompt_wake_recheck_the_stored_row() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let profile = "default";
+    for which in ["start", "prompt"] {
+        let mut inst = Instance::new("peer-archived", "/tmp/aoe-4116-peer");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        inst.status = Status::Stopped;
+        // Snoozed in memory so the prompt path would wake (and persist) it.
+        inst.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+        let id = inst.id.clone();
+        let mut peer = inst.clone();
+        peer.archive();
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = vec![peer];
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let refused = match which {
+            "start" => {
+                start_session(State(state.clone()), Path(id.clone()))
+                    .await
+                    .into_response()
+                    .status()
+                    == StatusCode::CONFLICT
+            }
+            _ => matches!(
+                state
+                    .session_service
+                    .touch_and_wake_on_prompt(&id, false)
+                    .await,
+                crate::server::session_service::PromptTouch::Blocked(
+                    crate::session::StartBlocked::Archived
+                )
+            ),
+        };
+        assert!(refused, "{which} must refuse a row archived on disk");
+        let stored = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap();
+        assert!(
+            stored.is_archived(),
+            "{which} must not clear the peer's archive"
+        );
+        assert_eq!(
+            stored.status,
+            Status::Stopped,
+            "{which} must not mark it Idle"
+        );
+    }
+}
+
 // Regression for a path-traversal vulnerability in the first cut of
 // `/api/sessions/{id}/diff/file?path=...`, where any authenticated user could
 // pass `?path=/etc/passwd` and have the server dump it in a diff response.

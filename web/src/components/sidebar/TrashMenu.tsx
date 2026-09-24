@@ -67,11 +67,6 @@ export function TrashMenu({
     setOpen(false);
     onDelete(sessionIds(ws));
   };
-  const fromMenu = (run: (ws: Workspace) => void) => () => {
-    if (!menu) return;
-    closeMenu();
-    run(menu.ws);
-  };
 
   useLayoutEffect(() => {
     if (!open) return;
@@ -180,7 +175,10 @@ export function TrashMenu({
       {open && menu && (
         <ContextMenu menu={menu} menuRef={menuRef} testId="sidebar-trash-context-menu">
           <MenuItem
-            onClick={fromMenu(openWorkspace)}
+            onClick={() => {
+              closeMenu();
+              openWorkspace(menu.ws);
+            }}
             testId="sidebar-trash-context-menu-open"
             icon={<ArrowUpRight className="h-3.5 w-3.5 shrink-0" />}
           >
@@ -189,14 +187,20 @@ export function TrashMenu({
           {!readOnly && (
             <>
               <MenuItem
-                onClick={fromMenu(restoreWorkspace)}
+                onClick={() => {
+                  closeMenu();
+                  restoreWorkspace(menu.ws);
+                }}
                 testId="sidebar-trash-context-menu-restore"
                 icon={<RotateCcw className="h-3.5 w-3.5 shrink-0" />}
               >
                 Restore
               </MenuItem>
               <MenuItem
-                onClick={fromMenu(deleteWorkspace)}
+                onClick={() => {
+                  closeMenu();
+                  deleteWorkspace(menu.ws);
+                }}
                 testId="sidebar-trash-context-menu-delete"
                 icon={<X className="h-3.5 w-3.5 shrink-0" />}
                 className="text-status-error hover:bg-status-error/10"
@@ -246,6 +250,8 @@ function TrashRow({
       data-testid="sidebar-trash-row"
       onContextMenu={(e) => {
         e.preventDefault();
+        // Every row shares one menu, whose document listener would close the menu just opened.
+        e.stopPropagation();
         onContextMenu(e.clientX, e.clientY);
       }}
       className="rounded-md border border-surface-700/30 bg-surface-900/20 px-3 py-2.5 text-[13px] text-text-secondary"

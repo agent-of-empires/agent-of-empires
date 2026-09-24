@@ -103,6 +103,8 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     return false;
   }, []);
 
+  // A refused ensure re-runs once the session is unarchived or restored.
+  const dismissed = !!session.archived_at || !!session.trashed_at;
   useEffect(() => {
     if (lastEnsuredSessionIdRef.current === session.id) {
       if (consumePendingTerminalFocus(focusTarget)) focusSelf();
@@ -129,7 +131,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       }
     });
     return () => controller.abort();
-  }, [session.id, focusSelf, surface, focusTarget, terminalIndex]);
+  }, [session.id, dismissed, focusSelf, surface, focusTarget, terminalIndex]);
 
   // Drain a pending focus latch once the pane is mounted.
   useEffect(() => {

@@ -406,6 +406,17 @@ test.describe("trashed structured session is read-only", () => {
     await expect(page.getByTestId("composer-footer")).toHaveCount(0);
   });
 
+  test("an empty archived session offers no starter prompts", async ({ page }) => {
+    const mock = await mockAcpSession(page, {
+      title: "story-archived-empty",
+      archivedAt: new Date().toISOString(),
+      initialEvents: [stopped("user_stopped")],
+    });
+    await openStructuredSession(page, mock);
+
+    await expect(page.getByTestId(`acp-archived-banner-${mock.sessionId}`)).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText("Ask the agent anything about this workspace.")).toHaveCount(0);
+  });
 });
 
 // ────────────────────────── seen telemetry ────────────────────────
