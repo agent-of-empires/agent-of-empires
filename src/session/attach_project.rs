@@ -697,13 +697,14 @@ pub fn attach(
 
 /// Execute an already-validated plan and persist it.
 pub fn attach_planned(
-    _storage: &Storage,
+    storage: &Storage,
     session_id: &str,
     instance: &super::Instance,
     plan: AttachPlan,
 ) -> Result<AttachOutcome> {
     let _identity_lock = crate::session::acquire_session_identity_lock()?;
-    let storage = Storage::open_unwatched(&instance.source_profile)?;
+    let profile = storage.profile().to_string();
+    let storage = Storage::open_unwatched(&profile)?;
     // A publication that has not been drained yet would be flushed after the
     // move with the stale cwd, re-qualifying the old directory after the
     // commit. Flush it first so the durable recheck sees the row as it will
@@ -742,7 +743,6 @@ pub fn attach_planned(
     if let Err(error) =
         crate::session::deletion::ensure_unclaimed_paths(session_id, &candidate_paths)
     {
-        prepared.rollback();
         anyhow::bail!("Attach path is already claimed by another session: {error}");
     }
 
@@ -750,14 +750,47 @@ pub fn attach_planned(
     let workspace = prepared.workspace_info.clone();
     let new_project_path = prepared.project_path().to_string();
     let converted = prepared.outcome.moved_to.is_some();
+    let expected_project_path = instance.project_path.clone();
+    let expected_worktree_info = instance.worktree_info.clone();
+    let expected_workspace = instance.workspace_info.as_ref().map(|workspace| {
+        (
+            workspace.branch.clone(),
+            workspace.workspace_dir.clone(),
+            workspace.repos.clone(),
+            workspace.cleanup_on_delete,
+        )
+    });
     let persisted = storage.update(|instances, _groups| {
         let inst = instances
             .iter_mut()
             .find(|i| i.id == id)
             .with_context(|| format!("session not found: {id}"))?;
         anyhow::ensure!(
+            !inst
+                .lifecycle_reservation
+                .as_ref()
+                .is_some_and(|reservation| {
+                    reservation.op == crate::session::LifecycleOperation::Purge
+                }),
+            "session is being purged and cannot be attached"
+        );
+        anyhow::ensure!(
             inst.lifecycle_generation == instance.lifecycle_generation,
             "session changed before attach could be recorded"
+        );
+        let current_workspace = inst.workspace_info.as_ref().map(|workspace| {
+            (
+                workspace.branch.clone(),
+                workspace.workspace_dir.clone(),
+                workspace.repos.clone(),
+                workspace.cleanup_on_delete,
+            )
+        });
+        anyhow::ensure!(
+            inst.project_path == expected_project_path
+                && inst.worktree_info == expected_worktree_info
+                && current_workspace == expected_workspace,
+            "session workspace changed before attach could be recorded"
         );
         anyhow::ensure!(
             !converted || !conversation_cannot_follow(inst),

@@ -113,11 +113,9 @@ impl PurgeTransaction {
     pub fn reserve(storage: Storage, mut request: DeletionRequest) -> Result<PurgeReservation> {
         let id = request.session_id.clone();
         let was_trashed = request.instance.is_trashed();
-        let identity_lock = if request.delete_worktree {
-            Some(crate::session::acquire_session_identity_lock()?)
-        } else {
-            None
-        };
+        let identity_lock = Some(crate::session::acquire_session_identity_lock()?);
+        let profile = storage.profile().to_string();
+        let storage = Storage::open_unwatched(&profile)?;
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&id)
             .context("failed to acquire instance purge lock")?;
@@ -204,12 +202,15 @@ impl PurgeTransaction {
     }
 
     fn ensure_lifecycle_lock(&mut self) -> Result<()> {
-        if self.request.delete_worktree && self.identity_lock.is_none() {
+        if self.identity_lock.is_none() {
             self.identity_lock = Some(
                 crate::session::acquire_session_identity_lock()
                     .context("failed to reacquire session identity lock after hooks")?,
             );
         }
+        let profile = self.storage.profile().to_string();
+        self.storage = Storage::open_unwatched(&profile)
+            .context("failed to reopen target profile after destroy hooks")?;
         if self.lifecycle_lock.is_none() {
             self.lifecycle_lock = Some(
                 self.storage
@@ -266,7 +267,11 @@ impl PurgeTransaction {
             Ok(())
         })?;
         let outcome = outcome.ok_or_else(|| anyhow::anyhow!("purge gate produced no outcome"))?;
-        if !matches!(outcome.0, CompletionGate::Proceed) {
+        if matches!(outcome.0, CompletionGate::Proceed) {
+            if let Some(current) = outcome.1.clone() {
+                self.request.instance = current;
+            }
+        } else {
             self.active = false;
         }
         Ok(outcome)
@@ -602,6 +607,19 @@ fn other_sessions_paths(instances: &[Instance], except_ids: &[&str]) -> Vec<Path
         .collect()
 }
 
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    let left_canonical = left.canonicalize().ok();
+    let right_canonical = right.canonicalize().ok();
+    match (left_canonical, right_canonical) {
+        (Some(left), Some(right)) => left.starts_with(&right) || right.starts_with(&left),
+        // An existing path with an unresolved alias is not proof of separation.
+        _ => true,
+    }
+}
+
 /// The paths sessions outside a deletion use, across every profile.
 pub(crate) enum PathsInUse {
     Known(Vec<PathBuf>),
@@ -612,7 +630,7 @@ pub(crate) enum PathsInUse {
 impl PathsInUse {
     pub(crate) fn covers(&self, root: &Path) -> bool {
         match self {
-            Self::Known(paths) => paths.iter().any(|path| path.starts_with(root)),
+            Self::Known(paths) => paths.iter().any(|path| paths_overlap(path, root)),
             Self::Unknown(_) => true,
         }
     }
@@ -640,9 +658,20 @@ fn all_profile_storages() -> std::result::Result<(Vec<String>, Vec<Storage>), St
 
 fn scan_paths_in_use(storages: &[Storage], except_ids: &[&str]) -> PathsInUse {
     let mut paths = Vec::new();
+    let mut ids = std::collections::HashSet::new();
     for storage in storages {
         match storage.load_strict_for_worktree_ownership_locked() {
-            Ok(instances) => paths.extend(other_sessions_paths(&instances, except_ids)),
+            Ok(instances) => {
+                if instances
+                    .iter()
+                    .any(|instance| !ids.insert(instance.id.clone()))
+                {
+                    return PathsInUse::Unknown(
+                        "duplicate session id in cross-profile inventory".to_string(),
+                    );
+                }
+                paths.extend(other_sessions_paths(&instances, except_ids));
+            }
             Err(error) => {
                 return PathsInUse::Unknown(format!(
                     "reading profile '{}': {error}",
@@ -671,9 +700,9 @@ pub(crate) fn ensure_unclaimed_paths(
         PathsInUse::Unknown(reason) => Err(reason),
         PathsInUse::Known(paths)
             if paths.iter().any(|path| {
-                candidates.iter().any(|candidate| {
-                    Path::new(path).starts_with(candidate) || candidate.starts_with(path)
-                })
+                candidates
+                    .iter()
+                    .any(|candidate| paths_overlap(Path::new(path), candidate))
             }) =>
         {
             Err("another session already claims one of the candidate paths".to_string())
@@ -850,8 +879,17 @@ fn perform_deletion_core(
     } else {
         stage(&PathsInUse::Known(Vec::new()))
     };
+    let scratch_preserved = if lifecycle_locked && request.instance.scratch {
+        let mut preserved = false;
+        with_paths_in_use_locked(&request.session_id, identity_lock_held, |paths| {
+            preserved = paths.covers(Path::new(&request.instance.project_path));
+        });
+        preserved
+    } else {
+        false
+    };
 
-    stage_cleanup_scratch(request, &mut errors, &mut messages);
+    stage_cleanup_scratch(request, scratch_preserved, &mut errors, &mut messages);
 
     // Last, and only when nothing else failed: any error here rolls the purge back
     // (`PurgeTransaction::complete_inner`), and a session that survives its own purge must survive
@@ -1269,9 +1307,14 @@ fn stage_remove_worktrees_and_branches(
 
 fn stage_cleanup_scratch(
     request: &DeletionRequest,
+    preserved_by_peer: bool,
     errors: &mut Vec<String>,
     messages: &mut Vec<String>,
 ) {
+    if preserved_by_peer {
+        messages.push("Scratch directory kept; another session still uses it".to_string());
+        return;
+    }
     // Scratch directory cleanup.
     if request.instance.scratch {
         let path = PathBuf::from(&request.instance.project_path);
@@ -1796,6 +1839,20 @@ mod tests {
                 std::thread::spawn(move || {
                     started_tx.send(()).unwrap();
                     crate::session::create_profile("late-peer").unwrap();
+                    let _identity_lock = crate::session::acquire_session_identity_lock().unwrap();
+                    let exists = worktree_for_writer.exists();
+                    if exists {
+                        let mut instance =
+                            Instance::new("late-peer", worktree_for_writer.to_str().unwrap());
+                        instance.source_profile = "late-peer".to_string();
+                        Storage::open_unwatched("late-peer")
+                            .unwrap()
+                            .update(|instances, _groups| {
+                                instances.push(instance);
+                                Ok(())
+                            })
+                            .unwrap();
+                    }
                     published_tx.send(worktree_for_writer.exists()).unwrap();
                 });
                 started_rx.recv().unwrap();
@@ -1820,6 +1877,11 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(3))
             .unwrap());
         assert!(!worktree.exists());
+        assert!(Storage::open_unwatched("late-peer")
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

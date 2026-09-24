@@ -350,26 +350,27 @@ pub(crate) async fn spawn_structured_session(
                 "Project path disappeared before the session was persisted"
             ));
         }
-        let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
-        candidate_paths.extend(
-            instance
-                .all_repos()
-                .iter()
-                .map(|repo| PathBuf::from(&repo.worktree_path)),
-        );
-        if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
-            &instance.id,
-            &candidate_paths,
-        ) {
-            builder::cleanup_instance(
-                &instance,
-                created_worktree.as_ref(),
-                &created_workspace_worktrees,
-                None,
+        let manages_worktree = instance
+            .worktree_info
+            .as_ref()
+            .is_some_and(|worktree| worktree.managed_by_aoe)
+            || instance.workspace_info.is_some();
+        if manages_worktree {
+            let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
+            candidate_paths.extend(
+                instance
+                    .all_repos()
+                    .iter()
+                    .map(|repo| PathBuf::from(&repo.worktree_path)),
             );
-            return Err(anyhow::anyhow!(
-                "Session path is already claimed by another session: {error}"
-            ));
+            if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
+                &instance.id,
+                &candidate_paths,
+            ) {
+                return Err(anyhow::anyhow!(
+                    "Session path is already claimed by another session: {error}"
+                ));
+            }
         }
         // Anything that fails between here and the final `Ok(..)` would otherwise orphan
         // the scratch directory `build_instance` already provisioned (Storage::new,

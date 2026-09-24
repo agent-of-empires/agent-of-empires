@@ -3,14 +3,12 @@
 //! This handles the potentially slow Docker operations (image pull, container creation)
 //! in a background thread so the UI remains responsive.
 
-use std::path::PathBuf;
-use std::sync::mpsc;
-use std::thread;
-
 use crate::session::builder::{self, CreatedWorktree, InstanceParams};
 use crate::session::config::repo_config::{self, HookProgress, ResolvedHooks};
 use crate::session::Instance;
 use crate::tui::dialogs::NewSessionData;
+use std::sync::mpsc;
+use std::thread;
 
 pub(in crate::tui) struct IdentityGuard {
     _lock: crate::session::StorageFlock,
@@ -129,7 +127,6 @@ impl CreationPoller {
         let hooks = request.hooks;
         let profile = data.profile.clone();
         let sandbox = data.sandbox;
-        let manages_worktree = !data.scratch;
 
         let existing_titles: Vec<&str> = request
             .existing_instances
@@ -166,6 +163,11 @@ impl CreationPoller {
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
         let warnings = build_result.warnings;
+        let manages_worktree = instance
+            .worktree_info
+            .as_ref()
+            .is_some_and(|worktree| worktree.managed_by_aoe)
+            || instance.workspace_info.is_some();
 
         let has_on_create = hooks
             .as_ref()
@@ -281,58 +283,31 @@ impl CreationPoller {
             }
         }
 
-        let identity_guard = if manages_worktree {
-            match crate::session::acquire_session_identity_lock() {
-                Ok(lock) => {
-                    if !std::path::Path::new(&instance.project_path).exists() {
-                        builder::cleanup_instance(
-                            &instance,
-                            created_worktree.as_ref(),
-                            &created_workspace_worktrees,
-                            None,
-                        );
-                        return CreationResult::Error(
-                            "Project path disappeared before the session was persisted".to_string(),
-                        );
-                    }
-                    Some(IdentityGuard { _lock: lock })
-                }
-                Err(error) => {
+        let identity_guard = match crate::session::acquire_session_identity_lock() {
+            Ok(lock) => {
+                if manages_worktree && !std::path::Path::new(&instance.project_path).exists() {
                     builder::cleanup_instance(
                         &instance,
                         created_worktree.as_ref(),
                         &created_workspace_worktrees,
                         None,
                     );
-                    return CreationResult::Error(format!("{error:#}"));
+                    return CreationResult::Error(
+                        "Project path disappeared before the session was persisted".to_string(),
+                    );
                 }
+                Some(IdentityGuard { _lock: lock })
             }
-        } else {
-            None
-        };
-        if manages_worktree {
-            let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
-            candidate_paths.extend(
-                instance
-                    .all_repos()
-                    .iter()
-                    .map(|repo| PathBuf::from(&repo.worktree_path)),
-            );
-            if let Err(error) =
-                crate::session::deletion::ensure_unclaimed_paths(&instance.id, &candidate_paths)
-            {
+            Err(error) => {
                 builder::cleanup_instance(
                     &instance,
                     created_worktree.as_ref(),
                     &created_workspace_worktrees,
                     None,
                 );
-                return CreationResult::Error(format!(
-                    "Session path is already claimed by another session: {error}"
-                ));
+                return CreationResult::Error(format!("{error:#}"));
             }
-        }
-
+        };
         let created_worktree_info = created_worktree.as_ref().map(CreatedWorktreeInfo::from);
         let created_workspace_worktree_info = created_workspace_worktrees
             .iter()

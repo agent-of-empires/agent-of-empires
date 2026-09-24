@@ -2,6 +2,7 @@
 //! cancel or a quit has to do.
 
 use super::*;
+use std::path::PathBuf;
 
 pub(super) fn cleanup_creation_resources(
     instance: &Instance,
@@ -294,6 +295,46 @@ impl HomeView {
                     // unreachable; bail without attaching rather than panicking.
                     return None;
                 };
+                let manages_worktree = instance
+                    .worktree_info
+                    .as_ref()
+                    .is_some_and(|worktree| worktree.managed_by_aoe)
+                    || instance.workspace_info.is_some();
+                if manages_worktree
+                    && crate::session::find_duplicate_session(
+                        storage.load().ok()?.iter(),
+                        &instance.title,
+                        &instance.project_path,
+                        None,
+                    )
+                    .is_none()
+                {
+                    let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
+                    candidate_paths.extend(
+                        instance
+                            .all_repos()
+                            .iter()
+                            .map(|repo| PathBuf::from(&repo.worktree_path)),
+                    );
+                    if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
+                        &instance.id,
+                        &candidate_paths,
+                    ) {
+                        cleanup_creation_resources(
+                            &instance,
+                            created_worktree.as_ref(),
+                            &created_workspace_worktrees,
+                            None,
+                        );
+                        self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            "Creation Failed",
+                            &format!("Session path is already claimed: {error}"),
+                        ));
+                        self.new_dialog = None;
+                        let _ = self.reload();
+                        return None;
+                    }
+                }
                 let persist_result = storage.update(|instances, groups| {
                     // `save()` can run while the builder works and persist the
                     // placeholder, so remove that exact row under the same storage lock used

@@ -260,11 +260,12 @@ impl HomeView {
             builder::structured::apply_structured_choice(&mut instance);
         }
         let session_id = instance.id.clone();
-        let identity_lock = if is_scratch {
-            None
-        } else {
-            Some(acquire_session_identity_lock()?)
-        };
+        let manages_worktree = instance
+            .worktree_info
+            .as_ref()
+            .is_some_and(|worktree| worktree.managed_by_aoe)
+            || instance.workspace_info.is_some();
+        let identity_lock = acquire_session_identity_lock()?;
         if !is_scratch && !std::path::Path::new(&instance.project_path).exists() {
             builder::cleanup_instance(
                 &instance,
@@ -276,7 +277,7 @@ impl HomeView {
                 "Project path disappeared before the session was persisted"
             ));
         }
-        if !is_scratch {
+        if manages_worktree {
             let mut candidate_paths = vec![PathBuf::from(&instance.project_path)];
             candidate_paths.extend(
                 instance
@@ -287,12 +288,6 @@ impl HomeView {
             if let Err(error) =
                 crate::session::deletion::ensure_unclaimed_paths(&instance.id, &candidate_paths)
             {
-                builder::cleanup_instance(
-                    &instance,
-                    created_worktree.as_ref(),
-                    &created_workspace_worktrees,
-                    None,
-                );
                 return Err(anyhow::anyhow!(
                     "Session path is already claimed by another session: {error}"
                 ));
@@ -300,11 +295,19 @@ impl HomeView {
         }
 
         self.storages.remove(&target_profile);
-        self.storages.insert(
-            target_profile.clone(),
-            Storage::open(&target_profile, self.file_watch.clone())?,
-        );
-
+        let storage = match Storage::open(&target_profile, self.file_watch.clone()) {
+            Ok(storage) => storage,
+            Err(error) => {
+                builder::cleanup_instance(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return Err(error);
+            }
+        };
+        self.storages.insert(target_profile.clone(), storage);
         self.add_instance(instance.clone());
         self.rebuild_group_trees();
         if !instance.group_path.is_empty() {

@@ -944,20 +944,26 @@ impl Storage {
         }
         let rows: Vec<serde_json::Value> = serde_json::from_str(&content)
             .with_context(|| format!("parsing {}", self.sessions_path.display()))?;
-        rows.into_iter()
-            .enumerate()
-            .map(|(idx, row)| {
-                let mut instance = <Instance as serde::Deserialize>::deserialize(&row)
-                    .with_context(|| {
-                        format!(
-                            "parsing session row {idx} in {}",
-                            self.sessions_path.display()
-                        )
-                    })?;
-                instance.set_file_watch(self.file_watch.clone());
-                Ok(instance)
-            })
-            .collect()
+        let mut ids = std::collections::HashSet::new();
+        let mut instances = Vec::with_capacity(rows.len());
+        for (idx, row) in rows.into_iter().enumerate() {
+            let mut instance =
+                <Instance as serde::Deserialize>::deserialize(&row).with_context(|| {
+                    format!(
+                        "parsing session row {idx} in {}",
+                        self.sessions_path.display()
+                    )
+                })?;
+            if !ids.insert(instance.id.clone()) {
+                anyhow::bail!(
+                    "duplicate session id {} in ownership inventory",
+                    instance.id
+                );
+            }
+            instance.set_file_watch(self.file_watch.clone());
+            instances.push(instance);
+        }
+        Ok(instances)
     }
 
     fn quarantine_corrupt_rows(&self, rows: &[serde_json::Value]) {
