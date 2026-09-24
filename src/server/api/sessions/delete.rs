@@ -610,18 +610,32 @@ pub(super) fn order_workspace_deletion(
 
 /// Owner-worktree dirty preflight for a workspace delete, mirroring the
 /// per-session gate in `perform_deletion` so dirty plus non-force stays
-/// all-or-nothing. Returns the first dirty message found.
-fn workspace_dirty_message(instance: &Instance) -> Option<String> {
+/// all-or-nothing. A worktree kept for a session outside `session_ids` is not
+/// removed, so its dirtiness does not block. Returns the first dirty message.
+async fn workspace_dirty_message(instance: Instance, session_ids: Vec<String>) -> Option<String> {
+    tokio::task::spawn_blocking(move || {
+        let ids: Vec<&str> = session_ids.iter().map(String::as_str).collect();
+        let kept = crate::session::deletion::paths_in_use_except(&ids);
+        workspace_dirty_message_blocking(&instance, &kept)
+    })
+    .await
+    .unwrap_or_else(|error| Some(format!("dirty check failed: {error}")))
+}
+
+fn workspace_dirty_message_blocking(
+    instance: &Instance,
+    kept: &crate::session::deletion::PathsInUse,
+) -> Option<String> {
     if let Some(wt) = &instance.worktree_info {
-        if wt.managed_by_aoe {
-            let path = std::path::PathBuf::from(&instance.project_path);
+        let path = std::path::PathBuf::from(&instance.project_path);
+        if wt.managed_by_aoe && !kept.covers(&path) {
             if let Some(msg) = crate::git::cleanup::dirty_worktree_message(&path) {
                 return Some(msg);
             }
         }
     }
     if let Some(ws) = &instance.workspace_info {
-        if ws.cleanup_on_delete {
+        if ws.cleanup_on_delete && !kept.covers(std::path::Path::new(&ws.workspace_dir)) {
             for repo in &ws.repos {
                 if repo.managed_by_aoe {
                     let path = std::path::PathBuf::from(&repo.worktree_path);
@@ -674,7 +688,8 @@ pub(super) async fn purge_workspace_artifacts(
             instances.iter().find(|i| i.id == owner_id).cloned()
         };
         if let Some(owner) = owner {
-            if let Some(msg) = workspace_dirty_message(&owner) {
+            let ids = plan.iter().map(|(id, _)| id.clone()).collect();
+            if let Some(msg) = workspace_dirty_message(owner, ids).await {
                 failed.push(WorkspaceDeleteFailure {
                     id: owner_id,
                     error: format!("Workspace: {msg}"),
@@ -794,7 +809,7 @@ pub async fn delete_workspace(
             instances.iter().find(|i| i.id == owner_id).cloned()
         };
         if let Some(owner) = owner {
-            if let Some(msg) = workspace_dirty_message(&owner) {
+            if let Some(msg) = workspace_dirty_message(owner, session_ids.clone()).await {
                 return api_error(StatusCode::CONFLICT, "dirty_worktree", msg);
             }
         }

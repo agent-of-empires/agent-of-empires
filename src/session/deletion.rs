@@ -79,9 +79,6 @@ pub struct PurgeTransaction {
     generation: u64,
     lifecycle_lock: Option<StorageFlock>,
     active: bool,
-    /// Paths other sessions work in, captured under the storage lock that
-    /// admits teardown.
-    paths_in_use: Vec<PathBuf>,
 }
 
 /// A purge whose durable row has already been removed. The same lifecycle
@@ -89,7 +86,6 @@ pub struct PurgeTransaction {
 #[must_use = "committed purge sidecars must be finished"]
 pub struct CommittedPurge {
     request: DeletionRequest,
-    paths_in_use: Vec<PathBuf>,
     _lifecycle_lock: StorageFlock,
 }
 
@@ -181,7 +177,6 @@ impl PurgeTransaction {
             generation,
             lifecycle_lock: Some(lifecycle_lock),
             active: true,
-            paths_in_use: Vec::new(),
         }))
     }
 
@@ -231,9 +226,7 @@ impl PurgeTransaction {
         let generation = self.generation;
         let was_trashed = self.was_trashed;
         let mut outcome = None;
-        let mut paths_in_use = Vec::new();
         self.storage.update(|instances, _groups| {
-            let others = other_sessions_paths(instances, &id);
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) else {
                 outcome = Some((CompletionGate::AlreadyGone, None));
                 return Ok(());
@@ -248,7 +241,6 @@ impl PurgeTransaction {
             } else if !owns {
                 CompletionGate::Superseded
             } else {
-                paths_in_use = others;
                 CompletionGate::Proceed
             };
             if !matches!(gate, CompletionGate::Proceed) {
@@ -259,10 +251,7 @@ impl PurgeTransaction {
             Ok(())
         })?;
         let outcome = outcome.ok_or_else(|| anyhow::anyhow!("purge gate produced no outcome"))?;
-        if matches!(outcome.0, CompletionGate::Proceed) {
-            paths_in_use.extend(other_profiles_paths(self.storage.profile(), &id));
-            self.paths_in_use = paths_in_use;
-        } else {
+        if !matches!(outcome.0, CompletionGate::Proceed) {
             self.active = false;
         }
         Ok(outcome)
@@ -313,7 +302,6 @@ impl PurgeTransaction {
         let generation = self.generation;
         let was_trashed = self.was_trashed;
         let mut commit = None;
-        let mut paths_in_use = Vec::new();
         if let Err(error) = self.storage.update(|instances, _groups| {
             let Some(index) = instances.iter().position(|instance| instance.id == id) else {
                 commit = Some((CompletionGate::AlreadyGone, None));
@@ -333,7 +321,6 @@ impl PurgeTransaction {
                 commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
             } else {
                 instances.remove(index);
-                paths_in_use = other_sessions_paths(instances, &id);
                 commit = Some((CompletionGate::Proceed, None));
             }
             Ok(())
@@ -358,9 +345,7 @@ impl PurgeTransaction {
         if !matches!(gate, CompletionGate::Proceed) {
             return Err(Box::new(self.result_for_gate(gate, retained)));
         }
-        paths_in_use.extend(other_profiles_paths(self.storage.profile(), &id));
         Ok(CommittedPurge {
-            paths_in_use,
             request: DeletionRequest {
                 session_id: self.request.session_id.clone(),
                 instance: self.request.instance.clone(),
@@ -408,8 +393,7 @@ impl PurgeTransaction {
         if !matches!(gate, CompletionGate::Proceed) {
             return self.result_for_gate(gate, retained);
         }
-        let mut result =
-            perform_deletion_teardown_lifecycle_locked(&self.request, &self.paths_in_use);
+        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request);
         if !result.success && !commit_on_teardown_failure {
             result.retained_instance = self.release_reservation().ok().flatten();
             result.disposition = DeletionDisposition::Failed;
@@ -500,8 +484,7 @@ impl CommittedPurge {
     /// Clean up resources while retaining the lifecycle flock that covered the
     /// irreversible durable-row removal.
     pub fn finish(self) -> DeletionResult {
-        let mut result =
-            perform_deletion_teardown_lifecycle_locked(&self.request, &self.paths_in_use);
+        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request);
         result.disposition = DeletionDisposition::Removed;
         result
     }
@@ -584,11 +567,11 @@ fn is_protected_default_branch(main_repo: &Path, branch: &str) -> bool {
         .is_ok_and(|names| names.contains(branch))
 }
 
-/// Every path a session other than `except_id` works in or will restore to.
-fn other_sessions_paths(instances: &[Instance], except_id: &str) -> Vec<PathBuf> {
+/// Every path a session outside `except_ids` works in or will restore to.
+fn other_sessions_paths(instances: &[Instance], except_ids: &[&str]) -> Vec<PathBuf> {
     instances
         .iter()
-        .filter(|instance| instance.id != except_id)
+        .filter(|instance| !except_ids.contains(&instance.id.as_str()))
         .flat_map(|instance| {
             std::iter::once(instance.project_path.as_str())
                 .chain(instance.pre_trash_project_path.as_deref())
@@ -603,30 +586,100 @@ fn other_sessions_paths(instances: &[Instance], except_id: &str) -> Vec<PathBuf>
         .collect()
 }
 
-/// [`other_sessions_paths`] across every profile but `profile`, read without
-/// their storage locks. An unreadable profile is skipped with a warning.
-fn other_profiles_paths(profile: &str, except_id: &str) -> Vec<PathBuf> {
-    let profiles = match crate::session::list_profiles() {
-        Ok(profiles) => profiles,
-        Err(error) => {
-            tracing::warn!(target: "session.delete", "listing profiles for shared worktrees failed: {error}");
-            return Vec::new();
+/// The paths sessions outside a deletion use, across every profile.
+pub(crate) enum PathsInUse {
+    Known(Vec<PathBuf>),
+    /// Some store could not be read, so every path must be assumed in use.
+    Unknown(String),
+}
+
+impl PathsInUse {
+    pub(crate) fn covers(&self, root: &Path) -> bool {
+        match self {
+            Self::Known(paths) => paths.iter().any(|path| path.starts_with(root)),
+            Self::Unknown(_) => true,
         }
-    };
-    profiles
+    }
+
+    fn reason(&self) -> String {
+        match self {
+            Self::Known(_) => "another session still uses it".to_string(),
+            Self::Unknown(reason) => format!("other sessions could not be checked ({reason})"),
+        }
+    }
+}
+
+fn all_profile_storages() -> std::result::Result<(Vec<String>, Vec<Storage>), String> {
+    let profiles =
+        crate::session::list_profiles().map_err(|error| format!("listing profiles: {error}"))?;
+    let storages = profiles
         .iter()
-        .filter(|other| other.as_str() != profile)
-        .flat_map(
-            |other| match Storage::open_unwatched(other).and_then(|storage| storage.load()) {
-                Ok(instances) => other_sessions_paths(&instances, except_id),
-                Err(error) => {
-                    tracing::warn!(target: "session.delete", profile = %other,
-                        "reading sessions for shared worktrees failed: {error}");
-                    Vec::new()
-                }
-            },
-        )
-        .collect()
+        .map(|profile| {
+            Storage::open_unwatched(profile)
+                .map_err(|error| format!("opening profile '{profile}': {error}"))
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    Ok((profiles, storages))
+}
+
+fn scan_paths_in_use(storages: &[Storage], except_ids: &[&str]) -> PathsInUse {
+    let mut paths = Vec::new();
+    for storage in storages {
+        match storage.load() {
+            Ok(instances) => paths.extend(other_sessions_paths(&instances, except_ids)),
+            Err(error) => {
+                return PathsInUse::Unknown(format!(
+                    "reading profile '{}': {error}",
+                    storage.profile()
+                ))
+            }
+        }
+    }
+    PathsInUse::Known(paths)
+}
+
+/// Unlocked snapshot of [`PathsInUse`], for a preflight that the teardown re-checks under lock.
+pub(crate) fn paths_in_use_except(except_ids: &[&str]) -> PathsInUse {
+    match all_profile_storages() {
+        Ok((_, storages)) => scan_paths_in_use(&storages, except_ids),
+        Err(reason) => PathsInUse::Unknown(reason),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_PATHS_IN_USE_SCAN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with the paths other sessions use while every profile's storage lock is held, so no
+/// session can adopt a path between the check and whatever `f` removes.
+fn with_paths_in_use_locked<R>(except_id: &str, f: impl FnOnce(&PathsInUse) -> R) -> R {
+    let (profiles, storages) = match all_profile_storages() {
+        Ok(found) => found,
+        Err(reason) => return f(&PathsInUse::Unknown(reason)),
+    };
+    let mut f = Some(f);
+    let locked = crate::session::storage::with_storages_locked(&storages, || {
+        let paths_in_use = match crate::session::list_profiles() {
+            Ok(now) if now.iter().all(|profile| profiles.contains(profile)) => {
+                scan_paths_in_use(&storages, &[except_id])
+            }
+            Ok(_) => PathsInUse::Unknown("a profile was created during the deletion".to_string()),
+            Err(error) => PathsInUse::Unknown(format!("listing profiles: {error}")),
+        };
+        #[cfg(test)]
+        if let Some(hook) = AFTER_PATHS_IN_USE_SCAN.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
+        f.take().expect("called once")(&paths_in_use)
+    });
+    match locked {
+        Ok(result) => result,
+        Err(error) => f.take().expect("called once")(&PathsInUse::Unknown(format!(
+            "locking session stores: {error}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -637,11 +690,8 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     })
 }
 
-fn perform_deletion_teardown_lifecycle_locked(
-    request: &DeletionRequest,
-    paths_in_use: &[PathBuf],
-) -> DeletionResult {
-    perform_deletion_core(request, true, paths_in_use, |session_id| {
+fn perform_deletion_teardown_lifecycle_locked(request: &DeletionRequest) -> DeletionResult {
+    perform_deletion_core(request, true, |session_id| {
         DockerContainer::from_session_id(session_id).teardown(session_id)
     })
 }
@@ -653,13 +703,13 @@ fn perform_deletion_with(
     request: &DeletionRequest,
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
 ) -> DeletionResult {
-    perform_deletion_core(request, false, &[], teardown)
+    perform_deletion_core(request, false, teardown)
 }
 
+/// `lifecycle_locked` is the production path, which also keeps any worktree another session uses.
 fn perform_deletion_core(
     request: &DeletionRequest,
     lifecycle_locked: bool,
-    paths_in_use: &[PathBuf],
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
 ) -> DeletionResult {
     let mut errors = Vec::new();
@@ -722,38 +772,29 @@ fn perform_deletion_core(
         &[]
     };
 
-    let preserved_worktree_paths =
-        stage_collect_preserved_worktrees(request, repos, paths_in_use, &mut errors, &mut messages);
-    // Any preserved worktree, dirty or default-branch, blocks the in-container preclean (a
-    // recursive `find. -delete` that would reach through and destroy the contents we just decided
-    // to keep) and the host workspace-dir removal alike: with a worktree preserved under it the
-    // directory is not ours to remove, so we skip it rather than surface a spurious failure.
-    let any_preserved = !preserved_worktree_paths.is_empty();
-
-    if request.delete_worktree && is_sandboxed && !any_preserved {
-        tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "sandbox_worktree_preclean", "perform_deletion: stage");
-        let _ = crate::git::cleanup::cleanup_sandbox_worktree(&request.instance);
-    }
-
-    // Stage 3: container removal.
-    let mut container_gone = false;
-    if request.delete_sandbox && is_sandboxed {
-        tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "container_remove", "perform_deletion: stage");
-        let outcome = teardown(&request.instance.id);
-        // A failed teardown can leave the container live with the store still bind mounted, so the
-        // store may only go once the container is provably gone.
-        container_gone = !matches!(outcome, crate::containers::Teardown::Failed(_));
-        deletion_messages_for(outcome, &mut messages, &mut errors);
-    }
-
-    stage_remove_worktrees_and_branches(
-        request,
-        repos,
-        &preserved_worktree_paths,
-        any_preserved,
-        &mut errors,
-        &mut messages,
-    );
+    let removes_managed_worktree = request.delete_worktree
+        && (request
+            .instance
+            .worktree_info
+            .as_ref()
+            .is_some_and(|wt| wt.managed_by_aoe)
+            || request.instance.workspace_info.is_some());
+    let stage = |paths_in_use: &PathsInUse| {
+        stage_teardown_worktrees(
+            request,
+            repos,
+            is_sandboxed,
+            paths_in_use,
+            teardown,
+            &mut errors,
+            &mut messages,
+        )
+    };
+    let container_gone = if lifecycle_locked && removes_managed_worktree {
+        with_paths_in_use_locked(&request.session_id, stage)
+    } else {
+        stage(&PathsInUse::Known(Vec::new()))
+    };
 
     stage_cleanup_scratch(request, &mut errors, &mut messages);
 
@@ -790,10 +831,57 @@ fn perform_deletion_core(
     }
 }
 
+/// Container and worktree teardown, which destroys checkout contents and so must run inside the
+/// same [`PathsInUse`] check that decides what to keep. Returns whether the container is gone.
+fn stage_teardown_worktrees(
+    request: &DeletionRequest,
+    repos: &[super::WorkspaceRepo],
+    is_sandboxed: bool,
+    paths_in_use: &PathsInUse,
+    teardown: impl FnOnce(&str) -> crate::containers::Teardown,
+    errors: &mut Vec<String>,
+    messages: &mut Vec<String>,
+) -> bool {
+    let preserved_worktree_paths =
+        stage_collect_preserved_worktrees(request, repos, paths_in_use, errors, messages);
+    // Any preserved worktree, dirty or default-branch, blocks the in-container preclean (a
+    // recursive `find. -delete` that would reach through and destroy the contents we just decided
+    // to keep) and the host workspace-dir removal alike: with a worktree preserved under it the
+    // directory is not ours to remove, so we skip it rather than surface a spurious failure.
+    let any_preserved = !preserved_worktree_paths.is_empty();
+
+    if request.delete_worktree && is_sandboxed && !any_preserved {
+        tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "sandbox_worktree_preclean", "perform_deletion: stage");
+        let _ = crate::git::cleanup::cleanup_sandbox_worktree(&request.instance);
+    }
+
+    // Stage 3: container removal.
+    let mut container_gone = false;
+    if request.delete_sandbox && is_sandboxed {
+        tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "container_remove", "perform_deletion: stage");
+        let outcome = teardown(&request.instance.id);
+        // A failed teardown can leave the container live with the store still bind mounted, so the
+        // store may only go once the container is provably gone.
+        container_gone = !matches!(outcome, crate::containers::Teardown::Failed(_));
+        deletion_messages_for(outcome, messages, errors);
+    }
+
+    stage_remove_worktrees_and_branches(
+        request,
+        repos,
+        &preserved_worktree_paths,
+        any_preserved,
+        errors,
+        messages,
+    );
+
+    container_gone
+}
+
 fn stage_collect_preserved_worktrees(
     request: &DeletionRequest,
     repos: &[super::WorkspaceRepo],
-    paths_in_use: &[PathBuf],
+    paths_in_use: &PathsInUse,
     errors: &mut Vec<String>,
     messages: &mut Vec<String>,
 ) -> std::collections::HashSet<PathBuf> {
@@ -838,11 +926,12 @@ fn stage_collect_preserved_worktrees(
         }
     }
 
-    // A worktree another session still works in is kept, and so its branch, whichever sessions
-    // the caller named. Checked before the dirty gate so a kept worktree cannot fail the deletion.
+    // A worktree another session still works in, or may, is kept, and so its branch, whichever
+    // sessions the caller named. Checked before the dirty gate so a kept worktree cannot fail the
+    // deletion.
     if request.delete_worktree {
-        let in_use = |root: &Path| paths_in_use.iter().any(|path| path.starts_with(root));
-        let still_used = "another session still uses it";
+        let in_use = |root: &Path| paths_in_use.covers(root);
+        let still_used = paths_in_use.reason();
         if let Some(wt_info) = &request.instance.worktree_info {
             let path = PathBuf::from(&request.instance.project_path);
             if wt_info.managed_by_aoe && !preserved_worktree_paths.contains(&path) && in_use(&path)
@@ -1527,6 +1616,107 @@ mod tests {
         assert!(acquired, "on_destroy hook held the lifecycle flock");
         assert_eq!(result.disposition, DeletionDisposition::Removed);
         assert!(storage.load().unwrap().is_empty());
+    }
+
+    /// #4107: a purge keeps a shared worktree when another profile cannot be read, and a session
+    /// adopting the worktree after the ownership scan cannot see it removed.
+    #[test]
+    #[serial]
+    fn purge_keeps_a_worktree_it_cannot_prove_unused() {
+        for adopt_after_scan in [false, true] {
+            let (tmp, main_repo, worktree, mut owner) = worktree_fixture("feature/shared");
+            let _home = isolate_app_dir_at(&tmp.path().join("home"));
+            let storage = Storage::new_unwatched("owner").unwrap();
+            owner.source_profile = "owner".to_string();
+            storage
+                .update(|instances, _groups| {
+                    instances.push(owner.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let other = Storage::new_unwatched("other").unwrap();
+            other.update(|_, _| Ok(())).unwrap();
+            let adopter = Instance::new("adopter", worktree.to_str().unwrap());
+
+            let writer = if adopt_after_scan {
+                let (event_tx, event_rx) = std::sync::mpsc::channel();
+                let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+                let worktree = worktree.clone();
+                AFTER_PATHS_IN_USE_SCAN.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        writer_tx
+                            .send(std::thread::spawn(move || {
+                                let _observer =
+                                    crate::session::storage::observe_lock_contention_for_test(
+                                        event_tx.clone(),
+                                    );
+                                let mut present = false;
+                                other
+                                    .update(|instances, _groups| {
+                                        present = worktree.exists();
+                                        instances.push(adopter);
+                                        Ok(())
+                                    })
+                                    .unwrap();
+                                let _ = event_tx.send(PathBuf::new());
+                                present
+                            }))
+                            .unwrap();
+                        // Resume once the adoption either committed or is blocked on its lock.
+                        event_rx.recv().unwrap();
+                    }));
+                });
+                Some(writer_rx)
+            } else {
+                other
+                    .update(|instances, _groups| {
+                        instances.push(adopter);
+                        Ok(())
+                    })
+                    .unwrap();
+                std::fs::write(other.sessions_path(), "not json").unwrap();
+                None
+            };
+
+            let transaction = match PurgeTransaction::reserve(
+                storage,
+                DeletionRequest {
+                    delete_worktree: true,
+                    delete_branch: true,
+                    ..request(owner)
+                },
+            )
+            .unwrap()
+            {
+                PurgeReservation::Reserved(transaction) => transaction,
+                PurgeReservation::Rejected(_) => panic!("purge reservation was refused"),
+            };
+            let result = transaction.complete();
+            assert_eq!(result.disposition, DeletionDisposition::Removed);
+
+            if let Some(writer) = writer {
+                let adopted_while_present = writer.recv().unwrap().join().unwrap();
+                assert!(
+                    !adopted_while_present || worktree.exists(),
+                    "a worktree adopted after the scan was removed"
+                );
+            } else {
+                assert!(result.success, "{:?}", result.errors);
+                assert!(
+                    result
+                        .messages
+                        .iter()
+                        .any(|m| m.contains("could not be checked")),
+                    "{:?}",
+                    result.messages
+                );
+                assert!(
+                    worktree.exists(),
+                    "worktree removed despite unreadable profile"
+                );
+                assert!(branch_exists(&main_repo, "feature/shared"));
+            }
+        }
     }
 
     #[test]

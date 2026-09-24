@@ -3598,7 +3598,8 @@ async fn list_sessions_applies_project_smart_rename_override_to_worktree_session
 
 /// #4084 review: deleting one session of a shared managed worktree, through
 /// either delete endpoint, removes that record but keeps the worktree and
-/// branch a surviving session still works in.
+/// branch a surviving session still works in. A dirty worktree kept this way
+/// does not block the delete (#4108); one nothing keeps still does.
 #[tokio::test]
 #[serial_test::serial]
 async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
@@ -3614,7 +3615,13 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
         assert!(out.status.success(), "git {args:?}: {out:?}");
     }
 
-    for workspace_endpoint in [false, true] {
+    // (workspace endpoint, dirty, survivor also selected)
+    for (workspace_endpoint, dirty, both_selected) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, true, true),
+    ] {
         let tmp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
         let main_repo = tmp.path().join("main");
@@ -3649,12 +3656,19 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
             owner.clone(),
             survivor.clone(),
         ]);
+        if dirty {
+            std::fs::write(checkout.join("wip.txt"), "unsaved").unwrap();
+        }
+        let mut session_ids = vec![owner.id.clone()];
+        if both_selected {
+            session_ids.push(survivor.id.clone());
+        }
 
         let resp = if workspace_endpoint {
             delete_workspace(
                 State(state.clone()),
                 Some(Json(DeleteWorkspaceBody {
-                    session_ids: vec![owner.id.clone()],
+                    session_ids,
                     delete_worktree: true,
                     delete_branch: true,
                     ..Default::default()
@@ -3675,13 +3689,17 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
             .await
             .into_response()
         };
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "endpoint {workspace_endpoint}"
-        );
+        let status = resp.status();
         let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let case = format!("endpoint {workspace_endpoint}, dirty {dirty}: {body}");
+        if both_selected {
+            assert_eq!(status, StatusCode::CONFLICT, "{case}");
+            assert_eq!(body["error"], "dirty_worktree", "{case}");
+            assert_eq!(storage.load().unwrap().len(), 2, "{case}");
+            continue;
+        }
+        assert_eq!(status, StatusCode::OK, "{case}");
         assert!(
             body["messages"].to_string().contains("another session"),
             "the kept worktree must be reported: {body}"
@@ -3689,8 +3707,9 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
 
         assert!(
             checkout.join(".git").exists(),
-            "shared worktree was removed"
+            "shared worktree was removed: {case}"
         );
+        assert_eq!(checkout.join("wip.txt").exists(), dirty, "{case}");
         let branches = std::process::Command::new("git")
             .args(["branch", "--list", "feat"])
             .current_dir(&main_repo)
