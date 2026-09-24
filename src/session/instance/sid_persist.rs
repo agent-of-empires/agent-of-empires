@@ -638,6 +638,137 @@ mod tests {
         assert_eq!(disk_sid(profile, &claimant.id), None);
         assert_eq!(disk_sid(profile, &owner.id).as_deref(), Some(sid));
     }
+    #[test]
+    #[serial]
+    fn pi_ownership_is_stable_before_and_after_transcript_publication() {
+        use crate::session::instance::{ActiveExecution, CaptureContext, SessionSidecarSource};
+        use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
+
+        let sid = VALID_SID;
+        let launch = "22222222-3333-4333-8444-555555555555";
+
+        for (case, publish_transcript) in [("id-only", false), ("with-transcript", true)] {
+            let (_hooks, _base, _hooks_tmp) = crate::hooks::test_support::BaseGuard::ready();
+            let profile = format!("sid-pi-{case}");
+            let root = tempdir().unwrap();
+            let root = root.path().to_path_buf();
+            let transcript_parent = root.join("sessions/project");
+            let transcript =
+                transcript_parent.join(format!("2026-01-01T00-00-00-000Z_{sid}.jsonl"));
+            std::fs::create_dir_all(&transcript_parent).unwrap();
+            std::fs::write(
+                &transcript,
+                format!("{}\n", serde_json::json!({"type": "session", "id": sid})),
+            )
+            .unwrap();
+            let binding = ExecutionBinding {
+                agent: "pi".into(),
+                stores: vec![root.clone()],
+                configuration: Vec::new(),
+                cwd: root.clone(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            };
+            let owner_binding = ConversationBinding {
+                session_id: sid.into(),
+                execution: Some(ExecutionBinding {
+                    stores: vec![transcript_parent.clone()],
+                    ..binding.clone()
+                }),
+                provenance: ConversationProvenance::Observed,
+                transcript_path: Some(transcript.clone()),
+            };
+            let mut owner = make_inst(&profile, "owner");
+            owner.set_agent_conversation(Some(sid.into()), Some(owner_binding), None);
+            let mut claimant = make_inst(&profile, "claimant");
+            let sidecar_source = SessionSidecarSource::host_hooks(&claimant.id);
+            claimant.active_execution = Some(ActiveExecution {
+                launch_id: launch.into(),
+                binding: binding.clone(),
+                capture: Some(CaptureContext::Pi {
+                    source: sidecar_source.clone(),
+                    root: root.clone(),
+                }),
+                container: None,
+            });
+            let (_temp, _home, storage) = seeded(&profile, &[&owner, &claimant]);
+            crate::hooks::write_session_id_via_guard(&claimant.id, sid, Some(launch)).unwrap();
+            if publish_transcript {
+                let sidecar = crate::hooks::ensure_instance_dir_path(&claimant.id).unwrap();
+                std::fs::write(
+                    sidecar.join(format!("session_path.{launch}")),
+                    transcript.to_string_lossy().as_bytes(),
+                )
+                .unwrap();
+            }
+            let observed = crate::session::capture::read_pi_session_observation(
+                &claimant.id,
+                &sidecar_source,
+                claimant.active_execution.as_ref(),
+                false,
+            )
+            .expect("the Pi sidecar publishes a valid observation");
+            if !publish_transcript {
+                assert!(observed.conversation_key().is_none());
+                assert!(observed.conversation_binding().is_none());
+            }
+            assert_eq!(
+                persist_session_with_storage(
+                    &storage,
+                    &claimant.id,
+                    &observed,
+                    &claimant.conversation_state(),
+                ),
+                SidWrite::Skipped,
+                "{case} must not change the one-owner decision"
+            );
+            assert_eq!(disk_sid(&profile, &owner.id).as_deref(), Some(sid));
+            assert_eq!(disk_sid(&profile, &claimant.id), None);
+        }
+
+        let (_hooks, _base, _hooks_tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let profile = "sid-pi-unclaimed";
+        let root = tempdir().unwrap();
+        let root = root.path().to_path_buf();
+        let binding = ExecutionBinding {
+            agent: "pi".into(),
+            stores: vec![root.clone()],
+            configuration: Vec::new(),
+            cwd: root.clone(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        let mut claimant = make_inst(profile, "claimant");
+        let sidecar_source = SessionSidecarSource::host_hooks(&claimant.id);
+        claimant.active_execution = Some(ActiveExecution {
+            launch_id: launch.into(),
+            binding: binding.clone(),
+            capture: Some(CaptureContext::Pi {
+                source: sidecar_source.clone(),
+                root: root.clone(),
+            }),
+            container: None,
+        });
+        let (_temp, _home, storage) = seeded(profile, &[&claimant]);
+        crate::hooks::write_session_id_via_guard(&claimant.id, sid, Some(launch)).unwrap();
+        let observed = crate::session::capture::read_pi_session_observation(
+            &claimant.id,
+            &sidecar_source,
+            claimant.active_execution.as_ref(),
+            false,
+        )
+        .expect("the unclaimed Pi ID is capturable before publication");
+        assert_eq!(
+            persist_session_with_storage(
+                &storage,
+                &claimant.id,
+                &observed,
+                &claimant.conversation_state(),
+            ),
+            SidWrite::Applied,
+            "an unclaimed ID remains capturable before publication"
+        );
+    }
 
     #[test]
     #[serial]

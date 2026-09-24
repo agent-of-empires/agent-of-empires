@@ -2111,9 +2111,7 @@ impl Instance {
         self.pi_session_path = pi_session_path.filter(|_| sid.is_some());
         self.agent_session_id = sid;
     }
-    /// The binding an observation is allowed to establish for this instance.
-    ///
-    /// An observation without launch evidence cannot qualify a conversation, so
+    /// An observation without a qualified source cannot qualify a conversation, so
     /// it may refresh the published id and transcript path but must keep the
     /// binding an earlier qualified publication established.
     pub(super) fn observed_binding(
