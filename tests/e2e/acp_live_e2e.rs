@@ -365,6 +365,8 @@ fn asserted_claude_store_harness(name: &str) -> (TuiTestHarness, PathBuf, PathBu
         "{}",
         String::from_utf8_lossy(&pin.stderr)
     );
+    // Stores are recorded canonically; macOS `/tmp` resolves to `/private/tmp`.
+    let selected = selected.canonicalize().unwrap();
 
     let sessions_path = app_dir_in(h.home_path()).join("profiles/default/sessions.json");
     let rows: serde_json::Value =
