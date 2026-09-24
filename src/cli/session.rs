@@ -1157,8 +1157,16 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     let mut failed: Vec<(String, String)> = Vec::new();
     let mut fresh_after_failed_resume: Vec<(String, String)> = Vec::new();
     let mut restarted: Vec<crate::session::Instance> = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
     while let Some(joined) = join_set.join_next().await {
         let (title, inst_opt, result) = joined.expect("JoinSet shouldn't panic on join itself");
+        // Archived or trashed after selection: the launch refused before touching anything.
+        if let Err(e) = &result {
+            if let Some(blocked) = e.downcast_ref::<crate::session::StartBlocked>() {
+                skipped.push((title, blocked.to_string()));
+                continue;
+            }
+        }
         let id = inst_opt.as_ref().map(|i| i.id.clone()).unwrap_or_default();
         if let Some(inst) = inst_opt {
             restarted.push(inst);
@@ -1217,6 +1225,12 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
         );
         for (_, title) in &orphaned {
             println!("  · {}", title);
+        }
+    }
+    if !skipped.is_empty() {
+        println!("⏭ {} skipped:", skipped.len());
+        for (title, reason) in &skipped {
+            println!("  · {}: {}", title, reason);
         }
     }
     if !failed.is_empty() {

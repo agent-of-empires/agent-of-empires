@@ -473,15 +473,22 @@ impl SessionService {
             let id_clone = id.to_string();
             let outcome = tokio::task::spawn_blocking(move || {
                 storage.update(|instances, _groups| {
-                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                        apply_prompt_persist_to_disk(inst, wake);
+                    let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
+                        return Ok(None);
+                    };
+                    // A peer (e.g. the CLI) may have archived or trashed the row since the
+                    // memory check; waking it here would clear that.
+                    if let Err(blocked) = inst.ensure_startable() {
+                        return Ok(Some(blocked));
                     }
-                    Ok(())
+                    apply_prompt_persist_to_disk(inst, wake);
+                    Ok(None)
                 })
             })
             .await;
             match outcome {
-                Ok(Ok(())) => {}
+                Ok(Ok(None)) => {}
+                Ok(Ok(Some(blocked))) => return PromptTouch::Blocked(blocked),
                 Ok(Err(e)) => tracing::warn!(
                     target: "server.session_service",
                     session = %id,
