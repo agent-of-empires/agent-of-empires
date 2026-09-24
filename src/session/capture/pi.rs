@@ -282,20 +282,22 @@ mod tests {
         )
         .unwrap();
         std::fs::write(sidecar.join("session_path"), current_file.to_str().unwrap()).unwrap();
+        let canonical_root = tmp.path().canonicalize().unwrap();
+        let canonical_file = current_file.canonicalize().unwrap();
         let observation = poll().expect("the matching transcript becomes available later");
         assert_eq!(observation.sid, current);
         assert_eq!(
             observation.pi_session_path.as_deref(),
-            current_file.to_str()
+            canonical_file.to_str()
         );
 
         let launch = "22222222-3333-4333-8444-555555555555";
         let source = crate::session::instance::SessionSidecarSource::host_hooks(&inst.id);
         let binding = crate::session::ExecutionBinding {
             agent: "pi".into(),
-            stores: vec![tmp.path().join("store")],
+            stores: vec![canonical_root.join("store")],
             configuration: Vec::new(),
-            cwd: tmp.path().to_path_buf(),
+            cwd: canonical_root.clone(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
         };
@@ -304,7 +306,7 @@ mod tests {
             binding: binding.clone(),
             capture: Some(crate::session::instance::CaptureContext::Pi {
                 source: source.clone(),
-                root: tmp.path().to_path_buf(),
+                root: canonical_root.clone(),
             }),
             container: None,
         };
@@ -321,12 +323,9 @@ mod tests {
         let observation = scoped().expect("the active launch publishes its path later");
         assert_eq!(
             observation.transcript_path.as_deref(),
-            Some(current_file.as_path())
+            Some(canonical_file.as_path())
         );
-        assert_eq!(
-            observation.source.unwrap().stores,
-            vec![tmp.path().to_path_buf()]
-        );
+        assert_eq!(observation.source.unwrap().stores, vec![canonical_root]);
 
         let outside = tempfile::tempdir().unwrap();
         let foreign = outside
