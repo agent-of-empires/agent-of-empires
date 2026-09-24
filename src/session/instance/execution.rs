@@ -1208,19 +1208,39 @@ impl Instance {
                             .and_then(|(_, binding, _)| binding)
                             .filter(|binding| binding.is_known())
                             .and_then(|binding| binding.execution.as_ref())
-                            .and_then(|execution| execution.stores.first())
-                            .cloned()
+                            .filter(|execution| !execution.stores.is_empty())
                     })
                     .flatten();
+                let exported = value("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty());
+                // Only an implicit default store leaves `CLAUDE_CONFIG_DIR` unset (#4119). A
+                // recorded store is explicit when its binding lists the exported config or the
+                // environment still names it.
+                let explicit = match recorded {
+                    Some(execution) => {
+                        !execution.configuration.is_empty()
+                            || exported.as_ref().is_some_and(|dir| {
+                                inputs.canonical_path(&absolute(PathBuf::from(dir))).ok().as_ref()
+                                    == Some(&execution.stores[0])
+                            })
+                    }
+                    None => {
+                        declared.as_ref().is_some_and(|declared| {
+                            *declared != crate::git::template::lexical_normalize(&home.join(".claude"))
+                        }) || exported.is_some()
+                    }
+                };
                 let root = absolute(recorded
+                    .map(|execution| execution.stores[0].clone())
                     .or_else(|| declared.clone())
-                    .or_else(|| value("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()).map(PathBuf::from))
+                    .or_else(|| exported.map(PathBuf::from))
                     .unwrap_or_else(|| home.join(".claude")));
                 let pinned = root.to_str().context("native store is not UTF-8")?.to_owned();
-                // Unset rather than export the default store, which Claude reads with `~/.claude.json` (#4119).
                 let export = inputs.container.is_some()
-                    || value("CLAUDE_CONFIG_DIR").is_some_and(|value| !value.is_empty())
+                    || explicit
                     || !crate::session::capture::is_default_claude_store(&root, &home);
+                if export && inputs.container.is_none() {
+                    configuration.extend(crate::session::capture::exported_default_claude_config(&root, &home));
+                }
                 routing.push(("CLAUDE_CONFIG_DIR".into(), export.then_some(pinned)));
                 vec![root]
             }
@@ -2217,6 +2237,20 @@ impl Instance {
             *primary = crate::session::capture::canonicalize_or_raw(
                 store.to_str().context("store path must be UTF-8")?,
             );
+            // An explicit store is exported even when it aliases the default.
+            let home = super::hooks::host_home(&self.resolved_host_environment())
+                .context("native HOME is unavailable")?;
+            execution.configuration =
+                crate::session::capture::exported_default_claude_config(primary, &home)
+                    .and_then(|file| {
+                        crate::session::capture::canonicalize_allowing_missing_leaf(&file)
+                    })
+                    .map(|path| ExecutionLocation {
+                        filesystem: "host".into(),
+                        path,
+                    })
+                    .into_iter()
+                    .collect();
         }
         Ok(ConversationBinding {
             session_id: sid.into(),

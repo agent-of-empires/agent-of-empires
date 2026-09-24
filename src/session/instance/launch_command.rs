@@ -1508,10 +1508,101 @@ mod tests {
                 "{command}"
             );
 
-            // Resuming a conversation recorded in the default store keeps it unset.
-            inst.resume_binding = Some(inst.asserted_resume_binding(sid, None).unwrap());
+            // Resuming a conversation recorded in the default store keeps it unset, also from
+            // a binding recorded before configuration listed an exported default store.
+            let mut asserted = inst.asserted_resume_binding(sid, None).unwrap();
+            inst.resume_binding = Some(asserted.clone());
             inst.resume_intent = ResumeIntent::Use(sid.into());
             assert_eq!(routed(&inst).0, expected, "exported={exported:?}");
+            asserted.execution.as_mut().unwrap().configuration.clear();
+            inst.resume_binding = Some(asserted);
+            assert_eq!(routed(&inst).0, expected, "legacy exported={exported:?}");
+        }
+    }
+
+    /// A store explicitly selected through a symlinked `~/.claude` is still exported, and the
+    /// selection survives capture; only the implicit default stays unset.
+    #[test]
+    #[serial_test::serial]
+    fn explicit_alias_of_the_default_claude_store_stays_exported() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let work = temp.path().join("profiles/work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::os::unix::fs::symlink(&work, temp.path().join(".claude")).unwrap();
+        let work = work.canonicalize().unwrap();
+        let declare = |profile: &str, dir: &str| {
+            let path =
+                crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                format!("[session.agent_config_dir]\nclaude = {dir:?}\n"),
+            )
+            .unwrap();
+        };
+        declare("alias", work.to_str().unwrap());
+        declare("literal", "~/.claude");
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let routed = |inst: &Instance| {
+            let execution = inst
+                .resolve_native_execution(inst.conversation_target())
+                .unwrap();
+            let routed = execution
+                .routing
+                .iter()
+                .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                .and_then(|(_, value)| value.clone())
+                .map(std::path::PathBuf::from);
+            (routed, execution.binding)
+        };
+        let capture = |inst: &mut Instance, binding| {
+            inst.resume_binding = None;
+            inst.resume_intent = ResumeIntent::Default;
+            inst.set_agent_conversation(
+                Some(sid.into()),
+                Some(crate::session::ConversationBinding {
+                    session_id: sid.into(),
+                    execution: Some(binding),
+                    provenance: crate::session::ConversationProvenance::Observed,
+                    transcript_path: None,
+                }),
+                None,
+            );
+        };
+
+        for (profile, store, expected) in [
+            ("undeclared", None, None),
+            ("literal", None, None),
+            ("alias", None, Some(&work)),
+            ("undeclared", Some(&work), Some(&work)),
+        ] {
+            let mut inst = Instance::new("claude-alias-store", "/tmp");
+            inst.source_profile = profile.into();
+            if let Some(store) = store {
+                inst.resume_binding = Some(inst.asserted_resume_binding(sid, Some(store)).unwrap());
+                inst.resume_intent = ResumeIntent::Use(sid.into());
+            }
+            let (launched, binding) = routed(&inst);
+            assert_eq!(
+                launched.as_ref(),
+                expected,
+                "profile={profile} store={store:?}"
+            );
+            // The next launch resumes from the binding this launch's capture records.
+            capture(&mut inst, binding);
+            inst.source_profile = "undeclared".into();
+            assert_eq!(
+                routed(&inst).0.as_ref(),
+                expected,
+                "profile={profile} store={store:?}"
+            );
         }
     }
 

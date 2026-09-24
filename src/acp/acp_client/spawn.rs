@@ -60,7 +60,7 @@ pub struct SpawnConfig {
     pub wrapper_substitution: Option<(String, String)>,
     /// Lifecycle epoch stamped on the runner's registry record.
     pub generation: u64,
-    pub claude_store_pin: Option<PathBuf>,
+    pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
 }
 
 /// Request-sourced keys may not redirect infrastructure the operator env
@@ -75,6 +75,8 @@ pub(super) fn provider_env_denyreason(key: &str) -> Option<&'static str> {
         Some("infrastructure key, controlled by operator env")
     } else if key.starts_with("LD_") || key.starts_with("DYLD_") {
         Some("dynamic linker hook, would alter child binary load")
+    } else if key == "CLAUDE_CONFIG_DIR" {
+        Some("Claude store routing, pinned from the session's conversation")
     } else {
         None
     }
@@ -279,20 +281,32 @@ pub(super) fn native_store_snapshot(
             .filter(|value| !value.is_empty())
     };
     let cwd = crate::session::capture::canonicalize_allowing_missing_leaf(&config.cwd)?;
-    let root = value("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| value("HOME").map(|home| PathBuf::from(home).join(".claude")))?;
+    let exported = value("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+    let home = value("HOME").map(PathBuf::from);
+    let root = exported
+        .clone()
+        .or_else(|| home.as_ref().map(|home| home.join(".claude")))?;
     let root = if root.is_absolute() {
         root
     } else {
         cwd.join(root)
     };
+    let configuration = home
+        .filter(|_| exported.is_some())
+        .and_then(|home| crate::session::capture::exported_default_claude_config(&root, &home))
+        .and_then(|file| crate::session::capture::canonicalize_allowing_missing_leaf(&file))
+        .map(|path| crate::session::ExecutionLocation {
+            filesystem: "host".into(),
+            path,
+        })
+        .into_iter()
+        .collect();
     Some(crate::session::ExecutionBinding {
         agent: "claude".into(),
         stores: vec![crate::session::capture::canonicalize_allowing_missing_leaf(
             &root,
         )?],
-        configuration: Vec::new(),
+        configuration,
         cwd,
         filesystem: "host".into(),
         cwd_filesystem: "host".into(),
@@ -450,6 +464,35 @@ mod tests {
         }
     }
 
+    /// The worker's handoff binding records an exported default store the way the
+    /// terminal launch does, so an explicit selection keeps matching across surfaces.
+    #[test]
+    fn claude_snapshot_records_only_an_exported_default_store() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let config = env_test_spawn_config(home.clone());
+        let command = std::process::Command::new("true");
+        let default = home.join(".claude");
+        let custom = home.join("custom");
+        for (exported, expected) in [
+            (None, vec![]),
+            (Some(&default), vec![default.join(".claude.json")]),
+            (Some(&custom), vec![]),
+        ] {
+            let mut overrides = vec![("HOME".to_string(), home.display().to_string())];
+            overrides.extend(
+                exported.map(|dir| ("CLAUDE_CONFIG_DIR".to_string(), dir.display().to_string())),
+            );
+            let snapshot = native_store_snapshot(&config, &command, &overrides).unwrap();
+            let configuration: Vec<_> = snapshot
+                .configuration
+                .into_iter()
+                .map(|location| location.path)
+                .collect();
+            assert_eq!(configuration, expected, "exported={exported:?}");
+        }
+    }
+
     #[test]
     fn env_deny_policies() {
         for (key, provider_denied, host_denied) in [
@@ -466,6 +509,7 @@ mod tests {
             ("MY_CUSTOM_VAR", false, false),
             ("XDG_CONFIG_HOME", false, false),
             ("CODEX_HOME", false, false),
+            ("CLAUDE_CONFIG_DIR", true, false),
             ("1BAD", false, true),
             ("HAS-DASH", false, true),
         ] {
