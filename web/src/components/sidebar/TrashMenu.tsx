@@ -1,6 +1,6 @@
 import { useCallback, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { RotateCcw, Trash2, X } from "lucide-react";
+import { ArrowUpRight, RotateCcw, Trash2, X } from "lucide-react";
 import type { Workspace } from "../../lib/types";
 import { isSessionActive } from "../../lib/session";
 import { useIdleDecayWindowMs } from "../../lib/idleDecay";
@@ -179,7 +179,11 @@ export function TrashMenu({
         )}
       {open && menu && (
         <ContextMenu menu={menu} menuRef={menuRef} testId="sidebar-trash-context-menu">
-          <MenuItem onClick={fromMenu(openWorkspace)} testId="sidebar-trash-context-menu-open">
+          <MenuItem
+            onClick={fromMenu(openWorkspace)}
+            testId="sidebar-trash-context-menu-open"
+            icon={<ArrowUpRight className="h-3.5 w-3.5 shrink-0" />}
+          >
             Open
           </MenuItem>
           {!readOnly && (

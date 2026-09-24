@@ -17,6 +17,21 @@ test.use({ viewport: { width: 1280, height: 720 } });
 test.describe("Session trash flow", () => {
   const SESSION = { id: "sess-trash", title: "story-trash", projectPath: "/tmp/story", groupPath: "/tmp" };
 
+  // #4116: right-clicking a trashed row offers Restore.
+  test("right-click Restore on a trashed row brings it back", async ({ page }) => {
+    const handle = await installTrashMocks(page, [{ ...SESSION, trashed: true }]);
+    await page.goto("/");
+    await openTrash(page);
+
+    await trashRows(page).filter({ hasText: "story-trash" }).click({ button: "right" });
+    const menu = page.locator('[data-testid="sidebar-trash-context-menu"]');
+    await expect(menu.locator("button")).toHaveText(["Open", "Restore", "Delete permanently"]);
+    await menu.locator('[data-testid="sidebar-trash-context-menu-restore"]').click();
+    await expect.poll(() => handle.restoredIds, { timeout: 10_000 }).toEqual(["sess-trash"]);
+    await expect(trashToggle(page)).toHaveCount(0, { timeout: 10_000 });
+    await expect(sessionRows(page).filter({ hasText: "story-trash" })).toBeVisible({ timeout: 10_000 });
+  });
+
   test("Delete on a long-named trashed row opens a usable permanent-delete dialog", async ({ page }) => {
     const title = `story-trash-${"x".repeat(240)}`;
     const handle = await installTrashMocks(page, [{ ...SESSION, title, trashed: true }]);
