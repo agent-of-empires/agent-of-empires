@@ -151,8 +151,9 @@ test.describe("scratch sessions", () => {
 
     const wizard = page.locator('[data-testid="session-wizard"]');
     await expect(wizard).toBeVisible({ timeout: 10_000 });
-    await expect(wizard.getByRole("button", { name: /Launch session/ })).toBeVisible({ timeout: 10_000 });
     await expect(wizard.getByText("Scratch session")).toBeVisible();
+    // Launch and its shortcut stay disabled until the profile defaults settle.
+    await expect(wizard.getByRole("button", { name: /Launch session/ })).toBeEnabled({ timeout: 10_000 });
     await page.keyboard.press("ControlOrMeta+Enter");
     await expectOneScratchSession(serve);
   });
