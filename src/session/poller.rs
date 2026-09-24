@@ -640,6 +640,19 @@ impl SessionPoller {
         self.pending_observation.clone()
     }
 
+    /// Inspect the sticky mailbox without cloning its pending observation.
+    pub(crate) fn pending_observation_matches(
+        &mut self,
+        predicate: impl FnOnce(&SessionIdObservation) -> bool,
+    ) -> bool {
+        while let Some(observation) = self.try_recv_observation() {
+            self.pending_observation = Some(observation);
+        }
+        self.pending_observation
+            .as_ref()
+            .is_some_and(|(_, observation)| predicate(observation))
+    }
+
     /// Acknowledge only the observation that reached a terminal outcome. A
     /// stale writer must not erase a newer correction queued in the meantime.
     pub(crate) fn acknowledge_observation(

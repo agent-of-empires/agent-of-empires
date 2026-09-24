@@ -587,8 +587,26 @@ fn drain_poller(inst: &Instance) -> Option<SessionIdObservation> {
         .map(|(_instance_id, observation)| observation)
 }
 
-pub(crate) fn pending_poller_observation(inst: &Instance) -> Option<SessionIdObservation> {
-    drain_poller(inst)
+/// Inspect the sticky poller mailbox without cloning its pending observation.
+pub(crate) fn pending_poller_observation_matches(
+    inst: &Instance,
+    predicate: impl FnOnce(&SessionIdObservation) -> bool,
+) -> bool {
+    let Some(arc) = inst.session_id_poller.as_ref() else {
+        return false;
+    };
+    let mut guard = match arc.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            tracing::warn!(
+                target: "session.sync",
+                instance = %inst.id,
+                "session_id_poller mutex poisoned; recovering inner guard",
+            );
+            poisoned.into_inner()
+        }
+    };
+    guard.pending_observation_matches(predicate)
 }
 
 fn acknowledge_poller_observation(inst: &Instance, observation: &SessionIdObservation) {
