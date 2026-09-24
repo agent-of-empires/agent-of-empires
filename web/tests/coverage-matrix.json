@@ -369,7 +369,7 @@
       "id": "terminal.mobile-live-wheel-forward-e2e",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["tests/live-terminal-input.spec.ts"],
+      "specs": ["tests/live-wheel-forward.spec.ts"],
       "components": [
         "web/src/lib/liveMouse.ts",
         "web/src/components/MobileLiveTerminal.tsx",

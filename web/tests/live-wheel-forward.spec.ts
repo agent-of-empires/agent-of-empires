@@ -135,6 +135,17 @@ test("a flick coasts: wheel messages keep arriving after the finger lifts, and a
   expect(handle.liveMessages.length).toBe(afterStop);
 });
 
+test("a legacy-mouse app forwards the same wheel message, not X10 bytes", async ({ page }) => {
+  const handle = await setup(page);
+  // The app's encoding is the daemon's business now, so an X10-only app must
+  // still receive the message an SGR app does. Buttons are unaffected and keep
+  // choosing an encoding client-side; see `live-terminal-input.spec.ts`.
+  await pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: false });
+  await swipeUp(page);
+  await expect.poll(() => wheels(handle).some((m) => m.up === false)).toBe(true);
+  expect(hasMouseBytes(handle)).toBe(false);
+});
+
 test("normal-screen agent does NOT forward the wheel", async ({ page }) => {
   const handle = await setup(page);
   await pushFrame(handle, { altScreen: false, mouse: true, mouseSgr: true });
