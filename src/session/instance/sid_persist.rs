@@ -699,6 +699,7 @@ mod tests {
         assert_eq!(disk_sid(profile, &claimant.id), None);
         assert_eq!(disk_sid(profile, &owner.id).as_deref(), Some(sid));
     }
+    
     #[test]
     #[serial]
     fn pi_ownership_is_stable_before_and_after_transcript_publication() {
