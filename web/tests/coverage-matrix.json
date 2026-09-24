@@ -1381,9 +1381,9 @@
     },
     {
       "id": "sidebar.trash-row-context-menu",
-      "kind": "vitest",
+      "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx"],
+      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx", "tests/session-trash.spec.ts"],
       "components": ["web/src/components/sidebar/TrashMenu.tsx"]
     },
     {
