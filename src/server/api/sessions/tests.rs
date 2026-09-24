@@ -2826,6 +2826,114 @@ async fn structured_start_and_prompt_wake_recheck_the_stored_row() {
     }
 }
 
+/// #4116: `/start` answers from the stored row, not a stale cache: a row a peer archived is
+/// refused and a purged one is not found, whether or not the cached session is stopped.
+#[tokio::test]
+#[serial_test::serial]
+async fn start_rechecks_the_stored_row() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let profile = "default";
+    let cases = [
+        (
+            "stopped structured, purged",
+            Status::Stopped,
+            true,
+            false,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "running, archived on disk",
+            Status::Running,
+            false,
+            true,
+            StatusCode::CONFLICT,
+        ),
+        (
+            "running, purged",
+            Status::Running,
+            false,
+            false,
+            StatusCode::NOT_FOUND,
+        ),
+    ];
+    for (label, status, structured, stored_row, want) in cases {
+        let mut inst = Instance::new("stale-cache", "/tmp/aoe-4116-stale");
+        inst.source_profile = profile.to_string();
+        inst.status = status;
+        if structured {
+            inst.view = crate::session::View::Structured;
+        }
+        let id = inst.id.clone();
+        let mut peer = inst.clone();
+        peer.archive();
+        Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|rows, _| {
+                *rows = if stored_row { vec![peer] } else { Vec::new() };
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let response = start_session(State(state.clone()), Path(id.clone()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), want, "{label}");
+        assert_eq!(state.instances.read().await[0].status, status, "{label}");
+    }
+}
+
+/// #4116: web `/send` rechecks the stored row under the lifecycle lock, so a peer's archive
+/// of a session with a live pane refuses the keystrokes and survives the send.
+#[tokio::test]
+#[serial_test::serial]
+async fn send_refuses_a_live_pane_archived_by_a_peer() {
+    if crate::tmux::tmux_command().arg("-V").output().is_err() {
+        eprintln!("tmux not available; skipping");
+        return;
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    let profile = "default";
+    let mut inst = make_test_instance();
+    inst.source_profile = profile.to_string();
+    let id = inst.id.clone();
+    let mut peer = inst.clone();
+    peer.archive();
+    let storage = Storage::new_unwatched(profile).unwrap();
+    storage
+        .update(|rows, _| {
+            *rows = vec![peer];
+            Ok(())
+        })
+        .unwrap();
+    let pane = crate::tmux::Session::generate_name(&id, &inst.title);
+    let created = crate::tmux::tmux_command()
+        .args(["new-session", "-d", "-s", &pane, "sleep", "60"])
+        .status();
+    if !created.map(|s| s.success()).unwrap_or(false) {
+        eprintln!("tmux new-session failed; skipping");
+        return;
+    }
+    crate::tmux::refresh_session_cache();
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+    let response = send_message(
+        State(state.clone()),
+        Path(id.clone()),
+        Ok(Json(SendMessageRequest {
+            message: "hello".into(),
+            revive: false,
+        })),
+    )
+    .await
+    .into_response();
+    let _ = crate::tmux::tmux_command()
+        .args(["kill-session", "-t", &pane])
+        .output();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(storage.load().unwrap()[0].is_archived());
+}
+
 // Regression for a path-traversal vulnerability in the first cut of
 // `/api/sessions/{id}/diff/file?path=...`, where any authenticated user could
 // pass `?path=/etc/passwd` and have the server dump it in a diff response.

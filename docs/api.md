@@ -82,7 +82,7 @@ curl -sS -X POST -H "Authorization: Bearer $AOE_TOKEN" \
 | `409` | `{"error": "session_not_running"}` | The tmux pane is gone |
 | `409` | `{"error": "resume_failed", "message", "resume_session_id"}` | Auto-revive tried a stored conversation and the pane exited before AoE could prove the id invalid; the id is preserved for retry |
 | `409` | `{"error": "session_transient", "status"}` | Mid-lifecycle, cannot accept input yet |
-| `409` | `{"error": "session_archived" \| "session_trashed", "message"}` | Auto-revive refused: unarchive or restore the session first. `/start`, `/ensure`, and structured-view prompts refuse the same way |
+| `409` | `{"error": "session_archived" \| "session_trashed", "message"}` | The session is archived or trashed, even with a live pane or `revive: false`; unarchive or restore it first. `/start`, `/ensure`, and structured-view prompts refuse the same way |
 | `500` | `{"error": "tmux_error"}` / `{"error": "internal"}` | Logged server-side |
 
 Concurrent POSTs to the same id are serialized, so two orchestrators racing on one session cannot interleave keystrokes; different ids run in parallel.

@@ -58,6 +58,16 @@ impl Instance {
         self.idle_dormant_since = None;
     }
 
+    /// Stamp recency after input reached a live pane. A web archive does not take the
+    /// lifecycle lock `lock_for_input` holds, so one may have landed since; never clear it.
+    pub fn touch_after_input(&mut self) {
+        if self.ensure_startable().is_ok() {
+            self.touch_last_accessed();
+        } else {
+            self.last_accessed_at = Some(Utc::now());
+        }
+    }
+
     /// Whether this session's structured view worker was auto-stopped for inactivity and should not
     /// be respawned by the reconciler until the user wakes it.
     pub fn is_idle_dormant(&self) -> bool {

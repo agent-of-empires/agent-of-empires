@@ -1114,8 +1114,18 @@ pub async fn start_session(
         )
     };
 
-    // Only a stopped session has anything to start; otherwise return current.
+    // Only a stopped session has anything to start; otherwise return current,
+    // unless a peer has since dismissed or purged the stored row.
     if !is_stopped {
+        match crate::server::api::load_persisted_instance(&state, &profile, &id).await {
+            Ok(Some(stored)) => {
+                if let Err(blocked) = stored.ensure_startable() {
+                    return crate::server::api::start_blocked_response(blocked);
+                }
+            }
+            Ok(None) => return session_not_found(),
+            Err(resp) => return resp,
+        }
         let instances = state.instances.read().await;
         let response = match instances.iter().find(|i| i.id == id) {
             Some(inst) => {
@@ -1133,17 +1143,19 @@ pub async fn start_session(
         // reconciler's next tick respawns the worker against the preserved
         // transcript.
         let persist_id = id.clone();
-        let blocked = Arc::new(std::sync::OnceLock::new());
-        let blocked_on_disk = Arc::clone(&blocked);
+        // Unset when a peer purged the row; `Err` when it archived or trashed it since the
+        // memory check.
+        let stored = Arc::new(std::sync::OnceLock::new());
+        let stored_on_disk = Arc::clone(&stored);
         if persist_session_update(
             profile,
             "start session",
             state.file_watch.clone(),
             move |instances| {
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                    // A peer may have archived or trashed the row since the memory check.
-                    if let Err(refusal) = inst.ensure_startable() {
-                        let _ = blocked_on_disk.set(refusal);
+                    let startable = inst.ensure_startable();
+                    let _ = stored_on_disk.set(startable);
+                    if startable.is_err() {
                         return;
                     }
                     inst.idle_dormant_since = None;
@@ -1157,8 +1169,10 @@ pub async fn start_session(
         {
             return persist_failed_response();
         }
-        if let Some(refusal) = blocked.get() {
-            return crate::server::api::start_blocked_response(*refusal);
+        match stored.get() {
+            None => return session_not_found(),
+            Some(Err(refusal)) => return crate::server::api::start_blocked_response(*refusal),
+            Some(Ok(())) => {}
         }
         {
             let mut instances = state.instances.write().await;

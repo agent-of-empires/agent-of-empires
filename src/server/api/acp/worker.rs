@@ -81,7 +81,8 @@ async fn refuse_if_stored_row_dismissed(
     state: &AppState,
     instance: &crate::session::Instance,
 ) -> Option<Response> {
-    match super::view::load_persisted_instance(state, &instance.source_profile, &instance.id).await
+    match crate::server::api::load_persisted_instance(state, &instance.source_profile, &instance.id)
+        .await
     {
         // A purge removes the row while the cache may still hold it.
         Ok(None) => Some(session_not_found()),
