@@ -394,6 +394,7 @@ impl Instance {
             self.sandbox_info
                 .as_ref()
                 .and_then(|info| info.container_workdir.as_deref()),
+            self.workspace_info.as_ref(),
         )
     }
 

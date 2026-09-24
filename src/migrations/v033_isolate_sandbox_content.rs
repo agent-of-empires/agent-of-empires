@@ -1396,6 +1396,12 @@ fn stage_receipt(
     if receipt.phase != Phase::Planned {
         return Ok(());
     }
+    let workspace_info = receipt
+        .retired_identity
+        .get("workspace_info")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()?;
     let container_workdir = container_config::container_workdir_for(
         workspace
             .to_str()
@@ -1404,6 +1410,7 @@ fn stage_receipt(
             .retired_identity
             .pointer("/sandbox_info/container_workdir")
             .and_then(Value::as_str),
+        workspace_info.as_ref(),
     );
     for part in &mut receipt.roots {
         if let Some(published) = &part.published {

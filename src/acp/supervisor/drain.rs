@@ -991,14 +991,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let events = sink.frames.lock().unwrap();
-        assert!(events
-            .iter()
-            .any(|(_, _, event)| matches!(event, Event::SessionContextReset { .. })));
-        assert!(events.iter().any(|(_, _, event)| matches!(event, Event::AgentStartupError { message } if message.contains("Could not commit the isolated native context"))));
-        assert!(!events
-            .iter()
-            .any(|(_, _, event)| matches!(event, Event::AcpSessionAssigned { .. })));
+        {
+            let events = sink.frames.lock().unwrap();
+            assert!(events
+                .iter()
+                .any(|(_, _, event)| matches!(event, Event::SessionContextReset { .. })));
+            assert!(events.iter().any(|(_, _, event)| matches!(event, Event::AgentStartupError { message } if message.contains("Could not commit the isolated native context"))));
+            assert!(!events
+                .iter()
+                .any(|(_, _, event)| matches!(event, Event::AcpSessionAssigned { .. })));
+        }
         assert_eq!(supervisor.take_startup_failures(), vec![id.to_string()]);
         assert!(!supervisor.workers.lock().await.contains_key(id));
     }
