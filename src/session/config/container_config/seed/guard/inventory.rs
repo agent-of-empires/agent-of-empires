@@ -81,7 +81,14 @@ impl<'a> Inventory<'a> {
     }
 
     fn resolve(&mut self, lookup: &Path, origin: StateOrigin, linked: bool) -> Result<()> {
-        let canonical = canonical_expected_path(lookup)?;
+        let canonical = match canonical_expected_path(lookup) {
+            Ok(canonical) => canonical,
+            // A loop reaches no inode; watching its entry catches a swap before publication.
+            Err(error) if super::unresolvable(&error) => {
+                return super::watch_entry(self.entries, lookup);
+            }
+            Err(error) => return Err(error.into()),
+        };
         if self.skip(&canonical, origin) {
             return Ok(());
         }

@@ -3408,7 +3408,11 @@ mod tests {
             ("kimi", ".kimi-code"),
             ("prime-agent", ".prime/agent"),
         ] {
-            for internal in [false, true] {
+            // (internal link, Kimi index is a symlink loop)
+            for (internal, index_loop) in [(false, false), (true, false), (false, true)] {
+                if index_loop && tool != "kimi" {
+                    continue;
+                }
                 let temporary = tempfile::tempdir().unwrap();
                 let _environment =
                     crate::session::test_support::isolate_app_dir_at(temporary.path());
@@ -3447,8 +3451,14 @@ mod tests {
                 };
                 fs::create_dir_all(foreign.join("own")).unwrap();
                 fs::write(foreign.join("own/session.jsonl"), b"FOREIGN_HISTORY").unwrap();
-                symlink(&foreign, root.path.join(&linked)).unwrap();
-                if tool == "kimi" {
+                if index_loop {
+                    fs::create_dir_all(root.path.join("sessions/own")).unwrap();
+                    fs::write(root.path.join("sessions/own/session.jsonl"), b"OWN").unwrap();
+                    symlink("session_index.jsonl", root.path.join("session_index.jsonl")).unwrap();
+                } else {
+                    symlink(&foreign, root.path.join(&linked)).unwrap();
+                }
+                if tool == "kimi" && !index_loop {
                     fs::write(
                         root.path.join("session_index.jsonl"),
                         format!(
@@ -3481,7 +3491,7 @@ mod tests {
                         &|_| Ok(Vec::new()),
                     )
                     .unwrap(),
-                    "{tool} internal={internal}"
+                    "{tool} internal={internal} index_loop={index_loop}"
                 );
                 assert!(
                     !root.path.join(&linked).exists(),
@@ -3494,10 +3504,22 @@ mod tests {
                     .unwrap()
                     .path()
                     .join("0/original");
-                assert!(fs::symlink_metadata(recovery.join(&linked))
+                let retained = if index_loop {
+                    PathBuf::from("session_index.jsonl")
+                } else {
+                    linked.clone()
+                };
+                assert!(fs::symlink_metadata(recovery.join(retained))
                     .unwrap()
                     .file_type()
                     .is_symlink());
+                if index_loop {
+                    // Unattributable without its index, the session stays whole in recovery.
+                    assert_eq!(
+                        fs::read(recovery.join("sessions/own/session.jsonl")).unwrap(),
+                        b"OWN"
+                    );
+                }
                 assert!(read_row(&registry, &instance.id)
                     .unwrap()
                     .unwrap()
@@ -3506,6 +3528,90 @@ mod tests {
             }
         }
     }
+    #[test]
+    #[serial_test::serial]
+    fn a_looped_carried_root_does_not_stop_migration_of_other_rows() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut rows = Vec::new();
+        let mut instances = Vec::new();
+        for title in ["looped", "fresh"] {
+            let mut instance = crate::session::Instance::new(title, project.to_str().unwrap());
+            instance.tool = "claude".into();
+            let mut row = serde_json::to_value(&instance).unwrap();
+            row["sandbox_info"] = serde_json::json!({
+                "enabled": true, "image": "img", "container_name": format!("aoe-sandbox-{title}")
+            });
+            rows.push(row);
+            instances.push(instance);
+        }
+        let roots = container_config::sandbox_content_roots(
+            "claude",
+            None,
+            &crate::session::Config::default().session,
+            &home,
+            &instances[0].id,
+        )
+        .unwrap();
+        let looped = roots
+            .iter()
+            .find(|root| root.roles.iter().any(|name| name == ".claude"))
+            .unwrap();
+        fs::create_dir_all(&looped.path).unwrap();
+        fs::write(looped.path.join("settings.json"), b"{}").unwrap();
+        fs::write(looped.path.join("CLAUDE.md"), b"AUTHORED").unwrap();
+        symlink("projects", looped.path.join("projects")).unwrap();
+        let registry = crate::session::get_profile_dir("default")
+            .unwrap()
+            .join("sessions.json");
+        fs::write(&registry, serde_json::to_vec(&rows).unwrap()).unwrap();
+
+        reconcile_in(
+            &app,
+            &home,
+            None,
+            true,
+            &|_| Ok(false),
+            &|_| Ok(true),
+            &|_| Ok(Vec::new()),
+        )
+        .unwrap();
+
+        for instance in &instances {
+            let roots = container_config::sandbox_content_roots(
+                "claude",
+                None,
+                &crate::session::Config::default().session,
+                &home,
+                &instance.id,
+            )
+            .unwrap();
+            assert!(
+                roots_ready(&app, &instance.id, "claude", &roots).unwrap(),
+                "{} was left pending",
+                instance.title
+            );
+        }
+        assert!(fs::symlink_metadata(looped.path.join("projects")).is_err());
+        let recovery = fs::read_dir(recovery_root(&looped.host).unwrap())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .join("0/original");
+        assert!(fs::symlink_metadata(recovery.join("projects"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
     #[test]
     #[serial_test::serial]
     fn retired_gemini_kimi_and_prime_keep_only_their_own_native_conversation() {
