@@ -31,9 +31,13 @@ pub(crate) use command::{hook_command, hook_command_session_id, status_command_f
 pub(crate) use config_io::with_config_lock_policy;
 pub use config_io::SymlinkPolicy;
 pub(crate) use dir_guard::{
-    ensure_instance_dir_path, hook_base_path, unlink_session_id_via_guard,
+    ensure_instance_dir_path, hook_base_path, session_id_leaf, unlink_session_id_via_guard,
     write_session_id_via_guard,
 };
+pub(crate) use status_file::{
+    read_hook_session_id_within, read_hook_sidecar_at, SESSION_ID_SIDECAR_MAX_AGE,
+};
+pub(crate) const SESSION_SOURCE_ENV: &str = "AOE_SESSION_SOURCE";
 pub use hermes::{install_hermes_hooks_with_events, uninstall_hermes_hooks};
 pub use json_settings::{
     install_cursor_hooks_with_events, install_hooks, uninstall_cursor_hooks, uninstall_hooks,
@@ -276,5 +280,55 @@ mod tests {
                 }
             });
         }
+    }
+    #[test]
+    #[serial_test::serial]
+    fn iter_hook_targets_includes_declared_alias_config_dir() {
+        let tmp = TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let profile_dir = crate::session::get_profile_dir("alias-profile").unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            format!(
+                "[session.custom_agents]\nremote-claude = \"ssh -t host claude\"\n\n[session.agent_detect_as]\nremote-claude = \"claude\"\n\n[session.agent_config_dir]\nremote-claude = \"{}\"\n",
+                tmp.path().join(".remote-claude").display()
+            ),
+        )
+        .unwrap();
+
+        let expected = tmp.path().join(".remote-claude/settings.json");
+        assert!(iter_hook_targets().iter().any(|target| {
+            matches!(target.kind, HookTargetKind::JsonSettings) && target.path == expected
+        }));
+        std::fs::write(profile_dir.join("sessions.json"), "not json").unwrap();
+        assert!(iter_hook_targets().iter().any(|target| {
+            matches!(target.kind, HookTargetKind::JsonSettings) && target.path == expected
+        }));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn iter_hook_targets_resolves_declared_roots_via_profile_home() {
+        let process_home = TempDir::new().unwrap();
+        let profile_home = TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", process_home.path().as_os_str()),
+            ("AOE_TEST_ALT_HOME", profile_home.path().as_os_str()),
+        ]);
+        let _app = crate::session::test_support::isolate_app_dir_at(process_home.path());
+        let profile_dir = crate::session::get_profile_dir("alias-home-profile").unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "environment = [\"HOME=$AOE_TEST_ALT_HOME\"]\n\n[session.custom_agents]\nremote-claude = \"ssh -t host claude\"\n\n[session.agent_detect_as]\nremote-claude = \"claude\"\n\n[session.agent_config_dir]\nremote-claude = \"~/.remote-claude\"\n",
+        )
+        .unwrap();
+
+        let paths: Vec<_> = iter_hook_targets()
+            .into_iter()
+            .filter(|target| matches!(target.kind, HookTargetKind::JsonSettings))
+            .map(|target| target.path)
+            .collect();
+        assert!(paths.contains(&profile_home.path().join(".remote-claude/settings.json")));
+        assert!(!paths.contains(&process_home.path().join(".remote-claude/settings.json")));
     }
 }

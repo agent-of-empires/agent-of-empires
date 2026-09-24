@@ -120,6 +120,7 @@ export async function ensureSession(id: string, signal?: AbortSignal): Promise<E
     return {
       ok: true,
       status: body.status as "alive" | "restarted" | undefined,
+      message: typeof body.message === "string" ? body.message : undefined,
     };
   } catch (e) {
     if ((e as { name?: string }).name === "AbortError") {
@@ -1523,13 +1524,17 @@ export async function acpEnable(sessionId: string): Promise<ViewSwitchResponse |
   });
 }
 
-/** Switch a session back to a terminal (POST /acp/disable). A claude session's
- *  conversation continues via `claude --resume`; other agents restart fresh.
- *  Resolves with the updated view or null on non-2xx. */
-export async function acpDisable(sessionId: string): Promise<ViewSwitchResponse | null> {
-  return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/disable`, {
-    method: "POST",
-  });
+export async function acpDisable(
+  sessionId: string,
+): Promise<{ ok: true; data: ViewSwitchResponse } | { ok: false; message?: string }> {
+  try {
+    const response = await fetch("/api/sessions/" + encodeURIComponent(sessionId) + "/acp/disable", { method: "POST" });
+    if (response.ok) return { ok: true, data: (await response.json()) as ViewSwitchResponse };
+    const message = (await response.text()).trim();
+    return message ? { ok: false, message } : { ok: false };
+  } catch {
+    return { ok: false };
+  }
 }
 
 // The daemon owns the structured-view prompt queue; /queue reads it on demand.

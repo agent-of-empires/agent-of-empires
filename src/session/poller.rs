@@ -274,6 +274,10 @@ pub(crate) enum SessionIdGuard {
 pub(crate) struct SessionIdObservation {
     pub(crate) sid: String,
     pub(crate) guard: SessionIdGuard,
+    pub(crate) execution: Option<crate::session::instance::ActiveExecution>,
+    pub(crate) source: Option<crate::session::ExecutionBinding>,
+    pub(crate) transcript_path: Option<std::path::PathBuf>,
+    pub(crate) pi_session_path: Option<String>,
 }
 
 pub(crate) type SessionIdPollFn =
@@ -284,6 +288,10 @@ impl SessionIdObservation {
         Self {
             sid,
             guard: SessionIdGuard::Unguarded,
+            execution: None,
+            source: None,
+            transcript_path: None,
+            pi_session_path: None,
         }
     }
 
@@ -291,6 +299,10 @@ impl SessionIdObservation {
         Self {
             sid,
             guard: SessionIdGuard::InstanceSidecar { transcript },
+            execution: None,
+            source: None,
+            transcript_path: None,
+            pi_session_path: None,
         }
     }
 
@@ -298,13 +310,42 @@ impl SessionIdObservation {
         Self {
             sid,
             guard: SessionIdGuard::OmpLegacy,
+            execution: None,
+            source: None,
+            transcript_path: None,
+            pi_session_path: None,
         }
     }
     pub(crate) fn omp(sid: String, generation: String) -> Self {
         Self {
             sid,
             guard: SessionIdGuard::OmpGeneration(generation),
+            execution: None,
+            source: None,
+            transcript_path: None,
+            pi_session_path: None,
         }
+    }
+    pub(crate) fn conversation_binding(&self) -> Option<crate::session::ConversationBinding> {
+        self.execution.as_ref()?;
+        self.source
+            .as_ref()
+            .map(|source| crate::session::ConversationBinding {
+                session_id: self.sid.clone(),
+                execution: Some(source.clone()),
+                provenance: crate::session::ConversationProvenance::Observed,
+                transcript_path: self.transcript_path.clone(),
+            })
+    }
+    pub(crate) fn confirms_omp_pin(&self, intent: &crate::session::ResumeIntent) -> bool {
+        self.execution.is_some()
+            && self.source.is_some()
+            && matches!(&self.guard, SessionIdGuard::OmpGeneration(_))
+            && matches!(intent, crate::session::ResumeIntent::Use(pinned) if pinned == &self.sid)
+    }
+
+    pub(crate) fn conversation_key(&self) -> Option<crate::session::instance::ConversationKey<'_>> {
+        self.source.as_ref().map(|source| source.key(&self.sid))
     }
 }
 
@@ -642,18 +683,14 @@ impl SessionPoller {
     }
 
     #[cfg(test)]
-    pub(crate) fn inject_test_omp_update(
+    pub(crate) fn inject_test_observation(
         &self,
         instance_id: &str,
-        session_id: &str,
-        generation: &str,
+        observation: SessionIdObservation,
     ) {
         self.result_tx
-            .send((
-                instance_id.to_string(),
-                SessionIdObservation::omp(session_id.to_string(), generation.to_string()),
-            ))
-            .expect("inject_test_omp_update: result channel disconnected");
+            .send((instance_id.to_owned(), observation))
+            .expect("inject_test_observation: result channel disconnected");
     }
 
     #[cfg(test)]

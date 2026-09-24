@@ -710,6 +710,7 @@ pub(crate) async fn spawn_structured_session(
                                 acp_mode_id,
                                 agent_command_override: command_override,
                                 seed_history_replay,
+                                claude_store_pin: None,
                             })
                             .await
                             .map_err(|error| {

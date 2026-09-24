@@ -42,7 +42,9 @@ pub(crate) mod v027_isolate_sandbox_stores;
 mod v028_clear_archived_live_status;
 mod v029_fold_pending_initial_turn;
 mod v030_global_only_profile_settings;
+mod v031_conversation_provenance;
 mod v031_core_daemon_launch;
+mod v032_bound_capture_exclusions;
 mod v032_serve_passphrase_policy;
 mod v033_pending_purge_owners;
 mod v034_capture_purge_runners;
@@ -87,7 +89,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 35;
+const CURRENT_VERSION: u32 = 37;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -271,6 +273,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 35,
         name: "canonical_sidebar",
         run: v035_canonical_sidebar::run,
+    },
+    Migration {
+        version: 36,
+        name: "conversation_provenance",
+        run: v031_conversation_provenance::run,
+    },
+    Migration {
+        version: 37,
+        name: "bound_capture_exclusions",
+        run: v032_bound_capture_exclusions::run,
     },
 ];
 

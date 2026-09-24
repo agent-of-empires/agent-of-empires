@@ -2,13 +2,14 @@
 //! (`web/tests/helpers/fakeAcpAgent.mjs`), whose `permission_request` entries
 //! gate the turn until the client decides.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serial_test::parallel;
 
 use crate::harness::{
-    app_dir_in, init_git_repo, require_node, require_tmux, wait_until, TuiTestHarness,
+    app_dir_in, init_git_repo, pick_free_port, require_node, require_tmux, wait_for_port,
+    wait_until, TuiTestHarness,
 };
 
 const APPROVAL_SCRIPT: &str = r#"{
@@ -280,13 +281,237 @@ fn wait_for_capture(dir: &Path, key: &str, expected: &str) -> String {
 }
 
 fn captures(dir: &Path) -> Vec<String> {
+    capture_files(dir)
+        .into_iter()
+        .map(|(_, contents)| contents)
+        .collect()
+}
+
+fn capture_files(dir: &Path) -> Vec<(PathBuf, String)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     entries
         .flatten()
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            std::fs::read_to_string(&path)
+                .ok()
+                .map(|contents| (path, contents))
+        })
         .collect()
+}
+
+fn asserted_claude_store_harness(name: &str) -> (TuiTestHarness, PathBuf, PathBuf, String) {
+    let mut h = TuiTestHarness::new_in_tmp(name);
+    h.stop_daemon_on_drop();
+    let selected = h.home_path().join("selected-claude");
+    let configured = h.home_path().join("configured-claude");
+    let project = h.project_path().canonicalize().unwrap();
+    let script = h.home_path().join("agent.json");
+    std::fs::write(&script, r#"{"turns":[]}"#).unwrap();
+    let capture_dir = h.home_path().join("adapter-env");
+    h.install_acp_shim_capturing_env(&script, &capture_dir);
+
+    let config_path = app_dir_in(h.home_path()).join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(
+        &config_path,
+        format!(
+            "environment = [\"CLAUDE_CONFIG_DIR={}\"]\n{config}",
+            configured.display()
+        ),
+    )
+    .unwrap();
+    let add = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "handoff",
+        "-c",
+        "claude",
+    ]);
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let sid = "11111111-1111-4111-8111-111111111111";
+    let encoded: String = project
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let transcripts = selected.join("projects").join(encoded);
+    std::fs::create_dir_all(&transcripts).unwrap();
+    std::fs::write(transcripts.join(format!("{sid}.jsonl")), "{}\n").unwrap();
+    let pin = h.run_cli(&[
+        "session",
+        "set-session-id",
+        "handoff",
+        sid,
+        "--store",
+        selected.to_str().unwrap(),
+    ]);
+    assert!(
+        pin.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pin.stderr)
+    );
+    // Stores are recorded canonically; macOS `/tmp` resolves to `/private/tmp`.
+    let selected = selected.canonicalize().unwrap();
+
+    let sessions_path = app_dir_in(h.home_path()).join("profiles/default/sessions.json");
+    let rows: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&sessions_path).unwrap()).unwrap();
+    let id = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["title"] == "handoff")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    (h, selected, capture_dir, id)
+}
+
+fn start_daemon(h: &TuiTestHarness) -> u16 {
+    let port = pick_free_port();
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port.to_string(),
+        "--no-auth",
+    ]);
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert!(wait_for_port(port, Duration::from_secs(10)));
+    port
+}
+
+fn wait_for_session_loads(log: &Path, minimum: usize) -> usize {
+    wait_until(Duration::from_secs(75), Duration::from_millis(50), || {
+        let contents = std::fs::read_to_string(log).unwrap_or_default();
+        let loads = contents
+            .matches("handleRequest method=session/load")
+            .count();
+        (loads >= minimum)
+            .then_some(loads)
+            .ok_or_else(|| format!("worker did not load the session: {contents}"))
+    })
+}
+
+#[test]
+#[parallel]
+fn selected_claude_store_survives_terminal_handoff() {
+    require_tmux!();
+    require_node!();
+    let (h, selected, capture_dir, id) = asserted_claude_store_harness("handoff_store");
+    let port = start_daemon(&h);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://127.0.0.1:{port}/api/sessions/{id}/acp/enable"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+    });
+
+    assert_eq!(
+        wait_for_session_loads(&app_dir_in(h.home_path()).join("fake-acp.log"), 1),
+        1
+    );
+    let capture = wait_for_capture(
+        &capture_dir,
+        "CLAUDE_CONFIG_DIR",
+        selected.to_str().unwrap(),
+    );
+    assert_eq!(
+        env_value(&capture, "CLAUDE_CONFIG_DIR").as_deref(),
+        Some(selected.to_str().unwrap())
+    );
+}
+
+#[test]
+#[parallel]
+fn selected_claude_store_survives_stop_and_respawn() {
+    require_tmux!();
+    require_node!();
+    let (h, selected, capture_dir, id) = asserted_claude_store_harness("handoff_respawn");
+    let port = start_daemon(&h);
+    let base = format!("http://127.0.0.1:{port}/api/sessions/{id}");
+    let log = app_dir_in(h.home_path()).join("fake-acp.log");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let response = reqwest::Client::new()
+            .post(format!("{base}/acp/enable"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+    });
+    assert_eq!(wait_for_session_loads(&log, 1), 1);
+    let captures_before: Vec<_> = capture_files(&capture_dir)
+        .into_iter()
+        .map(|(path, _)| path.file_name().unwrap().to_owned())
+        .collect();
+
+    runtime.block_on(async {
+        let client = reqwest::Client::new();
+        let response = client.post(format!("{base}/stop")).send().await.unwrap();
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+        let response = client
+            .post(format!("{base}/acp/spawn"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "{}",
+            response.text().await.unwrap()
+        );
+    });
+    assert_eq!(wait_for_session_loads(&log, 2), 2);
+    let respawned = capture_files(&capture_dir)
+        .into_iter()
+        .any(|(path, capture)| {
+            !captures_before.contains(&path.file_name().unwrap().to_owned())
+                && env_value(&capture, "CLAUDE_CONFIG_DIR").as_deref()
+                    == Some(selected.to_str().unwrap())
+        });
+    assert!(
+        respawned,
+        "respawned adapter must use {}",
+        selected.display()
+    );
 }
 
 /// Configured `environment` entries and the desktop session layer reach a

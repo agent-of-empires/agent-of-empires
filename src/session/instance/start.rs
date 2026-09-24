@@ -101,8 +101,7 @@ pub enum LaunchSidOutcome {
     /// observed `agent_session_id`, or retroactive-capture hit. The launch
     /// command embedded the agent's resume flag.
     Existing { sid: String },
-    /// `acquire_session_id` returned a fresh sid (Claude UUID generation)
-    /// or `None`. No prior conversation continued.
+
     Fresh {
         /// Set when the fresh launch pinned an id the session already had
         /// stored, rather than a UUID minted for a brand-new conversation:
@@ -151,7 +150,6 @@ impl Instance {
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance launch lock")?;
-        self.reconcile_from_disk();
         if self.is_structured() {
             return Ok(LaunchSidOutcome::Skipped);
         }
@@ -168,6 +166,7 @@ impl Instance {
         } else {
             false
         };
+        self.reconcile_from_store(&storage)?;
         let generation = self.acquire_lifecycle_reservation(
             &storage,
             LifecycleOperation::Launch,
@@ -180,19 +179,24 @@ impl Instance {
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, &storage, None);
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(&storage, generation, hook_result)?;
-        let prepared = match self
-            .apply_fresh_launch_intent(&storage)
-            .and_then(|()| self.prepare_launch_command(&storage))
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.fail_reserved_launch(&storage, generation, &error, false);
-                return Err(error);
-            }
-        };
+        self.reconcile_sidecar_into_disk_in(&storage)?;
+        let expected = self.apply_fresh_launch_intent_in(&storage);
+
+        let mut prepared =
+            match self.prepare_launch_command_in(CaptureStorage::Scoped(&storage), expected) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.fail_reserved_launch(&storage, generation, &error, false);
+                    return Err(error);
+                }
+            };
         let result = (|| {
             if corpse_pane {
                 self.kill_clean_locked()?;
+                prepared = self.refresh_prepared_prime_launch_after_pane_stop_in(
+                    CaptureStorage::Scoped(&storage),
+                    prepared,
+                )?;
             }
             let outcome = self.spawn_prepared_launch(size, &storage, prepared)?;
             self.commit_lifecycle_launch(&storage, generation, false)?;
@@ -205,14 +209,53 @@ impl Instance {
         result
     }
 
-    pub(super) fn apply_fresh_launch_intent(
+    pub(super) fn apply_fresh_launch_intent_in(
         &mut self,
-        storage: &dyn crate::session::SessionStore,
-    ) -> Result<()> {
+        _storage: &dyn crate::session::SessionStore,
+    ) -> ConversationState {
+        let expected = self.conversation_state();
         if std::mem::take(&mut self.force_fresh_next_launch) {
             self.resume_intent = ResumeIntent::Cleared;
         }
-        self.reconcile_sidecar_into_disk(storage)
+        expected
+    }
+
+    #[cfg(test)]
+    pub(super) fn apply_fresh_launch_intent(&mut self) -> ConversationState {
+        let storage =
+            crate::session::storage::Storage::new_unwatched(&self.effective_profile()).unwrap();
+        self.apply_fresh_launch_intent_in(&storage)
+    }
+
+    /// The conversation a fresh launch abandons, for the capture-exclusion log.
+    ///
+    /// A launch that re-emits the id it started from, preallocated or observed
+    /// under this launch's execution, is running that conversation: nothing is
+    /// abandoned, and a stale exclusion for it must be dropped instead. Only an
+    /// id the launch did not keep is recorded as abandoned.
+    fn abandoned_prior_conversation(
+        &self,
+        expected: &ConversationState,
+        prior_sid: &str,
+    ) -> Option<ConversationBinding> {
+        let kept = self.agent_session_id.as_deref() == Some(prior_sid)
+            && self.agent_session_binding.as_ref().is_some_and(|binding| {
+                binding.session_id == prior_sid
+                    && self.active_execution.as_ref().is_some_and(|execution| {
+                        binding.execution.as_ref() == Some(&execution.binding)
+                    })
+            });
+        if kept {
+            return None;
+        }
+        Some(
+            expected
+                .binding
+                .as_ref()
+                .filter(|binding| binding.session_id == prior_sid)
+                .cloned()
+                .unwrap_or_else(|| ConversationBinding::unknown(prior_sid.to_string())),
+        )
     }
 
     pub(super) fn spawn_prepared_launch(
@@ -229,20 +272,26 @@ impl Instance {
                 self.id
             );
         }
+        if !self.is_sandboxed() {
+            self.install_agent_status_hooks(self.status_agent(), prepared.execution.as_ref());
+        }
+        let canonicalized = prepared.canonical_conversation.is_some();
         let launch_sid = if prepared.is_existing {
             Some(
-                self.agent_session_id
-                    .clone()
+                prepared
+                    .canonical_conversation
+                    .as_ref()
+                    .and_then(|state| state.session_id.clone())
+                    .or_else(|| self.agent_session_id.clone())
                     .expect("existing launch command carries agent_session_id"),
             )
         } else {
             None
         };
         // Read before `finalize_launch`, which may replace `agent_session_id`.
-        let pinned_prior_sid = self
-            .agent_session_id
-            .clone()
-            .filter(|sid| prepared.expected_prior_sid.as_deref() == Some(sid.as_str()));
+        let pinned_prior_sid = self.agent_session_id.clone().filter(|sid| {
+            prepared.expected_conversation.session_id.as_deref() == Some(sid.as_str())
+        });
 
         tracing::debug!(
             target: "session.store",
@@ -251,11 +300,6 @@ impl Instance {
             "agent launch command prepared"
         );
 
-        if !prepared.is_existing {
-            if let Some(prior_sid) = prepared.expected_prior_sid.as_ref() {
-                self.retroactive_capture_excludes.insert(prior_sid.clone());
-            }
-        }
         self.clear_pane_identity_sidecar();
 
         let mut omp_capture_metadata = if let Some(plan) = prepared.omp_capture_plan {
@@ -277,7 +321,7 @@ impl Instance {
         } else {
             None
         };
-        let omp_generation_published = self.publish_omp_launch_generation(
+        let omp_generation_published = self.publish_omp_launch_generation_with_store(
             storage,
             omp_capture_metadata.as_ref(),
             prepared.expected_prior_omp_generation.as_deref(),
@@ -323,20 +367,91 @@ impl Instance {
             }
         }
 
+        if let Some(canonical) = prepared.canonical_conversation.take() {
+            self.adopt_conversation_state(canonical);
+        }
+        if let Some(execution) = prepared.execution.take() {
+            self.active_execution = Some(ActiveExecution {
+                launch_id: execution.inputs.launch_id,
+                binding: execution.binding.clone(),
+                capture: execution
+                    .capture
+                    .or_else(|| omp_capture_metadata.clone().map(CaptureContext::Omp)),
+                container: execution.inputs.container,
+            });
+            let native_mints_child = matches!(
+                prepared.expected_conversation.intent,
+                ResumeIntent::Fork { .. }
+            ) && !matches!(
+                execution.agent.fork_strategy,
+                crate::agents::ForkStrategy::ClaudeFork
+            );
+            if native_mints_child {
+                self.set_agent_conversation(None, None, None);
+            } else if let Some(sid) = self.agent_session_id.clone() {
+                let existing = self.agent_session_binding.as_ref().filter(|binding| {
+                    binding.session_id == sid
+                        && (binding.execution.as_ref() == Some(&execution.binding)
+                            || (matches!(self.resume_intent, ResumeIntent::Default)
+                                && binding.is_known()
+                                && binding
+                                    .execution
+                                    .as_ref()
+                                    .is_some_and(|prior| prior.agent == execution.binding.agent)))
+                });
+                let binding =
+                    if matches!(prepared.expected_conversation.intent, ResumeIntent::Use(_)) {
+                        self.resume_binding.clone()
+                    } else {
+                        existing.cloned()
+                    }
+                    .unwrap_or(ConversationBinding {
+                        session_id: sid.clone(),
+                        execution: Some(execution.binding.clone()),
+                        provenance: ConversationProvenance::Preallocated,
+                        transcript_path: None,
+                    });
+                self.set_agent_conversation(Some(sid), Some(binding), self.pi_session_path.clone());
+            }
+        } else {
+            self.active_execution = None;
+            if !matches!(self.resume_intent, ResumeIntent::Default)
+                || self.agent_session_binding.as_ref().is_none_or(|binding| {
+                    self.agent_session_id.as_deref() != Some(binding.session_id.as_str())
+                        || !binding.is_known()
+                })
+            {
+                self.agent_session_binding = None;
+            }
+        }
+        if !prepared.is_existing {
+            if let Some(prior_sid) = prepared.expected_conversation.session_id.clone() {
+                match self.abandoned_prior_conversation(&prepared.expected_conversation, &prior_sid)
+                {
+                    Some(abandoned) => {
+                        self.retroactive_capture_excludes.insert(abandoned);
+                    }
+                    None => {
+                        let source = self.active_execution.as_ref().map(|active| &active.binding);
+                        self.retroactive_capture_excludes
+                            .retain(|binding| !binding.excludes_capture(&prior_sid, source));
+                    }
+                }
+            }
+        }
         #[cfg(test)]
         test_support::observe(self, test_support::FinalizePhase::Before);
 
-        self.finalize_launch(
+        self.finalize_launch_with_store(
             session.name(),
             storage,
-            prepared.expected_prior_sid.as_deref(),
-            prepared.expected_prior_intent,
+            &prepared.expected_conversation,
             omp_capture_metadata,
+            canonicalized || prepared.carry_relocated,
         )?;
 
         #[cfg(test)]
         test_support::observe(self, test_support::FinalizePhase::After);
-
         Ok(match launch_sid {
             Some(sid) => LaunchSidOutcome::Existing { sid },
             None => LaunchSidOutcome::Fresh { pinned_prior_sid },
@@ -344,13 +459,13 @@ impl Instance {
     }
 
     /// Post-launch setup: persist state, start pollers, and apply tmux options.
-    pub(super) fn finalize_launch(
+    pub(super) fn finalize_launch_with_store(
         &mut self,
         session_name: &str,
         storage: &dyn crate::session::SessionStore,
-        expected_prior_sid: Option<&str>,
-        expected_prior_intent: ResumeIntent,
-        mut omp_capture_metadata: Option<OmpCaptureMetadata>,
+        expected: &ConversationState,
+        omp_capture_metadata: Option<OmpCaptureMetadata>,
+        confirm_desired_conversation: bool,
     ) -> Result<()> {
         let profile = storage.storage().profile();
         if let Some(metadata) = omp_capture_metadata.as_ref() {
@@ -369,17 +484,44 @@ impl Instance {
                 })
                 .ok()
             });
-            if published.is_none() {
-                omp_capture_metadata = None;
-            }
+            let _ = published;
         }
 
-        let outcome =
-            self.persist_session_id_with_store(storage, expected_prior_sid, expected_prior_intent)?;
+        let desired = confirm_desired_conversation.then(|| {
+            let mut desired = self.conversation_state();
+            // Mirror persist_session_id's promotion of one-shot launch
+            // directives, or the comparison below would reject the state it
+            // itself produces for Cleared, Fork and publisher-pinned Use.
+            if matches!(
+                desired.intent,
+                ResumeIntent::Cleared | ResumeIntent::Fork { .. }
+            ) || (matches!(desired.intent, ResumeIntent::Use(_))
+                && self.launch_has_session_publisher())
+            {
+                desired.intent = ResumeIntent::Default;
+                desired.resume_binding = None;
+            }
+            desired
+        });
+        let outcome = self.persist_session_id_with_storage(storage, expected);
+        if desired.is_some_and(|desired| {
+            !matches!(outcome, SidPersistOutcome::Published) || !desired.matches(self)
+        }) {
+            self.reconcile_from_store(storage)?;
+            anyhow::bail!("durable publication was not confirmed; durable reconciliation was attempted but may be unavailable, and the pane may remain if reservation verification or teardown fails");
+        }
 
         // Skip outcomes leave AOE_CAPTURED_SESSION_ID untouched: this path
         // runs before any poller publish, so env is empty for fresh sessions.
         let publish_sid = matches!(outcome, SidPersistOutcome::Published);
+        let previous_captured = if publish_sid {
+            None
+        } else {
+            crate::tmux::env::get_hidden_env(
+                session_name,
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            )
+        };
         let captured_sid: Option<String> = if publish_sid {
             self.agent_session_id.clone()
         } else {
@@ -401,7 +543,14 @@ impl Instance {
         if let Err(e) = crate::tmux::env::set_hidden_env_batch(&entries) {
             let keys: Vec<&str> = entries.iter().map(|(_, k, _)| *k).collect();
             tracing::warn!(target: "session.store",
-                "Failed to set tmux env keys [{}] at finalize_launch: {}", keys.join(", "), e);
+            "Failed to set tmux env keys [{}] at finalize_launch: {}", keys.join(", "), e);
+        }
+        if let Some(previous) = previous_captured {
+            let _ = crate::tmux::env::set_hidden_env(
+                session_name,
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                &previous,
+            );
         }
 
         if publish_sid && self.agent_session_id.is_none() {
@@ -410,26 +559,69 @@ impl Instance {
                 crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
             ) {
                 tracing::warn!(target: "session.store",
-                    instance = %self.id,
-                    "Failed to clear captured sid in tmux env: {}", e);
+                instance = %self.id,
+                "Failed to clear captured sid in tmux env: {}", e);
             }
         }
 
-        self.maybe_start_poller_since(omp_capture_metadata, CaptureStorage::Scoped(storage))?;
+        self.maybe_start_poller_since_in(CaptureStorage::Scoped(storage))?;
 
         self.status = Status::Starting;
         self.last_start_time = Some(std::time::Instant::now());
 
-        crate::tmux::status_bar::apply_all_tmux_options(
-            session_name,
-            &self.title,
-            self.worktree_info
-                .as_ref()
-                .map(|worktree| worktree.branch.as_str()),
-            self.sandbox_display().as_ref(),
-            profile,
-        );
+        // Apply status bar options in a background thread to avoid blocking
+        // the TUI on the multiple tmux subprocess calls they require.
+        let session_name = session_name.to_string();
+        let instance_id_for_log = self.id.clone();
+        let title = self.title.clone();
+        let branch = self.worktree_info.as_ref().map(|w| w.branch.clone());
+        let sandbox = self.sandbox_display();
+        let options_profile = profile.to_string();
+        match std::thread::Builder::new()
+            .name(format!("finalize-tmux-{}", instance_id_for_log))
+            .spawn(move || {
+                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::tmux::status_bar::apply_all_tmux_options(
+                        &session_name,
+                        &title,
+                        branch.as_deref(),
+                        sandbox.as_ref(),
+                        &options_profile,
+                    );
+                })) {
+                    tracing::error!(target: "session.store", "finalize-tmux thread panicked: {:?}", panic);
+                }
+            })
+        {
+            Ok(_handle) => {}
+            Err(e) => {
+                tracing::error!(target: "session.store",
+                    session = %instance_id_for_log,
+                    error = %e,
+                    "Failed to spawn finalize-tmux thread"
+                );
+            }
+        }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn finalize_launch(
+        &mut self,
+        session_name: &str,
+        profile: &str,
+        expected: &ConversationState,
+        omp_capture_metadata: Option<OmpCaptureMetadata>,
+        confirm_desired_conversation: bool,
+    ) -> Result<()> {
+        let storage = crate::session::storage::Storage::new_unwatched(profile)?;
+        self.finalize_launch_with_store(
+            session_name,
+            &storage,
+            expected,
+            omp_capture_metadata,
+            confirm_desired_conversation,
+        )
     }
 }
 

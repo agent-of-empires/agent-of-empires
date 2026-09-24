@@ -497,6 +497,7 @@ impl HomeView {
     /// Settle from the command lane, never from an unrelated status snapshot.
     pub fn apply_restart_results(&mut self) -> bool {
         let before = self.restart_in_flight.len();
+        let _ = self.session_feed.drain_command_errors();
         self.restart_in_flight
             .retain(|id| self.session_feed.has_pending(id));
         before != self.restart_in_flight.len()

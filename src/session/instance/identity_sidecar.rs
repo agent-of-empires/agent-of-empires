@@ -1,0 +1,924 @@
+//! Identity extension launches and the Pi/Prime sidecars and transcripts they publish.
+
+use super::*;
+use crate::agents::SessionCaptureBackend;
+use crate::session::config::container_config::PRIME_AGENT_DIR_IN_CONTAINER;
+
+pub(super) const SESSION_SIDECAR_MAX_BYTES: usize = 4096;
+
+pub(super) fn read_sandbox_sidecar_file(
+    store: &Path,
+    instance_id: &str,
+    leaf: &str,
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
+    crate::session::validate_instance_id(instance_id).ok()?;
+    let root = crate::session::AnchoredDir::open(store).ok()?;
+    let relative = Path::new("aoe-session").join(instance_id).join(leaf);
+    root.read_regular(&relative, max_bytes).ok()?
+}
+
+/// `Unreadable` is a statement about our view of the store, never about the
+/// conversation; only `Absent` may justify dropping a resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiTranscriptState {
+    Present,
+    Absent,
+    Unreadable,
+}
+
+/// Only a miss under a directory that reads back is `Absent`; `Path::is_file`
+/// would fold a denied lookup into a miss.
+fn host_transcript_state(host_path: &Path) -> PiTranscriptState {
+    match std::fs::metadata(host_path) {
+        Ok(metadata) if metadata.is_file() => PiTranscriptState::Present,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match host_path.parent().map(std::fs::metadata) {
+                Some(Ok(parent)) if parent.is_dir() => PiTranscriptState::Absent,
+                _ => PiTranscriptState::Unreadable,
+            }
+        }
+        _ => PiTranscriptState::Unreadable,
+    }
+}
+
+impl Instance {
+    #[cfg(test)]
+    pub(crate) fn mark_pi_extension_launched_for_test(&mut self) {
+        self.pi_extension_launched = true;
+    }
+
+    fn is_pi(&self) -> bool {
+        self.resolved_capture_backend() == Some(SessionCaptureBackend::Pi)
+    }
+
+    /// Extension flag and sidecar environment for an identity-publishing backend.
+    pub(super) fn identity_extension_launch(&self) -> Option<(String, String)> {
+        let backend = self.resolved_capture_backend()?;
+        backend.identity_publisher()?;
+        if !self.is_sandboxed() {
+            if backend != SessionCaptureBackend::Pi
+                || launch_command::environment_defines_path(&self.resolved_host_environment())
+                || !crate::agents::pi_supports_extension_flag()
+            {
+                return None;
+            }
+            let extension = launch_command::session_identity_extension_path().ok()?;
+            let sidecar = crate::hooks::ensure_instance_dir_path(&self.id)
+                .ok()?
+                .join("session_id");
+            return Some((
+                format!(" -e {}", shell_escape(&extension.to_string_lossy())),
+                format!(
+                    "AOE_SESSION_ID_FILE={} ",
+                    shell_escape(&sidecar.to_string_lossy())
+                ),
+            ));
+        }
+        let bind_dir = self.sandbox_capture_store_dir()?;
+        let launch_config = crate::session::storage::local_launch_configuration(
+            &self.effective_profile(),
+            Path::new(&self.project_path),
+        );
+        let config = self.build_container_config(&launch_config).ok()?;
+        let (container_root, flag, sidecar_root) = match backend {
+            SessionCaptureBackend::Pi => {
+                container_config::install_pi_sandbox_extension_at(&bind_dir).ok()?;
+                (
+                    "/root/.pi",
+                    String::new(),
+                    container_config::PI_SIDECAR_DIR_IN_CONTAINER.to_string(),
+                )
+            }
+            SessionCaptureBackend::PrimeAgent => {
+                self.prime_agent_capture_plan_with(&config, bind_dir.clone())?;
+                container_config::install_prime_sandbox_extension_at(&bind_dir).ok()?;
+                (
+                    PRIME_AGENT_DIR_IN_CONTAINER,
+                    format!(
+                        " -e {}",
+                        shell_escape(&format!(
+                            "{PRIME_AGENT_DIR_IN_CONTAINER}/extensions/aoe-session-id.js"
+                        ))
+                    ),
+                    format!("{PRIME_AGENT_DIR_IN_CONTAINER}/aoe-session"),
+                )
+            }
+            _ => return None,
+        };
+        if !config.uses_default_container_home()
+            || !config.path_is_mounted(&bind_dir, Path::new(container_root), true)
+        {
+            return None;
+        }
+        let container = DockerContainer::from_session_id(&self.id);
+        let container_known = self
+            .sandbox_info
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.container_id.is_some())
+            || container.exists().ok() == Some(true);
+        if container_known && container.mount_fingerprint_matches(&config).ok()? != Some(true) {
+            return None;
+        }
+        Some((
+            flag,
+            format!("AOE_SESSION_ID_FILE={sidecar_root}/{}/session_id ", self.id),
+        ))
+    }
+
+    /// Read the ID and path from the publisher recorded for this launch.
+    pub(crate) fn pi_published_conversation(
+        &self,
+        any_age: bool,
+    ) -> Option<crate::session::poller::SessionIdObservation> {
+        crate::session::capture::read_pi_session_observation(
+            &self.id,
+            &self.extension_sidecar_source()?,
+            self.active_execution.as_ref(),
+            any_age,
+        )
+    }
+
+    pub(crate) fn pi_sidecar_source(&self) -> Option<SessionSidecarSource> {
+        (self.source_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi))
+            .then(|| self.extension_sidecar_source())?
+    }
+
+    fn extension_sidecar_source(&self) -> Option<SessionSidecarSource> {
+        if let Some(active) = &self.active_execution {
+            return match &active.capture {
+                Some(CaptureContext::Pi { source, .. }) => Some(source.clone()),
+                Some(CaptureContext::Prime { sidecar, .. }) => sidecar.clone(),
+                _ => None,
+            };
+        }
+        self.resolve_extension_sidecar_source()
+    }
+
+    pub(super) fn resolve_extension_sidecar_source(&self) -> Option<SessionSidecarSource> {
+        self.resolved_capture_backend()?.identity_publisher()?;
+        if self.is_sandboxed() {
+            crate::session::validate_instance_id(&self.id).ok()?;
+            return Some(SessionSidecarSource::SandboxDir(
+                self.sandbox_capture_store_dir()?
+                    .join("aoe-session")
+                    .join(&self.id),
+            ));
+        }
+        Some(SessionSidecarSource::host_hooks(&self.id))
+    }
+
+    fn sandbox_store_root(&self) -> Option<crate::session::AnchoredDir> {
+        crate::session::AnchoredDir::open(&self.sandbox_capture_store_dir()?).ok()
+    }
+
+    /// A published Pi path as the host filesystem sees it.
+    pub(super) fn pi_host_view_of(&self, published: &str) -> Option<PathBuf> {
+        if let Some(active) = &self.active_execution {
+            return match &active.container {
+                Some(container) => container.host_path(Path::new(published), true),
+                None => Some(PathBuf::from(published)),
+            };
+        }
+        if !self.is_sandboxed() {
+            return Some(PathBuf::from(published));
+        }
+        let rest = published.strip_prefix("/root/.pi/")?;
+        Some(self.sandbox_capture_store_dir()?.join(rest))
+    }
+
+    fn pi_recorded_transcript_state(&self, path: &str) -> PiTranscriptState {
+        if let Some(active) = &self.active_execution {
+            let Some(CaptureContext::Pi { root, .. }) = &active.capture else {
+                return PiTranscriptState::Unreadable;
+            };
+            if !Path::new(path).starts_with(root) {
+                return PiTranscriptState::Unreadable;
+            }
+            return self
+                .pi_host_view_of(path)
+                .map(|path| host_transcript_state(&path))
+                .unwrap_or(PiTranscriptState::Unreadable);
+        }
+        if !self.is_sandboxed() {
+            return self
+                .pi_host_view_of(path)
+                .map_or(PiTranscriptState::Unreadable, |host| {
+                    host_transcript_state(&host)
+                });
+        }
+        let Some(relative) = path.strip_prefix("/root/.pi/").map(Path::new) else {
+            return PiTranscriptState::Unreadable;
+        };
+        let (Some(parent), Some(root)) = (relative.parent(), self.sandbox_store_root()) else {
+            return PiTranscriptState::Unreadable;
+        };
+        if !matches!(root.directory_modified(parent), Ok(Some(_))) {
+            return PiTranscriptState::Unreadable;
+        }
+        match root.regular_lookup(relative) {
+            Ok(Some(true)) => PiTranscriptState::Present,
+            Ok(None) => PiTranscriptState::Absent,
+            Ok(Some(false)) | Err(_) => PiTranscriptState::Unreadable,
+        }
+    }
+
+    /// The recorded transcript path when its file name carries the id this row owns.
+    fn pi_recorded_transcript(&self) -> Option<(&str, PiTranscriptState)> {
+        let path = self.pi_session_path.as_deref()?;
+        let id = self.agent_session_id.as_deref()?;
+        pi_transcript_names(path, id).then(|| (path, self.pi_recorded_transcript_state(path)))
+    }
+
+    pub(super) fn pi_resumable_transcript(&self) -> Option<String> {
+        let (path, state) = self.pi_recorded_transcript()?;
+        (state == PiTranscriptState::Present).then(|| path.to_string())
+    }
+
+    /// Positive evidence only: pi writes transcripts lazily, so a never-prompted
+    /// conversation has none, but an unreadable store proves nothing.
+    pub(super) fn pi_recorded_transcript_missing(&self) -> bool {
+        matches!(
+            self.pi_recorded_transcript(),
+            Some((_, PiTranscriptState::Absent))
+        )
+    }
+
+    pub(crate) fn absorb_published_pi_session_in(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+    ) {
+        let Some(observation) = self.pi_published_conversation(true) else {
+            return;
+        };
+        let expected = self.conversation_state();
+        match super::sid_persist::persist_session_with_storage(
+            storage,
+            &self.id,
+            &observation,
+            &expected,
+        ) {
+            SidWrite::Applied => self.apply_conversation_observation(&observation),
+            SidWrite::Skipped | SidWrite::PinnedForeign => {
+                let _ = self.reconcile_from_store(storage);
+            }
+            SidWrite::Failed => {}
+        }
+    }
+
+    pub(crate) fn uses_pi_session_sidecar(&self) -> bool {
+        self.pi_sidecar_source().is_some_and(|source| {
+            self.pi_extension_launched
+                || source
+                    .read_file(&self.id, "session_id", SESSION_SIDECAR_MAX_BYTES, None)
+                    .is_some()
+        })
+    }
+
+    /// Persist the transcript path a poller observation carried. False only while the write keeps
+    /// failing, so the caller holds the observation for a retry.
+    #[cfg(test)]
+    pub(crate) fn persist_observed_pi_transcript(
+        &mut self,
+        observation: &crate::session::poller::SessionIdObservation,
+    ) -> bool {
+        let crate::session::poller::SessionIdGuard::InstanceSidecar {
+            transcript: Some(path),
+        } = &observation.guard
+        else {
+            return true;
+        };
+        if !pi_transcript_names(path, &observation.sid) {
+            return true;
+        }
+        match crate::session::storage::Storage::new(
+            &self.effective_profile(),
+            self.resolve_file_watch(),
+        ) {
+            Ok(storage) => self.persist_pi_transcript_into(&storage, observation, path),
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn persist_pi_transcript_into(
+        &mut self,
+        storage: &crate::session::storage::Storage,
+        observation: &crate::session::poller::SessionIdObservation,
+        path: &str,
+    ) -> bool {
+        match self.store_pi_session_path(storage, observation, path) {
+            Some(true) => {
+                self.pi_session_path = Some(path.to_owned());
+                true
+            }
+            // A superseded execution makes the path stale, not pending.
+            Some(false) => true,
+            None => false,
+        }
+    }
+
+    /// Write a published path only while the durable row still owns its execution and source.
+    #[cfg(test)]
+    pub(super) fn store_pi_session_path(
+        &self,
+        storage: &crate::session::storage::Storage,
+        observation: &crate::session::poller::SessionIdObservation,
+        path: &str,
+    ) -> Option<bool> {
+        match storage.update(|instances, _| {
+            #[cfg(test)]
+            anyhow::ensure!(
+                !FAIL_PI_PATH_WRITES.with(std::cell::Cell::get),
+                "injected transcript path write failure"
+            );
+            let row = instances.iter_mut().find(|row| {
+                row.id == self.id
+                    && row.agent_session_id.as_deref() == Some(observation.sid.as_str())
+                    && row.active_execution.as_ref() == observation.execution.as_ref()
+                    && row.agent_session_binding.as_ref().map_or(
+                        observation.source.is_none(),
+                        |binding| {
+                            binding.session_id == observation.sid
+                                && binding.execution.as_ref() == observation.source.as_ref()
+                        },
+                    )
+                    && !row.is_capture_excluded(&observation.sid, observation.source.as_ref())
+                    && match &row.resume_intent {
+                        ResumeIntent::Fork { .. } | ResumeIntent::Cleared => false,
+                        ResumeIntent::Use(pinned) => {
+                            pinned == &observation.sid
+                                && row.resume_binding.as_ref().is_none_or(|target| {
+                                    target.execution.as_ref() == observation.source.as_ref()
+                                })
+                        }
+                        ResumeIntent::Default => true,
+                    }
+            });
+            Ok(row
+                .map(|row| row.pi_session_path = Some(path.to_string()))
+                .is_some())
+        }) {
+            Ok(stored) => Some(stored),
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.store",
+                    instance = %self.id,
+                    "could not persist the Pi transcript path the pane published: {error}",
+                );
+                None
+            }
+        }
+    }
+
+    pub(super) fn clear_pane_identity_sidecar(&self) {
+        // Prime's root_session survives failed launches and is replaced only by a root.
+        let host_sidecar = match self.resolved_capture_backend() {
+            Some(SessionCaptureBackend::Claude | SessionCaptureBackend::HookSidecar) => true,
+            Some(SessionCaptureBackend::Pi) => match self.extension_sidecar_source() {
+                Some(source @ SessionSidecarSource::HostHooks(_)) => {
+                    source.matches_host_hooks(&self.id)
+                }
+                Some(SessionSidecarSource::SandboxDir(_)) => {
+                    if let Some(root) = self.sandbox_store_root() {
+                        let base = Path::new("aoe-session").join(&self.id);
+                        let _ = root.remove_file(&base.join("session_id"));
+                        let _ = root.remove_file(&base.join("session_path"));
+                    }
+                    false
+                }
+                None => false,
+            },
+            _ => false,
+        };
+        if host_sidecar {
+            let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
+        }
+    }
+
+    /// A host Pi launch that can carry selectors may pin `--session-id`.
+    pub(super) fn pi_session_id_pinnable(&self) -> bool {
+        self.is_pi()
+            && !self.is_sandboxed()
+            && !launch_command::environment_defines_path(&self.resolved_host_environment())
+            && crate::agents::pi_supports_session_id_flag()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fails this thread's transcript-path writes while set.
+    pub(crate) static FAIL_PI_PATH_WRITES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether a Pi transcript file name (`<timestamp>_<id>.jsonl`) carries `sid`.
+fn pi_transcript_names(path: &str, sid: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.rsplit_once('_'))
+        .and_then(|(_, tail)| tail.strip_suffix(".jsonl"))
+        .is_some_and(|uuid| uuid == sid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::instance::test_helpers::*;
+    use crate::session::test_support::EnvGuard;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    #[serial_test::serial]
+    fn fresh_launch_clears_every_host_identity_sidecar() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        for tool in ["cursor", "pi"] {
+            let mut inst = Instance::new(tool, "/tmp/test");
+            inst.tool = tool.to_string();
+            inst.detect_as = tool.to_string();
+            crate::hooks::write_session_id_via_guard(&inst.id, "stale-sid", None).unwrap();
+            assert!(crate::hooks::session_id_sidecar_exists(&inst.id));
+
+            inst.clear_pane_identity_sidecar();
+            assert!(
+                !crate::hooks::session_id_sidecar_exists(&inst.id),
+                "{tool} retained stale pane identity"
+            );
+        }
+    }
+
+    #[test]
+    fn clearing_the_conversation_drops_its_transcript_path() {
+        let mut inst = tool_instance("pi", "/tmp/pi-clear");
+        inst.agent_session_id = Some("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa".to_string());
+        inst.pi_session_path = Some(
+            "/store/2026-01-01T00-00-00-000Z_aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa.jsonl"
+                .to_string(),
+        );
+        inst.resume_intent = ResumeIntent::Cleared;
+
+        let (sid, is_existing) = inst.acquire_session_id_with(None, &|_| None);
+
+        assert_eq!(sid, None, "no pin without a mint seam");
+        assert!(!is_existing);
+        assert_eq!(
+            inst.pi_session_path, None,
+            "the dropped conversation's transcript must not linger"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_unresolvable_sandbox_source_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set(&[("HOME", temp.path())]);
+
+        let mut inst = Instance::new("pi-unresolvable", "/tmp/pi-unresolvable");
+        inst.id = "../escape".to_string();
+        inst.tool = "pi".to_string();
+        inst.sandbox_info = Some(test_sandbox("aoe-pi-unresolvable", None));
+
+        assert_eq!(
+            inst.pi_sidecar_source(),
+            None,
+            "no source is the safe answer"
+        );
+        assert!(
+            !inst.uses_pi_session_sidecar(),
+            "a pane with no resolvable source does not publish"
+        );
+        assert!(
+            !inst.supports_session_poller(),
+            "and must not poll, which would read the host sidecar"
+        );
+        assert!(inst.pi_published_conversation(true).is_none());
+
+        let host = tool_instance("pi", "/tmp/pi-unresolvable");
+        assert!(matches!(
+            host.pi_sidecar_source(),
+            Some(SessionSidecarSource::HostHooks(_))
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn sandbox_pi_sidecar_reads_are_bounded_and_nonblocking() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let mut inst = tool_instance("pi", "/tmp/pi-bounded");
+        inst.sandbox_info = Some(test_sandbox("aoe-pi-bounded", None));
+        let SessionSidecarSource::SandboxDir(dir) = inst.pi_sidecar_source().unwrap() else {
+            panic!("sandboxed Pi must publish into its config bind");
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("session_id");
+        std::fs::write(&sidecar, vec![b'x'; SESSION_SIDECAR_MAX_BYTES + 1]).unwrap();
+        assert!(inst.pi_published_conversation(true).is_none());
+
+        std::fs::remove_file(&sidecar).unwrap();
+        mkfifo(&sidecar, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        assert!(inst.pi_published_conversation(true).is_none());
+        let poll = crate::session::capture::pi_sidecar_poll_fn(
+            inst.id.clone(),
+            SessionSidecarSource::SandboxDir(dir.clone()),
+            None,
+        );
+        assert!(poll().is_none());
+
+        std::fs::remove_file(&sidecar).unwrap();
+        let root = dir.parent().and_then(std::path::Path::parent).unwrap();
+        std::fs::remove_dir_all(root.join("aoe-session")).unwrap();
+        let foreign = temp.path().join("foreign-aoe-session");
+        std::fs::create_dir_all(foreign.join(&inst.id)).unwrap();
+        std::fs::write(
+            foreign.join(&inst.id).join("session_id"),
+            "99999999-9999-4999-8999-999999999999",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&foreign, root.join("aoe-session")).unwrap();
+        assert!(
+            poll().is_none(),
+            "the poller must anchor above the replaceable aoe-session ancestor"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sandboxed_pi_with_its_own_config_dir_uses_its_mounted_sidecar() {
+        const STALE_ID: &str = "01a053b6-c470-78de-9d8f-bc00ef05332a";
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let app_dir = crate::session::get_app_dir().unwrap();
+
+        let sandboxed_pi = |id: &str| {
+            let mut inst = Instance::new(id, "/tmp/pi-own-config");
+            inst.tool = "pi".to_string();
+            inst.sandbox_info = Some(test_sandbox("aoe-pi-own-config", None));
+            inst
+        };
+
+        let inst = sandboxed_pi("piownconfig01");
+        let SessionSidecarSource::SandboxDir(stale_sidecar) = inst.pi_sidecar_source().unwrap()
+        else {
+            panic!("sandboxed Pi must publish into its config bind");
+        };
+        std::fs::create_dir_all(&stale_sidecar).unwrap();
+        std::fs::write(stale_sidecar.join("session_id"), format!("{STALE_ID}\n")).unwrap();
+
+        std::fs::write(
+            app_dir.join("config.toml"),
+            r#"[session.agent_config_dir]
+pi = "~/.pi-personal"
+"#,
+        )
+        .unwrap();
+
+        let mut declared = sandboxed_pi("piownconfig01");
+        let (_, env_prefix) = declared
+            .identity_extension_launch()
+            .expect("declared sandbox config supports the pane extension");
+        assert!(env_prefix.contains("AOE_SESSION_ID_FILE=/root/.pi/aoe-session/"));
+        declared.mark_pi_extension_launched_for_test();
+        assert!(declared.pi_sidecar_source().is_some());
+        assert!(declared.uses_pi_session_sidecar());
+        assert!(declared.pi_published_conversation(true).is_none());
+
+        let mut cmd = String::from("pi");
+        declared
+            .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("pi"), None)
+            .unwrap();
+        assert!(
+            !cmd.contains(STALE_ID) && !cmd.contains("--session"),
+            "a sidecar from the unmounted default store must not reach the launch line: {cmd:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sandbox_transcript_paths_validate_in_the_host_namespace() {
+        let mut inst = tool_instance("pi", "/tmp/pi-ns");
+        inst.sandbox_info = Some(test_sandbox("aoe-pi-ns", None));
+
+        let published = "/root/.pi/sessions/--proj--/2026-01-01T00-00-00-000Z_x.jsonl";
+        let host = inst
+            .pi_host_view_of(published)
+            .expect("a container path maps to the sandbox dir");
+        let sandbox_root = inst.sandbox_capture_store_dir().unwrap();
+        assert!(host.starts_with(&sandbox_root),);
+        assert!(host.ends_with("sessions/--proj--/2026-01-01T00-00-00-000Z_x.jsonl"));
+        assert_eq!(
+            inst.pi_host_view_of("/elsewhere/x.jsonl"),
+            None,
+            "a path outside the bind cannot be mapped"
+        );
+
+        let host_inst = tool_instance("pi", "/tmp/pi-ns");
+        assert_eq!(
+            host_inst.pi_host_view_of("/home/u/.pi/x.jsonl"),
+            Some(std::path::PathBuf::from("/home/u/.pi/x.jsonl"))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pi_only_calls_a_transcript_missing_when_its_store_was_readable() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let leaf = format!("2026-01-01T00-00-00-000Z_{id}.jsonl");
+
+        let mut inst = tool_instance("pi", "/tmp/pi-store");
+        inst.agent_session_id = Some(id.to_string());
+        inst.sandbox_info = Some(test_sandbox("aoe-pi-store", None));
+        inst.pi_session_path = Some(format!("/root/.pi/agent/sessions/--proj--/{leaf}"));
+
+        assert!(
+            !inst.pi_recorded_transcript_missing(),
+            "an uninspectable store is not evidence the conversation is gone"
+        );
+        assert_eq!(inst.pi_resumable_transcript(), None);
+
+        let store = inst.sandbox_capture_store_dir().expect("bind dir");
+        let sessions = store.join("agent").join("sessions").join("--proj--");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        assert!(
+            inst.pi_recorded_transcript_missing(),
+            "a readable store with no file is the pane's own answer"
+        );
+
+        std::fs::write(sessions.join(&leaf), "{}\n").unwrap();
+        assert!(!inst.pi_recorded_transcript_missing());
+        assert_eq!(
+            inst.pi_resumable_transcript(),
+            Some(format!("/root/.pi/agent/sessions/--proj--/{leaf}")),
+            "the pane resumes its own transcript by the path it published"
+        );
+
+        inst.pi_session_path = Some(format!("/home/u/.pi/agent/sessions/--proj--/{leaf}"));
+        assert!(!inst.pi_recorded_transcript_missing());
+    }
+
+    #[test]
+    fn pi_never_calls_a_transcript_missing_on_a_store_it_could_not_ask_about() {
+        let temp = tempfile::tempdir().unwrap();
+        let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let leaf = format!("2026-01-01T00-00-00-000Z_{id}.jsonl");
+        let store = temp.path().join("sessions");
+
+        let mut inst = tool_instance("pi", "/tmp/pi-host-store");
+        inst.agent_session_id = Some(id.to_string());
+        inst.pi_session_path = Some(store.join(&leaf).to_string_lossy().into_owned());
+
+        assert!(
+            !inst.pi_recorded_transcript_missing(),
+            "a store directory that is not there says nothing about the conversation"
+        );
+
+        std::fs::create_dir_all(&store).unwrap();
+        assert!(
+            inst.pi_recorded_transcript_missing(),
+            "a readable store with no file is the pane's own answer"
+        );
+
+        std::fs::write(store.join(&leaf), "{}\n").unwrap();
+        assert!(!inst.pi_recorded_transcript_missing());
+
+        let not_a_dir = temp.path().join("occupied");
+        std::fs::write(&not_a_dir, "").unwrap();
+        inst.pi_session_path = Some(not_a_dir.join(&leaf).to_string_lossy().into_owned());
+        assert!(
+            !inst.pi_recorded_transcript_missing(),
+            "a store path that is not a directory says nothing about the conversation"
+        );
+        inst.pi_session_path = Some(store.join(&leaf).to_string_lossy().into_owned());
+
+        if !nix::unistd::Uid::effective().is_root() {
+            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let denied = !inst.pi_recorded_transcript_missing();
+            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                denied,
+                "a transcript AoE is not allowed to stat must not read as gone"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pi_launch_drops_the_failing_session_selector_when_the_transcript_is_gone() {
+        let (_hooks, _base, _hooks_tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+
+        let profile = "pi-missing-transcript";
+        let profile_dir = crate::session::get_profile_dir(profile).unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "environment = [\"PATH=/usr/bin\"]\n",
+        )
+        .unwrap();
+
+        let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let transcript = temp
+            .path()
+            .join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
+
+        let mut inst = tool_instance("pi", "/tmp/pi-gone");
+        inst.command = "pi".to_string();
+        inst.source_profile = profile.to_string();
+        inst.agent_session_id = Some(id.to_string());
+        inst.pi_session_path = Some(transcript.to_string_lossy().into_owned());
+
+        let mut cmd = "pi".to_string();
+        let resumed = inst
+            .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("pi"), None)
+            .unwrap();
+        assert_eq!(cmd, "pi", "no selector may be handed to a doomed resume");
+        assert!(!resumed, "nothing was resumed");
+        assert_eq!(
+            inst.agent_session_id.as_deref(),
+            Some(id),
+            "acquisition leaves the row's id alone; only the selector is dropped"
+        );
+
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let mut cmd = "pi".to_string();
+        assert!(inst
+            .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("pi"), None)
+            .unwrap());
+        assert_eq!(cmd, format!("pi --session '{}'", transcript.display()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_observed_transcript_path_stays_retryable_until_stored() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
+        let profile = "pi-path-retry";
+        let sid = "01a05234-8889-72e2-a7c9-7ebc27b25b78";
+        let mut inst = Instance::new("pipathretry00001", "/tmp/pi-path-retry");
+        inst.source_profile = profile.to_string();
+        inst.tool = "pi".to_string();
+        inst.sandbox_info = Some(test_sandbox("aoe-pi-path-retry", None));
+        inst.agent_session_id = Some(sid.to_string());
+        let mut storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _| {
+                *instances = vec![seed.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let stored = |storage: &crate::session::storage::Storage| {
+            storage.load().unwrap()[0].pi_session_path.clone()
+        };
+        let published =
+            format!("/root/.pi/agent/sessions/--proj--/2026-01-01T00-00-00-000Z_{sid}.jsonl");
+        let observation = crate::session::poller::SessionIdObservation::instance_sidecar(
+            sid.to_string(),
+            Some(published.clone()),
+        );
+
+        // No sidecar exists to re-read: only the observation carries the path.
+        storage.set_fail_writes_for_test(true);
+        assert!(!inst.persist_pi_transcript_into(&storage, &observation, &published));
+        assert_eq!(
+            inst.pi_session_path, None,
+            "an unstored path must not look current"
+        );
+        storage.set_fail_writes_for_test(false);
+        assert_eq!(stored(&storage), None);
+
+        assert!(inst.persist_observed_pi_transcript(&observation));
+        assert_eq!(stored(&storage), Some(published.clone()));
+        assert_eq!(inst.pi_session_path, Some(published));
+
+        let foreign = crate::session::poller::SessionIdObservation::instance_sidecar(
+            sid.to_string(),
+            Some("/root/.pi/agent/sessions/--proj--/2026-01-01T00-00-00-000Z_other.jsonl".into()),
+        );
+        let before = stored(&storage);
+        assert!(inst.persist_observed_pi_transcript(&foreign));
+        assert_eq!(
+            stored(&storage),
+            before,
+            "a path naming another id is not stored"
+        );
+
+        inst.pi_session_path = None;
+        let moved_on =
+            format!("/root/.pi/agent/sessions/--proj--/2026-01-02T00-00-00-000Z_{sid}.jsonl");
+        let moved_observation = crate::session::poller::SessionIdObservation::instance_sidecar(
+            sid.to_string(),
+            Some(moved_on.clone()),
+        );
+        storage
+            .update(|instances, _| {
+                instances[0].resume_intent = ResumeIntent::Fork { from: sid.into() };
+                Ok(())
+            })
+            .unwrap();
+        assert!(inst.persist_pi_transcript_into(&storage, &moved_observation, &moved_on));
+        assert_eq!(
+            stored(&storage),
+            before,
+            "a pending fork cannot change the anchor path"
+        );
+
+        storage
+            .update(|instances, _| {
+                instances[0].agent_session_id = Some("row-moved-on".into());
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            inst.persist_pi_transcript_into(&storage, &moved_observation, &moved_on),
+            "a row that moved to another id makes the path stale, not pending"
+        );
+        assert_eq!(
+            stored(&storage),
+            before,
+            "a row that no longer holds the id is not written"
+        );
+    }
+
+    #[test]
+    fn pi_resumes_by_published_path_only_for_its_own_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let other = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+        let mine = temp
+            .path()
+            .join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
+        std::fs::write(&mine, "{}\n").unwrap();
+        let theirs = temp
+            .path()
+            .join(format!("2026-01-01T00-00-00-000Z_{other}.jsonl"));
+        std::fs::write(&theirs, "{}\n").unwrap();
+
+        let mut inst = tool_instance("pi", "/tmp/pi-path");
+        inst.agent_session_id = Some(id.to_string());
+
+        assert_eq!(
+            inst.pi_resumable_transcript(),
+            None,
+            "no path published yet"
+        );
+
+        inst.pi_session_path = Some(mine.to_string_lossy().to_string());
+        assert_eq!(
+            inst.pi_resumable_transcript().as_deref(),
+            Some(mine.to_string_lossy().as_ref()),
+            "the pane's own transcript resumes by path"
+        );
+
+        inst.pi_session_path = Some(theirs.to_string_lossy().to_string());
+        assert_eq!(
+            inst.pi_resumable_transcript(),
+            None,
+            "a path for another conversation must not be resumed"
+        );
+
+        inst.agent_session_id = Some("aaaaaaaa".to_string());
+        inst.pi_session_path = Some(mine.to_string_lossy().to_string());
+        assert_eq!(inst.pi_resumable_transcript(), None, "partial pin");
+        inst.agent_session_id = Some(id.to_string());
+
+        inst.pi_session_path = Some(
+            temp.path()
+                .join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl.gone"))
+                .to_string_lossy()
+                .to_string(),
+        );
+        assert_eq!(inst.pi_resumable_transcript(), None, "the file must exist");
+    }
+
+    #[test]
+    fn pi_relaunch_of_an_unwritten_pin_uses_the_creating_flag() {
+        let inst = tool_instance("pi", "/tmp/pi-pinned");
+
+        let minted = Some("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa");
+        for (label, pinnable, sid, explicit, expected) in [
+            ("minted, pinnable", true, minted, false, false),
+            ("minted, old binary", false, minted, true, true),
+            ("user-pinned partial", true, Some("aaaaaaaa"), true, true),
+            ("user-pinned full uuid", true, minted, true, true),
+            ("no id", false, None, false, false),
+        ] {
+            assert_eq!(
+                inst.resume_flag_arm_is_existing(None, sid.is_some(), pinnable, sid, explicit),
+                expected,
+                "{label}"
+            );
+        }
+
+        let claude = tool_instance("claude", "/tmp/pi-pinned");
+        assert!(claude.resume_flag_arm_is_existing(None, true, true, minted, false));
+        assert!(!claude.pi_session_id_pinnable());
+    }
+}

@@ -54,6 +54,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
         sandbox_info: None,
         source_profile: None,
         mcp_servers: Vec::new(),
+        claude_store_pin: None,
     }
 }
 

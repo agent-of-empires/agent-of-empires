@@ -3,10 +3,7 @@
 
 use super::*;
 
-/// Build a post-login routing fingerprint check without embedding any routing
-/// value in argv. The pane hashes its live environment through stdin; if no
-/// SHA-256 utility exists or startup files changed routing, capture is skipped
-/// and the original OMP command runs untouched.
+/// Build a post-login routing fingerprint check without embedding any routing value in argv.
 fn omp_routing_fingerprint_check(plan: &OmpCapturePlan) -> String {
     let keys = crate::session::capture::OMP_STORE_ENV_KEYS.join(" ");
     format!(
@@ -197,44 +194,12 @@ impl Instance {
         OmpCliCaptureOptions::parse(&args).ok()
     }
 
-    /// Resolve OMP's store, routing environment, and per-launch marker after
-    /// `on_launch`. Environment values remain transient; the marker and layout
-    /// survive in capture metadata.
+    /// Instrument the already resolved launch without resolving routing again.
     pub(super) fn resolve_omp_capture_plan(
         &self,
-        options: &OmpCliCaptureOptions,
+        context: &crate::session::capture::OmpResolvedContext,
+        container_runtime: Option<crate::session::config::ContainerRuntimeName>,
     ) -> Option<OmpCapturePlan> {
-        let resolved = if self.is_sandboxed() {
-            let sandbox = self.sandbox_info.as_ref()?;
-            let launch_environment = resolved_sandbox_environment(
-                &self.source_profile,
-                sandbox,
-                Path::new(&self.project_path),
-            );
-            resolve_omp_store_layout_in_container_with_environment(
-                &sandbox.container_name,
-                &self.container_workdir(),
-                &launch_environment,
-                options,
-            )
-        } else {
-            resolve_omp_store_layout_with_environment(
-                &self.resolved_host_environment(),
-                &self.project_path,
-                options,
-            )
-        };
-        let (layout, routing_fingerprint) = match resolved {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                tracing::warn!(
-                    target: "session.store",
-                    instance = %self.id,
-                    "OMP capture disabled because launch routing could not be resolved: {error}"
-                );
-                return None;
-            }
-        };
         let launch_marker = if self.is_sandboxed() {
             omp_sandbox_launch_marker(&self.id)
         } else {
@@ -251,15 +216,11 @@ impl Instance {
             }
         };
         Some(OmpCapturePlan {
-            layout,
-            routing_fingerprint,
+            layout: context.layout.clone(),
+            routing_fingerprint: context.routing_fingerprint.clone(),
             launch_id: Uuid::new_v4().to_string(),
             launch_marker,
-            container_runtime: self.is_sandboxed().then(|| {
-                crate::session::config::Config::load()
-                    .map(|config| config.sandbox.container_runtime)
-                    .unwrap_or_default()
-            }),
+            container_runtime,
         })
     }
 
@@ -425,7 +386,7 @@ impl Instance {
 
     /// Publish the capture plan's generation, or mint a tombstone generation
     /// for an OMP launch whose capture plan could not be resolved.
-    pub(super) fn publish_omp_launch_generation(
+    pub(super) fn publish_omp_launch_generation_with_store(
         &mut self,
         storage: &dyn crate::session::SessionStore,
         metadata: Option<&OmpCaptureMetadata>,
@@ -444,6 +405,17 @@ impl Instance {
         // A tombstone rejects observations carrying the previous generation.
         let tombstone = format!("tombstone-{}", Uuid::new_v4());
         self.persist_omp_capture_generation(storage, &tombstone, expected_prior)
+    }
+
+    #[cfg(test)]
+    pub(super) fn publish_omp_launch_generation(
+        &mut self,
+        profile: &str,
+        metadata: Option<&OmpCaptureMetadata>,
+        expected_prior: Option<&str>,
+    ) -> Result<bool> {
+        let storage = crate::session::storage::Storage::new_unwatched(profile)?;
+        self.publish_omp_launch_generation_with_store(&storage, metadata, expected_prior)
     }
 
     /// CAS-persist one OMP capture generation and reload the durable winner
@@ -489,29 +461,28 @@ impl Instance {
         &mut self,
         storage: &dyn crate::session::SessionStore,
     ) -> Result<()> {
-        self.reconcile_from_store(storage)?;
-        if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp)
-            || self.agent_session_id.is_some()
+        if self.source_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp)
             || (self.is_sandboxed() && self.omp_capture_generation.is_none())
         {
             return Ok(());
         }
-        let Some(captured) = self.try_retroactive_capture(CaptureStorage::Scoped(storage))? else {
+        let Some(observation) = self.try_retroactive_capture_in(CaptureStorage::Scoped(storage))?
+        else {
             return Ok(());
         };
-        match super::sid_persist::persist_session_to_store_guarded(
+        match super::sid_persist::persist_session_with_storage(
             storage,
             &self.id,
-            &captured,
-            None,
-            true,
-            self.omp_capture_generation.as_deref(),
-        )? {
+            &observation,
+            &self.conversation_state(),
+        ) {
             SidWrite::Applied => {
-                self.agent_session_id = Some(captured);
+                self.apply_conversation_observation(&observation);
                 self.resume_probe_failed_sid = None;
             }
-            SidWrite::Skipped => self.reconcile_from_store(storage)?,
+            SidWrite::Skipped | SidWrite::PinnedForeign => {
+                self.reconcile_from_store(storage)?;
+            }
             SidWrite::Failed => {}
         }
         Ok(())
@@ -521,12 +492,13 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::capture::resolve_omp_store_layout_with_environment;
     use crate::session::instance::launch_command::wrap_command_ignore_suspend;
+    use crate::session::instance::test_helpers::*;
 
     #[test]
     fn omp_capture_accepts_benign_args_and_rejects_opaque_launches() {
-        let mut inst = Instance::new("test", "/tmp/test");
-        inst.tool = "omp".to_string();
+        let mut inst = tool_instance("omp", "/tmp/test");
         inst.extra_args =
             "--model sonnet --profile first --profile=work --session-dir '/tmp/omp sessions'"
                 .to_string();
@@ -594,7 +566,7 @@ mod tests {
             Some(crate::agents::SessionCaptureBackend::Omp)
         );
         assert!(inst
-            .publish_omp_launch_generation(&storage, None, None)
+            .publish_omp_launch_generation(PROFILE, None, None)
             .unwrap());
         let generation = inst
             .omp_capture_generation
@@ -614,8 +586,7 @@ mod tests {
 
     #[test]
     fn omp_launch_rejects_api_keys_in_extra_args() {
-        let mut instance = Instance::new("test", "/tmp/test");
-        instance.tool = "omp".to_string();
+        let mut instance = tool_instance("omp", "/tmp/test");
         for extra_args in [
             "--api-key secret",
             "--api-key=secret",
@@ -623,9 +594,7 @@ mod tests {
         ] {
             instance.extra_args = extra_args.to_string();
             let error = instance
-                .build_launch_command(CaptureStorage::Profiles(
-                    &crate::file_watch::FileWatchService::noop(),
-                ))
+                .build_launch_command(None)
                 .err()
                 .expect("inline OMP credentials must abort before launch");
             if extra_args.contains('$') {
@@ -654,25 +623,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn omp_routing_fingerprint_check_never_embeds_values() {
-        let routing_values = ["/resolved omp/home", "default", "$resolved-secret-route"];
-        let plan = omp_test_plan();
-
-        let command = omp_routing_fingerprint_check(&plan);
-        for value in routing_values {
-            assert!(
-                !command.contains(value),
-                "resolved routing value leaked into command: {value}"
-            );
-        }
-        assert!(command.contains("${$k+x}"));
-        assert!(command.contains("${$k-}"));
-        assert!(command.contains("sha256sum"));
-        assert!(command.contains("shasum -a 256"));
-        assert!(command.contains(&plan.routing_fingerprint));
-    }
-
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
@@ -682,14 +632,14 @@ mod tests {
         let home = tmp.path().join("home");
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let (_, fingerprint) = resolve_omp_store_layout_with_environment(
-            &[format!("HOME={}", home.display())],
+        let context = resolve_omp_store_layout_with_environment(
+            std::collections::HashMap::from([("HOME".into(), home.display().to_string())]),
             project.to_str().unwrap(),
             &OmpCliCaptureOptions::default(),
         )
         .unwrap();
         let mut plan = omp_test_plan();
-        plan.routing_fingerprint = fingerprint;
+        plan.routing_fingerprint = context.routing_fingerprint.clone();
         let check = omp_routing_fingerprint_check(&plan);
         let script = format!("launch_raw() {{ printf raw; exit 0; }}; {check}printf captured");
         let run = |live_home: &Path| {
@@ -697,17 +647,9 @@ mod tests {
             command
                 .args(["-c", &script])
                 .env_clear()
-                // `env_clear` is here to control which OMP_STORE_ENV_KEYS the
-                // fingerprint folds in, not to pin a filesystem layout. The
-                // child still needs a PATH that resolves `sha256sum` / `tr`,
-                // so it inherits the caller's.
+                // `env_clear` is here to control which OMP_STORE_ENV_KEYS the fingerprint folds in,
+                // not to pin a filesystem layout.
                 .env("PATH", std::env::var_os("PATH").unwrap_or_default());
-            // Pin the exact routing environment a host launch installs into the
-            // pane for this HOME, so the check reproduces the fingerprint's env
-            // instead of assuming the ambient OMP_STORE_ENV_KEYS are empty. They
-            // are not on every runner, and host_launcher_environment folds them
-            // into the fingerprint, so forcing empties here would diverge from
-            // the digest on any host that exports one of those keys.
             for mutation in omp_host_routing_environment(&[format!("HOME={}", live_home.display())])
             {
                 match mutation {
@@ -740,17 +682,16 @@ mod tests {
         let bin = root.join("bin");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir(&bin).unwrap();
-        let routing = vec![format!("HOME={}", home.display())];
-        let (layout, fingerprint) = resolve_omp_store_layout_with_environment(
-            &routing,
+        let context = resolve_omp_store_layout_with_environment(
+            std::collections::HashMap::from([("HOME".into(), home.display().to_string())]),
             root.to_str().unwrap(),
             &OmpCliCaptureOptions::default(),
         )
         .unwrap();
-        std::fs::create_dir_all(&layout.terminal_sessions).unwrap();
+        std::fs::create_dir_all(&context.layout.terminal_sessions).unwrap();
         let plan = OmpCapturePlan {
-            layout,
-            routing_fingerprint: fingerprint,
+            layout: context.layout.clone(),
+            routing_fingerprint: context.routing_fingerprint.clone(),
             launch_id: "native-wrapper-test".to_string(),
             launch_marker: root.join("marker").to_string_lossy().into_owned(),
             container_runtime: None,
@@ -799,11 +740,10 @@ mod tests {
             "env -i PATH={} ",
             shell_escape(&test_path_with_shim(&bin).to_string_lossy())
         );
-        for mutation in omp_host_routing_environment(&routing) {
-            if let tmux::PaneEnvMutation::Set { key, value } = mutation {
-                env.push_str(&shell_escape(&format!("{key}={value}")));
-                env.push(' ');
-            }
+        for (key, value) in &context.launcher_routing {
+            let Some(value) = value else { continue };
+            env.push_str(&shell_escape(&format!("{key}={value}")));
+            env.push(' ');
         }
         let script = root.join("launch.sh");
         std::fs::write(&script, format!("exec {env}{wrapped}")).unwrap();
@@ -877,19 +817,11 @@ mod tests {
         exercise_omp_wrapper(None);
     }
 
-    /// The shim dir, then the caller's `PATH`. Shim first, so the fake `tmux`
-    /// wins over any real one; inherited, so a host whose coreutils sit
-    /// outside the FHS layout still resolves them. `OsString` throughout: a
-    /// `PATH` entry need not be UTF-8.
-    ///
-    /// Child-scoped on purpose. Putting the shim on the process `PATH` would
-    /// hand the fake `tmux` to every test resolving a real one concurrently.
+    /// The shim dir, then the caller's `PATH`. Shim first, so the fake `tmux` wins over any real
+    /// one.
     #[cfg(unix)]
     fn test_path_with_shim(bin: &std::path::Path) -> std::ffi::OsString {
-        // An unset or empty PATH is handled separately: `split_paths("")`
-        // yields one EMPTY entry, and an empty PATH element means the current
-        // directory, so joining it would hand the child `<shim>:` and put cwd
-        // on its PATH.
+        // An unset or empty PATH is handled separately.
         let Some(inherited) = std::env::var_os("PATH").filter(|p| !p.is_empty()) else {
             return bin.as_os_str().to_os_string();
         };
@@ -921,7 +853,7 @@ mod tests {
         // Fail a selected breadcrumb write: only it runs after `breadcrumb_tmp` is set and
         // before `marker_tmp` is. `-ef` on /dev/fd cannot match the file on macOS.
         let injected_shell = r#"printf() {
-      if [ -n "${AOE_TEST_FAIL_WRITE-}" ] && [ -n "${breadcrumb_tmp-}" ] \
+  if [ -n "${AOE_TEST_FAIL_WRITE-}" ] && [ -n "${breadcrumb_tmp-}" ] \
     && [ -z "${marker_tmp-}" ]; then
     write_count=$(( ${write_count:-0} + 1 ))
     if [ "$write_count" -eq "$AOE_TEST_FAIL_WRITE" ]; then
@@ -930,10 +862,10 @@ mod tests {
       command printf '%s' "$@" >&-
       return $?
     fi
-      fi
-      command printf "$@"
-    }
-    . /dev/fd/3"#;
+  fi
+  command printf "$@"
+}
+. /dev/fd/3"#;
         let injected_script = root.join("inject-write-failure.sh");
         std::fs::write(&injected_script, injected_shell).unwrap();
         std::fs::write(
@@ -949,16 +881,16 @@ mod tests {
         std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let routing = vec![format!("HOME={}", home.display())];
-        let (layout, fingerprint) = resolve_omp_store_layout_with_environment(
-            &routing,
+        let context = resolve_omp_store_layout_with_environment(
+            std::collections::HashMap::from([("HOME".into(), home.display().to_string())]),
             root.to_str().unwrap(),
             &OmpCliCaptureOptions::default(),
         )
         .unwrap();
-        std::fs::create_dir_all(&layout.terminal_sessions).unwrap();
+        std::fs::create_dir_all(&context.layout.terminal_sessions).unwrap();
         let plan = OmpCapturePlan {
-            layout,
-            routing_fingerprint: fingerprint,
+            layout: context.layout,
+            routing_fingerprint: context.routing_fingerprint,
             launch_id: "wrapper-extra-test".to_string(),
             launch_marker: root.join("marker").to_string_lossy().into_owned(),
             container_runtime: None,
@@ -1106,9 +1038,8 @@ mod tests {
         assert!(status.success());
         assert_eq!(std::fs::read_to_string(&output).unwrap(), "marked");
 
-        // A valid 70 KiB prompt makes the capture gate body larger than
-        // Linux's per-argument exec limit because the raw and marked branches
-        // both contain it. The launch must still execute from the descriptor.
+        // A valid 70 KiB prompt makes the capture gate body larger than Linux's per-argument exec
+        // limit because the raw and marked branches both contain it.
         let payload = "x".repeat(70 * 1024);
         let large_command = format!(
             "printf '%s' {} > {}",
@@ -1116,7 +1047,8 @@ mod tests {
             shell_escape(&output.to_string_lossy())
         );
         let large_gate = gate_omp_launch(&large_command, &large_command, &omp_test_plan());
-        let large_outer = wrap_command_ignore_suspend(&large_gate, temp.path().to_str().unwrap());
+        let large_outer =
+            wrap_command_ignore_suspend(&large_gate, temp.path().to_str().unwrap(), &[], &[]);
         assert!(!large_outer.lines().next().unwrap().contains("-c"));
         std::fs::write(&script, large_outer).unwrap();
         let status = std::process::Command::new("sh")

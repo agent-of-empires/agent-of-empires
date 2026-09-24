@@ -341,6 +341,90 @@ fn restart_selected_session_debounces_via_cooldown_map() {
 
 #[test]
 #[serial]
+fn restart_tool_swap_refuses_a_foreign_pending_fork() {
+    if crate::tmux::tmux_command().arg("-V").output().is_err() {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    crate::session::config::update_app_state(|state| state.has_acknowledged_agent_hooks = true)
+        .unwrap();
+    let launched = temp.path().join("launched");
+    let _path = crate::session::test_support::install_login_shell_path_command(
+        temp.path(),
+        "codex",
+        &format!(
+            "#!/bin/sh\n: > {}\nsleep 60\n",
+            shell_words::quote(launched.to_str().unwrap())
+        ),
+    );
+    let profile = "pending-fork-swap";
+    let storage = Storage::new_unwatched(profile).unwrap();
+    let mut inst = Instance::new("pending-fork", temp.path().to_str().unwrap());
+    inst.source_profile = profile.into();
+    inst.tool = "claude".into();
+    inst.command.clear();
+    let sid = "11111111-1111-4111-8111-111111111111";
+    inst.resume_intent = crate::session::ResumeIntent::Fork { from: sid.into() };
+    inst.resume_binding = Some(crate::session::ConversationBinding {
+        session_id: sid.into(),
+        provenance: crate::session::ConversationProvenance::Observed,
+        execution: Some(crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![temp.path().join(".claude")],
+            configuration: Vec::new(),
+            cwd: temp.path().canonicalize().unwrap(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        }),
+        transcript_path: None,
+    });
+    let id = inst.id.clone();
+    let name = crate::tmux::Session::generate_name(&id, &inst.title);
+    storage
+        .update(|instances, _| {
+            *instances = vec![inst.clone()];
+            Ok(())
+        })
+        .unwrap();
+    let mut view = HomeView::new(
+        Some(profile.into()),
+        AvailableTools::with_tools(&["claude", "codex"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    let mut respond = view.session_feed.command_driver_for_test();
+    view.update_selected();
+    view.selected_session = Some(id.clone());
+    view.restart_selected_session(None, Some("codex"), None, None)
+        .unwrap();
+    let mut applied = false;
+    for _ in 0..120 {
+        let _ = respond(Err("restart refused before launch".to_string()));
+        if view.apply_restart_results() {
+            applied = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = crate::tmux::tmux_command()
+        .args(["kill-session", "-t", &name])
+        .output();
+    assert!(applied, "restart worker did not complete");
+    assert!(
+        !launched.exists(),
+        "a pending fork was dispatched as a fresh foreign session"
+    );
+    let rows = storage.load().unwrap();
+    let row = rows.iter().find(|row| row.id == id).unwrap();
+    assert!(
+        matches!(&row.resume_intent, crate::session::ResumeIntent::Fork { from } if from == sid)
+    );
+    assert_eq!(row.status, crate::session::Status::Idle);
+}
+
+#[test]
+#[serial]
 fn sending_to_a_session_that_is_gone_is_refused_before_any_pane_work() {
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();

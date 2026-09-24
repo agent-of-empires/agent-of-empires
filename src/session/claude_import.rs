@@ -18,6 +18,8 @@ pub const MAX_SESSIONS: usize = 200;
 pub struct ClaudeSessionSummary {
     /// The on-disk session id (filename stem). Fed to `session/load`.
     pub session_id: String,
+    #[serde(skip)]
+    pub config_dir: PathBuf,
     /// The working directory recorded in the transcript. The structured
     /// session must run here for `claude --resume` to resolve the file.
     pub cwd: String,
@@ -133,7 +135,7 @@ pub fn scan_sessions_in(config_dir: &Path) -> Vec<ClaudeSessionSummary> {
             if fpath.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            if let Some(summary) = summarize_file(&fpath) {
+            if let Some(summary) = summarize_file(&fpath, config_dir) {
                 // Scratch sessions live under `<app_dir>/scratch/<id>`.
                 if cwd_is_aoe_scratch(&summary.cwd) {
                     continue;
@@ -168,7 +170,7 @@ pub fn sessions_under_paths(
 
 /// Build a summary for one `.jsonl` file. Returns `None` when the file has no
 /// recoverable `cwd` (a session we could not safely resume), or no session id.
-fn summarize_file(path: &Path) -> Option<ClaudeSessionSummary> {
+fn summarize_file(path: &Path, config_dir: &Path) -> Option<ClaudeSessionSummary> {
     let session_id = path.file_stem()?.to_str()?.to_string();
 
     let last_modified_ms = fs::metadata(path)
@@ -209,6 +211,7 @@ fn summarize_file(path: &Path) -> Option<ClaudeSessionSummary> {
     let cwd_exists = Path::new(&cwd).is_dir();
     Some(ClaudeSessionSummary {
         session_id,
+        config_dir: crate::session::capture::canonicalize_or_raw(config_dir.to_str()?),
         cwd,
         title,
         last_modified_ms,
@@ -290,7 +293,7 @@ mod tests {
             ],
         );
 
-        let s = summarize_file(&path).unwrap();
+        let s = summarize_file(&path, path.parent().unwrap()).unwrap();
         assert_eq!(s.session_id, "713b7f46-d0f2-454e-91be-a3305d35660c");
         assert_eq!(s.cwd, cwd_str);
         assert_eq!(s.title.as_deref(), Some("Fix the spinner bug please"));
@@ -339,7 +342,7 @@ mod tests {
                 r#"{"type":"user","cwd":"/nonexistent/path/xyz","message":{"role":"user","content":"hi"}}"#,
             ],
         );
-        let s = summarize_file(&path).unwrap();
+        let s = summarize_file(&path, path.parent().unwrap()).unwrap();
         assert_eq!(s.cwd, "/nonexistent/path/xyz");
         assert!(!s.cwd_exists);
         assert_eq!(s.title.as_deref(), Some("hi"));
@@ -394,12 +397,13 @@ mod tests {
             "nocwd",
             &[r#"{"type":"last-prompt","sessionId":"nocwd"}"#],
         );
-        assert!(summarize_file(&path).is_none());
+        assert!(summarize_file(&path, path.parent().unwrap()).is_none());
     }
 
     fn summary(id: &str, cwd: &str) -> ClaudeSessionSummary {
         ClaudeSessionSummary {
             session_id: id.to_string(),
+            config_dir: PathBuf::from("/claude-import-store"),
             cwd: cwd.to_string(),
             title: None,
             last_modified_ms: 0,

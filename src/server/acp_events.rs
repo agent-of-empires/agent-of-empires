@@ -358,7 +358,20 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
         if status_intent.is_none() && acp_change.is_none() && load_session_capability.is_none() {
             continue;
         }
+        // Identity events share the per-session mutation lock with pollers and
+        // lifecycle callers. Hold it through the durable write so a concurrent
+        // SID publication cannot be overwritten by a stale ACP observation.
+        let identity_lock = if acp_change.is_some() {
+            Some(state.instance_lock(&frame.session_id).await)
+        } else {
+            None
+        };
+        let _identity_guard = match &identity_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
 
+        let mut canonical_changed = false;
         // Acquire `instances` once for both branches. Releases before
         // the (potentially blocking) sessions.json save.
         let (profile_to_save, unread_profile) = {
@@ -382,8 +395,10 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     .acp_supervisor
                     .is_current_worker_generation(&frame.session_id, generation)
                     .await
+                    && inst.acp_load_session_capable != Some(capable)
                 {
                     inst.acp_load_session_capable = Some(capable);
+                    canonical_changed = true;
                 }
             }
 
@@ -397,15 +412,25 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             // assign `status` more than once has to revisit this.
             let old_status = inst.status;
             apply_status_intent(inst, status_intent, &state.status_tx);
+            canonical_changed |= old_status != inst.status;
             let unread_profile =
                 should_mark_acp_unread(inst, old_status, crate::session::unread_enabled())
                     .then(|| inst.source_profile.clone());
-
-            (
-                apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref()),
-                unread_profile,
-            )
+            let profile_to_save =
+                apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref());
+            canonical_changed |= profile_to_save.is_some();
+            (profile_to_save, unread_profile)
         };
+        if canonical_changed {
+            state
+                .mutation_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        // Identity and turn-end are disjoint ACP events. If a future event ever
+        // combines them, release the identity guard before the unread helper takes it.
+        if unread_profile.is_some() {
+            drop(_identity_guard);
+        }
 
         // The turn just finished, so the row takes the automatic unread mark.
         // This is the sole producer of it for a structured row. The tmux poll
@@ -482,6 +507,9 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     );
                 }
             }
+        }
+        if canonical_changed {
+            state.runtime.request_publish();
         }
     }
 }
@@ -812,6 +840,9 @@ pub(super) fn apply_acp_session_change(
     session_id: &str,
     change: Option<&AcpSessionChange>,
 ) -> Option<String> {
+    if !inst.is_structured() {
+        return None;
+    }
     match change? {
         AcpSessionChange::Assigned(new_id) => {
             // A worker just initialized (session/new or session/load), so the
@@ -1657,9 +1688,17 @@ mod tests {
     async fn acp_event_listener_tracks_load_session_capability_updates() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("acp-session", "/tmp/acp");
+        inst.source_profile = "listener-capability".into();
         inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some("same-acp-id".to_string());
         let id = inst.id.clone();
+        crate::session::Storage::new_unwatched(&inst.source_profile)
+            .unwrap()
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
         let state = test_support::build_test_app_state(vec![inst]);
         let first_generation = state.acp_supervisor.test_insert_worker(&id).await;
         let listener = tokio::spawn(acp_event_listener(state.clone()));
@@ -2176,6 +2215,7 @@ mod tests {
     #[test]
     fn acp_session_assigned_clears_stale_dormant_marker_on_same_id() {
         let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some("sid-1".to_string());
         inst.idle_dormant_since = Some(chrono::Utc::now());
 
@@ -2237,6 +2277,7 @@ mod tests {
     #[test]
     fn non_fork_assignment_preserves_import_pending() {
         let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
         inst.acp_session_id = None;
         inst.fork_pending = None;
         inst.import_pending = Some(true);
@@ -2297,6 +2338,7 @@ mod tests {
     #[test]
     fn reset_without_fork_pending_preserves_import_pending() {
         let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
         inst.acp_session_id = Some("dead-id".into());
         inst.fork_pending = None;
         inst.import_pending = Some(true);
@@ -2392,6 +2434,24 @@ mod tests {
             inst.acp_session_id, None,
             "a /clear after an assignment must not leave the old id on disk"
         );
+    }
+    #[test]
+    fn acp_session_changes_do_not_mutate_terminal_conversations() {
+        let mut inst = Instance::new("terminal", "/tmp/terminal");
+        inst.view = crate::session::View::Terminal;
+        inst.resume_intent = crate::session::ResumeIntent::Use("native-id".into());
+        let expected = inst.conversation_state();
+
+        assert_eq!(
+            apply_acp_session_change(
+                &mut inst,
+                "terminal",
+                Some(&AcpSessionChange::Assigned("acp-id".into())),
+            ),
+            None
+        );
+        assert!(expected.matches(&inst));
+        assert_eq!(inst.acp_session_id, None);
     }
 
     #[test]

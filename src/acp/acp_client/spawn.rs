@@ -60,6 +60,7 @@ pub struct SpawnConfig {
     pub wrapper_substitution: Option<(String, String)>,
     /// Lifecycle epoch stamped on the runner's registry record.
     pub generation: u64,
+    pub claude_store_pin: Option<PathBuf>,
 }
 
 /// Request-sourced keys may not redirect infrastructure the operator env
@@ -253,7 +254,60 @@ fn apply_stdio_env(
     keys
 }
 
-pub(super) fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpError> {
+pub(super) fn native_store_snapshot(
+    config: &SpawnConfig,
+    command: &std::process::Command,
+    overrides: &[(String, String)],
+) -> Option<crate::session::ExecutionBinding> {
+    if config.sandbox_info.is_some()
+        || !matches!(config.agent_key.as_str(), "claude" | "claude-code")
+    {
+        return None;
+    }
+    let value = |name: &str| {
+        overrides
+            .iter()
+            .rev()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .or_else(|| {
+                command
+                    .get_envs()
+                    .find(|(key, _)| *key == name)
+                    .and_then(|(_, value)| value?.to_str().map(str::to_owned))
+            })
+            .filter(|value| !value.is_empty())
+    };
+    let cwd = crate::session::capture::canonicalize_allowing_missing_leaf(&config.cwd)?;
+    let root = value("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| value("HOME").map(|home| PathBuf::from(home).join(".claude")))?;
+    let root = if root.is_absolute() {
+        root
+    } else {
+        cwd.join(root)
+    };
+    Some(crate::session::ExecutionBinding {
+        agent: "claude".into(),
+        stores: vec![crate::session::capture::canonicalize_allowing_missing_leaf(
+            &root,
+        )?],
+        configuration: Vec::new(),
+        cwd,
+        filesystem: "host".into(),
+        cwd_filesystem: "host".into(),
+    })
+}
+
+pub(super) fn spawn_subprocess(
+    config: &SpawnConfig,
+) -> Result<
+    (
+        tokio::process::Child,
+        Option<crate::session::ExecutionBinding>,
+    ),
+    AcpError,
+> {
     // The daemon's PATH is frozen at launch, so resolve against known
     // node-manager dirs too (#1048).
     let app_dir = crate::session::get_app_dir().ok();
@@ -289,6 +343,7 @@ pub(super) fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::C
         "spawning ACP agent subprocess"
     );
 
+    let native_store = native_store_snapshot(config, cmd.as_std(), &[]);
     let mut child = cmd.spawn().map_err(|e| {
         warn!(
             target: "acp.protocol.spawn",
@@ -321,7 +376,7 @@ pub(super) fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::C
             "child has no stderr handle; agent crashes will be silent"
         ),
     }
-    Ok(child)
+    Ok((child, native_store))
 }
 
 /// An undrained stderr pipe fills and blocks the agent, which looks like a

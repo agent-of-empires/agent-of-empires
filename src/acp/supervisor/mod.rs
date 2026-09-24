@@ -112,6 +112,7 @@ struct WorkerHandle {
     restart_history: Vec<Instant>,
     kind: WorkerKind,
     lease: Lease,
+    native_session_id: Option<String>,
 }
 
 impl From<WorkerPhase> for AcpWorkerState {
@@ -217,6 +218,8 @@ pub struct SpawnRequest {
     pub agent_command_override: Option<AgentCommandOverride>,
     /// Let a `session/load` replay history into the (empty) event store for an import.
     pub seed_history_replay: bool,
+    /// Claude store selected by the conversation binding for a host Claude worker.
+    pub claude_store_pin: Option<PathBuf>,
 }
 
 impl<S: BroadcastSink> Supervisor<S> {
@@ -363,6 +366,23 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await
             .get(session_id)
             .is_some_and(|worker| worker.lease.epoch() == generation)
+    }
+
+    /// Return the native store owned by the current worker only when it still
+    /// owns the ACP identity being handed back to a terminal.
+    pub(crate) async fn native_handoff_store(
+        &self,
+        session_id: &str,
+        acp_session_id: &str,
+    ) -> Option<crate::session::ExecutionBinding> {
+        let workers = self.workers.lock().await;
+        let handle = workers.get(session_id)?;
+        if !lock_recover(&self.lifecycle).is_running(session_id)
+            || handle.native_session_id.as_deref() != Some(acp_session_id)
+        {
+            return None;
+        }
+        handle.client.native_store.clone()
     }
 
     /// Whether this daemon holds the session's lease in any phase, including stopping.

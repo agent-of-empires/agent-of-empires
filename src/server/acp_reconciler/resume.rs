@@ -315,10 +315,18 @@ async fn build_spawn_request(
     let inst_lock = service.instance_lock(&target.id).await;
     // Re-read under the session lock, for two reasons. A worktree rename holds
     // it across the move, so a snapshotted path could be stale (#2260); and the
-    // three persisted selectors can be re-picked after the tick snapshotted
+    // persisted selectors can be re-picked after the tick snapshotted
     // this target, which the handshake then re-asserts at the agent. Released
     // before ensure_container, which takes the same lock.
-    let (cwd, seed_history_replay, fork_from, acp_mode_id, acp_effort, agent_model) = {
+    let (
+        cwd,
+        seed_history_replay,
+        fork_from,
+        acp_mode_id,
+        acp_effort,
+        agent_model,
+        claude_store_pin,
+    ) = {
         let _guard = inst_lock.lock().await;
         let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
@@ -331,6 +339,8 @@ async fn build_spawn_request(
             inst.acp_mode_id.clone(),
             inst.acp_effort.clone(),
             inst.agent_model.clone(),
+            inst.selected_claude_conversation()
+                .and_then(|(_, execution)| execution.stores.first().cloned()),
         )
     };
     let agent = supervisor
@@ -377,6 +387,7 @@ async fn build_spawn_request(
         acp_mode_id,
         agent_command_override: command_override_for_spawn(&target.tool, &target.command),
         seed_history_replay,
+        claude_store_pin,
     })
 }
 

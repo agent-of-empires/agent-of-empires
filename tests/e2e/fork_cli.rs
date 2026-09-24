@@ -29,8 +29,7 @@ fn patch_session(h: &TuiTestHarness, title: &str, patch: impl Fn(&mut Value)) {
     .expect("write seeded sessions.json");
 }
 
-/// Add a parent session running `tool` and give it a captured agent id, which
-/// is what the fork gate keys off.
+/// Add a parent session and assert its native conversation through the CLI.
 fn seed_parent(h: &TuiTestHarness, project: &Path, title: &str, tool: &str) {
     h.run_cli_ok(&[
         "add",
@@ -40,9 +39,7 @@ fn seed_parent(h: &TuiTestHarness, project: &Path, title: &str, tool: &str) {
         "-t",
         title,
     ]);
-    patch_session(h, title, |session| {
-        session["agent_session_id"] = json!(PARENT_AGENT_ID);
-    });
+    h.run_cli_ok(&["session", "set-session-id", title, PARENT_AGENT_ID]);
 }
 
 fn assert_not_persisted(h: &TuiTestHarness, title: &str) {
@@ -76,6 +73,8 @@ fn fork_from_seeds_child_with_fork_intent() {
     let h = TuiTestHarness::new("fork_cli_happy");
     let project = h.project_path();
     seed_parent(&h, &project, "ForkParent", "claude");
+    let before = h.read_sessions();
+    let parent_before = session_by_title(&before, "ForkParent").clone();
 
     h.run_cli_ok(&[
         "add",
@@ -86,8 +85,9 @@ fn fork_from_seeds_child_with_fork_intent() {
         "ForkChild",
         "--fork-from",
         "ForkParent",
+        "--extra-args",
+        "--append-system-prompt resume",
     ]);
-
     let sessions = h.read_sessions();
     let child = session_by_title(&sessions, "ForkChild");
     let child_agent_id = child["agent_session_id"]
@@ -105,13 +105,10 @@ fn fork_from_seeds_child_with_fork_intent() {
         "the Fork intent must resume the parent's captured id"
     );
 
-    let parent = session_by_title(&sessions, "ForkParent");
-    assert_eq!(parent["agent_session_id"].as_str(), Some(PARENT_AGENT_ID));
-    assert!(
-        parent["resume_intent"].is_null()
-            || parent["resume_intent"]["kind"].as_str() == Some("Default"),
-        "parent must not gain a Fork intent, got: {:?}",
-        parent["resume_intent"]
+    assert_eq!(
+        session_by_title(&sessions, "ForkParent"),
+        &parent_before,
+        "forking must not mutate the parent"
     );
 }
 
@@ -138,6 +135,107 @@ fn fork_from_inherits_the_parents_agent() {
     );
 }
 
+#[test]
+#[parallel]
+fn restarting_a_never_launched_claude_session_dispatches_fresh() {
+    crate::harness::require_tmux!();
+    let mut h = TuiTestHarness::new("restart_unlaunched_claude");
+    install_dispatch_marker(&mut h, "claude");
+    let project = h.project_path();
+    h.run_cli_ok(&[
+        "add",
+        project.to_str().unwrap(),
+        "-c",
+        "claude",
+        "-t",
+        "FreshRestart",
+    ]);
+    h.run_cli_ok(&["session", "restart", "FreshRestart"]);
+    let marker = h.home_path().join("native-spawn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "dispatched");
+    let _ = h.run_cli(&["session", "stop", "FreshRestart"]);
+}
+
+fn install_dispatch_marker(h: &mut TuiTestHarness, agent: &str) {
+    let bin = h.install_path_command(agent);
+    let marker = h.home_path().join("native-spawn");
+    std::fs::write(
+        bin.join(agent),
+        format!(
+            "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nprintf dispatched > {}\n",
+            shell_words::quote(&marker.to_string_lossy()),
+        ),
+    )
+    .unwrap();
+}
+
+fn assert_launch_refused(h: &TuiTestHarness, title: &str) {
+    let before = h.read_sessions();
+    h.run_cli_err(&["session", "start", title]);
+    assert!(
+        !h.home_path().join("native-spawn").exists(),
+        "native dispatch must not occur"
+    );
+    let after = h.read_sessions();
+    for field in [
+        "agent_session_id",
+        "agent_session_binding",
+        "resume_intent",
+        "resume_binding",
+        "active_execution",
+        "pi_session_path",
+    ] {
+        assert_eq!(
+            session_by_title(&before, title)[field],
+            session_by_title(&after, title)[field],
+            "refusal changed {field}"
+        );
+    }
+}
+
+#[test]
+#[parallel]
+fn fork_from_mismatched_tool_is_refused_at_launch() {
+    let mut h = TuiTestHarness::new("fork_cli_tool_match");
+    let project = h.project_path();
+    install_dispatch_marker(&mut h, "gemini");
+    seed_parent(&h, &project, "MatchParent", "claude");
+    h.run_cli_ok(&[
+        "add",
+        project.to_str().unwrap(),
+        "--tool",
+        "gemini",
+        "-t",
+        "MismatchChild",
+        "--fork-from",
+        "MatchParent",
+    ]);
+    assert_launch_refused(&h, "MismatchChild");
+}
+
+#[test]
+#[parallel]
+fn fork_with_native_selector_is_refused_at_launch() {
+    let mut h = TuiTestHarness::new("fork_cli_native_selector");
+    let project = h.project_path();
+    install_dispatch_marker(&mut h, "claude");
+    seed_parent(&h, &project, "SelectorParent", "claude");
+    h.run_cli_ok(&[
+        "add",
+        project.to_str().unwrap(),
+        "--cmd",
+        "claude --resume abc",
+        "-t",
+        "SelectorChild",
+        "--fork-from",
+        "SelectorParent",
+    ]);
+    assert_launch_refused(&h, "SelectorChild");
+}
 /// Every way a fork can be refused: a different agent (a captured id is
 /// agent-specific), an agent with no fork capability, flags that change the
 /// working directory or carry their own resume/fork flags, a parent with no
@@ -161,11 +259,6 @@ fn fork_from_refusals_persist_nothing() {
     }
     let cases = [
         Case {
-            parent: Parent::Seeded("claude"),
-            args: &["--tool", "gemini"],
-            expect: "must use the parent's agent",
-        },
-        Case {
             // gemini is resume-only, so the parent uses it too and the
             // unforkable-agent gate is the only possible rejection.
             parent: Parent::Seeded("gemini"),
@@ -175,7 +268,7 @@ fn fork_from_refusals_persist_nothing() {
         Case {
             parent: Parent::Seeded("claude"),
             args: &["--worktree", "wt-branch"],
-            expect: "",
+            expect: "--worktree",
         },
         Case {
             parent: Parent::Seeded("claude"),
@@ -185,23 +278,7 @@ fn fork_from_refusals_persist_nothing() {
         Case {
             parent: Parent::Seeded("claude"),
             args: &["--sandbox"],
-            expect: "",
-        },
-        Case {
-            parent: Parent::Seeded("claude"),
-            args: &["--cmd", "claude --resume abc"],
-            expect: "",
-        },
-        Case {
-            // Codex's bare `fork` subcommand, matched as a word.
-            parent: Parent::Seeded("claude"),
-            args: &["--cmd", "codex fork abc"],
-            expect: "",
-        },
-        Case {
-            parent: Parent::Seeded("claude"),
-            args: &["--cmd-override", "some-other-binary"],
-            expect: "",
+            expect: "--sandbox",
         },
         Case {
             // A terminal fork cannot carry its state onto a structured session.

@@ -33,8 +33,8 @@ use layout::*;
 
 pub(crate) use container::{omp_poll_fn_sandboxed, try_capture_omp_session_id_in_container};
 pub(crate) use layout::{
-    omp_host_routing_environment, resolve_omp_store_layout,
-    resolve_omp_store_layout_in_container_with_environment,
+    host_launcher_environment, omp_host_routing_environment, read_container_environment,
+    resolve_omp_store_layout, resolve_omp_store_layout_in_container_with_environment,
     resolve_omp_store_layout_with_environment,
 };
 pub(crate) use options::{reject_omp_secret_args, OmpCliCaptureOptions};
@@ -78,6 +78,23 @@ pub(crate) struct OmpStoreLayout {
     pub managed_sessions: PathBuf,
     pub terminal_sessions: PathBuf,
     pub kind: OmpStoreKind,
+}
+
+#[derive(Debug)]
+pub(crate) struct OmpResolvedContext {
+    pub(crate) layout: OmpStoreLayout,
+    pub(crate) routing_fingerprint: String,
+    pub(crate) launcher_routing: Vec<(String, Option<String>)>,
+    pub(crate) profile: Option<String>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) agent_dir: PathBuf,
+}
+
+fn omp_routing_values(environment: &HashMap<String, String>) -> Vec<(String, Option<String>)> {
+    OMP_STORE_ENV_KEYS
+        .iter()
+        .map(|key| ((*key).to_owned(), environment.get(*key).cloned()))
+        .collect()
 }
 
 /// Transient launch snapshot; only the routing fingerprint reaches pane metadata.
@@ -321,7 +338,7 @@ fn lexical_store_session_path(
 
 /// Re-checks store membership on the canonical path before the host opens it,
 /// so an in-store directory symlink cannot redirect the read.
-fn ensure_canonical_store(layout: &OmpStoreLayout, session_path: &Path) -> Result<()> {
+fn ensure_canonical_store(layout: &OmpStoreLayout, session_path: &Path) -> Result<PathBuf> {
     let active_components = match layout.kind {
         OmpStoreKind::Managed => 2,
         OmpStoreKind::Custom => 1,
@@ -343,7 +360,7 @@ fn ensure_canonical_store(layout: &OmpStoreLayout, session_path: &Path) -> Resul
         canonical_store,
         "OMP breadcrumb resolves outside its allowed session store"
     );
-    Ok(())
+    Ok(canonical_path)
 }
 
 /// Rejects an excluded id and requires a materialized header to match the
@@ -507,11 +524,66 @@ fn read_host_breadcrumb(root: &Path, terminal_id: &str) -> Result<(String, u64)>
     Ok((content, modified_at_ms))
 }
 
+fn omp_source_observation(
+    metadata: &OmpCaptureMetadata,
+    sid: String,
+    session_path: &Path,
+    cwd: &str,
+    active: Option<&crate::session::instance::ActiveExecution>,
+) -> Result<crate::session::poller::SessionIdObservation> {
+    let mut observation = metadata.session_observation(sid);
+    let Some(active) = active else {
+        return Ok(observation);
+    };
+    anyhow::ensure!(
+        matches!(&active.capture,
+        Some(crate::session::instance::CaptureContext::Omp(expected)) if expected == metadata),
+        "OMP source metadata differs from the recorded launch"
+    );
+    anyhow::ensure!(
+        active.binding.agent == "omp",
+        "OMP source has a different native identity"
+    );
+    let (filesystem, path, cwd_filesystem, cwd) = if let Some(container) = &active.container {
+        let path = container
+            .runtime
+            .canonical_path(&container.id, session_path)?;
+        let cwd = container
+            .runtime
+            .canonical_path(&container.id, Path::new(cwd))?;
+        let (filesystem, path) = container.physical_path(&path);
+        let (cwd_filesystem, cwd) = container.physical_path(&cwd);
+        (filesystem, path, cwd_filesystem, cwd)
+    } else {
+        (
+            "host".to_owned(),
+            ensure_canonical_store(&metadata.layout, session_path)?,
+            "host".to_owned(),
+            super::canonicalize_or_raw(cwd),
+        )
+    };
+    anyhow::ensure!(
+        cwd == active.binding.cwd && cwd_filesystem == active.binding.cwd_filesystem,
+        "OMP transcript belongs to another working directory or filesystem"
+    );
+    let mut source = active.binding.clone();
+    source.stores = vec![path
+        .parent()
+        .context("OMP transcript has no store directory")?
+        .to_path_buf()];
+    source.filesystem = filesystem;
+    observation.execution = Some(active.clone());
+    observation.source = Some(source);
+    observation.transcript_path = Some(path);
+    Ok(observation)
+}
+
 fn capture_omp_session_id_from_terminal(
     metadata: &OmpCaptureMetadata,
     exclusion: &HashSet<String>,
     terminal_id: &str,
-) -> Result<String> {
+    active: Option<&crate::session::instance::ActiveExecution>,
+) -> Result<crate::session::poller::SessionIdObservation> {
     validate_layout(&metadata.layout)?;
     if !valid_omp_terminal_id(terminal_id) {
         anyhow::bail!("Invalid OMP terminal id");
@@ -519,8 +591,6 @@ fn capture_omp_session_id_from_terminal(
     let (content, modified_at_ms) =
         read_host_breadcrumb(&metadata.layout.terminal_sessions, terminal_id)?;
     let breadcrumb = parse_breadcrumb(&content)?;
-    // The marker only proves the breadcrumb is not the pre-launch sentinel;
-    // post-launch authorship additionally needs freshness.
     validate_launch_marker(metadata, terminal_id, breadcrumb.session_path)?;
     anyhow::ensure!(
         modified_at_ms > metadata.launched_at_ms,
@@ -536,22 +606,21 @@ fn capture_omp_session_id_from_terminal(
     } else {
         None
     };
+    let cwd = breadcrumb.cwd;
     let session_id = validate_breadcrumb(breadcrumb, &session_path, header, exclusion)?;
-    Ok(session_id)
+    omp_source_observation(metadata, session_id, &session_path, cwd, active)
 }
 
-/// Capture the OMP session owned by one exact host tmux pane.
 pub(crate) fn capture_omp_session_id(
     metadata: &OmpCaptureMetadata,
     exclusion: &HashSet<String>,
     tmux_session_name: &str,
-) -> Result<String> {
+    active: Option<&crate::session::instance::ActiveExecution>,
+) -> Result<crate::session::poller::SessionIdObservation> {
     let (_, terminal_id) = tty_and_terminal_id_for_tmux(tmux_session_name)?;
-    capture_omp_session_id_from_terminal(metadata, exclusion, &terminal_id)
+    capture_omp_session_id_from_terminal(metadata, exclusion, &terminal_id, active)
 }
 
-/// Pane identity per host poll tick. A TTY or metadata change during the read
-/// drops the observation; same-generation rewrites are the marker CAS's job.
 #[derive(PartialEq)]
 struct OmpPollIdentity {
     metadata: OmpCaptureMetadata,
@@ -569,11 +638,10 @@ fn resolve_omp_poll_identity(tmux_session_name: &str) -> Result<OmpPollIdentity>
     })
 }
 
-/// Host poller. Every tick follows the pane name resolved by the outer poller
-/// and refreshes the metadata generation and TTY twice on that same name.
 pub(crate) fn omp_poll_fn(
     instance_id: String,
-    extra_excludes: HashSet<String>,
+    extra_excludes: HashSet<crate::session::ConversationBinding>,
+    active: Option<crate::session::instance::ActiveExecution>,
 ) -> impl Fn(&str) -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
     move |tmux_session_name| {
         let identity = resolve_omp_poll_identity(tmux_session_name)
@@ -581,22 +649,23 @@ pub(crate) fn omp_poll_fn(
                 tracing::debug!(target: "session.capture", "OMP poll identity refresh failed: {}", error)
             })
             .ok()?;
-        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes);
         let captured = capture_omp_session_id_from_terminal(
             &identity.metadata,
-            &exclusion,
+            &HashSet::new(),
             &identity.terminal_id,
+            active.as_ref(),
         )
         .map_err(|error| {
             tracing::debug!(target: "session.capture", "OMP poll capture failed: {}", error)
         })
-        .ok()
-        .and_then(super::validated_session_id);
+        .ok()?;
         let refreshed = resolve_omp_poll_identity(tmux_session_name).ok()?;
         if refreshed != identity {
             return None;
         }
-        captured.map(|sid| identity.metadata.session_observation(sid))
+        let exclusion =
+            super::compose_exclusion(&instance_id, &extra_excludes, captured.source.as_ref());
+        (!exclusion.contains(&captured.sid)).then_some(captured)
     }
 }
 
@@ -621,12 +690,6 @@ mod fixtures {
     }
 
     pub(super) const ID: &str = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
-
-    pub(super) fn exists_where(
-        f: impl Fn(&Path) -> bool,
-    ) -> impl FnOnce([Option<&Path>; 2]) -> Result<[bool; 2]> {
-        move |paths| Ok(paths.map(|path| path.is_some_and(&f)))
-    }
 
     /// Writes a session JSONL with a header for `id` and `cwd` (plus `extra` fields).
     pub(super) fn write_session(path: &Path, id: &str, cwd: &str, extra: &str) {
@@ -718,6 +781,14 @@ mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
+    fn capture_sid(
+        metadata: &OmpCaptureMetadata,
+        exclusion: &HashSet<String>,
+        terminal_id: &str,
+    ) -> Result<String> {
+        capture_omp_session_id_from_terminal(metadata, exclusion, terminal_id, None)
+            .map(|observation| observation.sid)
+    }
     #[test]
     fn breadcrumb_extras_accept_known_formats_and_reject_invalid_ones() {
         let accepted = [
@@ -764,7 +835,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path().join("project");
         let home = tmp.path().join("home");
-        let layout = resolve_layout(
+        let (layout, _) = resolve_layout(
             &HashMap::from([("HOME".to_string(), home.display().to_string())]),
             &cwd,
             None,
@@ -772,7 +843,7 @@ mod tests {
                 session_dir: Some(tmp.path().join("custom")),
                 ..OmpCliCaptureOptions::default()
             },
-            exists_where(|_| false),
+            |_| false,
         )
         .unwrap();
         assert_eq!(layout.kind, OmpStoreKind::Custom);
@@ -858,7 +929,7 @@ mod tests {
         let session = session_in(&meta.layout.managed_sessions.join("historical-project"), ID);
         write_session(&session, ID, historical.to_str().unwrap(), "");
         let breadcrumb = write_breadcrumb(&meta, "pts-1", &historical, &session, false);
-        let capture = || capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1");
+        let capture = || capture_sid(&meta, &HashSet::new(), "pts-1");
         assert_eq!(capture().unwrap(), ID, "cross-project targets are accepted");
         set_mtime_ms(&breadcrumb, meta.launched_at_ms);
         assert!(capture().is_err());
@@ -887,7 +958,7 @@ mod tests {
         write_marker(launch_marker(&meta, "pts-1", &pending.to_string_lossy()));
         meta.launch_marker = marker.to_string_lossy().into_owned();
         set_mtime_ms(&crumb, meta.launched_at_ms + 1);
-        let capture = || capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1");
+        let capture = || capture_sid(&meta, &HashSet::new(), "pts-1");
         assert!(
             capture().is_err(),
             "the fresh sentinel is still the pending path"
@@ -935,9 +1006,7 @@ mod tests {
         let session = session_in(&meta.layout.sessions.join("bucket"), ID);
         for (terminal, fresh) in [("fresh", true), ("not-fresh", false)] {
             write_breadcrumb(&meta, terminal, &cwd, &session, fresh);
-            assert!(
-                capture_omp_session_id_from_terminal(&meta, &HashSet::new(), terminal).is_err()
-            );
+            assert!(capture_sid(&meta, &HashSet::new(), terminal).is_err());
         }
     }
 }

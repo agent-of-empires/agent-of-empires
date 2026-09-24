@@ -289,6 +289,13 @@ impl Conversion {
         }
     }
 }
+/// Whether the next launch resumes a known conversation that cannot move.
+fn conversation_cannot_follow(instance: &super::Instance) -> bool {
+    instance
+        .conversation_target()
+        .and_then(|(_, binding, _)| binding)
+        .is_some_and(crate::session::ConversationBinding::is_known)
+}
 
 /// Decide how to make room for the new repo, and where the workspace lands.
 ///
@@ -512,6 +519,16 @@ pub fn plan(
     // checkout, workspace path taken, branch already checked out) happens with
     // nothing created.
     let conversion = plan_conversion(instance, profile, on_existing)?;
+    if !matches!(conversion, Conversion::Append { .. }) && conversation_cannot_follow(instance) {
+        bail!(
+            "'{}' carries a conversation bound to its current working directory; \
+             moving the session into '{}' would leave that conversation \
+             unresumable. Keep its current directory, or explicitly clear the \
+             resume target before attaching to start a new conversation.",
+            instance.title,
+            conversion.workspace_dir().display()
+        );
+    }
 
     let workspace_dir = conversion.workspace_dir().to_path_buf();
     let worktree_path = workspace_dir.join(&repo_name);
@@ -870,6 +887,20 @@ pub fn attach_planned(
             && refreshed.added_branch.branch == plan.added_branch.branch,
         "attachment target changed while preparing project attachment"
     );
+    // A publication that has not been drained yet would be flushed after the
+    // move with the stale cwd, re-qualifying the old directory after the
+    // commit. Flush it first so the durable recheck sees the row as it will
+    // stand at the commit.
+    if refreshed.moves_session {
+        match fresh.flush_published_conversation(storage) {
+            Some(crate::session::SidWrite::Applied) | None => {}
+            Some(outcome) => anyhow::bail!(
+                "'{}' has an undrained conversation publication ({outcome:?}); drain it or \
+                 clear the resume target before converting",
+                fresh.title
+            ),
+        }
+    }
     let prepared = execute(&fresh, refreshed)?;
 
     let id = session_id.to_string();
@@ -881,6 +912,12 @@ pub fn attach_planned(
             .iter_mut()
             .find(|i| i.id == id)
             .with_context(|| format!("session not found: {id}"))?;
+        anyhow::ensure!(
+            !converted || !conversation_cannot_follow(inst),
+            "'{}' now resumes a conversation bound to its current working directory; \
+             conversion cannot be committed",
+            inst.title
+        );
         inst.workspace_info = Some(workspace);
         if converted {
             // The session now works in the workspace directory, and its old
@@ -1155,12 +1192,7 @@ fn attach_and_restart(request: AttachProjectRequest) -> Result<String, String> {
     }
 
     if restarts {
-        message.push_str("\n\nRestarted the session so it comes up with the new repo");
-        if quiesced.worker_was_running {
-            message.push_str("; the conversation is preserved.");
-        } else {
-            message.push('.');
-        }
+        message.push_str("\n\nRestarted the session so it comes up with the new repo.");
     } else {
         message.push_str(
             "\n\nThe agent is already working in this directory, so nothing was restarted.",

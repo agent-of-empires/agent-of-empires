@@ -560,10 +560,9 @@ fn wizard_create_body(
             Some(crate::session::ForkSeed::Structured {
                 parent_acp_session_id,
             }) => Some(parent_acp_session_id.clone()),
-            Some(crate::session::ForkSeed::Terminal {
-                parent_agent_session_id,
-                ..
-            }) => Some(parent_agent_session_id.clone()),
+            Some(crate::session::ForkSeed::Terminal { parent, .. }) => {
+                Some(parent.session_id.clone())
+            }
             None => None,
         },
         fork_session_id: None,

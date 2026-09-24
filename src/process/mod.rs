@@ -44,6 +44,11 @@ pub(crate) use platform::unix_peer_uid;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use unix::detach_daemon_stdin;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use platform::HAS_CODEX_MANAGED_PREFERENCES;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
+
 /// System memory + agent-count sampling for the TUI diagnostics strip.
 pub(crate) mod metrics;
 

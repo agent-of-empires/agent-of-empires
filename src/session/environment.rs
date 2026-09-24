@@ -689,11 +689,7 @@ pub(crate) fn resolved_sandbox_config(
     super::config::repo_config::resolve_config_with_repo_or_warn(&resolved, project_path).sandbox
 }
 
-/// Resolve the complete environment inherited by an in-container agent.
-///
-/// Capture resolution needs this transiently because Bun dotenv values may
-/// expand arbitrary launcher variables into one of OMP's routing keys. Callers
-/// must discard unrelated values after resolution.
+#[cfg(test)]
 pub(crate) fn resolved_sandbox_environment(
     profile: &str,
     sandbox: &SandboxInfo,
@@ -739,6 +735,14 @@ pub(crate) fn build_docker_env_args(
 pub(crate) fn build_docker_env_args_with_managed_codex_home(
     sandbox_config: &SandboxConfig,
     sandbox: &SandboxInfo,
+    managed_codex_home: Option<&str>,
+) -> DockerExecEnv {
+    docker_exec_environment(sandbox, sandbox_config, managed_codex_home)
+}
+
+pub(crate) fn docker_exec_environment(
+    sandbox: &SandboxInfo,
+    sandbox_config: &SandboxConfig,
     managed_codex_home: Option<&str>,
 ) -> DockerExecEnv {
     tracing::debug!(target: "session.create",
