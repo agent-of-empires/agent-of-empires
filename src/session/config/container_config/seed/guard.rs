@@ -668,15 +668,16 @@ mod tests {
             let mut guard = ReadGuard::new(&boundary, ReadAccess::default())?;
             guard.record_file(&candidate, &File::open(&candidate)?)?;
             let bytes = fs::read(&candidate)?;
+            // A different length, so the rewrite is visible within one timestamp tick.
             if attempts == 1 {
-                fs::write(&candidate, b"NEW_SOURCE")?;
+                fs::write(&candidate, b"NEW_LONGER_SOURCE")?;
             }
             guard.record_file(&candidate, &File::open(&candidate)?)?;
             guard.validate()?;
             Ok(bytes)
         })
         .unwrap();
-        assert_eq!(copied, b"NEW_SOURCE");
+        assert_eq!(copied, b"NEW_LONGER_SOURCE");
         assert_eq!(attempts, 2);
     }
 }
