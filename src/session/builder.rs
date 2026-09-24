@@ -759,15 +759,14 @@ pub fn build_instance(
     if let Some(seed) = params.fork_seed {
         match seed {
             crate::session::ForkSeed::Terminal {
-                parent_agent_session_id,
+                parent,
                 child_session_id,
             } => {
-                // Pre-pin the child id so it is durable on disk before launch,
-                // and carry the parent on the one-shot Fork intent.
                 instance.agent_session_id = Some(child_session_id);
                 instance.resume_intent = crate::session::ResumeIntent::Fork {
-                    from: parent_agent_session_id,
+                    from: parent.session_id.clone(),
                 };
+                instance.resume_binding = Some(parent);
             }
             crate::session::ForkSeed::Structured {
                 parent_acp_session_id,
@@ -2089,49 +2088,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn build_instance_applies_terminal_fork_seed() {
-        let _app_guard = crate::session::test_support::isolate_app_dir();
-        use crate::session::ForkSeed;
-        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
-        let params = InstanceParams {
-            title: "Forked".into(),
-            path: "/tmp".into(),
-            group: String::new(),
-            tool: "claude".into(),
-            worktree_enabled: false,
-            worktree_branch: None,
-            create_new_branch: false,
-            base_branch: None,
-            sandbox: false,
-            sandbox_image: String::new(),
-            yolo_mode: false,
-            extra_env: vec![],
-            extra_args: String::new(),
-            command_override: String::new(),
-            extra_repo_paths: vec![],
-            repo_base_branches: Vec::new(),
-            scratch: false,
-            fork_seed: Some(ForkSeed::Terminal {
-                parent_agent_session_id: "parent-uuid".into(),
-                child_session_id: "child-uuid".into(),
-            }),
-        };
-        let inst = build_instance(params, &[], &[], "default")
-            .unwrap()
-            .instance;
-        assert_eq!(inst.agent_session_id.as_deref(), Some("child-uuid"));
-        assert!(
-            matches!(
-                inst.resume_intent,
-                crate::session::instance::ResumeIntent::Fork { ref from } if from == "parent-uuid"
-            ),
-            "fork intent must carry the parent id in `from`, got {:?}",
-            inst.resume_intent
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn build_instance_applies_structured_fork_seed() {
         let _app_guard = crate::session::test_support::isolate_app_dir();
         use crate::session::ForkSeed;
@@ -2169,6 +2125,64 @@ mod tests {
             inst.resume_intent,
             crate::session::instance::ResumeIntent::Fork { .. }
         ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_applies_terminal_fork_seed() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
+        use crate::session::ForkSeed;
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        // The CLI e2e covers the separate application in `add.rs`; this is the
+        // arm `build_instance` owns, which pins the child conversation and the
+        // parent the first launch must fork from.
+        let parent = crate::session::ConversationBinding {
+            session_id: "parent-conversation".into(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![std::path::PathBuf::from("/tmp/store")],
+                configuration: Vec::new(),
+                cwd: "/tmp".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            }),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        };
+        let params = InstanceParams {
+            title: "Forked".into(),
+            path: "/tmp".into(),
+            group: String::new(),
+            tool: "claude".into(),
+            worktree_enabled: false,
+            worktree_branch: None,
+            create_new_branch: false,
+            base_branch: None,
+            sandbox: false,
+            sandbox_image: String::new(),
+            yolo_mode: false,
+            extra_env: vec![],
+            extra_args: String::new(),
+            command_override: String::new(),
+            extra_repo_paths: vec![],
+            repo_base_branches: Vec::new(),
+            scratch: false,
+            fork_seed: Some(ForkSeed::Terminal {
+                parent: parent.clone(),
+                child_session_id: "child-conversation".into(),
+            }),
+        };
+        let inst = build_instance(params, &[], &[], "default")
+            .unwrap()
+            .instance;
+        assert_eq!(inst.agent_session_id.as_deref(), Some("child-conversation"));
+        assert_eq!(
+            inst.resume_intent,
+            crate::session::ResumeIntent::Fork {
+                from: "parent-conversation".into()
+            }
+        );
+        assert_eq!(inst.resume_binding.as_ref(), Some(&parent));
     }
 
     #[test]

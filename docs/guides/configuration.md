@@ -97,9 +97,10 @@ sidebar_position = "left" # left | right; TUI session list
 | `smart_rename_model` | `{}` | Per-agent model for the rename one-shot, e.g. `{ claude = "haiku" }`. An absent key uses the agent's built-in default, an empty value forces the CLI default, and any other value is passed to the agent's model flag. |
 | `inherit_host_environment` | `false` | Forward AoE's whole environment to host sessions. See [Host environment](#host-environment). |
 | `agent_extra_args` | `{}` | Per-agent arguments appended after the binary, e.g. `{ opencode = "--port 8080" }`. Ignored for structured view sessions. |
-| `agent_command_override` | `{}` | Per-agent command replacing the binary. See [Agent command overrides](#agent-command-overrides). |
+| `agent_command_override` | `{}` | Per-agent command replacing the binary. Managed resume and fork validate the actual native command and store; opaque wrappers require an explicit execution contract. See [execution identity and wrappers](session-resume.md#execution-identity-and-wrappers). |
 | `custom_agents` | `{}` | User-defined agents (name to command). See [Custom agents](#custom-agents). |
-| `agent_detect_as` | `{}` | Maps a custom agent onto a built-in it inherits (status heuristics, ACP adapter, native resume). |
+| `agent_detect_as` | `{}` | Built-in status detection and ACP adapter inheritance for a custom agent. This is not authority for terminal resume or fork. |
+| `agent_execution_as` | `{}` | Explicit native-agent contract for an opaque terminal wrapper. Requires `agent_config_dir` naming its store. Trusted global/profile configuration only; repository overrides are refused. |
 | `agent_acp_cmd` | `{}` | ACP launch command that makes a custom agent structured-view capable, e.g. `{ "oc-superpowers" = "ocp run sp acp" }`. Split into argv and run with no shell. |
 | `agent_config_dir` | `{}` | Config directory an agent reads instead of its built-in default, keyed by agent name. Wins over the agent's config-dir environment variable. Two names pointing at the same agent are two accounts of it; a restart that swaps between them carries the conversation across, see [Session Resume](session-resume.md#swapping-the-engine-on-a-restart). Global/profile only. |
 | `agents.<name>.status_map` | `{}` | Trusted hook-event to status mapping (`running`, `waiting`, `idle`, `error`), applied on the next hook install. Hooks receive `AOE_PROFILE`, so a script can read the resolved map with `aoe -p "$AOE_PROFILE" profile show --status-map <agent> --json`. Global/profile only. |
@@ -149,11 +150,13 @@ agent_detect_as = { "lenovo-claude" = "claude" }
 ```
 
 - **`custom_agents`** maps a display name to the command AoE runs in a tmux pane.
-- **`agent_detect_as`** reuses a built-in's status detection and, when that built-in has one, its ACP adapter. Without it (and without `status_rules`) a custom agent always reports `Idle`. Native resume additionally requires the command to start with the built-in's exact binary token, or be a single bare token resolved on `PATH`; path-qualified scripts, remote launchers, and any shell control syntax fail closed.
+- **`agent_detect_as`** reuses built-in status detection and ACP adapter inheritance. It never proves which native CLI owns a terminal conversation.
+- **`agent_execution_as`** declares the native agent actually invoked by an opaque wrapper, together with its `agent_config_dir` store contract. This is required for managed resume and fork through such a wrapper.
+  Bare, non-path wrappers can receive Default automatic resume flags and pane-scoped capture without this contract. Cleared launches selected by a failed-resume marker or disabled `auto_resume_on_restart` start fresh, mint and pass fresh-session flags where supported, and capture the new pane-scoped ID; explicit resume and fork remain unavailable. See [Execution identity and wrappers](session-resume.md#execution-identity-and-wrappers).
 - **`agent_acp_cmd`** gives the agent its own ACP command (see below).
 - **`agent_config_dir`** names the config directory the wrapper points its CLI at (see below).
 
-Custom agents always show as available, since their command may target a remote host. Profile (and, for `agent_detect_as`, repo) values replace the global map entirely, so redeclare any entries you want to keep. The web wizard can select a custom agent but never edits these command strings.
+Custom agents remain selectable even for remote or unmanaged commands. Profile maps replace global maps, so redeclare entries you want to keep. `agent_execution_as` and `agent_config_dir` are trusted global/profile declarations; repository overrides are refused. The web wizard can select a custom agent but never edits these command strings.
 
 ### One CLI, two accounts
 
@@ -164,6 +167,9 @@ A wrapper that runs the same CLI against a second login usually exports the agen
 claude-personal = "claude-personal"      # a wrapper that exports CLAUDE_CONFIG_DIR
 
 [session.agent_detect_as]
+claude-personal = "claude"
+
+[session.agent_execution_as]
 claude-personal = "claude"
 
 [session.agent_config_dir]

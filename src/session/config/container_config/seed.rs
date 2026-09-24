@@ -198,7 +198,7 @@ impl NativeStateBoundary {
         let canonical = canonical_expected_path(root)?;
         for parent in [root.parent(), canonical.parent()].into_iter().flatten() {
             self.add_classified_path(
-                parent.join(crate::migrations::v031_isolate_sandbox_content::RECOVERY),
+                parent.join(crate::migrations::v033_isolate_sandbox_content::RECOVERY),
                 StateOrigin::Storage,
             );
         }
@@ -852,7 +852,7 @@ pub(super) fn carry_selected_sandbox_state(
     source: &Path,
     destination: &Path,
     mount: &AgentConfigMount,
-    resumes: &[crate::migrations::v031_isolate_sandbox_content::ResumeCandidate],
+    resumes: &[crate::migrations::v033_isolate_sandbox_content::ResumeCandidate],
     cwd: &str,
     boundary: &NativeStateBoundary,
 ) -> Result<BTreeSet<String>> {

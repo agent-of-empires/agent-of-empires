@@ -53,6 +53,7 @@ fn spawn_config(
         sandbox_info: None,
         source_profile: None,
         mcp_servers: Vec::new(),
+        claude_store_pin: None,
     }
 }
 

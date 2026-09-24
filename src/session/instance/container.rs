@@ -66,13 +66,18 @@ impl Instance {
     /// the profile list. That is the best available answer: the minted values
     /// are deliberately not persisted because they may be short-lived secrets.
     pub(crate) fn resolved_host_environment(&self) -> Vec<String> {
+        self.resolved_host_environment_from(self.profile_host_environment())
+    }
+
+    pub(super) fn resolved_host_environment_from(
+        &self,
+        profile_environment: Vec<String>,
+    ) -> Vec<String> {
         let mut environment = crate::session::environment::drop_shadowed_host_entries(
-            self.profile_host_environment(),
+            profile_environment,
             &self.pending_host_env,
         );
         environment.extend(self.pending_host_env.iter().map(|(key, value)| {
-            // These are already-concrete hook values. Escape a leading `$`
-            // back into the environment-list grammar so it remains literal.
             if value.starts_with('$') {
                 format!("{key}=${value}")
             } else {
@@ -86,7 +91,7 @@ impl Instance {
     /// container launch first copies that store; see [`Self::move_sandbox_store`].
     pub fn sandbox_store_move_pending(&self) -> bool {
         self.is_sandboxed()
-            && !crate::migrations::v031_isolate_sandbox_content::instance_ready(self)
+            && !crate::migrations::v033_isolate_sandbox_content::instance_ready(self)
                 .unwrap_or(false)
     }
 
@@ -163,11 +168,10 @@ impl Instance {
             }
         }
         // After every reload above, which may have replaced the tool.
-        let detect_as = self.effective_detect_as().into_owned();
-        // Admit the reconciled tool: reconciliation above may have replaced it,
-        // and the isolated store is seeded for the agent the launch will run.
+        let command = self.get_tool_command().to_owned();
+        // Admit the reconciled tool before refreshing or starting its native store.
         let _transition_lock =
-            crate::migrations::v031_isolate_sandbox_content::admit_fresh_instance(self)?;
+            crate::migrations::v033_isolate_sandbox_content::admit_fresh_instance(self)?;
 
         // Direct is_running()? / exists()? here rather than probe_running():
         // this function already returns Result, so `?` correctly propagates
@@ -186,10 +190,8 @@ impl Instance {
             // Already up: not a come-up, so don't re-mint. Fill lazily only if a
             // fresh process attached to a running container with no values yet.
             self.ensure_before_start_env(false)?;
-            // Still rotating the copy in its store. The refresh below would
-            // fold that copy into the shared file and log every sandbox on
-            // it out at the copy's next rotation, so refuse first.
-            if self.predates_shared_credential(&container, &detect_as)? {
+            // Refresh would fold a rotating private copy into the shared credential.
+            if self.predates_shared_credential(&container, &command)? {
                 anyhow::bail!(
                     "running sandbox {} predates the shared credential file; stop it, then relaunch to rebuild it",
                     self.id
@@ -202,12 +204,12 @@ impl Instance {
                 &self.effective_profile(),
                 &self.id,
                 &self.tool,
-                Some(detect_as.as_str()),
+                Some(command.as_str()),
                 fold,
                 std::path::Path::new(&self.container_workdir()),
             );
             let config = self.build_container_config_with(fold)?;
-            self.finish_container_reuse(&container, &config, detect_as.as_str())?;
+            self.finish_container_reuse(&container, &config, &command)?;
             return Ok(container);
         }
 
@@ -230,7 +232,7 @@ impl Instance {
                     &self.effective_profile(),
                     &self.id,
                     &self.tool,
-                    Some(detect_as.as_str()),
+                    Some(command.as_str()),
                     container_config::CredentialFold::Freshest,
                     std::path::Path::new(&self.container_workdir()),
                 );
@@ -244,7 +246,7 @@ impl Instance {
                 } else {
                     container_config::place_shadowed_credential_mountpoints(&config);
                     container.start()?;
-                    self.finish_container_reuse(&container, &config, detect_as.as_str())?;
+                    self.finish_container_reuse(&container, &config, &command)?;
                     return Ok(container);
                 }
             }
@@ -291,7 +293,7 @@ impl Instance {
         &mut self,
         container: &containers::DockerContainer,
         config: &crate::containers::ContainerConfig,
-        detect_as: &str,
+        command: &str,
     ) -> Result<()> {
         self.identity_publisher_launched = config.identity_publisher_installed
             && identity_publisher_mount_matches(container, config)?
@@ -300,7 +302,7 @@ impl Instance {
         self.backfill_container_workdir(container);
         container_config::ensure_folder_trust_config_for_active_agent(
             &self.tool,
-            Some(detect_as),
+            Some(command),
             &self.source_profile,
             &self.id,
             &self.container_workdir(),
@@ -312,7 +314,7 @@ impl Instance {
     fn container_agent_identity(&self) -> Result<String> {
         container_config::container_agent_identity(
             &self.tool,
-            Some(&self.effective_detect_as()),
+            Some(self.get_tool_command()),
             &self.source_profile,
         )
         .context("cannot resolve the session's agent to check its sandbox container")
@@ -325,12 +327,12 @@ impl Instance {
     pub(crate) fn predates_shared_credential(
         &self,
         container: &DockerContainer,
-        detect_as: &str,
+        command: &str,
     ) -> Result<bool> {
         if !container_config::agent_shares_credential_file(
             &self.effective_profile(),
             &self.tool,
-            Some(detect_as),
+            Some(command),
         ) {
             return Ok(false);
         }
@@ -437,7 +439,6 @@ impl Instance {
         fold: container_config::CredentialFold,
     ) -> Result<crate::containers::ContainerConfig> {
         self.ensure_container_hook_mount_source();
-        let detect_as = self.effective_detect_as();
         let sandbox = self
             .sandbox_info
             .as_ref()
@@ -467,9 +468,12 @@ impl Instance {
         container_config::build_container_config(
             &self.project_path,
             sandbox,
-            container_config::ContainerAgentSelection::new(&self.tool, Some(&detect_as))
-                .with_selected_agent(selected_agent.as_deref())
-                .with_credential_fold(fold),
+            container_config::ContainerAgentSelection::new(
+                &self.tool,
+                Some(self.get_tool_command()),
+            )
+            .with_selected_agent(selected_agent.as_deref())
+            .with_credential_fold(fold),
             self.is_yolo_mode(),
             &self.id,
             self.workspace_info.as_ref(),
@@ -854,20 +858,19 @@ claude-personal = "~/.claude-global"
                 1,
                 Some(".codex"),
             ),
+            // A status-only alias is not an execution identity, so this row's
+            // container label is its tool name and the reuse path refreshes no
+            // store. A wrapper or a built-in tool is what carries a store.
             (
                 ("alias-a", "claude"),
-                "alias-b:codex",
+                "alias-b",
                 Disk::Row("alias-b", "codex"),
                 0,
-                Some(".codex"),
+                None,
             ),
-            (
-                ("alias-a", "codex"),
-                "alias-a",
-                Disk::Absent,
-                1,
-                Some(".codex"),
-            ),
+            // Same contract: the alias-only row labels its container "alias-a"
+            // and therefore reuses it instead of rebuilding.
+            (("alias-a", "codex"), "alias-a", Disk::Absent, 0, None),
             (
                 ("alias-c", ""),
                 "alias-c:claude",

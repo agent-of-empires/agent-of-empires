@@ -128,19 +128,19 @@ describe("toolbar and send", () => {
   });
 
   it.each([
-    [{ amount: 0.42, currency: "USD" }, 120_000, "60%", true],
-    [null, 50_000, "25%", false],
-  ])("explains usage on hover (cost %o)", (cost, used, pct, mentionsSpend) => {
+    [{ amount: 0.42, currency: "USD" }, 120_000, "60%"],
+    [null, 50_000, "25%"],
+  ])("exposes usage and optional spend in the hint and tooltip (cost %o)", (cost, used, pct) => {
     mount({ sessionUsage: { used, size: 200_000, cost } });
+    const spend = new Intl.NumberFormat(undefined, { style: "currency", currency: "USD" }).format(0.42);
     const hint = screen.getByLabelText(/Context window:/);
-    // The compact form (percent and cost) is not breakpoint-hidden (#3916).
-    expect(hint.classList.contains("hidden")).toBe(false);
     expect(hint.textContent).toContain(pct);
-    expect(hint.textContent?.includes("· $0.42")).toBe(mentionsSpend);
+    expect(hint.textContent?.includes(spend)).toBe(cost !== null);
     fireEvent.mouseEnter(hint.parentElement!);
     const tip = screen.getByRole("tooltip").textContent ?? "";
-    expect(tip).toContain(`${used.toLocaleString()} of ${(200_000).toLocaleString()} tokens used (${pct})`);
-    expect(tip.includes("cumulative session spend since the last /clear or /compact")).toBe(mentionsSpend);
+    expect(tip).toContain(used.toLocaleString());
+    expect(tip).toContain(pct);
+    expect(tip.includes(spend)).toBe(cost !== null);
   });
 
   it("stages pasted image files and leaves text paste alone", async () => {

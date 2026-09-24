@@ -54,16 +54,18 @@ pub(super) fn load_all_instances(
 /// Carry over the in-memory-only fields from the prior `state.instances` entry into the
 /// freshly-loaded one.
 pub(super) fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
+    if fresh.active_execution == prior.active_execution {
+        fresh.session_id_poller = prior.session_id_poller;
+        fresh.poller_repair = prior.poller_repair;
+        fresh.session_id_poller_retry_after = prior.session_id_poller_retry_after;
+    } else {
+        prior.stop_poller();
+    }
     fresh.last_error_check = prior.last_error_check;
     fresh.last_start_time = prior.last_start_time;
-    // Only preserve `last_error` while the session is still in Error.
     if fresh.status == Status::Error {
         fresh.last_error = prior.last_error;
     }
-    fresh.session_id_poller = prior.session_id_poller;
-    fresh.poller_repair = prior.poller_repair;
-    fresh.session_id_poller_retry_after = prior.session_id_poller_retry_after;
-    fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
     fresh.acp_load_session_capable = prior.acp_load_session_capable;
     fresh
 }
@@ -766,5 +768,101 @@ mod tests {
         let merged = merge_runtime_fields(prior, fresh);
 
         assert_eq!(merged.acp_load_session_capable, Some(true));
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reload_captures_publications_from_a_replaced_execution() {
+        use crate::session::{ConversationProvenance, ExecutionBinding};
+        use std::os::unix::fs::DirBuilderExt;
+
+        let app = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(app.path());
+        let file_watch = FileWatchService::new().unwrap();
+        let hook_base = app.path().join("hooks");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&hook_base)
+            .unwrap();
+        let mergers: [fn(Instance, Instance) -> Instance; 2] =
+            [merge_runtime_fields, |prior, mut fresh| {
+                fresh.merge_runtime_from_reload(&prior);
+                fresh
+            }];
+        for merge in mergers {
+            let mut prior = Instance::new("reload-capture", app.path().to_str().unwrap());
+            prior.tool = "claude".into();
+            prior.source_profile = "reload-capture".into();
+            prior.status = Status::Running;
+            let hooks = hook_base.join(&prior.id);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&hooks)
+                .unwrap();
+            let launch = uuid::Uuid::new_v4().to_string();
+            prior.active_execution = Some(
+                serde_json::from_value(serde_json::json!({
+                    "launch_id": launch,
+                    "binding": ExecutionBinding {
+                        agent: "claude".into(),
+                        stores: vec![app.path().to_path_buf()],
+                        configuration: Vec::new(),
+                        cwd: app.path().to_path_buf(),
+                        cwd_filesystem: "host".into(),
+                        filesystem: "host".into(),
+                    },
+                    "capture": { "Hooks": hooks.join(format!("session_id.{launch}")) },
+                    "container": null,
+                }))
+                .unwrap(),
+            );
+            assert_eq!(
+                prior.maybe_start_poller(),
+                crate::session::PollerStart::Started
+            );
+            let mut fresh: Instance =
+                serde_json::from_str(&serde_json::to_string(&prior).unwrap()).unwrap();
+            fresh.source_profile = prior.source_profile.clone();
+            let launch = uuid::Uuid::new_v4().to_string();
+            let publication = hooks.join(format!("session_id.{launch}"));
+            let active = fresh.active_execution.as_mut().unwrap();
+            active.launch_id = launch;
+            active.capture =
+                Some(serde_json::from_value(serde_json::json!({ "Hooks": publication })).unwrap());
+            let storage = Storage::new_unwatched(&fresh.source_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    *rows = vec![fresh.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let mut reloaded = merge(prior, fresh);
+            let sid = uuid::Uuid::new_v4().to_string();
+            std::fs::write(&publication, &sid).unwrap();
+            let snapshot = crate::tmux::LiveSessionSnapshot::from_parts(
+                Some(vec![reloaded.tmux_session().unwrap().name().to_string()]),
+                None,
+            );
+            reloaded.repair_session_id_poller_if_needed(&snapshot);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                crate::session::sync::drain_and_persist_session_ids(
+                    std::slice::from_mut(&mut reloaded),
+                    &file_watch,
+                );
+                if reloaded.agent_session_id.as_deref() == Some(&sid)
+                    || std::time::Instant::now() >= deadline
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            reloaded.stop_poller();
+            let stored = storage.load().unwrap().remove(0);
+            assert_eq!(stored.agent_session_id.as_deref(), Some(sid.as_str()));
+            assert_eq!(
+                stored.agent_session_binding.unwrap().provenance,
+                ConversationProvenance::Observed
+            );
+        }
     }
 }

@@ -35,7 +35,9 @@ pub(crate) mod v027_isolate_sandbox_stores;
 mod v028_clear_archived_live_status;
 mod v029_fold_pending_initial_turn;
 mod v030_global_only_profile_settings;
-pub(crate) mod v031_isolate_sandbox_content;
+mod v031_conversation_provenance;
+mod v032_bound_capture_exclusions;
+pub(crate) mod v033_isolate_sandbox_content;
 
 /// Fixtures shared by the migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -81,7 +83,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 31;
+const CURRENT_VERSION: u32 = 33;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -192,8 +194,18 @@ const MIGRATIONS: &[Migration] = &[
     ),
     (
         31,
+        "conversation_provenance",
+        v031_conversation_provenance::run,
+    ),
+    (
+        32,
+        "bound_capture_exclusions",
+        v032_bound_capture_exclusions::run,
+    ),
+    (
+        33,
         "isolate_sandbox_content",
-        v031_isolate_sandbox_content::run,
+        v033_isolate_sandbox_content::run,
     ),
 ];
 
@@ -230,7 +242,7 @@ pub fn migrate_sandbox_store_for_with(
     }
     let _installed = progress::install(reporter);
     v027_isolate_sandbox_stores::migrate_instance(id)?;
-    v031_isolate_sandbox_content::migrate_instance(id)
+    v033_isolate_sandbox_content::migrate_instance(id)
 }
 
 /// [`migrate_sandbox_store_for_with`] with the container probes injected, for
@@ -280,7 +292,7 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
     }
     if current == CURRENT_VERSION {
         v027_isolate_sandbox_stores::reconcile_pending(announce)?;
-        return v031_isolate_sandbox_content::reconcile_pending(announce);
+        return v033_isolate_sandbox_content::reconcile_pending(announce);
     }
 
     let pending: Vec<&Migration> = MIGRATIONS
@@ -360,9 +372,31 @@ mod tests {
     }
 
     #[test]
-    fn test_current_version_matches_last_migration() {
-        if let Some((version, ..)) = MIGRATIONS.last() {
-            assert_eq!(CURRENT_VERSION, *version);
-        }
+    #[serial_test::serial]
+    fn schema_31_content_isolation_still_receives_upstream_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join(VERSION_FILE), "31").unwrap();
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"agent_session_id":"old","resume_intent":{"kind":"Use","value":"target"},"retroactive_capture_excludes":["old"]}]"#,
+        )
+        .unwrap();
+
+        run_migrations().unwrap();
+
+        let rows: serde_json::Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_eq!(rows[0]["agent_session_id"], "old");
+        assert_eq!(rows[0]["agent_session_binding"]["provenance"], "unknown");
+        assert!(rows[0]["agent_session_binding"]["execution"].is_null());
+        assert_eq!(rows[0]["resume_binding"]["session_id"], "target");
+        assert_eq!(
+            rows[0]["retroactive_capture_excludes"][0]["session_id"],
+            "old"
+        );
+        assert_eq!(get_current_version(), CURRENT_VERSION);
     }
 }

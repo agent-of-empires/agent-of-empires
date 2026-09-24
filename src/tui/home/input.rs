@@ -2853,7 +2853,11 @@ impl HomeView {
         if inst.is_structured() {
             crate::session::fork::structured_fork_capable(&inst.tool, inst.agent_name.as_deref())
         } else {
-            crate::session::fork::terminal_agent_can_fork(&inst.tool)
+            inst.fork_parent_binding()
+                .and_then(|parent| parent.execution.as_ref())
+                .is_some_and(|execution| {
+                    crate::session::fork::terminal_agent_can_fork(&execution.agent)
+                })
         }
     }
 
@@ -3008,8 +3012,12 @@ impl HomeView {
             return;
         };
         let tool = parent.tool.clone();
-        let parent_agent_session_id = parent.agent_session_id.clone();
-        let repo_path = parent.repo_path().to_string();
+        let parent_binding = parent.fork_parent_binding().cloned();
+        let repo_path = if parent.is_structured() {
+            parent.repo_path().to_string()
+        } else {
+            parent.project_path.clone()
+        };
         let group_path = parent.group_path.clone();
         let title = parent.title.clone();
         let parent_is_structured = parent.is_structured();
@@ -3046,11 +3054,7 @@ impl HomeView {
             }
         } else {
             let child_id = crate::session::capture::generate_session_uuid();
-            match crate::session::fork::terminal_fork_seed(
-                &tool,
-                parent_agent_session_id.as_deref(),
-                child_id,
-            ) {
+            match crate::session::fork::terminal_fork_seed(parent_binding.as_ref(), child_id) {
                 Ok(s) => s,
                 Err(crate::session::ForkDenied::AgentCannotFork) => {
                     self.info_dialog = Some(InfoDialog::new(

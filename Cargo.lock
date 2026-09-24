@@ -114,6 +114,7 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "dirs",
+ "dotenv-ng-core",
  "flate2",
  "fs2",
  "futures-util",
@@ -1289,6 +1290,12 @@ checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
 dependencies = [
  "litrs",
 ]
+
+[[package]]
+name = "dotenv-ng-core"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96cd2d7607be76b700f707349fe6f48970385220c7c3a59a72e4dcb5e19143ca"
 
 [[package]]
 name = "downcast-rs"

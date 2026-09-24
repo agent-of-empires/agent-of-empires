@@ -255,6 +255,11 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         }
 
+        let claude_store_pin = req.claude_store_pin.clone().filter(|_| {
+            req.sandbox_info.is_none() && matches!(req.agent.as_str(), "claude" | "claude-code")
+        });
+        apply_claude_store_pin(&mut host_environment, claude_store_pin.as_deref());
+
         let mut provider_env = req.provider_env.clone();
         if let Some(model) = model.clone() {
             provider_env.push(("AOE_AGENT_MODEL".into(), model));
@@ -269,6 +274,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             req.source_profile.clone(),
             req.cwd.clone(),
             host_environment.clone(),
+            claude_store_pin.clone(),
             "MCP resolution task failed",
         )
         .await;
@@ -285,12 +291,12 @@ impl<S: BroadcastSink> Supervisor<S> {
                 let id = req.session_id.clone();
                 let continuation = req.sandbox_continuation;
                 let context = tokio::task::spawn_blocking(move || {
-                    crate::migrations::v031_isolate_sandbox_content::prepare_acp_context(
+                    crate::migrations::v033_isolate_sandbox_content::prepare_acp_context(
                         &profile,
                         &id,
                         native_agent,
                         generation,
-                        crate::migrations::v031_isolate_sandbox_content::AcpContextUse::Launch,
+                        crate::migrations::v033_isolate_sandbox_content::AcpContextUse::Launch,
                         continuation,
                     )
                 })
@@ -353,6 +359,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 artifact_dir: crate::session::artifacts::session_artifact_dir(&req.session_id).ok(),
                 wrapper_substitution,
                 generation,
+                claude_store_pin,
             },
             context_reset,
         ))
@@ -409,6 +416,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             session_id.to_string(),
             WorkerHandle {
                 client: Arc::clone(&client),
+                native_session_id: None,
                 drain_task,
                 restart_history: vec![],
                 kind,
@@ -595,12 +603,12 @@ impl<S: BroadcastSink> Supervisor<S> {
             let native_agent = crate::acp::agent_profiles::resolve(&agent_key).native_config_agent;
             let generation = reservation.lease().epoch();
             let context = tokio::task::spawn_blocking(move || {
-                crate::migrations::v031_isolate_sandbox_content::prepare_acp_context(
+                crate::migrations::v033_isolate_sandbox_content::prepare_acp_context(
                     &profile,
                     &id,
                     native_agent,
                     generation,
-                    crate::migrations::v031_isolate_sandbox_content::AcpContextUse::Attach,
+                    crate::migrations::v033_isolate_sandbox_content::AcpContextUse::Attach,
                     super::SandboxContinuation::Persisted,
                 )
             })
@@ -737,6 +745,18 @@ pub(super) fn overlay_env(env: &mut Vec<(String, String)>, minted: Vec<(String, 
         env.push((key, value));
     }
 }
+pub(super) fn apply_claude_store_pin(
+    environment: &mut Vec<(String, String)>,
+    store: Option<&std::path::Path>,
+) {
+    if let Some(store) = store {
+        environment.retain(|(key, _)| key != "CLAUDE_CONFIG_DIR");
+        environment.push((
+            "CLAUDE_CONFIG_DIR".into(),
+            store.to_string_lossy().into_owned(),
+        ));
+    }
+}
 
 pub(super) async fn resolve_mcp_servers(
     agent_key: &str,
@@ -744,12 +764,20 @@ pub(super) async fn resolve_mcp_servers(
     profile: Option<String>,
     cwd: PathBuf,
     session_env: Vec<(String, String)>,
+    native_config_override: Option<PathBuf>,
     failure: &'static str,
 ) -> Vec<agent_client_protocol::schema::v1::McpServer> {
     let agent_key = agent_key.to_string();
     let session = session_id.to_string();
     tokio::task::spawn_blocking(move || {
-        resolve_mcp_layers(&agent_key, &session, profile.as_deref(), &cwd, &session_env)
+        resolve_mcp_layers(
+            &agent_key,
+            &session,
+            profile.as_deref(),
+            &cwd,
+            &session_env,
+            native_config_override.as_deref(),
+        )
     })
     .await
     .unwrap_or_else(|e| {
@@ -769,10 +797,11 @@ fn resolve_mcp_layers(
     profile: Option<&str>,
     cwd: &std::path::Path,
     session_env: &[(String, String)],
+    native_config_override: Option<&std::path::Path>,
 ) -> Vec<agent_client_protocol::schema::v1::McpServer> {
     use crate::session::mcp::mcp_model::{resolve_effective, summarize};
 
-    let merged = resolve_effective(agent_key, profile, cwd, session_env);
+    let merged = resolve_effective(agent_key, profile, cwd, session_env, native_config_override);
     if !merged.is_empty() {
         info!(
             target: "acp.mcp",
@@ -826,6 +855,70 @@ mod tests {
     use crate::acp::approvals::{ApprovalDecision, Nonce};
     use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
     use crate::daemon::AcpWorkerState;
+
+    fn mcp_names(servers: &[agent_client_protocol::schema::v1::McpServer]) -> Vec<&str> {
+        use agent_client_protocol::schema::v1::McpServer;
+        servers
+            .iter()
+            .map(|server| match server {
+                McpServer::Stdio(server) => server.name.as_str(),
+                McpServer::Http(server) => server.name.as_str(),
+                McpServer::Sse(server) => server.name.as_str(),
+                _ => "unknown",
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn selected_claude_store_controls_spawn_environment_and_native_mcp() {
+        let (_home, temp) = isolate_home();
+        let declared = temp.path().join("declared");
+        let selected = temp.path().join("selected");
+        std::fs::create_dir_all(&declared).unwrap();
+        std::fs::create_dir_all(&selected).unwrap();
+        std::fs::write(
+            declared.join(".claude.json"),
+            r#"{ "mcpServers": { "declared": { "command": "declared" } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            selected.join(".claude.json"),
+            r#"{ "mcpServers": { "selected": { "command": "selected" } } }"#,
+        )
+        .unwrap();
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            format!(
+                "[host_hooks]\nbefore_session = \"printf 'CLAUDE_CONFIG_DIR={}\\nHOOK_VALUE=kept\\n'\"\n\
+                 [session.agent_config_dir]\nclaude-code = \"{}\"\n",
+                temp.path().join("hook").display(),
+                declared.display()
+            ),
+        )
+        .unwrap();
+
+        let supervisor = Supervisor::new(VecSink::new());
+        let mut request = spawn_request("selected-store");
+        request.claude_store_pin = Some(selected.clone());
+        let (config, context_reset) = supervisor.spawn_config(&request, 1).await.unwrap();
+        assert!(context_reset.is_none());
+
+        assert_eq!(mcp_names(&config.mcp_servers), ["selected"]);
+        assert_eq!(
+            config
+                .host_environment
+                .iter()
+                .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                .map(|(_, value)| value.as_str()),
+            selected.to_str()
+        );
+        assert!(config
+            .host_environment
+            .contains(&("HOOK_VALUE".into(), "kept".into())));
+    }
 
     #[test]
     fn respawn_refreshes_the_model_pin_and_keeps_explicit_effort() {
@@ -1045,7 +1138,7 @@ mod tests {
 
         let resolve = |profile: Option<&'static str>, cwd: std::path::PathBuf| async move {
             let merged = tokio::task::spawn_blocking(move || {
-                resolve_mcp_layers("claude", "resolve-test", profile, &cwd, &[])
+                resolve_mcp_layers("claude", "resolve-test", profile, &cwd, &[], None)
             })
             .await
             .unwrap();

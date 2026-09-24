@@ -2,116 +2,161 @@
 
 use super::*;
 
-/// OMP 17.2.12's host store: Bun's cwd dotenv autoload applies before profile
-/// selection, then OMP's four literal dotenv files merge.
+/// Resolve OMP's host store and the native routing context used by the launch.
 pub(crate) fn resolve_omp_store_layout(
     environment: &[String],
     launch_cwd: &str,
     options: &OmpCliCaptureOptions,
 ) -> Result<OmpStoreLayout> {
-    resolve_omp_store_layout_with_environment(environment, launch_cwd, options)
-        .map(|(layout, _)| layout)
+    resolve_omp_store_layout_with_environment(
+        host_launcher_environment(environment),
+        launch_cwd,
+        options,
+    )
+    .map(|context| context.layout)
 }
 
-/// Also returns a fingerprint of the pre-dotenv routing so the pane can reject
-/// capture if startup files change it, without exposing routing values.
 pub(crate) fn resolve_omp_store_layout_with_environment(
-    environment: &[String],
+    launcher_env: HashMap<String, String>,
     launch_cwd: &str,
     options: &OmpCliCaptureOptions,
-) -> Result<(OmpStoreLayout, String)> {
+) -> Result<OmpResolvedContext> {
     let cwd = absolute_launch_cwd(launch_cwd)?;
-    let launcher_env = host_launcher_environment(environment);
     let routing_fingerprint = routing_fingerprint(&launcher_env);
-    let (merged, profile) =
-        merged_omp_environment(launcher_env, &cwd, options, read_dotenv_content)?;
-    let layout = resolve_layout(&merged, &cwd, profile.as_deref(), options, |paths| {
-        Ok(paths.map(|path| path.is_some_and(Path::exists)))
-    })?;
-    Ok((layout, routing_fingerprint))
-}
-
-pub(crate) fn resolve_omp_store_layout_in_container_with_environment(
-    container_name: &str,
-    container_cwd: &str,
-    launch_environment: &[(String, String)],
-    options: &OmpCliCaptureOptions,
-) -> Result<(OmpStoreLayout, String)> {
-    let cwd = absolute_launch_cwd(container_cwd)?;
-    let mut launcher_env = read_container_environment(container_name)?;
-    for (key, value) in launch_environment {
-        launcher_env.insert(key.clone(), value.clone());
-    }
-    let routing_fingerprint = routing_fingerprint(&launcher_env);
-    if nonempty(&launcher_env, "HOME").is_none() {
-        anyhow::bail!("OMP container has no HOME");
-    }
-    let (merged, profile) = merged_omp_environment(launcher_env, &cwd, options, |path| {
-        read_container_dotenv_content(container_name, path)
-    })?;
-    let layout = resolve_layout(&merged, &cwd, profile.as_deref(), options, |paths| {
-        probe_container_paths(container_name, paths)
-    })?;
-    Ok((layout, routing_fingerprint))
-}
-
-/// Applies Bun's autoload, selects the profile, then merges OMP's dotenv files.
-pub(super) fn merged_omp_environment(
-    launcher_env: HashMap<String, String>,
-    cwd: &Path,
-    options: &OmpCliCaptureOptions,
-    mut read_content: impl FnMut(&Path) -> Result<Option<String>>,
-) -> Result<(HashMap<String, String>, Option<String>)> {
-    let auto_env = autoload_bun_dotenv(launcher_env, cwd, &mut read_content)?;
+    let launcher_routing = omp_routing_values(&launcher_env);
+    let auto_env = autoload_bun_dotenv(launcher_env, &cwd, read_dotenv_content)?;
     let profile = resolve_profile(options.profile.as_deref(), &auto_env)?;
-    let files = dotenv_locations(&auto_env, cwd, profile.as_deref())?
+    let locations = dotenv_locations(&auto_env, &cwd, profile.as_deref())?;
+    let files = locations
         .iter()
         .map(|path| {
-            Ok(read_content(path)?
+            Ok(read_dotenv_content(path)?
                 .map(|content| parse_dotenv(&content))
                 .unwrap_or_default())
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok((merge_omp_environment(auto_env, &files), profile))
+    let merged = merge_omp_environment(auto_env, &files);
+    let (layout, agent_dir) =
+        resolve_layout(&merged, &cwd, profile.as_deref(), options, Path::exists)?;
+    Ok(OmpResolvedContext {
+        layout,
+        routing_fingerprint,
+        launcher_routing,
+        profile,
+        cwd: omp_session_cwd(&cwd, options),
+        agent_dir,
+    })
 }
 
-/// `exists` reports whether the XDG data and state candidates exist.
-pub(super) fn resolve_layout(
-    env: &HashMap<String, String>,
-    cwd: &Path,
-    profile: Option<&str>,
+pub(crate) fn resolve_omp_store_layout_in_container_with_environment(
+    runtime: &crate::containers::RuntimeExecutionSnapshot,
+    container_name: &str,
+    container_cwd: &str,
+    launcher_env: HashMap<String, String>,
     options: &OmpCliCaptureOptions,
-    exists: impl FnOnce([Option<&Path>; 2]) -> Result<[bool; 2]>,
-) -> Result<OmpStoreLayout> {
-    let agent_dir = managed_agent_dir(env, cwd, profile)?;
-    let data = xdg_candidate(env, cwd, "XDG_DATA_HOME", profile);
-    let state = xdg_candidate(env, cwd, "XDG_STATE_HOME", profile);
-    let [data_exists, state_exists] = exists([data.as_deref(), state.as_deref()])?;
-    let managed_sessions = data
-        .filter(|_| data_exists)
-        .unwrap_or_else(|| agent_dir.clone())
+) -> Result<OmpResolvedContext> {
+    let cwd = absolute_launch_cwd(container_cwd)?;
+    let routing_fingerprint = routing_fingerprint(&launcher_env);
+    let launcher_routing = omp_routing_values(&launcher_env);
+    if nonempty(&launcher_env, "HOME").is_none() {
+        anyhow::bail!("OMP container has no HOME");
+    }
+    let auto_env = autoload_bun_dotenv(launcher_env, &cwd, |path| {
+        read_container_dotenv_content(runtime, container_name, path)
+    })?;
+    let profile = resolve_profile(options.profile.as_deref(), &auto_env)?;
+    let locations = dotenv_locations(&auto_env, &cwd, profile.as_deref())?;
+    let files = locations
+        .iter()
+        .map(|path| read_container_dotenv(runtime, container_name, path))
+        .collect::<Result<Vec<_>>>()?;
+    let merged = merge_omp_environment(auto_env, &files);
+    let agent_dir = managed_agent_dir(&merged, &cwd, profile.as_deref())?;
+    let data_candidate = xdg_candidate(&merged, &cwd, "XDG_DATA_HOME", profile.as_deref());
+    let state_candidate = xdg_candidate(&merged, &cwd, "XDG_STATE_HOME", profile.as_deref());
+    let existence = probe_container_paths(
+        runtime,
+        container_name,
+        [data_candidate.as_deref(), state_candidate.as_deref()],
+    )?;
+    let managed_sessions = data_candidate
+        .as_ref()
+        .filter(|_| existence[0])
+        .unwrap_or(&agent_dir)
         .join("sessions");
-    let terminal_sessions = state
-        .filter(|_| state_exists)
-        .unwrap_or(agent_dir)
-        .join("terminal-sessions");
+    let session_cwd = omp_session_cwd(&cwd, options);
     let custom = options
         .session_dir
         .as_deref()
-        .or_else(|| nonempty(env, "PI_CODING_AGENT_SESSION_DIR").map(Path::new));
-    Ok(OmpStoreLayout {
+        .or_else(|| nonempty(&merged, "PI_CODING_AGENT_SESSION_DIR").map(Path::new));
+    let layout = OmpStoreLayout {
         sessions: custom.map_or_else(
             || managed_sessions.clone(),
-            |path| absolute_path(&omp_session_cwd(cwd, options), path),
+            |path| absolute_path(&session_cwd, path),
         ),
         managed_sessions,
-        terminal_sessions,
+        terminal_sessions: state_candidate
+            .as_ref()
+            .filter(|_| existence[1])
+            .unwrap_or(&agent_dir)
+            .join("terminal-sessions"),
         kind: if custom.is_some() {
             OmpStoreKind::Custom
         } else {
             OmpStoreKind::Managed
         },
+    };
+    Ok(OmpResolvedContext {
+        layout,
+        routing_fingerprint,
+        launcher_routing,
+        profile,
+        cwd: session_cwd,
+        agent_dir,
     })
+}
+
+pub(super) fn resolve_layout(
+    env: &HashMap<String, String>,
+    cwd: &Path,
+    profile: Option<&str>,
+    options: &OmpCliCaptureOptions,
+    mut exists: impl FnMut(&Path) -> bool,
+) -> Result<(OmpStoreLayout, PathBuf)> {
+    let session_cwd = omp_session_cwd(cwd, options);
+    let agent_dir = managed_agent_dir(env, cwd, profile)?;
+    let data_candidate = xdg_candidate(env, cwd, "XDG_DATA_HOME", profile);
+    let state_candidate = xdg_candidate(env, cwd, "XDG_STATE_HOME", profile);
+    let managed_sessions = data_candidate
+        .as_ref()
+        .filter(|path| exists(path))
+        .unwrap_or(&agent_dir)
+        .join("sessions");
+    let terminal_sessions = state_candidate
+        .as_ref()
+        .filter(|path| exists(path))
+        .unwrap_or(&agent_dir)
+        .join("terminal-sessions");
+    let custom = options
+        .session_dir
+        .as_deref()
+        .or_else(|| nonempty(env, "PI_CODING_AGENT_SESSION_DIR").map(Path::new));
+    Ok((
+        OmpStoreLayout {
+            sessions: custom.map_or_else(
+                || managed_sessions.clone(),
+                |path| absolute_path(&session_cwd, path),
+            ),
+            managed_sessions,
+            terminal_sessions,
+            kind: if custom.is_some() {
+                OmpStoreKind::Custom
+            } else {
+                OmpStoreKind::Managed
+            },
+        },
+        agent_dir,
+    ))
 }
 
 pub(super) fn resolve_profile(
@@ -172,7 +217,7 @@ pub(super) fn dotenv_locations(
     ])
 }
 
-pub(super) fn host_launcher_environment(entries: &[String]) -> HashMap<String, String> {
+pub(crate) fn host_launcher_environment(entries: &[String]) -> HashMap<String, String> {
     let mut values = std::env::vars_os()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
         .collect::<HashMap<_, _>>();
@@ -190,7 +235,6 @@ pub(super) fn host_launcher_environment(entries: &[String]) -> HashMap<String, S
     // Absent and empty differ: OMP_PROFILE falls back to PI_PROFILE only when absent.
     values
 }
-
 /// Host pane routing env matching the resolver's snapshot; explicit unsets stop
 /// tmux's server environment reviving stale values.
 pub(crate) fn omp_host_routing_environment(
@@ -634,17 +678,20 @@ pub(super) fn absolute_path(cwd: &Path, path: &Path) -> PathBuf {
     crate::git::template::lexical_normalize(&path)
 }
 
-pub(super) fn read_container_environment(container_name: &str) -> Result<HashMap<String, String>> {
-    let command = container_exec_command(container_name, None, &["env"]);
+pub(crate) fn read_container_environment(
+    runtime: &crate::containers::RuntimeExecutionSnapshot,
+    container_name: &str,
+) -> Result<HashMap<String, String>> {
+    let command = container_exec_command(container_name, None, Some(runtime), &["env", "-0"]);
     let output = super::super::run_with_timeout_limit(
         command,
         COMMAND_TIMEOUT,
-        "container exec (OMP env probe)",
+        "container exec (native environment probe)",
         MAX_CONTAINER_ENV_BYTES,
     )?;
-    let text = String::from_utf8_lossy(&output);
+    let text = String::from_utf8(output).context("Container environment is not UTF-8")?;
     let mut values = HashMap::new();
-    for line in text.lines() {
+    for line in text.split(char::from(0)) {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
@@ -656,11 +703,11 @@ pub(super) fn read_container_environment(container_name: &str) -> Result<HashMap
 }
 
 pub(super) fn read_container_dotenv_content(
+    runtime: &crate::containers::RuntimeExecutionSnapshot,
     container_name: &str,
     path: &Path,
 ) -> Result<Option<String>> {
-    // TOCTOU accepted: sh cannot open O_NOFOLLOW, and the probe stays inside a
-    // container the user controls, size-capped and parsed only for routing keys.
+    // Container-controlled paths permit a check/read race; bounded reads confer no host privileges.
     const SCRIPT: &str = r#"if [ -L "$1" ]; then
   printf 'unsafe\n'
 elif [ ! -e "$1" ]; then
@@ -677,6 +724,7 @@ fi"#;
     let command = container_exec_command(
         container_name,
         None,
+        Some(runtime),
         &["sh", "-c", SCRIPT, "aoe-omp-dotenv", path],
     );
     let output = super::super::run_with_timeout_limit(
@@ -713,7 +761,20 @@ fi"#;
     }
 }
 
+fn read_container_dotenv(
+    runtime: &crate::containers::RuntimeExecutionSnapshot,
+    container_name: &str,
+    path: &Path,
+) -> Result<HashMap<String, String>> {
+    Ok(
+        read_container_dotenv_content(runtime, container_name, path)?
+            .map(|content| parse_dotenv(&content))
+            .unwrap_or_default(),
+    )
+}
+
 pub(super) fn probe_container_paths(
+    runtime: &crate::containers::RuntimeExecutionSnapshot,
     container_name: &str,
     paths: [Option<&Path>; 2],
 ) -> Result<[bool; 2]> {
@@ -724,6 +785,7 @@ done"#;
     let command = container_exec_command(
         container_name,
         None,
+        Some(runtime),
         &[
             "sh",
             "-c",
@@ -750,9 +812,16 @@ done"#;
 
 #[cfg(test)]
 mod tests {
-    use super::super::fixtures::*;
     use super::*;
     use crate::session::test_support::EnvGuard;
+    fn resolve_with_entries(
+        entries: &[String],
+        cwd: &str,
+        options: &OmpCliCaptureOptions,
+    ) -> Result<(OmpStoreLayout, String)> {
+        resolve_omp_store_layout_with_environment(host_launcher_environment(entries), cwd, options)
+            .map(|context| (context.layout, context.routing_fingerprint))
+    }
     use serial_test::serial;
 
     #[test]
@@ -859,7 +928,7 @@ mod tests {
             format!("HOME={}", home.display()),
             "PI_PROFILE=work".to_string(),
         ];
-        let (pi_layout, absent_fingerprint) = resolve_omp_store_layout_with_environment(
+        let (pi_layout, absent_fingerprint) = resolve_with_entries(
             &pi_only,
             routing_project.to_str().unwrap(),
             &OmpCliCaptureOptions::default(),
@@ -880,7 +949,7 @@ mod tests {
 
         let mut explicit_default = pi_only;
         explicit_default.push("OMP_PROFILE=".to_string());
-        let (default_layout, empty_fingerprint) = resolve_omp_store_layout_with_environment(
+        let (default_layout, empty_fingerprint) = resolve_with_entries(
             &explicit_default,
             routing_project.to_str().unwrap(),
             &OmpCliCaptureOptions::default(),
@@ -903,7 +972,7 @@ mod tests {
         std::fs::write(project.join(".env"), "OMP_PROFILE=base\n").unwrap();
         std::fs::write(project.join(".env.testing"), "OMP_PROFILE=mode\n").unwrap();
         let _env = EnvGuard::unset(&OMP_STORE_ENV_KEYS);
-        let (mode_layout, _) = resolve_omp_store_layout_with_environment(
+        let (mode_layout, _) = resolve_with_entries(
             &[
                 format!("HOME={}", home.display()),
                 "NODE_ENV=testing".to_string(),
@@ -918,7 +987,7 @@ mod tests {
         );
 
         std::fs::write(project.join(".env.local"), "OMP_PROFILE=local\n").unwrap();
-        let (layout, fingerprint) = resolve_omp_store_layout_with_environment(
+        let (layout, fingerprint) = resolve_with_entries(
             &[
                 format!("HOME={}", home.display()),
                 "NODE_ENV=testing".to_string(),
@@ -997,7 +1066,7 @@ mod tests {
         )
         .unwrap();
         let _env = EnvGuard::unset(&OMP_STORE_ENV_KEYS);
-        let (layout, fingerprint) = resolve_omp_store_layout_with_environment(
+        let (layout, fingerprint) = resolve_with_entries(
             &[
                 format!("HOME={}", home.display()),
                 "PI_PROFILE=expanded".to_string(),
@@ -1015,7 +1084,7 @@ mod tests {
                 format!("{key}=$AWS_SECRET_ACCESS_KEY\n"),
             )
             .unwrap();
-            let error = resolve_omp_store_layout_with_environment(
+            let error = resolve_with_entries(
                 &[
                     format!("HOME={}", home.display()),
                     "AWS_SECRET_ACCESS_KEY=must-not-persist".to_string(),
@@ -1083,14 +1152,11 @@ mod tests {
             ("XDG_DATA_HOME".to_string(), "/data".to_string()),
             ("XDG_STATE_HOME".to_string(), "/state".to_string()),
         ]);
-        let data_only = resolve_layout(
-            &env,
-            cwd,
-            None,
-            &OmpCliCaptureOptions::default(),
-            exists_where(|path| path == Path::new("/data/omp")),
-        )
-        .unwrap();
+        let (data_only, _) =
+            resolve_layout(&env, cwd, None, &OmpCliCaptureOptions::default(), |path| {
+                path == Path::new("/data/omp")
+            })
+            .unwrap();
         assert_eq!(data_only.sessions, Path::new("/data/omp/sessions"));
         assert_eq!(
             data_only.terminal_sessions,
@@ -1101,12 +1167,12 @@ mod tests {
             "PI_CODING_AGENT_DIR".to_string(),
             "/ignored-for-profile".to_string(),
         );
-        let profile = resolve_layout(
+        let (profile, _) = resolve_layout(
             &env,
             cwd,
             Some("work"),
             &OmpCliCaptureOptions::default(),
-            exists_where(|_| true),
+            |_| true,
         )
         .unwrap();
         assert_eq!(
@@ -1125,14 +1191,8 @@ mod tests {
             "/home/test/.omp/profiles/work/agent".to_string(),
         );
         assert_eq!(resolve_profile(None, &env).unwrap(), None);
-        let restored_default = resolve_layout(
-            &env,
-            cwd,
-            None,
-            &OmpCliCaptureOptions::default(),
-            exists_where(|_| false),
-        )
-        .unwrap();
+        let (restored_default, _) =
+            resolve_layout(&env, cwd, None, &OmpCliCaptureOptions::default(), |_| false).unwrap();
         assert_eq!(
             restored_default.sessions,
             Path::new("/home/test/.omp/agent/sessions"),
@@ -1144,13 +1204,9 @@ mod tests {
             cwd: Some(PathBuf::from("../other")),
         };
         env.remove("PI_CODING_AGENT_DIR");
-        let custom = resolve_layout(
-            &env,
-            cwd,
-            None,
-            &custom_options,
-            exists_where(|path| path == Path::new("/state/omp")),
-        )
+        let (custom, _) = resolve_layout(&env, cwd, None, &custom_options, |path| {
+            path == Path::new("/state/omp")
+        })
         .unwrap();
         assert_eq!(custom.kind, OmpStoreKind::Custom);
         assert_eq!(custom.sessions, Path::new("/workspace/other/.sessions"));

@@ -6,10 +6,22 @@ use super::*;
 #[serial]
 fn fork_from_selection_seeds_terminal_fork_and_inherits_parent_context() {
     let mut env = create_test_env_empty();
-    let mut inst = Instance::new("parent", "/tmp/repo");
-    inst.source_profile = "test".to_string();
-    inst.tool = "claude".into();
-    inst.agent_session_id = Some("parent-1111-2222-3333-444444444444".into());
+    let mut inst = observed_fork_parent("claude");
+    inst.project_path = "/tmp/repo-worktrees/feature".into();
+    inst.agent_session_binding
+        .as_mut()
+        .unwrap()
+        .execution
+        .as_mut()
+        .unwrap()
+        .cwd = inst.project_path.clone().into();
+    inst.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "feature".into(),
+        main_repo_path: "/tmp/repo".into(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
     let id = inst.id.clone();
     env.view.add_instance(inst);
     env.view.selected_session = Some(id);
@@ -24,29 +36,25 @@ fn fork_from_selection_seeds_terminal_fork_and_inherits_parent_context() {
     let seed = dialog.fork_seed().cloned().expect("fork seed present");
     match seed {
         crate::session::ForkSeed::Terminal {
-            parent_agent_session_id,
+            parent,
             child_session_id,
         } => {
-            assert_eq!(
-                parent_agent_session_id,
-                "parent-1111-2222-3333-444444444444"
-            );
+            assert_eq!(parent.session_id, "parent-1111-2222-3333-444444444444");
             assert_ne!(child_session_id, "parent-1111-2222-3333-444444444444");
-            assert!(!child_session_id.is_empty());
+            assert!(crate::session::capture::is_valid_session_id(
+                &child_session_id
+            ));
         }
         other => panic!("expected Terminal fork seed, got {other:?}"),
     }
-    assert_eq!(dialog.path_value(), "/tmp/repo");
+    assert_eq!(dialog.path_value(), "/tmp/repo-worktrees/feature");
 }
 
 #[test]
 #[serial]
 fn fork_denied_for_resume_only_agent_shows_info() {
     let mut env = create_test_env_empty();
-    let mut inst = Instance::new("parent", "/tmp/repo");
-    inst.source_profile = "test".to_string();
-    inst.tool = "gemini".into();
-    inst.agent_session_id = Some("parent-uuid".into());
+    let inst = observed_fork_parent("gemini");
     let id = inst.id.clone();
     env.view.add_instance(inst);
     env.view.selected_session = Some(id);
@@ -72,10 +80,7 @@ fn fork_from_selection_preselects_parent_tool() {
     let mut env = create_test_env_empty();
     env.view
         .set_available_tools(AvailableTools::with_tools(&["claude", "codex"]));
-    let mut inst = Instance::new("parent", "/tmp/repo");
-    inst.source_profile = "test".to_string();
-    inst.tool = "codex".into();
-    inst.agent_session_id = Some("parent-1111-2222-3333-444444444444".into());
+    let inst = observed_fork_parent("codex");
     let id = inst.id.clone();
     env.view.add_instance(inst);
     env.view.selected_session = Some(id);

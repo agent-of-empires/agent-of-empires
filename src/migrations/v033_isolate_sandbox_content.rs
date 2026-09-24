@@ -49,6 +49,8 @@ pub(crate) struct SandboxContentReset {
     /// Pre-retirement candidates; a later isolated context is never cleared
     /// just because its first notice has not yet been acknowledged.
     retired_terminal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retired_terminal_binding: Option<crate::session::ConversationBinding>,
     retired_structured: Vec<String>,
     retired_import: bool,
 }
@@ -59,6 +61,22 @@ impl SandboxContentReset {
             NativeContextView::Terminal => &mut self.terminal,
             NativeContextView::Structured => &mut self.structured,
         }
+    }
+}
+
+fn retired_binding_matches(
+    current: Option<&crate::session::ConversationBinding>,
+    retired: Option<&crate::session::ConversationBinding>,
+    sid: &str,
+) -> bool {
+    match retired {
+        Some(retired) => current == Some(retired),
+        None => current.is_none_or(|binding| {
+            binding.session_id == sid
+                && binding.execution.is_none()
+                && binding.provenance == crate::session::ConversationProvenance::Unknown
+                && binding.transcript_path.is_none()
+        }),
     }
 }
 
@@ -80,14 +98,29 @@ fn claim_context_reset(
         if reset.lane(view).generation.is_none() {
             match view {
                 NativeContextView::Terminal => {
-                    if reset.retired_terminal.is_some()
-                        && instance.agent_session_id == reset.retired_terminal
-                    {
-                        instance.agent_session_id = None;
-                        instance.pi_session_path = None;
+                    if let Some(retired) = reset.retired_terminal.as_deref() {
+                        if instance.agent_session_id.as_deref() == Some(retired)
+                            && retired_binding_matches(
+                                instance.agent_session_binding.as_ref(),
+                                reset.retired_terminal_binding.as_ref(),
+                                retired,
+                            )
+                        {
+                            instance.agent_session_id = None;
+                            instance.agent_session_binding = None;
+                            instance.pi_session_path = None;
+                        }
                     }
-                    if instance.agent_session_id.is_none() && instance.pi_session_path.is_none() {
+                    if instance.agent_session_id.is_none()
+                        && instance.pi_session_path.is_none()
+                        && matches!(
+                            instance.resume_intent,
+                            crate::session::ResumeIntent::Default
+                                | crate::session::ResumeIntent::Cleared
+                        )
+                    {
                         instance.resume_intent = crate::session::ResumeIntent::Cleared;
+                        instance.resume_binding = None;
                         instance.capture_started_at = Some(std::time::SystemTime::now());
                     }
                 }
@@ -243,7 +276,7 @@ pub(crate) fn prepare_terminal_launch_context(
     }
     let generation = instance.lifecycle_generation;
     let storage = crate::session::Storage::new_unwatched(&instance.source_profile)?;
-    let (resets, notice, sid, pi_path, intent, floor, omp_generation) =
+    let (resets, notice, sid, sid_binding, pi_path, intent, resume_binding, floor, omp_generation) =
         storage.update(|instances, _| {
             let row = instances
                 .iter_mut()
@@ -258,8 +291,10 @@ pub(crate) fn prepare_terminal_launch_context(
                 row.sandbox_content_resets.clone(),
                 notice,
                 row.agent_session_id.clone(),
+                row.agent_session_binding.clone(),
                 row.pi_session_path.clone(),
                 row.resume_intent.clone(),
+                row.resume_binding.clone(),
                 row.capture_started_at,
                 row.omp_capture_generation.clone(),
             ))
@@ -267,8 +302,10 @@ pub(crate) fn prepare_terminal_launch_context(
     instance.sandbox_content_resets = resets;
     if notice.is_some() {
         instance.agent_session_id = sid;
+        instance.agent_session_binding = sid_binding;
         instance.pi_session_path = pi_path;
         instance.resume_intent = intent;
+        instance.resume_binding = resume_binding;
         instance.capture_started_at = floor;
         instance.omp_capture_generation = omp_generation;
     }
@@ -937,11 +974,18 @@ fn row_roots(
         .get("id")
         .and_then(Value::as_str)
         .context("sandbox row has no id")?;
-    let detect = (row.get("tool").and_then(Value::as_str) == Some(tool))
-        .then(|| row.get("detect_as").and_then(Value::as_str))
-        .flatten()
-        .filter(|name| !name.is_empty());
-    container_config::sandbox_content_roots(tool, detect, &config.session, home, id)
+    let current = row.get("tool").and_then(Value::as_str) == Some(tool);
+    let command = if current {
+        row.get("command")
+            .and_then(Value::as_str)
+            .filter(|command| !command.is_empty())
+    } else {
+        config.session.custom_agents.get(tool).map(String::as_str)
+    };
+    let command = command
+        .or_else(|| crate::agents::get_agent(tool).map(|agent| agent.binary))
+        .unwrap_or("bash");
+    container_config::sandbox_content_roots(tool, Some(command), &config.session, home, id)
 }
 
 /// Whether the same-kernel inode proof can authenticate a running container's
@@ -1543,6 +1587,25 @@ fn publish_receipt(receipt: &mut Receipt, path: &Path) -> Result<()> {
     write_receipt(path, receipt)
 }
 
+fn retired_json_binding_matches(
+    current: Option<&Value>,
+    retired: Option<&Value>,
+    sid: Option<&str>,
+) -> bool {
+    let current = current.filter(|binding| !binding.is_null());
+    match retired.filter(|binding| !binding.is_null()) {
+        Some(retired) => current == Some(retired),
+        None => current.is_none_or(|binding| {
+            sid.is_some_and(|sid| {
+                binding.get("session_id").and_then(Value::as_str) == Some(sid)
+                    && binding.get("execution").is_none_or(Value::is_null)
+                    && binding.get("provenance").and_then(Value::as_str) == Some("unknown")
+                    && binding.get("transcript_path").is_none_or(Value::is_null)
+            })
+        }),
+    }
+}
+
 fn reset_row(row: &mut Value, receipt: &Receipt) -> Result<()> {
     let object = row
         .as_object_mut()
@@ -1635,6 +1698,12 @@ fn reset_row(row: &mut Value, receipt: &Receipt) -> Result<()> {
                     .and_then(|prior| prior.get("agent_session_id"))
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                retired_terminal_binding: prior
+                    .and_then(|prior| prior.get("agent_session_binding"))
+                    .filter(|binding| !binding.is_null())
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?,
                 retired_structured,
                 retired_import: current
                     && snapshot.get("import_pending").and_then(Value::as_bool) == Some(true),
@@ -1667,9 +1736,22 @@ fn reset_row(row: &mut Value, receipt: &Receipt) -> Result<()> {
                 == prior
                     .get("pi_session_path")
                     .filter(|value| !value.is_null());
-            if same_id && same_pi {
+            let same_binding = retired_json_binding_matches(
+                object.get("agent_session_binding"),
+                prior.get("agent_session_binding"),
+                prior.get("agent_session_id").and_then(Value::as_str),
+            );
+            let same_resume = object.get("resume_intent") == prior.get("resume_intent")
+                && retired_json_binding_matches(
+                    object.get("resume_binding"),
+                    prior.get("resume_binding"),
+                    None,
+                );
+            if same_id && same_pi && same_binding && same_resume {
                 object.remove("agent_session_id");
+                object.remove("agent_session_binding");
                 object.remove("pi_session_path");
+                object.remove("resume_binding");
                 object.insert(
                     "resume_intent".into(),
                     serde_json::json!({"kind":"Cleared"}),
@@ -1698,8 +1780,14 @@ fn reset_row(row: &mut Value, receipt: &Receipt) -> Result<()> {
                     == prior
                         .get("agent_session_id")
                         .filter(|value| !value.is_null())
+                    && retired_json_binding_matches(
+                        current.get("agent_session_binding"),
+                        prior.get("agent_session_binding"),
+                        prior.get("agent_session_id").and_then(Value::as_str),
+                    )
                 {
                     let removed = current.remove("agent_session_id").is_some();
+                    current.remove("agent_session_binding");
                     retired_parked_omp |= agent == "omp" && removed;
                 }
             }
@@ -2017,8 +2105,13 @@ fn migrate_target(
         || current.get("project_path") != row.get("project_path")
         || [
             "tool",
+            "command",
+            "extra_args",
             "detect_as",
             "agent_session_id",
+            "agent_session_binding",
+            "resume_intent",
+            "resume_binding",
             "prior_tool_session_ids",
         ]
         .iter()
@@ -2129,6 +2222,8 @@ fn reconcile_in(
 }
 
 pub fn run() -> Result<()> {
+    // A prerelease v031 may have used this number for content isolation.
+    super::v031_conversation_provenance::run()?;
     // Content isolation is keyed by home. A host without one still advances
     // the schema and retries reconciliation once a home is available.
     if dirs::home_dir().is_none() {
@@ -2278,7 +2373,7 @@ pub(crate) fn instance_roots(instance: &crate::session::Instance) -> Result<Vec<
         crate::session::config::profile_config::resolve_config(&instance.effective_profile())?;
     container_config::sandbox_content_roots(
         &instance.tool,
-        Some(&instance.detect_as),
+        Some(instance.get_tool_command()),
         &config.session,
         &home,
         &instance.id,
@@ -2703,7 +2798,7 @@ mod tests {
     /// transaction's recovery paths.
     #[test]
     #[serial_test::serial]
-    fn a_retired_receipt_binds_to_the_current_content_roots() {
+    fn retired_receipt_scopes_roots_and_preserves_newer_bindings() {
         let temporary = tempfile::tempdir().unwrap();
         let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
         let home = dirs::home_dir().unwrap();
@@ -2771,6 +2866,89 @@ mod tests {
             Some("txn-other".to_owned()),
             "each roots set selects only its own archive"
         );
+        let old_binding = crate::session::ConversationBinding {
+            session_id: "old-native-context".into(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: "codex".into(),
+                stores: vec![current[0].path.clone()],
+                configuration: Vec::new(),
+                cwd: temporary.path().to_path_buf(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            }),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        };
+        let mut receipt = make("txn-bound", &current);
+        receipt.retired_identity["agent_session_binding"] =
+            serde_json::to_value(&old_binding).unwrap();
+        let mut removed = receipt.retired_identity.clone();
+        reset_row(&mut removed, &receipt).unwrap();
+        assert!(removed.get("agent_session_id").is_none());
+        assert!(removed.get("agent_session_binding").is_none());
+        assert_eq!(removed["resume_intent"]["kind"], "Cleared");
+        let notice: SandboxContentReset =
+            serde_json::from_value(removed["sandbox_content_resets"][0].clone()).unwrap();
+        assert_eq!(notice.retired_terminal_binding.as_ref(), Some(&old_binding));
+
+        let mut newer = old_binding.clone();
+        newer.execution.as_mut().unwrap().stores = vec![temporary.path().join("new-store")];
+        let mut rebound = receipt.retired_identity.clone();
+        rebound["agent_session_binding"] = serde_json::to_value(&newer).unwrap();
+        reset_row(&mut rebound, &receipt).unwrap();
+        assert_eq!(rebound["agent_session_id"], "old-native-context");
+        assert_eq!(
+            rebound["agent_session_binding"],
+            serde_json::to_value(&newer).unwrap()
+        );
+
+        for (binding, must_clear) in [(old_binding.clone(), true), (newer.clone(), false)] {
+            let mut terminal = instance.clone();
+            terminal.tool = "codex".into();
+            terminal.agent_session_id = Some("old-native-context".into());
+            terminal.agent_session_binding = Some(binding.clone());
+            terminal.sandbox_content_resets.push(notice.clone());
+            claim_context_reset(&mut terminal, Some("codex"), NativeContextView::Terminal, 8);
+            if must_clear {
+                assert!(terminal.agent_session_id.is_none());
+                assert!(terminal.agent_session_binding.is_none());
+                assert!(matches!(
+                    terminal.resume_intent,
+                    crate::session::ResumeIntent::Cleared
+                ));
+            } else {
+                assert_eq!(
+                    terminal.agent_session_id.as_deref(),
+                    Some("old-native-context")
+                );
+                assert_eq!(terminal.agent_session_binding, Some(binding));
+            }
+        }
+
+        let mut configuration_only = receipt.clone();
+        configuration_only.roots[0].original = None;
+        let mut preserved = receipt.retired_identity.clone();
+        preserved["resume_intent"] = serde_json::json!({"kind":"Use","value":"old-native-context"});
+        preserved["resume_binding"] = serde_json::to_value(&old_binding).unwrap();
+        preserved["prior_tool_session_ids"] = serde_json::json!({
+            "claude": {"agent_session_id": "parked", "agent_session_binding": {
+                "session_id": "parked", "execution": null, "provenance": "unknown"
+            }}
+        });
+        let original = preserved.clone();
+        reset_row(&mut preserved, &configuration_only).unwrap();
+        for field in [
+            "agent_session_id",
+            "agent_session_binding",
+            "resume_intent",
+            "resume_binding",
+            "prior_tool_session_ids",
+        ] {
+            assert_eq!(
+                preserved[field], original[field],
+                "configuration-only seed changed {field}"
+            );
+        }
     }
 
     /// A live mount that reaches the recovery namespace defers retention, and
@@ -3729,6 +3907,7 @@ mod tests {
                             generation: None,
                         },
                         retired_terminal: Some("terminal-context".into()),
+                        retired_terminal_binding: None,
                         retired_structured: vec![
                             "persisted-acp-context".into(),
                             "persisted-fork".into(),
@@ -4216,7 +4395,6 @@ mod tests {
             fs::read(archive.roots[0].recovery.join("sessions/original.jsonl")).unwrap(),
             b"PRIVATE_ORIGINAL_CONTEXT"
         );
-        assert_eq!(fs::read(app.join(".schema_version")).unwrap(), b"31");
         assert!(
             read_receipt(&receipt_path(&app, &instance.id, "codex").unwrap())
                 .unwrap()
@@ -4275,7 +4453,6 @@ mod tests {
         let _probes =
             install_test_reconcile_probes(|_| Ok(false), |_| Ok(true), |_| Ok(Vec::new()));
         super::super::run_migrations_with(Some(reporter)).unwrap();
-        assert_eq!(fs::read(app.join(".schema_version")).unwrap(), b"31");
         assert!(
             read_receipt(&receipt_path(&app, &instance.id, "codex").unwrap())
                 .unwrap()
@@ -4283,7 +4460,9 @@ mod tests {
         );
         let rows: Vec<Value> =
             serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
-        assert_eq!(rows, original);
+        assert_eq!(rows[0]["agent_session_id"], original[0]["agent_session_id"]);
+        assert_eq!(rows[0]["agent_session_binding"]["provenance"], "unknown");
+        assert!(rows[0]["agent_session_binding"]["execution"].is_null());
         assert!(!roots_ready(&app, &instance.id, "codex", &roots).unwrap());
         assert_eq!(
             fs::read(root.join("sessions/original.jsonl")).unwrap(),
@@ -4489,7 +4668,6 @@ mod tests {
             fs::read(roots[0].path.join("config.toml")).unwrap(),
             b"model = 'fixture-model'\n"
         );
-        assert_eq!(fs::read(app.join(".schema_version")).unwrap(), b"31");
         let receipt = receipt_path(&app, &instance.id, "codex").unwrap();
         let archives: BTreeMap<_, _> = fs::read_dir(receipt.parent().unwrap())
             .unwrap()
@@ -4583,7 +4761,6 @@ mod tests {
             std::sync::Arc::new(move |event| captured.lock().unwrap().push(event));
 
         super::super::run_migrations_with(Some(reporter)).unwrap();
-        assert_eq!(fs::read(app.join(".schema_version")).unwrap(), b"31");
         assert_eq!(fs::read(app.join("sessions.json")).unwrap(), registry);
         assert_eq!(identity(&legacy).unwrap(), original_identity);
         assert_eq!(

@@ -394,6 +394,7 @@ pub async fn switch_acp_agent(
         fork_from: None,
         seed_history_replay: false,
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Fresh,
+        claude_store_pin: None,
         ..spawn_request_for(&instance, target.clone(), sandbox_info)
     };
     if let Err(e) = state.acp_supervisor.spawn(request).await {

@@ -1175,6 +1175,18 @@ pub struct SessionConfig {
     )]
     pub agent_detect_as: HashMap<String, String>,
 
+    /// Explicit native execution contract: wrapper=builtin (e.g. lenovo-claude=claude).
+    /// Asserts which agent a wrapper executes and whose conversation namespace
+    /// it writes, paired with agent_config_dir.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[setting(
+        label = "Agent Execution As",
+        widget = "list",
+        web = "local_only:asserts the native execution and conversation namespace of a wrapper",
+        category = "Agents"
+    )]
+    pub agent_execution_as: HashMap<String, String>,
+
     /// ACP launch command for a custom agent, enabling it to run in the
     /// structured acp UI (e.g., "oc-superpowers" = "ocp run sp acp").
     /// A custom agent with an entry here is acp-capable; without one it
@@ -1787,8 +1799,9 @@ impl Default for SessionConfig {
             host_tab_title: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
-            agent_config_dir: HashMap::new(),
+            agent_execution_as: HashMap::new(),
             agent_acp_cmd: HashMap::new(),
+            agent_config_dir: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
             session_id_poller_max_threads: default_session_id_poller_max_threads(),

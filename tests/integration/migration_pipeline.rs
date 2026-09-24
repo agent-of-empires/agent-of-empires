@@ -86,14 +86,19 @@ fn test_partial_version_runs_remaining() -> Result<()> {
 
 #[test]
 #[serial]
-fn global_only_settings_migrate_before_the_schema_version_advances() -> Result<()> {
+fn post_v029_migrations_run_together_before_version_advances() -> Result<()> {
     let _temp = setup_temp_home();
     let app = agent_of_empires::session::get_app_dir()?;
     let profile = agent_of_empires::session::get_profile_dir("work")?.join("config.toml");
+    let sessions = profile.with_file_name("sessions.json");
     fs::write(app.join(".schema_version"), "29")?;
     fs::write(app.join("config.toml"), "default_profile = 'work'\n")?;
     fs::write(&profile, "[invalid")?;
 
+    fs::write(
+        &sessions,
+        r#"[{"agent_session_id":"legacy","retroactive_capture_excludes":["excluded"]}]"#,
+    )?;
     assert!(agent_of_empires::migrations::run_migrations().is_err());
     assert_eq!(fs::read_to_string(app.join(".schema_version"))?, "29");
     assert_eq!(fs::read_to_string(&profile)?, "[invalid");
@@ -109,7 +114,40 @@ fn global_only_settings_migrate_before_the_schema_version_advances() -> Result<(
     assert_eq!(effective.session.default_tool.as_deref(), Some("codex"));
     let saved: toml::Table = fs::read_to_string(&profile)?.parse()?;
     assert!(!saved.contains_key("theme"));
+    let rows: serde_json::Value = serde_json::from_str(&fs::read_to_string(&sessions)?)?;
+    assert_eq!(rows[0]["agent_session_binding"]["session_id"], "legacy");
+    assert_eq!(
+        rows[0]["retroactive_capture_excludes"][0]["session_id"],
+        "excluded"
+    );
     assert_eq!(saved["session"].as_table().unwrap().len(), 1);
+    assert_eq!(
+        fs::read_to_string(app.join(".schema_version"))?.parse::<u32>()?,
+        agent_of_empires::migrations::current_schema_version()
+    );
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn schema_v30_runs_pr_conversation_migrations() -> Result<()> {
+    let _temp = setup_temp_home();
+    let app = agent_of_empires::session::get_app_dir()?;
+    let sessions = app.join("sessions.json");
+    fs::write(app.join(".schema_version"), "30")?;
+    fs::write(
+        &sessions,
+        r#"[{"agent_session_id":"legacy","retroactive_capture_excludes":["excluded"]}]"#,
+    )?;
+
+    agent_of_empires::migrations::run_migrations()?;
+
+    let rows: serde_json::Value = serde_json::from_str(&fs::read_to_string(&sessions)?)?;
+    assert_eq!(rows[0]["agent_session_binding"]["session_id"], "legacy");
+    assert_eq!(
+        rows[0]["retroactive_capture_excludes"][0]["session_id"],
+        "excluded"
+    );
     assert_eq!(
         fs::read_to_string(app.join(".schema_version"))?.parse::<u32>()?,
         agent_of_empires::migrations::current_schema_version()

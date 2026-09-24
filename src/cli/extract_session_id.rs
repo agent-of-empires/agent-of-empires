@@ -32,7 +32,17 @@ pub async fn run(args: ExtractSessionIdArgs) -> Result<()> {
         );
         return Ok(());
     }
-    if let Err(e) = run_inner(std::io::stdin().lock(), &instance_id, args.field) {
+    let source = match std::env::var(crate::hooks::SESSION_SOURCE_ENV) {
+        Ok(source) => Some(source),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => return Ok(()),
+    };
+    if let Err(e) = run_inner(
+        std::io::stdin().lock(),
+        &instance_id,
+        args.field,
+        source.as_deref(),
+    ) {
         tracing::debug!(target: "hooks.session_id", "extract failed: {e}");
     }
     Ok(())
@@ -90,6 +100,7 @@ fn run_inner<R: Read>(
     stdin: R,
     instance_id: &str,
     field: crate::agents::HookIdentityField,
+    source: Option<&str>,
 ) -> Result<()> {
     let mut buf = String::new();
     stdin.take(STDIN_BYTE_CAP).read_to_string(&mut buf)?;
@@ -110,7 +121,7 @@ fn run_inner<R: Read>(
     if !crate::session::capture::is_valid_session_id(sid) {
         return Err(anyhow!("payload contains an unsafe native session id"));
     }
-    crate::hooks::write_session_id_via_guard(instance_id, sid)
+    crate::hooks::write_session_id_via_guard(instance_id, sid, source)
 }
 
 #[cfg(test)]
@@ -127,6 +138,7 @@ mod tests {
             payload.as_bytes(),
             instance_id,
             crate::agents::HookIdentityField::SessionId,
+            None,
         )
     }
 
@@ -259,14 +271,14 @@ mod tests {
         let field = crate::agents::HookIdentityField::ConversationIdOrSessionId;
 
         let payload = format!(r#"{{"conversation_id":"{conversation}","session_id":"{OTHER}"}}"#);
-        run_inner(payload.as_bytes(), "conversation_preferred", field).unwrap();
+        run_inner(payload.as_bytes(), "conversation_preferred", field, None).unwrap();
         assert_eq!(
             read_sidecar(&base, "conversation_preferred").as_deref(),
             Some(conversation)
         );
 
         let fallback = format!(r#"{{"session_id":"{OTHER}"}}"#);
-        run_inner(fallback.as_bytes(), "conversation_fallback", field).unwrap();
+        run_inner(fallback.as_bytes(), "conversation_fallback", field, None).unwrap();
         assert_eq!(
             read_sidecar(&base, "conversation_fallback").as_deref(),
             Some(OTHER)
@@ -288,6 +300,7 @@ mod tests {
             InfiniteReader,
             "infinite",
             crate::agents::HookIdentityField::SessionId,
+            None,
         );
         assert!(result.is_err(), "should reject after the 1 MiB cap");
         assert!(read_sidecar(&base, "infinite").is_none());
@@ -310,5 +323,52 @@ mod tests {
             "do not overwrite",
             "decoy bytes must be intact"
         );
+    }
+
+    fn read_suffixed_sidecar(
+        base: &std::path::Path,
+        instance_id: &str,
+        source: &str,
+    ) -> Option<String> {
+        std::fs::read_to_string(base.join(instance_id).join(format!("session_id.{source}"))).ok()
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn canonical_source_routes_to_suffixed_leaf() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let source = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let payload = r#"{"session_id":"11111111-2222-3333-4444-555555555555"}"#;
+        run_inner(
+            payload.as_bytes(),
+            "sourced",
+            crate::agents::HookIdentityField::SessionId,
+            Some(source),
+        )
+        .unwrap();
+        assert_eq!(
+            read_suffixed_sidecar(&base, "sourced", source).as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+        assert!(
+            read_sidecar(&base, "sourced").is_none(),
+            "a sourced write must not touch the default leaf"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn non_canonical_source_refuses_the_write() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let payload = r#"{"session_id":"11111111-2222-3333-4444-555555555555"}"#;
+        let err = run_inner(
+            payload.as_bytes(),
+            "bad_source",
+            crate::agents::HookIdentityField::SessionId,
+            Some("not-a-uuid"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"), "got: {err}");
+        assert!(read_sidecar(&base, "bad_source").is_none());
     }
 }

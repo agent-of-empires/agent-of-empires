@@ -1259,11 +1259,20 @@ function AppContent({
     const { sessionId, toStructured } = switchViewTarget;
     // Keep the dialog mounted through the request so its "Switching..." spinner
     // shows; close it once the switch resolves.
-    const result = toStructured ? await acpEnable(sessionId) : await acpDisable(sessionId);
-    setSwitchViewTarget(null);
-    if (!result) {
-      toastBus.handler?.error(`Failed to switch to ${toStructured ? "structured view" : "terminal"}`);
-      return;
+    if (toStructured) {
+      const enabled = await acpEnable(sessionId);
+      setSwitchViewTarget(null);
+      if (!enabled) {
+        toastBus.handler?.error("Failed to switch to structured view");
+        return;
+      }
+    } else {
+      const disabled = await acpDisable(sessionId);
+      setSwitchViewTarget(null);
+      if (!disabled.ok) {
+        toastBus.handler?.error(disabled.message ?? "Failed to switch to terminal");
+        return;
+      }
     }
     toastBus.handler?.info(`Switched to ${toStructured ? "structured view" : "terminal"}`);
   }, [switchViewTarget]);
@@ -1278,7 +1287,7 @@ function AppContent({
         toastBus.handler?.error("Failed to start session");
         return;
       }
-      toastBus.handler?.info("Session started");
+      toastBus.handler?.info(result.message ?? "Session started");
     },
     [setSessionStatus],
   );
