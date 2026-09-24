@@ -21,6 +21,7 @@ const mockedClearCtrlRef = { current: null };
 vi.mock("../../lib/api", () => ({
   ensureSession: (id: string, signal?: AbortSignal) => ensureSession(id, signal),
   ensureTerminal: vi.fn(),
+  isStartRefusal: (code?: string) => code === "session_archived" || code === "session_trashed",
 }));
 
 // The full hook is exercised by useTerminal.lifecycle.test.ts and the Playwright suites.
@@ -83,6 +84,20 @@ describe("TerminalView early-return states", () => {
     ensureSession.mockResolvedValueOnce({ ok: false });
     render(<TerminalView session={makeSession()} />);
     await waitFor(() => expect(screen.getByText(/Could not start session/i)).toBeDefined());
+  });
+
+  // #4116: an archived or trashed session stays refused, so there is nothing to retry.
+  it("omits Retry when ensure refuses an archived or trashed session", async () => {
+    ensureSession.mockResolvedValueOnce({
+      ok: false,
+      error: "session_archived",
+      message: "session is archived; unarchive it first",
+    });
+    render(<TerminalView session={makeSession()} />);
+    await waitFor(() => {
+      expect(screen.getByText("session is archived; unarchive it first")).toBeDefined();
+    });
+    expect(screen.queryByRole("button", { name: /retry/i })).toBeNull();
   });
 
   it("re-runs ensureSession when Retry is clicked", async () => {

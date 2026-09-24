@@ -444,6 +444,8 @@ pub async fn acp_disable(
 
     match tokio::task::spawn_blocking(move || instance.start()).await {
         Ok(Ok(())) => {}
+        // An archived or trashed session switches views without starting.
+        Ok(Err(e)) if e.downcast_ref::<crate::session::StartBlocked>().is_some() => {}
         Ok(Err(e)) => {
             tracing::warn!(target: "acp.switch", session = %id, "tmux start after disable: {e}");
         }

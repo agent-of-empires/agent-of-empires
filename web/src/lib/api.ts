@@ -1598,6 +1598,9 @@ export function stopSession(id: string): Promise<SessionResponse | null> {
   return sessionUpdate(id, "stop", jsonInit("POST"));
 }
 
+/** A 409 code for a start refused because the session is archived or trashed. */
+export const isStartRefusal = (code: string | undefined) => code === "session_archived" || code === "session_trashed";
+
 export type StartSessionResult =
   | { ok: true; session: SessionResponse }
   | { ok: false; refused: boolean; message?: string };
@@ -1608,9 +1611,7 @@ export async function startSession(id: string): Promise<StartSessionResult> {
   if (reply?.ok && reply.payload) return { ok: true, session: reply.payload as unknown as SessionResponse };
   return {
     ok: false,
-    refused:
-      reply?.status === 409 &&
-      ["session_archived", "session_trashed"].includes(stringField(reply.payload, "error") ?? ""),
+    refused: isStartRefusal(stringField(reply?.payload, "error")),
     message: stringField(reply?.payload, "message"),
   };
 }

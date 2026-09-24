@@ -38,6 +38,8 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     let is_structured = inst.is_structured();
 
     if is_structured {
+        // The daemon refuses too; checking here keeps the message readable.
+        inst.ensure_startable()?;
         return send_structured(&session_id, &session_title, &args.message, args.no_revive).await;
     }
 
@@ -122,7 +124,7 @@ mod tests {
     use crate::session::Instance;
     use serial_test::serial;
 
-    /// #4116: auto-revive refuses to start an archived or trashed session.
+    /// #4116: auto-revive refuses to start an archived or trashed session, terminal or structured.
     #[tokio::test]
     #[serial]
     async fn send_does_not_revive_archived_or_trashed_session() {
@@ -130,11 +132,16 @@ mod tests {
             (Instance::archive, "session is archived; unarchive it first"),
             (Instance::trash, "session is in trash; restore it first"),
         ];
-        for (dismiss, message) in dismissals {
+        for ((dismiss, message), structured) in
+            dismissals.into_iter().flat_map(|d| [(d, false), (d, true)])
+        {
             let temp = tempfile::tempdir().unwrap();
             let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
             let profile = "send-blocked";
             let mut inst = Instance::new("dismissed", "/tmp/x");
+            if structured {
+                inst.view = crate::session::View::Structured;
+            }
             dismiss(&mut inst);
             let id = inst.id.clone();
             Storage::new_unwatched(profile)
@@ -151,7 +158,7 @@ mod tests {
                 no_revive: false,
             };
             let err = run(profile, args).await.unwrap_err();
-            assert_eq!(err.to_string(), message);
+            assert_eq!(err.to_string(), message, "structured={structured}");
             let tmux = crate::tmux::Session::new(&id, &inst.title).unwrap();
             assert!(!tmux.exists());
         }
