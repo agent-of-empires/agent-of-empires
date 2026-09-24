@@ -76,7 +76,7 @@ fn drain_and_persist_session_ids_inner(
 ) -> SessionIdSyncOutcome {
     let mut updates: Vec<Update> = Vec::with_capacity(instances.len());
     let mut filtered_ids: HashSet<String> = HashSet::with_capacity(instances.len());
-    let mut already_current: Vec<String> = Vec::new();
+    let mut already_current: Vec<(String, SessionIdObservation)> = Vec::new();
 
     // Frozen pre-update ownership snapshot.
     let mut sid_owners: HashMap<String, String> = HashMap::with_capacity(instances.len());
@@ -163,9 +163,8 @@ fn drain_and_persist_session_ids_inner(
             }
         }
         if inst.agent_session_id.as_deref() == Some(sid.as_str()) && !confirms_omp_pin {
-            acknowledge_poller_observation(inst, &observation);
             // The pane published the id this row already holds, so there is no sid to write.
-            already_current.push(inst.id.clone());
+            already_current.push((inst.id.clone(), observation));
             continue;
         }
         updates.push(Update {
@@ -204,9 +203,12 @@ fn drain_and_persist_session_ids_inner(
         }
     });
 
-    for id in &already_current {
+    for (id, observation) in &already_current {
         if let Some(inst) = instances.iter_mut().find(|i| i.id == *id) {
-            inst.absorb_published_pi_session();
+            // Unacknowledged, a transcript path whose write failed is retried on the next drain.
+            if inst.persist_observed_pi_transcript(observation) {
+                acknowledge_poller_observation(inst, observation);
+            }
         }
     }
 
@@ -267,7 +269,7 @@ fn drain_and_persist_session_ids_inner(
             Ok(_) => match &update.guard {
                 // Same CAS as an unguarded write; the guard only records that the observation named
                 // this pane, which the Pi rule below reads.
-                SessionIdGuard::Unguarded | SessionIdGuard::InstanceSidecar => {
+                SessionIdGuard::Unguarded | SessionIdGuard::InstanceSidecar { .. } => {
                     persist_session_to_storage(
                         &update.profile,
                         &update.id,
@@ -328,8 +330,8 @@ fn drain_and_persist_session_ids_inner(
             }
         }
         match outcome {
+            // Acknowledged once its transcript path is stored, in the loop below.
             SidWrite::Applied => {
-                acknowledge_poller_observation_for(instances, &update.id, &update.observation);
                 to_apply.push((
                     update.id.clone(),
                     update.sid.clone(),
@@ -343,11 +345,12 @@ fn drain_and_persist_session_ids_inner(
                     if !update.confirms_omp_pin
                         && rb.disk_sid.as_deref() == Some(update.sid.as_str())
                     {
-                        acknowledge_poller_observation_for(
-                            instances,
-                            &update.id,
-                            &update.observation,
-                        );
+                        // Another writer stored this id; the captured path is still ours to store.
+                        if let Some(inst) = instances.iter_mut().find(|i| i.id == update.id) {
+                            if inst.persist_observed_pi_transcript(&update.observation) {
+                                acknowledge_poller_observation(inst, &update.observation);
+                            }
+                        }
                     }
                     to_rollback.push(rb);
                 } else {
@@ -379,8 +382,13 @@ fn drain_and_persist_session_ids_inner(
             } else {
                 inst.resume_probe_failed_sid = None;
             }
-            // The transcript path belongs with the id it names.
-            inst.absorb_published_pi_session();
+            // The transcript path belongs with the id it names. Unacknowledged, a path whose
+            // write failed is retried on the next drain.
+            if let Some(update) = updates.iter().find(|update| update.id == *id) {
+                if inst.persist_observed_pi_transcript(&update.observation) {
+                    acknowledge_poller_observation(inst, &update.observation);
+                }
+            }
         }
     }
     for rb in &to_rollback {
@@ -1233,7 +1241,7 @@ mod tests {
         seed_instance_on_disk(profile, &inst);
 
         let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
-        poller.inject_test_sidecar_update(&inst.id, "pi-new-conversation");
+        poller.inject_test_sidecar_update(&inst.id, "pi-new-conversation", None);
         inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
 
         let file_watch = FileWatchService::noop();
@@ -1249,6 +1257,64 @@ mod tests {
             instances[0].session_id_poller.is_some(),
             "a sidecar poller keeps watching for the next switch"
         );
+    }
+
+    // A captured transcript path stays pending until it is stored, whichever branch adopts its id.
+    #[test]
+    #[serial]
+    fn a_captured_pi_transcript_path_survives_a_failed_write_on_every_branch() {
+        use crate::session::instance::FAIL_PI_PATH_WRITES;
+        let old = "01a05234-8889-72e2-a7c9-7ebc27b25b78";
+        let new = "0192f7a1-4b3c-7d2e-9f10-aa1b2c3d4e5f";
+        let path =
+            format!("/home/u/.pi/agent/sessions/--proj--/2026-01-02T00-00-00-000Z_{new}.jsonl");
+        // (label, sid already on disk, first write fails)
+        for (label, disk_sid, fail_first) in [
+            ("applied new id", old, false),
+            ("applied new id, failed path write", old, true),
+            ("another writer stored the id", new, false),
+            ("another writer stored the id, failed path write", new, true),
+        ] {
+            let temp = tempdir().unwrap();
+            let _guard = storage_home_guard(&temp);
+            let profile = "sync-pi-path-delivery";
+            let mut inst = Instance::new("pi-path-delivery", "/tmp/pi-path-delivery");
+            inst.source_profile = profile.to_string();
+            inst.tool = "pi".to_string();
+            inst.mark_pi_extension_launched_for_test();
+            let mut on_disk = inst.clone();
+            on_disk.agent_session_id = Some(disk_sid.to_string());
+            seed_instance_on_disk(profile, &on_disk);
+            inst.agent_session_id = Some(old.to_string());
+
+            // No sidecar exists: only the observation carries the path.
+            let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+            poller.inject_test_sidecar_update(&inst.id, new, Some(&path));
+            inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+            let file_watch = FileWatchService::noop();
+            let mut instances = [inst];
+            let stored = || Storage::new_unwatched(profile).unwrap().load().unwrap()[0].clone();
+
+            FAIL_PI_PATH_WRITES.with(|fail| fail.set(fail_first));
+            drain_and_persist_session_ids(&mut instances, &file_watch);
+            FAIL_PI_PATH_WRITES.with(|fail| fail.set(false));
+            assert_eq!(stored().agent_session_id.as_deref(), Some(new), "{label}");
+            if fail_first {
+                assert_eq!(stored().pi_session_path, None, "{label}");
+                // Recovery needs no new publication: the held observation is retried.
+                drain_and_persist_session_ids(&mut instances, &file_watch);
+            }
+            assert_eq!(
+                stored().pi_session_path.as_deref(),
+                Some(path.as_str()),
+                "{label}"
+            );
+            let poller = instances[0].session_id_poller.as_ref().unwrap();
+            assert!(
+                poller.lock().unwrap().latest_observation().is_none(),
+                "{label}: a stored path acknowledges its observation"
+            );
+        }
     }
 
     #[test]
@@ -1268,12 +1334,9 @@ mod tests {
         seed_instance_on_disk(profile, &inst);
 
         let published = "/home/u/.pi/agent/sessions/--proj--/2026-01-01T00-00-00-000Z_01a05234-8889-72e2-a7c9-7ebc27b25b78.jsonl";
-        crate::hooks::write_session_id_via_guard(&inst.id, sid).unwrap();
-        let dir = crate::hooks::ensure_instance_dir_path(&inst.id).unwrap();
-        std::fs::write(dir.join("session_path"), format!("{published}\n")).unwrap();
-
+        // The sidecar is already gone: only the observation carries the path.
         let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
-        poller.inject_test_sidecar_update(&inst.id, sid);
+        poller.inject_test_sidecar_update(&inst.id, sid, Some(published));
         inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
 
         let file_watch = FileWatchService::noop();

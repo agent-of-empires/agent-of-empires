@@ -74,7 +74,7 @@ pub(super) fn extract_pi_uuid_from_filename(path: &Path) -> Option<String> {
     Some(uuid_part.to_string())
 }
 
-/// Polls the sidecar Pi's AoE extension writes for the pane's own conversation.
+/// Polls the sidecars Pi's AoE extension writes for the pane's own conversation and transcript.
 /// The caller supplies where the pane publishes; a wrong source silently never observes.
 pub(crate) fn pi_sidecar_poll_fn(
     instance_id: String,
@@ -82,29 +82,36 @@ pub(crate) fn pi_sidecar_poll_fn(
 ) -> impl Fn() -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
     move || {
         use crate::session::instance::SessionSidecarSource;
-        let id = match source {
-            SessionSidecarSource::SandboxDir(ref dir) => dir
-                .parent()
-                .and_then(Path::parent)
-                .filter(|root| root.join("aoe-session").join(&instance_id) == *dir)
-                .and_then(|root| crate::session::AnchoredDir::open(root).ok())
-                .and_then(|root| {
-                    root.read_regular(
-                        &Path::new("aoe-session")
-                            .join(&instance_id)
-                            .join("session_id"),
-                        4096,
-                    )
-                    .ok()
-                    .flatten()
-                })
-                .and_then(|raw| String::from_utf8(raw).ok())
-                .map(|raw| raw.trim().to_string())
-                .filter(|id| Uuid::parse_str(id).is_ok()),
-            SessionSidecarSource::HostHooks => crate::hooks::read_hook_session_id(&instance_id),
+        let (id, transcript) = match source {
+            SessionSidecarSource::SandboxDir(ref dir) => {
+                let root = dir
+                    .parent()
+                    .and_then(Path::parent)
+                    .filter(|root| root.join("aoe-session").join(&instance_id) == *dir)
+                    .and_then(|root| crate::session::AnchoredDir::open(root).ok());
+                let read = |leaf: &str| {
+                    let raw = root
+                        .as_ref()?
+                        .read_regular(
+                            &Path::new("aoe-session").join(&instance_id).join(leaf),
+                            4096,
+                        )
+                        .ok()??;
+                    Some(String::from_utf8(raw).ok()?.trim().to_string())
+                };
+                (
+                    read("session_id").filter(|id| Uuid::parse_str(id).is_ok()),
+                    read("session_path").filter(|path| path.starts_with('/')),
+                )
+            }
+            SessionSidecarSource::HostHooks => (
+                crate::hooks::read_hook_session_id(&instance_id),
+                crate::hooks::read_hook_session_path(&instance_id),
+            ),
         };
-        id.and_then(super::validated_session_id)
-            .map(crate::session::poller::SessionIdObservation::instance_sidecar)
+        id.and_then(super::validated_session_id).map(|sid| {
+            crate::session::poller::SessionIdObservation::instance_sidecar(sid, transcript)
+        })
     }
 }
 

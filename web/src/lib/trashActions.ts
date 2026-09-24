@@ -28,6 +28,17 @@ export function workspaceCleanupDefaults(sessions: SessionResponse[]): {
   };
 }
 
+/** Sessions outside `selected` working in a worktree `selected` would clean up. The server keeps that worktree and its branch. */
+export function sessionsSharingWorktree(selected: SessionResponse[], all: SessionResponse[]): SessionResponse[] {
+  const trim = (path: string) => path.replace(/\/+$/, "");
+  const ids = new Set(selected.map((s) => s.id));
+  const roots = selected.filter((s) => s.has_cleanable_worktree).map((s) => trim(s.project_path));
+  return all.filter((s) => {
+    const path = trim(s.project_path);
+    return !ids.has(s.id) && roots.some((root) => path === root || path.startsWith(`${root}/`));
+  });
+}
+
 interface TrashDeps {
   applySession: (session: SessionResponse) => void;
   notify: Notifier | null;
@@ -64,7 +75,7 @@ interface DeleteWorkspaceDeps {
   notify: Notifier | null;
 }
 
-/** Atomic workspace delete (the server removes the shared worktree once, last). Local cleanup and the redirect home only follow confirmed deletions. */
+/** Atomic delete of `sessions`; the server keeps a worktree any other session still uses. Local cleanup and the redirect home only follow confirmed deletions. */
 export async function deleteWorkspaceSessions(
   sessions: SessionResponse[],
   options: DeleteSessionOptions,

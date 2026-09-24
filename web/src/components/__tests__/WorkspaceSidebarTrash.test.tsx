@@ -91,7 +91,7 @@ describe("WorkspaceSidebar Trash control", () => {
     click("sidebar-trash-restore");
     expect(props.onRestoreSession).toHaveBeenCalledWith(["s1"]);
     click("sidebar-trash-purge");
-    expect(props.onDeleteSession).toHaveBeenCalledWith("trashed-ws");
+    expect(props.onDeleteSession).toHaveBeenCalledWith(["s1"]);
   });
 
   it("orders rows newest-trashed first", () => {
@@ -176,5 +176,29 @@ describe("WorkspaceSidebar Trash control", () => {
     expect(follows(screen.getByTestId("sidebar-sunk-section"), screen.getByTestId("sidebar-projects-section"))).toBe(
       true,
     );
+  });
+});
+
+describe("WorkspaceSidebar row actions on a group slice (#4019)", () => {
+  it("stop, start, and delete target only the row's sessions, not the whole workspace", () => {
+    const ws = workspace("multi-ws", [
+      { id: "a1", title: "alpha", group_path: "alpha" },
+      { id: "b1", title: "beta", group_path: "beta", status: "Running" },
+      { id: "b2", title: "beta", group_path: "beta", status: "Running" },
+    ]);
+    const onStopSession = vi.fn();
+    const onStartSession = vi.fn();
+    const props = renderSidebar([ws], { onStopSession, onStartSession });
+    const act = (title: string, item: string) => {
+      fireEvent.contextMenu(screen.getAllByTestId("sidebar-session-row").find((r) => r.textContent?.includes(title))!);
+      click(`sidebar-context-menu-${item}`);
+    };
+
+    act("beta", "stop");
+    expect(onStopSession).toHaveBeenCalledWith("b1");
+    act("alpha", "start");
+    expect(onStartSession).toHaveBeenCalledWith("a1");
+    act("beta", "delete");
+    expect(props.onDeleteSession).toHaveBeenCalledWith(["b1", "b2"]);
   });
 });

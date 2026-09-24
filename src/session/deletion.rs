@@ -79,6 +79,9 @@ pub struct PurgeTransaction {
     generation: u64,
     lifecycle_lock: Option<StorageFlock>,
     active: bool,
+    /// Paths other sessions work in, captured under the storage lock that
+    /// admits teardown.
+    paths_in_use: Vec<PathBuf>,
 }
 
 /// A purge whose durable row has already been removed. The same lifecycle
@@ -86,6 +89,7 @@ pub struct PurgeTransaction {
 #[must_use = "committed purge sidecars must be finished"]
 pub struct CommittedPurge {
     request: DeletionRequest,
+    paths_in_use: Vec<PathBuf>,
     _lifecycle_lock: StorageFlock,
 }
 
@@ -177,6 +181,7 @@ impl PurgeTransaction {
             generation,
             lifecycle_lock: Some(lifecycle_lock),
             active: true,
+            paths_in_use: Vec::new(),
         }))
     }
 
@@ -226,7 +231,9 @@ impl PurgeTransaction {
         let generation = self.generation;
         let was_trashed = self.was_trashed;
         let mut outcome = None;
+        let mut paths_in_use = Vec::new();
         self.storage.update(|instances, _groups| {
+            let others = other_sessions_paths(instances, &id);
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) else {
                 outcome = Some((CompletionGate::AlreadyGone, None));
                 return Ok(());
@@ -241,6 +248,7 @@ impl PurgeTransaction {
             } else if !owns {
                 CompletionGate::Superseded
             } else {
+                paths_in_use = others;
                 CompletionGate::Proceed
             };
             if !matches!(gate, CompletionGate::Proceed) {
@@ -251,7 +259,10 @@ impl PurgeTransaction {
             Ok(())
         })?;
         let outcome = outcome.ok_or_else(|| anyhow::anyhow!("purge gate produced no outcome"))?;
-        if !matches!(outcome.0, CompletionGate::Proceed) {
+        if matches!(outcome.0, CompletionGate::Proceed) {
+            paths_in_use.extend(other_profiles_paths(self.storage.profile(), &id));
+            self.paths_in_use = paths_in_use;
+        } else {
             self.active = false;
         }
         Ok(outcome)
@@ -302,6 +313,7 @@ impl PurgeTransaction {
         let generation = self.generation;
         let was_trashed = self.was_trashed;
         let mut commit = None;
+        let mut paths_in_use = Vec::new();
         if let Err(error) = self.storage.update(|instances, _groups| {
             let Some(index) = instances.iter().position(|instance| instance.id == id) else {
                 commit = Some((CompletionGate::AlreadyGone, None));
@@ -321,6 +333,7 @@ impl PurgeTransaction {
                 commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
             } else {
                 instances.remove(index);
+                paths_in_use = other_sessions_paths(instances, &id);
                 commit = Some((CompletionGate::Proceed, None));
             }
             Ok(())
@@ -345,7 +358,9 @@ impl PurgeTransaction {
         if !matches!(gate, CompletionGate::Proceed) {
             return Err(Box::new(self.result_for_gate(gate, retained)));
         }
+        paths_in_use.extend(other_profiles_paths(self.storage.profile(), &id));
         Ok(CommittedPurge {
+            paths_in_use,
             request: DeletionRequest {
                 session_id: self.request.session_id.clone(),
                 instance: self.request.instance.clone(),
@@ -393,7 +408,8 @@ impl PurgeTransaction {
         if !matches!(gate, CompletionGate::Proceed) {
             return self.result_for_gate(gate, retained);
         }
-        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request);
+        let mut result =
+            perform_deletion_teardown_lifecycle_locked(&self.request, &self.paths_in_use);
         if !result.success && !commit_on_teardown_failure {
             result.retained_instance = self.release_reservation().ok().flatten();
             result.disposition = DeletionDisposition::Failed;
@@ -484,7 +500,8 @@ impl CommittedPurge {
     /// Clean up resources while retaining the lifecycle flock that covered the
     /// irreversible durable-row removal.
     pub fn finish(self) -> DeletionResult {
-        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request);
+        let mut result =
+            perform_deletion_teardown_lifecycle_locked(&self.request, &self.paths_in_use);
         result.disposition = DeletionDisposition::Removed;
         result
     }
@@ -567,6 +584,51 @@ fn is_protected_default_branch(main_repo: &Path, branch: &str) -> bool {
         .is_ok_and(|names| names.contains(branch))
 }
 
+/// Every path a session other than `except_id` works in or will restore to.
+fn other_sessions_paths(instances: &[Instance], except_id: &str) -> Vec<PathBuf> {
+    instances
+        .iter()
+        .filter(|instance| instance.id != except_id)
+        .flat_map(|instance| {
+            std::iter::once(instance.project_path.as_str())
+                .chain(instance.pre_trash_project_path.as_deref())
+                .chain(
+                    instance
+                        .all_repos()
+                        .iter()
+                        .map(|r| r.worktree_path.as_str()),
+                )
+                .map(PathBuf::from)
+        })
+        .collect()
+}
+
+/// [`other_sessions_paths`] across every profile but `profile`, read without
+/// their storage locks. An unreadable profile is skipped with a warning.
+fn other_profiles_paths(profile: &str, except_id: &str) -> Vec<PathBuf> {
+    let profiles = match crate::session::list_profiles() {
+        Ok(profiles) => profiles,
+        Err(error) => {
+            tracing::warn!(target: "session.delete", "listing profiles for shared worktrees failed: {error}");
+            return Vec::new();
+        }
+    };
+    profiles
+        .iter()
+        .filter(|other| other.as_str() != profile)
+        .flat_map(
+            |other| match Storage::open_unwatched(other).and_then(|storage| storage.load()) {
+                Ok(instances) => other_sessions_paths(&instances, except_id),
+                Err(error) => {
+                    tracing::warn!(target: "session.delete", profile = %other,
+                        "reading sessions for shared worktrees failed: {error}");
+                    Vec::new()
+                }
+            },
+        )
+        .collect()
+}
+
 #[cfg(test)]
 pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     run_on_destroy_hooks(&request.instance, request.detach_hooks);
@@ -575,8 +637,11 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     })
 }
 
-fn perform_deletion_teardown_lifecycle_locked(request: &DeletionRequest) -> DeletionResult {
-    perform_deletion_core(request, true, |session_id| {
+fn perform_deletion_teardown_lifecycle_locked(
+    request: &DeletionRequest,
+    paths_in_use: &[PathBuf],
+) -> DeletionResult {
+    perform_deletion_core(request, true, paths_in_use, |session_id| {
         DockerContainer::from_session_id(session_id).teardown(session_id)
     })
 }
@@ -588,12 +653,13 @@ fn perform_deletion_with(
     request: &DeletionRequest,
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
 ) -> DeletionResult {
-    perform_deletion_core(request, false, teardown)
+    perform_deletion_core(request, false, &[], teardown)
 }
 
 fn perform_deletion_core(
     request: &DeletionRequest,
     lifecycle_locked: bool,
+    paths_in_use: &[PathBuf],
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
 ) -> DeletionResult {
     let mut errors = Vec::new();
@@ -657,7 +723,7 @@ fn perform_deletion_core(
     };
 
     let preserved_worktree_paths =
-        stage_collect_preserved_worktrees(request, repos, &mut errors, &mut messages);
+        stage_collect_preserved_worktrees(request, repos, paths_in_use, &mut errors, &mut messages);
     // Any preserved worktree, dirty or default-branch, blocks the in-container preclean (a
     // recursive `find. -delete` that would reach through and destroy the contents we just decided
     // to keep) and the host workspace-dir removal alike: with a worktree preserved under it the
@@ -727,6 +793,7 @@ fn perform_deletion_core(
 fn stage_collect_preserved_worktrees(
     request: &DeletionRequest,
     repos: &[super::WorkspaceRepo],
+    paths_in_use: &[PathBuf],
     errors: &mut Vec<String>,
     messages: &mut Vec<String>,
 ) -> std::collections::HashSet<PathBuf> {
@@ -767,6 +834,35 @@ fn stage_collect_preserved_worktrees(
                     repo.name, repo.branch
                 ));
                 preserved_worktree_paths.insert(PathBuf::from(&repo.worktree_path));
+            }
+        }
+    }
+
+    // A worktree another session still works in is kept, and so its branch, whichever sessions
+    // the caller named. Checked before the dirty gate so a kept worktree cannot fail the deletion.
+    if request.delete_worktree {
+        let in_use = |root: &Path| paths_in_use.iter().any(|path| path.starts_with(root));
+        let still_used = "another session still uses it";
+        if let Some(wt_info) = &request.instance.worktree_info {
+            let path = PathBuf::from(&request.instance.project_path);
+            if wt_info.managed_by_aoe && !preserved_worktree_paths.contains(&path) && in_use(&path)
+            {
+                messages.push(format!("Worktree kept; {still_used}"));
+                preserved_worktree_paths.insert(path);
+            }
+        }
+        if let Some(ws_info) = &request.instance.workspace_info {
+            // Sessions attached to a workspace work in its root, so any use under it keeps every
+            // repo worktree.
+            if in_use(Path::new(&ws_info.workspace_dir)) {
+                for repo in repos.iter().filter(|r| r.managed_by_aoe) {
+                    if preserved_worktree_paths.insert(PathBuf::from(&repo.worktree_path)) {
+                        messages.push(format!(
+                            "Workspace ({}) worktree kept; {still_used}",
+                            repo.name
+                        ));
+                    }
+                }
             }
         }
     }

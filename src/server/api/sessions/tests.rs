@@ -3577,3 +3577,115 @@ async fn list_sessions_applies_project_smart_rename_override_to_worktree_session
         .collect();
     assert_eq!(states, ["inactive", "inactive", "pending"]);
 }
+
+/// #4084 review: deleting one session of a shared managed worktree, through
+/// either delete endpoint, removes that record but keeps the worktree and
+/// branch a surviving session still works in.
+#[tokio::test]
+#[serial_test::serial]
+async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
+    use axum::body::to_bytes;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    for workspace_endpoint in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        let main_repo = tmp.path().join("main");
+        let checkout = tmp.path().join("shared");
+        std::fs::create_dir_all(&main_repo).unwrap();
+        git(&main_repo, &["init", "-b", "main"]);
+        git(&main_repo, &["commit", "--allow-empty", "-m", "init"]);
+        git(
+            &main_repo,
+            &["worktree", "add", "-b", "feat", checkout.to_str().unwrap()],
+        );
+
+        let profile = "shared-worktree-4084";
+        let mk = |title: &str, managed: bool| {
+            let mut inst = Instance::new(title, checkout.to_str().unwrap());
+            inst.source_profile = profile.to_string();
+            let mut info = worktree("feat", main_repo.to_string_lossy(), None);
+            info.managed_by_aoe = managed;
+            inst.worktree_info = Some(info);
+            inst
+        };
+        let owner = mk("owner", true);
+        let survivor = mk("survivor", false);
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances.extend([owner.clone(), survivor.clone()]);
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![
+            owner.clone(),
+            survivor.clone(),
+        ]);
+
+        let resp = if workspace_endpoint {
+            delete_workspace(
+                State(state.clone()),
+                Some(Json(DeleteWorkspaceBody {
+                    session_ids: vec![owner.id.clone()],
+                    delete_worktree: true,
+                    delete_branch: true,
+                    ..Default::default()
+                })),
+            )
+            .await
+            .into_response()
+        } else {
+            delete_session(
+                State(state.clone()),
+                Path(owner.id.clone()),
+                Some(Json(DeleteSessionBody {
+                    delete_worktree: true,
+                    delete_branch: true,
+                    ..Default::default()
+                })),
+            )
+            .await
+            .into_response()
+        };
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "endpoint {workspace_endpoint}"
+        );
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["messages"].to_string().contains("another session"),
+            "the kept worktree must be reported: {body}"
+        );
+
+        assert!(
+            checkout.join(".git").exists(),
+            "shared worktree was removed"
+        );
+        let branches = std::process::Command::new("git")
+            .args(["branch", "--list", "feat"])
+            .current_dir(&main_repo)
+            .output()
+            .unwrap();
+        assert!(!branches.stdout.is_empty(), "shared branch was deleted");
+        let stored: Vec<String> = storage.load().unwrap().into_iter().map(|i| i.id).collect();
+        assert_eq!(stored, vec![survivor.id.clone()]);
+        assert!(state
+            .instances
+            .read()
+            .await
+            .iter()
+            .all(|i| i.id != owner.id));
+    }
+}

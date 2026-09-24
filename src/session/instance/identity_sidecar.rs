@@ -218,11 +218,7 @@ impl Instance {
     fn pi_recorded_transcript(&self) -> Option<(&str, PiTranscriptState)> {
         let path = self.pi_session_path.as_deref()?;
         let id = self.agent_session_id.as_deref()?;
-        let name = Path::new(path).file_name()?.to_str()?;
-        name.rsplit_once('_')
-            .and_then(|(_, tail)| tail.strip_suffix(".jsonl"))
-            .filter(|uuid| *uuid == id)?;
-        Some((path, self.pi_recorded_transcript_state(path)))
+        pi_transcript_names(path, id).then(|| (path, self.pi_recorded_transcript_state(path)))
     }
 
     pub(super) fn pi_resumable_transcript(&self) -> Option<String> {
@@ -252,26 +248,81 @@ impl Instance {
             &self.effective_profile(),
             self.resolve_file_watch(),
         ) {
-            self.store_pi_session_path(&storage, &path);
+            self.store_pi_session_path(&storage, self.agent_session_id.as_deref(), &path);
         }
     }
 
+    /// Persist the transcript path a poller observation carried. False only while the write keeps
+    /// failing, so the caller holds the observation for a retry.
+    pub(crate) fn persist_observed_pi_transcript(
+        &mut self,
+        observation: &crate::session::poller::SessionIdObservation,
+    ) -> bool {
+        let crate::session::poller::SessionIdGuard::InstanceSidecar {
+            transcript: Some(path),
+        } = &observation.guard
+        else {
+            return true;
+        };
+        if !pi_transcript_names(path, &observation.sid) {
+            return true;
+        }
+        match crate::session::storage::Storage::new(
+            &self.effective_profile(),
+            self.resolve_file_watch(),
+        ) {
+            Ok(storage) => self.persist_pi_transcript_into(&storage, &observation.sid, path),
+            Err(_) => false,
+        }
+    }
+
+    pub(super) fn persist_pi_transcript_into(
+        &mut self,
+        storage: &crate::session::storage::Storage,
+        sid: &str,
+        path: &str,
+    ) -> bool {
+        match self.store_pi_session_path(storage, Some(sid), path) {
+            Some(true) => {
+                self.pi_session_path = Some(path.to_owned());
+                true
+            }
+            // The row moved to another id; the path is stale, not pending.
+            Some(false) => true,
+            None => false,
+        }
+    }
+
+    /// Writes the path only to this row while it still holds `expected_sid`. `None` when the
+    /// write failed; `Some(false)` when no row holds that id.
     pub(super) fn store_pi_session_path(
         &self,
         storage: &crate::session::storage::Storage,
+        expected_sid: Option<&str>,
         path: &str,
-    ) {
-        if let Err(error) = storage.update(|instances, _| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) {
-                inst.pi_session_path = Some(path.to_string());
-            }
-            Ok(())
-        }) {
-            tracing::warn!(
-                target: "session.store",
-                instance = %self.id,
-                "could not persist the Pi transcript path the pane published: {error}",
+    ) -> Option<bool> {
+        match storage.update(|instances, _| {
+            #[cfg(test)]
+            anyhow::ensure!(
+                !FAIL_PI_PATH_WRITES.with(std::cell::Cell::get),
+                "injected transcript path write failure"
             );
+            let row = instances
+                .iter_mut()
+                .find(|i| i.id == self.id && i.agent_session_id.as_deref() == expected_sid);
+            Ok(row
+                .map(|row| row.pi_session_path = Some(path.to_string()))
+                .is_some())
+        }) {
+            Ok(stored) => Some(stored),
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.store",
+                    instance = %self.id,
+                    "could not persist the Pi transcript path the pane published: {error}",
+                );
+                None
+            }
         }
     }
 
@@ -316,6 +367,23 @@ impl Instance {
             && !launch_command::environment_defines_path(&self.resolved_host_environment())
             && crate::agents::pi_supports_session_id_flag()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Fails this thread's transcript-path writes while set.
+    pub(crate) static FAIL_PI_PATH_WRITES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether a Pi transcript file name (`<timestamp>_<id>.jsonl`) carries `sid`.
+fn pi_transcript_names(path: &str, sid: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.rsplit_once('_'))
+        .and_then(|(_, tail)| tail.strip_suffix(".jsonl"))
+        .is_some_and(|uuid| uuid == sid)
 }
 
 #[cfg(test)]
@@ -695,6 +763,82 @@ pi = "~/.pi-personal"
         let mut cmd = "pi".to_string();
         assert!(inst.apply_session_flags(&mut cmd, "test").unwrap());
         assert_eq!(cmd, format!("pi --session '{}'", transcript.display()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_observed_transcript_path_stays_retryable_until_stored() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
+        let profile = "pi-path-retry";
+        let sid = "01a05234-8889-72e2-a7c9-7ebc27b25b78";
+        let mut inst = Instance::new("pipathretry00001", "/tmp/pi-path-retry");
+        inst.source_profile = profile.to_string();
+        inst.tool = "pi".to_string();
+        inst.sandbox_info = Some(test_sandbox("aoe-pi-path-retry", None));
+        inst.agent_session_id = Some(sid.to_string());
+        let mut storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _| {
+                *instances = vec![seed.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let stored = |storage: &crate::session::storage::Storage| {
+            storage.load().unwrap()[0].pi_session_path.clone()
+        };
+        let published =
+            format!("/root/.pi/agent/sessions/--proj--/2026-01-01T00-00-00-000Z_{sid}.jsonl");
+
+        // No sidecar exists to re-read: only the observation carries the path.
+        storage.set_fail_writes_for_test(true);
+        assert!(!inst.persist_pi_transcript_into(&storage, sid, &published));
+        assert_eq!(
+            inst.pi_session_path, None,
+            "an unstored path must not look current"
+        );
+        storage.set_fail_writes_for_test(false);
+        assert_eq!(stored(&storage), None);
+
+        let observation = crate::session::poller::SessionIdObservation::instance_sidecar(
+            sid.to_string(),
+            Some(published.clone()),
+        );
+        assert!(inst.persist_observed_pi_transcript(&observation));
+        assert_eq!(stored(&storage), Some(published.clone()));
+        assert_eq!(inst.pi_session_path, Some(published));
+
+        let foreign = crate::session::poller::SessionIdObservation::instance_sidecar(
+            sid.to_string(),
+            Some("/root/.pi/agent/sessions/--proj--/2026-01-01T00-00-00-000Z_other.jsonl".into()),
+        );
+        let before = stored(&storage);
+        assert!(inst.persist_observed_pi_transcript(&foreign));
+        assert_eq!(
+            stored(&storage),
+            before,
+            "a path naming another id is not stored"
+        );
+
+        inst.pi_session_path = None;
+        let moved_on =
+            format!("/root/.pi/agent/sessions/--proj--/2026-01-02T00-00-00-000Z_{sid}.jsonl");
+        storage
+            .update(|instances, _| {
+                instances[0].agent_session_id = Some("row-moved-on".into());
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            inst.persist_pi_transcript_into(&storage, sid, &moved_on),
+            "a row that moved to another id makes the path stale, not pending"
+        );
+        assert_eq!(
+            stored(&storage),
+            before,
+            "a row that no longer holds the id is not written"
+        );
     }
 
     #[test]
