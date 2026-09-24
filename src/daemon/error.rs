@@ -14,6 +14,7 @@ pub enum ApiErrorCode {
     TlsRequired,
     RuntimeEpochMismatch,
     ResumeFailed,
+    NoRevive,
     CreationTrustChanged,
     CreationCancelled,
     CreationNotPending,
@@ -31,6 +32,7 @@ impl ApiErrorCode {
             Self::TlsRequired => "tls_required",
             Self::RuntimeEpochMismatch => "runtime_epoch_mismatch",
             Self::ResumeFailed => "resume_failed",
+            Self::NoRevive => "no_revive",
             Self::CreationTrustChanged => "creation_trust_changed",
             Self::CreationCancelled => "creation_cancelled",
             Self::CreationNotPending => "creation_not_pending",
@@ -44,6 +46,7 @@ impl ApiErrorCode {
             Self::LifecycleLocked
             | Self::RuntimeEpochMismatch
             | Self::ResumeFailed
+            | Self::NoRevive
             | Self::CreationTrustChanged
             | Self::CreationCancelled
             | Self::CreationNotPending => StatusCode::CONFLICT,
@@ -77,6 +80,7 @@ impl ApiErrorCode {
             b"tls_required" => Self::TlsRequired,
             b"runtime_epoch_mismatch" => Self::RuntimeEpochMismatch,
             b"resume_failed" => Self::ResumeFailed,
+            b"no_revive" => Self::NoRevive,
             b"creation_trust_changed" => Self::CreationTrustChanged,
             b"creation_cancelled" => Self::CreationCancelled,
             b"creation_not_pending" => Self::CreationNotPending,
@@ -122,6 +126,13 @@ mod tests {
                 false,
                 Some(ApiErrorCode::RuntimeEpochMismatch),
             ),
+            (
+                StatusCode::CONFLICT,
+                "no_revive",
+                false,
+                Some(ApiErrorCode::NoRevive),
+            ),
+            (StatusCode::FORBIDDEN, "no_revive", false, None),
             (
                 StatusCode::BAD_REQUEST,
                 "create_hook_failed",

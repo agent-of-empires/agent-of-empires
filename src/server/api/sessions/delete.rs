@@ -357,60 +357,74 @@ pub async fn delete_session(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-    let namespace = state
-        .runtime
-        .purge_namespace_lease(&state.profile_namespace)
-        .await;
-    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
-        return response;
-    }
-    let body = body.map(|Json(body)| body).unwrap_or_default();
-    let Some(submission) = state
-        .session_service
-        .prompt_submission_for_session(&id)
-        .await
-    else {
-        return crate::server::api::session_not_found();
-    };
-    let lock = state.instance_lock(&id).await;
-    let guard = lock.lock().await;
-    let instance = state
-        .instances
-        .read()
-        .await
-        .iter()
-        .find(|row| row.id == id)
-        .cloned();
-    let Some(instance) = instance else {
-        return crate::server::api::session_not_found();
-    };
-    let recent_entry = crate::session::recent_project_entry_for(&instance);
-    let result = purge_session_artifacts(&state, &id, instance, &body, recent_entry, None).await;
-    drop(guard);
-    drop(submission);
-    drop(namespace);
-    let outcome = match result {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            if let Some(response) = super::lifecycle::lifecycle_rejection(&state, &error) {
-                return response;
-            }
-            if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
-            tracing::error!(target: "http.api.sessions", session = %id, %error, "purge failed");
-            return (
+    let join = tokio::spawn(async move {
+        let namespace = state
+            .runtime
+            .purge_namespace_lease(&state.profile_namespace)
+            .await;
+        if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+            return response;
+        }
+        let body = body.map(|Json(body)| body).unwrap_or_default();
+        let Some(submission) = state
+            .session_service
+            .prompt_submission_for_session(&id)
+            .await
+        else {
+            return crate::server::api::session_not_found();
+        };
+        let lock = state.instance_lock(&id).await;
+        let guard = lock.lock().await;
+        let instance = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .cloned();
+        let Some(instance) = instance else {
+            return crate::server::api::session_not_found();
+        };
+        let recent_entry = crate::session::recent_project_entry_for(&instance);
+        let result =
+            purge_session_artifacts(&state, &id, instance, &body, recent_entry, None).await;
+        drop(guard);
+        drop(submission);
+        drop(namespace);
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(response) = super::lifecycle::lifecycle_rejection(&state, &error) {
+                    return response;
+                }
+                if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                tracing::error!(target: "http.api.sessions", session = %id, %error, "purge failed");
+                return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "deletion_failed", "message": error.to_string()})),
             )
                 .into_response();
+            }
+        };
+        let snapshot = match state.runtime.publish(&state).await {
+            Ok(snapshot) => snapshot,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(outcome))
+    });
+    match join.await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", %error, "Deletion task failed");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "Deletion task failed",
+            )
         }
-    };
-    let snapshot = match state.runtime.publish(&state).await {
-        Ok(snapshot) => snapshot,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(outcome))
+    }
 }
 
 pub async fn abandon_purge(
@@ -812,39 +826,51 @@ pub async fn delete_workspace(
     let owner_needs_dirty_check = body.delete_worktree && !body.force_delete;
 
     let plan = order_workspace_deletion(&session_ids, &body);
-
-    let (deleted, kept, failed, messages, dirty) =
-        purge_workspace_artifacts(&state, owner_id, plan, owner_needs_dirty_check).await;
-    if let Some(msg) = dirty {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "dirty_worktree", "message": msg })),
-        )
-            .into_response();
-    }
-    if deleted.is_empty() && !failed.is_empty() {
-        let message = failed
-            .iter()
-            .map(|failure| failure.error.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
+    let join = tokio::spawn(async move {
+        let (deleted, kept, failed, messages, dirty) =
+            purge_workspace_artifacts(&state, owner_id, plan, owner_needs_dirty_check).await;
+        if let Some(msg) = dirty {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "dirty_worktree", "message": msg })),
+            )
+                .into_response();
+        }
+        if deleted.is_empty() && !failed.is_empty() {
+            let message = failed
+                .iter()
+                .map(|failure| failure.error.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "deletion_failed", "message": message, "failed": failed,
+                })),
+            )
+                .into_response();
+        }
+        let snapshot = match state.runtime.publish(&state).await {
+            Ok(snapshot) => snapshot,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        crate::server::runtime::mutation_response(
+            &snapshot.value.cursor,
             Json(serde_json::json!({
-                "error": "deletion_failed", "message": message, "failed": failed,
+                "status": if !failed.is_empty() || (!deleted.is_empty() && !kept.is_empty()) { "partial" } else if !kept.is_empty() { "kept" } else { "deleted" },
+                "deleted": deleted, "kept": kept, "failed": failed, "messages": messages,
             })),
         )
-            .into_response();
+    });
+    match join.await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", %error, "Workspace deletion task failed");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "Workspace deletion task failed",
+            )
+        }
     }
-    let snapshot = match state.runtime.publish(&state).await {
-        Ok(snapshot) => snapshot,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    crate::server::runtime::mutation_response(
-        &snapshot.value.cursor,
-        Json(serde_json::json!({
-            "status": if !failed.is_empty() || (!deleted.is_empty() && !kept.is_empty()) { "partial" } else if !kept.is_empty() { "kept" } else { "deleted" },
-            "deleted": deleted, "kept": kept, "failed": failed, "messages": messages,
-        })),
-    )
 }

@@ -76,7 +76,8 @@ impl CaptureStorage<'_> {
             instance.store_pi_session_path(storage, &observation.sid, path)
         });
         match result {
-            Ok(stored) => Ok(stored),
+            // A rejected CAS means this observation no longer owns the disk row.
+            Ok(_) => Ok(true),
             Err(error) if matches!(self, Self::Profiles(_)) => {
                 tracing::warn!(target: "session.sync", instance = %instance.id, %error, "Pi transcript path persistence failed");
                 Ok(false)
@@ -1408,6 +1409,45 @@ mod tests {
                 "{label}: a stored path acknowledges its observation"
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn stale_pi_path_observation_does_not_retry_after_the_disk_sid_changes() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+        let profile = "sync-pi-stale-path";
+        let old = "01a05234-8889-72e2-a7c9-7ebc27b25b78";
+        let new = "0192f7a1-4b3c-7d2e-9f10-aa1b2c3d4e5f";
+        let path =
+            format!("/home/u/.pi/agent/sessions/--proj--/2026-01-02T00-00-00-000Z_{old}.jsonl");
+        let mut inst = Instance::new("stale-path", temp.path().to_str().unwrap());
+        inst.source_profile = profile.to_string();
+        inst.tool = "pi".to_string();
+        inst.agent_session_id = Some(old.to_string());
+        inst.mark_pi_extension_launched_for_test();
+        let mut disk = inst.clone();
+        disk.agent_session_id = Some(new.to_string());
+        seed_instance_on_disk(profile, &disk);
+
+        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        poller.inject_test_sidecar_update(&inst.id, old, Some(&path));
+        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+        let file_watch = FileWatchService::noop();
+        drain_and_persist_session_ids(std::slice::from_mut(&mut inst), &file_watch);
+
+        let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
+        assert_eq!(disk[0].agent_session_id.as_deref(), Some(new));
+        assert_eq!(disk[0].pi_session_path, None);
+        assert!(
+            inst.session_id_poller
+                .unwrap()
+                .lock()
+                .unwrap()
+                .latest_observation()
+                .is_none(),
+            "an obsolete transcript must not be retried against a different conversation"
+        );
     }
 
     #[test]

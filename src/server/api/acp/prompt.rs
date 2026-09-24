@@ -50,6 +50,7 @@ fn worker_not_ready() -> Response {
 fn no_revive_refused() -> Response {
     (
         StatusCode::CONFLICT,
+        crate::daemon::ApiErrorCode::NoRevive.header(),
         "no_revive: reviving the session is required to accept this prompt",
     )
         .into_response()

@@ -4255,9 +4255,10 @@ async fn permanent_deletion_waits_for_an_in_flight_submission() {
         "a delete must not tear a session down under an in-flight submission"
     );
     assert_eq!(
-        claims
-            .try_recv()
-            .expect("contender reached submission claim"),
+        tokio::time::timeout(Duration::from_secs(10), claims.recv())
+            .await
+            .expect("contender must reach submission claim")
+            .expect("submission claim watcher must remain open"),
         "sess-3650-direct"
     );
     assert_eq!(
@@ -5656,5 +5657,84 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
             .await
             .iter()
             .all(|i| i.id != owner.id));
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn purges_finish_when_request_is_cancelled() {
+    for workspace in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let profile = "workspace-disconnect";
+        let mut instance = Instance::new("cancelled-request", tmp.path().to_str().unwrap());
+        instance.source_profile = profile.to_string();
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![instance.clone()]);
+        *state.canonical_metadata.write().await =
+            crate::server::reload::load_all_profiles(&state.file_watch)
+                .unwrap()
+                .metadata;
+
+        let lease = state
+            .runtime
+            .purge_namespace_lease(&state.profile_namespace)
+            .await;
+        let mut request = Box::pin(async {
+            if workspace {
+                delete_workspace(
+                    State(state.clone()),
+                    Some(Json(DeleteWorkspaceBody {
+                        session_ids: vec![instance.id.clone()],
+                        ..Default::default()
+                    })),
+                )
+                .await
+                .into_response()
+            } else {
+                delete_session(
+                    State(state.clone()),
+                    Path(instance.id.clone()),
+                    Some(Json(DeleteSessionBody::default())),
+                )
+                .await
+                .into_response()
+            }
+        });
+        let first_poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(request.as_mut(), cx))
+        })
+        .await;
+        assert!(
+            first_poll.is_pending(),
+            "purge must wait for the namespace lease"
+        );
+        drop(request);
+        drop(lease);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if storage.load().unwrap().is_empty()
+                    && state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .all(|row| row.id != instance.id)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{workspace}: deletion must finish after request cancellation"));
     }
 }
