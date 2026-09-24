@@ -24,8 +24,19 @@ pub enum EnsureReadyError {
     Transient(Status),
     /// Instance is structured view-mode (no backing tmux pane); send is not supported.
     StructuredView,
+    /// The pane needed a start, but the session is archived or trashed.
+    Blocked(StartBlocked),
     /// Underlying tmux operation failed.
     Tmux(anyhow::Error),
+}
+
+impl From<anyhow::Error> for EnsureReadyError {
+    fn from(error: anyhow::Error) -> Self {
+        match error.downcast_ref::<StartBlocked>() {
+            Some(blocked) => EnsureReadyError::Blocked(*blocked),
+            None => EnsureReadyError::Tmux(error),
+        }
+    }
 }
 
 impl std::fmt::Display for EnsureReadyError {
@@ -41,6 +52,7 @@ impl std::fmt::Display for EnsureReadyError {
                 f,
                 "Acp-mode sessions have no tmux pane; send is not supported"
             ),
+            EnsureReadyError::Blocked(blocked) => write!(f, "{blocked}"),
             EnsureReadyError::Tmux(e) => write!(f, "{e}"),
         }
     }
@@ -70,9 +82,8 @@ impl Instance {
         }
         let session = self.tmux_session().map_err(EnsureReadyError::Tmux)?;
         if !session.exists() {
-            let outcome = self
-                .start_with_resume_fallback(size, false, ResumeAttemptPolicy::Allow)
-                .map_err(EnsureReadyError::Tmux)?;
+            let outcome =
+                self.start_with_resume_fallback(size, false, ResumeAttemptPolicy::Allow)?;
             match outcome {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
@@ -85,9 +96,8 @@ impl Instance {
             return Ok(EnsureReadyOutcome::Started);
         }
         if session.is_pane_dead() {
-            let outcome = self
-                .restart_with_resume_policy(size, false, ResumeAttemptPolicy::Allow)
-                .map_err(EnsureReadyError::Tmux)?;
+            let outcome =
+                self.restart_with_resume_policy(size, false, ResumeAttemptPolicy::Allow)?;
             match outcome {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });

@@ -101,6 +101,9 @@ pub async fn spawn_acp(
     if !instance.is_structured() {
         return not_structured_response();
     }
+    if let Err(blocked) = instance.ensure_startable() {
+        return crate::server::api::start_blocked_response(blocked);
+    }
 
     let explicit = req.agent.clone().or_else(|| instance.agent_name.clone());
     let agent = pick_agent(&state, &instance, explicit.as_deref()).await;
@@ -339,6 +342,9 @@ pub async fn switch_acp_agent(
     let Some(instance) = find_instance(&state, &id).await else {
         return session_not_found();
     };
+    if let Err(blocked) = instance.ensure_startable() {
+        return crate::server::api::start_blocked_response(blocked);
+    }
     let from_agent = match check_switch_target(&state, &instance, &target).await {
         Ok(agent) => agent,
         Err(resp) => return resp,

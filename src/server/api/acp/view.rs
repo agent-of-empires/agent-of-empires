@@ -103,6 +103,9 @@ pub async fn acp_enable(
     if instance.is_structured() {
         return view_response(id, View::Structured);
     }
+    if let Err(blocked) = instance.ensure_startable() {
+        return crate::server::api::start_blocked_response(blocked);
+    }
 
     // Judged on the explicit agent (or the tool), not `pick_agent_for_tool`'s
     // default fallback, which would accept every tool.

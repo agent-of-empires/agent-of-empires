@@ -325,7 +325,10 @@ pub fn run_recovery_for_instance(inst: &mut Instance) -> Result<StartOutcome> {
     let _scope = HookTimeoutScope::new(recovery_hook_timeout());
     let result = inst.restart_with_size_opts(None, false);
     if let Err(ref e) = result {
-        stamp_recovery_error(inst, e);
+        // A peer archived or trashed the row after the candidate filter; that is not a failure.
+        if e.downcast_ref::<super::StartBlocked>().is_none() {
+            stamp_recovery_error(inst, e);
+        }
     }
     result
 }
@@ -809,5 +812,43 @@ mod tests {
                 .is_some_and(|checked| checked >= before),
             "last_error_check must arm sticky error handling",
         );
+    }
+
+    /// #4116: a row archived or trashed after the candidate filter is not relaunched by
+    /// `auto_resume_on_restart` recovery, and is not stamped as a recovery failure.
+    #[test]
+    #[serial_test::serial]
+    fn recovery_does_not_relaunch_a_row_dismissed_after_candidacy() {
+        use crate::session::StartBlocked;
+        for (dismiss, want) in [
+            (
+                Instance::archive as fn(&mut Instance),
+                StartBlocked::Archived,
+            ),
+            (Instance::trash, StartBlocked::Trashed),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_home(temp.path());
+            let profile = "recovery-dismissed";
+            let mut inst = Instance::new("dismissed", "/tmp/test");
+            inst.source_profile = profile.to_string();
+            inst.status = super::super::Status::Error;
+            inst.agent_session_id = Some("11111111-1111-4111-8111-111111111111".into());
+            assert!(is_recovery_candidate(&inst));
+            let mut peer = inst.clone();
+            dismiss(&mut peer);
+            super::super::Storage::new_unwatched(profile)
+                .unwrap()
+                .update(|rows, _| {
+                    *rows = vec![peer];
+                    Ok(())
+                })
+                .unwrap();
+
+            let err = run_recovery_for_instance(&mut inst).unwrap_err();
+            assert_eq!(err.downcast_ref::<StartBlocked>(), Some(&want));
+            assert_eq!(inst.last_error, None);
+            assert!(!inst.tmux_session().unwrap().exists());
+        }
     }
 }

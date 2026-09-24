@@ -4,7 +4,7 @@ use crate::session::builder::{self, InstanceParams};
 use crate::session::conversation_carry;
 use crate::session::{
     acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, list_profiles,
-    GroupMovePlan, Instance, Item, LifecycleOperation, Status, Storage,
+    GroupMovePlan, Instance, Item, LifecycleOperation, StartBlocked, Status, Storage,
 };
 use crate::tui::deletion_poller::DeletionRequest;
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
@@ -282,6 +282,33 @@ impl HomeView {
         Ok(session_id)
     }
 
+    /// A trashed/archived row's agent was stopped deliberately, so refuse a start
+    /// visibly and point at the restore key instead of swallowing the press.
+    pub(in crate::tui) fn refuse_start_if_shelved(&mut self, id: &str) -> bool {
+        let shelved = self.get_instance(id).and_then(|inst| {
+            // A row mid-purge gets no restore hint: it would race the in-flight delete.
+            if inst.status == Status::Deleting {
+                return None;
+            }
+            match inst.ensure_startable() {
+                Err(StartBlocked::Trashed) => Some(("Session in trash", "in the trash", "restore")),
+                Err(StartBlocked::Archived) => Some(("Session archived", "archived", "unarchive")),
+                Ok(()) => None,
+            }
+        });
+        let Some((dialog_title, state, verb)) = shelved else {
+            return false;
+        };
+        let key = if self.strict_hotkeys { "Z" } else { "z" };
+        self.info_dialog = Some(InfoDialog::new(
+            dialog_title,
+            &format!(
+                "This session is {state}; its agent stays stopped. Press {key} to {verb} it first."
+            ),
+        ));
+        true
+    }
+
     /// Restart the cursor's session, optionally migrating to a new profile and/or
     /// swapping the AI engine first.
     ///
@@ -318,27 +345,7 @@ impl HomeView {
             return Ok(());
         }
 
-        // A trashed/archived row's agent was stopped deliberately, so refuse visibly and
-        // point at the restore key instead of swallowing the press.
-        let shelved = self.get_instance(&id).and_then(|inst| {
-            // A row mid-purge gets no restore hint: it would race the in-flight delete.
-            // Falls through to the transient skip below, which drops Deleting silently.
-            if inst.status == Status::Deleting {
-                None
-            } else if inst.is_trashed() {
-                Some(("Session in trash", "in the trash", "restore"))
-            } else if inst.is_archived() {
-                Some(("Session archived", "archived", "unarchive"))
-            } else {
-                None
-            }
-        });
-        if let Some((dialog_title, state, verb)) = shelved {
-            let key = if self.strict_hotkeys { "Z" } else { "z" };
-            self.info_dialog = Some(InfoDialog::new(
-                dialog_title,
-                &format!("This session is {state}; its agent stays stopped. Press {key} to {verb} it first."),
-            ));
+        if self.refuse_start_if_shelved(&id) {
             return Ok(());
         }
 

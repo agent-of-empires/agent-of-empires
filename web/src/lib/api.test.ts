@@ -346,7 +346,11 @@ const requestCases: RequestCase[] = [
   ],
   ["POST /api/sessions/s1/restore", () => api.restoreSession("s1"), { respond: json(session), result: session }],
   ["POST /api/sessions/s1/stop", () => api.stopSession("s1"), { respond: json(session), result: session }],
-  ["POST /api/sessions/s1/start", () => api.startSession("s1"), { respond: json(session), result: session }],
+  [
+    "POST /api/sessions/s1/start",
+    () => api.startSession("s1"),
+    { respond: json(session), result: { ok: true, session } },
+  ],
   ["PATCH /api/sessions/s1/snooze", () => api.setSessionSnooze("s1", 60), { body: { minutes: 60 } }],
   ["PATCH /api/sessions/s1/unread", () => api.setSessionUnread("s1", true), { body: { unread: true } }],
   [
@@ -611,6 +615,28 @@ describe("ensureSession", () => {
     expect(await api.ensureSession("s1")).toEqual({ ok: false, error: "aborted" });
     offline();
     expect(await api.ensureSession("s1")).toEqual({ ok: false, message: "offline" });
+  });
+});
+describe("startSession", () => {
+  it.each([
+    [
+      "archived refusal",
+      json({ error: "session_archived", message: "session is archived; unarchive it first" }, 409),
+      { ok: false, refused: true, message: "session is archived; unarchive it first" },
+    ],
+    [
+      "trashed refusal",
+      json({ error: "session_trashed", message: "session is in trash; restore it first" }, 409),
+      { ok: false, refused: true, message: "session is in trash; restore it first" },
+    ],
+    [
+      "restart failure",
+      json({ error: "restart_failed", message: "boom" }, 500),
+      { ok: false, refused: false, message: "boom" },
+    ],
+  ])("%s", async (_name, response, expected) => {
+    fetchSpy.mockResolvedValueOnce(response);
+    expect(await api.startSession("s1")).toEqual(expected);
   });
 });
 describe("acpDisable", () => {

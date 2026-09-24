@@ -51,8 +51,10 @@ A grouping toggle next to it cycles **By repo** (default), **By group** (the gro
 Right-click (long-press on touch) a session row:
 
 - **Pin** floats the workspace to the top in every sort mode. Pin is web-only and distinct from the favorite mark.
-- **Archive** tears down every tmux session the workspace owns (pass `kill_pane: false` in the API, or `--no-kill` on the CLI, to skip that) and shuts down the structured-view worker, then sinks the row into the collapsible "Snoozed & archived" footer. Daemon restarts skip archived sessions, and sending a message wakes one back into the live list.
+- **Archive** tears down every tmux session the workspace owns (pass `kill_pane: false` in the API, or `--no-kill` on the CLI, to skip that) and shuts down the structured-view worker, then sinks the row into the collapsible "Snoozed & archived" footer. An archived session never starts or resumes, whether from a message, **Start**, attaching, or a daemon restart; unarchive it first.
 - **Snooze** sinks the row for a chosen duration (1h through 1w); it wakes when the timer expires, or early if you send a message.
+
+Trashed sessions live behind the **Trash** control in the sidebar footer. Right-click a trashed row for **Open**, **Restore**, or **Delete permanently**. Like an archived session, a trashed one cannot start until it is restored.
 
 A session is never pinned and sunk at once, but either transition is one step: pinning a sunk row surfaces it, and archiving or snoozing a pinned row removes the pin. All three entries are hidden in read-only mode.
 

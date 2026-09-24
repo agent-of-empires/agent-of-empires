@@ -256,24 +256,29 @@ describe("sendPrompt outcomes", () => {
       url.includes("/acp/prompt") ? json({ disposition: "queued", queued_id: "srv-queued-1" }, 202) : undefined;
     const patches = (suffix: string) => calls.filter((c) => c.method === "PATCH" && c.url.endsWith(suffix));
 
-    it.each([
-      ["archived", ["2026-01-01T00:00:00Z", null], "/archive", { archived: false, kill_pane: true }],
-      ["snoozed", [null, "2099-01-01T00:00:00Z"], "/snooze", { minutes: null }],
-      [
-        "archived and snoozed",
-        ["2026-01-01T00:00:00Z", "2099-01-01T00:00:00Z"],
-        "/archive",
-        { archived: false, kill_pane: true },
-      ],
-    ] as const)("wakes a %s session before sending", async (_label, [archived, snoozed], suffix, body) => {
+    it("wakes a snoozed session before sending", async () => {
       calls = installAcpFakes(queuedPrompt);
-      const { result } = render("sess-wake", "absent", archived, snoozed);
+      const { result } = render("sess-wake", "absent", null, "2099-01-01T00:00:00Z");
       await flushAsync();
       await act(() => result.current.sendPrompt("wake me up"));
       await flushAsync();
-      expect(patches("/archive").length + patches("/snooze").length).toBe(1);
-      expect(JSON.parse(patches(suffix)[0]!.body!)).toEqual(body);
+      expect(patches("/snooze").map((c) => JSON.parse(c.body!))).toEqual([{ minutes: null }]);
       expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["wake me up"]);
+    });
+
+    // #4116: sending never unarchives; the user must unarchive first.
+    it.each([
+      ["archived", null],
+      ["archived and snoozed", "2099-01-01T00:00:00Z"],
+    ])("refuses to send to an %s session", async (_label, snoozed) => {
+      calls = installAcpFakes(queuedPrompt);
+      const { result } = render("sess-archived", "absent", "2026-01-01T00:00:00Z", snoozed);
+      await flushAsync();
+      await act(() => result.current.sendPrompt("wake me up"));
+      await flushAsync();
+      expect(calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
+      expect(posts("/acp/prompt")).toHaveLength(0);
+      expect(result.current.state.lastError).toBe("This session is archived; unarchive it first.");
     });
 
     it("does not call wake endpoints for a live session", async () => {
@@ -286,12 +291,9 @@ describe("sendPrompt outcomes", () => {
       expect(result.current.state.queuedPrompts).toHaveLength(1);
     });
 
-    it.each([
-      ["/archive", "2026-01-01T00:00:00Z", null],
-      ["/snooze", null, "2099-01-01T00:00:00Z"],
-    ])("sends nothing when the %s wake fails", async (suffix, archived, snoozed) => {
-      calls = installAcpFakes(failingWake(suffix));
-      const { result } = render("sess-wake-fail", "absent", archived, snoozed);
+    it("sends nothing when the snooze wake fails", async () => {
+      calls = installAcpFakes(failingWake("/snooze"));
+      const { result } = render("sess-wake-fail", "absent", null, "2099-01-01T00:00:00Z");
       await flushAsync();
       await act(() => result.current.sendPrompt("wake me up"));
       await flushAsync();
