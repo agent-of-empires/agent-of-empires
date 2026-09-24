@@ -258,7 +258,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         let claude_store_pin = req.claude_store_pin.clone().filter(|_| {
             req.sandbox_info.is_none() && matches!(req.agent.as_str(), "claude" | "claude-code")
         });
-        apply_claude_store_pin(&mut host_environment, claude_store_pin.as_deref());
+        let claude_config_dir =
+            apply_claude_store_pin(&mut host_environment, claude_store_pin.as_deref());
 
         let mut provider_env = req.provider_env.clone();
         if let Some(model) = model.clone() {
@@ -274,7 +275,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             req.source_profile.clone(),
             req.cwd.clone(),
             host_environment.clone(),
-            claude_store_pin.clone(),
+            claude_config_dir,
             "MCP resolution task failed",
         )
         .await;
@@ -745,13 +746,13 @@ pub(super) fn overlay_env(env: &mut Vec<(String, String)>, minted: Vec<(String, 
         env.push((key, value));
     }
 }
+/// Pins a structured Claude worker to `store` and returns the directory its
+/// `.claude.json` is then read from.
 pub(super) fn apply_claude_store_pin(
     environment: &mut Vec<(String, String)>,
     store: Option<&std::path::Path>,
-) {
-    let Some(store) = store else {
-        return;
-    };
+) -> Option<std::path::PathBuf> {
+    let store = store?;
     let value = |key: &str| {
         environment
             .iter()
@@ -762,18 +763,20 @@ pub(super) fn apply_claude_store_pin(
             .filter(|value| !value.is_empty())
     };
     // Leave the default store unexported, as the terminal launch does (#4119).
-    if value("CLAUDE_CONFIG_DIR").is_none()
-        && value("HOME").is_some_and(|home| {
-            crate::session::capture::is_default_claude_store(store, std::path::Path::new(&home))
-        })
-    {
-        return;
+    if value("CLAUDE_CONFIG_DIR").is_none() {
+        if let Some(home) = value("HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|home| crate::session::capture::is_default_claude_store(store, home))
+        {
+            return Some(home);
+        }
     }
     environment.retain(|(key, _)| key != "CLAUDE_CONFIG_DIR");
     environment.push((
         "CLAUDE_CONFIG_DIR".into(),
         store.to_string_lossy().into_owned(),
     ));
+    Some(store.to_path_buf())
 }
 
 pub(super) async fn resolve_mcp_servers(
@@ -951,11 +954,17 @@ mod tests {
                 .iter()
                 .map(|(key, value)| (key.to_string(), value.display().to_string()))
                 .collect();
-            apply_claude_store_pin(&mut environment, Some(store));
-            environment
+            let config_dir = apply_claude_store_pin(&mut environment, Some(store));
+            let exported = environment
                 .into_iter()
                 .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
-                .map(|(_, value)| std::path::PathBuf::from(value))
+                .map(|(_, value)| std::path::PathBuf::from(value));
+            // MCP discovery reads `.claude.json` where the worker will.
+            assert_eq!(
+                config_dir.as_deref(),
+                Some(exported.as_deref().unwrap_or(temp.path()))
+            );
+            exported
         };
         for (ambient, store, environment, expected) in [
             (None, &default, vec![], None),

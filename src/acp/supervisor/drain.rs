@@ -502,6 +502,7 @@ impl<S: BroadcastSink> Drain<S> {
             ),
         }
 
+        let mut claude_config_dir = config.claude_store_pin.clone();
         if config.sandbox_info.is_none() {
             let minted = before_session_env(
                 session_id,
@@ -526,7 +527,7 @@ impl<S: BroadcastSink> Drain<S> {
                     "{what} on respawn; reusing the environment from the prior launch"
                 );
             }
-            apply_claude_store_pin(
+            claude_config_dir = apply_claude_store_pin(
                 &mut config.host_environment,
                 config.claude_store_pin.as_deref(),
             );
@@ -538,7 +539,7 @@ impl<S: BroadcastSink> Drain<S> {
             config.source_profile.clone(),
             config.cwd.clone(),
             config.host_environment.clone(),
-            config.claude_store_pin.clone(),
+            claude_config_dir,
             "MCP re-resolution on respawn failed",
         )
         .await;
