@@ -248,17 +248,14 @@ impl CleanupProtection {
         })
     }
 
-    pub(crate) fn references_ancestor_of(&self, target: &Path) -> bool {
+    pub(crate) fn references_exact_path(&self, target: &Path) -> bool {
         if self.paths.is_empty() {
             return false;
         }
         let target = PathIdentity::new(target);
         self.paths.iter().any(|path| {
-            path.spellings().any(|reference| {
-                target
-                    .spellings()
-                    .any(|target| target.starts_with(reference))
-            })
+            path.spellings()
+                .any(|reference| target.spellings().any(|target| reference == target))
         })
     }
 

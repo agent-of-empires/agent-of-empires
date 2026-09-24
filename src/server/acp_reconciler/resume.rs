@@ -381,6 +381,7 @@ async fn build_spawn_request(
         effort: acp_effort,
         stored_acp_session_id: target.stored_acp_session_id.clone(),
         fork_from,
+        sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
         sandbox_info,
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,

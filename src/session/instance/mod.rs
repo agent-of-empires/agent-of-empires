@@ -442,6 +442,13 @@ pub struct Instance {
     /// Immutable source and destination pairs while a v027 transition is pending.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) sandbox_store_transition_paths: Vec<SandboxStoreTransitionPath>,
+    /// Scheduling cache only; host-owned physical-root receipts authorize use.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub(crate) sandbox_content_policy: u8,
+    /// Retired native contexts and their transaction-owned fresh-start notices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) sandbox_content_resets:
+        Vec<crate::migrations::v033_isolate_sandbox_content::SandboxContentReset>,
 
     // Paired terminal session
     #[serde(default, skip_serializing_if = "Option::is_none")]

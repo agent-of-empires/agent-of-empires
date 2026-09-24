@@ -5585,7 +5585,13 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
         assert!(out.status.success(), "git {args:?}: {out:?}");
     }
 
-    for (workspace_endpoint, surviving_peer) in [(false, true), (true, true), (true, false)] {
+    // (workspace endpoint, dirty, survivor also selected)
+    for (workspace_endpoint, dirty, both_selected) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, true, true),
+    ] {
         let tmp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
         crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
@@ -5614,14 +5620,7 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
             inst
         };
         let owner = mk("owner", true);
-        let peer = mk(
-            if surviving_peer {
-                "survivor"
-            } else {
-                "sibling"
-            },
-            false,
-        );
+        let peer = mk("survivor", false);
         let rows = vec![owner.clone(), peer.clone()];
         let storage = Storage::new_unwatched(profile).unwrap();
         storage
@@ -5635,16 +5634,19 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
             crate::server::reload::load_all_profiles(&state.file_watch)
                 .unwrap()
                 .metadata;
+        if dirty {
+            std::fs::write(checkout.join("wip.txt"), "unsaved").unwrap();
+        }
+        let mut session_ids = vec![owner.id.clone()];
+        if both_selected {
+            session_ids.push(peer.id.clone());
+        }
 
         let resp = if workspace_endpoint {
             delete_workspace(
                 State(state.clone()),
                 Some(Json(DeleteWorkspaceBody {
-                    session_ids: if surviving_peer {
-                        vec![owner.id.clone()]
-                    } else {
-                        vec![peer.id.clone(), owner.id.clone()]
-                    },
+                    session_ids,
                     delete_worktree: true,
                     delete_branch: true,
                     ..Default::default()
@@ -5665,23 +5667,17 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
             .await
             .into_response()
         };
-        if !surviving_peer {
-            assert_eq!(resp.status(), StatusCode::CONFLICT);
-            assert_eq!(
-                storage.load().unwrap().len(),
-                2,
-                "dirty preflight must spare the sibling"
-            );
-            assert!(checkout.join("untracked.txt").exists());
-            continue;
-        }
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "endpoint {workspace_endpoint}"
-        );
+        let status = resp.status();
         let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let case = format!("endpoint {workspace_endpoint}, dirty {dirty}: {body}");
+        if both_selected {
+            assert_eq!(status, StatusCode::CONFLICT, "{case}");
+            assert_eq!(body["error"], "dirty_worktree", "{case}");
+            assert_eq!(storage.load().unwrap().len(), 2, "{case}");
+            continue;
+        }
+        assert_eq!(status, StatusCode::OK, "{case}");
         assert!(
             body["messages"].to_string().contains("another session"),
             "the kept worktree must be reported: {body}"
@@ -5689,8 +5685,9 @@ async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
 
         assert!(
             checkout.join(".git").exists(),
-            "shared worktree was removed"
+            "shared worktree was removed: {case}"
         );
+        assert_eq!(checkout.join("wip.txt").exists(), dirty, "{case}");
         let branches = std::process::Command::new("git")
             .args(["branch", "--list", "feat"])
             .current_dir(&main_repo)

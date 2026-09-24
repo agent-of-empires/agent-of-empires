@@ -608,31 +608,36 @@ pub(super) fn order_workspace_deletion(
     plan
 }
 
-/// Reject dirty managed checkouts that this batch would actually remove.
-/// Paths retained for surviving sessions cannot block deletion.
-fn workspace_dirty_message(
+/// Owner-worktree dirty preflight for a workspace delete, mirroring the
+/// per-session gate in `perform_deletion` so dirty plus non-force stays
+/// all-or-nothing. A worktree kept for a session outside `session_ids` is not
+/// removed, so its dirtiness does not block. Returns the first dirty message.
+async fn workspace_dirty_message(instance: Instance, session_ids: Vec<String>) -> Option<String> {
+    tokio::task::spawn_blocking(move || {
+        let ids: Vec<&str> = session_ids.iter().map(String::as_str).collect();
+        let kept = crate::session::deletion::paths_in_use_except(&ids);
+        workspace_dirty_message_blocking(&instance, &kept)
+    })
+    .await
+    .unwrap_or_else(|error| Some(format!("dirty check failed: {error}")))
+}
+
+fn workspace_dirty_message_blocking(
     instance: &Instance,
-    protection: &crate::session::path_identity::CleanupProtection,
+    kept: &crate::session::deletion::PathsInUse,
 ) -> Option<String> {
     if let Some(wt) = &instance.worktree_info {
-        if wt.managed_by_aoe
-            && !protection.references_path(std::path::Path::new(&instance.project_path))
-        {
-            let path = std::path::PathBuf::from(&instance.project_path);
+        let path = std::path::PathBuf::from(&instance.project_path);
+        if wt.managed_by_aoe && !kept.covers(&path) {
             if let Some(msg) = crate::git::cleanup::dirty_worktree_message(&path) {
                 return Some(msg);
             }
         }
     }
     if let Some(ws) = &instance.workspace_info {
-        if ws.cleanup_on_delete {
-            let root_protected =
-                protection.references_ancestor_of(std::path::Path::new(&ws.workspace_dir));
+        if ws.cleanup_on_delete && !kept.covers(std::path::Path::new(&ws.workspace_dir)) {
             for repo in &ws.repos {
-                if repo.managed_by_aoe
-                    && !root_protected
-                    && !protection.references_path(std::path::Path::new(&repo.worktree_path))
-                {
+                if repo.managed_by_aoe {
                     let path = std::path::PathBuf::from(&repo.worktree_path);
                     if let Some(msg) = crate::git::cleanup::dirty_worktree_message(&path) {
                         return Some(format!("{}: {}", repo.name, msg));
@@ -723,7 +728,8 @@ pub(super) async fn purge_workspace_artifacts(
                     return (deleted, kept, failed, messages, None);
                 }
             };
-            if let Some(msg) = workspace_dirty_message(&owner, &protection) {
+            let ids = plan.iter().map(|(id, _)| id.clone()).collect();
+            if let Some(msg) = workspace_dirty_message(owner, ids).await {
                 failed.push(WorkspaceDeleteFailure {
                     id: owner_id,
                     error: format!("Workspace: {msg}"),
@@ -825,6 +831,20 @@ pub async fn delete_workspace(
 
     let owner_needs_dirty_check = body.delete_worktree && !body.force_delete;
 
+    // Preflight: refuse a non-force delete of a dirty shared worktree before
+    // tearing down any session. A fast early 409;
+    // `purge_workspace_artifacts` re-checks authoritatively under the owner lock.
+    if owner_needs_dirty_check {
+        let owner = {
+            let instances = state.instances.read().await;
+            instances.iter().find(|i| i.id == owner_id).cloned()
+        };
+        if let Some(owner) = owner {
+            if let Some(msg) = workspace_dirty_message(owner, session_ids.clone()).await {
+                return api_error(StatusCode::CONFLICT, "dirty_worktree", msg);
+            }
+        }
+    }
     let plan = order_workspace_deletion(&session_ids, &body);
     let join = tokio::spawn(async move {
         let (deleted, kept, failed, messages, dirty) =

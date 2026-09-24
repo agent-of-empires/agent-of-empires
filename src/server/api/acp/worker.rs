@@ -393,6 +393,7 @@ pub async fn switch_acp_agent(
         stored_acp_session_id: None,
         fork_from: None,
         seed_history_replay: false,
+        sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Fresh,
         claude_store_pin: None,
         ..spawn_request_for(&instance, target.clone(), sandbox_info)
     };

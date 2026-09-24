@@ -116,7 +116,12 @@ mod tests {
         std::fs::create_dir_all(&app).unwrap();
         std::fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
         std::fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
-        let mut row = serde_json::to_value(Instance::new("legacy", "/tmp")).unwrap();
+        // A project under HOME keeps the sandbox's mount clear of the recovery
+        // namespace the isolation pass refuses to expose.
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut row =
+            serde_json::to_value(Instance::new("legacy", project.to_str().unwrap())).unwrap();
         row["tool"] = "gemini".into();
         row["sandbox_store_generation"] = 0.into();
         row["sandbox_info"] = serde_json::json!({

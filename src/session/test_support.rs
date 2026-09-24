@@ -310,6 +310,10 @@ pub(crate) fn isolate_app_dir_at(path: &Path) -> AppDirGuard {
 }
 
 fn install_env_vars(path: PathBuf, temp: Option<TempDir>) -> AppDirGuard {
+    // Keep the watched native-state ancestor stable when XDG data is first used.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    std::fs::create_dir_all(path.join(".local/share"))
+        .expect("create isolated XDG data directory before exposing HOME");
     // Only the vars this target actually mutates are handed to the guard; a var that is never
     // written needs no restore.
     #[allow(unused_mut)]

@@ -35,6 +35,9 @@ impl Instance {
         &self,
         stores: CaptureStorage<'_>,
     ) -> Result<Option<crate::session::poller::SessionIdObservation>> {
+        if !crate::migrations::v033_isolate_sandbox_content::instance_ready(self).unwrap_or(false) {
+            return Ok(None);
+        }
         let Some((capture, context)) = self.source_session_support() else {
             return Ok(None);
         };

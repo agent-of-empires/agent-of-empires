@@ -24,10 +24,15 @@ impl<S: BroadcastSink> Supervisor<S> {
         loop {
             let notified = self.worker_notify.notified();
             tokio::pin!(notified);
-            if self.workers.lock().await.contains_key(session_id) {
+            let has_worker = self.workers.lock().await.contains_key(session_id);
+            let waiting_for_context =
+                lock_recover(&self.pending_context_resets).contains(session_id);
+            if has_worker && !waiting_for_context {
                 return true;
             }
-            if lock_recover(&self.lifecycle).phase(session_id) != WorkerPhase::Resuming {
+            if !has_worker
+                && lock_recover(&self.lifecycle).phase(session_id) != WorkerPhase::Resuming
+            {
                 return false;
             }
             let remaining = deadline.saturating_sub(started.elapsed());
@@ -71,6 +76,12 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// The session's client, after waiting out a mid-resume worker.
     async fn ready_client(&self, session_id: &str) -> Result<Arc<AcpClient>, SupervisorError> {
         self.wait_for_worker(session_id, WORKER_READY_TIMEOUT).await;
+        if lock_recover(&self.pending_context_resets).contains(session_id) {
+            return Err(AcpError::Spawn(
+                "isolated native context initialization is not complete".into(),
+            )
+            .into());
+        }
         self.client_for_session(session_id).await
     }
 
@@ -273,6 +284,38 @@ mod tests {
             "the wakeup must not depend on a poll timer"
         );
         assert_eq!(sup.worker_state("s-1748").await, AcpWorkerState::Absent);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_worker_blocks_until_native_context_is_durable() {
+        let sup = Arc::new(Supervisor::new(VecSink::new()));
+        sup.test_install_handle(
+            "s-isolated",
+            AcpClient::fake_for_test_dead_connection(AcpSessionId("acp-isolated".into())),
+            WorkerKind::Stdio,
+            None,
+        )
+        .await;
+        lock_recover(&sup.pending_context_resets).insert("s-isolated".into());
+
+        let mut entered = sup.watch_worker_waits();
+        let waiter = {
+            let sup = Arc::clone(&sup);
+            tokio::spawn(async move {
+                sup.wait_for_worker("s-isolated", Duration::from_secs(60))
+                    .await
+            })
+        };
+        assert_eq!(entered.recv().await.unwrap(), "s-isolated");
+        assert!(!waiter.is_finished());
+
+        lock_recover(&sup.pending_context_resets).remove("s-isolated");
+        sup.worker_notify.notify_waiters();
+        assert!(tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("context acknowledgement must wake the waiter")
+            .unwrap());
+        sup.test_remove_worker("s-isolated").await;
     }
 
     #[tokio::test]

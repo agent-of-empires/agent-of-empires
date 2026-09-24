@@ -105,6 +105,13 @@ enum WorkerKind {
     Stdio,
 }
 
+#[derive(Clone)]
+pub(super) struct PendingContextReset {
+    pub(super) profile: String,
+    pub(super) reason: String,
+    pub(super) transactions: Vec<String>,
+}
+
 struct WorkerHandle {
     client: Arc<AcpClient>,
     drain_task: JoinHandle<()>,
@@ -157,6 +164,8 @@ pub struct Supervisor<S: BroadcastSink> {
     force_respawn: SharedSet,
     /// Sessions whose worker failed before establishing a session.
     startup_failures: SharedSet,
+    /// Sessions whose isolated native identity is not durable yet.
+    pending_context_resets: SharedSet,
     /// Sessions whose crashed worker the drain task relaunched in place.
     respawned_in_place: SharedSet,
     max_concurrent_workers: u32,
@@ -192,6 +201,14 @@ pub struct AgentCommandOverride {
     pub command: String,
 }
 
+/// Which durable continuation lane a sandboxed spawn may consume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxContinuation {
+    Persisted,
+    ImportTerminal,
+    Fresh,
+}
+
 #[derive(Debug, Clone)]
 pub struct SpawnRequest {
     pub session_id: String,
@@ -210,6 +227,7 @@ pub struct SpawnRequest {
     pub stored_acp_session_id: Option<String>,
     /// Parent ACP session id to `session/fork` from.
     pub fork_from: Option<String>,
+    pub sandbox_continuation: SandboxContinuation,
     pub sandbox_info: Option<SandboxInfo>,
     pub source_profile: Option<String>,
     pub yolo_mode: bool,
@@ -248,6 +266,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             incompatible_binaries: Arc::default(),
             force_respawn: Arc::default(),
             startup_failures: Arc::default(),
+            pending_context_resets: Arc::default(),
             respawned_in_place: Arc::default(),
             max_concurrent_workers,
         }

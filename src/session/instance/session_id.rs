@@ -431,6 +431,11 @@ impl Instance {
         &self,
         stores: CaptureStorage<'_>,
     ) -> Option<crate::session::poller::SessionIdObservation> {
+        if self.is_sandboxed()
+            && !crate::migrations::v033_isolate_sandbox_content::instance_ready(self).ok()?
+        {
+            return None;
+        }
         let observation = match self.source_capture_backend()? {
             SessionCaptureBackend::Pi => self.pi_published_conversation(false)?,
             SessionCaptureBackend::PrimeAgent => self.prime_published_conversation_in(stores)?,
@@ -1728,13 +1733,13 @@ work-opencode = "opencode"
                     true,
                 ),
                 (
-                    "sandboxed claude reads host sidecar",
+                    "sandboxed claude ignores unproven host sidecar",
                     "claude",
                     true,
                     &[(A, 120), (B, 5)],
                     Some(A),
                     C,
-                    A,
+                    C,
                     true,
                 ),
             ];
