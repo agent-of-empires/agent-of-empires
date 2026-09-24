@@ -179,13 +179,23 @@ impl NativeStateBoundary {
                     classified = true;
                 }
             }
-            // The active mount already fences its own source, including status-only aliases.
-            if !classified
-                && !(super::resolve_active_agent(tool, None, config)
-                    .is_some_and(|agent| agent.name == active_mount.tool_name)
-                    && canonical_expected_path(&root)?
-                        == canonical_expected_path(self.source_root.path())?)
+            if classified {
+                continue;
+            }
+            // A status-only alias declaring the active source keeps every mount of the active
+            // agent fenced there, not only the one seeding now.
+            if super::resolve_active_agent(tool, None, config)
+                .is_some_and(|agent| agent.name == active_mount.tool_name)
+                && canonical_expected_path(&root)?
+                    == canonical_expected_path(self.source_root.path())?
             {
+                for mount in AGENT_CONFIG_MOUNTS
+                    .iter()
+                    .filter(|mount| mount.tool_name == active_mount.tool_name)
+                {
+                    self.add_root(&root, mount)?;
+                }
+            } else {
                 self.add_path(root);
             }
         }
@@ -381,6 +391,13 @@ fn canonical_source(
     let canonical = match fs::canonicalize(path) {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // A linked or looped carried file is not carried, like a linked directory.
+        Err(error)
+            if matches!(access.exception, Exception::Carried { .. })
+                && matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) =>
+        {
+            return Ok(None);
+        }
         Err(error) if matches!(access.exception, Exception::Carried { .. }) => {
             return Err(error).context("resolving carried native state");
         }
@@ -566,7 +583,12 @@ pub(super) fn carry_sandbox_state(
             };
             let canonical = match fs::canonicalize(&entry) {
                 Ok(canonical) => canonical,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        || matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) =>
+                {
+                    continue
+                }
                 Err(error) => return Err(error).context("resolving carried native state"),
             };
             let declared = boundary.source_root.path().join(relative);
@@ -2035,6 +2057,25 @@ mod tests {
     }
 
     #[test]
+    fn a_looped_carried_entry_is_not_carried() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let active = temporary.path().join("active");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir(&active).unwrap();
+        fs::write(source.join("opencode.db"), b"OWN_NATIVE_HISTORY").unwrap();
+        std::os::unix::fs::symlink("opencode.db-wal", source.join("opencode.db-wal")).unwrap();
+        let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+        boundary.stopped_original = Some(boundary.source_root.path().to_path_buf());
+        carry_sandbox_state(&source, &active, &["opencode.db*"], &boundary).unwrap();
+        assert_eq!(
+            fs::read(active.join("opencode.db")).unwrap(),
+            b"OWN_NATIVE_HISTORY"
+        );
+        assert!(fs::symlink_metadata(active.join("opencode.db-wal")).is_err());
+    }
+
+    #[test]
     fn carried_hardlinks_keep_outside_directory_alias_witnesses() {
         for outward in [true, false] {
             let temporary = tempfile::tempdir().unwrap();
@@ -2378,6 +2419,44 @@ mod tests {
             "deduplicated native scope rules must not discard the declared route"
         );
         assert_eq!(fs::read(active.join("auth.json")).unwrap(), b"LOCAL_AUTH");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_status_alias_declaring_the_active_source_fences_every_mount_of_its_agent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
+        let home = temporary.path().join("home");
+        let source = home.join("opencode-work");
+        let active = temporary.path().join("active");
+        fs::create_dir_all(source.join("storage")).unwrap();
+        fs::create_dir_all(&active).unwrap();
+        fs::write(source.join("opencode.db"), b"HISTORY").unwrap();
+        fs::write(source.join("opencode.json"), b"{}").unwrap();
+        let mut config = crate::session::config::SessionConfig::default();
+        config
+            .agent_detect_as
+            .insert("oc-work".into(), "opencode".into());
+        config
+            .agent_config_dir
+            .insert("oc-work".into(), source.display().to_string());
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|mount| mount.tool_name == "opencode" && mount.host_rel == ".config/opencode")
+            .unwrap();
+        let boundary = NativeStateBoundary::new(&source, mount, &home, &config, &active).unwrap();
+        let canonical = source.canonicalize().unwrap();
+        for (native, directory) in [("opencode.db", false), ("storage", true)] {
+            assert!(
+                boundary.rejects(&canonical.join(native), directory, ReadAccess::default()),
+                "{native} is the data mount's native state"
+            );
+        }
+        assert!(!boundary.rejects(
+            &canonical.join("opencode.json"),
+            false,
+            ReadAccess::default()
+        ));
     }
 
     #[test]
