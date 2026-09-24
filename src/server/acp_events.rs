@@ -468,6 +468,25 @@ pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
     }
 }
 
+/// Whether reaching `status` should release a plugin's `sessions.turn.send` pending mark:
+/// either it is now genuinely counted (`Running`/`Waiting`/`Starting`/`Creating`), or it is a
+/// terminal outcome for this revival attempt (`Error`/`Stopped`/`Deleting`). `Idle` and
+/// `Unknown` are deliberately excluded: a `Stopped`/`Error` session's `HealError` heal passes
+/// through `Idle` before `Running`, and treating that hop as settled would release the mark
+/// before the session is actually counted.
+fn revival_pending_clears_on(status: Status) -> bool {
+    matches!(
+        status,
+        Status::Running
+            | Status::Waiting
+            | Status::Starting
+            | Status::Creating
+            | Status::Error
+            | Status::Stopped
+            | Status::Deleting
+    )
+}
+
 /// Fold a derived `StatusIntent` into an `Instance`.
 pub(crate) fn apply_status_intent(
     inst: &mut Instance,
@@ -511,6 +530,13 @@ pub(crate) fn apply_status_intent(
             Status::Idle
         }
     };
+    // A plugin's sessions.turn.send marks a resting session pending right before waking it, so
+    // the active-session cap counts it before this, its first real status report, lands.
+    // Checked against `target` ahead of the no-op return below (not gated by it): a redundant
+    // intent that resolves to a status the row is already in must still release a stale mark.
+    if revival_pending_clears_on(target) {
+        inst.plugin_revival_pending = false;
+    }
     if inst.status == target {
         return;
     }
@@ -1972,6 +1998,48 @@ mod tests {
     fn apply(inst: &mut Instance, intent: StatusIntent) {
         let tx = broadcast::channel(8).0;
         apply_status_intent(inst, Some(intent), &tx);
+    }
+
+    /// A `sessions.turn.send` revival marks the row pending before the wake; `HealError`'s
+    /// `Idle` hop must not release that mark; only the `UserPromptSent` that actually drives
+    /// it to `Running` may.
+    #[test]
+    fn heal_error_does_not_clear_a_pending_plugin_revival() {
+        let mut inst = stopped_structured_instance();
+        inst.plugin_revival_pending = true;
+
+        apply(&mut inst, StatusIntent::HealError);
+        assert_eq!(inst.status, Status::Idle);
+        assert!(
+            inst.plugin_revival_pending,
+            "the heal's Idle hop must not release the mark early"
+        );
+
+        apply(&mut inst, StatusIntent::Set(Status::Running));
+        assert_eq!(inst.status, Status::Running);
+        assert!(
+            !inst.plugin_revival_pending,
+            "reaching a counted status must release the mark"
+        );
+    }
+
+    /// A redundant intent that resolves to the row's current status is a no-op for `status`
+    /// itself, but must still release a stale pending mark rather than being silently skipped
+    /// by the same early return.
+    #[test]
+    fn a_noop_transition_still_clears_a_pending_plugin_revival() {
+        let mut inst = Instance::new("s", "/tmp/s");
+        inst.view = crate::session::View::Structured;
+        inst.status = Status::Running;
+        inst.plugin_revival_pending = true;
+
+        apply(&mut inst, StatusIntent::Set(Status::Running));
+
+        assert_eq!(inst.status, Status::Running);
+        assert!(
+            !inst.plugin_revival_pending,
+            "a no-op transition to an already-counted status must still release a stale mark"
+        );
     }
 
     #[test]
