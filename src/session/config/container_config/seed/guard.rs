@@ -201,8 +201,16 @@ impl<'a> ReadGuard<'a> {
 
     fn add_alias(&mut self, path: &Path, origin: StateOrigin) -> Result<()> {
         watch_entry(&mut self.entries, path)?;
-        let canonical = canonical_expected_path(path)
-            .with_context(|| format!("resolving native-state boundary {}", path.display()))?;
+        let canonical = match canonical_expected_path(path) {
+            Ok(canonical) => canonical,
+            // A loop names no reachable state: fence its spelling; the watched entry catches a
+            // swap to a real alias before publication.
+            Err(error) if unresolvable(&error) => crate::git::template::lexical_normalize(path),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("resolving native-state boundary {}", path.display()))
+            }
+        };
         self.routes.push((path.to_path_buf(), canonical.clone()));
         self.aliases.push((canonical, origin));
         Ok(())
@@ -404,7 +412,7 @@ fn validate_namespace(
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
+                ) || unresolvable(&error) =>
             {
                 None
             }
@@ -420,7 +428,13 @@ fn validate_namespace(
         }
     }
     for (path, expected) in routes {
-        if canonical_expected_path(path)? != *expected {
+        let current = match canonical_expected_path(path) {
+            Ok(current) => current,
+            // Still a loop matches its recorded spelling; one that now resolves does not.
+            Err(error) if unresolvable(&error) => crate::git::template::lexical_normalize(path),
+            Err(error) => return Err(error.into()),
+        };
+        if current != *expected {
             return Err(Changed(
                 "native-state boundary changed during configuration seeding".into(),
             )
@@ -428,6 +442,11 @@ fn validate_namespace(
         }
     }
     Ok(())
+}
+
+/// A symlink loop, or a component that is not a directory, resolves to nothing.
+pub(super) fn unresolvable(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR))
 }
 
 fn watch_entry(
@@ -451,11 +470,12 @@ fn watch_entry(
                 }
                 return Ok(());
             }
+            // Below a looped ancestor, watch the loop itself.
             Err(error)
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
+                ) || unresolvable(&error) =>
             {
                 missing = Some(candidate.to_path_buf());
                 cursor = candidate.parent();
@@ -653,6 +673,59 @@ mod tests {
     }
 
     #[test]
+    fn a_looped_native_path_fails_validation_once_it_resolves() {
+        for swap in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("source");
+            let active = temporary.path().join("active");
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(&active).unwrap();
+            let native = source.join("projects");
+            symlink("projects", &native).unwrap();
+            let candidate = source.join("config.json");
+            fs::write(&candidate, b"{}").unwrap();
+            let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+            boundary.add_path(native.clone());
+            let mut guard = ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
+            assert!(guard
+                .record_file(&candidate, &File::open(&candidate).unwrap())
+                .unwrap());
+            if swap {
+                fs::remove_file(&native).unwrap();
+                symlink("config.json", &native).unwrap();
+            }
+            assert_eq!(guard.validate().is_err(), swap, "swap={swap}");
+        }
+    }
+
+    #[test]
+    fn a_native_path_below_a_looped_ancestor_fails_validation_once_it_resolves() {
+        for swap in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let source = temporary.path().join("source");
+            let active = temporary.path().join("active");
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(&active).unwrap();
+            let ancestor = source.join("agent");
+            symlink("agent", &ancestor).unwrap();
+            let candidate = source.join("config.json");
+            fs::write(&candidate, b"{}").unwrap();
+            let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+            boundary.add_path(ancestor.join("sessions"));
+            let mut guard = ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
+            assert!(guard
+                .record_file(&candidate, &File::open(&candidate).unwrap())
+                .unwrap());
+            if swap {
+                fs::remove_file(&ancestor).unwrap();
+                fs::create_dir(&ancestor).unwrap();
+                symlink("../config.json", ancestor.join("sessions")).unwrap();
+            }
+            assert_eq!(guard.validate().is_err(), swap, "swap={swap}");
+        }
+    }
+
+    #[test]
     fn changed_file_between_reads_is_reopened_before_publication() {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("source");
@@ -668,15 +741,16 @@ mod tests {
             let mut guard = ReadGuard::new(&boundary, ReadAccess::default())?;
             guard.record_file(&candidate, &File::open(&candidate)?)?;
             let bytes = fs::read(&candidate)?;
+            // A different length, so the rewrite is visible within one timestamp tick.
             if attempts == 1 {
-                fs::write(&candidate, b"NEW_SOURCE")?;
+                fs::write(&candidate, b"NEW_LONGER_SOURCE")?;
             }
             guard.record_file(&candidate, &File::open(&candidate)?)?;
             guard.validate()?;
             Ok(bytes)
         })
         .unwrap();
-        assert_eq!(copied, b"NEW_SOURCE");
+        assert_eq!(copied, b"NEW_LONGER_SOURCE");
         assert_eq!(attempts, 2);
     }
 }
