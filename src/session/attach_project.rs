@@ -719,8 +719,35 @@ pub fn attach_planned(
             ),
         }
     }
+    let attach_generation = storage.update(|instances, _groups| {
+        let row = instances
+            .iter_mut()
+            .find(|candidate| candidate.id == session_id)
+            .with_context(|| format!("session not found: {session_id}"))?;
+        row.try_acquire_lifecycle_reservation(
+            crate::session::LifecycleOperation::Attach,
+            super::Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now(),
+        )?;
+        Ok(row.lifecycle_generation)
+    })?;
     drop(_identity_lock);
-    let prepared = execute(instance, plan)?;
+    let prepared = match execute(instance, plan) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _identity_lock = crate::session::acquire_session_identity_lock()?;
+            let _ = storage.update(|instances, _groups| {
+                if let Some(row) = instances.iter_mut().find(|row| row.id == session_id) {
+                    row.release_lifecycle_reservation_if_owned(
+                        crate::session::LifecycleOperation::Attach,
+                        attach_generation,
+                    );
+                }
+                Ok(())
+            });
+            return Err(error);
+        }
+    };
     let _identity_lock = match crate::session::acquire_session_identity_lock() {
         Ok(lock) => lock,
         Err(error) => {
@@ -751,6 +778,15 @@ pub fn attach_planned(
     if let Err(error) =
         crate::session::deletion::ensure_unclaimed_paths(session_id, &candidate_paths)
     {
+        let _ = storage.update(|instances, _groups| {
+            if let Some(row) = instances.iter_mut().find(|row| row.id == session_id) {
+                row.release_lifecycle_reservation_if_owned(
+                    crate::session::LifecycleOperation::Attach,
+                    attach_generation,
+                );
+            }
+            Ok(())
+        });
         anyhow::bail!("Attach path is already claimed by another session: {error}");
     }
 
@@ -783,7 +819,7 @@ pub fn attach_planned(
             "session is being purged and cannot be attached"
         );
         anyhow::ensure!(
-            inst.lifecycle_generation == instance.lifecycle_generation,
+            inst.lifecycle_generation == attach_generation,
             "session changed before attach could be recorded"
         );
         let current_workspace = inst.workspace_info.as_ref().map(|workspace| {

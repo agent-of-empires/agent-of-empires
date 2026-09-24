@@ -265,7 +265,7 @@ impl HomeView {
             .as_ref()
             .is_some_and(|worktree| worktree.managed_by_aoe)
             || instance.workspace_info.is_some();
-        let identity_lock = match acquire_session_identity_lock() {
+        let _identity_lock = match acquire_session_identity_lock() {
             Ok(lock) => lock,
             Err(error) => {
                 builder::cleanup_instance(
@@ -326,7 +326,6 @@ impl HomeView {
                 tree.create_group(&instance.group_path);
             }
         }
-        drop(identity_lock);
         self.save_with_storage()?;
 
         self.reload()?;
