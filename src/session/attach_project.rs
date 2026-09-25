@@ -1032,65 +1032,38 @@ mod tests {
     }
 
     #[test]
-    fn plan_refuses_a_scratch_session() {
-        let mut inst = Instance::new("Scratchpad", "/tmp/scratch/abc");
-        inst.scratch = true;
-        let Err(err) = plan(
-            &inst,
-            "default",
-            Path::new("/tmp/definitely-not-a-repo"),
-            ExistingBranch::Refuse,
-        ) else {
-            panic!("a scratch session has no repo to attach to");
-        };
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("scratch session"),
-            "the scratch refusal must win over the not-a-git-repo error: {msg}"
-        );
-    }
-
-    #[test]
     fn plan_refuses_states_that_are_never_attachable() {
-        let attempt = |inst: &Instance| {
+        use super::super::Status;
+        type Setup = fn(&mut Instance);
+        // Each refusal must win over the not-a-git-repo error; a Running session reaches it.
+        let cases: [(Setup, &str); 6] = [
+            (|i| i.scratch = true, "scratch session"),
+            (
+                |i| i.status = Status::Creating,
+                "being created or is being deleted",
+            ),
+            (
+                |i| i.status = Status::Deleting,
+                "being created or is being deleted",
+            ),
+            (|i| i.trashed_at = Some(Utc::now()), "in the trash"),
+            (|i| i.archived_at = Some(Utc::now()), "archived"),
+            (|i| i.status = Status::Running, "not a git repository"),
+        ];
+        for (setup, want) in cases {
+            let mut inst = Instance::new("Attach", "/tmp/attach");
+            setup(&mut inst);
             let Err(err) = plan(
-                inst,
+                &inst,
                 "default",
                 Path::new("/tmp/definitely-not-a-repo"),
                 ExistingBranch::Refuse,
             ) else {
-                panic!("this lifecycle state must be refused");
+                panic!("{want}: must be refused");
             };
-            format!("{err:#}")
-        };
-
-        for status in [
-            super::super::Status::Creating,
-            super::super::Status::Deleting,
-        ] {
-            let mut inst = Instance::new("Busy", "/tmp/busy");
-            inst.status = status;
-            let msg = attempt(&inst);
-            assert!(
-                msg.contains("being created or is being deleted"),
-                "{status:?} must be refused with its own reason: {msg}"
-            );
+            let msg = format!("{err:#}");
+            assert!(msg.contains(want), "{want}: {msg}");
         }
-
-        let mut trashed = Instance::new("Trashed", "/tmp/trashed");
-        trashed.trashed_at = Some(Utc::now());
-        assert!(attempt(&trashed).contains("in the trash"));
-
-        let mut archived = Instance::new("Archived", "/tmp/archived");
-        archived.archived_at = Some(Utc::now());
-        assert!(attempt(&archived).contains("archived"));
-
-        let mut running = Instance::new("Running", "/tmp/running");
-        running.status = super::super::Status::Running;
-        assert!(
-            attempt(&running).contains("not a git repository"),
-            "a Running session must reach the repo checks, not a lifecycle refusal"
-        );
     }
 
     #[test]
