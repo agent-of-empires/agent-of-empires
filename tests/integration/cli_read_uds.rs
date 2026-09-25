@@ -6,10 +6,14 @@
 
 use std::time::Duration;
 
+use agent_of_empires::cli::definition::Cli;
+use agent_of_empires::cli::runtime_read::classify;
 use agent_of_empires::cli::runtime_read::{execute, ReadOutcome, ReadRequestSource, ScopedCommand};
 use agent_of_empires::server::test_support::{
     build_test_app_state_with_policy, RuntimeUdsTestServer,
 };
+use agent_of_empires::session::Instance;
+use clap::Parser;
 
 /// No explicit endpoint: the client must find the daemon on its own socket.
 fn local_source() -> ReadRequestSource {
@@ -47,6 +51,45 @@ async fn a_live_daemon_socket_serves_the_read() {
         Some("No profiles found.\nRun 'aoe' to create the first profile automatically.\n")
     );
     drop(server);
+}
+
+/// Every scoped command and alias completes over the real local socket.
+#[tokio::test]
+#[serial_test::serial]
+async fn every_scoped_command_and_alias_round_trips_over_uds() {
+    let mut instance = Instance::new("s1", "/repo");
+    instance.source_profile = "main".into();
+    instance.title = "Session".into();
+    instance.tool = "claude".into();
+    instance.group_path = "alpha".into();
+    instance.id = "s1".into();
+    let state = build_test_app_state_with_policy(vec![instance], Vec::new(), Vec::new(), None);
+    let server = RuntimeUdsTestServer::start(state.clone())
+        .unwrap_or_else(|reason| panic!("the local read must be publishable: {reason}"));
+    agent_of_empires::session::create_profile("main").expect("create fixture profile");
+
+    for argv in [
+        vec!["aoe", "list"],
+        vec!["aoe", "ls"],
+        vec!["aoe", "status"],
+        vec!["aoe", "session", "show", "s1"],
+        vec!["aoe", "session", "list-trash"],
+        vec!["aoe", "group", "list"],
+        vec!["aoe", "group", "ls"],
+        vec!["aoe", "profile"],
+        vec!["aoe", "profile", "list"],
+        vec!["aoe", "profile", "ls"],
+        vec!["aoe", "project", "list"],
+        vec!["aoe", "project", "ls"],
+    ] {
+        let cli = Cli::try_parse_from(&argv).expect("command parses");
+        let command = classify(cli.command.as_ref()).expect("command is scoped read");
+        let outcome = read(command).await;
+        assert_eq!(outcome.exit, 0, "{argv:?} failed: {:?}", outcome.stderr);
+        assert!(outcome.stdout.is_some(), "{argv:?} produced no stdout");
+    }
+    state.shutdown.cancel();
+    server.join().await;
 }
 
 /// The same publication, read twice: one snapshot per connection, both
