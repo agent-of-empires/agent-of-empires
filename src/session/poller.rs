@@ -1165,7 +1165,7 @@ mod tests {
     }
 
     #[test]
-    fn test_thread_budget_cap() {
+    fn thread_budget_caps_pollers_and_cleanup_returns_slots() {
         let budget = test_support::IsolatedBudget::exhausted();
 
         let mut poller = SessionPoller::new("test-session".to_string());
@@ -1195,6 +1195,47 @@ mod tests {
             session_id_poller_budget_available(),
             "one free slot must read as available"
         );
+        drop(budget);
+
+        {
+            let budget = test_support::IsolatedBudget::with_ceiling(1);
+            let sid = Arc::new(Mutex::new("initial-id".to_string()));
+            let observed_sid = sid.clone();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let mut poller = SessionPoller::new("test-session".to_string());
+            poller.cmd_tx.send(PollCommand::Stop).expect("queue stop");
+            assert_eq!(
+                poller.start(
+                    "test-cleanup".to_string(),
+                    Box::new(move || Some(lock_unpoisoned(&observed_sid).clone())),
+                    Box::new(move |value| {
+                        if value == "initial-id" {
+                            started_tx.send(()).expect("report initial observation");
+                            let _ = release_rx.recv();
+                        }
+                    }),
+                    None,
+                ),
+                PollerSpawn::Spawned
+            );
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("initial observation");
+            let active_before_stop = budget.active();
+            *lock_unpoisoned(&sid) = "final-id".to_string();
+            drop(release_tx);
+            poller.stop();
+            assert_eq!(active_before_stop, 1);
+            assert_eq!(budget.active(), 0);
+            assert_eq!(
+                poller.latest_observation(),
+                Some((
+                    "test-cleanup".to_string(),
+                    SessionIdObservation::unguarded("final-id".to_string()),
+                ))
+            );
+        }
     }
 
     #[test]
@@ -1246,47 +1287,6 @@ mod tests {
         );
         assert!(poller.is_running());
         poller.stop();
-    }
-
-    #[test]
-    fn test_poller_cleanup_decrements_counter() {
-        let budget = test_support::IsolatedBudget::with_ceiling(1);
-        let sid = Arc::new(Mutex::new("initial-id".to_string()));
-        let observed_sid = sid.clone();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let mut poller = SessionPoller::new("test-session".to_string());
-        poller.cmd_tx.send(PollCommand::Stop).expect("queue stop");
-        assert_eq!(
-            poller.start(
-                "test-cleanup".to_string(),
-                Box::new(move || Some(lock_unpoisoned(&observed_sid).clone())),
-                Box::new(move |value| {
-                    if value == "initial-id" {
-                        started_tx.send(()).expect("report initial observation");
-                        let _ = release_rx.recv();
-                    }
-                }),
-                None,
-            ),
-            PollerSpawn::Spawned
-        );
-        started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("initial observation");
-        let active_before_stop = budget.active();
-        *lock_unpoisoned(&sid) = "final-id".to_string();
-        drop(release_tx);
-        poller.stop();
-        assert_eq!(active_before_stop, 1);
-        assert_eq!(budget.active(), 0);
-        assert_eq!(
-            poller.latest_observation(),
-            Some((
-                "test-cleanup".to_string(),
-                SessionIdObservation::unguarded("final-id".to_string()),
-            ))
-        );
     }
 
     #[test]

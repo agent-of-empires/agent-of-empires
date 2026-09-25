@@ -1928,16 +1928,16 @@ mod tests {
         }
 
         #[test]
-        fn real_worktree_and_branch_are_removed_idempotently() {
+        fn worktree_and_branch_are_removed_idempotently_unless_preserved() {
             let _app_guard = isolate_app_dir();
             let (_tmp, main_repo, worktree_path, instance) = worktree_fixture("feature/delete-me");
-            let request = DeletionRequest {
+            let delete_both = DeletionRequest {
                 delete_worktree: true,
                 delete_branch: true,
                 ..request(instance)
             };
             for _ in 0..2 {
-                let result = perform_deletion(&request);
+                let result = perform_deletion(&delete_both);
                 assert!(
                     result.success,
                     "perform_deletion failed: {:?}",
@@ -1946,6 +1946,26 @@ mod tests {
                 assert!(!worktree_path.exists());
                 assert!(!main_repo.join(".git/worktrees/worktree").exists());
                 assert!(!branch_exists(&main_repo, "feature/delete-me"));
+            }
+
+            {
+                let (_tmp, main_repo, worktree_path, instance) =
+                    worktree_fixture("feature/keep-me");
+                let result = perform_deletion(&DeletionRequest {
+                    delete_branch: true,
+                    ..request(instance)
+                });
+
+                assert!(result.success, "{:?}", result.errors);
+                assert!(!result.errors.iter().any(|e| e.starts_with("Branch:")));
+                assert!(
+                    result.messages.iter().any(|m| m.contains("kept")),
+                    "a kept-branch message is expected: {:?}",
+                    result.messages
+                );
+                assert!(worktree_path.exists());
+                assert!(main_repo.join(".git/worktrees/worktree").exists());
+                assert!(branch_exists(&main_repo, "feature/keep-me"));
             }
         }
 
@@ -2123,27 +2143,6 @@ mod tests {
             );
             assert!(!worktree.exists(), "worktree should be removed");
             assert!(branch_exists(&main_repo, "mine"));
-        }
-
-        #[test]
-        fn preserved_worktree_keeps_its_branch() {
-            let _app_guard = isolate_app_dir();
-            let (_tmp, main_repo, worktree_path, instance) = worktree_fixture("feature/keep-me");
-            let result = perform_deletion(&DeletionRequest {
-                delete_branch: true,
-                ..request(instance)
-            });
-
-            assert!(result.success, "{:?}", result.errors);
-            assert!(!result.errors.iter().any(|e| e.starts_with("Branch:")));
-            assert!(
-                result.messages.iter().any(|m| m.contains("kept")),
-                "a kept-branch message is expected: {:?}",
-                result.messages
-            );
-            assert!(worktree_path.exists());
-            assert!(main_repo.join(".git/worktrees/worktree").exists());
-            assert!(branch_exists(&main_repo, "feature/keep-me"));
         }
 
         /// A dirty worktree survives a normal delete (the sandbox preclean is skipped too, or it

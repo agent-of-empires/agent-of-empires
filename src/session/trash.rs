@@ -769,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn is_expired_cases() {
+    fn expiry_and_holding_path_cases() {
         let now = Utc::now();
         // (case, trashed days ago, retention days, expected)
         let cases = [
@@ -793,13 +793,12 @@ mod tests {
             vec![old_a.id, old_b.id],
             "filters and preserves order"
         );
-    }
 
-    #[test]
-    fn holding_path_is_namespaced_sibling() {
-        let p = trash_holding_path(Path::new("/repo-worktrees/feature"), "abc123").unwrap();
-        assert_eq!(p, PathBuf::from("/repo-worktrees/.aoe-trash/abc123"));
-        assert!(trash_holding_path(Path::new("/"), "abc123").is_none());
+        {
+            let p = trash_holding_path(Path::new("/repo-worktrees/feature"), "abc123").unwrap();
+            assert_eq!(p, PathBuf::from("/repo-worktrees/.aoe-trash/abc123"));
+            assert!(trash_holding_path(Path::new("/"), "abc123").is_none());
+        }
     }
 
     fn real_worktree_instance() -> (tempfile::TempDir, Instance) {
@@ -962,7 +961,7 @@ mod tests {
     }
 
     #[test]
-    fn relocate_then_restore_round_trip() {
+    fn relocated_worktree_restores_or_purges() {
         if !git_available() {
             return;
         }
@@ -1007,10 +1006,43 @@ mod tests {
         assert_eq!(inst.project_path, original);
         assert!(inst.pre_trash_project_path.is_none());
         assert!(PathBuf::from(&original).exists());
+
+        {
+            let _app_guard = crate::session::test_support::isolate_app_dir();
+            if !git_available() {
+                return;
+            }
+            let (_tmp, mut inst) = real_worktree_instance();
+            inst.trash();
+            assert!(matches!(
+                relocate_worktree_to_trash(&mut inst),
+                RelocateOutcome::Relocated { .. }
+            ));
+            let holding = PathBuf::from(&inst.project_path);
+            assert!(holding.exists());
+
+            let result = crate::session::deletion::perform_deletion(
+                &crate::session::deletion::DeletionRequest {
+                    session_id: inst.id.clone(),
+                    instance: inst.clone(),
+                    delete_worktree: true,
+                    delete_branch: true,
+                    delete_sandbox: false,
+                    force_delete: true,
+                    detach_hooks: true,
+                    keep_scratch: false,
+                },
+            );
+            assert!(result.success, "purge failed: {:?}", result.errors);
+            assert!(
+                !holding.exists(),
+                "relocated worktree should be gone after purge"
+            );
+        }
     }
 
     #[test]
-    fn reconcile_backfills_legacy_then_is_idempotent() {
+    fn reconcile_backfills_legacy_once_and_skips_rows_already_in_holding() {
         if !git_available() {
             return;
         }
@@ -1032,6 +1064,27 @@ mod tests {
         assert!(!PathBuf::from(&original).exists());
 
         assert!(!reconcile_trashed_location(&mut inst));
+
+        {
+            if !git_available() {
+                return;
+            }
+            let (_tmp, mut inst) = real_worktree_instance();
+            inst.trash();
+            assert!(matches!(
+                relocate_worktree_to_trash(&mut inst),
+                RelocateOutcome::Relocated { .. }
+            ));
+            let holding = inst.project_path.clone();
+            inst.pre_trash_project_path = None;
+
+            assert!(
+                !reconcile_trashed_location(&mut inst),
+                "a markerless row already in holding must be left alone"
+            );
+            assert_eq!(inst.project_path, holding);
+            assert!(!PathBuf::from(&holding).join(".aoe-trash").exists());
+        }
     }
 
     #[test]
@@ -1291,28 +1344,6 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_skips_markerless_row_already_in_holding() {
-        if !git_available() {
-            return;
-        }
-        let (_tmp, mut inst) = real_worktree_instance();
-        inst.trash();
-        assert!(matches!(
-            relocate_worktree_to_trash(&mut inst),
-            RelocateOutcome::Relocated { .. }
-        ));
-        let holding = inst.project_path.clone();
-        inst.pre_trash_project_path = None;
-
-        assert!(
-            !reconcile_trashed_location(&mut inst),
-            "a markerless row already in holding must be left alone"
-        );
-        assert_eq!(inst.project_path, holding);
-        assert!(!PathBuf::from(&holding).join(".aoe-trash").exists());
-    }
-
-    #[test]
     fn reconcile_heals_pointer_to_holding_after_lost_persist() {
         if !git_available() {
             return;
@@ -1343,40 +1374,6 @@ mod tests {
                 Some(original.as_str())
             );
         }
-    }
-
-    #[test]
-    fn purge_removes_relocated_worktree() {
-        let _app_guard = crate::session::test_support::isolate_app_dir();
-        if !git_available() {
-            return;
-        }
-        let (_tmp, mut inst) = real_worktree_instance();
-        inst.trash();
-        assert!(matches!(
-            relocate_worktree_to_trash(&mut inst),
-            RelocateOutcome::Relocated { .. }
-        ));
-        let holding = PathBuf::from(&inst.project_path);
-        assert!(holding.exists());
-
-        let result = crate::session::deletion::perform_deletion(
-            &crate::session::deletion::DeletionRequest {
-                session_id: inst.id.clone(),
-                instance: inst.clone(),
-                delete_worktree: true,
-                delete_branch: true,
-                delete_sandbox: false,
-                force_delete: true,
-                detach_hooks: true,
-                keep_scratch: false,
-            },
-        );
-        assert!(result.success, "purge failed: {:?}", result.errors);
-        assert!(
-            !holding.exists(),
-            "relocated worktree should be gone after purge"
-        );
     }
 
     // Regression: a trashed worktree is relocated + re-locked, then its holding checkout is cleared
