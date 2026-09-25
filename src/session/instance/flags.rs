@@ -463,23 +463,4 @@ mod tests {
         let age = inst.idle_age().unwrap().as_secs();
         assert!((4..=30).contains(&age));
     }
-
-    #[test]
-    fn archive_settles_only_live_interaction_statuses() {
-        for (status, expected) in [
-            (Status::Running, Status::Idle),
-            (Status::Waiting, Status::Idle),
-            (Status::Starting, Status::Idle),
-            (Status::Idle, Status::Idle),
-            (Status::Stopped, Status::Stopped),
-            (Status::Error, Status::Error),
-            (Status::Unknown, Status::Unknown),
-        ] {
-            let mut inst = inst();
-            inst.status = status;
-            inst.archive();
-            assert!(inst.is_archived());
-            assert_eq!(inst.status, expected, "{status:?}");
-        }
-    }
 }

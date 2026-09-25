@@ -950,19 +950,49 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_custom_codex_detected_agent_uses_codex_hook_installer() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
-        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+    fn codex_hook_installer_follows_detect_as_and_profile_hook_setting() {
+        // (tool, profile config, global hooks off, expect hooks.json)
+        for (tool, profile, global_off, installed) in [
+            ("my-codex-wrapper", None, false, true),
+            (
+                "codex",
+                Some("[session]\nagent_status_hooks = false\n"),
+                false,
+                false,
+            ),
+            (
+                "codex",
+                Some("[session]\nagent_status_hooks = true\n"),
+                true,
+                true,
+            ),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
+            let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+            if global_off {
+                crate::session::config::update_config(|global| {
+                    global.session.agent_status_hooks = false;
+                })
+                .unwrap();
+            }
+            acknowledge_hooks();
+            let mut inst = hook_inst(tool);
+            inst.detect_as = "codex".to_string();
+            if let Some(config) = profile {
+                write_profile("codex-hooks", config);
+                inst.source_profile = "codex-hooks".to_string();
+            }
+            inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as), None);
 
-        acknowledge_hooks();
-        let mut inst = Instance::new("wrapped", "/tmp/test");
-        inst.tool = "my-codex-wrapper".to_string();
-        inst.detect_as = "codex".to_string();
-        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as), None);
-
-        assert_aoe_codex_hooks(&tmp.path().join(".codex").join("hooks.json"));
-        assert!(!tmp.path().join(".codex").join("config.toml").exists());
+            let hooks = tmp.path().join(".codex").join("hooks.json");
+            if installed {
+                assert_aoe_codex_hooks(&hooks);
+            } else {
+                assert!(!hooks.exists(), "{tool} {profile:?}");
+            }
+            assert!(!tmp.path().join(".codex").join("config.toml").exists());
+        }
     }
 
     #[test]
@@ -1040,22 +1070,6 @@ mod tests {
         });
 
         assert_eq!(writes, [false, false, true]);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_codex_hook_installer_respects_profile_hooks_disabled() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
-        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
-
-        write_profile("hooks-disabled", "[session]\nagent_status_hooks = false\n");
-
-        let mut inst = hook_inst("codex");
-        inst.source_profile = "hooks-disabled".to_string();
-        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as), None);
-
-        assert!(!tmp.path().join(".codex").join("hooks.json").exists());
     }
 
     #[test]
@@ -1174,28 +1188,6 @@ agent_status_hooks = false
                 "profile={profile}: host trust record presence"
             );
         }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_codex_hook_installer_respects_profile_hooks_enabled() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
-        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
-
-        crate::session::config::update_config(|global| {
-            global.session.agent_status_hooks = false;
-        })
-        .unwrap();
-
-        write_profile("hooks-enabled", "[session]\nagent_status_hooks = true\n");
-
-        acknowledge_hooks();
-        let mut inst = hook_inst("codex");
-        inst.source_profile = "hooks-enabled".to_string();
-        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as), None);
-
-        assert_aoe_codex_hooks(&tmp.path().join(".codex").join("hooks.json"));
     }
 
     #[test]
@@ -1321,80 +1313,49 @@ agent_status_hooks = false
     #[test]
     #[serial_test::serial]
     fn disabling_status_hooks_removes_stale_aoe_entries_but_keeps_foreign_hooks() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
-        let _env = EnvGuard::set(&[("HOME", tmp.path().as_os_str())]);
-        acknowledge_hooks();
+        // (agent, hooks file, native config written after install); codex also has its own
+        // hooks feature turned off (#3781).
+        for (tool, hooks_file, native_config) in [
+            ("gemini", ".gemini/settings.json", None),
+            (
+                "codex",
+                ".codex/hooks.json",
+                Some((".codex/config.toml", "[features]\nhooks = false\n")),
+            ),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+            let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
+            let _home_guard = EnvGuard::set(&[("HOME", tmp.path())]);
+            acknowledge_hooks();
 
-        let mut inst = hook_inst("gemini");
-        inst.install_agent_status_hooks(crate::agents::get_agent("gemini"), None);
-        let path = tmp.path().join(".gemini/settings.json");
-        let mut settings: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        settings["hooks"]["ForeignEvent"] = serde_json::json!([{
-            "hooks": [{"type": "command", "command": "printf foreign"}]
-        }]);
-        std::fs::write(&path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+            let agent = crate::agents::get_agent(tool);
+            let mut inst = hook_inst(tool);
+            inst.install_agent_status_hooks(agent, None);
+            let path = tmp.path().join(hooks_file);
+            let mut settings: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            settings["hooks"]["ForeignEvent"] = serde_json::json!([{
+                "hooks": [{"type": "command", "command": "printf foreign"}]
+            }]);
+            std::fs::write(&path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+            if let Some((file, config)) = native_config {
+                std::fs::write(tmp.path().join(file), config).unwrap();
+            }
 
-        let profile = "cleanup-disabled-hooks";
-        let profile_dir = crate::session::get_profile_dir(profile).unwrap();
-        std::fs::write(
-            profile_dir.join("config.toml"),
-            "[session]
-agent_status_hooks = false
-",
-        )
-        .unwrap();
-        inst.source_profile = profile.to_string();
-        inst.ensure_disclosed_host_hook_path(crate::agents::get_agent("gemini"))
-            .unwrap();
-        inst.install_agent_status_hooks(crate::agents::get_agent("gemini"), None);
+            write_profile(
+                "cleanup-disabled-hooks",
+                "[session]\nagent_status_hooks = false\n",
+            );
+            inst.source_profile = "cleanup-disabled-hooks".to_string();
+            inst.ensure_disclosed_host_hook_path(agent).unwrap();
+            inst.install_agent_status_hooks(agent, None);
 
-        let content = std::fs::read_to_string(path).unwrap();
-        assert!(content.contains("printf foreign"));
-        assert!(!content.contains("aoe-hooks"));
-        assert!(!inst.identity_publisher_launched);
-    }
-    #[test]
-    #[serial_test::serial]
-    fn disabling_status_hooks_removes_stale_codex_entries_while_codex_hooks_are_disabled() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
-        let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
-        let _home_guard = EnvGuard::set(&[("HOME", tmp.path())]);
-        acknowledge_hooks();
-
-        let mut inst = hook_inst("codex");
-        inst.install_agent_status_hooks(crate::agents::get_agent("codex"), None);
-        let path = tmp.path().join(".codex/hooks.json");
-        let mut settings: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        settings["hooks"]["ForeignEvent"] = serde_json::json!([{
-            "hooks": [{"type": "command", "command": "printf foreign"}]
-        }]);
-        std::fs::write(&path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
-        std::fs::write(
-            tmp.path().join(".codex/config.toml"),
-            "[features]\nhooks = false\n",
-        )
-        .unwrap();
-
-        let profile = "cleanup-disabled-codex-hooks";
-        let profile_dir = crate::session::get_profile_dir(profile).unwrap();
-        std::fs::write(
-            profile_dir.join("config.toml"),
-            "[session]\nagent_status_hooks = false\n",
-        )
-        .unwrap();
-        inst.source_profile = profile.to_string();
-        inst.ensure_disclosed_host_hook_path(crate::agents::get_agent("codex"))
-            .unwrap();
-        inst.install_agent_status_hooks(crate::agents::get_agent("codex"), None);
-
-        let content = std::fs::read_to_string(path).unwrap();
-        assert!(content.contains("printf foreign"));
-        assert!(!content.contains("aoe-hooks"));
-        assert!(!inst.identity_publisher_launched);
+            let content = std::fs::read_to_string(path).unwrap();
+            assert!(content.contains("printf foreign"), "{tool}");
+            assert!(!content.contains("aoe-hooks"), "{tool}");
+            assert!(!inst.identity_publisher_launched, "{tool}");
+        }
     }
 
     #[test]
