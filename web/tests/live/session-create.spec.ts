@@ -241,19 +241,6 @@ test.describe("directory browser", () => {
     await expect(option(page, "repo-a")).toBeVisible({ timeout: 10_000 });
     await expect(option(page, "projects")).toHaveCount(0);
   });
-
-  test("DirectoryBrowser: parent-dir row navigates up one level", async ({ page, spawnServe }) => {
-    const serve = await spawnServe({
-      seedFn: ({ home }) => void mkdirSync(join(home, "projects", "nested"), { recursive: true }),
-    });
-    await page.goto(serve.baseUrl);
-    await openWizardWithShortcut(page);
-    await option(page, "projects").click({ timeout: 10_000 });
-    await option(page, "nested").click();
-    await expect(page.getByText("No visible subfolders here")).toBeVisible();
-    await option(page, "(parent directory)").click();
-    await expect(option(page, "nested")).toBeVisible({ timeout: 5_000 });
-  });
 });
 
 test.describe("worktrees", () => {

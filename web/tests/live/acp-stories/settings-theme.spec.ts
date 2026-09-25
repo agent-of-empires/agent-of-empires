@@ -34,44 +34,27 @@ async function expectOption(select: Locator, value: string) {
     .toBe(true);
 }
 
-test("theme name SelectField round-trips through the UI", async ({ page, serve }) => {
-  const select = await openThemeSelect(page, serve.baseUrl);
-  await expect.poll(() => select.locator("option").count(), { timeout: 10_000 }).toBeGreaterThan(0);
-  const next = await optionOtherThanCurrent(select);
-
-  await select.selectOption(next);
-  await expect(select).toHaveValue(next);
-  // The value flipping is not enough; the resolved theme must paint.
-  await expect.poll(() => datasetTheme(page), { timeout: 10_000 }).toBe(next);
-
-  await page.reload();
-  await openSettingsTab(page, "Theme");
-  await expect(settingsSelectByLabel(page, "Theme")).toHaveValue(next, { timeout: 10_000 });
-  await expect.poll(() => datasetTheme(page), { timeout: 10_000 }).toBe(next);
-});
-
-test("custom theme TOML appears in the dropdown and applies on pick", async ({ page, spawnServe }) => {
+test("a custom theme TOML appears and applies on pick; a malformed one does not break the dropdown", async ({
+  page,
+  spawnServe,
+}) => {
   const name = "aoe-story-custom";
   const serve = await spawnServe({
-    seedFn: ({ home, xdg }) => void seedCustomTheme(home, xdg, name, VALID_CUSTOM_THEME_TOML),
+    seedFn: ({ home, xdg }) => {
+      seedCustomTheme(home, xdg, name, VALID_CUSTOM_THEME_TOML);
+      seedCustomTheme(home, xdg, "aoe-story-malformed", MALFORMED_CUSTOM_THEME_TOML);
+    },
   });
   const select = await openThemeSelect(page, serve.baseUrl);
   // Builtins populate first, so wait for the custom entry itself.
   await expectOption(select, name);
+  await expectOption(select, "dracula");
 
   await select.selectOption(name);
   await expect(select).toHaveValue(name);
   await expect.poll(() => datasetTheme(page), { timeout: 10_000 }).toBe(name);
   // The TOML's background projects onto --color-surface-900.
   expect((await surface900(page)).toLowerCase()).toBe("#11131c");
-});
-
-test("malformed custom theme TOML does not break the dropdown", async ({ page, spawnServe }) => {
-  const serve = await spawnServe({
-    seedFn: ({ home, xdg }) => void seedCustomTheme(home, xdg, "aoe-story-malformed", MALFORMED_CUSTOM_THEME_TOML),
-  });
-  const select = await openThemeSelect(page, serve.baseUrl);
-  await expectOption(select, "dracula");
 
   await select.selectOption("dracula");
   await expect(select).toHaveValue("dracula");

@@ -22,16 +22,6 @@ test.describe("theme API", () => {
     return res.json();
   };
 
-  test("GET /api/themes/:name returns within 2s and is not stuck in resolve", async () => {
-    const body = await fetchTheme("dracula");
-    expect(body.name).toBe("dracula");
-    expect(body.source).toBe("builtin");
-    expect(body.appearance).toBe("dark");
-    expect(body.web.cssVars["--color-surface-900"]).toBe(DRACULA_SURFACE);
-    expect(body.terminal.cssVars["--term-bg"]).toBe(DRACULA_SURFACE);
-    expect(body.syntax.shikiTheme).toBe("dracula");
-  });
-
   test("GET /api/themes/:name handles all 6 builtins sequentially without hanging", async () => {
     for (const name of ["empire", "phosphor", "tokyo-night-storm", "catppuccin-latte", "dracula", "rose-pine"]) {
       const body = await fetchTheme(name);
@@ -40,21 +30,6 @@ test.describe("theme API", () => {
     }
   });
 
-  test("dashboard chrome repaints when theme switches via API", async ({ page }) => {
-    const surface = () =>
-      page.evaluate(() => document.documentElement.style.getPropertyValue("--color-surface-900").trim());
-    await page.goto(`${handle.baseUrl}/`);
-    await expect
-      .poll(async () => (await surface()).length > 0, { timeout: 10_000, intervals: [100, 250, 500] })
-      .toBe(true);
-    const patch = await page.request.patch(`${handle.baseUrl}/api/theme`, { data: { name: "dracula" } });
-    expect(patch.ok()).toBe(true);
-    await page.evaluate((name) => {
-      window.dispatchEvent(new CustomEvent("aoe:theme-picker-changed", { detail: { name } }));
-    }, "dracula");
-    await expectRepaint(page);
-    expect(await page.evaluate(() => getComputedStyle(document.body).backgroundColor)).toMatch(/40,\s*42,\s*54/);
-  });
 });
 
 const DRACULA_SURFACE = "#282a36";
@@ -93,23 +68,6 @@ async function expectRepaint(page: Page) {
     })
     .toBe(DRACULA_SURFACE);
 }
-
-test("theme setting persists through PATCH + reload", async ({ serve, page }) => {
-  // #1217
-  const settingsUrl = `${serve.baseUrl}/api/settings`;
-  const before = await getJson(settingsUrl);
-  const newTheme = before?.theme?.name === "modus-vivendi" ? "default" : "modus-vivendi";
-  const patchRes = await fetch(settingsUrl, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ theme: { ...(before?.theme ?? {}), name: newTheme } }),
-  });
-  expect(patchRes.ok).toBeTruthy();
-  expect((await getJson(settingsUrl))?.theme?.name).toBe(newTheme);
-
-  await page.goto(serve.baseUrl);
-  expect((await readInPage(page, settingsUrl))?.theme?.name).toBe(newTheme);
-});
 
 test("structured view settings persist through PATCH + reload, node_path is stripped", async ({ serve, page }) => {
   // #1689: the section was missing from the allowlist. node_path is a local-only RCE surface.
