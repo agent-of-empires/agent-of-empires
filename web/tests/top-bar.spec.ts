@@ -13,18 +13,7 @@ test.describe("Top bar", () => {
     await expect(page.getByText("offline")).toBeVisible();
   });
 
-  test("overflow Help opens help overlay", async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await page.getByRole("button", { name: "More options" }).click();
-    await page.getByRole("menuitem", { name: "Help" }).click();
-    await expect(page.getByRole("heading", { name: "Help" })).toBeVisible();
-    // A sample binding row, proving the shortcuts list rendered and not
-    // just the heading (ported from the live modal-help story).
-    await expect(page.getByText(/Toggle this help/i)).toBeVisible();
-  });
-
-  test("overflow About opens the About modal with links; Escape and the X close it", async ({ page }) => {
+  test("overflow About and Help open their modals; Escape and the X close About", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await page.getByRole("button", { name: "More options" }).click();
@@ -43,6 +32,14 @@ test.describe("Top bar", () => {
     await expect(dialog.getByText("Agent of Empires")).toBeVisible();
     await dialog.getByRole("button", { name: "Close" }).click();
     await expect(dialog).toBeHidden();
+
+    // Help opens from the same overflow menu.
+    await page.getByRole("button", { name: "More options" }).click();
+    await page.getByRole("menuitem", { name: "Help" }).click();
+    await expect(page.getByRole("heading", { name: "Help" })).toBeVisible();
+    // A sample binding row, proving the shortcuts list rendered and not
+    // just the heading (ported from the live modal-help story).
+    await expect(page.getByText(/Toggle this help/i)).toBeVisible();
   });
 
   test("Go to dashboard returns to / from a session view", async ({ page }) => {

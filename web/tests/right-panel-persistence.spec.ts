@@ -21,13 +21,6 @@ async function getLayout(page: import("@playwright/test").Page) {
 }
 
 test.describe("Right dock pane-layout persistence", () => {
-  test("desktop with empty storage seeds both panes open", async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-    expect(await getLayout(page)).toEqual({ diff: true, terminal: true });
-  });
-
   test("mobile with empty storage seeds both panes closed", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
@@ -43,7 +36,9 @@ test.describe("Right dock pane-layout persistence", () => {
     expect(await getLayout(page)).toEqual({ diff: true, terminal: true });
   });
 
-  test("keyboard toggle flips the diff pane and survives reload", async ({ page }) => {
+  test("desktop seeds both panes open; the keyboard toggle flips the diff pane and survives reload", async ({
+    page,
+  }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     // Per-session layout: toggles need an active session, so open one directly.
     await page.goto(`/session/${SESSION}`);

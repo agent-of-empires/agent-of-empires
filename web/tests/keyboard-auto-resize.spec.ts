@@ -78,7 +78,9 @@ async function paneHeight(page: Page): Promise<number> {
 const openSession = (page: Page, handle: MockHandle) => openLiveSession(page, handle, { mobile: true, settings: null });
 
 test.describe("Keyboard auto-resize (#1432)", () => {
-  test("Safari mode: keyboard insets the pane but never resizes tmux", async ({ page }) => {
+  test("Safari mode: the keyboard insets the pane without resizing tmux and returns a reader to the prompt", async ({
+    page,
+  }) => {
     const handle = await mockTerminalApis(page);
     await openSession(page, handle);
 
@@ -103,11 +105,6 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     await observeFor(page, 800, async () => {
       expect(extractResizes(handle).length, "keyboard close must not resize tmux").toBe(baselineCount);
     });
-  });
-
-  test("Safari mode: opening the keyboard returns a scrollback reader to the visible prompt", async ({ page }) => {
-    const handle = await mockTerminalApis(page);
-    await openSession(page, handle);
 
     // Opening the keyboard is an intent to type, so it returns to the prompt from a reading position.
     await page.evaluate(() => {

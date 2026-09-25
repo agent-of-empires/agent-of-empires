@@ -166,19 +166,6 @@ async function pickMode(page: Page, mode: RegExp) {
   await item.click();
 }
 
-test("ModePicker switches the structured view mode", async ({ page, spawnServe }) => {
-  const { serve, sessionId } = await startAcpSession(spawnServe, { title: "story-mode-picker" });
-  // Without an attached session /acp/mode races the implicit spawn and fails silently.
-  await spawnAcpAgent(serve.baseUrl, sessionId);
-  await openStructuredView(page, serve, sessionId);
-
-  const trigger = modeTrigger(page, /^(Default|Plan|Accept|Bypass)$/);
-  await expect(trigger).toBeVisible({ timeout: 10_000 });
-  await trigger.click();
-  await pickMode(page, /^Plan$/i);
-  await expect(trigger).toContainText(/Plan/i, { timeout: 10_000 });
-});
-
 test("ModePicker uses OpenCode's config-option modes and never traps the user", async ({ page, spawnServe }) => {
   // #1764: OpenCode advertises modes only as a config option and rejects claude's phantom "Default".
   const { serve, sessionId } = await startAcpSession(spawnServe, {

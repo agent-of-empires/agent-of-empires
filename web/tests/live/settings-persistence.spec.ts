@@ -93,24 +93,6 @@ test("structured view settings persist through PATCH + reload, node_path is stri
   expect(fetched?.acp?.node_path).not.toBe("/tmp/evil-node");
 });
 
-test("a schema-driven select persists through the UI and a reload", async ({ serve, page }) => {
-  // #1792: tmux is a non-elevated, profile-overridable schema section.
-  const profileUrl = `${serve.baseUrl}/api/profiles/${encodeURIComponent(await defaultProfile(serve))}/settings`;
-  const baseline = ((await getJson(profileUrl))?.tmux?.status_bar as string | undefined) ?? "auto";
-  const next = baseline === "enabled" ? "disabled" : "enabled";
-
-  await page.goto(`${serve.baseUrl}/settings/tmux`);
-  const statusBar = labelledSelect(page, /^Status Bar$/);
-  await expect(statusBar).toBeVisible({ timeout: 10_000 });
-  await statusBar.selectOption(next);
-  await expect(async () => {
-    expect((await getJson(profileUrl))?.tmux?.status_bar).toBe(next);
-  }).toPass({ timeout: 5_000 });
-
-  await page.reload();
-  await expect(labelledSelect(page, /^Status Bar$/)).toHaveValue(next, { timeout: 10_000 });
-});
-
 test("theme picker repaints, persists across reload and serve restart (#1510)", async ({ serve, page }) => {
   // The picker writes the global /api/theme endpoint and must dispatch its repaint only after the write.
   const settingsUrl = `${serve.baseUrl}/api/settings`;

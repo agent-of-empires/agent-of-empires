@@ -42,13 +42,19 @@ test.describe("URL routing", () => {
     await expect(page).toHaveURL("/settings");
   });
 
-  test("'/session/<id>' for an unknown session falls back to dashboard", async ({ page }) => {
+  test("an unknown or legacy '?session=' session URL keeps its '/session/<id>' path over the dashboard", async ({
+    page,
+  }) => {
     // No backend, sessions list is empty, so the route still matches but
     // the resolver finds no session and the dashboard renders. Importantly
     // the URL stays put so a real backend can later resolve it.
     await page.goto("/session/does-not-exist");
     await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).toBeVisible();
     await expect(page).toHaveURL("/session/does-not-exist");
+
+    // A legacy '?session=X' URL is rewritten to '/session/X'.
+    await page.goto("/?session=abc-123");
+    await expect(page).toHaveURL("/session/abc-123");
   });
 
   test("'/session/<id>' holds the loading shell while the sessions list is still in flight", async ({ page }) => {
@@ -103,11 +109,6 @@ test.describe("URL routing", () => {
     await expect(page.locator('[data-term="agent"] textarea')).toHaveCount(1);
     await expect(page).toHaveURL("/session/known-session");
     await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).not.toBeVisible();
-  });
-
-  test("legacy '?session=X' URL is rewritten to '/session/X'", async ({ page }) => {
-    await page.goto("/?session=abc-123");
-    await expect(page).toHaveURL("/session/abc-123");
   });
 });
 

@@ -81,7 +81,9 @@ test.describe("Dockable pane system", () => {
     await expect(page.getByLabel("Move diff to right dock")).toBeVisible();
   });
 
-  test("a plugin pane renders as a dockable tool-window and its action hits the worker", async ({ page }) => {
+  test("a plugin pane renders as a dockable tool-window, its action hits the worker, and it survives a dock collapse", async ({
+    page,
+  }) => {
     await openSession(page);
 
     await page.route("**/api/plugins/ui-state", (route) =>
@@ -126,42 +128,11 @@ test.describe("Dockable pane system", () => {
 
     await page.getByTestId("plugin-pane-action").click();
     await expect.poll(() => actionBody?.method).toBe("demo.reload");
-  });
 
-  test("right-dock collapse shortcut preserves an active plugin pane", async ({ page }) => {
-    await openSession(page);
-
-    await page.route("**/api/plugins/ui-state", (route) =>
-      route.fulfill({
-        json: {
-          entries: [
-            {
-              plugin_id: "acme.demo",
-              slot: "pane",
-              id: "demo_pane",
-              session_id: SESSION,
-              payload: {
-                title: "Demo",
-                default_location: "right",
-                blocks: [{ kind: "heading", text: "Demo" }],
-              },
-            },
-          ],
-          notifications: [],
-        },
-      }),
-    );
-
-    await page.goto(`/session/${SESSION}`);
-
-    const paneId = "plugin:acme.demo:demo_pane";
-    await page.locator(`[data-testid="pane-toggle-${paneId}"]`).click();
-    await expect(page.locator('[data-testid="plugin-pane-body"][data-plugin-id="acme.demo"]')).toBeVisible();
-
+    // Collapsing and re-expanding the right dock keeps the active plugin pane.
     const handle = page.getByTestId("content-split-resize-handle");
     await page.keyboard.press("ControlOrMeta+Alt+b");
     await expect(handle).toBeHidden();
-
     await page.keyboard.press("ControlOrMeta+Alt+b");
     await expect(handle).toBeVisible();
     await expect(page.getByTestId(`pane-tab-${paneId}`)).toBeVisible();

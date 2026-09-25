@@ -20,7 +20,9 @@ test.describe("compact mode (#2288)", () => {
     { id: "s-b", title: "beta-session", project_path: "/tmp/repo-alpha", branch: "feat/b" },
   ];
 
-  test("compact toggle slims the sidebar, hides extras, stays tappable, and persists", async ({ page }) => {
+  test("compact toggle slims the sidebar, hides extras and an open filter, stays tappable, and persists", async ({
+    page,
+  }) => {
     await openSidebar(page, SESSIONS);
     const panel = page.locator('[data-tour="sidebar"]');
     const width = async () => (await panel.boundingBox())!.width;
@@ -49,22 +51,18 @@ test.describe("compact mode (#2288)", () => {
     await page.getByRole("button", { name: "Expand sidebar" }).click();
     await expect.poll(width).toBeGreaterThan(200);
     await expect(page.locator(COUNT).first()).toBeVisible();
-  });
 
-  test("entering compact hides an open filter and stops its query narrowing the list", async ({ page }) => {
-    await openSidebar(page, SESSIONS);
+    // Entering compact hides an open filter and stops its query narrowing the list.
     await page.getByRole("button", { name: "Filter sessions" }).click();
     const filterInput = page.getByTestId("sidebar-filter-input");
     // "beta" matches a title only; "alpha" would also match the project name.
     await filterInput.fill("beta");
     await expect(page.getByText("alpha-session")).toHaveCount(0);
     await expect(page.getByText("beta-session")).toBeVisible();
-
     await page.getByRole("button", { name: "Compact sidebar" }).click();
     await expect(filterInput).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Filter sessions" })).toHaveCount(0);
     await expect(page.getByText("alpha-session")).toBeVisible();
-
     await page.getByRole("button", { name: "Expand sidebar" }).click();
     await expect(filterInput).toHaveValue("beta");
     await expect(page.getByText("alpha-session")).toHaveCount(0);

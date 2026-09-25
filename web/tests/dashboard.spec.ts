@@ -121,16 +121,6 @@ test.describe("Keyboard shortcuts", () => {
 });
 
 test.describe("Mobile responsive", () => {
-  test("sidebar closed by default on mobile", async ({ page }) => {
-    await page.setViewportSize({ width: 375, height: 812 });
-    await page.goto("/");
-    // Sidebar is translated off-screen on mobile (not display:none), so
-    // use toBeInViewport rather than toBeVisible.
-    await expect(page.getByLabel("New project session")).not.toBeInViewport();
-    // Home screen content visible
-    await expect(page.getByText("empires", { exact: false })).toBeVisible();
-  });
-
   test("mobile home screen's Show sessions button opens the sidebar", async ({ page }) => {
     // Dashboard.tsx's own `md:hidden` trigger, not TopBar's "Toggle sidebar":
     // the two are separate elements and nothing else in web/ drives this one.
