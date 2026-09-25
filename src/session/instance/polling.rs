@@ -6,6 +6,36 @@ use sha2::{Digest as _, Sha256};
 
 const MANAGED_CAPTURE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_FINAL_PI_DRAIN: std::cell::RefCell<
+        Option<Box<dyn FnOnce(&mut Instance)>>,
+    > = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn take_after_final_pi_drain_hook() -> Option<Box<dyn FnOnce(&mut Instance)>> {
+    AFTER_FINAL_PI_DRAIN.with(|hook| hook.borrow_mut().take())
+}
+
+#[cfg(test)]
+fn clear_after_final_pi_drain_hook() {
+    AFTER_FINAL_PI_DRAIN.with(|hook| {
+        let _ = hook.borrow_mut().take();
+    });
+}
+
+#[cfg(test)]
+#[must_use = "binds the Pi drain hook cleanup to this guard's lifetime"]
+pub(crate) struct FinalPiDrainHookGuard;
+
+#[cfg(test)]
+impl Drop for FinalPiDrainHookGuard {
+    fn drop(&mut self) {
+        clear_after_final_pi_drain_hook();
+    }
+}
+
 /// Outcome of [`Instance::maybe_start_poller`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollerStart {
@@ -665,6 +695,18 @@ impl Instance {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_after_final_pi_drain_hook_for_test(
+        hook: impl FnOnce(&mut Instance) + 'static,
+    ) -> FinalPiDrainHookGuard {
+        AFTER_FINAL_PI_DRAIN.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none(), "final Pi drain hook already installed");
+            *slot = Some(Box::new(hook));
+        });
+        FinalPiDrainHookGuard
+    }
+
     pub(crate) fn stop_poller(&self) {
         if let Some(ref poller_arc) = self.session_id_poller {
             match poller_arc.lock() {
@@ -715,6 +757,21 @@ impl Instance {
                 std::slice::from_mut(self),
                 &file_watch,
             );
+            #[cfg(test)]
+            if let Some(hook) = take_after_final_pi_drain_hook() {
+                hook(self);
+            }
+            let inst = &*self;
+            let retry_pi_path =
+                crate::session::sync::pending_poller_observation_matches(inst, |observation| {
+                    inst.observation_is_current_pi_path(observation)
+                });
+            if retry_pi_path {
+                let _ = crate::session::sync::drain_and_persist_session_ids_lifecycle_locked(
+                    std::slice::from_mut(self),
+                    &file_watch,
+                );
+            }
         }
         self.session_id_poller = None;
     }

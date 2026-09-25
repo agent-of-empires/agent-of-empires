@@ -347,6 +347,7 @@ pub struct AcpState {
     pub pending_approvals: Vec<Approval>,
     #[serde(default)]
     pub pending_elicitations: Vec<Elicitation>,
+    #[serde(default)]
     pub recent_diffs: Vec<DiffPreview>,
     pub thinking: Option<ThinkingSignal>,
     pub rate_limit: Option<RateLimitInfo>,

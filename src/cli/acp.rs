@@ -143,8 +143,9 @@ pub enum AcpCommands {
         since: u64,
     },
     /// Open the TUI structured view directly for a known session id.
-    /// Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`) to attach
-    /// across machines without going through the home session list.
+    /// Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`, or
+    /// `AOE_DAEMON_PASSPHRASE` against a `--auth=passphrase` daemon) to
+    /// attach across machines without going through the home session list.
     Attach {
         /// Acp session id.
         session: String,

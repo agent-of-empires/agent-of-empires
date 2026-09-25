@@ -196,10 +196,15 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
   const disabled = offline || phase === "submitting";
 
   return (
-    <div
+    <form
       className="my-2 overflow-hidden rounded-md border border-surface-800/60 bg-surface-800/50 text-sm"
       role="alertdialog"
       aria-label="Question from the agent"
+      noValidate
+      onSubmit={(e) => {
+        e.preventDefault();
+        submit();
+      }}
     >
       <div className="flex w-full items-center gap-2 border-b border-surface-800/60 px-3 py-2">
         <HelpCircle className="h-3.5 w-3.5 shrink-0 text-brand-500" />
@@ -235,13 +240,12 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
 
       <div className="flex items-stretch gap-1.5 border-t border-surface-800/60 p-2">
         <button
-          type="button"
+          type="submit"
           className={[
             "flex flex-1 items-center justify-center gap-1.5 rounded-md py-2 px-3 text-xs font-medium text-white",
             phase === "submitting" ? "bg-brand-700 opacity-70 cursor-wait" : "bg-brand-600 hover:bg-brand-500",
           ].join(" ")}
           disabled={disabled}
-          onClick={submit}
         >
           {phase === "submitting" ? "Submitting…" : "Submit"}
         </button>
@@ -264,7 +268,7 @@ export function AskUserQuestionCard({ elicitation, onResolve }: Props) {
           Cancel
         </button>
       </div>
-    </div>
+    </form>
   );
 }
 

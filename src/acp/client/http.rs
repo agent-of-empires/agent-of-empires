@@ -9,6 +9,7 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 use super::discovery::DaemonEndpoint;
+use super::passphrase_session::{self, PassphraseSessionCache};
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::{
     ApprovalDecisionWire, FilesResponse, PromptRequest, ReplayResponse, ResolveApprovalRequest,
@@ -82,6 +83,7 @@ pub const REPLAY_PAGE_SIZE: u64 = 1000;
 pub struct HttpClient {
     http: reqwest::Client,
     endpoint: DaemonEndpoint,
+    passphrase_session: PassphraseSessionCache,
 }
 
 #[derive(Debug, Error)]
@@ -120,20 +122,30 @@ impl HttpClient {
             .timeout(DEFAULT_TIMEOUT)
             .user_agent(concat!("aoe-acp-client/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        Ok(Self { http, endpoint })
+        Ok(Self {
+            http,
+            endpoint,
+            passphrase_session: PassphraseSessionCache::default(),
+        })
     }
 
+    /// Bare, unauthenticated request: callers rebuild this on every attempt
+    /// (see `send`), so it stays cheap data (method + path), not a
+    /// once-usable `RequestBuilder`.
     fn request(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
         let url = format!("{}{path}", self.endpoint.base_url);
-        self.auth(self.http.request(method, url))
+        self.http.request(method, url)
     }
 
+    /// Attach whichever credential is available via `send_authed` (retrying
+    /// once on a stale cached passphrase session), then classify the
+    /// response by `scope`.
     async fn send(
         &self,
-        request: reqwest::RequestBuilder,
+        build: impl Fn() -> reqwest::RequestBuilder,
         scope: Scope<'_>,
     ) -> Result<reqwest::Response, HttpError> {
-        let res = request.send().await?;
+        let res = self.send_authed(build).await?;
         let status = res.status();
         if status.is_success() {
             return Ok(res);
@@ -147,7 +159,7 @@ impl HttpClient {
         path: &str,
         scope: Scope<'_>,
     ) -> Result<T, HttpError> {
-        let res = self.send(self.request(Method::GET, path), scope).await?;
+        let res = self.send(|| self.request(Method::GET, path), scope).await?;
         Ok(res.json().await?)
     }
 
@@ -159,11 +171,15 @@ impl HttpClient {
         path: &str,
         body: Option<serde_json::Value>,
     ) -> Result<(), HttpError> {
-        let mut request = self.request(method, &format!("/api/sessions/{session_id}{path}"));
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        self.send(request, Scope::Session(session_id)).await?;
+        let full_path = format!("/api/sessions/{session_id}{path}");
+        let build = || {
+            let request = self.request(method.clone(), &full_path);
+            match &body {
+                Some(body) => request.json(body),
+                None => request,
+            }
+        };
+        self.send(build, Scope::Session(session_id)).await?;
         Ok(())
     }
 
@@ -281,8 +297,12 @@ impl HttpClient {
             no_revive,
         };
         let path = format!("/api/sessions/{session_id}/acp/prompt");
-        let request = self.request(Method::POST, &path).json(&body);
-        let res = self.send(request, Scope::Session(session_id)).await?;
+        let res = self
+            .send(
+                || self.request(Method::POST, &path).json(&body),
+                Scope::Session(session_id),
+            )
+            .await?;
         Ok(res.json::<PromptDispatchWire>().await.unwrap_or_default())
     }
 
@@ -309,8 +329,11 @@ impl HttpClient {
             utf8_percent_encode(fqid, PATH_SEGMENT)
         );
         let body = serde_json::json!({ "session_id": session_id });
-        let request = self.request(Method::POST, &path).json(&body);
-        self.send(request, Scope::Global).await?;
+        self.send(
+            || self.request(Method::POST, &path).json(&body),
+            Scope::Global,
+        )
+        .await?;
         Ok(())
     }
 
@@ -320,18 +343,20 @@ impl HttpClient {
         plugin_id: &str,
         enabled: bool,
     ) -> Result<(), HttpError> {
+        let path = format!("/api/plugins/{plugin_id}/enabled");
         let body = serde_json::json!({ "enabled": enabled });
-        let request = self
-            .request(Method::POST, &format!("/api/plugins/{plugin_id}/enabled"))
-            .json(&body);
-        self.send(request, Scope::Global).await?;
+        self.send(
+            || self.request(Method::POST, &path).json(&body),
+            Scope::Global,
+        )
+        .await?;
         Ok(())
     }
 
     /// Reload plugins from disk and replace this plugin's worker.
     pub async fn restart_plugin_worker(&self, plugin_id: &str) -> Result<(), HttpError> {
         let path = format!("/api/plugins/{plugin_id}/worker/restart");
-        self.send(self.request(Method::POST, &path), Scope::Global)
+        self.send(|| self.request(Method::POST, &path), Scope::Global)
             .await?;
         Ok(())
     }
@@ -410,8 +435,12 @@ impl HttpClient {
             reason: reason.map(str::to_string),
         };
         let path = format!("/api/sessions/{session_id}/acp/switch-agent");
-        let request = self.request(Method::POST, &path).json(&body);
-        let res = self.send(request, Scope::Session(session_id)).await?;
+        let res = self
+            .send(
+                || self.request(Method::POST, &path).json(&body),
+                Scope::Session(session_id),
+            )
+            .await?;
         Ok(res.json().await?)
     }
 
@@ -423,7 +452,9 @@ impl HttpClient {
         body: &impl serde::Serialize,
     ) -> Result<(), HttpError> {
         let path = format!("/api/sessions/{session_id}/acp/{kind}/{nonce}");
-        let res = self.request(Method::POST, &path).json(body).send().await?;
+        let res = self
+            .send_authed(|| self.request(Method::POST, &path).json(body))
+            .await?;
         let status = res.status();
         if status.is_success() {
             return Ok(());
@@ -503,7 +534,9 @@ impl HttpClient {
     /// Cheapest authenticated probe: separates a down host (transport error)
     /// from misconfigured auth (401).
     pub async fn health_check(&self) -> Result<(), HttpError> {
-        let res = self.request(Method::GET, "/api/sessions").send().await?;
+        let res = self
+            .send_authed(|| self.request(Method::GET, "/api/sessions"))
+            .await?;
         let status = res.status();
         if status.is_success() {
             return Ok(());
@@ -520,6 +553,56 @@ impl HttpClient {
             Some(token) => builder.header(header::AUTHORIZATION, format!("Bearer {token}")),
             None => builder,
         }
+    }
+
+    /// Attach whichever credential is available: a bearer token when one
+    /// resolves (`--auth=token`, unchanged), otherwise the passphrase-login
+    /// cookie (`--auth=passphrase`), logging in on first use. Neither
+    /// resolving (`--auth=none`, or no daemon credential at all) leaves the
+    /// request untouched.
+    async fn authed_builder(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, HttpError> {
+        if self.endpoint.resolved_token().is_some() {
+            return Ok(self.auth(builder));
+        }
+        if self.endpoint.resolved_passphrase().is_some() {
+            let session = self.ensure_passphrase_session().await?;
+            return Ok(builder
+                .header(header::COOKIE, session.cookie)
+                .header("X-Aoe-Device-Binding", session.binding_secret));
+        }
+        Ok(builder)
+    }
+
+    async fn ensure_passphrase_session(
+        &self,
+    ) -> Result<passphrase_session::PassphraseSession, HttpError> {
+        if let Some(session) = self.passphrase_session.get(&self.endpoint) {
+            return Ok(session);
+        }
+        passphrase_session::login(&self.endpoint, &self.passphrase_session).await
+    }
+
+    /// Build, authenticate, and send a request via `build`, retrying once
+    /// after a fresh passphrase login if a *cached* session came back 401
+    /// (rotated passphrase, expired or evicted session). A first-ever login
+    /// failure, or a 401 with a bearer token, is not retried: the credential
+    /// itself is wrong, not merely stale.
+    async fn send_authed(
+        &self,
+        mut build: impl FnMut() -> reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, HttpError> {
+        let had_cached_session = self.passphrase_session.get(&self.endpoint).is_some();
+        let request = self.authed_builder(build()).await?;
+        let response = request.send().await?;
+        if !had_cached_session || response.status() != StatusCode::UNAUTHORIZED {
+            return Ok(response);
+        }
+        self.passphrase_session.invalidate(&self.endpoint);
+        let request = self.authed_builder(build()).await?;
+        Ok(request.send().await?)
     }
 }
 
@@ -561,10 +644,12 @@ mod tests {
     use super::*;
     use crate::acp::client::discovery::Source;
 
-    fn authorization(endpoint: DaemonEndpoint) -> Option<String> {
+    async fn authorization(endpoint: DaemonEndpoint) -> Option<String> {
         let client = HttpClient::new(endpoint).unwrap();
         let request = client
-            .request(Method::GET, "/api/sessions")
+            .authed_builder(client.request(Method::GET, "/api/sessions"))
+            .await
+            .unwrap()
             .build()
             .unwrap();
         request
@@ -573,19 +658,22 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_string())
     }
 
-    #[test]
-    fn auth_header() {
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn auth_header() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
         let base = "http://127.0.0.1:8080".to_string();
         assert_eq!(
             authorization(DaemonEndpoint::new(
                 base.clone(),
                 Some("tok".into()),
                 Source::Env
-            )),
+            ))
+            .await,
             Some("Bearer tok".into())
         );
         assert_eq!(
-            authorization(DaemonEndpoint::new(base.clone(), None, Source::Env)),
+            authorization(DaemonEndpoint::new(base.clone(), None, Source::Env)).await,
             None
         );
         // A local daemon's rotated token file wins over the discovered one.
@@ -595,7 +683,94 @@ mod tests {
         std::fs::write(&token_path, &rotated).unwrap();
         let local = DaemonEndpoint::new(base, Some("a".repeat(64)), Source::LocalDaemon)
             .with_local_token_path(token_path);
-        assert_eq!(authorization(local), Some(format!("Bearer {rotated}")));
+        assert_eq!(
+            authorization(local).await,
+            Some(format!("Bearer {rotated}"))
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn authed_builder_sends_no_credential_without_token_or_passphrase() {
+        // --auth=none: neither a token nor a passphrase resolves, so the
+        // request must go out exactly as built, matching pre-passphrase
+        // behavior.
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let client = HttpClient::new(DaemonEndpoint::new(
+            "http://127.0.0.1:8080".into(),
+            None,
+            Source::Env,
+        ))
+        .unwrap();
+        let request = client
+            .authed_builder(client.http.get("http://127.0.0.1:8080/api/sessions"))
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(request.headers().get(header::AUTHORIZATION).is_none());
+        assert!(request.headers().get(header::COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn authed_builder_prefers_bearer_token_over_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let passphrase_path = dir.path().join("serve.passphrase");
+        std::fs::write(&passphrase_path, "hunter2").unwrap();
+        let daemon_endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:8080".into(),
+            Some("tok".to_string()),
+            Source::LocalDaemon,
+        )
+        .with_local_passphrase_path(passphrase_path);
+        let client = HttpClient::new(daemon_endpoint).unwrap();
+
+        let request = client
+            .authed_builder(client.http.get("http://127.0.0.1:8080/api/sessions"))
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers().get(header::AUTHORIZATION).unwrap(),
+            "Bearer tok"
+        );
+        assert!(request.headers().get(header::COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn authed_builder_sends_cached_passphrase_session_as_cookie() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
+        let dir = tempfile::tempdir().unwrap();
+        let passphrase_path = dir.path().join("serve.passphrase");
+        std::fs::write(&passphrase_path, "hunter2").unwrap();
+        let daemon_endpoint =
+            DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::LocalDaemon)
+                .with_local_passphrase_path(passphrase_path);
+        let client = HttpClient::new(daemon_endpoint).unwrap();
+        client
+            .passphrase_session
+            .set_for_test(passphrase_session::PassphraseSession {
+                cookie: "aoe_session=abc123".to_string(),
+                binding_secret: "the-binding-secret".to_string(),
+            });
+
+        let request = client
+            .authed_builder(client.http.get("http://127.0.0.1:8080/api/sessions"))
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(request.headers().get(header::AUTHORIZATION).is_none());
+        assert_eq!(
+            request.headers().get(header::COOKIE).unwrap(),
+            "aoe_session=abc123"
+        );
+        assert_eq!(
+            request.headers().get("X-Aoe-Device-Binding").unwrap(),
+            "the-binding-secret"
+        );
     }
 
     #[test]
