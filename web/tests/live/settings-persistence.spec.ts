@@ -29,7 +29,6 @@ test.describe("theme API", () => {
       expect(body.web.cssVars).toBeTruthy();
     }
   });
-
 });
 
 const DRACULA_SURFACE = "#282a36";

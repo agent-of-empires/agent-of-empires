@@ -1,13 +1,7 @@
 // Permission and elicitation cards: the fake agent gates its next update on the client's answer.
 
 import { test, expect } from "../../helpers/liveTest";
-import {
-  chunk,
-  endTurn,
-  openStructuredView,
-  script,
-  startAcpSession,
-} from "../../helpers/acp";
+import { chunk, endTurn, openStructuredView, script, startAcpSession } from "../../helpers/acp";
 
 const turn = (...updates: object[]) => script(endTurn(...updates));
 const permission = (toolCallId: string, title: string) => ({

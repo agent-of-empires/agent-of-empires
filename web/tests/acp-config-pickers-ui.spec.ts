@@ -4,11 +4,7 @@
 // the adapter's confirmation or rejection. The live spec pins the wire shape.
 
 import { test, expect } from "./helpers/mockedTest";
-import {
-  mockAcpSession,
-  openStructuredSession,
-  configOptionsUpdated,
-} from "./helpers/acpMock";
+import { mockAcpSession, openStructuredSession, configOptionsUpdated } from "./helpers/acpMock";
 
 function modelOption(current: string) {
   return {
