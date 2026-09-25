@@ -868,6 +868,54 @@ mod tests {
         assert_eq!(inst.resume_intent, disk[0].resume_intent);
         assert_eq!(inst.agent_session_id, disk[0].agent_session_id);
     }
+    /// Store routing is not conversation identity: a pinned conversation is still captured
+    /// when its launch exports a default store the pin was recorded without.
+    #[test]
+    #[serial]
+    fn pinned_capture_ignores_the_exported_default_store_flag() {
+        let profile = "pinned-exported-default";
+        let binding = |exported_default_store| crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec!["/home/me/.claude".into()],
+            configuration: Vec::new(),
+            exported_default_store,
+            cwd: "/tmp/x".into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        let active = crate::session::instance::ActiveExecution {
+            launch_id: "launch".into(),
+            binding: binding(Some(true)),
+            capture: None,
+            container: None,
+        };
+        let mut inst = make_inst(profile, "pinned");
+        inst.agent_session_id = Some(VALID_SID.into());
+        inst.resume_intent = ResumeIntent::Use(VALID_SID.into());
+        inst.resume_binding = Some(crate::session::ConversationBinding {
+            session_id: VALID_SID.into(),
+            execution: Some(binding(None)),
+            provenance: crate::session::ConversationProvenance::Asserted,
+            transcript_path: None,
+        });
+        inst.active_execution = Some(active.clone());
+        let (_temp, _home, storage) = seeded(profile, &[&inst]);
+        let observation = crate::session::poller::SessionIdObservation {
+            execution: Some(active),
+            source: Some(binding(Some(true))),
+            ..observation(VALID_SID)
+        };
+
+        assert_eq!(
+            persist_session_with_storage(
+                &storage,
+                &inst.id,
+                &observation,
+                &inst.conversation_state()
+            ),
+            SidWrite::Applied
+        );
+    }
 
     #[test]
     #[serial]

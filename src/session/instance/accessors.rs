@@ -831,6 +831,55 @@ mod tests {
         );
         assert!(!inst.backfill_claude_store_marker());
     }
+    #[test]
+    #[serial_test::serial]
+    fn explicit_alias_of_default_store_derives_exported_routing() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "alias-routing-provenance";
+        let work = temp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::os::unix::fs::symlink(&work, temp.path().join(".claude")).unwrap();
+        let config_path =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            config_path,
+            format!(
+                "[session.agent_config_dir]\nclaude = {:?}\n",
+                work.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let mut inst = Instance::new("alias", temp.path().to_str().unwrap());
+        inst.source_profile = profile.into();
+        inst.tool = "claude".into();
+        inst.resume_intent = ResumeIntent::Use(sid.into());
+        inst.resume_binding = Some(ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![work],
+                configuration: Vec::new(),
+                cwd: temp.path().to_path_buf(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            }),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+
+        assert!(inst.backfill_claude_store_marker());
+        assert_eq!(
+            inst.selected_claude_store_pin()
+                .unwrap()
+                .exported_default_store,
+            Some(true)
+        );
+    }
 
     #[test]
     fn new_instance_has_a_unique_hex_id_and_defaults() {

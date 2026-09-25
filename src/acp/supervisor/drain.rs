@@ -513,18 +513,24 @@ impl<S: BroadcastSink> Drain<S> {
             .await;
             match minted {
                 Ok(Ok(pairs)) => overlay_env(&mut host_environment, pairs),
-                Ok(Err(e)) => warn!(
-                    target: "acp.supervisor",
-                    session = %session_id,
-                    error = %e,
-                    "before_session hook failed on respawn; reusing the unminted base environment"
-                ),
-                Err(e) => warn!(
-                    target: "acp.supervisor",
-                    session = %session_id,
-                    error = %e,
-                    "before_session hook task failed on respawn; reusing the unminted base environment"
-                ),
+                Ok(Err(e)) => {
+                    host_environment = config.host_environment.clone();
+                    warn!(
+                        target: "acp.supervisor",
+                        session = %session_id,
+                        error = %e,
+                        "before_session hook failed on respawn; reusing the last known environment"
+                    )
+                }
+                Err(e) => {
+                    host_environment = config.host_environment.clone();
+                    warn!(
+                        target: "acp.supervisor",
+                        session = %session_id,
+                        error = %e,
+                        "before_session hook task failed on respawn; reusing the last known environment"
+                    )
+                }
             }
             claude_config_dir =
                 apply_claude_store_pin(&mut host_environment, config.claude_store_pin.as_ref());

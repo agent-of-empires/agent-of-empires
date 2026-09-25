@@ -590,6 +590,7 @@ mod tests {
             ("AOE_TEST_UNLISTED_SENTINEL", "leak"),
             ("AOE_TOKEN", "daemon-secret"),
             ("LD_PRELOAD", "/tmp/evil.so"),
+            ("CLAUDE_CONFIG_DIR", "/operator/claude"),
         ]);
         let reg = crate::acp::agent_registry::AgentRegistry::with_defaults();
         let mut config = env_test_spawn_config(tmp.path().to_path_buf());
@@ -602,7 +603,12 @@ mod tests {
             ..config.spec.clone()
         };
         let custom = crate::acp::AgentSpec::from_acp_cmd("custom", "/bin/true").unwrap();
-        let cases: [(AgentSpec, &[(&str, &str)], &[&str]); 5] = [
+        let cases: [(AgentSpec, &[(&str, &str)], &[&str]); 6] = [
+            (
+                reg.get("claude-code").unwrap().clone(),
+                &[("CLAUDE_CONFIG_DIR", "/operator/claude")],
+                &["OPENAI_API_KEY"],
+            ),
             (
                 reg.get("aoe-agent").unwrap().clone(),
                 &[
