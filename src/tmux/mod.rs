@@ -3208,54 +3208,55 @@ mod tests {
     #[test]
     fn snapshot_lookup_matches_the_per_item_probe() {
         let agent = format!("{P}Refactor_{ID8}");
-        let cases = [(false, Some(agent.as_str())), (true, None)];
-        for (pane_dead, expected) in cases {
-            let snapshot = LiveSessionSnapshot::from_parts(
+        let snapshot = |pane_dead: Option<bool>| match pane_dead {
+            Some(dead) => LiveSessionSnapshot::from_parts(
                 Some(vec![agent.clone()]),
-                Some(HashMap::from([(agent.clone(), dead_pane_meta(pane_dead))])),
-            );
+                Some(HashMap::from([(agent.clone(), dead_pane_meta(dead))])),
+            ),
+            None => LiveSessionSnapshot::from_parts(None, None),
+        };
+        // A dead pane and an unreachable server are both not live.
+        for (pane_dead, expected) in [
+            (Some(false), Some(agent.as_str())),
+            (Some(true), None),
+            (None, None),
+        ] {
             assert_eq!(
-                live_any_kind_name_for_id_in(&snapshot, ID).as_deref(),
+                live_any_kind_name_for_id_in(&snapshot(pane_dead), ID).as_deref(),
                 expected,
-                "pane_dead = {pane_dead}"
+                "pane_dead = {pane_dead:?}"
             );
         }
     }
 
-    #[test]
-    fn snapshot_lookup_reports_not_live_when_server_unreachable() {
-        let snapshot = LiveSessionSnapshot::from_parts(None, None);
-        assert_eq!(live_any_kind_name_for_id_in(&snapshot, ID), None);
-    }
-
+    /// The agent pane wins, then the paired terminal, then the container
+    /// terminal; tool sub-sessions and other ids never match.
     #[test]
     #[serial_test::serial]
     fn live_any_kind_name_for_id_prefers_agent_then_terminal_then_container() {
         let agent = format!("{P}Refactor_{ID8}");
         let terminal = format!("{TERMINAL_PREFIX}Refactor_{ID8}");
         let container = format!("{CONTAINER_TERMINAL_PREFIX}Refactor_{ID8}");
-
-        let all = [agent.as_str(), terminal.as_str(), container.as_str()];
-        assert_eq!(
-            live_any_kind_name_for_id(unmarked(all), ID, utils::is_pane_dead).as_deref(),
-            Some(agent.as_str()),
-            "the agent pane wins when present"
-        );
-        assert_eq!(
-            live_any_kind_name_for_id(
-                unmarked([terminal.as_str(), container.as_str()]),
-                ID,
-                utils::is_pane_dead
-            )
-            .as_deref(),
-            Some(terminal.as_str()),
-            "the paired terminal is preferred over the container terminal"
-        );
-        assert_eq!(
-            live_any_kind_name_for_id(unmarked([container.as_str()]), ID, utils::is_pane_dead)
-                .as_deref(),
-            Some(container.as_str()),
-        );
+        let others = [
+            format!("{TOOL_PREFIX}lazygit_Refactor_{ID8}"),
+            format!("{P}Refactor_99999999"),
+            format!("{TERMINAL_PREFIX}Refactor_99999999"),
+            "vim".to_string(),
+        ];
+        let cases: [(Vec<&str>, Option<&str>); 4] = [
+            (vec![&agent, &terminal, &container], Some(&agent)),
+            (vec![&terminal, &container], Some(&terminal)),
+            (vec![&container], Some(&container)),
+            (others.iter().map(String::as_str).collect(), None),
+        ];
+        for (names, expected) in cases {
+            assert_eq!(
+                live_any_kind_name_for_id(unmarked(names.iter().copied()), ID, utils::is_pane_dead)
+                    .as_deref(),
+                expected,
+                "{names:?}"
+            );
+        }
     }
 
     #[test]
@@ -3489,26 +3490,6 @@ mod tests {
             resolve_agent_session_name([derived.as_str(), agent.as_str()], ID, &derived),
             derived,
             "unmarked keeps the pre-marker answer: a live derived name wins"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn live_any_kind_name_for_id_excludes_tool_subsessions_and_other_ids() {
-        let names = [
-            format!("{TOOL_PREFIX}lazygit_Refactor_{ID8}"),
-            format!("{P}Refactor_99999999"),
-            format!("{TERMINAL_PREFIX}Refactor_99999999"),
-            "vim".to_string(),
-        ];
-        assert_eq!(
-            live_any_kind_name_for_id(
-                unmarked(names.iter().map(String::as_str)),
-                ID,
-                utils::is_pane_dead
-            ),
-            None,
-            "a tool sub-session and other ids are never this session's pane"
         );
     }
 

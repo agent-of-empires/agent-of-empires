@@ -3326,116 +3326,40 @@ mod tests {
         assert_eq!(strip_trailing_row_terminator(b""), b"");
     }
 
+    /// The seed lands the cursor at the queried, visible-screen-relative
+    /// position (bottom-anchored when the pane outgrew the grid), honours its
+    /// visibility, and never over-scrolls the content it replays.
     #[test]
-    fn seed_places_cursor_at_queried_position_not_end_of_content() {
-        let rows: u16 = 6;
-        let cols: u16 = 20;
-        let body = b"row0-full-content\nrow1-full-content\nrow2-full-content\nrow3-full-content\nrow4-full-content\nrow5-full-content\n";
-        let state = PaneSeedState {
-            cursor_x: 3,
-            cursor_y: 1,
-            cursor_visible: true,
-            pane_height: rows,
-            ..Default::default()
+    fn seed_places_the_cursor_where_the_pane_reports_it() {
+        let lines = |rows: std::ops::Range<usize>, label: &str| -> String {
+            rows.map(|i| format!("{label}{i:02}\n")).collect()
         };
-        let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-        p.process(&assemble_seed_stream(body, &state, rows));
-
-        assert_eq!(
-            p.screen().cursor_position(),
-            (1, 3),
-            "cursor must sit at the queried (row 1, col 3), not end-of-content"
-        );
-        assert!(
-            !p.screen().hide_cursor(),
-            "cursor_flag=1 must show the cursor"
-        );
-        assert!(
-            p.screen().contents().contains("row0-full-content"),
-            "top row must survive (no over-scroll):\n{}",
-            p.screen().contents()
-        );
-    }
-
-    #[test]
-    fn seed_hides_cursor_when_pane_hid_it() {
-        let state = PaneSeedState {
-            cursor_x: 0,
-            cursor_y: 0,
-            cursor_visible: false,
-            ..Default::default()
-        };
-        let mut p = vt100::Parser::new(4, 10, 0);
-        p.process(&assemble_seed_stream(b"hi\n", &state, 4));
-        assert!(
-            p.screen().hide_cursor(),
-            "cursor_flag=0 must hide the seeded cursor"
-        );
-    }
-
-    #[test]
-    fn seed_cursor_row_is_visible_screen_relative_with_scrollback() {
-        let rows: u16 = 4;
-        let cols: u16 = 12;
-        let mut body = Vec::new();
-        for i in 0..10 {
-            body.extend_from_slice(format!("HL{i:02}\n").as_bytes());
+        let full = lines(0..6, "row-full-content-");
+        let history = lines(0..10, "HL");
+        let outgrown = format!("{}READY> \n{}", lines(0..3, "line-"), "\n".repeat(4));
+        // (body, grid rows, pane height, cursor x/y/visible) -> (position, text kept on screen)
+        let cases: [(&str, u16, u16, (u16, u16, bool), (u16, u16), &str); 4] = [
+            (&full, 6, 6, (3, 1, true), (1, 3), "row-full-content-00"),
+            (&history, 4, 4, (2, 1, true), (1, 2), "HL09"),
+            (&outgrown, 6, 8, (7, 3, true), (1, 7), "READY>"),
+            ("hi\n", 4, 0, (0, 0, false), (0, 0), "hi"),
+        ];
+        for (body, rows, pane_height, (cursor_x, cursor_y, cursor_visible), position, kept) in cases
+        {
+            let state = PaneSeedState {
+                cursor_x,
+                cursor_y,
+                cursor_visible,
+                pane_height,
+                ..Default::default()
+            };
+            let mut p = vt100::Parser::new(rows, 20, SCROLLBACK_LINES);
+            p.process(&assemble_seed_stream(body.as_bytes(), &state, rows));
+            let screen = p.screen();
+            assert_eq!(screen.cursor_position(), position, "{}", screen.contents());
+            assert_eq!(screen.hide_cursor(), !cursor_visible, "{body:?}");
+            assert!(screen.contents().contains(kept), "{}", screen.contents());
         }
-        let state = PaneSeedState {
-            cursor_x: 2,
-            cursor_y: 1,
-            cursor_visible: true,
-            pane_height: rows,
-            ..Default::default()
-        };
-        let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-        p.process(&assemble_seed_stream(&body, &state, rows));
-        assert_eq!(
-            p.screen().cursor_position(),
-            (1, 2),
-            "cursor row is visible-screen-relative, not counted from the top of history"
-        );
-        assert!(
-            p.screen().contents().contains("HL09"),
-            "newest row must be on the visible screen:\n{}",
-            p.screen().contents()
-        );
-    }
-
-    #[test]
-    fn seed_keeps_cursor_on_the_prompt_when_the_pane_outgrows_the_grid() {
-        let rows: u16 = 6;
-        let cols: u16 = 20;
-        let pane_height: u16 = 8;
-        let mut body = Vec::new();
-        for i in 0..3 {
-            body.extend_from_slice(format!("line-{i}\n").as_bytes());
-        }
-        body.extend_from_slice(b"READY> \n");
-        for _ in 4..pane_height {
-            body.extend_from_slice(b"\n");
-        }
-        let state = PaneSeedState {
-            cursor_x: 7,
-            cursor_y: 3,
-            cursor_visible: true,
-            pane_height,
-            ..Default::default()
-        };
-        let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-        p.process(&assemble_seed_stream(&body, &state, rows));
-
-        assert_eq!(
-            p.screen().cursor_position(),
-            (1, 7),
-            "cursor must follow the prompt row the taller body pushed up:\n{}",
-            p.screen().contents()
-        );
-        assert!(
-            p.screen().contents().contains("READY>"),
-            "prompt must be on the visible screen:\n{}",
-            p.screen().contents()
-        );
     }
 
     #[test]
