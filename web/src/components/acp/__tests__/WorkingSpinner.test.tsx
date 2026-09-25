@@ -48,35 +48,46 @@ const button = (name: RegExp) => screen.queryByRole("button", { name });
 
 describe("WorkingSpinner", () => {
   // label: expected text (null = neither waiting label); button: the only force button shown.
-  it.each<[string, SpinnerOpts, RegExp | null, RegExp | null]>([
-    // A tool in flight never offers Force end turn; a long Task gap is normal.
-    ["tool past threshold", { stalledSecs: 60, tool: "Write" }, /waiting on tool…/i, null],
-    ["long Task subagent", { stalledSecs: 180, tool: "Task" }, /waiting on tool… 3m \d{2}s/i, null],
-    ["silent model past threshold", { stalledSecs: 60, tool: null }, /waiting on model…/i, /force end turn/i],
-    ["below threshold", { stalledSecs: 5, tool: null }, null, null],
-    // A /compact is silent for minutes; name it from the first tick and never offer the abort.
-    [
-      "compaction past threshold",
-      { stalledSecs: 85, tool: null, compacting: true },
-      /compaction in progress… 1m \d{2}s/i,
-      null,
-    ],
-    ["compaction early", { stalledSecs: 3, tool: null, compacting: true }, /compaction in progress… \ds/i, null],
-    [
-      "cancel during compaction",
-      { stalledSecs: 85, tool: null, compacting: true, cancelling: true },
-      /stopping…/i,
-      /force stop/i,
-    ],
-    // Force stop shows even with a tool in flight: a runaway loop is one.
-    ["cancel with tool in flight", { stalledSecs: 2, tool: "Terminal", cancelling: true }, /stopping…/i, /force stop/i],
-  ])("%s", (_label, opts, label, forceButton) => {
-    renderSpinner(opts);
-    if (label) expect(screen.getByText(label)).toBeTruthy();
-    else expect(screen.queryByText(/waiting on (model|tool)…/i)).toBeNull();
-    if (!opts.compacting || opts.cancelling) expect(screen.queryByText(/compaction in progress…/i)).toBeNull();
-    for (const name of [/force end turn/i, /force stop/i]) {
-      expect(button(name) !== null).toBe(String(name) === String(forceButton));
+  it("labels the wait and offers only the applicable force button", () => {
+    const cases: [string, SpinnerOpts, RegExp | null, RegExp | null][] = [
+      // A tool in flight never offers Force end turn; a long Task gap is normal.
+      ["tool past threshold", { stalledSecs: 60, tool: "Write" }, /waiting on tool…/i, null],
+      ["long Task subagent", { stalledSecs: 180, tool: "Task" }, /waiting on tool… 3m \d{2}s/i, null],
+      ["silent model past threshold", { stalledSecs: 60, tool: null }, /waiting on model…/i, /force end turn/i],
+      ["below threshold", { stalledSecs: 5, tool: null }, null, null],
+      // A /compact is silent for minutes; name it from the first tick and never offer the abort.
+      [
+        "compaction past threshold",
+        { stalledSecs: 85, tool: null, compacting: true },
+        /compaction in progress… 1m \d{2}s/i,
+        null,
+      ],
+      ["compaction early", { stalledSecs: 3, tool: null, compacting: true }, /compaction in progress… \ds/i, null],
+      [
+        "cancel during compaction",
+        { stalledSecs: 85, tool: null, compacting: true, cancelling: true },
+        /stopping…/i,
+        /force stop/i,
+      ],
+      // Force stop shows even with a tool in flight: a runaway loop is one.
+      [
+        "cancel with tool in flight",
+        { stalledSecs: 2, tool: "Terminal", cancelling: true },
+        /stopping…/i,
+        /force stop/i,
+      ],
+    ];
+    for (const [caseLabel, opts, label, forceButton] of cases) {
+      renderSpinner(opts);
+      if (label) expect(screen.queryByText(label), caseLabel).not.toBeNull();
+      else expect(screen.queryByText(/waiting on (model|tool)…/i), caseLabel).toBeNull();
+      if (!opts.compacting || opts.cancelling) {
+        expect(screen.queryByText(/compaction in progress…/i), caseLabel).toBeNull();
+      }
+      for (const name of [/force end turn/i, /force stop/i]) {
+        expect(button(name) !== null, `${caseLabel}: ${name}`).toBe(String(name) === String(forceButton));
+      }
+      cleanup();
     }
   });
 
