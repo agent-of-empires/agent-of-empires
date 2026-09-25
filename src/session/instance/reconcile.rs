@@ -144,84 +144,85 @@ mod tests {
 
     #[test]
     #[serial]
-    fn reconcile_from_disk_picks_up_peer_writes_and_keeps_runtime_state() {
-        {
-            type ReconcileCase = (&'static str, fn(&mut Instance), fn(&Instance));
-            let cases: &[ReconcileCase] = &[
-                (
-                    "peer persist",
-                    |row| row.agent_session_id = Some("new-sid".to_string()),
-                    |inst| assert_eq!(inst.agent_session_id.as_deref(), Some("new-sid")),
-                ),
-                (
-                    "peer clear",
-                    |row| row.agent_session_id = None,
-                    |inst| assert_eq!(inst.agent_session_id, None),
-                ),
-                (
-                    "peer resume intent",
-                    |row| row.resume_intent = ResumeIntent::Use("peer-pinned".to_string()),
-                    |inst| {
-                        assert_eq!(
-                            inst.resume_intent,
-                            ResumeIntent::Use("peer-pinned".to_string())
-                        )
-                    },
-                ),
-            ];
-            for (label, peer_write, expect) in cases {
-                let temp = tempdir().unwrap();
-                let _home_guard = crate::session::test_support::isolate_home(temp.path());
-                let profile = "reconcile-peer";
-                let mut inst = Instance::new(label, "/tmp/x");
-                inst.source_profile = profile.to_string();
-                inst.agent_session_id = Some("old-sid".to_string());
-                let storage = seeded(profile, &inst);
-                storage
-                    .update(|rows, _| {
-                        peer_write(&mut rows[0]);
-                        Ok(())
-                    })
-                    .unwrap();
-
-                inst.reconcile_from_disk();
-
-                expect(&inst);
-            }
-        }
-        // Runtime-only (`#[serde(skip)]`) state is absent from the disk snapshot, so the reload has to
-        // carry it across from memory.
-        {
+    fn reconcile_from_disk_picks_up_peer_writes() {
+        type ReconcileCase = (&'static str, fn(&mut Instance), fn(&Instance));
+        let cases: &[ReconcileCase] = &[
+            (
+                "peer persist",
+                |row| row.agent_session_id = Some("new-sid".to_string()),
+                |inst| assert_eq!(inst.agent_session_id.as_deref(), Some("new-sid")),
+            ),
+            (
+                "peer clear",
+                |row| row.agent_session_id = None,
+                |inst| assert_eq!(inst.agent_session_id, None),
+            ),
+            (
+                "peer resume intent",
+                |row| row.resume_intent = ResumeIntent::Use("peer-pinned".to_string()),
+                |inst| {
+                    assert_eq!(
+                        inst.resume_intent,
+                        ResumeIntent::Use("peer-pinned".to_string())
+                    )
+                },
+            ),
+        ];
+        for (label, peer_write, expect) in cases {
             let temp = tempdir().unwrap();
             let _home_guard = crate::session::test_support::isolate_home(temp.path());
-            let profile = "reconcile-runtime";
-            let mut inst = Instance::new("runtime state", "/tmp/x");
+            let profile = "reconcile-peer";
+            let mut inst = Instance::new(label, "/tmp/x");
             inst.source_profile = profile.to_string();
-            inst.sandbox_info = Some(test_sandbox("ctr", None));
-            seeded(profile, &inst);
-
-            let now = std::time::Instant::now();
-            inst.poller_repair.defer(now);
-            inst.poller_repair.defer(now);
-            assert!(!inst.poller_repair.due(now));
-            inst.identity_publisher_launched = true;
-            inst.sandbox_info.as_mut().unwrap().before_start_env =
-                vec![("GH_TOKEN".to_string(), "ghs_minted".to_string())];
-            inst.ever_confirmed_present = true;
-            let unknown_since = now - std::time::Duration::from_secs(5);
-            inst.unknown_since = Some(unknown_since);
+            inst.agent_session_id = Some("old-sid".to_string());
+            let storage = seeded(profile, &inst);
+            storage
+                .update(|rows, _| {
+                    peer_write(&mut rows[0]);
+                    Ok(())
+                })
+                .unwrap();
 
             inst.reconcile_from_disk();
 
-            assert!(!inst.poller_repair.due(now), "poller backoff must survive");
-            assert!(inst.identity_publisher_launched);
-            assert_eq!(
-                inst.sandbox_info.as_ref().unwrap().before_start_env,
-                vec![("GH_TOKEN".to_string(), "ghs_minted".to_string())]
-            );
-            assert!(inst.ever_confirmed_present);
-            assert_eq!(inst.unknown_since, Some(unknown_since));
+            expect(&inst);
         }
+    }
+
+    /// Runtime-only (`#[serde(skip)]`) state is absent from the disk snapshot, so the reload has to
+    /// carry it across from memory.
+    #[test]
+    #[serial]
+    fn reconcile_from_disk_keeps_runtime_only_state() {
+        let temp = tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp.path());
+        let profile = "reconcile-runtime";
+        let mut inst = Instance::new("runtime state", "/tmp/x");
+        inst.source_profile = profile.to_string();
+        inst.sandbox_info = Some(test_sandbox("ctr", None));
+        seeded(profile, &inst);
+
+        let now = std::time::Instant::now();
+        inst.poller_repair.defer(now);
+        inst.poller_repair.defer(now);
+        assert!(!inst.poller_repair.due(now));
+        inst.identity_publisher_launched = true;
+        inst.sandbox_info.as_mut().unwrap().before_start_env =
+            vec![("GH_TOKEN".to_string(), "ghs_minted".to_string())];
+        inst.ever_confirmed_present = true;
+        let unknown_since = now - std::time::Duration::from_secs(5);
+        inst.unknown_since = Some(unknown_since);
+
+        inst.reconcile_from_disk();
+
+        assert!(!inst.poller_repair.due(now), "poller backoff must survive");
+        assert!(inst.identity_publisher_launched);
+        assert_eq!(
+            inst.sandbox_info.as_ref().unwrap().before_start_env,
+            vec![("GH_TOKEN".to_string(), "ghs_minted".to_string())]
+        );
+        assert!(inst.ever_confirmed_present);
+        assert_eq!(inst.unknown_since, Some(unknown_since));
     }
 
     #[test]

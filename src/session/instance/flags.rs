@@ -248,58 +248,29 @@ mod tests {
     }
 
     #[test]
-    fn set_color_and_trash_bucket_rules() {
-        {
-            let mut inst = inst();
-            for c in SESSION_COLORS {
-                inst.set_color(Some((*c).to_string())).unwrap();
-                assert_eq!(inst.color.as_deref(), Some(*c));
-            }
-            inst.set_color(None).unwrap();
-            assert_eq!(inst.color, None);
-
-            inst.set_color(Some("green".to_string())).unwrap();
-            let err = inst.set_color(Some("chartreuse".to_string())).unwrap_err();
-            assert!(err.contains("chartreuse"), "{err}");
-            assert_eq!(inst.color.as_deref(), Some("green"));
-
-            for (color, valid) in [
-                ("red", true),
-                ("amber", true),
-                ("green", true),
-                ("blue", false),
-                ("", false),
-                ("Red", false),
-            ] {
-                assert_eq!(is_valid_session_color(color), valid, "{color}");
-            }
+    fn set_color_accepts_only_the_palette() {
+        let mut inst = inst();
+        for c in SESSION_COLORS {
+            inst.set_color(Some((*c).to_string())).unwrap();
+            assert_eq!(inst.color.as_deref(), Some(*c));
         }
-        {
-            let mut inst = inst();
-            assert_eq!(inst.effective_bucket(), SessionBucket::Active);
-            let json = serde_json::to_string(&inst).unwrap();
-            assert!(!json.contains("trashed_at"));
-            inst.favorite();
-            inst.pin();
-            inst.trash();
-            assert!(inst.is_trashed());
-            assert_eq!(inst.effective_bucket(), SessionBucket::Trashed);
-            assert!(inst.is_favorited() && inst.is_pinned());
-            let back: Instance =
-                serde_json::from_str(&serde_json::to_string(&inst).unwrap()).unwrap();
-            assert!(back.is_trashed());
-            inst.untrash();
-            assert!(!inst.is_trashed());
-            assert_eq!(inst.effective_bucket(), SessionBucket::Active);
-            assert!(inst.is_favorited() && inst.is_pinned());
+        inst.set_color(None).unwrap();
+        assert_eq!(inst.color, None);
 
-            let mut archived = self::inst();
-            archived.archive();
-            assert_eq!(archived.effective_bucket(), SessionBucket::Archived);
-            archived.trash();
-            assert_eq!(archived.effective_bucket(), SessionBucket::Trashed);
-            archived.untrash();
-            assert_eq!(archived.effective_bucket(), SessionBucket::Archived);
+        inst.set_color(Some("green".to_string())).unwrap();
+        let err = inst.set_color(Some("chartreuse".to_string())).unwrap_err();
+        assert!(err.contains("chartreuse"), "{err}");
+        assert_eq!(inst.color.as_deref(), Some("green"));
+
+        for (color, valid) in [
+            ("red", true),
+            ("amber", true),
+            ("green", true),
+            ("blue", false),
+            ("", false),
+            ("Red", false),
+        ] {
+            assert_eq!(is_valid_session_color(color), valid, "{color}");
         }
     }
 
@@ -421,6 +392,34 @@ mod tests {
             assert!(inst.is_archived());
             assert_eq!(inst.status, expected, "{status:?}");
         }
+    }
+
+    #[test]
+    fn trash_wins_the_bucket_and_preserves_decorations() {
+        let mut inst = inst();
+        assert_eq!(inst.effective_bucket(), SessionBucket::Active);
+        let json = serde_json::to_string(&inst).unwrap();
+        assert!(!json.contains("trashed_at"));
+        inst.favorite();
+        inst.pin();
+        inst.trash();
+        assert!(inst.is_trashed());
+        assert_eq!(inst.effective_bucket(), SessionBucket::Trashed);
+        assert!(inst.is_favorited() && inst.is_pinned());
+        let back: Instance = serde_json::from_str(&serde_json::to_string(&inst).unwrap()).unwrap();
+        assert!(back.is_trashed());
+        inst.untrash();
+        assert!(!inst.is_trashed());
+        assert_eq!(inst.effective_bucket(), SessionBucket::Active);
+        assert!(inst.is_favorited() && inst.is_pinned());
+
+        let mut archived = self::inst();
+        archived.archive();
+        assert_eq!(archived.effective_bucket(), SessionBucket::Archived);
+        archived.trash();
+        assert_eq!(archived.effective_bucket(), SessionBucket::Trashed);
+        archived.untrash();
+        assert_eq!(archived.effective_bucket(), SessionBucket::Archived);
     }
 
     #[test]

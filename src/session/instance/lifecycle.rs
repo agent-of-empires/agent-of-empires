@@ -381,105 +381,48 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn lifecycle_status_commit_and_failed_launch_release_the_reservation() {
-        {
-            let temp = tempfile::tempdir().unwrap();
-            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-            let storage =
-                crate::session::storage::Storage::new_unwatched("lifecycle-lease").unwrap();
-            let mut instance = Instance::new("session", "/tmp/test");
+    fn lifecycle_status_commit_releases_the_acquired_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let storage = crate::session::storage::Storage::new_unwatched("lifecycle-lease").unwrap();
+        let mut instance = Instance::new("session", "/tmp/test");
 
-            let missing = instance
-                .acquire_lifecycle_reservation(
-                    &storage,
-                    LifecycleOperation::Launch,
-                    Some(Status::Starting),
-                )
-                .unwrap_err();
-            assert!(missing.to_string().contains("no longer exists"));
+        let missing = instance
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
+            .unwrap_err();
+        assert!(missing.to_string().contains("no longer exists"));
 
-            storage
-                .update(|instances, _groups| {
-                    instances.push(instance.clone());
-                    Ok(())
-                })
-                .unwrap();
-            instance
-                .acquire_lifecycle_reservation(
-                    &storage,
-                    LifecycleOperation::Launch,
-                    Some(Status::Starting),
-                )
-                .unwrap();
-            let generation = instance.lifecycle_generation;
-            instance
-                .commit_lifecycle_status(&storage, LifecycleOperation::Launch, Status::Error)
-                .unwrap();
-
-            let reloaded = storage
-                .load()
-                .unwrap()
-                .into_iter()
-                .find(|candidate| candidate.id == instance.id)
-                .unwrap();
-            assert_eq!(reloaded.lifecycle_generation, generation);
-            assert_eq!(reloaded.lifecycle_reservation, None);
-            assert_eq!(reloaded.status, Status::Error);
-        }
-        {
-            let temp = tempfile::tempdir().unwrap();
-            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-            let profile = "lifecycle-fail-drift";
-            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
-            let mut inst = Instance::new("drift", "/tmp/test");
-            inst.source_profile = profile.to_string();
-            inst.status = Status::Idle;
-            storage
-                .update(|instances, _groups| {
-                    instances.push(inst.clone());
-                    Ok(())
-                })
-                .unwrap();
-
-            inst.acquire_lifecycle_reservation(
+        storage
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        instance
+            .acquire_lifecycle_reservation(
                 &storage,
                 LifecycleOperation::Launch,
                 Some(Status::Starting),
             )
             .unwrap();
-            let reserved_gen = inst.lifecycle_generation;
+        let generation = instance.lifecycle_generation;
+        instance
+            .commit_lifecycle_status(&storage, LifecycleOperation::Launch, Status::Error)
+            .unwrap();
 
-            // A same-generation passive status patch changes presentation state
-            // without changing ownership while prepare_launch runs unlocked.
-            storage
-                .update(|instances, _groups| {
-                    let stored = instances.iter_mut().find(|i| i.id == inst.id).unwrap();
-                    assert_eq!(stored.lifecycle_generation, reserved_gen);
-                    assert!(stored.lifecycle_reservation.is_some());
-                    stored.status = Status::Stopped;
-                    Ok(())
-                })
-                .unwrap();
-
-            // The launch guard still recognizes the exact-generation reservation. A later launch
-            // failure must release it rather than stranding the marker until its TTL.
-            inst.ensure_reservation_current_or_fail(&storage).unwrap();
-            let error = anyhow::anyhow!("launch failed after status drift");
-            inst.fail_reserved_launch(&storage, &error, false);
-
-            let leftover = storage
-                .update(|instances, _groups| {
-                    Ok(instances
-                        .iter()
-                        .find(|instance| instance.id == inst.id)
-                        .and_then(|instance| instance.lifecycle_reservation.clone()))
-                })
-                .unwrap();
-            assert!(
-                leftover.is_none(),
-                "a failed launch must clear its reservation even after a same-generation status drift"
-            );
-        }
+        let reloaded = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == instance.id)
+            .unwrap();
+        assert_eq!(reloaded.lifecycle_generation, generation);
+        assert_eq!(reloaded.lifecycle_reservation, None);
+        assert_eq!(reloaded.status, Status::Error);
     }
 
     #[test]
@@ -615,6 +558,63 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn failed_launch_releases_reservation_after_status_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "lifecycle-fail-drift";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let mut inst = Instance::new("drift", "/tmp/test");
+        inst.source_profile = profile.to_string();
+        inst.status = Status::Idle;
+        storage
+            .update(|instances, _groups| {
+                instances.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        inst.acquire_lifecycle_reservation(
+            &storage,
+            LifecycleOperation::Launch,
+            Some(Status::Starting),
+        )
+        .unwrap();
+        let reserved_gen = inst.lifecycle_generation;
+
+        // A same-generation passive status patch changes presentation state
+        // without changing ownership while prepare_launch runs unlocked.
+        storage
+            .update(|instances, _groups| {
+                let stored = instances.iter_mut().find(|i| i.id == inst.id).unwrap();
+                assert_eq!(stored.lifecycle_generation, reserved_gen);
+                assert!(stored.lifecycle_reservation.is_some());
+                stored.status = Status::Stopped;
+                Ok(())
+            })
+            .unwrap();
+
+        // The launch guard still recognizes the exact-generation reservation. A later launch
+        // failure must release it rather than stranding the marker until its TTL.
+        inst.ensure_reservation_current_or_fail(&storage).unwrap();
+        let error = anyhow::anyhow!("launch failed after status drift");
+        inst.fail_reserved_launch(&storage, &error, false);
+
+        let leftover = storage
+            .update(|instances, _groups| {
+                Ok(instances
+                    .iter()
+                    .find(|instance| instance.id == inst.id)
+                    .and_then(|instance| instance.lifecycle_reservation.clone()))
+            })
+            .unwrap();
+        assert!(
+            leftover.is_none(),
+            "a failed launch must clear its reservation even after a same-generation status drift"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn lifecycle_launch_commit_keeps_reserved_generation_and_rejects_stale_or_overflowed_tokens() {
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
@@ -716,96 +716,92 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_reservation_serializes_sparsely_excludes_peers_and_recovers_when_expired() {
-        {
-            let fresh = Instance::new("s", "/tmp/x");
-            let fresh_json = serde_json::to_string(&fresh).expect("serialize fresh");
-            assert!(!fresh_json.contains("lifecycle_reservation"));
-            let parsed: Instance = serde_json::from_str(&fresh_json).expect("parse fresh");
-            assert_eq!(parsed.lifecycle_reservation, None);
+    fn lifecycle_reservation_roundtrips_and_legacy_rows_default_to_none() {
+        let fresh = Instance::new("s", "/tmp/x");
+        let fresh_json = serde_json::to_string(&fresh).expect("serialize fresh");
+        assert!(!fresh_json.contains("lifecycle_reservation"));
+        let parsed: Instance = serde_json::from_str(&fresh_json).expect("parse fresh");
+        assert_eq!(parsed.lifecycle_reservation, None);
 
-            let mut instance = Instance::new("s", "/tmp/x");
-            let now = Utc::now();
-            let generation = instance
-                .try_acquire_lifecycle_reservation(
-                    LifecycleOperation::Purge,
-                    Instance::LIFECYCLE_RESERVATION_TTL,
-                    now,
-                )
-                .expect("free row grants the lease");
-            let json = serde_json::to_string(&instance).expect("serialize");
-            let back: Instance = serde_json::from_str(&json).expect("round-trip");
-            assert_eq!(
-                back.lifecycle_reservation,
-                Some(LifecycleReservation {
-                    op: LifecycleOperation::Purge,
-                    generation,
-                    at: now,
-                })
-            );
-        }
-        {
-            let now = Utc::now();
-            let mut instance = Instance::new("s", "/tmp/x");
-            let generation = instance
-                .try_acquire_lifecycle_reservation(
-                    LifecycleOperation::Purge,
-                    Instance::LIFECYCLE_RESERVATION_TTL,
-                    now,
-                )
-                .expect("first operation acquires");
-
-            for contender in [
-                LifecycleOperation::Launch,
-                LifecycleOperation::Stop,
+        let mut instance = Instance::new("s", "/tmp/x");
+        let now = Utc::now();
+        let generation = instance
+            .try_acquire_lifecycle_reservation(
                 LifecycleOperation::Purge,
-                LifecycleOperation::Restore,
-                LifecycleOperation::Trash,
-            ] {
-                assert_eq!(
-                    instance.try_acquire_lifecycle_reservation(
-                        contender,
-                        Instance::LIFECYCLE_RESERVATION_TTL,
-                        now + chrono::Duration::seconds(1),
-                    ),
-                    Err(LifecycleReservationError::Busy(LifecycleOperation::Purge)),
-                    "{contender:?} must not replace a live peer reservation",
-                );
-            }
-            assert!(
-                !instance.release_lifecycle_reservation_if_owned(
-                    LifecycleOperation::Purge,
-                    generation + 1,
-                )
-            );
-            assert!(instance.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation));
-            assert!(instance
-                .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation));
-        }
-        {
-            let ttl = Instance::LIFECYCLE_RESERVATION_TTL;
-            let now = Utc::now();
-            let mut instance = Instance::new("s", "/tmp/x");
-            let old_generation = instance
-                .try_acquire_lifecycle_reservation(
-                    LifecycleOperation::Purge,
-                    ttl,
-                    now - ttl - chrono::Duration::seconds(1),
-                )
-                .expect("first operation acquires");
-            let new_generation = instance
-                .try_acquire_lifecycle_reservation(LifecycleOperation::Restore, ttl, now)
-                .expect("expired lease can be replaced");
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                now,
+            )
+            .expect("free row grants the lease");
+        let json = serde_json::to_string(&instance).expect("serialize");
+        let back: Instance = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(
+            back.lifecycle_reservation,
+            Some(LifecycleReservation {
+                op: LifecycleOperation::Purge,
+                generation,
+                at: now,
+            })
+        );
+    }
 
-            assert!(new_generation > old_generation);
-            assert!(
-                !instance.release_lifecycle_reservation_if_owned(
-                    LifecycleOperation::Purge,
-                    old_generation,
-                )
+    #[test]
+    fn lifecycle_reservation_excludes_peers_and_uses_generation_as_identity() {
+        let now = Utc::now();
+        let mut instance = Instance::new("s", "/tmp/x");
+        let generation = instance
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Purge,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                now,
+            )
+            .expect("first operation acquires");
+
+        for contender in [
+            LifecycleOperation::Launch,
+            LifecycleOperation::Stop,
+            LifecycleOperation::Purge,
+            LifecycleOperation::Restore,
+            LifecycleOperation::Trash,
+        ] {
+            assert_eq!(
+                instance.try_acquire_lifecycle_reservation(
+                    contender,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    now + chrono::Duration::seconds(1),
+                ),
+                Err(LifecycleReservationError::Busy(LifecycleOperation::Purge)),
+                "{contender:?} must not replace a live peer reservation",
             );
-            assert!(instance
-                .lifecycle_reservation_is_owned(LifecycleOperation::Restore, new_generation,));
         }
+        assert!(!instance
+            .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation + 1,));
+        assert!(instance.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation));
+        assert!(
+            instance.release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation)
+        );
+    }
+
+    #[test]
+    fn expired_lifecycle_reservation_is_recoverable_without_reusing_generation() {
+        let ttl = Instance::LIFECYCLE_RESERVATION_TTL;
+        let now = Utc::now();
+        let mut instance = Instance::new("s", "/tmp/x");
+        let old_generation = instance
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Purge,
+                ttl,
+                now - ttl - chrono::Duration::seconds(1),
+            )
+            .expect("first operation acquires");
+        let new_generation = instance
+            .try_acquire_lifecycle_reservation(LifecycleOperation::Restore, ttl, now)
+            .expect("expired lease can be replaced");
+
+        assert!(new_generation > old_generation);
+        assert!(!instance
+            .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, old_generation,));
+        assert!(
+            instance.lifecycle_reservation_is_owned(LifecycleOperation::Restore, new_generation,)
+        );
     }
 }

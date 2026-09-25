@@ -308,156 +308,153 @@ mod tests {
 
     #[test]
     fn container_terminal_resolver_executes_only_usable_shells() {
-        {
-            for invalid_kind in ["non_executable", "directory", "non_shell"] {
-                let temp = tempfile::tempdir().unwrap();
-                write_executable(
-                    &temp.path().join("getent"),
-                    r#"#!/bin/sh
-    printf 'test:x:2999:2999::/tmp:%s\n' "$PASSWD_SHELL"
-    "#,
-                );
-                write_executable(&temp.path().join("id"), "#!/bin/sh\nprintf 2999\n");
-
-                let candidate = temp.path().join(invalid_kind);
-                match invalid_kind {
-                    "non_executable" => std::fs::write(&candidate, "not executable").unwrap(),
-                    "directory" => std::fs::create_dir(&candidate).unwrap(),
-                    "non_shell" => {
-                        write_executable(&candidate, "#!/bin/sh\necho WRONG_CANDIDATE\n")
-                    }
-                    _ => unreachable!(),
-                }
-
-                let resolver_command =
-                    container_terminal_autodetect_command("/etc/passwd", "/etc/shells");
-                let mut child = Command::new("/bin/sh")
-                    .arg("-c")
-                    .arg(&resolver_command)
-                    .env("HOME", temp.path())
-                    .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
-                    .env("PASSWD_SHELL", &candidate)
-                    .env("SHELL", "/bin/sh")
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                child
-                    .stdin
-                    .take()
-                    .unwrap()
-                    .write_all(b"echo RESOLVED_SHELL\nexit\n")
-                    .unwrap();
-                let output = child.wait_with_output().unwrap();
-                let stdout = String::from_utf8_lossy(&output.stdout);
-
-                assert!(
-                    output.status.success(),
-                    "resolver failed for {invalid_kind}: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                assert!(
-                    stdout.contains("RESOLVED_SHELL"),
-                    "resolver executed {invalid_kind} instead of a shell: stdout={stdout}, stderr={}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                assert!(!stdout.contains("WRONG_CANDIDATE"));
-            }
-
+        for invalid_kind in ["non_executable", "directory", "non_shell"] {
             let temp = tempfile::tempdir().unwrap();
-            let shell = temp.path().join("fish");
-            write_executable(
-                &shell,
-                r#"#!/bin/sh
-    printf 'CUSTOM_SHELL %s %s\n' "$1" "$SHELL"
-    "#,
-            );
             write_executable(
                 &temp.path().join("getent"),
                 r#"#!/bin/sh
-    printf 'test:x:2999:2999::/tmp:%s\n' "$PASSWD_SHELL"
-    "#,
+printf 'test:x:2999:2999::/tmp:%s\n' "$PASSWD_SHELL"
+"#,
             );
             write_executable(&temp.path().join("id"), "#!/bin/sh\nprintf 2999\n");
+
+            let candidate = temp.path().join(invalid_kind);
+            match invalid_kind {
+                "non_executable" => std::fs::write(&candidate, "not executable").unwrap(),
+                "directory" => std::fs::create_dir(&candidate).unwrap(),
+                "non_shell" => write_executable(&candidate, "#!/bin/sh\necho WRONG_CANDIDATE\n"),
+                _ => unreachable!(),
+            }
+
             let resolver_command =
                 container_terminal_autodetect_command("/etc/passwd", "/etc/shells");
-            let output = Command::new("/bin/sh")
+            let mut child = Command::new("/bin/sh")
                 .arg("-c")
                 .arg(&resolver_command)
+                .env("HOME", temp.path())
                 .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
-                .env("PASSWD_SHELL", &shell)
-                .env_remove("SHELL")
-                .output()
+                .env("PASSWD_SHELL", &candidate)
+                .env("SHELL", "/bin/sh")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
                 .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"echo RESOLVED_SHELL\nexit\n")
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
+
             assert!(
                 output.status.success(),
-                "{}",
+                "resolver failed for {invalid_kind}: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert!(stdout.contains(&format!("CUSTOM_SHELL -l {}", shell.display())));
+            assert!(
+                stdout.contains("RESOLVED_SHELL"),
+                "resolver executed {invalid_kind} instead of a shell: stdout={stdout}, stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!stdout.contains("WRONG_CANDIDATE"));
         }
-        {
-            for (case, passwd_ending, shells_ending) in [
-                ("terminated", "\n", "\n"),
-                ("unterminated_passwd", "", "\n"),
-                ("unterminated_shells", "\n", ""),
-            ] {
-                let temp = tempfile::tempdir().unwrap();
-                write_executable(&temp.path().join("id"), "#!/bin/sh\nprintf 2999\n");
 
-                let passwd_shell = temp.path().join("custom-authorized-shell");
-                write_executable(
-                    &passwd_shell,
-                    "#!/bin/sh\nprintf 'PASSWD argc=%s arg1=%s shell=%s\\n' \"$#\" \"${1-}\" \"$SHELL\"\n",
-                );
-                let fallback_shell = temp.path().join("bash");
-                write_executable(&fallback_shell, "#!/bin/sh\nprintf 'WRONG_FALLBACK\\n'\n");
+        let temp = tempfile::tempdir().unwrap();
+        let shell = temp.path().join("fish");
+        write_executable(
+            &shell,
+            r#"#!/bin/sh
+printf 'CUSTOM_SHELL %s %s\n' "$1" "$SHELL"
+"#,
+        );
+        write_executable(
+            &temp.path().join("getent"),
+            r#"#!/bin/sh
+printf 'test:x:2999:2999::/tmp:%s\n' "$PASSWD_SHELL"
+"#,
+        );
+        write_executable(&temp.path().join("id"), "#!/bin/sh\nprintf 2999\n");
+        let resolver_command = container_terminal_autodetect_command("/etc/passwd", "/etc/shells");
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&resolver_command)
+            .env("PATH", format!("{}:/usr/bin:/bin", temp.path().display()))
+            .env("PASSWD_SHELL", &shell)
+            .env_remove("SHELL")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains(&format!("CUSTOM_SHELL -l {}", shell.display())));
+    }
+    #[test]
+    fn container_terminal_resolver_reads_passwd_without_getent() {
+        for (case, passwd_ending, shells_ending) in [
+            ("terminated", "\n", "\n"),
+            ("unterminated_passwd", "", "\n"),
+            ("unterminated_shells", "\n", ""),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            write_executable(&temp.path().join("id"), "#!/bin/sh\nprintf 2999\n");
 
-                let passwd_file = temp.path().join("passwd");
-                std::fs::write(
-                    &passwd_file,
-                    format!(
-                        "test:x:2999:2999::/tmp:{}{passwd_ending}",
-                        passwd_shell.display()
-                    ),
-                )
+            let passwd_shell = temp.path().join("custom-authorized-shell");
+            write_executable(
+                &passwd_shell,
+                "#!/bin/sh\nprintf 'PASSWD argc=%s arg1=%s shell=%s\\n' \"$#\" \"${1-}\" \"$SHELL\"\n",
+            );
+            let fallback_shell = temp.path().join("bash");
+            write_executable(&fallback_shell, "#!/bin/sh\nprintf 'WRONG_FALLBACK\\n'\n");
+
+            let passwd_file = temp.path().join("passwd");
+            std::fs::write(
+                &passwd_file,
+                format!(
+                    "test:x:2999:2999::/tmp:{}{passwd_ending}",
+                    passwd_shell.display()
+                ),
+            )
+            .unwrap();
+            let shells_file = temp.path().join("shells");
+            std::fs::write(
+                &shells_file,
+                format!("{}{shells_ending}", passwd_shell.display()),
+            )
+            .unwrap();
+
+            let resolver_command = container_terminal_autodetect_command(
+                passwd_file.to_str().unwrap(),
+                shells_file.to_str().unwrap(),
+            );
+            let output = Command::new("/bin/sh")
+                .args(["-c", &resolver_command])
+                .env_clear()
+                .env("HOME", temp.path())
+                .env("PATH", temp.path())
+                .env("SHELL", &fallback_shell)
+                .output()
                 .unwrap();
-                let shells_file = temp.path().join("shells");
-                std::fs::write(
-                    &shells_file,
-                    format!("{}{shells_ending}", passwd_shell.display()),
-                )
-                .unwrap();
 
-                let resolver_command = container_terminal_autodetect_command(
-                    passwd_file.to_str().unwrap(),
-                    shells_file.to_str().unwrap(),
-                );
-                let output = Command::new("/bin/sh")
-                    .args(["-c", &resolver_command])
-                    .env_clear()
-                    .env("HOME", temp.path())
-                    .env("PATH", temp.path())
-                    .env("SHELL", &fallback_shell)
-                    .output()
-                    .unwrap();
-
-                assert!(
-                    output.status.success(),
-                    "{case}: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                assert!(output.stderr.is_empty(), "{case}");
-                assert_eq!(
-                    String::from_utf8_lossy(&output.stdout),
-                    format!("PASSWD argc=0 arg1= shell={}\n", passwd_shell.display()),
-                    "{case}"
-                );
-            }
+            assert!(
+                output.status.success(),
+                "{case}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stderr.is_empty(), "{case}");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                format!("PASSWD argc=0 arg1= shell={}\n", passwd_shell.display()),
+                "{case}"
+            );
         }
     }
+
     #[test]
     fn container_terminal_command_preserves_runtime_boundaries() {
         let temp = tempfile::tempdir().unwrap();

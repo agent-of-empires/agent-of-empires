@@ -486,71 +486,47 @@ mod tests {
     use crate::session::instance::test_helpers::*;
 
     #[test]
-    fn omp_capture_accepts_benign_args_and_rejects_opaque_or_secret_launches() {
-        {
-            let mut inst = tool_instance("omp", "/tmp/test");
-            inst.extra_args =
-                "--model sonnet --profile first --profile=work --session-dir '/tmp/omp sessions'"
-                    .to_string();
+    fn omp_capture_accepts_benign_args_and_rejects_opaque_launches() {
+        let mut inst = tool_instance("omp", "/tmp/test");
+        inst.extra_args =
+            "--model sonnet --profile first --profile=work --session-dir '/tmp/omp sessions'"
+                .to_string();
 
-            let options = inst
-                .omp_capture_options()
-                .expect("benign argv must capture");
-            assert_eq!(options.profile.as_deref(), Some("work"));
-            assert_eq!(
-                options.session_dir.as_deref(),
-                Some(std::path::Path::new("/tmp/omp sessions"))
-            );
-            inst.extra_args = "--model ${model:---profile=work}".to_string();
+        let options = inst
+            .omp_capture_options()
+            .expect("benign argv must capture");
+        assert_eq!(options.profile.as_deref(), Some("work"));
+        assert_eq!(
+            options.session_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/omp sessions"))
+        );
+        inst.extra_args = "--model ${model:---profile=work}".to_string();
+        assert!(
+            inst.omp_capture_options().is_some(),
+            "model values are shell-quoted before both capture parsing and launch"
+        );
+        for arg in ["--continue", "-c", "--continue=false"] {
+            inst.extra_args = arg.to_string();
             assert!(
                 inst.omp_capture_options().is_some(),
-                "model values are shell-quoted before both capture parsing and launch"
+                "{arg} remains a transparent OMP launch argument"
             );
-            for arg in ["--continue", "-c", "--continue=false"] {
-                inst.extra_args = arg.to_string();
-                assert!(
-                    inst.omp_capture_options().is_some(),
-                    "{arg} remains a transparent OMP launch argument"
-                );
-            }
-            inst.extra_args = "--model sonnet[1m]".to_string();
-            assert!(
-                inst.omp_capture_options().is_some(),
-                "the launch path quotes model context suffixes before shell expansion"
-            );
+        }
+        inst.extra_args = "--model sonnet[1m]".to_string();
+        assert!(
+            inst.omp_capture_options().is_some(),
+            "the launch path quotes model context suffixes before shell expansion"
+        );
 
-            inst.extra_args = "--no-session".to_string();
-            assert!(inst.omp_capture_options().is_none());
-            inst.extra_args = "'unterminated".to_string();
-            assert!(inst.omp_capture_options().is_none());
-            inst.extra_args.clear();
-            inst.command = "omp".to_string();
-            assert!(inst.omp_capture_options().is_some());
-            inst.command = "omp-wrapper".to_string();
-            assert!(inst.omp_capture_options().is_none());
-        }
-        {
-            let mut instance = tool_instance("omp", "/tmp/test");
-            for extra_args in [
-                "--api-key secret",
-                "--api-key=secret",
-                "--api-key$EMPTY secret",
-            ] {
-                instance.extra_args = extra_args.to_string();
-                let error = instance
-                    .build_launch_command(None)
-                    .err()
-                    .expect("inline OMP credentials must abort before launch");
-                if extra_args.contains('$') {
-                    assert!(error.to_string().contains("opaque shell syntax"), "{error}");
-                } else {
-                    assert!(
-                        error.to_string().contains("through the environment"),
-                        "{extra_args}: {error}"
-                    );
-                }
-            }
-        }
+        inst.extra_args = "--no-session".to_string();
+        assert!(inst.omp_capture_options().is_none());
+        inst.extra_args = "'unterminated".to_string();
+        assert!(inst.omp_capture_options().is_none());
+        inst.extra_args.clear();
+        inst.command = "omp".to_string();
+        assert!(inst.omp_capture_options().is_some());
+        inst.command = "omp-wrapper".to_string();
+        assert!(inst.omp_capture_options().is_none());
     }
 
     #[test]
@@ -593,6 +569,30 @@ mod tests {
                 .and_then(|row| row.omp_capture_generation),
             Some(generation.to_string())
         );
+    }
+
+    #[test]
+    fn omp_launch_rejects_api_keys_in_extra_args() {
+        let mut instance = tool_instance("omp", "/tmp/test");
+        for extra_args in [
+            "--api-key secret",
+            "--api-key=secret",
+            "--api-key$EMPTY secret",
+        ] {
+            instance.extra_args = extra_args.to_string();
+            let error = instance
+                .build_launch_command(None)
+                .err()
+                .expect("inline OMP credentials must abort before launch");
+            if extra_args.contains('$') {
+                assert!(error.to_string().contains("opaque shell syntax"), "{error}");
+            } else {
+                assert!(
+                    error.to_string().contains("through the environment"),
+                    "{extra_args}: {error}"
+                );
+            }
+        }
     }
 
     fn omp_test_plan() -> OmpCapturePlan {

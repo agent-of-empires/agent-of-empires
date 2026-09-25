@@ -778,125 +778,91 @@ mod tests {
 
     #[test]
     fn acquire_reuses_stored_and_pinned_ids_unless_cleared() {
-        {
-            for (tool, stored, intent, expected) in [
-                (
-                    "opencode",
-                    Some("oc-session-42"),
-                    ResumeIntent::Default,
-                    "oc-session-42",
-                ),
-                ("codex", Some("sess-99"), ResumeIntent::Default, "sess-99"),
-                (
-                    "claude",
-                    None,
-                    ResumeIntent::Use("user-pinned".into()),
-                    "user-pinned",
-                ),
-                (
-                    "claude",
-                    Some("observed"),
-                    ResumeIntent::Use("user-pinned".into()),
-                    "user-pinned",
-                ),
-            ] {
-                let mut inst = tool_instance(tool, "/tmp/x");
-                inst.agent_session_id = stored.map(str::to_string);
-                inst.resume_intent = intent;
-                assert_eq!(
-                    inst.acquire_session_id(None),
-                    (Some(expected.to_string()), true),
-                    "{tool}"
-                );
-                assert_eq!(inst.agent_session_id.as_deref(), Some(expected));
-            }
-            let mut claude = tool_instance("claude", "/tmp/x");
-            claude.agent_session_id = Some("observed".to_string());
-            claude.resume_intent = ResumeIntent::Cleared;
-            let (sid, is_existing) = claude.acquire_session_id(None);
-            assert!(sid.is_some() && !is_existing);
-            assert_ne!(sid.as_deref(), Some("observed"));
-            assert_eq!(claude.agent_session_id, sid);
-
-            let mut opencode = tool_instance("opencode", "/tmp/x");
-            opencode.agent_session_id = Some("observed".to_string());
-            opencode.resume_intent = ResumeIntent::Cleared;
-            assert_eq!(opencode.acquire_session_id(None), (None, false));
-            assert_eq!(opencode.agent_session_id, None);
-        }
-        {
-            let parent = "parent-1111-2222-3333-444444444444";
-            let child = "child-5555-6666-7777-888888888888";
-            let mut inst = tool_instance("claude", "/tmp/x");
-            inst.agent_session_id = Some(child.to_string());
-            inst.resume_intent = ResumeIntent::Fork {
-                from: parent.to_string(),
-            };
-            let mut cmd = "claude".to_string();
-            assert!(!inst
-                .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("claude"), None,)
-                .unwrap());
+        for (tool, stored, intent, expected) in [
+            (
+                "opencode",
+                Some("oc-session-42"),
+                ResumeIntent::Default,
+                "oc-session-42",
+            ),
+            ("codex", Some("sess-99"), ResumeIntent::Default, "sess-99"),
+            (
+                "claude",
+                None,
+                ResumeIntent::Use("user-pinned".into()),
+                "user-pinned",
+            ),
+            (
+                "claude",
+                Some("observed"),
+                ResumeIntent::Use("user-pinned".into()),
+                "user-pinned",
+            ),
+        ] {
+            let mut inst = tool_instance(tool, "/tmp/x");
+            inst.agent_session_id = stored.map(str::to_string);
+            inst.resume_intent = intent;
             assert_eq!(
-                cmd,
-                format!("claude --resume {parent} --fork-session --session-id {child}")
+                inst.acquire_session_id(None),
+                (Some(expected.to_string()), true),
+                "{tool}"
             );
-            assert_eq!(inst.agent_session_id.as_deref(), Some(child));
+            assert_eq!(inst.agent_session_id.as_deref(), Some(expected));
         }
+        let mut claude = tool_instance("claude", "/tmp/x");
+        claude.agent_session_id = Some("observed".to_string());
+        claude.resume_intent = ResumeIntent::Cleared;
+        let (sid, is_existing) = claude.acquire_session_id(None);
+        assert!(sid.is_some() && !is_existing);
+        assert_ne!(sid.as_deref(), Some("observed"));
+        assert_eq!(claude.agent_session_id, sid);
+
+        let mut opencode = tool_instance("opencode", "/tmp/x");
+        opencode.agent_session_id = Some("observed".to_string());
+        opencode.resume_intent = ResumeIntent::Cleared;
+        assert_eq!(opencode.acquire_session_id(None), (None, false));
+        assert_eq!(opencode.agent_session_id, None);
     }
 
     #[test]
-    fn fresh_launch_mints_only_where_the_agent_can_pin() {
-        {
-            let mut inst = tool_instance("claude", "/tmp/test");
-            let (first, first_existing) = inst.acquire_session_id(None);
-            assert!(first.is_some() && !first_existing);
-            assert_eq!(inst.agent_session_id, first);
-            // With no transcript on disk the same id stays fresh-pinned.
-            assert_eq!(inst.acquire_session_id(None), (first, false));
+    fn fork_intent_emits_resume_fork_session_and_pins_child() {
+        let parent = "parent-1111-2222-3333-444444444444";
+        let child = "child-5555-6666-7777-888888888888";
+        let mut inst = tool_instance("claude", "/tmp/x");
+        inst.agent_session_id = Some(child.to_string());
+        inst.resume_intent = ResumeIntent::Fork {
+            from: parent.to_string(),
+        };
+        let mut cmd = "claude".to_string();
+        assert!(!inst
+            .apply_session_flags(&mut cmd, "test", crate::agents::get_agent("claude"), None,)
+            .unwrap());
+        assert_eq!(
+            cmd,
+            format!("claude --resume {parent} --fork-session --session-id {child}")
+        );
+        assert_eq!(inst.agent_session_id.as_deref(), Some(child));
+    }
 
-            let mut fresh = tool_instance("claude", "/tmp/test");
-            let mut cmd = String::from("claude");
-            assert!(!fresh
-                .apply_session_flags(&mut cmd, "test", None, None)
-                .unwrap());
-            fresh.resume_intent = ResumeIntent::Use("019342ab-1234-7def-8901-abcdef012345".into());
-            let mut cmd = String::from("claude");
-            assert!(fresh
-                .apply_session_flags(&mut cmd, "test", None, None)
-                .unwrap());
-        }
-        {
-            for (tool, intent, minted, expected) in [
-                (
-                    "opencode",
-                    ResumeIntent::Default,
-                    Some("ses_preassigned"),
-                    Some("ses_preassigned"),
-                ),
-                ("opencode", ResumeIntent::Default, None, None),
-                (
-                    "opencode",
-                    ResumeIntent::Cleared,
-                    Some("ses_cleared"),
-                    Some("ses_cleared"),
-                ),
-            ] {
-                let mut inst = tool_instance(tool, "/tmp/test");
-                inst.resume_intent = intent;
-                let result = inst.acquire_session_id_with(None, &|_| minted.map(str::to_string));
-                assert_eq!(result, (expected.map(str::to_string), false));
-                assert_eq!(inst.agent_session_id.as_deref(), expected);
-            }
-            let mut claude = tool_instance("claude", "/tmp/test");
-            let (claude_sid, _) =
-                claude.acquire_session_id_with(None, &|_| panic!("seam ran for claude"));
-            assert!(claude_sid.is_some());
-            let mut codex = tool_instance("codex", "/tmp/test");
-            assert_eq!(
-                codex.acquire_session_id_with(None, &|_| panic!("seam ran for codex")),
-                (None, false)
-            );
-        }
+    #[test]
+    fn fresh_claude_launch_mints_a_stable_pinned_id() {
+        let mut inst = tool_instance("claude", "/tmp/test");
+        let (first, first_existing) = inst.acquire_session_id(None);
+        assert!(first.is_some() && !first_existing);
+        assert_eq!(inst.agent_session_id, first);
+        // With no transcript on disk the same id stays fresh-pinned.
+        assert_eq!(inst.acquire_session_id(None), (first, false));
+
+        let mut fresh = tool_instance("claude", "/tmp/test");
+        let mut cmd = String::from("claude");
+        assert!(!fresh
+            .apply_session_flags(&mut cmd, "test", None, None)
+            .unwrap());
+        fresh.resume_intent = ResumeIntent::Use("019342ab-1234-7def-8901-abcdef012345".into());
+        let mut cmd = String::from("claude");
+        assert!(fresh
+            .apply_session_flags(&mut cmd, "test", None, None)
+            .unwrap());
     }
 
     #[test]
@@ -1103,41 +1069,45 @@ work-opencode = "opencode"
     }
 
     #[test]
-    #[serial]
-    fn opencode_preassign_requires_a_mirrorable_launch_and_profile_opt_in() {
-        {
-            let mut inst = tool_instance("opencode", "/tmp/test");
-            assert!(inst.opencode_launch_mirrorable_by_ambient_serve());
-            inst.command = "opencode-wrapper".to_string();
-            assert!(!inst.opencode_launch_mirrorable_by_ambient_serve());
+    fn fresh_launch_mint_seam_is_used_only_by_opencode_and_pi() {
+        for (tool, intent, minted, expected) in [
+            (
+                "opencode",
+                ResumeIntent::Default,
+                Some("ses_preassigned"),
+                Some("ses_preassigned"),
+            ),
+            ("opencode", ResumeIntent::Default, None, None),
+            (
+                "opencode",
+                ResumeIntent::Cleared,
+                Some("ses_cleared"),
+                Some("ses_cleared"),
+            ),
+        ] {
+            let mut inst = tool_instance(tool, "/tmp/test");
+            inst.resume_intent = intent;
+            let result = inst.acquire_session_id_with(None, &|_| minted.map(str::to_string));
+            assert_eq!(result, (expected.map(str::to_string), false));
+            assert_eq!(inst.agent_session_id.as_deref(), expected);
         }
-        {
-            let temp = tempdir().unwrap();
-            let _home = crate::session::test_support::isolate_home(temp.path());
-            let cases = [
-                ("opencode-preassign-off", false),
-                ("opencode-preassign-on", true),
-            ];
+        let mut claude = tool_instance("claude", "/tmp/test");
+        let (claude_sid, _) =
+            claude.acquire_session_id_with(None, &|_| panic!("seam ran for claude"));
+        assert!(claude_sid.is_some());
+        let mut codex = tool_instance("codex", "/tmp/test");
+        assert_eq!(
+            codex.acquire_session_id_with(None, &|_| panic!("seam ran for codex")),
+            (None, false)
+        );
+    }
 
-            for (profile, enabled) in cases {
-                let config_path = crate::session::get_profile_dir_path(profile)
-                    .unwrap()
-                    .join("config.toml");
-                std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-                std::fs::write(
-                    config_path,
-                    format!(
-                        "environment = [\"OPENCODE_CONFIG_DIR=/tmp/opencode-test\"]\n[session]\nopencode_preassign_session_id = {enabled}\n"
-                    ),
-                )
-                .unwrap();
-
-                let mut inst = Instance::new("Test", "/tmp/test");
-                inst.source_profile = profile.to_string();
-                inst.tool = "opencode".to_string();
-                assert_eq!(inst.opencode_preassign_enabled(), enabled);
-            }
-        }
+    #[test]
+    fn opencode_preassign_requires_a_mirrorable_launch() {
+        let mut inst = tool_instance("opencode", "/tmp/test");
+        assert!(inst.opencode_launch_mirrorable_by_ambient_serve());
+        inst.command = "opencode-wrapper".to_string();
+        assert!(!inst.opencode_launch_mirrorable_by_ambient_serve());
     }
 
     #[test]
@@ -1216,65 +1186,75 @@ work-opencode = "opencode"
     }
 
     #[test]
-    fn resume_flags_follow_capture_context_support() {
-        {
-            let sid = "11111111-2222-3333-4444-555555555555";
-            for (tool, expected, resumed) in [
-                ("copilot", format!("copilot --session-id {sid}"), true),
-                ("kimi", format!("kimi --session {sid}"), true),
-                ("prime-agent", format!("prime-agent --resume {sid}"), true),
-            ] {
-                let mut inst = Instance::new("test", "/tmp/test");
-                inst.tool = tool.to_string();
-                inst.agent_session_id = Some(sid.to_string());
-                inst.resume_intent = ResumeIntent::Use(sid.to_string());
-                inst.sandbox_info = Some(test_sandbox("test", None));
-                let mut cmd = tool.to_string();
-                assert_eq!(
-                    inst.apply_session_flags(
-                        &mut cmd,
-                        "test",
-                        crate::agents::get_agent(tool),
-                        None,
-                    )
+    fn sandbox_resume_flags_follow_capture_context_support() {
+        let sid = "11111111-2222-3333-4444-555555555555";
+        for (tool, expected, resumed) in [
+            ("copilot", format!("copilot --session-id {sid}"), true),
+            ("kimi", format!("kimi --session {sid}"), true),
+            ("prime-agent", format!("prime-agent --resume {sid}"), true),
+        ] {
+            let mut inst = Instance::new("test", "/tmp/test");
+            inst.tool = tool.to_string();
+            inst.agent_session_id = Some(sid.to_string());
+            inst.resume_intent = ResumeIntent::Use(sid.to_string());
+            inst.sandbox_info = Some(test_sandbox("test", None));
+            let mut cmd = tool.to_string();
+            assert_eq!(
+                inst.apply_session_flags(&mut cmd, "test", crate::agents::get_agent(tool), None,)
                     .unwrap(),
-                    resumed,
-                    "{tool}"
-                );
-                assert_eq!(cmd, expected, "{tool}");
-                assert_eq!(inst.agent_session_id.as_deref(), Some(sid));
-            }
-
-            let mut automatic_copilot = tool_instance("copilot", "/tmp/test");
-            automatic_copilot.agent_session_id = Some(sid.to_string());
-            automatic_copilot.sandbox_info = Some(test_sandbox("test", None));
-            let mut automatic_cmd = "copilot".to_string();
-            assert!(!automatic_copilot
-                .apply_session_flags(&mut automatic_cmd, "test", None, None)
-                .unwrap());
-            assert_eq!(automatic_cmd, "copilot");
-
-            let mut host_prime = tool_instance("prime-agent", "/tmp/test");
-            host_prime.agent_session_id = Some(sid.to_string());
-            host_prime.resume_intent = ResumeIntent::Use(sid.to_string());
-            let mut cmd = "prime-agent".to_string();
-            assert!(host_prime
-                .apply_session_flags(&mut cmd, "test", None, None)
-                .unwrap());
-            assert_eq!(cmd, format!("prime-agent --resume {sid}"));
+                resumed,
+                "{tool}"
+            );
+            assert_eq!(cmd, expected, "{tool}");
+            assert_eq!(inst.agent_session_id.as_deref(), Some(sid));
         }
-        {
-            let mut inst = tool_instance("codex", "/tmp/test");
-            assert_eq!(inst.acquire_session_id_with(None, &|_| None), (None, false));
-            assert_eq!(inst.agent_session_id, None);
-            let mut cmd = String::from("codex");
-            assert!(!inst
-                .apply_session_flags(&mut cmd, "test", None, None)
-                .unwrap());
-            assert_eq!(cmd, "codex");
-            inst.capture_started_at = Some(std::time::SystemTime::now());
-            inst.maybe_start_poller_since(None);
-            assert!(inst.session_id_poller.is_none());
+
+        let mut automatic_copilot = tool_instance("copilot", "/tmp/test");
+        automatic_copilot.agent_session_id = Some(sid.to_string());
+        automatic_copilot.sandbox_info = Some(test_sandbox("test", None));
+        let mut automatic_cmd = "copilot".to_string();
+        assert!(!automatic_copilot
+            .apply_session_flags(&mut automatic_cmd, "test", None, None)
+            .unwrap());
+        assert_eq!(automatic_cmd, "copilot");
+
+        let mut host_prime = tool_instance("prime-agent", "/tmp/test");
+        host_prime.agent_session_id = Some(sid.to_string());
+        host_prime.resume_intent = ResumeIntent::Use(sid.to_string());
+        let mut cmd = "prime-agent".to_string();
+        assert!(host_prime
+            .apply_session_flags(&mut cmd, "test", None, None)
+            .unwrap());
+        assert_eq!(cmd, format!("prime-agent --resume {sid}"));
+    }
+
+    #[test]
+    #[serial]
+    fn opencode_preassign_requires_profile_opt_in() {
+        let temp = tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let cases = [
+            ("opencode-preassign-off", false),
+            ("opencode-preassign-on", true),
+        ];
+
+        for (profile, enabled) in cases {
+            let config_path = crate::session::get_profile_dir_path(profile)
+                .unwrap()
+                .join("config.toml");
+            std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                config_path,
+                format!(
+                    "environment = [\"OPENCODE_CONFIG_DIR=/tmp/opencode-test\"]\n[session]\nopencode_preassign_session_id = {enabled}\n"
+                ),
+            )
+            .unwrap();
+
+            let mut inst = Instance::new("Test", "/tmp/test");
+            inst.source_profile = profile.to_string();
+            inst.tool = "opencode".to_string();
+            assert_eq!(inst.opencode_preassign_enabled(), enabled);
         }
     }
 
@@ -1369,85 +1349,100 @@ work-opencode = "opencode"
     }
 
     #[test]
-    fn native_session_selectors_skip_injection_or_conflict_with_managed_state() {
-        // A command's own session selector skips AoE injection, and conflicts with AoE state.
-        {
-            let sid = "11111111-2222-3333-4444-555555555555";
-            for command in [
-                "claude --resume external",
-                "claude --resume=external",
-                "claude --session-id=external",
-                "claude -c",
-                "claude --continue",
-                "claude -r external",
-                "claude --from-pr=3678",
-                "claude --from-pr 3678",
-                "claude --teleport external",
-                "claude --cloud external",
-                "claude --remote external",
-                "claude --fork-session",
+    fn unsupported_context_without_identity_neither_resumes_nor_polls() {
+        let mut inst = tool_instance("codex", "/tmp/test");
+        assert_eq!(inst.acquire_session_id_with(None, &|_| None), (None, false));
+        assert_eq!(inst.agent_session_id, None);
+        let mut cmd = String::from("codex");
+        assert!(!inst
+            .apply_session_flags(&mut cmd, "test", None, None)
+            .unwrap());
+        assert_eq!(cmd, "codex");
+        inst.capture_started_at = Some(std::time::SystemTime::now());
+        inst.maybe_start_poller_since(None);
+        assert!(inst.session_id_poller.is_none());
+    }
+
+    /// A command's own session selector skips AoE injection, and conflicts with AoE state.
+    #[test]
+    fn external_session_selectors_skip_injection_or_conflict_with_managed_state() {
+        let sid = "11111111-2222-3333-4444-555555555555";
+        for command in [
+            "claude --resume external",
+            "claude --resume=external",
+            "claude --session-id=external",
+            "claude -c",
+            "claude --continue",
+            "claude -r external",
+            "claude --from-pr=3678",
+            "claude --from-pr 3678",
+            "claude --teleport external",
+            "claude --cloud external",
+            "claude --remote external",
+            "claude --fork-session",
+        ] {
+            let mut inst = tool_instance("claude", "/tmp/x");
+            let mut actual = command.to_string();
+            assert!(!inst
+                .apply_session_flags(&mut actual, "test", None, None)
+                .unwrap());
+            assert_eq!(actual, command);
+            assert!(inst.agent_session_id.is_none());
+            for (stored, intent) in [
+                (Some(sid.to_string()), ResumeIntent::Default),
+                (None, ResumeIntent::Use(sid.to_string())),
+                (
+                    Some("child-session".to_string()),
+                    ResumeIntent::Fork {
+                        from: sid.to_string(),
+                    },
+                ),
             ] {
-                let mut inst = tool_instance("claude", "/tmp/x");
-                let mut actual = command.to_string();
-                assert!(!inst
-                    .apply_session_flags(&mut actual, "test", None, None)
-                    .unwrap());
-                assert_eq!(actual, command);
-                assert!(inst.agent_session_id.is_none());
-                for (stored, intent) in [
-                    (Some(sid.to_string()), ResumeIntent::Default),
-                    (None, ResumeIntent::Use(sid.to_string())),
-                    (
-                        Some("child-session".to_string()),
-                        ResumeIntent::Fork {
-                            from: sid.to_string(),
-                        },
-                    ),
-                ] {
-                    let mut managed = tool_instance("claude", "/tmp/x");
-                    managed.agent_session_id = stored;
-                    managed.resume_intent = intent;
-                    let error = managed
-                        .apply_session_flags(&mut command.to_string(), "test", None, None)
-                        .unwrap_err()
-                        .to_string();
-                    assert!(
-                        error.contains("already contains native session selector"),
-                        "{command}: {error}"
-                    );
-                    assert!(error.contains("clear the AoE-managed resume state"));
-                }
+                let mut managed = tool_instance("claude", "/tmp/x");
+                managed.agent_session_id = stored;
+                managed.resume_intent = intent;
+                let error = managed
+                    .apply_session_flags(&mut command.to_string(), "test", None, None)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains("already contains native session selector"),
+                    "{command}: {error}"
+                );
+                assert!(error.contains("clear the AoE-managed resume state"));
             }
         }
-        {
-            let mut external = tool_instance("codex", "/tmp/x");
-            let mut command = "codex resume external".to_string();
-            assert!(!external
-                .apply_session_flags(&mut command, "test", None, None)
-                .unwrap());
-            assert_eq!(command, "codex resume external");
+    }
 
-            let sid = "11111111-2222-3333-4444-555555555555";
-            let mut value_token = tool_instance("codex", "/tmp/x");
-            value_token.resume_intent = ResumeIntent::Use(sid.to_string());
-            let mut command = "codex --model resume".to_string();
-            assert!(value_token
-                .apply_session_flags(&mut command, "test", value_token.resolved_agent(), None)
-                .unwrap());
-            assert_eq!(command, format!("codex resume {sid} --model resume"));
+    #[test]
+    fn codex_selector_requires_subcommand_position_and_resolves_alias() {
+        let mut external = tool_instance("codex", "/tmp/x");
+        let mut command = "codex resume external".to_string();
+        assert!(!external
+            .apply_session_flags(&mut command, "test", None, None)
+            .unwrap());
+        assert_eq!(command, "codex resume external");
 
-            const PROFILE: &str = "selector-detect-as-alias";
-            let _registry = install_aliases(PROFILE, &[("work-claude", "claude")]);
-            let mut alias = Instance::new("alias", "/tmp/x");
-            alias.source_profile = PROFILE.to_string();
-            alias.tool = "work-claude".to_string();
-            alias.command = "claude --resume external".to_string();
-            let mut command = alias.command.clone();
-            assert!(!alias
-                .apply_session_flags(&mut command, "test", alias.resolved_agent(), None)
-                .unwrap());
-            assert!(alias.agent_session_id.is_none());
-        }
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let mut value_token = tool_instance("codex", "/tmp/x");
+        value_token.resume_intent = ResumeIntent::Use(sid.to_string());
+        let mut command = "codex --model resume".to_string();
+        assert!(value_token
+            .apply_session_flags(&mut command, "test", value_token.resolved_agent(), None)
+            .unwrap());
+        assert_eq!(command, format!("codex resume {sid} --model resume"));
+
+        const PROFILE: &str = "selector-detect-as-alias";
+        let _registry = install_aliases(PROFILE, &[("work-claude", "claude")]);
+        let mut alias = Instance::new("alias", "/tmp/x");
+        alias.source_profile = PROFILE.to_string();
+        alias.tool = "work-claude".to_string();
+        alias.command = "claude --resume external".to_string();
+        let mut command = alias.command.clone();
+        assert!(!alias
+            .apply_session_flags(&mut command, "test", alias.resolved_agent(), None)
+            .unwrap());
+        assert!(alias.agent_session_id.is_none());
     }
 
     #[test]
@@ -1591,159 +1586,151 @@ work-opencode = "opencode"
                 .unwrap();
         }
 
+        /// Default intent: the pane's sidecar outranks the stored id and peer transcripts, and a
+        /// host Claude id with no transcript relaunches pinned instead of a doomed `--resume`.
         #[test]
         #[serial]
         fn acquire_reconciles_stored_id_with_sidecar_and_transcript() {
-            // Default intent: the pane's sidecar outranks the stored id and peer transcripts, and a
-            // host Claude id with no transcript relaunches pinned instead of a doomed `--resume`.
-            {
-                const A: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
-                const B: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
-                const C: &str = "cccccccc-3333-4333-8333-cccccccccccc";
-                type Case<'a> = (
-                    &'a str,
-                    &'a str,
-                    bool,
-                    &'a [(&'a str, u64)],
-                    Option<&'a str>,
-                    &'a str,
-                    &'a str,
-                    bool,
-                );
-                let cases: [Case; 7] = [
-                    (
-                        "sidecar rotation supersedes stored",
-                        "claude",
-                        false,
-                        &[(B, 0)],
-                        Some(B),
-                        A,
-                        B,
-                        true,
-                    ),
-                    (
-                        "observed sid without transcript",
-                        "claude",
-                        false,
-                        &[(A, 120)],
-                        Some(B),
-                        A,
-                        B,
-                        false,
-                    ),
-                    (
-                        "stored sid without transcript",
-                        "claude",
-                        false,
-                        &[],
-                        None,
-                        C,
-                        C,
-                        false,
-                    ),
-                    (
-                        "idle transcript still resumes",
-                        "claude",
-                        false,
-                        &[(C, 3600)],
-                        None,
-                        C,
-                        C,
-                        true,
-                    ),
-                    (
-                        "unsupported tool keeps stored id",
-                        "cursor",
-                        false,
-                        &[],
-                        None,
-                        "stored-cursor-sid",
-                        "stored-cursor-sid",
-                        true,
-                    ),
-                    (
-                        "sidecar wins over fresher peer",
-                        "claude",
-                        false,
-                        &[(A, 120), (B, 5)],
-                        Some(A),
-                        C,
-                        A,
-                        true,
-                    ),
-                    (
-                        "sandboxed claude ignores unproven host sidecar",
-                        "claude",
-                        true,
-                        &[(A, 120), (B, 5)],
-                        Some(A),
-                        C,
-                        C,
-                        true,
-                    ),
-                ];
-                for (
-                    label,
-                    tool,
-                    sandboxed,
-                    transcripts,
-                    sidecar,
-                    stored,
-                    want_sid,
-                    want_existing,
-                ) in cases
-                {
-                    let temp = tempdir().unwrap();
-                    let _home = claude_home_guard(&temp);
-                    let (_hooks, _base, _hook_temp) =
-                        crate::hooks::test_support::BaseGuard::ready();
-                    let project_path = "/tmp/aoe-test-verify-on-resume";
-                    for (sid, age) in transcripts {
-                        write_transcript(&temp.path().join(".claude"), project_path, sid, *age);
-                    }
-                    let mut inst = tool_instance(tool, project_path);
-                    inst.agent_session_id = Some(stored.to_string());
-                    if sandboxed {
-                        inst.sandbox_info = Some(test_sandbox("verify-sandbox", None));
-                    }
-                    let dir = sidecar.map(|sid| write_sidecar(&inst.id, sid));
-                    let acquired = inst.acquire_session_id(None);
-                    if let Some(dir) = dir {
-                        fs::remove_dir_all(dir).ok();
-                    }
-                    assert_eq!(
-                        acquired,
-                        (Some(want_sid.to_string()), want_existing),
-                        "{label}"
-                    );
-                    assert_eq!(inst.agent_session_id.as_deref(), Some(want_sid), "{label}");
-                }
-            }
+            const A: &str = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+            const B: &str = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+            const C: &str = "cccccccc-3333-4333-8333-cccccccccccc";
+            type Case<'a> = (
+                &'a str,
+                &'a str,
+                bool,
+                &'a [(&'a str, u64)],
+                Option<&'a str>,
+                &'a str,
+                &'a str,
+                bool,
+            );
+            let cases: [Case; 7] = [
+                (
+                    "sidecar rotation supersedes stored",
+                    "claude",
+                    false,
+                    &[(B, 0)],
+                    Some(B),
+                    A,
+                    B,
+                    true,
+                ),
+                (
+                    "observed sid without transcript",
+                    "claude",
+                    false,
+                    &[(A, 120)],
+                    Some(B),
+                    A,
+                    B,
+                    false,
+                ),
+                (
+                    "stored sid without transcript",
+                    "claude",
+                    false,
+                    &[],
+                    None,
+                    C,
+                    C,
+                    false,
+                ),
+                (
+                    "idle transcript still resumes",
+                    "claude",
+                    false,
+                    &[(C, 3600)],
+                    None,
+                    C,
+                    C,
+                    true,
+                ),
+                (
+                    "unsupported tool keeps stored id",
+                    "cursor",
+                    false,
+                    &[],
+                    None,
+                    "stored-cursor-sid",
+                    "stored-cursor-sid",
+                    true,
+                ),
+                (
+                    "sidecar wins over fresher peer",
+                    "claude",
+                    false,
+                    &[(A, 120), (B, 5)],
+                    Some(A),
+                    C,
+                    A,
+                    true,
+                ),
+                (
+                    "sandboxed claude ignores unproven host sidecar",
+                    "claude",
+                    true,
+                    &[(A, 120), (B, 5)],
+                    Some(A),
+                    C,
+                    C,
+                    true,
+                ),
+            ];
+            for (label, tool, sandboxed, transcripts, sidecar, stored, want_sid, want_existing) in
+                cases
             {
                 let temp = tempdir().unwrap();
-                let _guard = claude_home_guard(&temp);
-                let mut inst = Instance::new("idle-sidecar", "/tmp/idle-sidecar");
-                inst.tool = "claude".to_string();
-                inst.agent_session_id = Some("stored-old".to_string());
-                inst.resume_intent = ResumeIntent::Default;
-
-                let dir = super::write_sidecar(&inst.id, "published-new");
-                let stale = SystemTime::now() - Duration::from_secs(10 * 60);
-                std::fs::File::options()
-                    .write(true)
-                    .open(dir.join("session_id"))
-                    .unwrap()
-                    .set_times(std::fs::FileTimes::new().set_modified(stale))
-                    .unwrap();
-
+                let _home = claude_home_guard(&temp);
+                let (_hooks, _base, _hook_temp) = crate::hooks::test_support::BaseGuard::ready();
+                let project_path = "/tmp/aoe-test-verify-on-resume";
+                for (sid, age) in transcripts {
+                    write_transcript(&temp.path().join(".claude"), project_path, sid, *age);
+                }
+                let mut inst = tool_instance(tool, project_path);
+                inst.agent_session_id = Some(stored.to_string());
+                if sandboxed {
+                    inst.sandbox_info = Some(test_sandbox("verify-sandbox", None));
+                }
+                let dir = sidecar.map(|sid| write_sidecar(&inst.id, sid));
+                let acquired = inst.acquire_session_id(None);
+                if let Some(dir) = dir {
+                    fs::remove_dir_all(dir).ok();
+                }
                 assert_eq!(
-                    inst.capture_freshest_conversation()
-                        .map(|observation| observation.sid)
-                        .as_deref(),
-                    Some("published-new")
+                    acquired,
+                    (Some(want_sid.to_string()), want_existing),
+                    "{label}"
                 );
-                std::fs::remove_dir_all(dir).ok();
+                assert_eq!(inst.agent_session_id.as_deref(), Some(want_sid), "{label}");
             }
+        }
+
+        #[test]
+        #[serial]
+        fn idle_sidecar_still_overrides_stored_identity() {
+            let temp = tempdir().unwrap();
+            let _guard = claude_home_guard(&temp);
+            let mut inst = Instance::new("idle-sidecar", "/tmp/idle-sidecar");
+            inst.tool = "claude".to_string();
+            inst.agent_session_id = Some("stored-old".to_string());
+            inst.resume_intent = ResumeIntent::Default;
+
+            let dir = super::write_sidecar(&inst.id, "published-new");
+            let stale = SystemTime::now() - Duration::from_secs(10 * 60);
+            std::fs::File::options()
+                .write(true)
+                .open(dir.join("session_id"))
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(stale))
+                .unwrap();
+
+            assert_eq!(
+                inst.capture_freshest_conversation()
+                    .map(|observation| observation.sid)
+                    .as_deref(),
+                Some("published-new")
+            );
+            std::fs::remove_dir_all(dir).ok();
         }
 
         /// Same-cwd sessions in profiles with different `CLAUDE_CONFIG_DIR`s each resume their

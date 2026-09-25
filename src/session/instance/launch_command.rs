@@ -928,101 +928,110 @@ mod tests {
         }
     }
 
+    // The sidecar env var has to survive into the docker argv; no CI container would catch it.
     #[test]
     #[serial_test::serial]
-    fn pi_session_extension_is_injected_only_into_direct_host_launches() {
-        {
-            let home = tempfile::tempdir().unwrap();
-            let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+    fn sandboxed_pi_publishes_through_env_without_a_command_line_extension() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = tool_instance("pi", project.to_str().unwrap());
+        let mut sandbox = test_sandbox("aoe-pi-argv", Some("/workspace"));
+        sandbox.extra_env = Some(vec![
+            "AOE_SESSION_ROOT_ONLY=1".to_string(),
+            "PI_CODING_AGENT_SESSION_DIR=/root/.pi/agent/sessions".to_string(),
+        ]);
+        inst.sandbox_info = Some(sandbox);
+        admit_fixture_content(&inst);
+        let config = inst.build_container_config().unwrap();
+        let _transport =
+            install_container_transport(temp_home.path(), "aoe-pi-argv", &config.volumes);
+        std::fs::copy(
+            temp_home.path().join("native-bin/prime-agent"),
+            temp_home.path().join("native-bin/pi"),
+        )
+        .unwrap();
+        let sidecar = format!(
+            "AOE_SESSION_ID_FILE={}/{}/session_id",
+            crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
+            inst.id
+        );
 
-            let mut alias = Instance::new("pi alias", "/tmp/pi-alias-launch");
-            alias.tool = "company-pi".to_string();
-            alias.detect_as = "pi".to_string();
-            alias.command = "pi".to_string();
-            let agent = alias.resolved_agent();
-            let identity_extension = (
-                " -e '/tmp/pi-aoe-session-id.js'".to_string(),
-                "AOE_SESSION_ID_FILE='/tmp/pi-session-id' ".to_string(),
-            );
-            let (command, _, _) = alias
-                .build_host_command_with_identity_extension(agent, Some(&identity_extension), None)
-                .unwrap();
-            let command = command.unwrap();
-            assert!(command.contains(" -e "), "{command}");
-            assert!(command.contains("AOE_SESSION_ID_FILE="));
-            assert!(command.contains("AOE_SESSION_ROOT_ONLY=0"));
-            assert!(alias.pi_extension_launched);
+        // Native container launches carry the publisher through the exec environment file.
+        let execution = inst.resolve_native_execution(None).unwrap();
+        let docker_env = execution.inputs.docker_env.as_ref().unwrap();
+        let value = |key| {
+            docker_env
+                .env
+                .iter()
+                .rev()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(
+            value("AOE_SESSION_ID_FILE"),
+            Some(sidecar.split_once('=').unwrap().1)
+        );
+        assert_eq!(value("AOE_SESSION_ROOT_ONLY"), Some("0"));
 
-            let mut wrapper = Instance::new("pi alias wrapper", "/tmp/pi-alias-wrapper");
-            wrapper.tool = "company-pi".to_string();
-            wrapper.detect_as = "pi".to_string();
-            wrapper.command = "echo not-pi".to_string();
-            assert!(wrapper.identity_extension_launch().is_none());
-            let agent = wrapper.resolved_agent();
-            let command = wrapper.build_host_command(agent, None).unwrap().0.unwrap();
-            assert!(!command.contains("pi-aoe-session-id.js"));
-            assert!(!command.contains("AOE_SESSION_ID_FILE="));
-            assert!(!wrapper.pi_extension_launched);
+        let (cmd, _, _, _) = inst
+            .build_launch_command(Some(&execution))
+            .expect("a sandboxed launch line");
+        let cmd = cmd.expect("a command");
+        assert!(cmd.contains("--env-file"), "{cmd}");
+        assert!(!cmd.contains("aoe-session-id.js"), "{cmd}");
+    }
 
-            let mut terminated = tool_instance("pi", "/tmp/pi-terminator");
-            terminated.extra_args = "--".to_string();
-            let command = host_command(&mut terminated);
-            assert!(!command.contains(" -e "), "extension follows --: {command}");
-            assert!(!terminated.pi_extension_launched);
-        }
-        // The sidecar env var has to survive into the docker argv; no CI container would catch it.
-        {
-            let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
-            let temp_home = tempfile::tempdir().unwrap();
-            let _home = crate::session::test_support::isolate_home(temp_home.path());
-            let project = temp_home.path().join("proj");
-            std::fs::create_dir_all(&project).unwrap();
-            let mut inst = tool_instance("pi", project.to_str().unwrap());
-            let mut sandbox = test_sandbox("aoe-pi-argv", Some("/workspace"));
-            sandbox.extra_env = Some(vec![
-                "AOE_SESSION_ROOT_ONLY=1".to_string(),
-                "PI_CODING_AGENT_SESSION_DIR=/root/.pi/agent/sessions".to_string(),
-            ]);
-            inst.sandbox_info = Some(sandbox);
-            admit_fixture_content(&inst);
-            let config = inst.build_container_config().unwrap();
-            let _transport =
-                install_container_transport(temp_home.path(), "aoe-pi-argv", &config.volumes);
-            std::fs::copy(
-                temp_home.path().join("native-bin/prime-agent"),
-                temp_home.path().join("native-bin/pi"),
-            )
+    #[test]
+    #[serial_test::serial]
+    fn pi_extension_is_injected_only_into_a_direct_pi_launch() {
+        let home = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+
+        let mut alias = Instance::new("pi alias", "/tmp/pi-alias-launch");
+        alias.tool = "company-pi".to_string();
+        alias.detect_as = "pi".to_string();
+        alias.command = "pi".to_string();
+        let agent = alias.resolved_agent();
+        let identity_extension = (
+            " -e '/tmp/pi-aoe-session-id.js'".to_string(),
+            "AOE_SESSION_ID_FILE='/tmp/pi-session-id' ".to_string(),
+        );
+        let (command, _, _) = alias
+            .build_host_command_with_identity_extension(agent, Some(&identity_extension), None)
             .unwrap();
-            let sidecar = format!(
-                "AOE_SESSION_ID_FILE={}/{}/session_id",
-                crate::session::config::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
-                inst.id
-            );
+        let command = command.unwrap();
+        assert!(command.contains(" -e "), "{command}");
+        assert!(command.contains("AOE_SESSION_ID_FILE="));
+        assert!(command.contains("AOE_SESSION_ROOT_ONLY=0"));
+        assert!(alias.pi_extension_launched);
 
-            // Native container launches carry the publisher through the exec environment file.
-            let execution = inst.resolve_native_execution(None).unwrap();
-            let docker_env = execution.inputs.docker_env.as_ref().unwrap();
-            let value = |key| {
-                docker_env
-                    .env
-                    .iter()
-                    .rev()
-                    .find(|(name, _)| name == key)
-                    .map(|(_, value)| value.as_str())
-            };
-            assert_eq!(
-                value("AOE_SESSION_ID_FILE"),
-                Some(sidecar.split_once('=').unwrap().1)
-            );
-            assert_eq!(value("AOE_SESSION_ROOT_ONLY"), Some("0"));
+        let mut wrapper = Instance::new("pi alias wrapper", "/tmp/pi-alias-wrapper");
+        wrapper.tool = "company-pi".to_string();
+        wrapper.detect_as = "pi".to_string();
+        wrapper.command = "echo not-pi".to_string();
+        assert!(wrapper.identity_extension_launch().is_none());
+        let agent = wrapper.resolved_agent();
+        let command = wrapper.build_host_command(agent, None).unwrap().0.unwrap();
+        assert!(!command.contains("pi-aoe-session-id.js"));
+        assert!(!command.contains("AOE_SESSION_ID_FILE="));
+        assert!(!wrapper.pi_extension_launched);
 
-            let (cmd, _, _, _) = inst
-                .build_launch_command(Some(&execution))
-                .expect("a sandboxed launch line");
-            let cmd = cmd.expect("a command");
-            assert!(cmd.contains("--env-file"), "{cmd}");
-            assert!(!cmd.contains("aoe-session-id.js"), "{cmd}");
-        }
+        let mut terminated = tool_instance("pi", "/tmp/pi-terminator");
+        terminated.extra_args = "--".to_string();
+        let command = host_command(&mut terminated);
+        assert!(!command.contains(" -e "), "extension follows --: {command}");
+        assert!(!terminated.pi_extension_launched);
+    }
+
+    #[test]
+    fn yolo_envvar_value_is_quoted_and_survives_the_suspend_wrapper() {
+        let cmd = format_env_var_prefix("OPENCODE_PERMISSION", r#"{"*":"allow"}"#, "opencode");
+        assert_eq!(cmd, r#"OPENCODE_PERMISSION='{"*":"allow"}' opencode"#);
+        let wrapped = wrap_command_ignore_suspend(&cmd, "/tmp/proj", &[], &[]);
+        assert!(wrapped.contains(r#"OPENCODE_PERMISSION='{"*":"allow"}' opencode"#));
     }
 
     #[test]
@@ -1121,66 +1130,66 @@ mod tests {
 
     #[test]
     fn resume_and_fork_flags_per_agent() {
-        {
-            let sid = "019342ab-1234-7def-8901-abcdef012345";
-            for (tool, existing, expected) in [
-                ("claude", true, format!("--resume {sid}")),
-                ("claude", false, format!("--session-id {sid}")),
-                ("opencode", true, format!("--session {sid}")),
-                ("opencode", false, format!("--session {sid}")),
-                ("vibe", true, format!("--resume {sid}")),
-                ("copilot", true, format!("--session-id {sid}")),
-                ("pi", true, format!("--session {sid}")),
-                ("pi", false, format!("--session-id {sid}")),
-                ("mistral", false, String::new()),
-            ] {
-                assert_eq!(
-                    build_resume_flags(tool, sid, existing),
-                    expected,
-                    "{tool}/{existing}"
-                );
-            }
-            assert_eq!(build_resume_flags("claude", "$(rm -rf /)", true), "");
-            assert_eq!(build_resume_flags("opencode", "id; echo pwned", false), "");
-
-            for (tool, parent, child, expected) in [
-                ("codex", "parent-id", "ignored-child", "fork parent-id"),
-                (
-                    "opencode",
-                    "parent-id",
-                    "ignored-child",
-                    "--session parent-id --fork",
-                ),
-                ("cursor", "parent", "child", ""),
-                ("claude", "$(rm -rf /)", "child", ""),
-                ("claude", "parent", "; echo pwned", ""),
-            ] {
-                assert_eq!(build_fork_flags(tool, parent, child), expected, "{tool}");
-            }
+        let sid = "019342ab-1234-7def-8901-abcdef012345";
+        for (tool, existing, expected) in [
+            ("claude", true, format!("--resume {sid}")),
+            ("claude", false, format!("--session-id {sid}")),
+            ("opencode", true, format!("--session {sid}")),
+            ("opencode", false, format!("--session {sid}")),
+            ("vibe", true, format!("--resume {sid}")),
+            ("copilot", true, format!("--session-id {sid}")),
+            ("pi", true, format!("--session {sid}")),
+            ("pi", false, format!("--session-id {sid}")),
+            ("mistral", false, String::new()),
+        ] {
+            assert_eq!(
+                build_resume_flags(tool, sid, existing),
+                expected,
+                "{tool}/{existing}"
+            );
         }
-        {
-            for (tool, cmd, expected) in [
-                (
-                    "codex",
-                    "codex --some-flag",
-                    "codex fork parent-1234 --some-flag",
-                ),
-                (
-                    "opencode",
-                    "opencode",
-                    "opencode --session parent-1234 --fork",
-                ),
-            ] {
-                let mut inst = tool_instance(tool, "/tmp/x");
-                inst.agent_session_id = Some("child-ignored".to_string());
-                inst.resume_intent = ResumeIntent::Fork {
-                    from: "parent-1234".to_string(),
-                };
-                let mut cmd = cmd.to_string();
-                inst.apply_session_flags(&mut cmd, "test", crate::agents::get_agent(tool), None)
-                    .unwrap();
-                assert_eq!(cmd, expected);
-            }
+        assert_eq!(build_resume_flags("claude", "$(rm -rf /)", true), "");
+        assert_eq!(build_resume_flags("opencode", "id; echo pwned", false), "");
+
+        for (tool, parent, child, expected) in [
+            ("codex", "parent-id", "ignored-child", "fork parent-id"),
+            (
+                "opencode",
+                "parent-id",
+                "ignored-child",
+                "--session parent-id --fork",
+            ),
+            ("cursor", "parent", "child", ""),
+            ("claude", "$(rm -rf /)", "child", ""),
+            ("claude", "parent", "; echo pwned", ""),
+        ] {
+            assert_eq!(build_fork_flags(tool, parent, child), expected, "{tool}");
+        }
+    }
+
+    #[test]
+    fn fork_command_places_codex_subcommand_after_binary_and_appends_flags() {
+        for (tool, cmd, expected) in [
+            (
+                "codex",
+                "codex --some-flag",
+                "codex fork parent-1234 --some-flag",
+            ),
+            (
+                "opencode",
+                "opencode",
+                "opencode --session parent-1234 --fork",
+            ),
+        ] {
+            let mut inst = tool_instance(tool, "/tmp/x");
+            inst.agent_session_id = Some("child-ignored".to_string());
+            inst.resume_intent = ResumeIntent::Fork {
+                from: "parent-1234".to_string(),
+            };
+            let mut cmd = cmd.to_string();
+            inst.apply_session_flags(&mut cmd, "test", crate::agents::get_agent(tool), None)
+                .unwrap();
+            assert_eq!(cmd, expected);
         }
     }
 
@@ -1290,88 +1299,83 @@ mod tests {
     }
 
     #[test]
-    fn host_command_applies_yolo_color_resume_and_selected_agent() {
+    fn host_command_applies_yolo_resume_and_launch_subcommand() {
+        let mut codex = tool_instance("codex", "/tmp/test");
+        codex.yolo_mode = true;
+        let cmd = host_command(&mut codex);
+        match crate::agents::get_agent("codex")
+            .unwrap()
+            .yolo
+            .as_ref()
+            .unwrap()
         {
-            let mut codex = tool_instance("codex", "/tmp/test");
-            codex.yolo_mode = true;
-            let cmd = host_command(&mut codex);
-            match crate::agents::get_agent("codex")
-                .unwrap()
-                .yolo
-                .as_ref()
-                .unwrap()
-            {
-                crate::agents::YoloMode::CliFlag(flag) => assert!(cmd.contains(flag)),
-                crate::agents::YoloMode::EnvVar(key, _) => assert!(cmd.contains(key)),
-                crate::agents::YoloMode::AlwaysYolo => {}
-            }
-
-            let mut claude = tool_instance("claude", "/tmp/test");
-            claude.agent_session_id = Some("ses_abc123def456".to_string());
-            let cmd = host_command(&mut claude);
-            assert!(cmd.contains("ses_abc123def456"));
-            assert!(cmd.contains("--session-id") || cmd.contains("--resume"));
-
-            // Kiro must launch via `kiro-cli chat`, with yolo flags after the subcommand.
-            let mut kiro = tool_instance("kiro", "/tmp/test");
-            kiro.yolo_mode = true;
-            let cmd = host_command(&mut kiro);
-            let chat = cmd.find("kiro-cli chat").expect("chat subcommand present");
-            assert!(cmd.find("--trust-all-tools").expect("yolo flag present") > chat);
-
-            // A command override is verbatim: no injected subcommand.
-            let mut custom = tool_instance("kiro", "/tmp/test");
-            custom.command = "kiro-cli chat --trust-all-tools".to_string();
-            assert_eq!(host_command(&mut custom).matches("chat").count(), 1);
+            crate::agents::YoloMode::CliFlag(flag) => assert!(cmd.contains(flag)),
+            crate::agents::YoloMode::EnvVar(key, _) => assert!(cmd.contains(key)),
+            crate::agents::YoloMode::AlwaysYolo => {}
         }
-        {
-            let cmd = format_env_var_prefix("OPENCODE_PERMISSION", r#"{"*":"allow"}"#, "opencode");
-            assert_eq!(cmd, r#"OPENCODE_PERMISSION='{"*":"allow"}' opencode"#);
-            let wrapped = wrap_command_ignore_suspend(&cmd, "/tmp/proj", &[], &[]);
-            assert!(wrapped.contains(r#"OPENCODE_PERMISSION='{"*":"allow"}' opencode"#));
-        }
-        {
-            for (tool, command, needle, forced) in [
-                ("antigravity", "", "agy", true),
-                ("antigravity", "agy --some-flag", "agy --some-flag", true),
-                ("codex", "", "codex", true),
-                ("cursor", "", "", false),
+
+        let mut claude = tool_instance("claude", "/tmp/test");
+        claude.agent_session_id = Some("ses_abc123def456".to_string());
+        let cmd = host_command(&mut claude);
+        assert!(cmd.contains("ses_abc123def456"));
+        assert!(cmd.contains("--session-id") || cmd.contains("--resume"));
+
+        // Kiro must launch via `kiro-cli chat`, with yolo flags after the subcommand.
+        let mut kiro = tool_instance("kiro", "/tmp/test");
+        kiro.yolo_mode = true;
+        let cmd = host_command(&mut kiro);
+        let chat = cmd.find("kiro-cli chat").expect("chat subcommand present");
+        assert!(cmd.find("--trust-all-tools").expect("yolo flag present") > chat);
+
+        // A command override is verbatim: no injected subcommand.
+        let mut custom = tool_instance("kiro", "/tmp/test");
+        custom.command = "kiro-cli chat --trust-all-tools".to_string();
+        assert_eq!(host_command(&mut custom).matches("chat").count(), 1);
+    }
+
+    #[test]
+    fn host_command_forces_color_only_for_color_sensitive_agents() {
+        for (tool, command, needle, forced) in [
+            ("antigravity", "", "agy", true),
+            ("antigravity", "agy --some-flag", "agy --some-flag", true),
+            ("codex", "", "codex", true),
+            ("cursor", "", "", false),
+        ] {
+            let mut inst = tool_instance(tool, "/tmp/test");
+            inst.command = command.to_string();
+            let cmd = host_command(&mut inst);
+            assert!(cmd.contains(needle), "{cmd}");
+            for env in [
+                "env -u NO_COLOR",
+                "TERM=xterm-256color",
+                "COLORTERM=truecolor",
             ] {
-                let mut inst = tool_instance(tool, "/tmp/test");
-                inst.command = command.to_string();
-                let cmd = host_command(&mut inst);
-                assert!(cmd.contains(needle), "{cmd}");
-                for env in [
-                    "env -u NO_COLOR",
-                    "TERM=xterm-256color",
-                    "COLORTERM=truecolor",
-                ] {
-                    assert_eq!(cmd.contains(env), forced, "{tool}: {env}");
-                }
-            }
-        }
-        {
-            for (command, extra, expected) in [
-                ("", "--agent custom-agent", "custom-agent"),
-                ("kiro-cli chat --agent custom-agent", "", "custom-agent"),
-                (
-                    "kiro-cli chat --agent from-command",
-                    "--agent from-extra",
-                    "from-extra",
-                ),
-            ] {
-                let mut inst = tool_instance("kiro", "/tmp/test");
-                inst.command = command.to_string();
-                inst.extra_args = extra.to_string();
-                assert_eq!(
-                    crate::agents::parse_selected_agent(&inst.selected_agent_args(), "--agent")
-                        .as_deref(),
-                    Some(expected)
-                );
+                assert_eq!(cmd.contains(env), forced, "{tool}: {env}");
             }
         }
     }
 
+    #[test]
+    fn selected_agent_args_combines_command_and_extra_last_wins() {
+        for (command, extra, expected) in [
+            ("", "--agent custom-agent", "custom-agent"),
+            ("kiro-cli chat --agent custom-agent", "", "custom-agent"),
+            (
+                "kiro-cli chat --agent from-command",
+                "--agent from-extra",
+                "from-extra",
+            ),
+        ] {
+            let mut inst = tool_instance("kiro", "/tmp/test");
+            inst.command = command.to_string();
+            inst.extra_args = extra.to_string();
+            assert_eq!(
+                crate::agents::parse_selected_agent(&inst.selected_agent_args(), "--agent")
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+    }
     #[test]
     #[serial_test::serial]
     fn default_known_target_attempts_moved_context_without_rebinding() {
@@ -1446,100 +1450,35 @@ mod tests {
         }
     }
 
+    /// Claude reads `$CLAUDE_CONFIG_DIR/.claude.json` whenever the variable is
+    /// set, so a host launch into the default store must leave it unset (#4119).
     #[test]
     #[serial_test::serial]
-    fn host_claude_exports_only_a_non_default_or_explicitly_aliased_store() {
-        // Claude reads `$CLAUDE_CONFIG_DIR/.claude.json` whenever the variable is
-        // set, so a host launch into the default store must leave it unset (#4119).
-        {
-            let temp = tempfile::tempdir().unwrap();
-            let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
-            let _claude = crate::session::test_support::install_login_shell_path_command(
-                temp.path(),
-                "claude",
-                "#!/bin/sh\nexit 0\n",
-            );
-            let default = temp.path().join(".claude");
-            let custom = temp.path().join("custom-claude");
-            let sid = "11111111-1111-4111-8111-111111111111";
-            let canonical = |path: &std::path::Path| {
-                crate::session::capture::canonicalize_allowing_missing_leaf(path).unwrap()
+    fn host_claude_exports_its_store_only_when_it_is_not_the_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let default = temp.path().join(".claude");
+        let custom = temp.path().join("custom-claude");
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let canonical = |path: &std::path::Path| {
+            crate::session::capture::canonicalize_allowing_missing_leaf(path).unwrap()
+        };
+        for (exported, expected) in [
+            (None, None),
+            (Some(&default), Some(&default)),
+            (Some(&custom), Some(&custom)),
+        ] {
+            let _env = match exported {
+                Some(dir) => EnvGuard::set(&[("CLAUDE_CONFIG_DIR", dir)]),
+                None => EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]),
             };
-            for (exported, expected) in [
-                (None, None),
-                (Some(&default), Some(&default)),
-                (Some(&custom), Some(&custom)),
-            ] {
-                let _env = match exported {
-                    Some(dir) => EnvGuard::set(&[("CLAUDE_CONFIG_DIR", dir)]),
-                    None => EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]),
-                };
-                let expected = expected.map(|path| canonical(path));
-                let mut inst = Instance::new("claude-host-store", "/tmp");
-                let routed = |inst: &Instance| {
-                    let execution = inst
-                        .resolve_native_execution(inst.conversation_target())
-                        .unwrap();
-                    let routed = execution
-                        .routing
-                        .iter()
-                        .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
-                        .map(|(_, value)| value.as_deref().map(|value| canonical(value.as_ref())))
-                        .expect("Claude store is always routed");
-                    (routed, execution)
-                };
-                let (fresh, execution) = routed(&inst);
-                assert_eq!(fresh, expected, "exported={exported:?}");
-                let (command, _, _, _) = inst.build_launch_command(Some(&execution)).unwrap();
-                let command = command.unwrap();
-                assert_eq!(
-                    command.contains("unset CLAUDE_CONFIG_DIR"),
-                    expected.is_none(),
-                    "{command}"
-                );
-
-                // Resuming a conversation recorded in the default store keeps it unset, also from
-                // a binding recorded before the export was, and that binding still validates.
-                let mut asserted = inst.asserted_resume_binding(sid, None).unwrap();
-                inst.resume_binding = Some(asserted.clone());
-                inst.resume_intent = ResumeIntent::Use(sid.into());
-                assert_eq!(routed(&inst).0, expected, "exported={exported:?}");
-                asserted.execution.as_mut().unwrap().exported_default_store = false;
-                inst.resume_binding = Some(asserted);
-                let (legacy, execution) = routed(&inst);
-                assert_eq!(legacy, expected, "legacy exported={exported:?}");
-                inst.validate_conversation_target(&execution.binding, Some(sid))
-                    .unwrap();
-            }
-        }
-        // A store explicitly selected through a symlinked `~/.claude` is still exported, and the
-        // selection survives capture; only the implicit default stays unset.
-        {
-            let temp = tempfile::tempdir().unwrap();
-            let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
-            let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
-            let _claude = crate::session::test_support::install_login_shell_path_command(
-                temp.path(),
-                "claude",
-                "#!/bin/sh\nexit 0\n",
-            );
-            let work = temp.path().join("profiles/work");
-            std::fs::create_dir_all(&work).unwrap();
-            std::os::unix::fs::symlink(&work, temp.path().join(".claude")).unwrap();
-            let work = work.canonicalize().unwrap();
-            let declare = |profile: &str, dir: &str| {
-                let path = crate::session::config::profile_config::get_profile_config_path(profile)
-                    .unwrap();
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(
-                    &path,
-                    format!("[session.agent_config_dir]\nclaude = {dir:?}\n"),
-                )
-                .unwrap();
-            };
-            declare("alias", work.to_str().unwrap());
-            declare("literal", "~/.claude");
-            let sid = "11111111-1111-4111-8111-111111111111";
+            let expected = expected.map(|path| canonical(path));
+            let mut inst = Instance::new("claude-host-store", "/tmp");
             let routed = |inst: &Instance| {
                 let execution = inst
                     .resolve_native_execution(inst.conversation_target())
@@ -1548,70 +1487,135 @@ mod tests {
                     .routing
                     .iter()
                     .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
-                    .and_then(|(_, value)| value.clone())
-                    .map(std::path::PathBuf::from);
-                (routed, execution.binding)
+                    .map(|(_, value)| value.as_deref().map(|value| canonical(value.as_ref())))
+                    .expect("Claude store is always routed");
+                (routed, execution)
             };
-            let capture = |inst: &mut Instance, binding| {
-                inst.resume_binding = None;
-                inst.resume_intent = ResumeIntent::Default;
-                inst.set_agent_conversation(
-                    Some(sid.into()),
-                    Some(crate::session::ConversationBinding {
-                        session_id: sid.into(),
-                        execution: Some(binding),
-                        provenance: crate::session::ConversationProvenance::Observed,
-                        transcript_path: None,
-                    }),
-                    None,
-                );
-            };
+            let (fresh, execution) = routed(&inst);
+            assert_eq!(fresh, expected, "exported={exported:?}");
+            let (command, _, _, _) = inst.build_launch_command(Some(&execution)).unwrap();
+            let command = command.unwrap();
+            assert_eq!(
+                command.contains("unset CLAUDE_CONFIG_DIR"),
+                expected.is_none(),
+                "{command}"
+            );
 
-            let literal = temp.path().join(".claude");
-            for (profile, store, expected) in [
-                ("undeclared", None, None),
-                ("literal", None, None),
-                ("alias", None, Some(&work)),
-                ("undeclared", Some(&work), Some(&work)),
-                ("undeclared", Some(&literal), None),
-            ] {
-                let mut inst = Instance::new("claude-alias-store", "/tmp");
-                inst.source_profile = profile.into();
-                if let Some(store) = store {
-                    inst.resume_binding =
-                        Some(inst.asserted_resume_binding(sid, Some(store)).unwrap());
-                    inst.resume_intent = ResumeIntent::Use(sid.into());
-                }
-                let (launched, binding) = routed(&inst);
-                assert_eq!(
-                    launched.as_ref(),
-                    expected,
-                    "profile={profile} store={store:?}"
-                );
-                // The next launch resumes from the binding this launch's capture records.
-                capture(&mut inst, binding.clone());
-                inst.source_profile = "undeclared".into();
-                assert_eq!(
-                    routed(&inst).0.as_ref(),
-                    expected,
-                    "profile={profile} store={store:?}"
-                );
-                // A binding recorded before the export was kept it only while a selector names it.
-                capture(
-                    &mut inst,
-                    crate::session::ExecutionBinding {
-                        exported_default_store: false,
-                        ..binding
-                    },
-                );
-                inst.source_profile = profile.into();
-                let legacy = if store.is_some() { None } else { expected };
-                assert_eq!(
-                    routed(&inst).0.as_ref(),
-                    legacy,
-                    "legacy profile={profile} store={store:?}"
-                );
+            // Resuming a conversation recorded in the default store keeps it unset, also from
+            // a binding recorded before the export was, and that binding still validates.
+            let mut asserted = inst.asserted_resume_binding(sid, None).unwrap();
+            inst.resume_binding = Some(asserted.clone());
+            inst.resume_intent = ResumeIntent::Use(sid.into());
+            assert_eq!(routed(&inst).0, expected, "exported={exported:?}");
+            asserted.execution.as_mut().unwrap().exported_default_store = false;
+            inst.resume_binding = Some(asserted);
+            let (legacy, execution) = routed(&inst);
+            assert_eq!(legacy, expected, "legacy exported={exported:?}");
+            inst.validate_conversation_target(&execution.binding, Some(sid))
+                .unwrap();
+        }
+    }
+
+    /// A store explicitly selected through a symlinked `~/.claude` is still exported, and the
+    /// selection survives capture; only the implicit default stays unset.
+    #[test]
+    #[serial_test::serial]
+    fn explicit_alias_of_the_default_claude_store_stays_exported() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let work = temp.path().join("profiles/work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::os::unix::fs::symlink(&work, temp.path().join(".claude")).unwrap();
+        let work = work.canonicalize().unwrap();
+        let declare = |profile: &str, dir: &str| {
+            let path =
+                crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                format!("[session.agent_config_dir]\nclaude = {dir:?}\n"),
+            )
+            .unwrap();
+        };
+        declare("alias", work.to_str().unwrap());
+        declare("literal", "~/.claude");
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let routed = |inst: &Instance| {
+            let execution = inst
+                .resolve_native_execution(inst.conversation_target())
+                .unwrap();
+            let routed = execution
+                .routing
+                .iter()
+                .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                .and_then(|(_, value)| value.clone())
+                .map(std::path::PathBuf::from);
+            (routed, execution.binding)
+        };
+        let capture = |inst: &mut Instance, binding| {
+            inst.resume_binding = None;
+            inst.resume_intent = ResumeIntent::Default;
+            inst.set_agent_conversation(
+                Some(sid.into()),
+                Some(crate::session::ConversationBinding {
+                    session_id: sid.into(),
+                    execution: Some(binding),
+                    provenance: crate::session::ConversationProvenance::Observed,
+                    transcript_path: None,
+                }),
+                None,
+            );
+        };
+
+        let literal = temp.path().join(".claude");
+        for (profile, store, expected) in [
+            ("undeclared", None, None),
+            ("literal", None, None),
+            ("alias", None, Some(&work)),
+            ("undeclared", Some(&work), Some(&work)),
+            ("undeclared", Some(&literal), None),
+        ] {
+            let mut inst = Instance::new("claude-alias-store", "/tmp");
+            inst.source_profile = profile.into();
+            if let Some(store) = store {
+                inst.resume_binding = Some(inst.asserted_resume_binding(sid, Some(store)).unwrap());
+                inst.resume_intent = ResumeIntent::Use(sid.into());
             }
+            let (launched, binding) = routed(&inst);
+            assert_eq!(
+                launched.as_ref(),
+                expected,
+                "profile={profile} store={store:?}"
+            );
+            // The next launch resumes from the binding this launch's capture records.
+            capture(&mut inst, binding.clone());
+            inst.source_profile = "undeclared".into();
+            assert_eq!(
+                routed(&inst).0.as_ref(),
+                expected,
+                "profile={profile} store={store:?}"
+            );
+            // A binding recorded before the export was kept it only while a selector names it.
+            capture(
+                &mut inst,
+                crate::session::ExecutionBinding {
+                    exported_default_store: false,
+                    ..binding
+                },
+            );
+            inst.source_profile = profile.into();
+            let legacy = if store.is_some() { None } else { expected };
+            assert_eq!(
+                routed(&inst).0.as_ref(),
+                legacy,
+                "legacy profile={profile} store={store:?}"
+            );
         }
     }
 
