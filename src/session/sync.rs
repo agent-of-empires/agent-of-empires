@@ -1477,7 +1477,6 @@ mod tests {
     #[test]
     #[serial]
     fn failed_pi_path_write_does_not_reattach_after_execution_change() {
-        use crate::session::instance::FAIL_PI_PATH_WRITES;
         let temp = tempdir().unwrap();
         let _guard = storage_home_guard(&temp);
         let profile = "sync-pi-stale-after-failed-path";
@@ -1523,13 +1522,6 @@ mod tests {
         let poller = Arc::new(Mutex::new(poller));
         inst.session_id_poller = Some(poller.clone());
 
-        FAIL_PI_PATH_WRITES.with(|fail| fail.set(true));
-        let mut instances = [inst];
-        drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
-        FAIL_PI_PATH_WRITES.with(|fail| fail.set(false));
-        assert_eq!(instances[0].pi_session_path, None);
-        assert!(poller.lock().unwrap().latest_observation().is_some());
-
         let mut next_execution = execution;
         next_execution.launch_id = uuid::Uuid::new_v4().to_string();
         next_execution.binding.stores = vec!["/tmp/peer-pi-store".into()];
@@ -1539,24 +1531,39 @@ mod tests {
             provenance: crate::session::ConversationProvenance::Observed,
             transcript_path: None,
         };
-        instances[0].active_execution = Some(next_execution.clone());
-        instances[0].agent_session_binding = Some(next_binding.clone());
-        let storage = Storage::new_unwatched(profile).unwrap();
-        storage
-            .update(|rows, _| {
-                rows[0].active_execution = Some(next_execution.clone());
-                rows[0].agent_session_binding = Some(next_binding.clone());
-                Ok(())
-            })
-            .unwrap();
+        let hook_execution = next_execution.clone();
+        let hook_binding = next_binding.clone();
+        let hook_profile = profile.to_string();
+        let _hook = Instance::set_after_final_pi_drain_hook_for_test(move |inst| {
+            assert_eq!(inst.pi_session_path, None);
+            assert!(inst.session_id_poller.is_some());
+            assert!(crate::session::sync::pending_poller_observation_matches(
+                inst,
+                |observation| inst.observation_is_current_pi_path(observation),
+            ));
+            inst.active_execution = Some(hook_execution.clone());
+            inst.agent_session_binding = Some(hook_binding.clone());
+            let storage = Storage::new_unwatched(&hook_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows[0].active_execution = Some(hook_execution.clone());
+                    rows[0].agent_session_binding = Some(hook_binding.clone());
+                    Ok(())
+                })
+                .unwrap();
+        });
 
-        let outcome = drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
-        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
-        assert_eq!(instances[0].pi_session_path, None);
-        assert!(poller.lock().unwrap().latest_observation().is_none());
+        inst.fail_next_pi_path_write_for_test();
+        inst.stop_and_flush_poller();
+
+        assert!(inst.session_id_poller.is_none());
+        assert_eq!(inst.pi_session_path, None);
         let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
+        assert_eq!(stored[0].agent_session_id.as_deref(), Some(sid));
         assert_eq!(stored[0].pi_session_path, None);
         assert_eq!(stored[0].active_execution, Some(next_execution));
+        assert_eq!(stored[0].agent_session_binding, Some(next_binding));
+        assert!(poller.lock().unwrap().latest_observation().is_some());
     }
 
     #[test]
