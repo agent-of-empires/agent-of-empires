@@ -45,54 +45,54 @@ mod tests {
     }
 
     #[test]
-    fn rename_default_theme_cases() {
-        // renames default to zinc
-        {
-            let (_dir, path) = write(
-                r#"
-    [theme]
-    name = "default"
-    idle_decay_minutes = 5
-    "#,
-            );
-            rename_theme(&path).unwrap();
-            let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-            let theme = result.get("theme").and_then(|t| t.as_table()).unwrap();
-            assert_eq!(theme.get("name").and_then(|v| v.as_str()), Some("zinc"));
-            assert_eq!(
-                theme.get("idle_decay_minutes").and_then(|v| v.as_integer()),
-                Some(5),
-                "unrelated keys are preserved"
-            );
-        }
-        // leaves other themes untouched
-        {
-            let (_dir, path) = write(
-                r#"
-    [theme]
-    name = "empire"
-    "#,
-            );
-            let before = fs::read_to_string(&path).unwrap();
-            rename_theme(&path).unwrap();
-            assert_eq!(before, fs::read_to_string(&path).unwrap());
-        }
-        // idempotent when no theme pinned
-        {
-            let (_dir, path) = write(
-                r#"
-    [session]
-    default_tool = "claude"
-    "#,
-            );
-            let before = fs::read_to_string(&path).unwrap();
-            rename_theme(&path).unwrap();
-            assert_eq!(before, fs::read_to_string(&path).unwrap());
-        }
-        // missing file is a noop
-        {
-            let dir = tempfile::TempDir::new().unwrap();
-            assert!(rename_theme(&dir.path().join("nope.toml")).is_ok());
-        }
+    fn renames_default_to_zinc() {
+        let (_dir, path) = write(
+            r#"
+[theme]
+name = "default"
+idle_decay_minutes = 5
+"#,
+        );
+        rename_theme(&path).unwrap();
+        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+        let theme = result.get("theme").and_then(|t| t.as_table()).unwrap();
+        assert_eq!(theme.get("name").and_then(|v| v.as_str()), Some("zinc"));
+        assert_eq!(
+            theme.get("idle_decay_minutes").and_then(|v| v.as_integer()),
+            Some(5),
+            "unrelated keys are preserved"
+        );
+    }
+
+    #[test]
+    fn leaves_other_themes_untouched() {
+        let (_dir, path) = write(
+            r#"
+[theme]
+name = "empire"
+"#,
+        );
+        let before = fs::read_to_string(&path).unwrap();
+        rename_theme(&path).unwrap();
+        assert_eq!(before, fs::read_to_string(&path).unwrap());
+    }
+
+    #[test]
+    fn idempotent_when_no_theme_pinned() {
+        let (_dir, path) = write(
+            r#"
+[session]
+default_tool = "claude"
+"#,
+        );
+        let before = fs::read_to_string(&path).unwrap();
+        rename_theme(&path).unwrap();
+        assert_eq!(before, fs::read_to_string(&path).unwrap());
+    }
+
+    #[test]
+    fn missing_file_is_a_noop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(rename_theme(&dir.path().join("nope.toml")).is_ok());
     }
 }

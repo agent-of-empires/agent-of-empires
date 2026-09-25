@@ -294,177 +294,178 @@ mod tests {
     use super::*;
 
     #[test]
-    fn acp_rename_cases() {
-        // renames config section and drops keys
+    fn renames_config_section_and_drops_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[other]\nk = \"v\"\n\n[cockpit]\nenabled = true\ndefault_for_claude = false\ndefault_agent = \"aoe-agent\"\nmax_concurrent_workers = 5\n",
+        )
+        .unwrap();
+
+        migrate_config_file(&path).unwrap();
+
+        let doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert!(!doc.contains_key("cockpit"));
+        let acp = doc["acp"].as_table().unwrap();
+        assert!(!acp.contains_key("enabled"));
+        assert!(!acp.contains_key("default_for_claude"));
+        assert_eq!(acp["default_agent"].as_str(), Some("aoe-agent"));
+        assert_eq!(acp["max_concurrent_workers"].as_integer(), Some(5));
+        assert!(doc.contains_key("other"));
+
+        // Idempotent.
+        migrate_config_file(&path).unwrap();
+        let doc2: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert!(!doc2.contains_key("cockpit"));
+        assert!(doc2.contains_key("acp"));
+    }
+
+    #[test]
+    fn migrates_session_keys_and_view_enum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        fs::write(
+            &path,
+            r#"[
+              {"id":"a","cockpit_mode":true,"cockpit_agent":"claude-code","cockpit_model":"opus","cockpit_acp_session_id":"x"},
+              {"id":"b","cockpit_mode":false,"cockpit_agent":"gemini"},
+              {"id":"c","title":"plain tmux"}
+            ]"#,
+        )
+        .unwrap();
+
+        migrate_sessions_file(&path).unwrap();
+
+        let arr: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        // structured session: cockpit_mode=true -> view="structured".
+        let a = &arr[0];
+        assert_eq!(a["view"], serde_json::json!("structured"));
+        assert_eq!(a["agent_name"], serde_json::json!("claude-code"));
+        assert_eq!(a["agent_model"], serde_json::json!("opus"));
+        assert_eq!(a["acp_session_id"], serde_json::json!("x"));
+        assert!(a.get("cockpit_mode").is_none());
+        assert!(a.get("cockpit_agent").is_none());
+        // terminal session: cockpit_mode=false -> no `view` key (default terminal).
+        let b = &arr[1];
+        assert!(b.get("cockpit_mode").is_none());
+        assert!(b.get("view").is_none());
+        assert_eq!(b["agent_name"], serde_json::json!("gemini"));
+        // A plain session without the keys is untouched.
+        assert_eq!(arr[2]["title"], serde_json::json!("plain tmux"));
+
+        // Idempotent.
+        migrate_sessions_file(&path).unwrap();
+        let arr2: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(arr2[0]["view"], serde_json::json!("structured"));
+        assert!(arr2[1].get("view").is_none());
+    }
+
+    #[test]
+    fn relocates_workers_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("cockpit-workers");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("s1.json"), "{}").unwrap();
+
+        relocate_workers_dir(dir.path()).unwrap();
+
+        assert!(!old.exists());
+        assert!(dir.path().join("acp-workers").join("s1.json").exists());
+    }
+
+    #[test]
+    fn relocates_events_db_renaming_file_and_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("cockpit_events.db");
+        // Seed an old-shape transcript db: cockpit_* tables, indexes, one row.
         {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("config.toml");
-            fs::write(
-                &path,
-                "[other]\nk = \"v\"\n\n[cockpit]\nenabled = true\ndefault_for_claude = false\ndefault_agent = \"aoe-agent\"\nmax_concurrent_workers = 5\n",
+            let conn = rusqlite::Connection::open(&old).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE cockpit_events (session_id TEXT, seq INTEGER, event_json TEXT, created_at INTEGER, PRIMARY KEY (session_id, seq));
+                 CREATE INDEX idx_cockpit_events_session_seq ON cockpit_events(session_id, seq);
+                 CREATE INDEX idx_cockpit_events_session_created_at ON cockpit_events(session_id, created_at);
+                 CREATE TABLE cockpit_attachments (session_id TEXT, attachment_id TEXT, PRIMARY KEY (session_id, attachment_id));
+                 CREATE INDEX idx_cockpit_attachments_session_seq ON cockpit_attachments(session_id);
+                 INSERT INTO cockpit_events VALUES ('sess-1', 1, '{\"x\":1}', 42);",
             )
             .unwrap();
-
-            migrate_config_file(&path).unwrap();
-
-            let doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-            assert!(!doc.contains_key("cockpit"));
-            let acp = doc["acp"].as_table().unwrap();
-            assert!(!acp.contains_key("enabled"));
-            assert!(!acp.contains_key("default_for_claude"));
-            assert_eq!(acp["default_agent"].as_str(), Some("aoe-agent"));
-            assert_eq!(acp["max_concurrent_workers"].as_integer(), Some(5));
-            assert!(doc.contains_key("other"));
-
-            // Idempotent.
-            migrate_config_file(&path).unwrap();
-            let doc2: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-            assert!(!doc2.contains_key("cockpit"));
-            assert!(doc2.contains_key("acp"));
         }
-        // migrates session keys and view enum
-        {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("sessions.json");
-            fs::write(
-                &path,
-                r#"[
-                  {"id":"a","cockpit_mode":true,"cockpit_agent":"claude-code","cockpit_model":"opus","cockpit_acp_session_id":"x"},
-                  {"id":"b","cockpit_mode":false,"cockpit_agent":"gemini"},
-                  {"id":"c","title":"plain tmux"}
-                ]"#,
+
+        relocate_events_db(dir.path()).unwrap();
+
+        let new = dir.path().join("acp_events.db");
+        assert!(!old.exists(), "old db file should be renamed away");
+        assert!(new.exists(), "new db file should exist");
+        let conn = rusqlite::Connection::open(&new).unwrap();
+        // Table renamed, row preserved (history intact).
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_events WHERE session_id = 'sess-1'",
+                [],
+                |r| r.get(0),
             )
             .unwrap();
+        assert_eq!(n, 1, "transcript row must survive the rename");
+        // Old table name is gone; new attachment table exists.
+        let old_tbl: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cockpit_events'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_tbl, 0);
+        let att: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='acp_attachments'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(att, 1);
 
-            migrate_sessions_file(&path).unwrap();
+        // Idempotent: a second run is a no-op (new db already present, old gone).
+        relocate_events_db(dir.path()).unwrap();
+        assert!(new.exists());
+    }
 
-            let arr: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-            // structured session: cockpit_mode=true -> view="structured".
-            let a = &arr[0];
-            assert_eq!(a["view"], serde_json::json!("structured"));
-            assert_eq!(a["agent_name"], serde_json::json!("claude-code"));
-            assert_eq!(a["agent_model"], serde_json::json!("opus"));
-            assert_eq!(a["acp_session_id"], serde_json::json!("x"));
-            assert!(a.get("cockpit_mode").is_none());
-            assert!(a.get("cockpit_agent").is_none());
-            // terminal session: cockpit_mode=false -> no `view` key (default terminal).
-            let b = &arr[1];
-            assert!(b.get("cockpit_mode").is_none());
-            assert!(b.get("view").is_none());
-            assert_eq!(b["agent_name"], serde_json::json!("gemini"));
-            // A plain session without the keys is untouched.
-            assert_eq!(arr[2]["title"], serde_json::json!("plain tmux"));
-
-            // Idempotent.
-            migrate_sessions_file(&path).unwrap();
-            let arr2: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-            assert_eq!(arr2[0]["view"], serde_json::json!("structured"));
-            assert!(arr2[1].get("view").is_none());
-        }
-        // relocates workers dir
+    #[test]
+    fn relocates_events_db_merges_orphaned_history_on_round_trip() {
+        // Simulates a round-trip: a prior PR-branch run left an empty
+        // `acp_events.db` while the real history stayed in `cockpit_events.db`.
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("cockpit_events.db");
+        let new = dir.path().join("acp_events.db");
         {
-            let dir = tempfile::tempdir().unwrap();
-            let old = dir.path().join("cockpit-workers");
-            fs::create_dir_all(&old).unwrap();
-            fs::write(old.join("s1.json"), "{}").unwrap();
-
-            relocate_workers_dir(dir.path()).unwrap();
-
-            assert!(!old.exists());
-            assert!(dir.path().join("acp-workers").join("s1.json").exists());
+            // Orphaned old db with real history.
+            let oc = rusqlite::Connection::open(&old).unwrap();
+            oc.execute_batch(
+                "CREATE TABLE cockpit_events (session_id TEXT, seq INTEGER, event_json TEXT, created_at INTEGER, PRIMARY KEY (session_id, seq));
+                 INSERT INTO cockpit_events VALUES ('s1', 1, '{\"a\":1}', 10), ('s1', 2, '{\"a\":2}', 20);",
+            )
+            .unwrap();
+            // Empty new db created by the prior PR run (acp schema, no rows).
+            let nc = rusqlite::Connection::open(&new).unwrap();
+            nc.execute_batch(
+                "CREATE TABLE acp_events (session_id TEXT, seq INTEGER, event_json TEXT, created_at INTEGER, PRIMARY KEY (session_id, seq));",
+            )
+            .unwrap();
         }
-        // relocates events db renaming file and tables
-        {
-            let dir = tempfile::tempdir().unwrap();
-            let old = dir.path().join("cockpit_events.db");
-            // Seed an old-shape transcript db: cockpit_* tables, indexes, one row.
-            {
-                let conn = rusqlite::Connection::open(&old).unwrap();
-                conn.execute_batch(
-                    "CREATE TABLE cockpit_events (session_id TEXT, seq INTEGER, event_json TEXT, created_at INTEGER, PRIMARY KEY (session_id, seq));
-                     CREATE INDEX idx_cockpit_events_session_seq ON cockpit_events(session_id, seq);
-                     CREATE INDEX idx_cockpit_events_session_created_at ON cockpit_events(session_id, created_at);
-                     CREATE TABLE cockpit_attachments (session_id TEXT, attachment_id TEXT, PRIMARY KEY (session_id, attachment_id));
-                     CREATE INDEX idx_cockpit_attachments_session_seq ON cockpit_attachments(session_id);
-                     INSERT INTO cockpit_events VALUES ('sess-1', 1, '{\"x\":1}', 42);",
-                )
-                .unwrap();
-            }
 
-            relocate_events_db(dir.path()).unwrap();
+        relocate_events_db(dir.path()).unwrap();
 
-            let new = dir.path().join("acp_events.db");
-            assert!(!old.exists(), "old db file should be renamed away");
-            assert!(new.exists(), "new db file should exist");
-            let conn = rusqlite::Connection::open(&new).unwrap();
-            // Table renamed, row preserved (history intact).
-            let n: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM acp_events WHERE session_id = 'sess-1'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(n, 1, "transcript row must survive the rename");
-            // Old table name is gone; new attachment table exists.
-            let old_tbl: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cockpit_events'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(old_tbl, 0);
-            let att: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='acp_attachments'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(att, 1);
-
-            // Idempotent: a second run is a no-op (new db already present, old gone).
-            relocate_events_db(dir.path()).unwrap();
-            assert!(new.exists());
-        }
-        // relocates events db merges orphaned history on round trip
-        {
-            // Simulates a round-trip: a prior PR-branch run left an empty
-            // `acp_events.db` while the real history stayed in `cockpit_events.db`.
-            let dir = tempfile::tempdir().unwrap();
-            let old = dir.path().join("cockpit_events.db");
-            let new = dir.path().join("acp_events.db");
-            {
-                // Orphaned old db with real history.
-                let oc = rusqlite::Connection::open(&old).unwrap();
-                oc.execute_batch(
-                    "CREATE TABLE cockpit_events (session_id TEXT, seq INTEGER, event_json TEXT, created_at INTEGER, PRIMARY KEY (session_id, seq));
-                     INSERT INTO cockpit_events VALUES ('s1', 1, '{\"a\":1}', 10), ('s1', 2, '{\"a\":2}', 20);",
-                )
-                .unwrap();
-                // Empty new db created by the prior PR run (acp schema, no rows).
-                let nc = rusqlite::Connection::open(&new).unwrap();
-                nc.execute_batch(
-                    "CREATE TABLE acp_events (session_id TEXT, seq INTEGER, event_json TEXT, created_at INTEGER, PRIMARY KEY (session_id, seq));",
-                )
-                .unwrap();
-            }
-
-            relocate_events_db(dir.path()).unwrap();
-
-            assert!(!old.exists(), "orphaned old db must be removed after merge");
-            let conn = rusqlite::Connection::open(&new).unwrap();
-            let n: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM acp_events WHERE session_id = 's1'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(n, 2, "both orphaned rows must be merged into acp_events");
-        }
+        assert!(!old.exists(), "orphaned old db must be removed after merge");
+        let conn = rusqlite::Connection::open(&new).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM acp_events WHERE session_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2, "both orphaned rows must be merged into acp_events");
     }
 }

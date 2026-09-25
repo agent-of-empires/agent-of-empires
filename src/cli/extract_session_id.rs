@@ -335,41 +335,40 @@ mod tests {
 
     #[test]
     #[serial_test::serial(hook_base)]
-    fn only_the_canonical_source_writes_the_leaf() {
-        // canonical source routes to suffixed leaf
-        {
-            let (_g, base, _tmp) = BaseGuard::ready();
-            let source = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-            let payload = r#"{"session_id":"11111111-2222-3333-4444-555555555555"}"#;
-            run_inner(
-                payload.as_bytes(),
-                "sourced",
-                crate::agents::HookIdentityField::SessionId,
-                Some(source),
-            )
-            .unwrap();
-            assert_eq!(
-                read_suffixed_sidecar(&base, "sourced", source).as_deref(),
-                Some("11111111-2222-3333-4444-555555555555")
-            );
-            assert!(
-                read_sidecar(&base, "sourced").is_none(),
-                "a sourced write must not touch the default leaf"
-            );
-        }
-        // non canonical source refuses the write
-        {
-            let (_g, base, _tmp) = BaseGuard::ready();
-            let payload = r#"{"session_id":"11111111-2222-3333-4444-555555555555"}"#;
-            let err = run_inner(
-                payload.as_bytes(),
-                "bad_source",
-                crate::agents::HookIdentityField::SessionId,
-                Some("not-a-uuid"),
-            )
-            .unwrap_err();
-            assert!(err.to_string().contains("UUID"), "got: {err}");
-            assert!(read_sidecar(&base, "bad_source").is_none());
-        }
+    fn canonical_source_routes_to_suffixed_leaf() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let source = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let payload = r#"{"session_id":"11111111-2222-3333-4444-555555555555"}"#;
+        run_inner(
+            payload.as_bytes(),
+            "sourced",
+            crate::agents::HookIdentityField::SessionId,
+            Some(source),
+        )
+        .unwrap();
+        assert_eq!(
+            read_suffixed_sidecar(&base, "sourced", source).as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+        assert!(
+            read_sidecar(&base, "sourced").is_none(),
+            "a sourced write must not touch the default leaf"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn non_canonical_source_refuses_the_write() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let payload = r#"{"session_id":"11111111-2222-3333-4444-555555555555"}"#;
+        let err = run_inner(
+            payload.as_bytes(),
+            "bad_source",
+            crate::agents::HookIdentityField::SessionId,
+            Some("not-a-uuid"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("UUID"), "got: {err}");
+        assert!(read_sidecar(&base, "bad_source").is_none());
     }
 }

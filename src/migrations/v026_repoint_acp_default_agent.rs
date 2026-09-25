@@ -65,80 +65,80 @@ mod tests {
     }
 
     #[test]
-    fn repoint_acp_default_agent_cases() {
-        // rewrites only the seeded aoe agent
-        {
-            let cases = [
-                // The serialized old default: the case this migration exists for.
-                (
-                    "[acp]\ndefault_agent = \"aoe-agent\"\n",
-                    Some("claude-code"),
-                ),
-                // A deliberate choice of any other agent survives.
-                ("[acp]\ndefault_agent = \"codex\"\n", Some("codex")),
-                // Already repointed, by an earlier run or a fresh install.
-                (
-                    "[acp]\ndefault_agent = \"claude-code\"\n",
-                    Some("claude-code"),
-                ),
-                // An absent key already resolves to the new default.
-                ("[acp]\nreplay_events = 0\n", None),
-                // No [acp] table at all.
-                ("[theme]\nname = \"empire\"\n", None),
-            ];
-            for (content, expected) in cases {
-                assert_eq!(
-                    default_agent_after(content).as_deref(),
-                    expected,
-                    "{content:?}"
-                );
-            }
-        }
-        // preserves other settings and is idempotent
-        {
-            let (_dir, path) = write(
-                "[acp]\ndefault_agent = \"aoe-agent\"\nmax_concurrent_workers = 5\n\n\
-                 [theme]\nname = \"rose-pine\"\n",
-            );
-
-            run_in(&path).unwrap();
-            let first = fs::read_to_string(&path).unwrap();
-            let doc: toml::Table = first.parse().unwrap();
-            let acp = doc.get("acp").unwrap().as_table().unwrap();
+    fn rewrites_only_the_seeded_aoe_agent() {
+        let cases = [
+            // The serialized old default: the case this migration exists for.
+            (
+                "[acp]\ndefault_agent = \"aoe-agent\"\n",
+                Some("claude-code"),
+            ),
+            // A deliberate choice of any other agent survives.
+            ("[acp]\ndefault_agent = \"codex\"\n", Some("codex")),
+            // Already repointed, by an earlier run or a fresh install.
+            (
+                "[acp]\ndefault_agent = \"claude-code\"\n",
+                Some("claude-code"),
+            ),
+            // An absent key already resolves to the new default.
+            ("[acp]\nreplay_events = 0\n", None),
+            // No [acp] table at all.
+            ("[theme]\nname = \"empire\"\n", None),
+        ];
+        for (content, expected) in cases {
             assert_eq!(
-                acp.get("default_agent").and_then(|v| v.as_str()),
-                Some("claude-code")
-            );
-            assert_eq!(
-                acp.get("max_concurrent_workers")
-                    .and_then(|v| v.as_integer()),
-                Some(5),
-                "sibling acp settings must survive the rewrite"
-            );
-            assert_eq!(
-                doc.get("theme")
-                    .and_then(|t| t.as_table())
-                    .and_then(|t| t.get("name"))
-                    .and_then(|v| v.as_str()),
-                Some("rose-pine"),
-                "unrelated sections must survive the rewrite"
-            );
-
-            run_in(&path).unwrap();
-            assert_eq!(
-                first,
-                fs::read_to_string(&path).unwrap(),
-                "a second run must not rewrite the file"
+                default_agent_after(content).as_deref(),
+                expected,
+                "{content:?}"
             );
         }
-        // A missing or unparsable config is skipped, never a startup-aborting
-        // error: this migration corrects a default, so it must not brick boot.
-        {
-            let dir = tempfile::TempDir::new().unwrap();
-            assert!(run_in(&dir.path().join("nope.toml")).is_ok());
+    }
 
-            let (_dir, path) = write("this is not = = toml");
-            assert!(run_in(&path).is_ok());
-        }
+    #[test]
+    fn preserves_other_settings_and_is_idempotent() {
+        let (_dir, path) = write(
+            "[acp]\ndefault_agent = \"aoe-agent\"\nmax_concurrent_workers = 5\n\n\
+             [theme]\nname = \"rose-pine\"\n",
+        );
+
+        run_in(&path).unwrap();
+        let first = fs::read_to_string(&path).unwrap();
+        let doc: toml::Table = first.parse().unwrap();
+        let acp = doc.get("acp").unwrap().as_table().unwrap();
+        assert_eq!(
+            acp.get("default_agent").and_then(|v| v.as_str()),
+            Some("claude-code")
+        );
+        assert_eq!(
+            acp.get("max_concurrent_workers")
+                .and_then(|v| v.as_integer()),
+            Some(5),
+            "sibling acp settings must survive the rewrite"
+        );
+        assert_eq!(
+            doc.get("theme")
+                .and_then(|t| t.as_table())
+                .and_then(|t| t.get("name"))
+                .and_then(|v| v.as_str()),
+            Some("rose-pine"),
+            "unrelated sections must survive the rewrite"
+        );
+
+        run_in(&path).unwrap();
+        assert_eq!(
+            first,
+            fs::read_to_string(&path).unwrap(),
+            "a second run must not rewrite the file"
+        );
+    }
+
+    /// A missing or unparsable config is skipped, never a startup-aborting
+    /// error: this migration corrects a default, so it must not brick boot.
+    #[test]
+    fn unusable_config_is_a_noop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(run_in(&dir.path().join("nope.toml")).is_ok());
+
+        let (_dir, path) = write("this is not = = toml");
+        assert!(run_in(&path).is_ok());
     }
 }

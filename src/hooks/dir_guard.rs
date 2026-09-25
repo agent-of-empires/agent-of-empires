@@ -662,35 +662,17 @@ mod tests {
 
     #[test]
     #[serial(hook_base)]
-    fn init_rejects_and_caches_a_symlinked_base() {
-        // init rejects symlink at base
-        {
-            let (_g, base, tmp) = BaseGuard::fresh();
-            let target = tmp.path().join("decoy");
-            std::fs::create_dir_all(&target).unwrap();
-            std::os::unix::fs::symlink(&target, &base).unwrap();
-            let err = with_hook_base(|_| Ok(())).unwrap_err();
-            let s = format!("{err:#}");
-            assert!(
-                s.contains("symlink") || s.contains("ELOOP") || s.contains("Too many levels"),
-                "expected symlink rejection, got: {s}"
-            );
-        }
-        // init caches error
-        {
-            let (_g, base, tmp) = BaseGuard::fresh();
-            let target = tmp.path().join("decoy2");
-            std::fs::create_dir_all(&target).unwrap();
-            std::os::unix::fs::symlink(&target, &base).unwrap();
-            let _ = with_hook_base(|_| Ok(())).unwrap_err();
-            let after_first = open_calls();
-            let _ = with_hook_base(|_| Ok(())).unwrap_err();
-            assert_eq!(
-                open_calls(),
-                after_first,
-                "second call must reuse cached error, not re-attempt open"
-            );
-        }
+    fn init_rejects_symlink_at_base() {
+        let (_g, base, tmp) = BaseGuard::fresh();
+        let target = tmp.path().join("decoy");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &base).unwrap();
+        let err = with_hook_base(|_| Ok(())).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(
+            s.contains("symlink") || s.contains("ELOOP") || s.contains("Too many levels"),
+            "expected symlink rejection, got: {s}"
+        );
     }
 
     /// Any bit past `0o700`, and any of setuid, setgid or sticky, rejects the
@@ -756,6 +738,23 @@ mod tests {
 
     #[test]
     #[serial(hook_base)]
+    fn init_caches_error() {
+        let (_g, base, tmp) = BaseGuard::fresh();
+        let target = tmp.path().join("decoy2");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &base).unwrap();
+        let _ = with_hook_base(|_| Ok(())).unwrap_err();
+        let after_first = open_calls();
+        let _ = with_hook_base(|_| Ok(())).unwrap_err();
+        assert_eq!(
+            open_calls(),
+            after_first,
+            "second call must reuse cached error, not re-attempt open"
+        );
+    }
+
+    #[test]
+    #[serial(hook_base)]
     fn instance_dir_is_private_and_round_trips_files() {
         let (_g, base, _tmp) = BaseGuard::fresh();
         make_correct_base(&base);
@@ -798,51 +797,50 @@ mod tests {
 
     #[test]
     #[serial(hook_base)]
-    fn leaf_symlinks_are_neither_read_nor_written() {
-        // read file at rejects symlink leaf
-        {
-            let (_g, base, tmp) = BaseGuard::fresh();
-            make_correct_base(&base);
-            let dir = open_instance_dir("sym_read").unwrap();
-            // Plant a symlink leaf using std (path-based; we own the dir 0o700).
-            let canary = tmp.path().join("canary_text");
-            std::fs::write(&canary, b"sensitive").unwrap();
-            std::os::unix::fs::symlink(&canary, base.join("sym_read").join("status")).unwrap();
-            // Reader must NOT follow.
-            let res = read_file_at(dir.as_fd(), "status", 64).unwrap();
-            assert!(
-                res.is_none(),
-                "read_file_at must refuse symlink leaves, got {res:?}"
-            );
-            // Canary remains intact.
-            let mut s = String::new();
-            std::fs::File::open(&canary)
-                .unwrap()
-                .read_to_string(&mut s)
-                .unwrap();
-            assert_eq!(s, "sensitive");
-        }
-        // write short rejects symlink leaf
-        {
-            let (_g, base, tmp) = BaseGuard::fresh();
-            make_correct_base(&base);
-            let dir = open_instance_dir("sym_write").unwrap();
-            let canary = tmp.path().join("canary_text2");
-            std::fs::write(&canary, b"untouched").unwrap();
-            std::os::unix::fs::symlink(&canary, base.join("sym_write").join("status")).unwrap();
-            let err = write_short(dir.as_fd(), "status", b"running").unwrap_err();
-            let s = format!("{err:#}");
-            assert!(
-                s.contains("ELOOP") || s.contains("Too many levels") || s.contains("symlink"),
-                "expected ELOOP, got: {s}"
-            );
-            let mut got = String::new();
-            std::fs::File::open(&canary)
-                .unwrap()
-                .read_to_string(&mut got)
-                .unwrap();
-            assert_eq!(got, "untouched");
-        }
+    fn read_file_at_rejects_symlink_leaf() {
+        let (_g, base, tmp) = BaseGuard::fresh();
+        make_correct_base(&base);
+        let dir = open_instance_dir("sym_read").unwrap();
+        // Plant a symlink leaf using std (path-based; we own the dir 0o700).
+        let canary = tmp.path().join("canary_text");
+        std::fs::write(&canary, b"sensitive").unwrap();
+        std::os::unix::fs::symlink(&canary, base.join("sym_read").join("status")).unwrap();
+        // Reader must NOT follow.
+        let res = read_file_at(dir.as_fd(), "status", 64).unwrap();
+        assert!(
+            res.is_none(),
+            "read_file_at must refuse symlink leaves, got {res:?}"
+        );
+        // Canary remains intact.
+        let mut s = String::new();
+        std::fs::File::open(&canary)
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
+        assert_eq!(s, "sensitive");
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn write_short_rejects_symlink_leaf() {
+        let (_g, base, tmp) = BaseGuard::fresh();
+        make_correct_base(&base);
+        let dir = open_instance_dir("sym_write").unwrap();
+        let canary = tmp.path().join("canary_text2");
+        std::fs::write(&canary, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&canary, base.join("sym_write").join("status")).unwrap();
+        let err = write_short(dir.as_fd(), "status", b"running").unwrap_err();
+        let s = format!("{err:#}");
+        assert!(
+            s.contains("ELOOP") || s.contains("Too many levels") || s.contains("symlink"),
+            "expected ELOOP, got: {s}"
+        );
+        let mut got = String::new();
+        std::fs::File::open(&canary)
+            .unwrap()
+            .read_to_string(&mut got)
+            .unwrap();
+        assert_eq!(got, "untouched");
     }
 
     #[test]

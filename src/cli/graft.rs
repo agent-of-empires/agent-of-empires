@@ -99,39 +99,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn graft_keeps_core_and_rejects_unknown() {
-        // augmented command keeps core subcommands
-        {
-            let core: HashSet<String> = Cli::command()
-                .get_subcommands()
-                .map(|s| s.get_name().to_string())
-                .collect();
-            let augmented: HashSet<String> = augmented_command()
-                .get_subcommands()
-                .map(|s| s.get_name().to_string())
-                .collect();
-            assert_eq!(core, augmented);
-            assert!(augmented.contains("add"));
-        }
-        // graft onto skips core and duplicate names
-        {
-            let commands = vec![
-                pc("acme.kit", "add"),
-                pc("acme.kit", "do-thing"),
-                pc("acme.other", "do-thing"),
-            ];
-            let cmd = graft_onto(Cli::command(), commands);
-            let names: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
-            assert_eq!(names.iter().filter(|n| **n == "add").count(), 1);
-            assert_eq!(names.iter().filter(|n| **n == "do-thing").count(), 1);
-        }
-        // dispatch rejects unknown command
-        {
-            let matches = Cli::command()
-                .try_get_matches_from(["aoe", "agents"])
-                .expect("core agents parses");
-            assert!(dispatch_plugin_command(&matches).is_err());
-        }
+    fn augmented_command_keeps_core_subcommands() {
+        let core: HashSet<String> = Cli::command()
+            .get_subcommands()
+            .map(|s| s.get_name().to_string())
+            .collect();
+        let augmented: HashSet<String> = augmented_command()
+            .get_subcommands()
+            .map(|s| s.get_name().to_string())
+            .collect();
+        assert_eq!(core, augmented);
+        assert!(augmented.contains("add"));
     }
 
     fn pc(plugin_id: &str, name: &str) -> PluginCommand {
@@ -140,6 +118,27 @@ mod tests {
             name: name.to_string(),
             title: String::new(),
         }
+    }
+
+    #[test]
+    fn graft_onto_skips_core_and_duplicate_names() {
+        let commands = vec![
+            pc("acme.kit", "add"),
+            pc("acme.kit", "do-thing"),
+            pc("acme.other", "do-thing"),
+        ];
+        let cmd = graft_onto(Cli::command(), commands);
+        let names: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
+        assert_eq!(names.iter().filter(|n| **n == "add").count(), 1);
+        assert_eq!(names.iter().filter(|n| **n == "do-thing").count(), 1);
+    }
+
+    #[test]
+    fn dispatch_rejects_unknown_command() {
+        let matches = Cli::command()
+            .try_get_matches_from(["aoe", "agents"])
+            .expect("core agents parses");
+        assert!(dispatch_plugin_command(&matches).is_err());
     }
 
     fn parse(args: &[&str]) -> Cli {
@@ -153,33 +152,31 @@ mod tests {
     }
 
     #[test]
-    fn disabled_serve_is_hidden_and_blocked() {
-        // serve start blocked only when web off and not lifecycle
-        {
-            let start = parse(&["aoe", "serve"]);
-            assert!(serve_start_blocked(&start, true));
-            assert!(!serve_start_blocked(&start, false));
-            for verb in ["--stop", "--status", "--restart"] {
-                let c = parse(&["aoe", "serve", verb]);
-                assert!(
-                    !serve_start_blocked(&c, true),
-                    "{verb} must bypass the gate"
-                );
-            }
-            assert!(!serve_start_blocked(&parse(&["aoe", "agents"]), true));
+    fn serve_start_blocked_only_when_web_off_and_not_lifecycle() {
+        let start = parse(&["aoe", "serve"]);
+        assert!(serve_start_blocked(&start, true));
+        assert!(!serve_start_blocked(&start, false));
+        for verb in ["--stop", "--status", "--restart"] {
+            let c = parse(&["aoe", "serve", verb]);
+            assert!(
+                !serve_start_blocked(&c, true),
+                "{verb} must bypass the gate"
+            );
         }
-        // hide disabled serve hides only when disabled
-        {
-            let shown = hide_disabled_serve(Cli::command(), false);
-            assert!(!shown
-                .find_subcommand("serve")
-                .expect("serve present")
-                .is_hide_set());
-            let hidden = hide_disabled_serve(Cli::command(), true);
-            assert!(hidden
-                .find_subcommand("serve")
-                .expect("serve present")
-                .is_hide_set());
-        }
+        assert!(!serve_start_blocked(&parse(&["aoe", "agents"]), true));
+    }
+
+    #[test]
+    fn hide_disabled_serve_hides_only_when_disabled() {
+        let shown = hide_disabled_serve(Cli::command(), false);
+        assert!(!shown
+            .find_subcommand("serve")
+            .expect("serve present")
+            .is_hide_set());
+        let hidden = hide_disabled_serve(Cli::command(), true);
+        assert!(hidden
+            .find_subcommand("serve")
+            .expect("serve present")
+            .is_hide_set());
     }
 }

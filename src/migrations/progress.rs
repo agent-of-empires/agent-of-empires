@@ -310,205 +310,208 @@ mod tests {
     }
 
     #[test]
-    fn progress_cases() {
-        // reporter receives events only while installed
+    fn reporter_receives_events_only_while_installed() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
         {
-            let seen = Arc::new(Mutex::new(Vec::new()));
-            {
-                let _guard = install(Some(recording(&seen)));
-                step("planning");
-                progress("3 files");
-                notice("deferred");
-            }
-            step("after uninstall");
-            assert_eq!(
-                *seen.lock().unwrap(),
-                vec![
-                    Event::Step("planning".into()),
-                    Event::Progress("3 files".into()),
-                    Event::Notice("deferred".into()),
-                ]
-            );
-        }
-        // Guards may overlap and drop in either order: the newest live reporter
-        // gets the events, a dropped guard takes only its own registration with
-        // it, and nothing is resurrected once every guard is gone.
-        {
-            let a = Arc::new(Mutex::new(Vec::new()));
-            let b = Arc::new(Mutex::new(Vec::new()));
-            let drained =
-                |seen: &Arc<Mutex<Vec<Event>>>| std::mem::take(&mut *seen.lock().unwrap());
-
-            // Non-LIFO: the older guard drops first.
-            let guard_a = install(Some(recording(&a)));
-            let guard_b = install(Some(recording(&b)));
-            step("both");
-            drop(guard_a);
-            step("b only");
-            drop(guard_b);
-            step("nobody");
-            assert!(
-                drained(&a).is_empty(),
-                "a was never the newest live reporter"
-            );
-            assert_eq!(
-                drained(&b),
-                vec![Event::Step("both".into()), Event::Step("b only".into())]
-            );
-
-            // Nested LIFO: the inner guard hands back to the outer one.
-            let guard_a = install(Some(recording(&a)));
-            {
-                let _guard_b = install(Some(recording(&b)));
-                step("inner");
-            }
-            step("outer again");
-            drop(guard_a);
-            step("nobody");
-            assert_eq!(drained(&a), vec![Event::Step("outer again".into())]);
-            assert_eq!(drained(&b), vec![Event::Step("inner".into())]);
-
-            // `None` installs nothing, so an outer reporter keeps receiving.
-            let _guard_a = install(Some(recording(&a)));
-            {
-                let _silent = install(None);
-                step("through none");
-            }
-            assert_eq!(drained(&a), vec![Event::Step("through none".into())]);
-        }
-        // Reporters are per thread: a migration on another thread neither sees
-        // this thread's reporter nor disturbs it.
-        {
-            let seen = Arc::new(Mutex::new(Vec::new()));
             let _guard = install(Some(recording(&seen)));
-            std::thread::spawn(|| {
-                step("other thread, no reporter");
-                let _inner = install(None);
-            })
-            .join()
-            .unwrap();
-            step("this thread");
-            assert_eq!(
-                *seen.lock().unwrap(),
-                vec![Event::Step("this thread".into())]
-            );
+            step("planning");
+            progress("3 files");
+            notice("deferred");
         }
-        // console progress builds a status line and keeps notices
-        {
-            let mut console = ConsoleProgress::default();
-            assert_eq!(console.status_line(), None);
-            console.apply(Event::Started {
-                version: 27,
-                name: "isolate_sandbox_stores",
-                position: 1,
-                total: 1,
-            });
-            assert!(console
-                .status_line()
-                .unwrap()
-                .starts_with("Data migration v27 (isolate_sandbox_stores) ("));
-            console.apply(Event::Step("copying store 1/2".into()));
-            console.apply(Event::Progress("120 files, 4.0 MB".into()));
-            let line = console.status_line().unwrap();
-            assert!(line.starts_with(
-                "Data migration v27 (isolate_sandbox_stores): copying store 1/2, 120 files, 4.0 MB ("
-            ));
-            // A new step drops the stale detail.
-            console.apply(Event::Step("retiring legacy store".into()));
-            assert!(!console.status_line().unwrap().contains("120 files"));
-            console.apply(Event::Notice(
-                "session abc is running; its store moves after it stops".into(),
-            ));
-            console.apply(Event::Finished {
-                version: 27,
-                elapsed: Duration::from_millis(2500),
-            });
-            assert_eq!(console.status_line(), None);
-            let lines = console.take_lines();
-            assert_eq!(lines.len(), 2);
-            assert!(lines[0].contains("session abc"));
-            assert!(lines[1].ends_with("done in 2.5s"));
-            assert!(console.take_lines().is_empty());
-            // Instant finishes stay quiet; a multi-migration run numbers its label.
-            console.apply(Event::Started {
-                version: 26,
-                name: "x",
-                position: 2,
-                total: 3,
-            });
-            assert!(console
-                .status_line()
-                .unwrap()
-                .starts_with("Data migration 2/3 (v26 x)"));
-            console.apply(Event::Finished {
-                version: 26,
-                elapsed: Duration::from_millis(20),
-            });
-            assert!(console.take_lines().is_empty());
-        }
-        // formatting helpers pick readable units
-        {
-            assert_eq!(format_elapsed(Duration::from_millis(1500)), "1.5s");
-            assert_eq!(format_elapsed(Duration::from_secs(42)), "42s");
-            assert_eq!(format_elapsed(Duration::from_secs(125)), "2m05s");
-            assert_eq!(format_bytes(500), "500 B");
-            assert_eq!(format_bytes(512 * 1024), "512 KB");
-            assert_eq!(format_bytes(3 * 1024 * 1024 / 2), "1.5 MB");
-            assert_eq!(format_bytes(40 * 1024 * 1024), "40 MB");
-        }
-        // fit width elides the middle and keeps both ends
-        {
-            use unicode_width::UnicodeWidthStr;
+        step("after uninstall");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                Event::Step("planning".into()),
+                Event::Progress("3 files".into()),
+                Event::Notice("deferred".into()),
+            ]
+        );
+    }
 
-            assert_eq!(fit_width("short", 80), "short");
-            assert_eq!(fit_width("short", 0), "short");
-            let long =
-                "copying store 1/2: /home/u/.gemini/sandbox -> /home/u/.gemini/sandbox-v2/abc (0.4s)";
-            let fitted = fit_width(long, 40);
-            assert_eq!(fitted.width(), 40);
-            assert!(fitted.starts_with("copying store 1/2: "));
-            assert!(fitted.ends_with(" (0.4s)"));
+    /// Guards may overlap and drop in either order: the newest live reporter
+    /// gets the events, a dropped guard takes only its own registration with
+    /// it, and nothing is resurrected once every guard is gone.
+    #[test]
+    fn overlapping_guards_route_to_the_newest_live_reporter() {
+        let a = Arc::new(Mutex::new(Vec::new()));
+        let b = Arc::new(Mutex::new(Vec::new()));
+        let drained = |seen: &Arc<Mutex<Vec<Event>>>| std::mem::take(&mut *seen.lock().unwrap());
+
+        // Non-LIFO: the older guard drops first.
+        let guard_a = install(Some(recording(&a)));
+        let guard_b = install(Some(recording(&b)));
+        step("both");
+        drop(guard_a);
+        step("b only");
+        drop(guard_b);
+        step("nobody");
+        assert!(
+            drained(&a).is_empty(),
+            "a was never the newest live reporter"
+        );
+        assert_eq!(
+            drained(&b),
+            vec![Event::Step("both".into()), Event::Step("b only".into())]
+        );
+
+        // Nested LIFO: the inner guard hands back to the outer one.
+        let guard_a = install(Some(recording(&a)));
+        {
+            let _guard_b = install(Some(recording(&b)));
+            step("inner");
+        }
+        step("outer again");
+        drop(guard_a);
+        step("nobody");
+        assert_eq!(drained(&a), vec![Event::Step("outer again".into())]);
+        assert_eq!(drained(&b), vec![Event::Step("inner".into())]);
+
+        // `None` installs nothing, so an outer reporter keeps receiving.
+        let _guard_a = install(Some(recording(&a)));
+        {
+            let _silent = install(None);
+            step("through none");
+        }
+        assert_eq!(drained(&a), vec![Event::Step("through none".into())]);
+    }
+
+    /// Reporters are per thread: a migration on another thread neither sees
+    /// this thread's reporter nor disturbs it.
+    #[test]
+    fn reporters_do_not_cross_threads() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let _guard = install(Some(recording(&seen)));
+        std::thread::spawn(|| {
+            step("other thread, no reporter");
+            let _inner = install(None);
+        })
+        .join()
+        .unwrap();
+        step("this thread");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Event::Step("this thread".into())]
+        );
+    }
+
+    #[test]
+    fn console_progress_builds_a_status_line_and_keeps_notices() {
+        let mut console = ConsoleProgress::default();
+        assert_eq!(console.status_line(), None);
+        console.apply(Event::Started {
+            version: 27,
+            name: "isolate_sandbox_stores",
+            position: 1,
+            total: 1,
+        });
+        assert!(console
+            .status_line()
+            .unwrap()
+            .starts_with("Data migration v27 (isolate_sandbox_stores) ("));
+        console.apply(Event::Step("copying store 1/2".into()));
+        console.apply(Event::Progress("120 files, 4.0 MB".into()));
+        let line = console.status_line().unwrap();
+        assert!(line.starts_with(
+            "Data migration v27 (isolate_sandbox_stores): copying store 1/2, 120 files, 4.0 MB ("
+        ));
+        // A new step drops the stale detail.
+        console.apply(Event::Step("retiring legacy store".into()));
+        assert!(!console.status_line().unwrap().contains("120 files"));
+        console.apply(Event::Notice(
+            "session abc is running; its store moves after it stops".into(),
+        ));
+        console.apply(Event::Finished {
+            version: 27,
+            elapsed: Duration::from_millis(2500),
+        });
+        assert_eq!(console.status_line(), None);
+        let lines = console.take_lines();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("session abc"));
+        assert!(lines[1].ends_with("done in 2.5s"));
+        assert!(console.take_lines().is_empty());
+        // Instant finishes stay quiet; a multi-migration run numbers its label.
+        console.apply(Event::Started {
+            version: 26,
+            name: "x",
+            position: 2,
+            total: 3,
+        });
+        assert!(console
+            .status_line()
+            .unwrap()
+            .starts_with("Data migration 2/3 (v26 x)"));
+        console.apply(Event::Finished {
+            version: 26,
+            elapsed: Duration::from_millis(20),
+        });
+        assert!(console.take_lines().is_empty());
+    }
+
+    #[test]
+    fn formatting_helpers_pick_readable_units() {
+        assert_eq!(format_elapsed(Duration::from_millis(1500)), "1.5s");
+        assert_eq!(format_elapsed(Duration::from_secs(42)), "42s");
+        assert_eq!(format_elapsed(Duration::from_secs(125)), "2m05s");
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(512 * 1024), "512 KB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 / 2), "1.5 MB");
+        assert_eq!(format_bytes(40 * 1024 * 1024), "40 MB");
+    }
+
+    #[test]
+    fn fit_width_elides_the_middle_and_keeps_both_ends() {
+        use unicode_width::UnicodeWidthStr;
+
+        assert_eq!(fit_width("short", 80), "short");
+        assert_eq!(fit_width("short", 0), "short");
+        let long =
+            "copying store 1/2: /home/u/.gemini/sandbox -> /home/u/.gemini/sandbox-v2/abc (0.4s)";
+        let fitted = fit_width(long, 40);
+        assert_eq!(fitted.width(), 40);
+        assert!(fitted.starts_with("copying store 1/2: "));
+        assert!(fitted.ends_with(" (0.4s)"));
+        assert!(fitted.contains('\u{2026}'));
+        assert_eq!(fit_width("abcdefghij", 5), "abcde");
+
+        // Width is measured in terminal cells over grapheme clusters, never
+        // in chars: wide glyphs cost two columns, combining marks and
+        // zero-width joiners none, and no cluster is split.
+        let wide = "copying store: /home/u/\u{6f22}\u{5b57}\u{6f22}\u{5b57}\u{6f22}\u{5b57}\u{6f22}\u{5b57}/sandbox (0.4s)";
+        for width in [9, 12, 20, 33] {
+            let fitted = fit_width(wide, width);
+            assert!(fitted.width() <= width, "{width}: {fitted:?}");
+            assert!(fitted.width() >= width - 2, "{width}: {fitted:?}");
             assert!(fitted.contains('\u{2026}'));
-            assert_eq!(fit_width("abcdefghij", 5), "abcde");
-
-            // Width is measured in terminal cells over grapheme clusters, never
-            // in chars: wide glyphs cost two columns, combining marks and
-            // zero-width joiners none, and no cluster is split.
-            let wide = "copying store: /home/u/\u{6f22}\u{5b57}\u{6f22}\u{5b57}\u{6f22}\u{5b57}\u{6f22}\u{5b57}/sandbox (0.4s)";
-            for width in [9, 12, 20, 33] {
-                let fitted = fit_width(wide, width);
-                assert!(fitted.width() <= width, "{width}: {fitted:?}");
-                assert!(fitted.width() >= width - 2, "{width}: {fitted:?}");
-                assert!(fitted.contains('\u{2026}'));
-                assert!(fitted.starts_with("cop"), "{width}: {fitted:?}");
-                assert!(fitted.ends_with("s)"), "{width}: {fitted:?}");
-            }
-            assert_eq!(fit_width("\u{6f22}\u{5b57}\u{6f22}", 5), "\u{6f22}\u{5b57}");
-            assert_eq!(fit_width("\u{6f22}\u{5b57}\u{6f22}", 4), "\u{6f22}\u{5b57}");
-            assert_eq!(fit_width("\u{6f22}\u{5b57}\u{6f22}", 1), "");
-            let combining =
-                "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}";
-            assert_eq!(combining.width(), 10);
-            assert_eq!(
-                fit_width(combining, 10),
-                combining,
-                "10 cells fit in 10 columns"
-            );
-            let fitted = fit_width(combining, 9);
-            assert_eq!(fitted.width(), 9);
-            assert_eq!(fitted.graphemes(true).count(), 9);
-            assert!(fitted
-                .graphemes(true)
-                .all(|g| g == "e\u{301}" || g == "\u{2026}"));
-            let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
-            let joined = format!("{family}{family}{family}{family}{family}");
-            let fitted = fit_width(&joined, 8);
-            assert!(fitted.width() <= 8);
-            assert!(
-                !fitted.contains("\u{200d}\u{2026}"),
-                "must not split a joiner sequence: {fitted:?}"
-            );
-            assert_eq!(fit_width("abcdefghij", 3), "abc");
+            assert!(fitted.starts_with("cop"), "{width}: {fitted:?}");
+            assert!(fitted.ends_with("s)"), "{width}: {fitted:?}");
         }
+        assert_eq!(fit_width("\u{6f22}\u{5b57}\u{6f22}", 5), "\u{6f22}\u{5b57}");
+        assert_eq!(fit_width("\u{6f22}\u{5b57}\u{6f22}", 4), "\u{6f22}\u{5b57}");
+        assert_eq!(fit_width("\u{6f22}\u{5b57}\u{6f22}", 1), "");
+        let combining =
+            "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}";
+        assert_eq!(combining.width(), 10);
+        assert_eq!(
+            fit_width(combining, 10),
+            combining,
+            "10 cells fit in 10 columns"
+        );
+        let fitted = fit_width(combining, 9);
+        assert_eq!(fitted.width(), 9);
+        assert_eq!(fitted.graphemes(true).count(), 9);
+        assert!(fitted
+            .graphemes(true)
+            .all(|g| g == "e\u{301}" || g == "\u{2026}"));
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        let joined = format!("{family}{family}{family}{family}{family}");
+        let fitted = fit_width(&joined, 8);
+        assert!(fitted.width() <= 8);
+        assert!(
+            !fitted.contains("\u{200d}\u{2026}"),
+            "must not split a joiner sequence: {fitted:?}"
+        );
+        assert_eq!(fit_width("abcdefghij", 3), "abc");
     }
 }

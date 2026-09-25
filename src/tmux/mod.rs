@@ -2778,22 +2778,12 @@ mod tests {
         );
     }
     #[test]
-    fn tmux_command_targets_the_isolated_test_socket() {
-        // tmux command carries socket flag
-        {
-            let cmd = tmux_command();
-            let args: Vec<_> = cmd.get_args().map(|a| a.to_owned()).collect();
-            assert_eq!(args.first().map(|a| a.to_str().unwrap()), Some("-S"));
-            assert!(args.get(1).is_some(), "socket path arg present");
-            assert_eq!(cmd.get_program().to_str(), Some("tmux"));
-        }
-        // tmux socket resolves under test
-        {
-            assert!(
-                matches!(tmux_socket(), Some(TmuxSocket::Path(_))),
-                "unit tests must isolate onto an explicit socket path, not the default socket"
-            );
-        }
+    fn test_tmux_command_carries_socket_flag() {
+        let cmd = tmux_command();
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_owned()).collect();
+        assert_eq!(args.first().map(|a| a.to_str().unwrap()), Some("-S"));
+        assert!(args.get(1).is_some(), "socket path arg present");
+        assert_eq!(cmd.get_program().to_str(), Some("tmux"));
     }
 
     #[test]
@@ -2991,6 +2981,14 @@ mod tests {
     }
 
     #[test]
+    fn test_tmux_socket_resolves_under_test() {
+        assert!(
+            matches!(tmux_socket(), Some(TmuxSocket::Path(_))),
+            "unit tests must isolate onto an explicit socket path, not the default socket"
+        );
+    }
+
+    #[test]
     fn socket_from_config_name_accepts_bare_names_only() {
         let named = |n: &str| Some(TmuxSocket::Name(n.to_string()));
         for (configured, want) in [
@@ -3083,120 +3081,123 @@ mod tests {
     const ID8: &str = "abc12345";
 
     #[test]
-    fn resolve_agent_session_name_cases() {
-        // resolve agent session name prefers the derived name when it is live
-        {
-            let derived = format!("{P}Refactor_billing_{ID8}");
-            let stale = format!("{P}Vikings_{ID8}");
-            let names = [derived.as_str(), stale.as_str()];
-            assert_eq!(
-                resolve_agent_session_name(names, ID, &derived),
-                derived,
-                "a live derived name is never overridden"
-            );
-        }
-        // resolve agent session name adopts the stale name after a retitle
-        {
-            let derived = format!("{P}Refactor_billing_mod_{ID8}");
-            let stale = format!("{P}Vikings_{ID8}");
-            assert_eq!(
-                resolve_agent_session_name([stale.as_str()], ID, &derived),
-                stale,
-                "lifecycle ops must follow the live session, not the derived name"
-            );
-        }
-        // resolve agent session name ignores other kinds and other ids
-        {
-            let derived = format!("{P}Refactor_{ID8}");
-            let names = [
-                format!("{TERMINAL_PREFIX}Vikings_{ID8}"),
-                format!("{CONTAINER_TERMINAL_PREFIX}Vikings_{ID8}"),
-                format!("{TOOL_PREFIX}lazygit_Vikings_{ID8}"),
-                format!("{P}Vikings_99999999"),
-                "vim".to_string(),
-            ];
-            assert_eq!(
-                resolve_agent_session_name(names.iter().map(String::as_str), ID, &derived),
-                derived,
-                "nothing here is this session's agent pane"
-            );
-        }
-        // resolve agent session name falls back when two candidates are ambiguous
-        {
-            let derived = format!("{P}Refactor_{ID8}");
-            let names = [format!("{P}Vikings_{ID8}"), format!("{P}Aztecs_{ID8}")];
-            assert_eq!(
-                resolve_agent_session_name(names.iter().map(String::as_str), ID, &derived),
-                derived,
-            );
-        }
-        // resolve agent session name in agrees with the scan on both paths
-        {
-            let meta = |names: &[&str]| -> HashMap<String, PaneMetadata> {
-                names
-                    .iter()
-                    .map(|n| {
-                        (
-                            n.to_string(),
-                            PaneMetadata {
-                                pane_dead: false,
-                                pane_current_command: None,
-                                pane_start_command_is_protected: false,
-                                pane_pid: None,
-                                pane_title: None,
-                                window_activity: None,
-                                window_size: None,
-                            },
-                        )
-                    })
-                    .collect()
-            };
-            let derived = format!("{P}Refactor_{ID8}");
-            let stale = format!("{P}Vikings_{ID8}");
+    fn resolve_agent_session_name_prefers_the_derived_name_when_it_is_live() {
+        let derived = format!("{P}Refactor_billing_{ID8}");
+        let stale = format!("{P}Vikings_{ID8}");
+        let names = [derived.as_str(), stale.as_str()];
+        assert_eq!(
+            resolve_agent_session_name(names, ID, &derived),
+            derived,
+            "a live derived name is never overridden"
+        );
+    }
 
-            for names in [
-                vec![derived.as_str()],
-                vec![stale.as_str()],
-                vec![derived.as_str(), stale.as_str()],
-                vec![],
-            ] {
-                let map = meta(&names);
-                assert_eq!(
-                    resolve_agent_session_name_in(&map, ID, &derived),
-                    resolve_agent_session_name(names.iter().copied(), ID, &derived),
-                    "fast path and scan disagree for {names:?}"
-                );
-            }
-        }
-        // resolve agent session name handles a title shaped like an aux prefix
-        {
-            let derived = format!("{P}term_rewriting_{ID8}");
-            let stale = format!("{P}Vikings_{ID8}");
+    #[test]
+    fn resolve_agent_session_name_adopts_the_stale_name_after_a_retitle() {
+        let derived = format!("{P}Refactor_billing_mod_{ID8}");
+        let stale = format!("{P}Vikings_{ID8}");
+        assert_eq!(
+            resolve_agent_session_name([stale.as_str()], ID, &derived),
+            stale,
+            "lifecycle ops must follow the live session, not the derived name"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_session_name_ignores_other_kinds_and_other_ids() {
+        let derived = format!("{P}Refactor_{ID8}");
+        let names = [
+            format!("{TERMINAL_PREFIX}Vikings_{ID8}"),
+            format!("{CONTAINER_TERMINAL_PREFIX}Vikings_{ID8}"),
+            format!("{TOOL_PREFIX}lazygit_Vikings_{ID8}"),
+            format!("{P}Vikings_99999999"),
+            "vim".to_string(),
+        ];
+        assert_eq!(
+            resolve_agent_session_name(names.iter().map(String::as_str), ID, &derived),
+            derived,
+            "nothing here is this session's agent pane"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_session_name_falls_back_when_two_candidates_are_ambiguous() {
+        let derived = format!("{P}Refactor_{ID8}");
+        let names = [format!("{P}Vikings_{ID8}"), format!("{P}Aztecs_{ID8}")];
+        assert_eq!(
+            resolve_agent_session_name(names.iter().map(String::as_str), ID, &derived),
+            derived,
+        );
+    }
+
+    #[test]
+    fn resolve_agent_session_name_in_agrees_with_the_scan_on_both_paths() {
+        let meta = |names: &[&str]| -> HashMap<String, PaneMetadata> {
+            names
+                .iter()
+                .map(|n| {
+                    (
+                        n.to_string(),
+                        PaneMetadata {
+                            pane_dead: false,
+                            pane_current_command: None,
+                            pane_start_command_is_protected: false,
+                            pane_pid: None,
+                            pane_title: None,
+                            window_activity: None,
+                            window_size: None,
+                        },
+                    )
+                })
+                .collect()
+        };
+        let derived = format!("{P}Refactor_{ID8}");
+        let stale = format!("{P}Vikings_{ID8}");
+
+        for names in [
+            vec![derived.as_str()],
+            vec![stale.as_str()],
+            vec![derived.as_str(), stale.as_str()],
+            vec![],
+        ] {
+            let map = meta(&names);
             assert_eq!(
-                resolve_agent_session_name([stale.as_str()], ID, &derived),
-                stale,
-                "retitled INTO an aux-shaped title still resolves onto the live pane"
-            );
-            assert_eq!(
-                resolve_agent_session_name([stale.as_str(), derived.as_str()], ID, &derived),
-                derived,
-                "a live derived name wins even when the shape filter excludes it"
+                resolve_agent_session_name_in(&map, ID, &derived),
+                resolve_agent_session_name(names.iter().copied(), ID, &derived),
+                "fast path and scan disagree for {names:?}"
             );
         }
-        // agent session belongs to matches by id not title
-        {
-            assert!(agent_session_belongs_to(&format!("{P}Vikings_{ID8}"), ID));
-            assert!(agent_session_belongs_to(&format!("{P}Anything_{ID8}"), ID));
-            assert!(!agent_session_belongs_to(
-                &format!("{TERMINAL_PREFIX}Vikings_{ID8}"),
-                ID
-            ));
-            assert!(!agent_session_belongs_to(
-                &format!("{P}Vikings_99999999"),
-                ID
-            ));
-            assert!(!agent_session_belongs_to("vim", ID));
-        }
+    }
+
+    #[test]
+    fn resolve_agent_session_name_handles_a_title_shaped_like_an_aux_prefix() {
+        let derived = format!("{P}term_rewriting_{ID8}");
+        let stale = format!("{P}Vikings_{ID8}");
+        assert_eq!(
+            resolve_agent_session_name([stale.as_str()], ID, &derived),
+            stale,
+            "retitled INTO an aux-shaped title still resolves onto the live pane"
+        );
+        assert_eq!(
+            resolve_agent_session_name([stale.as_str(), derived.as_str()], ID, &derived),
+            derived,
+            "a live derived name wins even when the shape filter excludes it"
+        );
+    }
+
+    #[test]
+    fn agent_session_belongs_to_matches_by_id_not_title() {
+        assert!(agent_session_belongs_to(&format!("{P}Vikings_{ID8}"), ID));
+        assert!(agent_session_belongs_to(&format!("{P}Anything_{ID8}"), ID));
+        assert!(!agent_session_belongs_to(
+            &format!("{TERMINAL_PREFIX}Vikings_{ID8}"),
+            ID
+        ));
+        assert!(!agent_session_belongs_to(
+            &format!("{P}Vikings_99999999"),
+            ID
+        ));
+        assert!(!agent_session_belongs_to("vim", ID));
     }
 
     fn dead_pane_meta(dead: bool) -> PaneMetadata {
@@ -3590,112 +3591,109 @@ mod tests {
     }
 
     #[test]
-    fn tmux_no_server_running_matches_only_the_empty_server_error() {
-        // tmux no server running detects empty case
-        {
-            assert!(tmux_no_server_running(
-                b"no server running on /tmp/tmux-501/default\n"
-            ));
-            assert!(tmux_no_server_running(b"no server running on /path.sock"));
-            assert!(tmux_no_server_running(
-                b"error connecting to /path.sock (No such file or directory)"
-            ));
-            assert!(tmux_no_server_running(
-                b"error connecting to /tmp/No such file or directory.sock (No such file or directory)"
-            ));
-        }
-        // tmux no server running rejects other errors and empty
-        {
-            assert!(!tmux_no_server_running(b"can't find session: aoe_foo"));
-            assert!(!tmux_no_server_running(b"usage: list-sessions"));
-            assert!(!tmux_no_server_running(b""));
-            assert!(!tmux_no_server_running(
-                b"error connecting to /path.sock (Permission denied)"
-            ));
-            assert!(!tmux_no_server_running(
-                b"error connecting to /path.sock (Socket operation on non-socket)"
-            ));
-            assert!(!tmux_no_server_running(
-                b"error connecting to /tmp/No such file or directory.sock (Permission denied)"
-            ));
-            assert!(!tmux_no_server_running(
-                b"error connecting to /tmp/no server running.sock (Permission denied)"
-            ));
-        }
+    fn tmux_no_server_running_detects_empty_case() {
+        assert!(tmux_no_server_running(
+            b"no server running on /tmp/tmux-501/default\n"
+        ));
+        assert!(tmux_no_server_running(b"no server running on /path.sock"));
+        assert!(tmux_no_server_running(
+            b"error connecting to /path.sock (No such file or directory)"
+        ));
+        assert!(tmux_no_server_running(
+            b"error connecting to /tmp/No such file or directory.sock (No such file or directory)"
+        ));
     }
 
     #[test]
-    fn test_parse_pane_metadata() {
-        // parse pane metadata basic
-        {
-            let output = format!("{P}my_proj_abc12345|0|0|190|52|claude|claude|4242\n");
-            let map = parse_pane_metadata(&output);
-            assert_eq!(map.len(), 1);
-            let meta = map.get(&format!("{P}my_proj_abc12345")).unwrap();
-            assert!(!meta.pane_dead);
-            assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
-            assert!(!meta.pane_start_command_is_protected);
-            assert_eq!(meta.pane_pid, Some(4242));
-            assert_eq!(meta.window_size, Some((190, 52)));
-        }
-        // parse pane metadata reads the tail fields
-        {
-            let output = format!(
-                "{P}proj_abc12345|0|0|190|52|claude|claude{TAIL_SEP}1770000000{TAIL_SEP}✶ Working\n"
-            );
-            let meta = parse_pane_metadata(&output)
-                .remove(&format!("{P}proj_abc12345"))
-                .unwrap();
-            assert_eq!(meta.window_activity, Some(1770000000));
-            assert_eq!(meta.pane_title.as_deref(), Some("✶ Working"));
+    fn tmux_no_server_running_rejects_other_errors_and_empty() {
+        assert!(!tmux_no_server_running(b"can't find session: aoe_foo"));
+        assert!(!tmux_no_server_running(b"usage: list-sessions"));
+        assert!(!tmux_no_server_running(b""));
+        assert!(!tmux_no_server_running(
+            b"error connecting to /path.sock (Permission denied)"
+        ));
+        assert!(!tmux_no_server_running(
+            b"error connecting to /path.sock (Socket operation on non-socket)"
+        ));
+        assert!(!tmux_no_server_running(
+            b"error connecting to /tmp/No such file or directory.sock (Permission denied)"
+        ));
+        assert!(!tmux_no_server_running(
+            b"error connecting to /tmp/no server running.sock (Permission denied)"
+        ));
+    }
 
-            let escaped_output = format!(
-                "{P}proj_escaped_abc12345|0|0|190|52|claude|claude literal{}{ESCAPED_TAIL_SEP}|4242{ESCAPED_TAIL_SEP}1770000001{ESCAPED_TAIL_SEP}literal{}{ESCAPED_TAIL_SEP}title{}",
-                char::from(92),
-                char::from(92),
-                char::from(10)
-            );
-            let escaped_meta = parse_pane_metadata(&escaped_output)
-                .remove(&format!("{P}proj_escaped_abc12345"))
-                .unwrap();
-            assert_eq!(escaped_meta.pane_pid, Some(4242));
-            assert_eq!(escaped_meta.window_activity, Some(1770000001));
+    #[test]
+    fn test_parse_pane_metadata_basic() {
+        let output = format!("{P}my_proj_abc12345|0|0|190|52|claude|claude|4242\n");
+        let map = parse_pane_metadata(&output);
+        assert_eq!(map.len(), 1);
+        let meta = map.get(&format!("{P}my_proj_abc12345")).unwrap();
+        assert!(!meta.pane_dead);
+        assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
+        assert!(!meta.pane_start_command_is_protected);
+        assert_eq!(meta.pane_pid, Some(4242));
+        assert_eq!(meta.window_size, Some((190, 52)));
+    }
+
+    #[test]
+    fn test_parse_pane_metadata_reads_the_tail_fields() {
+        let output = format!(
+            "{P}proj_abc12345|0|0|190|52|claude|claude{TAIL_SEP}1770000000{TAIL_SEP}✶ Working\n"
+        );
+        let meta = parse_pane_metadata(&output)
+            .remove(&format!("{P}proj_abc12345"))
+            .unwrap();
+        assert_eq!(meta.window_activity, Some(1770000000));
+        assert_eq!(meta.pane_title.as_deref(), Some("✶ Working"));
+
+        let escaped_output = format!(
+            "{P}proj_escaped_abc12345|0|0|190|52|claude|claude literal{}{ESCAPED_TAIL_SEP}|4242{ESCAPED_TAIL_SEP}1770000001{ESCAPED_TAIL_SEP}literal{}{ESCAPED_TAIL_SEP}title{}",
+            char::from(92),
+            char::from(92),
+            char::from(10)
+        );
+        let escaped_meta = parse_pane_metadata(&escaped_output)
+            .remove(&format!("{P}proj_escaped_abc12345"))
+            .unwrap();
+        assert_eq!(escaped_meta.pane_pid, Some(4242));
+        assert_eq!(escaped_meta.window_activity, Some(1770000001));
+        assert_eq!(
+            escaped_meta.pane_title,
+            Some(format!("literal{}{ESCAPED_TAIL_SEP}title", char::from(92)))
+        );
+
+        let odd = format!("{P}proj_def67890|0|0|||claude|claude{TAIL_SEP}{TAIL_SEP}\n");
+        let meta = parse_pane_metadata(&odd)
+            .remove(&format!("{P}proj_def67890"))
+            .unwrap();
+        assert_eq!(meta.window_activity, None);
+        assert_eq!(meta.pane_title, None);
+        assert_eq!(meta.window_size, None);
+    }
+
+    #[test]
+    fn test_parse_pane_metadata_protected_wrapper_shell_is_not_stale() {
+        let output = format!(
+            "{P}protected_abc12345|0|0|190|52|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'\n\
+             {P}interactive_def67890|0|0|190|52|sh|sh\n"
+        );
+        let map = parse_pane_metadata(&output);
+
+        let cases = [
+            (format!("{P}protected_abc12345"), false),
+            (format!("{P}interactive_def67890"), true),
+        ];
+        for (name, expected_shell_stale) in cases {
+            let meta = map.get(&name).unwrap();
             assert_eq!(
-                escaped_meta.pane_title,
-                Some(format!("literal{}{ESCAPED_TAIL_SEP}title", char::from(92)))
+                utils::is_pane_running_shell_command(
+                    meta.pane_current_command.as_deref().unwrap(),
+                    meta.pane_start_command_is_protected,
+                ),
+                expected_shell_stale,
+                "{name}"
             );
-
-            let odd = format!("{P}proj_def67890|0|0|||claude|claude{TAIL_SEP}{TAIL_SEP}\n");
-            let meta = parse_pane_metadata(&odd)
-                .remove(&format!("{P}proj_def67890"))
-                .unwrap();
-            assert_eq!(meta.window_activity, None);
-            assert_eq!(meta.pane_title, None);
-            assert_eq!(meta.window_size, None);
-        }
-        // parse pane metadata protected wrapper shell is not stale
-        {
-            let output = format!(
-                "{P}protected_abc12345|0|0|190|52|sh|/bin/sh -c 'prepare | . /tmp/aoe-pane-env-123 | exec claude'\n\
-                 {P}interactive_def67890|0|0|190|52|sh|sh\n"
-            );
-            let map = parse_pane_metadata(&output);
-
-            let cases = [
-                (format!("{P}protected_abc12345"), false),
-                (format!("{P}interactive_def67890"), true),
-            ];
-            for (name, expected_shell_stale) in cases {
-                let meta = map.get(&name).unwrap();
-                assert_eq!(
-                    utils::is_pane_running_shell_command(
-                        meta.pane_current_command.as_deref().unwrap(),
-                        meta.pane_start_command_is_protected,
-                    ),
-                    expected_shell_stale,
-                    "{name}"
-                );
-            }
         }
     }
 

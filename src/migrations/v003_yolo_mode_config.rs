@@ -56,122 +56,123 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn yolo_mode_config_cases() {
-        // migrate yolo from sandbox to session
-        {
-            let dir = tempfile::TempDir::new().unwrap();
-            let config_path = dir.path().join("config.toml");
+    fn test_migrate_yolo_from_sandbox_to_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
 
-            let content = r#"
-    [sandbox]
-    enabled_by_default = false
-    yolo_mode_default = true
-    default_image = "ghcr.io/njbrake/aoe-sandbox:latest"
+        let content = r#"
+[sandbox]
+enabled_by_default = false
+yolo_mode_default = true
+default_image = "ghcr.io/njbrake/aoe-sandbox:latest"
 
-    [session]
-    default_tool = "claude"
-    "#;
-            fs::write(&config_path, content).unwrap();
+[session]
+default_tool = "claude"
+"#;
+        fs::write(&config_path, content).unwrap();
 
-            migrate_config_file(&config_path.to_path_buf()).unwrap();
+        migrate_config_file(&config_path.to_path_buf()).unwrap();
 
-            let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
+        let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
 
-            // yolo_mode_default should be under [session]
-            assert_eq!(result["session"]["yolo_mode_default"].as_bool(), Some(true));
+        // yolo_mode_default should be under [session]
+        assert_eq!(result["session"]["yolo_mode_default"].as_bool(), Some(true));
 
-            // yolo_mode_default should be removed from [sandbox]
-            assert!(result["sandbox"]
-                .as_table()
-                .unwrap()
-                .get("yolo_mode_default")
-                .is_none());
+        // yolo_mode_default should be removed from [sandbox]
+        assert!(result["sandbox"]
+            .as_table()
+            .unwrap()
+            .get("yolo_mode_default")
+            .is_none());
 
-            // Other sandbox settings should be preserved
-            assert_eq!(
-                result["sandbox"]["enabled_by_default"].as_bool(),
-                Some(false)
-            );
-        }
-        // migrate yolo false not set in session
-        {
-            let dir = tempfile::TempDir::new().unwrap();
-            let config_path = dir.path().join("config.toml");
+        // Other sandbox settings should be preserved
+        assert_eq!(
+            result["sandbox"]["enabled_by_default"].as_bool(),
+            Some(false)
+        );
+    }
 
-            let content = r#"
-    [sandbox]
-    yolo_mode_default = false
-    "#;
-            fs::write(&config_path, content).unwrap();
+    #[test]
+    fn test_migrate_yolo_false_not_set_in_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
 
-            migrate_config_file(&config_path.to_path_buf()).unwrap();
+        let content = r#"
+[sandbox]
+yolo_mode_default = false
+"#;
+        fs::write(&config_path, content).unwrap();
 
-            let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
+        migrate_config_file(&config_path.to_path_buf()).unwrap();
 
-            // yolo_mode_default=false is the default, so no need to add to [session]
-            assert!(result.get("session").is_none());
+        let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
 
-            // Should still be removed from [sandbox]
-            assert!(result["sandbox"]
-                .as_table()
-                .unwrap()
-                .get("yolo_mode_default")
-                .is_none());
-        }
-        // migrate no sandbox section
-        {
-            let dir = tempfile::TempDir::new().unwrap();
-            let config_path = dir.path().join("config.toml");
+        // yolo_mode_default=false is the default, so no need to add to [session]
+        assert!(result.get("session").is_none());
 
-            let content = r#"
-    [session]
-    default_tool = "claude"
-    "#;
-            fs::write(&config_path, content).unwrap();
+        // Should still be removed from [sandbox]
+        assert!(result["sandbox"]
+            .as_table()
+            .unwrap()
+            .get("yolo_mode_default")
+            .is_none());
+    }
 
-            migrate_config_file(&config_path.to_path_buf()).unwrap();
+    #[test]
+    fn test_migrate_no_sandbox_section() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
 
-            let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
+        let content = r#"
+[session]
+default_tool = "claude"
+"#;
+        fs::write(&config_path, content).unwrap();
 
-            // Nothing should change
-            assert_eq!(result["session"]["default_tool"].as_str(), Some("claude"));
-            assert!(result["session"]
-                .as_table()
-                .unwrap()
-                .get("yolo_mode_default")
-                .is_none());
-        }
-        // migrate nonexistent file
-        {
-            let dir = tempfile::TempDir::new().unwrap();
-            let config_path = dir.path().join("nonexistent.toml");
+        migrate_config_file(&config_path.to_path_buf()).unwrap();
 
-            // Should not error
-            migrate_config_file(&config_path.to_path_buf()).unwrap();
-        }
-        // migrate does not overwrite existing session value
-        {
-            let dir = tempfile::TempDir::new().unwrap();
-            let config_path = dir.path().join("config.toml");
+        let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
 
-            let content = r#"
-    [sandbox]
-    yolo_mode_default = true
+        // Nothing should change
+        assert_eq!(result["session"]["default_tool"].as_str(), Some("claude"));
+        assert!(result["session"]
+            .as_table()
+            .unwrap()
+            .get("yolo_mode_default")
+            .is_none());
+    }
 
-    [session]
-    yolo_mode_default = false
-    "#;
-            fs::write(&config_path, content).unwrap();
+    #[test]
+    fn test_migrate_nonexistent_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("nonexistent.toml");
 
-            migrate_config_file(&config_path.to_path_buf()).unwrap();
+        // Should not error
+        migrate_config_file(&config_path.to_path_buf()).unwrap();
+    }
 
-            let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
+    #[test]
+    fn test_migrate_does_not_overwrite_existing_session_value() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
 
-            // Should preserve the existing [session] value (false), not overwrite with sandbox's true
-            assert_eq!(
-                result["session"]["yolo_mode_default"].as_bool(),
-                Some(false)
-            );
-        }
+        let content = r#"
+[sandbox]
+yolo_mode_default = true
+
+[session]
+yolo_mode_default = false
+"#;
+        fs::write(&config_path, content).unwrap();
+
+        migrate_config_file(&config_path.to_path_buf()).unwrap();
+
+        let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
+
+        // Should preserve the existing [session] value (false), not overwrite with sandbox's true
+        assert_eq!(
+            result["session"]["yolo_mode_default"].as_bool(),
+            Some(false)
+        );
     }
 }

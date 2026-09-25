@@ -263,39 +263,38 @@ mod tests {
         config
     }
 
-    #[test]
     #[serial]
-    fn first_match_wins_and_no_rules_is_none() {
-        // no rules returns none
-        {
-            let _registry = ProfileRegistryGuard::take("default");
-            install_from_config("default", &crate::session::Config::default());
-            assert_eq!(detect("default", "anything", "some pane text"), None);
-            assert!(!has_rules("default", "anything"));
-        }
-        // first match wins and no match is idle
-        {
-            let _registry = ProfileRegistryGuard::take("default");
-            install_from_config(
-                "default",
-                &config_with_rules(
-                    "rules-agent",
-                    vec![
-                        rule(HookStatus::Waiting, Some("(y/n)"), None),
-                        rule(HookStatus::Running, Some("esc to interrupt"), None),
-                    ],
-                ),
-            );
-            assert_eq!(
-                detect("default", "rules-agent", "approve? (y/n)\nesc to interrupt"),
-                Some(Status::Waiting)
-            );
-            assert_eq!(
-                detect("default", "rules-agent", "working... esc to interrupt"),
-                Some(Status::Running)
-            );
-            assert_eq!(detect("default", "rules-agent", "$ "), Some(Status::Idle));
-        }
+    #[test]
+    fn no_rules_returns_none() {
+        let _registry = ProfileRegistryGuard::take("default");
+        install_from_config("default", &crate::session::Config::default());
+        assert_eq!(detect("default", "anything", "some pane text"), None);
+        assert!(!has_rules("default", "anything"));
+    }
+
+    #[serial]
+    #[test]
+    fn first_match_wins_and_no_match_is_idle() {
+        let _registry = ProfileRegistryGuard::take("default");
+        install_from_config(
+            "default",
+            &config_with_rules(
+                "rules-agent",
+                vec![
+                    rule(HookStatus::Waiting, Some("(y/n)"), None),
+                    rule(HookStatus::Running, Some("esc to interrupt"), None),
+                ],
+            ),
+        );
+        assert_eq!(
+            detect("default", "rules-agent", "approve? (y/n)\nesc to interrupt"),
+            Some(Status::Waiting)
+        );
+        assert_eq!(
+            detect("default", "rules-agent", "working... esc to interrupt"),
+            Some(Status::Running)
+        );
+        assert_eq!(detect("default", "rules-agent", "$ "), Some(Status::Idle));
     }
 
     #[serial]
@@ -369,59 +368,58 @@ mod tests {
         );
     }
 
-    #[test]
     #[serial]
-    fn install_replaces_rules_within_its_profile() {
-        // install replaces previous rules
-        {
-            let _registry = ProfileRegistryGuard::take("default");
-            install_from_config(
-                "default",
-                &config_with_rules(
-                    "rules-agent",
-                    vec![rule(HookStatus::Running, Some("spin"), None)],
-                ),
-            );
-            assert!(has_rules("default", "rules-agent"));
-            install_from_config("default", &crate::session::Config::default());
-            assert!(!has_rules("default", "rules-agent"));
-        }
-        // install is scoped to its profile
-        {
-            let _registry_p1 = ProfileRegistryGuard::take("p1");
-            let _registry_p2 = ProfileRegistryGuard::take("p2");
-            install_from_config(
-                "p1",
-                &config_with_rules(
-                    "gjc",
-                    vec![rule(HookStatus::Running, Some("busy marker"), None)],
-                ),
-            );
-            install_from_config(
-                "p2",
-                &config_with_rules(
-                    "gjc",
-                    vec![rule(HookStatus::Error, Some("busy marker"), None)],
-                ),
-            );
-            assert_eq!(
-                detect("p1", "gjc", "busy marker"),
-                Some(Status::Running),
-                "p1 rules must survive p2's install"
-            );
-            assert_eq!(
-                detect("p2", "gjc", "busy marker"),
-                Some(Status::Error),
-                "p2 rules are independent of p1's"
-            );
+    #[test]
+    fn install_replaces_previous_rules() {
+        let _registry = ProfileRegistryGuard::take("default");
+        install_from_config(
+            "default",
+            &config_with_rules(
+                "rules-agent",
+                vec![rule(HookStatus::Running, Some("spin"), None)],
+            ),
+        );
+        assert!(has_rules("default", "rules-agent"));
+        install_from_config("default", &crate::session::Config::default());
+        assert!(!has_rules("default", "rules-agent"));
+    }
 
-            install_from_config("p2", &crate::session::Config::default());
-            assert!(!has_rules("p2", "gjc"));
-            assert_eq!(detect("p1", "gjc", "busy marker"), Some(Status::Running));
+    #[serial]
+    #[test]
+    fn install_is_scoped_to_its_profile() {
+        let _registry_p1 = ProfileRegistryGuard::take("p1");
+        let _registry_p2 = ProfileRegistryGuard::take("p2");
+        install_from_config(
+            "p1",
+            &config_with_rules(
+                "gjc",
+                vec![rule(HookStatus::Running, Some("busy marker"), None)],
+            ),
+        );
+        install_from_config(
+            "p2",
+            &config_with_rules(
+                "gjc",
+                vec![rule(HookStatus::Error, Some("busy marker"), None)],
+            ),
+        );
+        assert_eq!(
+            detect("p1", "gjc", "busy marker"),
+            Some(Status::Running),
+            "p1 rules must survive p2's install"
+        );
+        assert_eq!(
+            detect("p2", "gjc", "busy marker"),
+            Some(Status::Error),
+            "p2 rules are independent of p1's"
+        );
 
-            install_from_config("p1", &crate::session::Config::default());
-            assert!(!has_rules("p1", "gjc"));
-        }
+        install_from_config("p2", &crate::session::Config::default());
+        assert!(!has_rules("p2", "gjc"));
+        assert_eq!(detect("p1", "gjc", "busy marker"), Some(Status::Running));
+
+        install_from_config("p1", &crate::session::Config::default());
+        assert!(!has_rules("p1", "gjc"));
     }
 
     #[serial]
@@ -492,62 +490,61 @@ mod tests {
         assert_eq!(detection_tool("default", "rules-agent", ""), "rules-agent");
     }
 
-    #[test]
     #[serial]
-    fn rules_override_the_builtin_detector() {
-        // rules dispatch through detect status from content in
-        {
-            let _registry = ProfileRegistryGuard::take("default");
-            install_from_config(
+    #[test]
+    fn rules_dispatch_through_detect_status_from_content_in() {
+        let _registry = ProfileRegistryGuard::take("default");
+        install_from_config(
+            "default",
+            &config_with_rules(
+                "rules-agent",
+                vec![rule(HookStatus::Running, Some("esc to interrupt"), None)],
+            ),
+        );
+        assert_eq!(
+            super::super::status_detection::detect_status_from_content_in(
                 "default",
-                &config_with_rules(
-                    "rules-agent",
-                    vec![rule(HookStatus::Running, Some("esc to interrupt"), None)],
-                ),
-            );
-            assert_eq!(
-                super::super::status_detection::detect_status_from_content_in(
-                    "default",
-                    "\x1b[31mesc to interrupt\x1b[0m",
-                    "rules-agent"
-                ),
-                Status::Running
-            );
-            assert_eq!(
-                super::super::status_detection::detect_status_from_content_in(
-                    "default", "anything", "no-rules"
-                ),
-                Status::Idle
-            );
-        }
-        // rules override builtin detector
-        {
-            let _registry = ProfileRegistryGuard::take("default");
-            install_from_config(
+                "\x1b[31mesc to interrupt\x1b[0m",
+                "rules-agent"
+            ),
+            Status::Running
+        );
+        assert_eq!(
+            super::super::status_detection::detect_status_from_content_in(
+                "default", "anything", "no-rules"
+            ),
+            Status::Idle
+        );
+    }
+
+    #[serial]
+    #[test]
+    fn rules_override_builtin_detector() {
+        let _registry = ProfileRegistryGuard::take("default");
+        install_from_config(
+            "default",
+            &config_with_rules(
+                "claude",
+                vec![rule(HookStatus::Error, Some("custom fail marker"), None)],
+            ),
+        );
+        assert_eq!(
+            super::super::status_detection::detect_status_from_content_in(
                 "default",
-                &config_with_rules(
-                    "claude",
-                    vec![rule(HookStatus::Error, Some("custom fail marker"), None)],
-                ),
-            );
-            assert_eq!(
-                super::super::status_detection::detect_status_from_content_in(
-                    "default",
-                    "custom fail marker",
-                    "claude"
-                ),
-                Status::Error
-            );
-            install_from_config("default", &crate::session::Config::default());
-            assert_eq!(
-                super::super::status_detection::detect_status_from_content_in(
-                    "default",
-                    "custom fail marker",
-                    "claude"
-                ),
-                Status::Idle
-            );
-        }
+                "custom fail marker",
+                "claude"
+            ),
+            Status::Error
+        );
+        install_from_config("default", &crate::session::Config::default());
+        assert_eq!(
+            super::super::status_detection::detect_status_from_content_in(
+                "default",
+                "custom fail marker",
+                "claude"
+            ),
+            Status::Idle
+        );
     }
 
     #[serial]

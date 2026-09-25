@@ -59,69 +59,69 @@ mod tests {
     }
 
     #[test]
-    fn strip_profile_theme_cases() {
-        // strips name and color mode but keeps idle decay
-        {
-            let (_dir, path) = write(
-                r#"
-    [theme]
-    name = "rose-pine"
-    color_mode = "palette"
-    idle_decay_minutes = 5
-    "#,
-            );
-            strip_profile_theme(&path).unwrap();
-            let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-            let theme = result.get("theme").and_then(|t| t.as_table()).unwrap();
-            assert!(theme.get("name").is_none(), "name should be stripped");
-            assert!(
-                theme.get("color_mode").is_none(),
-                "color_mode should be stripped"
-            );
-            assert_eq!(
-                theme.get("idle_decay_minutes").and_then(|v| v.as_integer()),
-                Some(5),
-                "idle_decay_minutes stays profile-overridable"
-            );
-        }
-        // drops table when only global keys present
-        {
-            let (_dir, path) = write(
-                r#"
-    [theme]
-    name = "rose-pine"
+    fn strips_name_and_color_mode_but_keeps_idle_decay() {
+        let (_dir, path) = write(
+            r#"
+[theme]
+name = "rose-pine"
+color_mode = "palette"
+idle_decay_minutes = 5
+"#,
+        );
+        strip_profile_theme(&path).unwrap();
+        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+        let theme = result.get("theme").and_then(|t| t.as_table()).unwrap();
+        assert!(theme.get("name").is_none(), "name should be stripped");
+        assert!(
+            theme.get("color_mode").is_none(),
+            "color_mode should be stripped"
+        );
+        assert_eq!(
+            theme.get("idle_decay_minutes").and_then(|v| v.as_integer()),
+            Some(5),
+            "idle_decay_minutes stays profile-overridable"
+        );
+    }
 
-    [session]
-    default_tool = "claude"
-    "#,
-            );
-            strip_profile_theme(&path).unwrap();
-            let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-            assert!(
-                result.get("theme").is_none(),
-                "an emptied [theme] table is removed"
-            );
-            // Unrelated sections are untouched.
-            assert!(result.get("session").is_some());
-        }
-        // idempotent when no theme override
-        {
-            let (_dir, path) = write(
-                r#"
-    [session]
-    default_tool = "claude"
-    "#,
-            );
-            let before = fs::read_to_string(&path).unwrap();
-            strip_profile_theme(&path).unwrap();
-            let after = fs::read_to_string(&path).unwrap();
-            assert_eq!(before, after, "no theme override means no rewrite");
-        }
-        // missing file is a noop
-        {
-            let dir = tempfile::TempDir::new().unwrap();
-            let path = dir.path().join("nope.toml");
-            assert!(strip_profile_theme(&path).is_ok());
-        }
+    #[test]
+    fn drops_table_when_only_global_keys_present() {
+        let (_dir, path) = write(
+            r#"
+[theme]
+name = "rose-pine"
+
+[session]
+default_tool = "claude"
+"#,
+        );
+        strip_profile_theme(&path).unwrap();
+        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert!(
+            result.get("theme").is_none(),
+            "an emptied [theme] table is removed"
+        );
+        // Unrelated sections are untouched.
+        assert!(result.get("session").is_some());
+    }
+
+    #[test]
+    fn idempotent_when_no_theme_override() {
+        let (_dir, path) = write(
+            r#"
+[session]
+default_tool = "claude"
+"#,
+        );
+        let before = fs::read_to_string(&path).unwrap();
+        strip_profile_theme(&path).unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after, "no theme override means no rewrite");
+    }
+
+    #[test]
+    fn missing_file_is_a_noop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nope.toml");
+        assert!(strip_profile_theme(&path).is_ok());
     }
 }

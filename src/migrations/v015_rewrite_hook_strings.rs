@@ -230,458 +230,475 @@ mod tests {
 
     #[test]
     #[serial_test::serial(shell_env)]
-    fn rewrite_hook_strings_cases() {
-        // claude legacy settings rewritten user preserved
-        {
-            let _g = unset_agent_home_env();
-            let (_tmp, home, app_dir) = setup_dirs();
-            let claude = home.join(".claude/settings.json");
-            write_json(
-                &claude,
-                &serde_json::json!({
-                    "hooks": {
-                        "PreToolUse": [
-                            {
-                                "matcher": "Bash",
-                                "hooks": [{"type": "command", "command": "echo user-hook"}]
-                            },
-                            {
-                                "hooks": [{"type": "command", "command": LEGACY_STATUS_CMD}]
-                            }
-                        ]
-                    }
-                }),
-            );
+    fn claude_legacy_settings_rewritten_user_preserved() {
+        let _g = unset_agent_home_env();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let claude = home.join(".claude/settings.json");
+        write_json(
+            &claude,
+            &serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [{"type": "command", "command": "echo user-hook"}]
+                        },
+                        {
+                            "hooks": [{"type": "command", "command": LEGACY_STATUS_CMD}]
+                        }
+                    ]
+                }
+            }),
+        );
 
-            run_in(&home, &app_dir).unwrap();
+        run_in(&home, &app_dir).unwrap();
 
-            let content: Value =
-                serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
-            let pre_tool = content["hooks"]["PreToolUse"].as_array().unwrap();
-            assert!(
-                pre_tool.len() >= 2,
-                "v015 must keep the user matcher group AND append the AoE group; got {} block(s)",
-                pre_tool.len(),
-            );
-            assert_eq!(pre_tool[0]["matcher"], "Bash");
-            assert_eq!(pre_tool[0]["hooks"][0]["command"], "echo user-hook");
-            // Byte-for-byte canonical check (issue #1845 acceptance #4); catches
-            // wrong-status / wrong-shape regressions a substring would miss.
-            assert_claude_canonical(&claude);
-        }
-        // claude no marker untouched
-        {
-            let _g = unset_agent_home_env();
-            let (_tmp, home, app_dir) = setup_dirs();
-            let claude = home.join(".claude/settings.json");
-            write_json(
-                &claude,
-                &serde_json::json!({
-                    "hooks": {
-                        "PreToolUse": [
-                            {"hooks": [{"type": "command", "command": "echo only-user"}]}
-                        ]
-                    }
-                }),
-            );
-            let before = fs::read(&claude).unwrap();
+        let content: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
+        let pre_tool = content["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(
+            pre_tool.len() >= 2,
+            "v015 must keep the user matcher group AND append the AoE group; got {} block(s)",
+            pre_tool.len(),
+        );
+        assert_eq!(pre_tool[0]["matcher"], "Bash");
+        assert_eq!(pre_tool[0]["hooks"][0]["command"], "echo user-hook");
+        // Byte-for-byte canonical check (issue #1845 acceptance #4); catches
+        // wrong-status / wrong-shape regressions a substring would miss.
+        assert_claude_canonical(&claude);
+    }
 
-            run_in(&home, &app_dir).unwrap();
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn claude_no_marker_untouched() {
+        let _g = unset_agent_home_env();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let claude = home.join(".claude/settings.json");
+        write_json(
+            &claude,
+            &serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {"hooks": [{"type": "command", "command": "echo only-user"}]}
+                    ]
+                }
+            }),
+        );
+        let before = fs::read(&claude).unwrap();
 
-            assert_eq!(
-                fs::read(&claude).unwrap(),
-                before,
-                "files without an AoE marker must be byte-untouched"
-            );
-        }
-        // claude idempotent byte identical and canonical
-        {
-            let _g = unset_agent_home_env();
-            let (_tmp, home, app_dir) = setup_dirs();
-            let claude = home.join(".claude/settings.json");
-            write_json(
-                &claude,
-                &serde_json::json!({
-                    "hooks": { "PreToolUse": [
-                        {"hooks": [{"type": "command", "command": LEGACY_STATUS_CMD}]}
-                    ]}
-                }),
-            );
+        run_in(&home, &app_dir).unwrap();
 
-            run_in(&home, &app_dir).unwrap();
-            let after_first = fs::read(&claude).unwrap();
+        assert_eq!(
+            fs::read(&claude).unwrap(),
+            before,
+            "files without an AoE marker must be byte-untouched"
+        );
+    }
 
-            // Catches the `{}` regression: without this assertion, run-2 would
-            // see no marker, skip, and the file would be byte-equal to a totally
-            // broken run-1 output.
-            assert_claude_canonical(&claude);
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn claude_idempotent_byte_identical_and_canonical() {
+        let _g = unset_agent_home_env();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let claude = home.join(".claude/settings.json");
+        write_json(
+            &claude,
+            &serde_json::json!({
+                "hooks": { "PreToolUse": [
+                    {"hooks": [{"type": "command", "command": LEGACY_STATUS_CMD}]}
+                ]}
+            }),
+        );
 
-            run_in(&home, &app_dir).unwrap();
-            let after_second = fs::read(&claude).unwrap();
+        run_in(&home, &app_dir).unwrap();
+        let after_first = fs::read(&claude).unwrap();
 
-            // Byte-equality relies on serde_json's BTreeMap-ordered serialization;
-            // switch to parsed-`Value` equality if `preserve_order` ever defaults.
-            assert_eq!(after_first, after_second, "v015 must be byte-idempotent");
+        // Catches the `{}` regression: without this assertion, run-2 would
+        // see no marker, skip, and the file would be byte-equal to a totally
+        // broken run-1 output.
+        assert_claude_canonical(&claude);
 
-            // Catches "idempotent on the wrong fixed point" (run-2 produces
-            // non-canonical bytes that happen to byte-equal run-1's).
-            assert_claude_canonical(&claude);
-        }
-        // mixed user aoe matcher group documents double firing
-        {
-            // Documented limitation: a hand-merged matcher group with both a
-            // user hook and a legacy AoE hook stays intact (`remove_aoe_entries`
-            // drops only all-AoE groups), AND v015 appends a fresh AoE-only
-            // group. Both fire per event; the legacy command stays unhardened.
-            // Defense-in-depth gap bounded by PR #1803's host-side
-            // `AOE_INSTANCE_ID` validator.
-            let _g = unset_agent_home_env();
-            let (_tmp, home, app_dir) = setup_dirs();
-            let claude = home.join(".claude/settings.json");
-            write_json(
-                &claude,
-                &serde_json::json!({
-                    "hooks": { "PreToolUse": [{
-                        "matcher": "Bash",
-                        "hooks": [
-                            {"type": "command", "command": "echo user"},
-                            {"type": "command", "command": LEGACY_STATUS_CMD}
-                        ]
-                    }]}
-                }),
-            );
+        run_in(&home, &app_dir).unwrap();
+        let after_second = fs::read(&claude).unwrap();
 
-            run_in(&home, &app_dir).unwrap();
+        // Byte-equality relies on serde_json's BTreeMap-ordered serialization;
+        // switch to parsed-`Value` equality if `preserve_order` ever defaults.
+        assert_eq!(after_first, after_second, "v015 must be byte-idempotent");
 
-            let after: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
-            let pre_tool = after["hooks"]["PreToolUse"].as_array().unwrap();
+        // Catches "idempotent on the wrong fixed point" (run-2 produces
+        // non-canonical bytes that happen to byte-equal run-1's).
+        assert_claude_canonical(&claude);
+    }
 
-            // (1) Two matcher groups: the original mixed group at index 0 PLUS
-            // a fresh canonical AoE-only group at index >= 1. This explicitly
-            // locks the double-firing behaviour.
-            assert!(
-                pre_tool.len() >= 2,
-                "v015 must APPEND a fresh canonical AoE matcher block alongside \
-                 the legacy mixed group; got {} matcher block(s)",
-                pre_tool.len(),
-            );
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn mixed_user_aoe_matcher_group_documents_double_firing() {
+        // Documented limitation: a hand-merged matcher group with both a
+        // user hook and a legacy AoE hook stays intact (`remove_aoe_entries`
+        // drops only all-AoE groups), AND v015 appends a fresh AoE-only
+        // group. Both fire per event; the legacy command stays unhardened.
+        // Defense-in-depth gap bounded by PR #1803's host-side
+        // `AOE_INSTANCE_ID` validator.
+        let _g = unset_agent_home_env();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let claude = home.join(".claude/settings.json");
+        write_json(
+            &claude,
+            &serde_json::json!({
+                "hooks": { "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "echo user"},
+                        {"type": "command", "command": LEGACY_STATUS_CMD}
+                    ]
+                }]}
+            }),
+        );
 
-            // (2) The mixed group at index 0 is byte-identical to its input shape.
-            let mixed = &pre_tool[0];
-            assert_eq!(mixed["matcher"], "Bash");
-            let inner = mixed["hooks"].as_array().unwrap();
-            assert_eq!(inner.len(), 2);
-            assert_eq!(inner[0]["command"], "echo user");
-            assert_eq!(
-                inner[1]["command"], LEGACY_STATUS_CMD,
-                "legacy AoE bytes inside the mixed group are NOT rewritten",
-            );
+        run_in(&home, &app_dir).unwrap();
 
-            // (3) Some subsequent matcher group (index >= 1) carries a fresh
-            // canonical hardened AoE entry. This locks the dual invariant: the
-            // legacy entry is preserved AND v015 still installs the current
-            // canonical bytes adjacent to it (so live status detection works
-            // for the next session).
-            use crate::hooks::status_command_for_event;
-            // Claude's PreToolUse is the tool-gated writer (running by default,
-            // waiting for AskUserQuestion), so canonicalize through the same
-            // selector the installer uses.
-            let canonical_running = status_command_for_event(
-                crate::agents::HookStatus::Running,
-                &["AskUserQuestion".to_string()],
-                crate::hooks::HookInstallTarget::Host,
-            );
-            let found_hardened = pre_tool.iter().skip(1).any(|m| {
-                m["hooks"].as_array().is_some_and(|arr| {
-                    arr.iter()
-                        .any(|h| h["command"].as_str() == Some(canonical_running.as_str()))
-                })
-            });
-            assert!(
-                found_hardened,
-                "v015 must append a fresh canonical AoE matcher block alongside \
-                 the legacy mixed group: {pre_tool:#?}",
-            );
-        }
-        // settl marker only rewrites aoe lines
-        {
-            let _g = unset_agent_home_env();
-            let (_tmp, home, app_dir) = setup_dirs();
-            let settl = home.join(".settl/config.toml");
-            fs::create_dir_all(settl.parent().unwrap()).unwrap();
-            fs::write(
-                &settl,
-                format!(
-                    "[[hooks]]\n\
-                     event = \"GameWon\"\n\
-                     command = \"echo user-only\"\n\
-                     \n\
-                     [[hooks]]\n\
-                     event = \"TurnStarted\"\n\
-                     command = {LEGACY_STATUS_CMD:?}\n"
-                ),
-            )
-            .unwrap();
+        let after: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
+        let pre_tool = after["hooks"]["PreToolUse"].as_array().unwrap();
 
-            run_in(&home, &app_dir).unwrap();
+        // (1) Two matcher groups: the original mixed group at index 0 PLUS
+        // a fresh canonical AoE-only group at index >= 1. This explicitly
+        // locks the double-firing behaviour.
+        assert!(
+            pre_tool.len() >= 2,
+            "v015 must APPEND a fresh canonical AoE matcher block alongside \
+             the legacy mixed group; got {} matcher block(s)",
+            pre_tool.len(),
+        );
 
-            let parsed: toml::Value = toml::from_str(&fs::read_to_string(&settl).unwrap()).unwrap();
-            let hooks = parsed["hooks"].as_array().unwrap();
-            let user = hooks
-                .iter()
-                .find(|h| h["command"].as_str() == Some("echo user-only"))
-                .expect("user hook must survive");
-            assert_eq!(user["event"].as_str(), Some("GameWon"));
-            let aoe: Vec<_> = hooks
-                .iter()
-                .filter_map(|h| h["command"].as_str())
-                .filter(|c| c.contains("aoe-hooks"))
-                .collect();
-            assert!(
-                aoe.iter().all(|c| c.contains("case \"$AOE_INSTANCE_ID\"")),
-                "every AoE line must carry the hardened guard"
-            );
-        }
-        // hermes config and allowlist both rewritten
-        {
-            let _g = unset_agent_home_env();
-            let (_tmp, home, app_dir) = setup_dirs();
-            let cfg = home.join(".hermes/config.yaml");
-            fs::create_dir_all(cfg.parent().unwrap()).unwrap();
-            fs::write(
-                &cfg,
-                format!("hooks:\n  pre_tool_call:\n    - command: {LEGACY_STATUS_CMD:?}\n"),
-            )
-            .unwrap();
+        // (2) The mixed group at index 0 is byte-identical to its input shape.
+        let mixed = &pre_tool[0];
+        assert_eq!(mixed["matcher"], "Bash");
+        let inner = mixed["hooks"].as_array().unwrap();
+        assert_eq!(inner.len(), 2);
+        assert_eq!(inner[0]["command"], "echo user");
+        assert_eq!(
+            inner[1]["command"], LEGACY_STATUS_CMD,
+            "legacy AoE bytes inside the mixed group are NOT rewritten",
+        );
 
-            run_in(&home, &app_dir).unwrap();
+        // (3) Some subsequent matcher group (index >= 1) carries a fresh
+        // canonical hardened AoE entry. This locks the dual invariant: the
+        // legacy entry is preserved AND v015 still installs the current
+        // canonical bytes adjacent to it (so live status detection works
+        // for the next session).
+        use crate::hooks::status_command_for_event;
+        // Claude's PreToolUse is the tool-gated writer (running by default,
+        // waiting for AskUserQuestion), so canonicalize through the same
+        // selector the installer uses.
+        let canonical_running = status_command_for_event(
+            crate::agents::HookStatus::Running,
+            &["AskUserQuestion".to_string()],
+            crate::hooks::HookInstallTarget::Host,
+        );
+        let found_hardened = pre_tool.iter().skip(1).any(|m| {
+            m["hooks"].as_array().is_some_and(|arr| {
+                arr.iter()
+                    .any(|h| h["command"].as_str() == Some(canonical_running.as_str()))
+            })
+        });
+        assert!(
+            found_hardened,
+            "v015 must append a fresh canonical AoE matcher block alongside \
+             the legacy mixed group: {pre_tool:#?}",
+        );
+    }
 
-            let yaml = fs::read_to_string(&cfg).unwrap();
-            assert!(
-                yaml.contains("case \"$AOE_INSTANCE_ID\""),
-                "Hermes YAML must be rewritten to hardened form"
-            );
-            let allow = home.join(".hermes/shell-hooks-allowlist.json");
-            assert!(allow.exists(), "allowlist must be created alongside config");
-            let parsed: Value = serde_json::from_str(&fs::read_to_string(&allow).unwrap()).unwrap();
-            let approvals = parsed["approvals"].as_array().unwrap();
-            for approval in approvals {
-                let cmd = approval["command"].as_str().unwrap();
-                assert!(
-                    cmd.contains("case \"$AOE_INSTANCE_ID\""),
-                    "allowlist must key on the new hardened command"
-                );
-            }
-        }
-        // hermes allowlist approved at preserved on idempotency
-        {
-            let _g = unset_agent_home_env();
-            let (_tmp, home, app_dir) = setup_dirs();
-            let cfg = home.join(".hermes/config.yaml");
-            let allow_path = home.join(".hermes/shell-hooks-allowlist.json");
-            fs::create_dir_all(cfg.parent().unwrap()).unwrap();
-            fs::write(
-                &cfg,
-                format!("hooks:\n  pre_tool_call:\n    - command: {LEGACY_STATUS_CMD:?}\n"),
-            )
-            .unwrap();
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn settl_marker_only_rewrites_aoe_lines() {
+        let _g = unset_agent_home_env();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let settl = home.join(".settl/config.toml");
+        fs::create_dir_all(settl.parent().unwrap()).unwrap();
+        fs::write(
+            &settl,
+            format!(
+                "[[hooks]]\n\
+                 event = \"GameWon\"\n\
+                 command = \"echo user-only\"\n\
+                 \n\
+                 [[hooks]]\n\
+                 event = \"TurnStarted\"\n\
+                 command = {LEGACY_STATUS_CMD:?}\n"
+            ),
+        )
+        .unwrap();
 
-            // First run rewrites legacy YAML to hardened form and creates the
-            // canonical allowlist with current `approved_at` values.
-            run_in(&home, &app_dir).unwrap();
+        run_in(&home, &app_dir).unwrap();
 
-            // Plant a sentinel timestamp on every approval. Because the entries
-            // now carry the HARDENED command (the same bytes a re-run of
-            // render_hermes_allowlist will match on), a subsequent rewrite must
-            // hit the (event, command) collision branch and preserve approved_at.
-            // Without this trick (e.g. running run_in twice back-to-back without
-            // the sentinel injection), the test would pass even if preservation
-            // were reverted to per-call `Utc::now()`, because to_rfc3339_opts
-            // collapses sub-second timestamps to the same string within one
-            // wall-clock second.
-            const SENTINEL: &str = "2020-01-01T00:00:00Z";
-            let mut data: Value =
-                serde_json::from_str(&fs::read_to_string(&allow_path).unwrap()).unwrap();
-            for approval in data["approvals"].as_array_mut().unwrap() {
-                approval["approved_at"] = Value::String(SENTINEL.into());
-                // Re-render canary: render_hermes_allowlist's retain+push path
-                // re-emits only its 4 canonical fields, so this stripped key
-                // distinguishes "re-render ran" from "re-render skipped". A
-                // skipped re-render would leave the planted canary intact and
-                // let the sentinel assertion below pass without proving anything.
-                approval["__reentry_canary"] = Value::Bool(true);
-            }
-            fs::write(&allow_path, serde_json::to_string_pretty(&data).unwrap()).unwrap();
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&settl).unwrap()).unwrap();
+        let hooks = parsed["hooks"].as_array().unwrap();
+        let user = hooks
+            .iter()
+            .find(|h| h["command"].as_str() == Some("echo user-only"))
+            .expect("user hook must survive");
+        assert_eq!(user["event"].as_str(), Some("GameWon"));
+        let aoe: Vec<_> = hooks
+            .iter()
+            .filter_map(|h| h["command"].as_str())
+            .filter(|c| c.contains("aoe-hooks"))
+            .collect();
+        assert!(
+            aoe.iter().all(|c| c.contains("case \"$AOE_INSTANCE_ID\"")),
+            "every AoE line must carry the hardened guard"
+        );
+    }
 
-            // Re-plant the legacy YAML so the marker gate fires again and v015
-            // genuinely re-enters the rewrite path.
-            fs::write(
-                &cfg,
-                format!("hooks:\n  pre_tool_call:\n    - command: {LEGACY_STATUS_CMD:?}\n"),
-            )
-            .unwrap();
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn hermes_config_and_allowlist_both_rewritten() {
+        let _g = unset_agent_home_env();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let cfg = home.join(".hermes/config.yaml");
+        fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        fs::write(
+            &cfg,
+            format!("hooks:\n  pre_tool_call:\n    - command: {LEGACY_STATUS_CMD:?}\n"),
+        )
+        .unwrap();
 
-            run_in(&home, &app_dir).unwrap();
+        run_in(&home, &app_dir).unwrap();
 
-            let after: Value =
-                serde_json::from_str(&fs::read_to_string(&allow_path).unwrap()).unwrap();
-            let approvals = after["approvals"].as_array().unwrap();
-            assert!(!approvals.is_empty(), "allowlist must not be wiped");
-            for approval in approvals {
-                assert!(
-                    approval.get("__reentry_canary").is_none(),
-                    "v015 must re-render the allowlist on the second run; canary survived: {approval}"
-                );
-                assert_eq!(
-                    approval["approved_at"].as_str(),
-                    Some(SENTINEL),
-                    "approved_at must be preserved on (event, hardened_command) collision: {approval}"
-                );
-            }
-        }
-        // kiro rewrite preserves extra keys
-        {
-            let _g = unset_agent_home_env();
-            let (_tmp, home, app_dir) = setup_dirs();
-            let kiro = home.join(".kiro/agents/aoe-hooks.json");
-            write_json(
-                &kiro,
-                &serde_json::json!({
-                    "name": "my-custom-agent",
-                    "tools": ["Read", "Bash"],
-                    "description": "user description that must survive",
-                    "model": "claude-3-5-sonnet",
-                    "custom_user_field": {"nested": [1, 2, 3]},
-                    "hooks": {
-                        "preToolUse": [{"command": LEGACY_STATUS_CMD}]
-                    }
-                }),
-            );
-
-            run_in(&home, &app_dir).unwrap();
-
-            let parsed: Value = serde_json::from_str(&fs::read_to_string(&kiro).unwrap()).unwrap();
-            assert_eq!(parsed["name"].as_str(), Some("my-custom-agent"));
-            assert_eq!(parsed["tools"][0], "Read");
-            assert_eq!(
-                parsed["description"].as_str(),
-                Some("user description that must survive"),
-                "arbitrary user-set keys must be preserved"
-            );
-            assert_eq!(parsed["model"].as_str(), Some("claude-3-5-sonnet"));
-            assert_eq!(parsed["custom_user_field"]["nested"][2], 3);
-            let cmd = parsed["hooks"]["preToolUse"][0]["command"]
-                .as_str()
-                .unwrap();
+        let yaml = fs::read_to_string(&cfg).unwrap();
+        assert!(
+            yaml.contains("case \"$AOE_INSTANCE_ID\""),
+            "Hermes YAML must be rewritten to hardened form"
+        );
+        let allow = home.join(".hermes/shell-hooks-allowlist.json");
+        assert!(allow.exists(), "allowlist must be created alongside config");
+        let parsed: Value = serde_json::from_str(&fs::read_to_string(&allow).unwrap()).unwrap();
+        let approvals = parsed["approvals"].as_array().unwrap();
+        for approval in approvals {
+            let cmd = approval["command"].as_str().unwrap();
             assert!(
                 cmd.contains("case \"$AOE_INSTANCE_ID\""),
-                "Kiro hook command must be rewritten"
+                "allowlist must key on the new hardened command"
             );
         }
-        // missing files noop
-        {
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn hermes_allowlist_approved_at_preserved_on_idempotency() {
+        let _g = unset_agent_home_env();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let cfg = home.join(".hermes/config.yaml");
+        let allow_path = home.join(".hermes/shell-hooks-allowlist.json");
+        fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        fs::write(
+            &cfg,
+            format!("hooks:\n  pre_tool_call:\n    - command: {LEGACY_STATUS_CMD:?}\n"),
+        )
+        .unwrap();
+
+        // First run rewrites legacy YAML to hardened form and creates the
+        // canonical allowlist with current `approved_at` values.
+        run_in(&home, &app_dir).unwrap();
+
+        // Plant a sentinel timestamp on every approval. Because the entries
+        // now carry the HARDENED command (the same bytes a re-run of
+        // render_hermes_allowlist will match on), a subsequent rewrite must
+        // hit the (event, command) collision branch and preserve approved_at.
+        // Without this trick (e.g. running run_in twice back-to-back without
+        // the sentinel injection), the test would pass even if preservation
+        // were reverted to per-call `Utc::now()`, because to_rfc3339_opts
+        // collapses sub-second timestamps to the same string within one
+        // wall-clock second.
+        const SENTINEL: &str = "2020-01-01T00:00:00Z";
+        let mut data: Value =
+            serde_json::from_str(&fs::read_to_string(&allow_path).unwrap()).unwrap();
+        for approval in data["approvals"].as_array_mut().unwrap() {
+            approval["approved_at"] = Value::String(SENTINEL.into());
+            // Re-render canary: render_hermes_allowlist's retain+push path
+            // re-emits only its 4 canonical fields, so this stripped key
+            // distinguishes "re-render ran" from "re-render skipped". A
+            // skipped re-render would leave the planted canary intact and
+            // let the sentinel assertion below pass without proving anything.
+            approval["__reentry_canary"] = Value::Bool(true);
+        }
+        fs::write(&allow_path, serde_json::to_string_pretty(&data).unwrap()).unwrap();
+
+        // Re-plant the legacy YAML so the marker gate fires again and v015
+        // genuinely re-enters the rewrite path.
+        fs::write(
+            &cfg,
+            format!("hooks:\n  pre_tool_call:\n    - command: {LEGACY_STATUS_CMD:?}\n"),
+        )
+        .unwrap();
+
+        run_in(&home, &app_dir).unwrap();
+
+        let after: Value = serde_json::from_str(&fs::read_to_string(&allow_path).unwrap()).unwrap();
+        let approvals = after["approvals"].as_array().unwrap();
+        assert!(!approvals.is_empty(), "allowlist must not be wiped");
+        for approval in approvals {
+            assert!(
+                approval.get("__reentry_canary").is_none(),
+                "v015 must re-render the allowlist on the second run; canary survived: {approval}"
+            );
+            assert_eq!(
+                approval["approved_at"].as_str(),
+                Some(SENTINEL),
+                "approved_at must be preserved on (event, hardened_command) collision: {approval}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn kiro_rewrite_preserves_extra_keys() {
+        let _g = unset_agent_home_env();
+        let (_tmp, home, app_dir) = setup_dirs();
+        let kiro = home.join(".kiro/agents/aoe-hooks.json");
+        write_json(
+            &kiro,
+            &serde_json::json!({
+                "name": "my-custom-agent",
+                "tools": ["Read", "Bash"],
+                "description": "user description that must survive",
+                "model": "claude-3-5-sonnet",
+                "custom_user_field": {"nested": [1, 2, 3]},
+                "hooks": {
+                    "preToolUse": [{"command": LEGACY_STATUS_CMD}]
+                }
+            }),
+        );
+
+        run_in(&home, &app_dir).unwrap();
+
+        let parsed: Value = serde_json::from_str(&fs::read_to_string(&kiro).unwrap()).unwrap();
+        assert_eq!(parsed["name"].as_str(), Some("my-custom-agent"));
+        assert_eq!(parsed["tools"][0], "Read");
+        assert_eq!(
+            parsed["description"].as_str(),
+            Some("user description that must survive"),
+            "arbitrary user-set keys must be preserved"
+        );
+        assert_eq!(parsed["model"].as_str(), Some("claude-3-5-sonnet"));
+        assert_eq!(parsed["custom_user_field"]["nested"][2], 3);
+        let cmd = parsed["hooks"]["preToolUse"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cmd.contains("case \"$AOE_INSTANCE_ID\""),
+            "Kiro hook command must be rewritten"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn missing_files_noop() {
+        let _g = unset_agent_home_env();
+        let (_tmp, home, app_dir) = setup_dirs();
+
+        run_in(&home, &app_dir).unwrap();
+
+        assert!(
+            !home.join(".claude/settings.json").exists(),
+            "no AoE config existed; migration must NOT create new files"
+        );
+        assert!(!home.join(".codex/config.toml").exists());
+        assert!(!home.join(".hermes/config.yaml").exists());
+        assert!(!home.join(".settl/config.toml").exists());
+    }
+
+    /// A file the gate cannot parse stays byte-identical, and nothing is
+    /// written beside it.
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn unparseable_gate_files_stay_byte_identical() {
+        for (rel, body, sibling) in [
+            (".claude/settings.json", "{not json", None),
+            (".settl/config.toml", "[[hooks\n# unclosed", None),
+            (
+                ".hermes/config.yaml",
+                "hooks:\n  pre_tool_call:\n    - command: 'unterminated\n",
+                Some(".hermes/shell-hooks-allowlist.json"),
+            ),
+        ] {
             let _g = unset_agent_home_env();
             let (_tmp, home, app_dir) = setup_dirs();
+            let path = home.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, body).unwrap();
 
             run_in(&home, &app_dir).unwrap();
 
-            assert!(
-                !home.join(".claude/settings.json").exists(),
-                "no AoE config existed; migration must NOT create new files"
+            assert_eq!(fs::read_to_string(&path).unwrap(), body, "{rel}");
+            if let Some(sibling) = sibling {
+                assert!(
+                    !home.join(sibling).exists(),
+                    "{sibling} must not be written"
+                );
+            }
+        }
+    }
+
+    /// A profile `environment` override is reached, and the default path it
+    /// replaces is not created.
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn profile_config_dir_overrides_are_rewritten() {
+        // `CLAUDE_CONFIG_DIR` replaces the whole `~/.claude` directory, so the
+        // override file lands at the basename of `settings_rel_path`.
+        for (var, dir, file, event, default) in [
+            (
+                "CODEX_HOME",
+                "work-codex",
+                "hooks.json",
+                "SessionStart",
+                ".codex/hooks.json",
+            ),
+            (
+                "CLAUDE_CONFIG_DIR",
+                "work-claude",
+                "settings.json",
+                "PreToolUse",
+                ".claude/settings.json",
+            ),
+        ] {
+            let _g = unset_agent_home_env();
+            let (_tmp, home, app_dir) = setup_dirs();
+            let override_dir = home.join(dir);
+            fs::create_dir_all(&override_dir).unwrap();
+            let mut events = serde_json::Map::new();
+            events.insert(
+                event.to_string(),
+                serde_json::json!([{"hooks": [{"type": "command", "command": LEGACY_STATUS_CMD}]}]),
             );
-            assert!(!home.join(".codex/config.toml").exists());
-            assert!(!home.join(".hermes/config.yaml").exists());
-            assert!(!home.join(".settl/config.toml").exists());
-        }
-        // A file the gate cannot parse stays byte-identical, and nothing is
-        // written beside it.
-        {
-            for (rel, body, sibling) in [
-                (".claude/settings.json", "{not json", None),
-                (".settl/config.toml", "[[hooks\n# unclosed", None),
-                (
-                    ".hermes/config.yaml",
-                    "hooks:\n  pre_tool_call:\n    - command: 'unterminated\n",
-                    Some(".hermes/shell-hooks-allowlist.json"),
-                ),
-            ] {
-                let _g = unset_agent_home_env();
-                let (_tmp, home, app_dir) = setup_dirs();
-                let path = home.join(rel);
-                fs::create_dir_all(path.parent().unwrap()).unwrap();
-                fs::write(&path, body).unwrap();
+            write_json(
+                &override_dir.join(file),
+                &serde_json::json!({"hooks": events}),
+            );
 
-                run_in(&home, &app_dir).unwrap();
+            let profile_dir = app_dir.join("profiles/work");
+            fs::create_dir_all(&profile_dir).unwrap();
+            fs::write(
+                profile_dir.join("config.toml"),
+                format!("environment = [\"{var}={}\"]\n", override_dir.display()),
+            )
+            .unwrap();
 
-                assert_eq!(fs::read_to_string(&path).unwrap(), body, "{rel}");
-                if let Some(sibling) = sibling {
-                    assert!(
-                        !home.join(sibling).exists(),
-                        "{sibling} must not be written"
-                    );
-                }
-            }
-        }
-        // A profile `environment` override is reached, and the default path it
-        // replaces is not created.
-        {
-            // `CLAUDE_CONFIG_DIR` replaces the whole `~/.claude` directory, so the
-            // override file lands at the basename of `settings_rel_path`.
-            for (var, dir, file, event, default) in [
-                (
-                    "CODEX_HOME",
-                    "work-codex",
-                    "hooks.json",
-                    "SessionStart",
-                    ".codex/hooks.json",
-                ),
-                (
-                    "CLAUDE_CONFIG_DIR",
-                    "work-claude",
-                    "settings.json",
-                    "PreToolUse",
-                    ".claude/settings.json",
-                ),
-            ] {
-                let _g = unset_agent_home_env();
-                let (_tmp, home, app_dir) = setup_dirs();
-                let override_dir = home.join(dir);
-                fs::create_dir_all(&override_dir).unwrap();
-                let mut events = serde_json::Map::new();
-                events.insert(
-                    event.to_string(),
-                    serde_json::json!([{"hooks": [{"type": "command", "command": LEGACY_STATUS_CMD}]}]),
-                );
-                write_json(
-                    &override_dir.join(file),
-                    &serde_json::json!({"hooks": events}),
-                );
+            run_in(&home, &app_dir).unwrap();
 
-                let profile_dir = app_dir.join("profiles/work");
-                fs::create_dir_all(&profile_dir).unwrap();
-                fs::write(
-                    profile_dir.join("config.toml"),
-                    format!("environment = [\"{var}={}\"]\n", override_dir.display()),
-                )
-                .unwrap();
-
-                run_in(&home, &app_dir).unwrap();
-
-                let parsed: Value =
-                    serde_json::from_str(&fs::read_to_string(override_dir.join(file)).unwrap())
-                        .unwrap();
-                let cmd = parsed["hooks"][event][0]["hooks"][0]["command"]
-                    .as_str()
-                    .expect("AoE command must be present at the override path");
-                assert!(
-                    cmd.contains("case \"$AOE_INSTANCE_ID\""),
-                    "{var} override must be reached and rewritten; got: {cmd}"
-                );
-                assert!(
-                    !home.join(default).exists(),
-                    "{default} must not be magicked into existence"
-                );
-            }
+            let parsed: Value =
+                serde_json::from_str(&fs::read_to_string(override_dir.join(file)).unwrap())
+                    .unwrap();
+            let cmd = parsed["hooks"][event][0]["hooks"][0]["command"]
+                .as_str()
+                .expect("AoE command must be present at the override path");
+            assert!(
+                cmd.contains("case \"$AOE_INSTANCE_ID\""),
+                "{var} override must be reached and rewritten; got: {cmd}"
+            );
+            assert!(
+                !home.join(default).exists(),
+                "{default} must not be magicked into existence"
+            );
         }
     }
 }

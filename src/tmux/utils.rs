@@ -798,42 +798,40 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn pane_title_reads_the_published_title_without_its_delimiter() {
-        // pane title reads the panes published title
-        {
-            require_tmux!();
-            let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_pane_title");
-            let name = guard.name();
-            let mut args: Vec<String> = ["new-session", "-d", "-s", name, "sleep", "30"]
-                .iter()
-                .map(|arg| arg.to_string())
-                .collect();
-            append_pane_base_index_args(&mut args, name);
-            assert!(crate::tmux::tmux_command()
-                .args(&args)
-                .status()
-                .expect("create title fixture")
-                .success());
-            let target = crate::tmux::test_helpers::only_pane_id(name);
-            assert!(crate::tmux::tmux_command()
-                .args(["select-pane", "-t", &target, "-T", "aoe-title-probe"])
-                .status()
-                .expect("set pane title")
-                .success());
-            let title = pane_title(name);
-            assert_eq!(title.as_deref(), Some("aoe-title-probe"));
-        }
-        // strip display delimiter removes only the delimiter
-        {
-            assert_eq!(strip_display_delimiter("title\n"), "title");
-            assert_eq!(strip_display_delimiter("title"), "title");
-            assert_eq!(strip_display_delimiter(""), "");
-            assert_eq!(
-                strip_display_delimiter("title\n\n"),
-                "title\n",
-                "a newline the title itself carried must survive"
-            );
-        }
+    fn pane_title_reads_the_panes_published_title() {
+        require_tmux!();
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_pane_title");
+        let name = guard.name();
+        let mut args: Vec<String> = ["new-session", "-d", "-s", name, "sleep", "30"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+        append_pane_base_index_args(&mut args, name);
+        assert!(crate::tmux::tmux_command()
+            .args(&args)
+            .status()
+            .expect("create title fixture")
+            .success());
+        let target = crate::tmux::test_helpers::only_pane_id(name);
+        assert!(crate::tmux::tmux_command()
+            .args(["select-pane", "-t", &target, "-T", "aoe-title-probe"])
+            .status()
+            .expect("set pane title")
+            .success());
+        let title = pane_title(name);
+        assert_eq!(title.as_deref(), Some("aoe-title-probe"));
+    }
+
+    #[test]
+    fn strip_display_delimiter_removes_only_the_delimiter() {
+        assert_eq!(strip_display_delimiter("title\n"), "title");
+        assert_eq!(strip_display_delimiter("title"), "title");
+        assert_eq!(strip_display_delimiter(""), "");
+        assert_eq!(
+            strip_display_delimiter("title\n\n"),
+            "title\n",
+            "a newline the title itself carried must survive"
+        );
     }
 }
 

@@ -164,139 +164,136 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn new_adopts_only_an_unambiguous_retitled_tool_session() {
-        // new adopts a retitled tool session but not another tools
-        {
-            let guard = crate::tmux::SessionCacheGuard::capture();
-            let stale_lazygit = ToolSession::generate_name(ID, "Vikings", "lazygit");
-            guard.force_present(&[stale_lazygit.as_str()]);
+    fn new_adopts_a_retitled_tool_session_but_not_another_tools() {
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        let stale_lazygit = ToolSession::generate_name(ID, "Vikings", "lazygit");
+        guard.force_present(&[stale_lazygit.as_str()]);
 
-            assert_eq!(
-                ToolSession::new(ID, "Refactor billing", "lazygit").session_name(),
-                stale_lazygit
-            );
-            let yazi = ToolSession::new(ID, "Refactor billing", "yazi")
-                .session_name()
-                .to_string();
-            assert!(
-                yazi.starts_with(&format!("{TOOL_PREFIX}yazi_")),
-                "yazi must not adopt lazygit's pane: {yazi}"
-            );
-            assert!(yazi.contains("Refactor_billing"));
-        }
-        // new keeps the derived name when an extension named tool is ambiguous
-        {
-            let guard = crate::tmux::SessionCacheGuard::capture();
-            let git = ToolSession::generate_name(ID, "Vikings", "git");
-            let git_log = ToolSession::generate_name(ID, "Vikings", "git_log");
-            assert!(
-                git_log.starts_with(&ToolSession::name_prefix("git")),
-                "the collision this guards only exists because `git_log` matches \
-                 `git`'s prefix: {git_log}"
-            );
-            guard.force_present(&[git.as_str(), git_log.as_str()]);
-
-            let derived = ToolSession::generate_name(ID, "Refactor billing", "git");
-            assert_eq!(
-                ToolSession::new(ID, "Refactor billing", "git").session_name(),
-                derived,
-                "two candidates are ambiguous, so neither pane is adopted"
-            );
-        }
+        assert_eq!(
+            ToolSession::new(ID, "Refactor billing", "lazygit").session_name(),
+            stale_lazygit
+        );
+        let yazi = ToolSession::new(ID, "Refactor billing", "yazi")
+            .session_name()
+            .to_string();
+        assert!(
+            yazi.starts_with(&format!("{TOOL_PREFIX}yazi_")),
+            "yazi must not adopt lazygit's pane: {yazi}"
+        );
+        assert!(yazi.contains("Refactor_billing"));
     }
 
     #[test]
     #[serial_test::serial]
-    fn wait_until_ready_tracks_pane_liveness() {
-        // wait until ready errs with pane tail when pane dies immediately
-        {
-            let _env = crate::session::test_support::EnvGuard::read_lock();
-            require_tmux!();
+    fn new_keeps_the_derived_name_when_an_extension_named_tool_is_ambiguous() {
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        let git = ToolSession::generate_name(ID, "Vikings", "git");
+        let git_log = ToolSession::generate_name(ID, "Vikings", "git_log");
+        assert!(
+            git_log.starts_with(&ToolSession::name_prefix("git")),
+            "the collision this guards only exists because `git_log` matches \
+             `git`'s prefix: {git_log}"
+        );
+        guard.force_present(&[git.as_str(), git_log.as_str()]);
 
-            let dir = tempfile::tempdir().expect("tempdir");
-            let guard = TmuxTestSession::new("aoe_test_tool_dead");
-            let tool = ToolSession {
-                name: guard.name().to_string(),
-            };
-            tool.create_with_size(
-                dir.path().to_str().expect("utf8 path"),
-                "sh -c 'echo boom; exit 1'",
-                Some((80, 24)),
-                "default",
-            )
-            .expect("create_with_size");
+        let derived = ToolSession::generate_name(ID, "Refactor billing", "git");
+        assert_eq!(
+            ToolSession::new(ID, "Refactor billing", "git").session_name(),
+            derived,
+            "two candidates are ambiguous, so neither pane is adopted"
+        );
+    }
+    #[test]
+    #[serial_test::serial]
+    fn wait_until_ready_errs_with_pane_tail_when_pane_dies_immediately() {
+        let _env = crate::session::test_support::EnvGuard::read_lock();
+        require_tmux!();
 
-            let pane_id = crate::tmux::test_helpers::only_pane_id(tool.session_name());
-            crate::tmux::test_helpers::wait_for_pane_dead(&pane_id);
-            let result = tool.wait_until_ready();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let guard = TmuxTestSession::new("aoe_test_tool_dead");
+        let tool = ToolSession {
+            name: guard.name().to_string(),
+        };
+        tool.create_with_size(
+            dir.path().to_str().expect("utf8 path"),
+            "sh -c 'echo boom; exit 1'",
+            Some((80, 24)),
+            "default",
+        )
+        .expect("create_with_size");
 
-            assert!(
-                result.is_err(),
-                "wait_until_ready should error when the pane dies before the budget expires"
-            );
-            let message = result.unwrap_err().to_string();
-            assert!(
-                message.contains("boom"),
-                "error should include the captured pane tail, got: {message:?}"
-            );
-        }
-        // wait until ready ok when pane stays alive
-        {
-            require_tmux!();
+        let pane_id = crate::tmux::test_helpers::only_pane_id(tool.session_name());
+        crate::tmux::test_helpers::wait_for_pane_dead(&pane_id);
+        let result = tool.wait_until_ready();
 
-            let dir = tempfile::tempdir().expect("tempdir");
-            let guard = TmuxTestSession::new("aoe_test_tool_alive");
-            let tool = ToolSession {
-                name: guard.name().to_string(),
-            };
-            tool.create_with_size(
-                dir.path().to_str().expect("utf8 path"),
-                "sleep 5",
-                Some((80, 24)),
-                "default",
-            )
-            .expect("create_with_size");
-
-            let result = tool.wait_until_ready();
-
-            assert!(
-                result.is_ok(),
-                "wait_until_ready should succeed for a still-running pane, got: {result:?}"
-            );
-        }
+        assert!(
+            result.is_err(),
+            "wait_until_ready should error when the pane dies before the budget expires"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("boom"),
+            "error should include the captured pane tail, got: {message:?}"
+        );
     }
 
     #[test]
-    fn new_names_are_sanitized_and_distinct() {
-        // new name includes prefix tool title and truncated id
-        {
-            let s = ToolSession::new("0123456789abcdef", "my-session", "lazygit");
-            let name = s.session_name();
-            assert!(name.starts_with(TOOL_PREFIX), "name was {}", name);
-            assert!(name.contains("lazygit"));
-            assert!(name.contains("my-session"));
-            assert!(name.ends_with("_01234567"), "name was {}", name);
-        }
-        // new name sanitizes unsafe characters
-        {
-            let s = ToolSession::new("abc12345", "feature/foo:bar", "my tool.v2");
-            let name = s.session_name();
-            assert!(!name.contains(':'), "name was {}", name);
-            assert!(!name.contains('.'), "name was {}", name);
-            assert!(!name.contains(' '), "name was {}", name);
-        }
-        // distinct tools on same session have distinct names
-        {
-            let id = "0123456789abcdef";
-            let lazygit = ToolSession::new(id, "x", "lazygit");
-            let yazi = ToolSession::new(id, "x", "yazi");
-            assert_ne!(lazygit.session_name(), yazi.session_name());
-        }
-        // distinct sessions for same tool have distinct names
-        {
-            let a = ToolSession::new("aaaaaaaa1111", "x", "lazygit");
-            let b = ToolSession::new("bbbbbbbb2222", "x", "lazygit");
-            assert_ne!(a.session_name(), b.session_name());
-        }
+    #[serial_test::serial]
+    fn wait_until_ready_ok_when_pane_stays_alive() {
+        require_tmux!();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let guard = TmuxTestSession::new("aoe_test_tool_alive");
+        let tool = ToolSession {
+            name: guard.name().to_string(),
+        };
+        tool.create_with_size(
+            dir.path().to_str().expect("utf8 path"),
+            "sleep 5",
+            Some((80, 24)),
+            "default",
+        )
+        .expect("create_with_size");
+
+        let result = tool.wait_until_ready();
+
+        assert!(
+            result.is_ok(),
+            "wait_until_ready should succeed for a still-running pane, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn new_name_includes_prefix_tool_title_and_truncated_id() {
+        let s = ToolSession::new("0123456789abcdef", "my-session", "lazygit");
+        let name = s.session_name();
+        assert!(name.starts_with(TOOL_PREFIX), "name was {}", name);
+        assert!(name.contains("lazygit"));
+        assert!(name.contains("my-session"));
+        assert!(name.ends_with("_01234567"), "name was {}", name);
+    }
+
+    #[test]
+    fn new_name_sanitizes_unsafe_characters() {
+        let s = ToolSession::new("abc12345", "feature/foo:bar", "my tool.v2");
+        let name = s.session_name();
+        assert!(!name.contains(':'), "name was {}", name);
+        assert!(!name.contains('.'), "name was {}", name);
+        assert!(!name.contains(' '), "name was {}", name);
+    }
+
+    #[test]
+    fn distinct_tools_on_same_session_have_distinct_names() {
+        let id = "0123456789abcdef";
+        let lazygit = ToolSession::new(id, "x", "lazygit");
+        let yazi = ToolSession::new(id, "x", "yazi");
+        assert_ne!(lazygit.session_name(), yazi.session_name());
+    }
+
+    #[test]
+    fn distinct_sessions_for_same_tool_have_distinct_names() {
+        let a = ToolSession::new("aaaaaaaa1111", "x", "lazygit");
+        let b = ToolSession::new("bbbbbbbb2222", "x", "lazygit");
+        assert_ne!(a.session_name(), b.session_name());
     }
 }

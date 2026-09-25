@@ -126,98 +126,98 @@ mod tests {
     }
 
     #[test]
-    fn backfill_detect_as_cases() {
-        // backfills only unaliased rows with a mapped tool
-        {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("sessions.json");
-            fs::write(
-                &path,
-                r#"[
-                    {"id":"a","tool":"claude-personal"},
-                    {"id":"b","tool":"claude-personal","detect_as":""},
-                    {"id":"c","tool":"claude-personal","detect_as":"codex"},
-                    {"id":"d","tool":"codex-company"},
-                    {"id":"e","tool":"claude"},
-                    {"id":"f"}
-                ]"#,
-            )
-            .unwrap();
+    fn backfills_only_unaliased_rows_with_a_mapped_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        fs::write(
+            &path,
+            r#"[
+                {"id":"a","tool":"claude-personal"},
+                {"id":"b","tool":"claude-personal","detect_as":""},
+                {"id":"c","tool":"claude-personal","detect_as":"codex"},
+                {"id":"d","tool":"codex-company"},
+                {"id":"e","tool":"claude"},
+                {"id":"f"}
+            ]"#,
+        )
+        .unwrap();
 
-            backfill(&path, &aliases(&[("claude-personal", "claude")])).unwrap();
+        backfill(&path, &aliases(&[("claude-personal", "claude")])).unwrap();
 
-            let v: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-            let arr = v.as_array().unwrap();
-            // absent alias + mapped tool -> filled (the bug footprint)
-            assert_eq!(arr[0]["detect_as"], "claude");
-            // empty alias is the same state as absent -> filled
-            assert_eq!(arr[1]["detect_as"], "claude");
-            // an alias already stored is a deliberate pin -> untouched
-            assert_eq!(arr[2]["detect_as"], "codex");
-            // tool with no config entry -> left for the runtime fallback to miss too
-            assert!(arr[3].get("detect_as").is_none());
-            // built-in tool -> never aliased
-            assert!(arr[4].get("detect_as").is_none());
-            // row without a tool -> untouched, not a panic
-            assert!(arr[5].get("detect_as").is_none());
-        }
-        // is idempotent
-        {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("sessions.json");
-            fs::write(&path, r#"[{"id":"a","tool":"claude-personal"}]"#).unwrap();
-            let map = aliases(&[("claude-personal", "claude")]);
-            backfill(&path, &map).unwrap();
-            let first = fs::read_to_string(&path).unwrap();
-            backfill(&path, &map).unwrap();
-            assert_eq!(fs::read_to_string(&path).unwrap(), first);
-        }
-        // skips unreadable and absent and unmapped
-        {
-            let dir = tempfile::tempdir().unwrap();
-            // Missing file.
-            backfill(&dir.path().join("nope.json"), &aliases(&[("a", "claude")])).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let arr = v.as_array().unwrap();
+        // absent alias + mapped tool -> filled (the bug footprint)
+        assert_eq!(arr[0]["detect_as"], "claude");
+        // empty alias is the same state as absent -> filled
+        assert_eq!(arr[1]["detect_as"], "claude");
+        // an alias already stored is a deliberate pin -> untouched
+        assert_eq!(arr[2]["detect_as"], "codex");
+        // tool with no config entry -> left for the runtime fallback to miss too
+        assert!(arr[3].get("detect_as").is_none());
+        // built-in tool -> never aliased
+        assert!(arr[4].get("detect_as").is_none());
+        // row without a tool -> untouched, not a panic
+        assert!(arr[5].get("detect_as").is_none());
+    }
 
-            // Corrupt file is left exactly as found.
-            let corrupt = dir.path().join("corrupt.json");
-            fs::write(&corrupt, "{ not valid json").unwrap();
-            backfill(&corrupt, &aliases(&[("a", "claude")])).unwrap();
-            assert_eq!(fs::read_to_string(&corrupt).unwrap(), "{ not valid json");
+    #[test]
+    fn is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        fs::write(&path, r#"[{"id":"a","tool":"claude-personal"}]"#).unwrap();
+        let map = aliases(&[("claude-personal", "claude")]);
+        backfill(&path, &map).unwrap();
+        let first = fs::read_to_string(&path).unwrap();
+        backfill(&path, &map).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), first);
+    }
 
-            // No aliases configured means no rewrite at all.
-            let path = dir.path().join("sessions.json");
-            let row = r#"[{"id":"a","tool":"claude-personal"}]"#;
-            fs::write(&path, row).unwrap();
-            backfill(&path, &HashMap::new()).unwrap();
-            assert_eq!(fs::read_to_string(&path).unwrap(), row);
-        }
-        // walks profiles and legacy layouts with per profile aliases
-        {
-            let dir = tempfile::tempdir().unwrap();
-            let work = dir.path().join("profiles").join("work");
-            fs::create_dir_all(&work).unwrap();
-            let row = r#"[{"id":"a","tool":"my-agent"}]"#;
-            fs::write(work.join("sessions.json"), row).unwrap();
-            fs::write(dir.path().join("sessions.json"), row).unwrap();
+    #[test]
+    fn skips_unreadable_and_absent_and_unmapped() {
+        let dir = tempfile::tempdir().unwrap();
+        // Missing file.
+        backfill(&dir.path().join("nope.json"), &aliases(&[("a", "claude")])).unwrap();
 
-            // Each profile resolves its own map, and the legacy file is asked for
-            // the default profile's (empty name).
-            run_in(dir.path(), &|profile| match profile {
-                "work" => aliases(&[("my-agent", "claude")]),
-                "" => aliases(&[("my-agent", "codex")]),
-                _ => HashMap::new(),
-            })
-            .unwrap();
+        // Corrupt file is left exactly as found.
+        let corrupt = dir.path().join("corrupt.json");
+        fs::write(&corrupt, "{ not valid json").unwrap();
+        backfill(&corrupt, &aliases(&[("a", "claude")])).unwrap();
+        assert_eq!(fs::read_to_string(&corrupt).unwrap(), "{ not valid json");
 
-            let read = |p: std::path::PathBuf| -> serde_json::Value {
-                serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap()
-            };
-            assert_eq!(read(work.join("sessions.json"))[0]["detect_as"], "claude");
-            assert_eq!(
-                read(dir.path().join("sessions.json"))[0]["detect_as"],
-                "codex"
-            );
-        }
+        // No aliases configured means no rewrite at all.
+        let path = dir.path().join("sessions.json");
+        let row = r#"[{"id":"a","tool":"claude-personal"}]"#;
+        fs::write(&path, row).unwrap();
+        backfill(&path, &HashMap::new()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), row);
+    }
+
+    #[test]
+    fn walks_profiles_and_legacy_layouts_with_per_profile_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("profiles").join("work");
+        fs::create_dir_all(&work).unwrap();
+        let row = r#"[{"id":"a","tool":"my-agent"}]"#;
+        fs::write(work.join("sessions.json"), row).unwrap();
+        fs::write(dir.path().join("sessions.json"), row).unwrap();
+
+        // Each profile resolves its own map, and the legacy file is asked for
+        // the default profile's (empty name).
+        run_in(dir.path(), &|profile| match profile {
+            "work" => aliases(&[("my-agent", "claude")]),
+            "" => aliases(&[("my-agent", "codex")]),
+            _ => HashMap::new(),
+        })
+        .unwrap();
+
+        let read = |p: std::path::PathBuf| -> serde_json::Value {
+            serde_json::from_str(&fs::read_to_string(&p).unwrap()).unwrap()
+        };
+        assert_eq!(read(work.join("sessions.json"))[0]["detect_as"], "claude");
+        assert_eq!(
+            read(dir.path().join("sessions.json"))[0]["detect_as"],
+            "codex"
+        );
     }
 }
