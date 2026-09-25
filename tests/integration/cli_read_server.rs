@@ -208,3 +208,40 @@ async fn the_route_refuses_an_unauthenticated_upgrade_with_401() {
         "an unauthenticated caller must not be upgraded: {response}"
     );
 }
+
+/// A valid browser cookie is not a runtime credential. The daemon-wide auth
+/// middleware accepts cookies for the dashboard, but this read-only route is
+/// deliberately narrower and requires one Authorization: Bearer header.
+#[tokio::test]
+#[serial_test::parallel]
+async fn the_route_rejects_a_valid_dashboard_cookie() {
+    let state =
+        build_test_app_state_with_policy(Vec::new(), hosts(), Vec::new(), Some(TOKEN.to_string()));
+    let address = serve(state).await;
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect");
+    stream
+        .write_all(
+            b"GET /api/runtime/ws HTTP/1.1\r\n\
+              Host: 127.0.0.1\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\
+              Sec-WebSocket-Key: AAECAwQFBgcICQoLDA0ODw==\r\n\
+              Sec-WebSocket-Version: 13\r\n\
+              Cookie: aoe_token=server-token-valid\r\n\r\n",
+        )
+        .await
+        .expect("write request");
+    let mut head = [0u8; 4096];
+    let read = stream.read(&mut head).await.expect("read response");
+    let response = String::from_utf8_lossy(&head[..read]).into_owned();
+    assert!(
+        response.starts_with("HTTP/1.1 401 Unauthorized\r\n"),
+        "unexpected response: {response}"
+    );
+    assert!(
+        !response.contains("101 Switching Protocols"),
+        "cookie must not upgrade: {response}"
+    );
+}

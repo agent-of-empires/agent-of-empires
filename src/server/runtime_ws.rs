@@ -14,6 +14,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
@@ -31,7 +32,16 @@ const NAMESPACE: &str = if cfg!(debug_assertions) {
     "release:agent-of-empires"
 };
 
-pub async fn runtime_ws(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
+pub async fn runtime_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    // The daemon-wide middleware also accepts browser cookies and query tokens.
+    // The runtime read contract accepts exactly one Authorization: Bearer header.
+    if !has_bearer_header(&headers) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
     // CityHall lockdown must not be bypassable by opening this route directly.
     if let Some(response) = super::api::cityhall_block(&state) {
         return response;
@@ -40,6 +50,27 @@ pub async fn runtime_ws(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>
         .into_response()
 }
 
+fn has_bearer_header(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let Some(token) = value.strip_prefix("Bearer ") else {
+        return false;
+    };
+    let bytes = token.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 4096
+        && bytes
+            .iter()
+            .all(|byte| (0x21..=0x7e).contains(byte) && *byte != b'"' && *byte != b'\\')
+}
 async fn serve_runtime_read(mut socket: WebSocket, state: Arc<AppState>) {
     let runtime = &RUNTIME;
     // Single-flight: a second connection waits for the in-flight sample instead of
@@ -909,5 +940,14 @@ mod tests {
         assert!(!canonical_absolute_path("/repo/../etc"));
         assert!(!canonical_absolute_path("/repo//one"));
         assert!(!canonical_absolute_path("/repo/\u{202e}"));
+    }
+    #[test]
+    fn runtime_ws_requires_one_bearer_header() {
+        let mut headers = HeaderMap::new();
+        assert!(!has_bearer_header(&headers));
+        headers.append(header::AUTHORIZATION, "Bearer token".parse().unwrap());
+        assert!(has_bearer_header(&headers));
+        headers.append(header::AUTHORIZATION, "Bearer second".parse().unwrap());
+        assert!(!has_bearer_header(&headers));
     }
 }
