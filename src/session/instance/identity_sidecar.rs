@@ -42,6 +42,28 @@ fn host_transcript_state(host_path: &Path) -> PiTranscriptState {
     }
 }
 
+#[cfg(test)]
+#[must_use]
+pub(crate) struct FailNextPiPathWriteGuard {
+    previous_armed: bool,
+    previous_consumed: bool,
+}
+
+#[cfg(test)]
+impl FailNextPiPathWriteGuard {
+    pub(crate) fn was_consumed(&self) -> bool {
+        FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(std::cell::Cell::get)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailNextPiPathWriteGuard {
+    fn drop(&mut self) {
+        FAIL_NEXT_PI_PATH_WRITE.with(|armed| armed.set(self.previous_armed));
+        FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(|consumed| consumed.set(self.previous_consumed));
+    }
+}
+
 impl Instance {
     #[cfg(test)]
     pub(crate) fn mark_pi_extension_launched_for_test(&mut self) {
@@ -352,7 +374,13 @@ impl Instance {
             #[cfg(test)]
             anyhow::ensure!(
                 !FAIL_PI_PATH_WRITES.with(std::cell::Cell::get)
-                    && !FAIL_NEXT_PI_PATH_WRITE.with(|fail| fail.replace(false)),
+                    && !FAIL_NEXT_PI_PATH_WRITE.with(|fail| {
+                        let armed = fail.replace(false);
+                        if armed {
+                            FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(|consumed| consumed.set(true));
+                        }
+                        armed
+                    }),
                 "injected transcript path write failure"
             );
             let row = instances
@@ -400,8 +428,24 @@ impl Instance {
     }
 
     #[cfg(test)]
-    pub(crate) fn fail_next_pi_path_write_for_test(&self) {
-        FAIL_NEXT_PI_PATH_WRITE.with(|fail| fail.set(true));
+    pub(crate) fn fail_next_pi_path_write_for_test() -> FailNextPiPathWriteGuard {
+        let previous_armed = FAIL_NEXT_PI_PATH_WRITE.with(std::cell::Cell::get);
+        let previous_consumed = FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(std::cell::Cell::get);
+        assert!(
+            !previous_armed && !previous_consumed,
+            "a previous Pi path write failure is still active"
+        );
+        FAIL_NEXT_PI_PATH_WRITE.with(|armed| armed.set(true));
+        FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(|consumed| consumed.set(false));
+        FailNextPiPathWriteGuard {
+            previous_armed,
+            previous_consumed,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_pi_path_write_consumed_for_test() -> bool {
+        FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(std::cell::Cell::get)
     }
 
     /// A host Pi launch that can carry selectors may pin `--session-id`.
@@ -419,6 +463,8 @@ thread_local! {
     pub(crate) static FAIL_PI_PATH_WRITES: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static FAIL_NEXT_PI_PATH_WRITE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_PI_PATH_WRITE_CONSUMED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 

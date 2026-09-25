@@ -1463,7 +1463,7 @@ mod tests {
         poller.inject_test_sidecar_update(&inst.id, sid, Some(&path));
         let poller = Arc::new(Mutex::new(poller));
         inst.session_id_poller = Some(poller.clone());
-        inst.fail_next_pi_path_write_for_test();
+        let _fail_next = Instance::fail_next_pi_path_write_for_test();
 
         inst.stop_and_flush_poller();
 
@@ -1534,7 +1534,9 @@ mod tests {
         let hook_execution = next_execution.clone();
         let hook_binding = next_binding.clone();
         let hook_profile = profile.to_string();
+        let fail_next = Instance::fail_next_pi_path_write_for_test();
         let _hook = Instance::set_after_final_pi_drain_hook_for_test(move |inst| {
+            assert!(Instance::fail_next_pi_path_write_consumed_for_test());
             assert_eq!(inst.pi_session_path, None);
             assert!(inst.session_id_poller.is_some());
             assert!(crate::session::sync::pending_poller_observation_matches(
@@ -1553,8 +1555,8 @@ mod tests {
                 .unwrap();
         });
 
-        inst.fail_next_pi_path_write_for_test();
         inst.stop_and_flush_poller();
+        assert!(fail_next.was_consumed());
 
         assert!(inst.session_id_poller.is_none());
         assert_eq!(inst.pi_session_path, None);
