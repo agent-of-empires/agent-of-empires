@@ -424,36 +424,6 @@ mod tests {
     }
 
     #[test]
-    fn user_action_diff_propagates_set_and_clear() {
-        type Action = fn(&mut Instance);
-        type Check = fn(&Instance) -> bool;
-        let cases: &[(&str, Action, Action, Check)] = &[
-            (
-                "unread",
-                |i| i.unread = true,
-                |i| i.unread = false,
-                |i| i.unread,
-            ),
-            ("trash", |i| i.trash(), |i| i.untrash(), |i| i.is_trashed()),
-        ];
-        for (label, set, clear, is_set) in cases {
-            let pre = inst();
-            let mut post = pre.clone();
-            set(&mut post);
-            let mut disk = pre.clone();
-            disk.merge_user_action_diff(&pre, &post);
-            assert!(is_set(&disk), "{label} set");
-
-            let pre = post.clone();
-            let mut post = pre.clone();
-            clear(&mut post);
-            let mut disk = pre.clone();
-            disk.merge_user_action_diff(&pre, &post);
-            assert!(!is_set(&disk), "{label} cleared");
-        }
-    }
-
-    #[test]
     fn archive_through_every_merge_settles_live_status() {
         for status in [Status::Running, Status::Waiting, Status::Starting] {
             // User-action splice has no `status` arm, so archive() must settle it on disk.
@@ -622,180 +592,210 @@ mod tests {
     }
 
     #[test]
-    fn merge_post_restart_keeps_peer_sid_and_matching_marker() {
-        let mut stored = inst();
-        stored.agent_session_id = Some("peer-fresh-sid".to_string());
-        stored.resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
-        stored.snooze(15);
-        let mut working = inst();
-        working.id = stored.id.clone();
-        working.status = Status::Starting;
-        working.agent_session_id = Some("phase1-stale-sid".to_string());
-        working.resume_probe_failed_sid = Some("phase1-stale-sid".to_string());
-        stored.merge_post_restart(&working);
-        assert_eq!(stored.status, Status::Starting);
-        assert_eq!(stored.agent_session_id.as_deref(), Some("peer-fresh-sid"));
-        assert_eq!(
-            stored.resume_probe_failed_sid.as_deref(),
-            Some("peer-fresh-sid")
-        );
-        assert!(stored.is_snoozed());
-
-        let mut stored = inst();
-        stored.agent_session_id = Some("failed-sid".to_string());
-        let mut working = stored.clone();
-        working.status = Status::Error;
-        working.resume_probe_failed_sid = Some("failed-sid".to_string());
-        stored.merge_post_restart(&working);
-        assert_eq!(stored.status, Status::Error);
-        assert_eq!(
-            stored.resume_probe_failed_sid.as_deref(),
-            Some("failed-sid")
-        );
-    }
-
-    #[test]
     #[serial_test::serial]
-    fn merge_post_restart_with_baseline_follows_omp_generation_and_poller() {
-        let mut before = Instance::new("omp-session", "/tmp/test");
-        before.agent_session_id = Some("old-sid".to_string());
-        before.omp_capture_generation = Some("generation-a".to_string());
-        let now = std::time::Instant::now();
-        before.poller_repair.defer(now);
-        before.poller_repair.defer(now);
-        assert_eq!(before.poller_repair.deferrals(), 2);
-        let mut restarted = before.clone();
-        restarted.omp_capture_generation = Some("generation-b".to_string());
-        restarted.poller_repair.reset();
-        let restarted_poller = running_poller(&before.id);
-        restarted.session_id_poller = Some(restarted_poller.clone());
+    fn merge_post_restart_keeps_peer_identity_and_follows_the_restarted_generation() {
+        {
+            let mut stored = inst();
+            stored.agent_session_id = Some("peer-fresh-sid".to_string());
+            stored.resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
+            stored.snooze(15);
+            let mut working = inst();
+            working.id = stored.id.clone();
+            working.status = Status::Starting;
+            working.agent_session_id = Some("phase1-stale-sid".to_string());
+            working.resume_probe_failed_sid = Some("phase1-stale-sid".to_string());
+            stored.merge_post_restart(&working);
+            assert_eq!(stored.status, Status::Starting);
+            assert_eq!(stored.agent_session_id.as_deref(), Some("peer-fresh-sid"));
+            assert_eq!(
+                stored.resume_probe_failed_sid.as_deref(),
+                Some("peer-fresh-sid")
+            );
+            assert!(stored.is_snoozed());
 
-        let mut live = before.clone();
-        live.merge_post_restart_with_baseline(&before, &restarted);
-        assert_eq!(live.omp_capture_generation.as_deref(), Some("generation-b"));
-        assert!(live.session_id_poller.is_some());
-        assert_eq!(live.poller_repair.deferrals(), 0);
+            let mut stored = inst();
+            stored.agent_session_id = Some("failed-sid".to_string());
+            let mut working = stored.clone();
+            working.status = Status::Error;
+            working.resume_probe_failed_sid = Some("failed-sid".to_string());
+            stored.merge_post_restart(&working);
+            assert_eq!(stored.status, Status::Error);
+            assert_eq!(
+                stored.resume_probe_failed_sid.as_deref(),
+                Some("failed-sid")
+            );
+        }
+        {
+            let mut before = Instance::new("omp-session", "/tmp/test");
+            before.agent_session_id = Some("old-sid".to_string());
+            before.omp_capture_generation = Some("generation-a".to_string());
+            let now = std::time::Instant::now();
+            before.poller_repair.defer(now);
+            before.poller_repair.defer(now);
+            assert_eq!(before.poller_repair.deferrals(), 2);
+            let mut restarted = before.clone();
+            restarted.omp_capture_generation = Some("generation-b".to_string());
+            restarted.poller_repair.reset();
+            let restarted_poller = running_poller(&before.id);
+            restarted.session_id_poller = Some(restarted_poller.clone());
 
-        let mut converged = before.clone();
-        converged.agent_session_id = Some("peer-sid".to_string());
-        converged.omp_capture_generation = Some("generation-b".to_string());
-        converged.merge_post_restart_with_baseline(&before, &restarted);
-        assert_eq!(converged.agent_session_id.as_deref(), Some("peer-sid"));
-        assert!(converged.session_id_poller.is_some());
+            let mut live = before.clone();
+            live.merge_post_restart_with_baseline(&before, &restarted);
+            assert_eq!(live.omp_capture_generation.as_deref(), Some("generation-b"));
+            assert!(live.session_id_poller.is_some());
+            assert_eq!(live.poller_repair.deferrals(), 0);
 
-        // A concurrent third generation keeps its own id but adopts the running poller.
-        let mut peer_relaunched = before.clone();
-        peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
-        peer_relaunched.merge_post_restart_with_baseline(&before, &restarted);
-        assert_eq!(
-            peer_relaunched.omp_capture_generation.as_deref(),
-            Some("peer-generation")
-        );
-        assert!(Arc::ptr_eq(
-            peer_relaunched.session_id_poller.as_ref().unwrap(),
-            &restarted_poller
-        ));
-        assert_eq!(peer_relaunched.poller_repair.deferrals(), 0);
+            let mut converged = before.clone();
+            converged.agent_session_id = Some("peer-sid".to_string());
+            converged.omp_capture_generation = Some("generation-b".to_string());
+            converged.merge_post_restart_with_baseline(&before, &restarted);
+            assert_eq!(converged.agent_session_id.as_deref(), Some("peer-sid"));
+            assert!(converged.session_id_poller.is_some());
 
-        let mut not_started = restarted.clone();
-        not_started.session_id_poller = None;
-        let mut live = before.clone();
-        live.merge_post_restart_with_baseline(&before, &not_started);
-        assert_eq!(live.poller_repair.deferrals(), 2);
-        stop(&restarted_poller);
+            // A concurrent third generation keeps its own id but adopts the running poller.
+            let mut peer_relaunched = before.clone();
+            peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
+            peer_relaunched.merge_post_restart_with_baseline(&before, &restarted);
+            assert_eq!(
+                peer_relaunched.omp_capture_generation.as_deref(),
+                Some("peer-generation")
+            );
+            assert!(Arc::ptr_eq(
+                peer_relaunched.session_id_poller.as_ref().unwrap(),
+                &restarted_poller
+            ));
+            assert_eq!(peer_relaunched.poller_repair.deferrals(), 0);
+
+            let mut not_started = restarted.clone();
+            not_started.session_id_poller = None;
+            let mut live = before.clone();
+            live.merge_post_restart_with_baseline(&before, &not_started);
+            assert_eq!(live.poller_repair.deferrals(), 2);
+            stop(&restarted_poller);
+        }
     }
 
     #[test]
     fn user_action_diff_applies_triage_invariants_over_peer_writes() {
-        type Action = fn(&mut Instance);
-        type Check = fn(&Instance) -> bool;
-        let archived: Check = |i| i.archived_at.is_some();
-        let favorited: Check = |i| i.favorited_at.is_some();
-        let pinned: Check = |i| i.pinned_at.is_some();
-        let snoozed: Check = |i| i.snoozed_until.is_some();
-        // (label, pre setup, tui action, peer action, [(check, expected)])
-        let cases: &[(&str, Action, Action, Action, &[(Check, bool)])] = &[
-            (
-                "tui favorite beats peer archive",
-                |_| {},
-                |i| i.favorite(),
-                |i| i.archive(),
-                &[(favorited, true), (archived, false)],
-            ),
-            (
-                "tui archive beats peer favorite",
-                |_| {},
-                |i| i.archive(),
-                |i| i.favorite(),
-                &[(archived, true), (favorited, false)],
-            ),
-            (
-                "tui touch beats peer archive",
-                |_| {},
-                |i| i.touch_last_accessed(),
-                |i| i.archive(),
-                &[(archived, false)],
-            ),
-            (
-                "peer touch beats tui archive",
-                |i| i.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60)),
-                |i| i.archive(),
-                |i| i.touch_last_accessed(),
-                &[(archived, false)],
-            ),
-            (
-                "peer archive clears tui snooze",
-                |_| {},
-                |i| i.snooze(15),
-                |i| i.archive(),
-                &[(archived, true), (snoozed, false)],
-            ),
-            (
-                "tui unfavorite keeps peer archive",
-                |i| i.favorite(),
-                |i| i.unfavorite(),
-                |i| i.archive(),
-                &[(favorited, false), (archived, true)],
-            ),
-            (
-                "tui pin beats peer archive",
-                |_| {},
-                |i| i.pin(),
-                |i| i.archive(),
-                &[(pinned, true), (archived, false)],
-            ),
-            (
-                "tui archive beats peer pin",
-                |_| {},
-                |i| i.archive(),
-                |i| i.pin(),
-                &[(archived, true), (pinned, false)],
-            ),
-            (
-                "tui snooze beats peer pin",
-                |_| {},
-                |i| i.snooze(30),
-                |i| i.pin(),
-                &[(snoozed, true), (pinned, false)],
-            ),
-            (
-                "peer touch keeps tui pin",
-                |i| i.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60)),
-                |i| i.pin(),
-                |i| i.touch_last_accessed(),
-                &[(pinned, true)],
-            ),
-        ];
-        for (label, setup, tui, peer, checks) in cases {
-            let mut pre = inst();
-            setup(&mut pre);
-            let mut post = pre.clone();
-            tui(&mut post);
-            let mut disk = pre.clone();
-            peer(&mut disk);
-            disk.merge_user_action_diff(&pre, &post);
-            for (check, expected) in checks.iter() {
-                assert_eq!(check(&disk), *expected, "{label}");
+        {
+            type Action = fn(&mut Instance);
+            type Check = fn(&Instance) -> bool;
+            let archived: Check = |i| i.archived_at.is_some();
+            let favorited: Check = |i| i.favorited_at.is_some();
+            let pinned: Check = |i| i.pinned_at.is_some();
+            let snoozed: Check = |i| i.snoozed_until.is_some();
+            // (label, pre setup, tui action, peer action, [(check, expected)])
+            let cases: &[(&str, Action, Action, Action, &[(Check, bool)])] = &[
+                (
+                    "tui favorite beats peer archive",
+                    |_| {},
+                    |i| i.favorite(),
+                    |i| i.archive(),
+                    &[(favorited, true), (archived, false)],
+                ),
+                (
+                    "tui archive beats peer favorite",
+                    |_| {},
+                    |i| i.archive(),
+                    |i| i.favorite(),
+                    &[(archived, true), (favorited, false)],
+                ),
+                (
+                    "tui touch beats peer archive",
+                    |_| {},
+                    |i| i.touch_last_accessed(),
+                    |i| i.archive(),
+                    &[(archived, false)],
+                ),
+                (
+                    "peer touch beats tui archive",
+                    |i| i.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60)),
+                    |i| i.archive(),
+                    |i| i.touch_last_accessed(),
+                    &[(archived, false)],
+                ),
+                (
+                    "peer archive clears tui snooze",
+                    |_| {},
+                    |i| i.snooze(15),
+                    |i| i.archive(),
+                    &[(archived, true), (snoozed, false)],
+                ),
+                (
+                    "tui unfavorite keeps peer archive",
+                    |i| i.favorite(),
+                    |i| i.unfavorite(),
+                    |i| i.archive(),
+                    &[(favorited, false), (archived, true)],
+                ),
+                (
+                    "tui pin beats peer archive",
+                    |_| {},
+                    |i| i.pin(),
+                    |i| i.archive(),
+                    &[(pinned, true), (archived, false)],
+                ),
+                (
+                    "tui archive beats peer pin",
+                    |_| {},
+                    |i| i.archive(),
+                    |i| i.pin(),
+                    &[(archived, true), (pinned, false)],
+                ),
+                (
+                    "tui snooze beats peer pin",
+                    |_| {},
+                    |i| i.snooze(30),
+                    |i| i.pin(),
+                    &[(snoozed, true), (pinned, false)],
+                ),
+                (
+                    "peer touch keeps tui pin",
+                    |i| i.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60)),
+                    |i| i.pin(),
+                    |i| i.touch_last_accessed(),
+                    &[(pinned, true)],
+                ),
+            ];
+            for (label, setup, tui, peer, checks) in cases {
+                let mut pre = inst();
+                setup(&mut pre);
+                let mut post = pre.clone();
+                tui(&mut post);
+                let mut disk = pre.clone();
+                peer(&mut disk);
+                disk.merge_user_action_diff(&pre, &post);
+                for (check, expected) in checks.iter() {
+                    assert_eq!(check(&disk), *expected, "{label}");
+                }
+            }
+        }
+        {
+            type Action = fn(&mut Instance);
+            type Check = fn(&Instance) -> bool;
+            let cases: &[(&str, Action, Action, Check)] = &[
+                (
+                    "unread",
+                    |i| i.unread = true,
+                    |i| i.unread = false,
+                    |i| i.unread,
+                ),
+                ("trash", |i| i.trash(), |i| i.untrash(), |i| i.is_trashed()),
+            ];
+            for (label, set, clear, is_set) in cases {
+                let pre = inst();
+                let mut post = pre.clone();
+                set(&mut post);
+                let mut disk = pre.clone();
+                disk.merge_user_action_diff(&pre, &post);
+                assert!(is_set(&disk), "{label} set");
+
+                let pre = post.clone();
+                let mut post = pre.clone();
+                clear(&mut post);
+                let mut disk = pre.clone();
+                disk.merge_user_action_diff(&pre, &post);
+                assert!(!is_set(&disk), "{label} cleared");
             }
         }
     }
@@ -838,70 +838,70 @@ mod tests {
 
     #[test]
     fn passive_status_patch_is_a_narrow_generation_guarded_splice() {
-        let mut disk = inst();
-        disk.status = Status::Running;
-        disk.last_accessed_at = Some(Utc::now() - chrono::Duration::hours(1));
-        disk.title = "peer-title".to_string();
-        disk.group_path = "peer/group".to_string();
-        disk.unread = true;
-        disk.pinned_at = Some(Utc::now());
-        let before = disk.clone();
-        let now = Utc::now();
-        let fresh = patch(Status::Idle, Some(now), Some(now));
-        disk.merge_passive_status_patch(&disk.id.clone(), &fresh);
-        assert_eq!(
-            (disk.status, disk.idle_entered_at, disk.last_accessed_at),
-            (Status::Idle, Some(now), Some(now))
-        );
-        assert_eq!(
-            (&disk.title, &disk.group_path, disk.unread, disk.pinned_at),
-            (
-                &before.title,
-                &before.group_path,
-                before.unread,
-                before.pinned_at
-            )
-        );
-        // Idempotent when replayed.
-        disk.merge_passive_status_patch(&disk.id.clone(), &fresh);
-        assert_eq!(
-            (disk.status, disk.last_accessed_at),
-            (Status::Idle, Some(now))
-        );
-
-        disk.lifecycle_generation = 2;
-        disk.status = Status::Stopped;
-        let mut stale = patch(Status::Running, None, None);
-        stale.lifecycle_generation = 1;
-        disk.merge_passive_status_patch(&disk.id.clone(), &stale);
-        assert_eq!(disk.status, Status::Stopped);
-    }
-
-    #[test]
-    fn passive_status_patch_only_advances_last_accessed_at() {
-        let ts = Utc::now();
-        let older = ts - chrono::Duration::minutes(5);
-        // (disk last_accessed_at, patch last_accessed_at, expected)
-        for (disk_ts, patch_ts, expected) in [
-            (None, None, None),
-            (Some(ts), Some(older), Some(ts)),
-            (Some(ts), Some(ts), Some(ts)),
-            (Some(older), Some(ts), Some(ts)),
-            (None, Some(ts), Some(ts)),
-        ] {
+        {
             let mut disk = inst();
             disk.status = Status::Running;
-            disk.last_accessed_at = disk_ts;
-            disk.merge_passive_status_patch(
-                &disk.id.clone(),
-                &patch(Status::Idle, Some(older), patch_ts),
-            );
-            assert_eq!(disk.status, Status::Idle);
-            assert_eq!(disk.idle_entered_at, Some(older));
+            disk.last_accessed_at = Some(Utc::now() - chrono::Duration::hours(1));
+            disk.title = "peer-title".to_string();
+            disk.group_path = "peer/group".to_string();
+            disk.unread = true;
+            disk.pinned_at = Some(Utc::now());
+            let before = disk.clone();
+            let now = Utc::now();
+            let fresh = patch(Status::Idle, Some(now), Some(now));
+            disk.merge_passive_status_patch(&disk.id.clone(), &fresh);
             assert_eq!(
-                disk.last_accessed_at, expected,
-                "{disk_ts:?} <- {patch_ts:?}"
+                (disk.status, disk.idle_entered_at, disk.last_accessed_at),
+                (Status::Idle, Some(now), Some(now))
             );
+            assert_eq!(
+                (&disk.title, &disk.group_path, disk.unread, disk.pinned_at),
+                (
+                    &before.title,
+                    &before.group_path,
+                    before.unread,
+                    before.pinned_at
+                )
+            );
+            // Idempotent when replayed.
+            disk.merge_passive_status_patch(&disk.id.clone(), &fresh);
+            assert_eq!(
+                (disk.status, disk.last_accessed_at),
+                (Status::Idle, Some(now))
+            );
+
+            disk.lifecycle_generation = 2;
+            disk.status = Status::Stopped;
+            let mut stale = patch(Status::Running, None, None);
+            stale.lifecycle_generation = 1;
+            disk.merge_passive_status_patch(&disk.id.clone(), &stale);
+            assert_eq!(disk.status, Status::Stopped);
+        }
+        {
+            let ts = Utc::now();
+            let older = ts - chrono::Duration::minutes(5);
+            // (disk last_accessed_at, patch last_accessed_at, expected)
+            for (disk_ts, patch_ts, expected) in [
+                (None, None, None),
+                (Some(ts), Some(older), Some(ts)),
+                (Some(ts), Some(ts), Some(ts)),
+                (Some(older), Some(ts), Some(ts)),
+                (None, Some(ts), Some(ts)),
+            ] {
+                let mut disk = inst();
+                disk.status = Status::Running;
+                disk.last_accessed_at = disk_ts;
+                disk.merge_passive_status_patch(
+                    &disk.id.clone(),
+                    &patch(Status::Idle, Some(older), patch_ts),
+                );
+                assert_eq!(disk.status, Status::Idle);
+                assert_eq!(disk.idle_entered_at, Some(older));
+                assert_eq!(
+                    disk.last_accessed_at, expected,
+                    "{disk_ts:?} <- {patch_ts:?}"
+                );
+            }
         }
     }
 
@@ -969,55 +969,75 @@ mod tests {
         assert_eq!(stale.last_accessed_at, Some(later));
     }
 
-    /// claude -> pi -> claude resumes the parked Claude conversation, not a third one.
     #[test]
-    fn swap_tool_parks_and_restores_per_tool_session_ids() {
-        let mut inst = tool_instance("claude", "/home/user/project");
-        inst.agent_session_id = Some("claude-session-123".to_string());
-        inst.acp_session_id = Some("acp-claude-1".to_string());
-        inst.acp_load_session_capable = Some(true);
-        inst.resume_probe_failed_sid = Some("claude-session-123".to_string());
-        inst.acp_effort = Some("high".to_string());
-        inst.agent_model = Some("claude-opus-4-7".to_string());
-        inst.agent_name = Some("claude-code".to_string());
-        inst.acp_mode_id = Some("plan".to_string());
+    fn swap_tool_parks_and_restores_ids_and_reresolves_detect_as() {
+        // claude -> pi -> claude resumes the parked Claude conversation, not a third one.
+        {
+            let mut inst = tool_instance("claude", "/home/user/project");
+            inst.agent_session_id = Some("claude-session-123".to_string());
+            inst.acp_session_id = Some("acp-claude-1".to_string());
+            inst.acp_load_session_capable = Some(true);
+            inst.resume_probe_failed_sid = Some("claude-session-123".to_string());
+            inst.acp_effort = Some("high".to_string());
+            inst.agent_model = Some("claude-opus-4-7".to_string());
+            inst.agent_name = Some("claude-code".to_string());
+            inst.acp_mode_id = Some("plan".to_string());
 
-        inst.swap_tool("pi");
-        assert_eq!(inst.tool, "pi");
-        assert_eq!(
-            (inst.agent_session_id.clone(), inst.acp_session_id.clone()),
-            (None, None)
-        );
-        assert_eq!(inst.acp_load_session_capable, None);
-        assert_eq!(
-            (
-                inst.acp_effort.clone(),
-                inst.agent_model.clone(),
-                inst.agent_name.clone()
-            ),
-            (None, None, None)
-        );
-        assert_eq!(inst.resume_probe_failed_sid, None);
-        assert_eq!(inst.acp_mode_id.as_deref(), Some("plan"));
+            inst.swap_tool("pi");
+            assert_eq!(inst.tool, "pi");
+            assert_eq!(
+                (inst.agent_session_id.clone(), inst.acp_session_id.clone()),
+                (None, None)
+            );
+            assert_eq!(inst.acp_load_session_capable, None);
+            assert_eq!(
+                (
+                    inst.acp_effort.clone(),
+                    inst.agent_model.clone(),
+                    inst.agent_name.clone()
+                ),
+                (None, None, None)
+            );
+            assert_eq!(inst.resume_probe_failed_sid, None);
+            assert_eq!(inst.acp_mode_id.as_deref(), Some("plan"));
 
-        inst.agent_session_id = Some("pi-session-9".to_string());
-        inst.acp_load_session_capable = Some(false);
-        inst.swap_tool("claude");
-        assert_eq!(inst.agent_session_id.as_deref(), Some("claude-session-123"));
-        assert_eq!(inst.acp_session_id.as_deref(), Some("acp-claude-1"));
-        assert_eq!(inst.acp_load_session_capable, None);
-        assert_eq!(
-            inst.prior_tool_session_ids["pi"]
-                .agent_session_id
-                .as_deref(),
-            Some("pi-session-9")
-        );
-        assert!(!inst.prior_tool_session_ids.contains_key("claude"));
+            inst.agent_session_id = Some("pi-session-9".to_string());
+            inst.acp_load_session_capable = Some(false);
+            inst.swap_tool("claude");
+            assert_eq!(inst.agent_session_id.as_deref(), Some("claude-session-123"));
+            assert_eq!(inst.acp_session_id.as_deref(), Some("acp-claude-1"));
+            assert_eq!(inst.acp_load_session_capable, None);
+            assert_eq!(
+                inst.prior_tool_session_ids["pi"]
+                    .agent_session_id
+                    .as_deref(),
+                Some("pi-session-9")
+            );
+            assert!(!inst.prior_tool_session_ids.contains_key("claude"));
 
-        // Same-tool swap is a no-op, so disk and memory rows can both apply it.
-        inst.swap_tool("claude");
-        assert_eq!(inst.agent_session_id.as_deref(), Some("claude-session-123"));
-        assert!(!inst.prior_tool_session_ids.contains_key("claude"));
+            // Same-tool swap is a no-op, so disk and memory rows can both apply it.
+            inst.swap_tool("claude");
+            assert_eq!(inst.agent_session_id.as_deref(), Some("claude-session-123"));
+            assert!(!inst.prior_tool_session_ids.contains_key("claude"));
+        }
+        {
+            const PROFILE: &str = "detect-as-swap-test";
+            let _registry = install_aliases(
+                PROFILE,
+                &[("claude-personal", "claude"), ("codex-personal", "codex")],
+            );
+            for (tool, detect_as, new_tool, expected) in [
+                ("claude", "", "claude-personal", "claude"),
+                ("codex-personal", "codex", "claude-personal", "claude"),
+                ("claude-personal", "claude", "codex", ""),
+            ] {
+                let mut inst = tool_instance(tool, "/tmp/x");
+                inst.source_profile = PROFILE.to_string();
+                inst.detect_as = detect_as.to_string();
+                inst.swap_tool(new_tool);
+                assert_eq!(inst.detect_as, expected, "{tool} -> {new_tool}");
+            }
+        }
     }
 
     /// The cross-profile move re-applies the swap to the freshly locked disk
@@ -1131,25 +1151,5 @@ mod tests {
         );
         inst.swap_account("claude-2");
         assert!(inst.prior_tool_session_ids.contains_key("claude-2"));
-    }
-
-    #[test]
-    fn swap_tool_reresolves_detect_as() {
-        const PROFILE: &str = "detect-as-swap-test";
-        let _registry = install_aliases(
-            PROFILE,
-            &[("claude-personal", "claude"), ("codex-personal", "codex")],
-        );
-        for (tool, detect_as, new_tool, expected) in [
-            ("claude", "", "claude-personal", "claude"),
-            ("codex-personal", "codex", "claude-personal", "claude"),
-            ("claude-personal", "claude", "codex", ""),
-        ] {
-            let mut inst = tool_instance(tool, "/tmp/x");
-            inst.source_profile = PROFILE.to_string();
-            inst.detect_as = detect_as.to_string();
-            inst.swap_tool(new_tool);
-            assert_eq!(inst.detect_as, expected, "{tool} -> {new_tool}");
-        }
     }
 }

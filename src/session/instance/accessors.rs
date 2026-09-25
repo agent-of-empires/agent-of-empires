@@ -812,161 +812,159 @@ mod tests {
     }
 
     #[test]
-    fn native_resume_requires_a_direct_local_builtin_launch() {
-        const PROFILE: &str = "resume-custom-launch-test";
-        let _registry = install_aliases(PROFILE, &[("work-claude", "claude")]);
-        // (tool, command, extra_args, supported)
-        for (tool, command, extra, supported) in [
-            ("work-claude", "claude --model opus", "", true),
-            ("claude", "claude --model opus", "", true),
-            ("claude", "", "--model sonnet[1m]", true),
-            ("claude", "ssh -t host claude", "", false),
-            ("claude", "claude > /tmp/transcript", "", false),
-            ("claude", "claude $BARRIER", "", false),
-            ("claude", "claude ${BARRIER}", "", false),
-            ("claude", "claude *", "", false),
-            ("claude", "claude session-?", "", false),
-            ("claude", "claude [abc]", "", false),
-            ("claude", "claude {one,two}", "", false),
-            ("claude", "claude ~/thread", "", false),
-            ("claude", "/opt/wrappers/claude", "", false),
-            ("claude", "./claude", "", false),
-            (
-                "claude",
-                "claude",
-                "--model opus | tee /tmp/transcript",
-                false,
-            ),
-            ("claude", "claude", "--append-system-prompt $PROMPT", false),
-            ("claude", "claude # local note", "", false),
-            ("claude", "claude", "--model opus # local note", false),
-            ("claude", "claude\n", "", false),
-            ("claude", "claude\r", "", false),
-            ("claude", "claude\r\n", "", false),
-            ("claude", "claude --", "", false),
-            ("claude", "claude", "--", false),
-            ("claude", "claude", "--model opus\n", false),
-            ("claude", "claude", "--model opus\r", false),
-            ("claude", "claude", "--model opus\r\n", false),
-        ] {
-            let mut inst = tool_instance(tool, "/tmp/custom");
-            inst.source_profile = PROFILE.to_string();
-            inst.command = command.to_string();
-            inst.extra_args = extra.to_string();
-            assert_eq!(
-                inst.supports_native_resume(),
-                supported,
-                "{command:?} {extra:?}"
-            );
+    fn native_resume_and_hook_publisher_proof_require_a_direct_builtin_launch() {
+        {
+            const PROFILE: &str = "resume-custom-launch-test";
+            let _registry = install_aliases(PROFILE, &[("work-claude", "claude")]);
+            // (tool, command, extra_args, supported)
+            for (tool, command, extra, supported) in [
+                ("work-claude", "claude --model opus", "", true),
+                ("claude", "claude --model opus", "", true),
+                ("claude", "", "--model sonnet[1m]", true),
+                ("claude", "ssh -t host claude", "", false),
+                ("claude", "claude > /tmp/transcript", "", false),
+                ("claude", "claude $BARRIER", "", false),
+                ("claude", "claude ${BARRIER}", "", false),
+                ("claude", "claude *", "", false),
+                ("claude", "claude session-?", "", false),
+                ("claude", "claude [abc]", "", false),
+                ("claude", "claude {one,two}", "", false),
+                ("claude", "claude ~/thread", "", false),
+                ("claude", "/opt/wrappers/claude", "", false),
+                ("claude", "./claude", "", false),
+                (
+                    "claude",
+                    "claude",
+                    "--model opus | tee /tmp/transcript",
+                    false,
+                ),
+                ("claude", "claude", "--append-system-prompt $PROMPT", false),
+                ("claude", "claude # local note", "", false),
+                ("claude", "claude", "--model opus # local note", false),
+                ("claude", "claude\n", "", false),
+                ("claude", "claude\r", "", false),
+                ("claude", "claude\r\n", "", false),
+                ("claude", "claude --", "", false),
+                ("claude", "claude", "--", false),
+                ("claude", "claude", "--model opus\n", false),
+                ("claude", "claude", "--model opus\r", false),
+                ("claude", "claude", "--model opus\r\n", false),
+            ] {
+                let mut inst = tool_instance(tool, "/tmp/custom");
+                inst.source_profile = PROFILE.to_string();
+                inst.command = command.to_string();
+                inst.extra_args = extra.to_string();
+                assert_eq!(
+                    inst.supports_native_resume(),
+                    supported,
+                    "{command:?} {extra:?}"
+                );
+            }
+        }
+        {
+            let cases = [
+                ("", true),
+                ("--model opus", true),
+                ("--setting-sources user", true),
+                ("--setting-sources=project,user", true),
+                ("--safe-mode", false),
+                ("--bare", false),
+                ("--setting-sources project", false),
+                ("--setting-sources=user --setting-sources project", false),
+                (
+                    "--setting-sources=project --setting-sources local,user",
+                    true,
+                ),
+                ("--setting-sources", false),
+            ];
+            for (args, expected) in cases {
+                let mut inst = Instance::new("claude", "/tmp/x");
+                inst.tool = "claude".to_string();
+                inst.extra_args = args.to_string();
+                assert_eq!(
+                    inst.hook_session_publisher_allowed_by_argv(),
+                    expected,
+                    "args={args:?}"
+                );
+            }
         }
     }
 
     #[test]
-    fn claude_hook_publisher_proof_respects_hook_disabling_argv() {
-        let cases = [
-            ("", true),
-            ("--model opus", true),
-            ("--setting-sources user", true),
-            ("--setting-sources=project,user", true),
-            ("--safe-mode", false),
-            ("--bare", false),
-            ("--setting-sources project", false),
-            ("--setting-sources=user --setting-sources project", false),
-            (
-                "--setting-sources=project --setting-sources local,user",
-                true,
-            ),
-            ("--setting-sources", false),
-        ];
-        for (args, expected) in cases {
-            let mut inst = Instance::new("claude", "/tmp/x");
-            inst.tool = "claude".to_string();
-            inst.extra_args = args.to_string();
+    #[serial_test::serial]
+    fn handoff_accepts_session_home_refuses_unwritten_stores_and_keeps_acp_on_failure() {
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let _config_dir = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+            let _claude = crate::session::test_support::install_login_shell_path_command(
+                temp.path(),
+                "claude",
+                "#!/bin/sh\nexit 0\n",
+            );
+            let session_home = temp.path().join("agent-home");
+            let mut inst = Instance::new("claude-session-home", "/tmp");
+            inst.pending_host_env = vec![("HOME".into(), session_home.display().to_string())];
+            inst.view = View::Structured;
+            inst.acp_session_id = Some("sid-abc".to_string());
+
+            let worker = inst.resolve_native_execution(None).unwrap().binding;
+            inst.switch_to_terminal_keep_context(Some(&worker)).unwrap();
+
             assert_eq!(
-                inst.hook_session_publisher_allowed_by_argv(),
-                expected,
-                "args={args:?}"
+                inst.agent_session_binding
+                    .as_ref()
+                    .and_then(|binding| binding.execution.as_ref())
+                    .and_then(|execution| execution.stores.first())
+                    .map(std::path::PathBuf::as_path),
+                Some(path_identity(&session_home.join(".claude")).as_path())
             );
         }
-    }
-    #[test]
-    #[serial_test::serial]
-    fn handoff_accepts_a_session_home_store() {
-        let temp = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let _config_dir = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
-        let _claude = crate::session::test_support::install_login_shell_path_command(
-            temp.path(),
-            "claude",
-            "#!/bin/sh\nexit 0\n",
-        );
-        let session_home = temp.path().join("agent-home");
-        let mut inst = Instance::new("claude-session-home", "/tmp");
-        inst.pending_host_env = vec![("HOME".into(), session_home.display().to_string())];
-        inst.view = View::Structured;
-        inst.acp_session_id = Some("sid-abc".to_string());
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let profile = "handoff-declared-store";
+            let path =
+                crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                format!(
+                    "[session.agent_config_dir]\nclaude = {:?}\n",
+                    temp.path().join("declared-claude").to_str().unwrap()
+                ),
+            )
+            .unwrap();
+            let mut inst = Instance::new("claude-declared", "/tmp");
+            inst.source_profile = profile.into();
+            inst.view = View::Structured;
+            inst.acp_session_id = Some("sid-abc".to_string());
 
-        let worker = inst.resolve_native_execution(None).unwrap().binding;
-        inst.switch_to_terminal_keep_context(Some(&worker)).unwrap();
+            let error = inst.switch_to_terminal_keep_context(None).unwrap_err();
+            assert!(error.to_string().contains("set-session-id"));
+            assert_eq!(inst.view, View::Structured);
+            assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+        }
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let _claude = crate::session::test_support::install_login_shell_path_command(
+                temp.path(),
+                "claude",
+                "#!/bin/sh\nexit 0\n",
+            );
+            let mut inst = Instance::new("claude-handoff-error", "/tmp");
+            inst.view = View::Structured;
+            inst.acp_session_id = Some("sid-abc".into());
+            let worker = inst.resolve_native_execution(None).unwrap().binding;
+            inst.extra_args = "--mcp-config /tmp/unattested.json".into();
 
-        assert_eq!(
-            inst.agent_session_binding
-                .as_ref()
-                .and_then(|binding| binding.execution.as_ref())
-                .and_then(|execution| execution.stores.first())
-                .map(std::path::PathBuf::as_path),
-            Some(path_identity(&session_home.join(".claude")).as_path())
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn handoff_refuses_a_store_the_worker_never_wrote() {
-        let temp = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let profile = "handoff-declared-store";
-        let path =
-            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &path,
-            format!(
-                "[session.agent_config_dir]\nclaude = {:?}\n",
-                temp.path().join("declared-claude").to_str().unwrap()
-            ),
-        )
-        .unwrap();
-        let mut inst = Instance::new("claude-declared", "/tmp");
-        inst.source_profile = profile.into();
-        inst.view = View::Structured;
-        inst.acp_session_id = Some("sid-abc".to_string());
-
-        let error = inst.switch_to_terminal_keep_context(None).unwrap_err();
-        assert!(error.to_string().contains("set-session-id"));
-        assert_eq!(inst.view, View::Structured);
-        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
-    }
-    #[test]
-    #[serial_test::serial]
-    fn handoff_reports_native_resolution_failure_without_losing_acp_session() {
-        let temp = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let _claude = crate::session::test_support::install_login_shell_path_command(
-            temp.path(),
-            "claude",
-            "#!/bin/sh\nexit 0\n",
-        );
-        let mut inst = Instance::new("claude-handoff-error", "/tmp");
-        inst.view = View::Structured;
-        inst.acp_session_id = Some("sid-abc".into());
-        let worker = inst.resolve_native_execution(None).unwrap().binding;
-        inst.extra_args = "--mcp-config /tmp/unattested.json".into();
-
-        let error = inst
-            .switch_to_terminal_keep_context(Some(&worker))
-            .unwrap_err();
-        assert!(error.to_string().contains("--mcp-config"), "{error:#}");
-        assert_eq!(inst.view, View::Structured);
-        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+            let error = inst
+                .switch_to_terminal_keep_context(Some(&worker))
+                .unwrap_err();
+            assert!(error.to_string().contains("--mcp-config"), "{error:#}");
+            assert_eq!(inst.view, View::Structured);
+            assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+        }
     }
 }

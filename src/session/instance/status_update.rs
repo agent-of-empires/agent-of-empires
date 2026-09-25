@@ -489,98 +489,120 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn skip_capture_requires_an_unchanged_pane_captured_past_its_activity_second() {
-        // (activity, last activity, last capture second, has hook, pending) -> skip
-        for (args, skip) in [
-            ((Some(100), Some(100), Some(101), false, false), true),
-            // A pending proposal must be resolved by a capture, not skipped past.
-            ((Some(100), Some(100), Some(101), false, true), false),
-            ((Some(100), Some(100), Some(101), true, false), false),
-            ((Some(101), Some(100), Some(102), false, false), false),
-            ((None, None, Some(101), false, false), false),
-            ((Some(100), None, Some(101), false, false), false),
-            // A capture inside or before the activity second proves nothing (#3624).
-            ((Some(100), Some(100), Some(100), false, false), false),
-            ((Some(100), Some(100), Some(99), false, false), false),
-            ((Some(100), Some(100), None, false, false), false),
-        ] {
-            let (activity, last, taken, hook, pending) = args;
-            assert_eq!(
-                skip_capture(activity, last, taken, hook, pending),
-                skip,
-                "{args:?}"
-            );
+    fn skip_capture_and_confirm_detection_gate_unwitnessed_frames() {
+        {
+            // (activity, last activity, last capture second, has hook, pending) -> skip
+            for (args, skip) in [
+                ((Some(100), Some(100), Some(101), false, false), true),
+                // A pending proposal must be resolved by a capture, not skipped past.
+                ((Some(100), Some(100), Some(101), false, true), false),
+                ((Some(100), Some(100), Some(101), true, false), false),
+                ((Some(101), Some(100), Some(102), false, false), false),
+                ((None, None, Some(101), false, false), false),
+                ((Some(100), None, Some(101), false, false), false),
+                // A capture inside or before the activity second proves nothing (#3624).
+                ((Some(100), Some(100), Some(100), false, false), false),
+                ((Some(100), Some(100), Some(99), false, false), false),
+                ((Some(100), Some(100), None, false, false), false),
+            ] {
+                let (activity, last, taken, hook, pending) = args;
+                assert_eq!(
+                    skip_capture(activity, last, taken, hook, pending),
+                    skip,
+                    "{args:?}"
+                );
+            }
         }
-    }
-
-    #[test]
-    fn archived_poll_settles_live_status_and_keeps_resting_ones() {
-        for (status, expected) in [
-            (Status::Running, Status::Idle),
-            (Status::Waiting, Status::Idle),
-            (Status::Starting, Status::Idle),
-            (Status::Idle, Status::Idle),
-            (Status::Stopped, Status::Stopped),
-            (Status::Error, Status::Error),
-            (Status::Unknown, Status::Unknown),
-        ] {
+        {
             let mut inst = Instance::new("test", "/tmp/test");
-            inst.status = status;
-            inst.archived_at = Some(Utc::now());
-            inst.update_status_with_metadata(None, None);
-            assert_eq!(inst.status, expected, "{status:?}");
+            inst.status = Status::Running;
+            assert_eq!(inst.confirm_detection(Status::Idle, false), None);
+            assert_eq!(inst.status, Status::Running);
+            assert_eq!(
+                inst.confirm_detection(Status::Idle, false),
+                Some(Status::Idle)
+            );
+
+            // Chrome-witnessed idle and every other direction publish immediately.
+            for (from, to, witnessed) in [
+                (Status::Running, Status::Idle, true),
+                (Status::Idle, Status::Running, false),
+                (Status::Running, Status::Waiting, false),
+            ] {
+                inst.status = from;
+                assert_eq!(
+                    inst.confirm_detection(to, witnessed),
+                    Some(to),
+                    "{from:?}->{to:?}"
+                );
+            }
+
+            // A proposal that changes before it is confirmed starts over.
+            inst.status = Status::Running;
+            assert_eq!(inst.confirm_detection(Status::Idle, false), None);
+            assert_eq!(
+                inst.confirm_detection(Status::Waiting, false),
+                Some(Status::Waiting)
+            );
+            assert!(inst.detection.pending.is_none());
         }
-
-        // Archiving kills tmux on purpose: no Error for the missing session (#2206).
-        let mut inst = Instance::new("test", "/tmp/test");
-        inst.archive();
-        inst.update_status_with_metadata(None, None);
-        assert_eq!((inst.status, inst.last_error.clone()), (Status::Idle, None));
-
-        // A genuine failure survives archive and unarchive.
-        inst.status = Status::Error;
-        inst.last_error = Some("agent crashed".to_string());
-        inst.update_status_with_metadata(None, None);
-        assert_eq!(inst.status, Status::Error);
-        inst.unarchive();
-        inst.update_status_with_metadata(None, None);
-        assert_eq!(inst.status, Status::Error);
-        assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
     }
 
     #[test]
-    fn confirm_detection_holds_only_unwitnessed_idle() {
-        let mut inst = Instance::new("test", "/tmp/test");
-        inst.status = Status::Running;
-        assert_eq!(inst.confirm_detection(Status::Idle, false), None);
-        assert_eq!(inst.status, Status::Running);
-        assert_eq!(
-            inst.confirm_detection(Status::Idle, false),
-            Some(Status::Idle)
-        );
+    fn archived_status_settles_live_polls_and_reanchors_idle() {
+        {
+            for (status, expected) in [
+                (Status::Running, Status::Idle),
+                (Status::Waiting, Status::Idle),
+                (Status::Starting, Status::Idle),
+                (Status::Idle, Status::Idle),
+                (Status::Stopped, Status::Stopped),
+                (Status::Error, Status::Error),
+                (Status::Unknown, Status::Unknown),
+            ] {
+                let mut inst = Instance::new("test", "/tmp/test");
+                inst.status = status;
+                inst.archived_at = Some(Utc::now());
+                inst.update_status_with_metadata(None, None);
+                assert_eq!(inst.status, expected, "{status:?}");
+            }
 
-        // Chrome-witnessed idle and every other direction publish immediately.
-        for (from, to, witnessed) in [
-            (Status::Running, Status::Idle, true),
-            (Status::Idle, Status::Running, false),
-            (Status::Running, Status::Waiting, false),
-        ] {
-            inst.status = from;
-            assert_eq!(
-                inst.confirm_detection(to, witnessed),
-                Some(to),
-                "{from:?}->{to:?}"
-            );
+            // Archiving kills tmux on purpose: no Error for the missing session (#2206).
+            let mut inst = Instance::new("test", "/tmp/test");
+            inst.archive();
+            inst.update_status_with_metadata(None, None);
+            assert_eq!((inst.status, inst.last_error.clone()), (Status::Idle, None));
+
+            // A genuine failure survives archive and unarchive.
+            inst.status = Status::Error;
+            inst.last_error = Some("agent crashed".to_string());
+            inst.update_status_with_metadata(None, None);
+            assert_eq!(inst.status, Status::Error);
+            inst.unarchive();
+            inst.update_status_with_metadata(None, None);
+            assert_eq!(inst.status, Status::Error);
+            assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
         }
+        {
+            let mut inst = Instance::new("test", "/tmp/test");
+            inst.archive();
+            inst.live_status_baseline = Some(Status::Idle);
+            inst.status = Status::Unknown;
+            let user_touch = Some(Utc::now() - chrono::Duration::hours(2));
+            inst.last_accessed_at = user_touch;
 
-        // A proposal that changes before it is confirmed starts over.
-        inst.status = Status::Running;
-        assert_eq!(inst.confirm_detection(Status::Idle, false), None);
-        assert_eq!(
-            inst.confirm_detection(Status::Waiting, false),
-            Some(Status::Waiting)
-        );
-        assert!(inst.detection.pending.is_none());
+            inst.update_status_with_metadata(None, None);
+            assert_eq!(inst.status, Status::Unknown);
+            assert_eq!(inst.idle_entered_at, None);
+            assert_eq!(inst.last_accessed_at, user_touch);
+            assert_eq!(inst.live_status_baseline, Some(Status::Unknown));
+
+            inst.status = Status::Idle;
+            inst.update_status_with_metadata(None, None);
+            assert!(inst.idle_entered_at.is_some());
+            assert_eq!(inst.last_accessed_at, user_touch);
+            assert_eq!(inst.live_status_baseline, Some(Status::Idle));
+        }
     }
 
     #[test]
@@ -761,28 +783,6 @@ mod tests {
         assert_eq!(untouched.last_accessed_at, None);
     }
 
-    #[test]
-    fn archived_status_transitions_reanchor_idle_without_touching_last_accessed() {
-        let mut inst = Instance::new("test", "/tmp/test");
-        inst.archive();
-        inst.live_status_baseline = Some(Status::Idle);
-        inst.status = Status::Unknown;
-        let user_touch = Some(Utc::now() - chrono::Duration::hours(2));
-        inst.last_accessed_at = user_touch;
-
-        inst.update_status_with_metadata(None, None);
-        assert_eq!(inst.status, Status::Unknown);
-        assert_eq!(inst.idle_entered_at, None);
-        assert_eq!(inst.last_accessed_at, user_touch);
-        assert_eq!(inst.live_status_baseline, Some(Status::Unknown));
-
-        inst.status = Status::Idle;
-        inst.update_status_with_metadata(None, None);
-        assert!(inst.idle_entered_at.is_some());
-        assert_eq!(inst.last_accessed_at, user_touch);
-        assert_eq!(inst.live_status_baseline, Some(Status::Idle));
-    }
-
     struct KillTmuxOnDrop(String);
 
     impl Drop for KillTmuxOnDrop {
@@ -944,225 +944,225 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         guard
     }
 
-    /// the hookless path's precedence is that a profile's own `[[agents.<name>.status_rules]]`
-    /// decide, and the manifest path applies it.
     #[test]
     #[serial_test::serial]
-    fn configured_rules_outrank_a_fresh_legacy_hook() {
-        const PROFILE: &str = "legacy-hook-rules-precedence-test";
-        let _registry = install_status_rules(
-            PROFILE,
-            "settl",
-            vec![crate::session::config::StatusRule {
-                status: crate::agents::HookStatus::Waiting,
-                contains: Some("approve this?".to_string()),
-                regex: None,
-            }],
-        );
+    fn configured_rules_outrank_a_fresh_legacy_hook_that_keeps_its_error() {
+        // the hookless path's precedence is that a profile's own `[[agents.<name>.status_rules]]`
+        // decide, and the manifest path applies it.
+        {
+            const PROFILE: &str = "legacy-hook-rules-precedence-test";
+            let _registry = install_status_rules(
+                PROFILE,
+                "settl",
+                vec![crate::session::config::StatusRule {
+                    status: crate::agents::HookStatus::Waiting,
+                    contains: Some("approve this?".to_string()),
+                    regex: None,
+                }],
+            );
 
-        let mut inst = Instance::new("legacy-rules", "/tmp/legacy-rules");
-        inst.source_profile = PROFILE.to_string();
-        inst.tool = "settl".to_string();
-        inst.status = Status::Idle;
-        assert!(
-            !tmux::detect::has_manifest(&inst.tool),
-            "fixture invariant: settl must still be on the legacy hook path"
-        );
-        write_hook_status(&inst.id, "running");
+            let mut inst = Instance::new("legacy-rules", "/tmp/legacy-rules");
+            inst.source_profile = PROFILE.to_string();
+            inst.tool = "settl".to_string();
+            inst.status = Status::Idle;
+            assert!(
+                !tmux::detect::has_manifest(&inst.tool),
+                "fixture invariant: settl must still be on the legacy hook path"
+            );
+            write_hook_status(&inst.id, "running");
 
-        let name = tmux::Session::generate_name(&inst.id, &inst.title);
-        let guard = crate::tmux::SessionCacheGuard::capture();
-        guard.force_present(&[name.as_str()]);
+            let name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_present(&[name.as_str()]);
 
-        let metadata = agent_pane_metadata("settl", None);
-        inst.update_status_with_metadata_inner(Some(&metadata), None);
-        crate::hooks::cleanup_hook_status_dir(&inst.id);
+            let metadata = agent_pane_metadata("settl", None);
+            inst.update_status_with_metadata_inner(Some(&metadata), None);
+            crate::hooks::cleanup_hook_status_dir(&inst.id);
 
-        assert_eq!(
-            inst.status,
-            Status::Idle,
-            "configured rules must decide over a fresh `running` hook write"
-        );
-    }
-
-    /// the legacy hook path cleared `last_error` unconditionally, so an `error` write landed a row
-    /// on Error with no explanation to render and no `last_error` for the 30s error re-check
-    /// throttle to key on.
-    #[test]
-    #[serial_test::serial]
-    fn legacy_error_hook_keeps_an_explanation() {
-        const PROFILE: &str = "legacy-hook-error-explanation-test";
-        // An empty config under a profile of its own: no rules for settl, so
-        // this exercises the hook short-circuit rather than the rules path.
-        let _registry = install_status_rules(PROFILE, "settl", Vec::new());
-
-        let mut inst = Instance::new("legacy-error", "/tmp/legacy-error");
-        inst.source_profile = PROFILE.to_string();
-        inst.tool = "settl".to_string();
-        inst.status = Status::Running;
-        inst.last_error = None;
-        write_hook_status(&inst.id, "error");
-
-        let name = tmux::Session::generate_name(&inst.id, &inst.title);
-        let guard = crate::tmux::SessionCacheGuard::capture();
-        guard.force_present(&[name.as_str()]);
-        let metadata = agent_pane_metadata("settl", None);
-
-        inst.update_status_with_metadata_inner(Some(&metadata), None);
-        assert_eq!(inst.status, Status::Error);
-        assert!(
-            inst.last_error.is_some(),
-            "an Error hook must leave an explanation, which the error re-check \
-             throttle also keys on"
-        );
-
-        // A standing explanation is the better one: it came from whatever
-        // first diagnosed the failure.
-        inst.last_error = Some("agent crashed".to_string());
-        inst.last_error_check = None;
-        inst.update_status_with_metadata_inner(Some(&metadata), None);
-        crate::hooks::cleanup_hook_status_dir(&inst.id);
-
-        assert_eq!(inst.status, Status::Error);
-        assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
-    }
-
-    /// `#{window_activity}` is an epoch second and the poller runs twice a second, so a turn's last
-    /// running frame and the idle frame that follows it can share one value.
-    #[test]
-    #[serial_test::serial]
-    fn idle_frame_sharing_an_activity_second_is_still_observed() {
-        if !tmux_available() {
-            eprintln!("skipping: tmux not available");
-            return;
+            assert_eq!(
+                inst.status,
+                Status::Idle,
+                "configured rules must decide over a fresh `running` hook write"
+            );
         }
+        // the legacy hook path cleared `last_error` unconditionally, so an `error` write landed a row
+        // on Error with no explanation to render and no `last_error` for the 30s error re-check
+        // throttle to key on.
+        {
+            const PROFILE: &str = "legacy-hook-error-explanation-test";
+            // An empty config under a profile of its own: no rules for settl, so
+            // this exercises the hook short-circuit rather than the rules path.
+            let _registry = install_status_rules(PROFILE, "settl", Vec::new());
 
-        let mut inst = Instance::new("aoe_test_3624_activity", "/tmp");
-        assert_eq!(inst.tool, "claude");
+            let mut inst = Instance::new("legacy-error", "/tmp/legacy-error");
+            inst.source_profile = PROFILE.to_string();
+            inst.tool = "settl".to_string();
+            inst.status = Status::Running;
+            inst.last_error = None;
+            write_hook_status(&inst.id, "error");
 
-        // The running frame is Claude's `active_spinner` shape. The idle frame matches no rule at
-        // all, which is the unwitnessed Idle that has to wait for a confirming poll.
-        let dir = std::env::temp_dir().join(format!("aoe_test_3624_{}", inst.id));
-        std::fs::create_dir_all(&dir).expect("create fixture dir");
-        let running_file = dir.join("running.txt");
-        let idle_file = dir.join("idle.txt");
-        let marker = dir.join("marker");
-        std::fs::write(&running_file, "\u{2736} Working\u{2026} (5s)\n").expect("write running");
-        std::fs::write(&idle_file, format!("{}turn over\n", "\n".repeat(150))).expect("write idle");
+            let name = tmux::Session::generate_name(&inst.id, &inst.title);
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_present(&[name.as_str()]);
+            let metadata = agent_pane_metadata("settl", None);
 
-        let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
-        // The marker file is the test's clock: the pane holds the running frame until it appears.
-        let launch = format!(
-            "cat {}; until [ -f {} ]; do sleep 0.05; done; cat {}; sleep 300",
-            shell_quote(&running_file),
-            shell_quote(&marker),
-            shell_quote(&idle_file),
-        );
-        let _guard = spawn_pane(&session_name, &launch);
-        assert!(
-            wait_for_pane(&session_name, "Working"),
-            "running frame never painted"
-        );
+            inst.update_status_with_metadata_inner(Some(&metadata), None);
+            assert_eq!(inst.status, Status::Error);
+            assert!(
+                inst.last_error.is_some(),
+                "an Error hook must leave an explanation, which the error re-check \
+                 throttle also keys on"
+            );
 
-        let cache = crate::tmux::SessionCacheGuard::capture();
-        cache.force_present(&[session_name.as_str()]);
+            // A standing explanation is the better one: it came from whatever
+            // first diagnosed the failure.
+            inst.last_error = Some("agent crashed".to_string());
+            inst.last_error_check = None;
+            inst.update_status_with_metadata_inner(Some(&metadata), None);
+            crate::hooks::cleanup_hook_status_dir(&inst.id);
 
-        let poll = |inst: &mut Instance, activity: Option<i64>| {
-            let metadata = agent_pane_metadata("claude", activity);
-            inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
-        };
-
-        // The activity value both frames share. tmux stamps it in whichever second the output
-        // landed in, which is the second this first capture is taken in.
-        poll(&mut inst, Some(0));
-        assert_eq!(inst.status, Status::Running, "running frame must be seen");
-        let shared = inst
-            .detection
-            .captured_at
-            .expect("capture stamps its second");
-        inst.detection.activity = Some(shared);
-
-        std::fs::File::create(&marker).expect("touch marker");
-        assert!(
-            wait_for_pane(&session_name, "turn over"),
-            "idle frame never painted"
-        );
-
-        poll(&mut inst, Some(shared));
-        assert_eq!(
-            inst.status,
-            Status::Running,
-            "an unwitnessed Idle waits one poll before it publishes"
-        );
-        assert_eq!(
-            inst.detection.pending,
-            Some(Status::Idle),
-            "the final frame must be captured, not skipped as unchanged (#3624)"
-        );
-
-        poll(&mut inst, Some(shared));
-        std::fs::remove_dir_all(&dir).ok();
-
-        assert_eq!(
-            inst.status,
-            Status::Idle,
-            "the confirming poll must publish the idle the final frame showed"
-        );
+            assert_eq!(inst.status, Status::Error);
+            assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
+        }
     }
 
-    /// `aoe ps`, `aoe status` and the worktree-edit guards observe a session once and exit, so the
-    /// confirming poll an unwitnessed `Running -> Idle` waits for never arrives.
     #[test]
     #[serial_test::serial]
-    fn a_single_observation_publishes_an_unwitnessed_idle() {
-        if !tmux_available() {
-            eprintln!("skipping: tmux not available");
-            return;
+    fn unwitnessed_idle_is_observed_within_an_activity_second_and_published_once() {
+        // `#{window_activity}` is an epoch second and the poller runs twice a second, so a turn's last
+        // running frame and the idle frame that follows it can share one value.
+        {
+            if !tmux_available() {
+                eprintln!("skipping: tmux not available");
+                return;
+            }
+
+            let mut inst = Instance::new("aoe_test_3624_activity", "/tmp");
+            assert_eq!(inst.tool, "claude");
+
+            // The running frame is Claude's `active_spinner` shape. The idle frame matches no rule at
+            // all, which is the unwitnessed Idle that has to wait for a confirming poll.
+            let dir = std::env::temp_dir().join(format!("aoe_test_3624_{}", inst.id));
+            std::fs::create_dir_all(&dir).expect("create fixture dir");
+            let running_file = dir.join("running.txt");
+            let idle_file = dir.join("idle.txt");
+            let marker = dir.join("marker");
+            std::fs::write(&running_file, "\u{2736} Working\u{2026} (5s)\n")
+                .expect("write running");
+            std::fs::write(&idle_file, format!("{}turn over\n", "\n".repeat(150)))
+                .expect("write idle");
+
+            let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
+            // The marker file is the test's clock: the pane holds the running frame until it appears.
+            let launch = format!(
+                "cat {}; until [ -f {} ]; do sleep 0.05; done; cat {}; sleep 300",
+                shell_quote(&running_file),
+                shell_quote(&marker),
+                shell_quote(&idle_file),
+            );
+            let _guard = spawn_pane(&session_name, &launch);
+            assert!(
+                wait_for_pane(&session_name, "Working"),
+                "running frame never painted"
+            );
+
+            let cache = crate::tmux::SessionCacheGuard::capture();
+            cache.force_present(&[session_name.as_str()]);
+
+            let poll = |inst: &mut Instance, activity: Option<i64>| {
+                let metadata = agent_pane_metadata("claude", activity);
+                inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+            };
+
+            // The activity value both frames share. tmux stamps it in whichever second the output
+            // landed in, which is the second this first capture is taken in.
+            poll(&mut inst, Some(0));
+            assert_eq!(inst.status, Status::Running, "running frame must be seen");
+            let shared = inst
+                .detection
+                .captured_at
+                .expect("capture stamps its second");
+            inst.detection.activity = Some(shared);
+
+            std::fs::File::create(&marker).expect("touch marker");
+            assert!(
+                wait_for_pane(&session_name, "turn over"),
+                "idle frame never painted"
+            );
+
+            poll(&mut inst, Some(shared));
+            assert_eq!(
+                inst.status,
+                Status::Running,
+                "an unwitnessed Idle waits one poll before it publishes"
+            );
+            assert_eq!(
+                inst.detection.pending,
+                Some(Status::Idle),
+                "the final frame must be captured, not skipped as unchanged (#3624)"
+            );
+
+            poll(&mut inst, Some(shared));
+            std::fs::remove_dir_all(&dir).ok();
+
+            assert_eq!(
+                inst.status,
+                Status::Idle,
+                "the confirming poll must publish the idle the final frame showed"
+            );
         }
+        // `aoe ps`, `aoe status` and the worktree-edit guards observe a session once and exit, so the
+        // confirming poll an unwitnessed `Running -> Idle` waits for never arrives.
+        {
+            if !tmux_available() {
+                eprintln!("skipping: tmux not available");
+                return;
+            }
 
-        let mut polled = Instance::new("aoe_test_3712_polled", "/tmp");
-        // Guard, not a constant assertion: the manifest path is only reached
-        // for a tool that has one.
-        assert_eq!(polled.tool, "claude");
+            let mut polled = Instance::new("aoe_test_3712_polled", "/tmp");
+            // Guard, not a constant assertion: the manifest path is only reached
+            // for a tool that has one.
+            assert_eq!(polled.tool, "claude");
 
-        // A parked Claude prompt carrying half-typed text.
-        let pane = "earlier output\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f} half typed prompt\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\n";
-        let pane_file = std::env::temp_dir().join(format!("aoe_test_3712_{}.txt", polled.id));
-        std::fs::write(&pane_file, pane).expect("write pane fixture");
+            // A parked Claude prompt carrying half-typed text.
+            let pane = "earlier output\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f} half typed prompt\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle)\n";
+            let pane_file = std::env::temp_dir().join(format!("aoe_test_3712_{}.txt", polled.id));
+            std::fs::write(&pane_file, pane).expect("write pane fixture");
 
-        let session_name = tmux::Session::generate_name(&polled.id, &polled.title);
-        let _guard = spawn_pane(
-            &session_name,
-            &format!("cat {}; sleep 300", shell_quote(&pane_file)),
-        );
-        let painted = wait_for_pane(&session_name, "half typed prompt");
-        std::fs::remove_file(&pane_file).ok();
-        assert!(painted, "parked prompt never painted into the tmux pane");
+            let session_name = tmux::Session::generate_name(&polled.id, &polled.title);
+            let _guard = spawn_pane(
+                &session_name,
+                &format!("cat {}; sleep 300", shell_quote(&pane_file)),
+            );
+            let painted = wait_for_pane(&session_name, "half typed prompt");
+            std::fs::remove_file(&pane_file).ok();
+            assert!(painted, "parked prompt never painted into the tmux pane");
 
-        let cache = crate::tmux::SessionCacheGuard::capture();
-        cache.force_present(&[session_name.as_str()]);
-        let metadata = agent_pane_metadata("claude", None);
+            let cache = crate::tmux::SessionCacheGuard::capture();
+            cache.force_present(&[session_name.as_str()]);
+            let metadata = agent_pane_metadata("claude", None);
 
-        // Both rows come off disk on `Running`, which is what the CLI reads.
-        polled.status = Status::Running;
-        polled.update_status_with_metadata(Some(&metadata), Some(&session_name));
-        assert_eq!(
-            polled.status,
-            Status::Running,
-            "a repeating poller holds an unwitnessed Idle for the poll that agrees"
-        );
-        assert_eq!(polled.detection.pending, Some(Status::Idle));
+            // Both rows come off disk on `Running`, which is what the CLI reads.
+            polled.status = Status::Running;
+            polled.update_status_with_metadata(Some(&metadata), Some(&session_name));
+            assert_eq!(
+                polled.status,
+                Status::Running,
+                "a repeating poller holds an unwitnessed Idle for the poll that agrees"
+            );
+            assert_eq!(polled.detection.pending, Some(Status::Idle));
 
-        // A one-shot reader starts from a bare disk load: no proposal on
-        // record, and none it can ever meet.
-        let mut once = Instance::new("aoe_test_3712_once", "/tmp");
-        once.status = Status::Running;
-        once.update_status_once(Some(&metadata), Some(&session_name));
-        assert_eq!(
-            once.status,
-            Status::Idle,
-            "one observation is all this caller gets, so its proposal decides (#3712)"
-        );
-        assert_eq!(once.detection.pending, None);
+            // A one-shot reader starts from a bare disk load: no proposal on
+            // record, and none it can ever meet.
+            let mut once = Instance::new("aoe_test_3712_once", "/tmp");
+            once.status = Status::Running;
+            once.update_status_once(Some(&metadata), Some(&session_name));
+            assert_eq!(
+                once.status,
+                Status::Idle,
+                "one observation is all this caller gets, so its proposal decides (#3712)"
+            );
+            assert_eq!(once.detection.pending, None);
+        }
     }
 }

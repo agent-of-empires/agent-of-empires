@@ -209,74 +209,73 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn unauthorized_alias_does_not_contend_with_a_direct_base() {
-        const PROFILE: &str = "contended-unauthorized-alias-test";
-        let _registry = crate::session::instance::test_helpers::install_aliases(
-            PROFILE,
-            &[("opencode-remote", "opencode")],
-        );
-        let cwd = std::env::current_dir().unwrap();
-        let project = cwd.to_str().unwrap();
-        let canonical = crate::session::capture::canonicalize_or_raw(project)
-            .to_string_lossy()
-            .into_owned();
-        let mut base = Instance::new("base", project);
-        base.tool = "opencode".to_string();
-        let mut remote = Instance::new("remote", project);
-        remote.source_profile = PROFILE.to_string();
-        remote.tool = "opencode-remote".to_string();
-        remote.command = "ssh host opencode".to_string();
-        assert!(base.resolved_session_support().is_some());
-        assert!(remote.resolved_session_support().is_none());
+    fn alias_capture_contention_follows_authorization() {
+        {
+            const PROFILE: &str = "contended-unauthorized-alias-test";
+            let _registry = crate::session::instance::test_helpers::install_aliases(
+                PROFILE,
+                &[("opencode-remote", "opencode")],
+            );
+            let cwd = std::env::current_dir().unwrap();
+            let project = cwd.to_str().unwrap();
+            let canonical = crate::session::capture::canonicalize_or_raw(project)
+                .to_string_lossy()
+                .into_owned();
+            let mut base = Instance::new("base", project);
+            base.tool = "opencode".to_string();
+            let mut remote = Instance::new("remote", project);
+            remote.source_profile = PROFILE.to_string();
+            remote.tool = "opencode-remote".to_string();
+            remote.command = "ssh host opencode".to_string();
+            assert!(base.resolved_session_support().is_some());
+            assert!(remote.resolved_session_support().is_none());
 
-        let guard = crate::tmux::SessionCacheGuard::capture();
-        guard.force_present(&[]);
-        let sessions = [&base, &remote]
-            .map(|instance| crate::tmux::Session::resolve_name(&instance.id, &instance.title));
-        let live = sessions.iter().map(String::as_str).collect::<Vec<_>>();
-        guard.force_present(&live);
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_present(&[]);
+            let sessions = [&base, &remote]
+                .map(|instance| crate::tmux::Session::resolve_name(&instance.id, &instance.title));
+            let live = sessions.iter().map(String::as_str).collect::<Vec<_>>();
+            guard.force_present(&live);
 
-        assert!(
-            !Instance::contended_capture_cwds(&[base, remote])
-                .contains(&("opencode".to_string(), canonical)),
-            "an alias without capture authorization cannot veto the direct pane"
-        );
-    }
+            assert!(
+                !Instance::contended_capture_cwds(&[base, remote])
+                    .contains(&("opencode".to_string(), canonical)),
+                "an alias without capture authorization cannot veto the direct pane"
+            );
+        }
+        {
+            const PROFILE: &str = "contended-alias-test";
+            let _registry = crate::session::instance::test_helpers::install_aliases(
+                PROFILE,
+                &[("opencode-personal", "opencode")],
+            );
+            let cwd = std::env::current_dir().unwrap();
+            let project = cwd.to_str().unwrap();
+            let canonical = crate::session::capture::canonicalize_or_raw(project)
+                .to_string_lossy()
+                .into_owned();
+            let mut base = Instance::new("base", project);
+            base.tool = "opencode".to_string();
+            let mut alias = Instance::new("alias", project);
+            alias.source_profile = PROFILE.to_string();
+            alias.tool = "opencode-personal".to_string();
+            alias.command = "opencode".to_string();
+            assert!(base.resolved_session_support().is_some());
+            assert!(alias.resolved_session_support().is_some());
 
-    #[test]
-    #[serial_test::serial]
-    fn contended_capture_cwds_spans_a_direct_alias_and_its_base() {
-        const PROFILE: &str = "contended-alias-test";
-        let _registry = crate::session::instance::test_helpers::install_aliases(
-            PROFILE,
-            &[("opencode-personal", "opencode")],
-        );
-        let cwd = std::env::current_dir().unwrap();
-        let project = cwd.to_str().unwrap();
-        let canonical = crate::session::capture::canonicalize_or_raw(project)
-            .to_string_lossy()
-            .into_owned();
-        let mut base = Instance::new("base", project);
-        base.tool = "opencode".to_string();
-        let mut alias = Instance::new("alias", project);
-        alias.source_profile = PROFILE.to_string();
-        alias.tool = "opencode-personal".to_string();
-        alias.command = "opencode".to_string();
-        assert!(base.resolved_session_support().is_some());
-        assert!(alias.resolved_session_support().is_some());
+            let guard = crate::tmux::SessionCacheGuard::capture();
+            guard.force_present(&[]);
+            let sessions = [&base, &alias]
+                .map(|instance| crate::tmux::Session::resolve_name(&instance.id, &instance.title));
+            let live = sessions.iter().map(String::as_str).collect::<Vec<_>>();
+            guard.force_present(&live);
 
-        let guard = crate::tmux::SessionCacheGuard::capture();
-        guard.force_present(&[]);
-        let sessions = [&base, &alias]
-            .map(|instance| crate::tmux::Session::resolve_name(&instance.id, &instance.title));
-        let live = sessions.iter().map(String::as_str).collect::<Vec<_>>();
-        guard.force_present(&live);
-
-        assert!(
-            Instance::contended_capture_cwds(&[base, alias])
-                .contains(&("opencode".to_string(), canonical)),
-            "a direct alias and its base share one capture identity"
-        );
+            assert!(
+                Instance::contended_capture_cwds(&[base, alias])
+                    .contains(&("opencode".to_string(), canonical)),
+                "a direct alias and its base share one capture identity"
+            );
+        }
     }
 
     #[test]

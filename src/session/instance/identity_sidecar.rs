@@ -488,125 +488,124 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn fresh_launch_clears_every_host_identity_sidecar() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
-        for tool in ["cursor", "pi"] {
-            let mut inst = Instance::new(tool, "/tmp/test");
-            inst.tool = tool.to_string();
-            inst.detect_as = tool.to_string();
-            crate::hooks::write_session_id_via_guard(&inst.id, "stale-sid", None).unwrap();
-            assert!(crate::hooks::session_id_sidecar_exists(&inst.id));
+    fn fresh_launch_clears_host_identity_sidecars_and_the_transcript_path() {
+        {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+            for tool in ["cursor", "pi"] {
+                let mut inst = Instance::new(tool, "/tmp/test");
+                inst.tool = tool.to_string();
+                inst.detect_as = tool.to_string();
+                crate::hooks::write_session_id_via_guard(&inst.id, "stale-sid", None).unwrap();
+                assert!(crate::hooks::session_id_sidecar_exists(&inst.id));
 
-            inst.clear_pane_identity_sidecar();
-            assert!(
-                !crate::hooks::session_id_sidecar_exists(&inst.id),
-                "{tool} retained stale pane identity"
+                inst.clear_pane_identity_sidecar();
+                assert!(
+                    !crate::hooks::session_id_sidecar_exists(&inst.id),
+                    "{tool} retained stale pane identity"
+                );
+            }
+        }
+        {
+            let mut inst = tool_instance("pi", "/tmp/pi-clear");
+            inst.agent_session_id = Some("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa".to_string());
+            inst.pi_session_path = Some(
+                "/store/2026-01-01T00-00-00-000Z_aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa.jsonl"
+                    .to_string(),
+            );
+            inst.resume_intent = ResumeIntent::Cleared;
+
+            let (sid, is_existing) = inst.acquire_session_id_with(None, &|_| None);
+
+            assert_eq!(sid, None, "no pin without a mint seam");
+            assert!(!is_existing);
+            assert_eq!(
+                inst.pi_session_path, None,
+                "the dropped conversation's transcript must not linger"
             );
         }
     }
 
     #[test]
-    fn clearing_the_conversation_drops_its_transcript_path() {
-        let mut inst = tool_instance("pi", "/tmp/pi-clear");
-        inst.agent_session_id = Some("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa".to_string());
-        inst.pi_session_path = Some(
-            "/store/2026-01-01T00-00-00-000Z_aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa.jsonl"
-                .to_string(),
-        );
-        inst.resume_intent = ResumeIntent::Cleared;
-
-        let (sid, is_existing) = inst.acquire_session_id_with(None, &|_| None);
-
-        assert_eq!(sid, None, "no pin without a mint seam");
-        assert!(!is_existing);
-        assert_eq!(
-            inst.pi_session_path, None,
-            "the dropped conversation's transcript must not linger"
-        );
-    }
-
-    #[test]
     #[serial_test::serial]
-    fn an_unresolvable_sandbox_source_fails_closed() {
-        let temp = tempfile::tempdir().unwrap();
-        let _home = EnvGuard::set(&[("HOME", temp.path())]);
+    fn sandbox_sidecar_source_fails_closed_and_survives_reload() {
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let _home = EnvGuard::set(&[("HOME", temp.path())]);
 
-        let mut inst = Instance::new("pi-unresolvable", "/tmp/pi-unresolvable");
-        inst.id = "../escape".to_string();
-        inst.tool = "pi".to_string();
-        inst.sandbox_info = Some(test_sandbox("aoe-pi-unresolvable", None));
+            let mut inst = Instance::new("pi-unresolvable", "/tmp/pi-unresolvable");
+            inst.id = "../escape".to_string();
+            inst.tool = "pi".to_string();
+            inst.sandbox_info = Some(test_sandbox("aoe-pi-unresolvable", None));
 
-        assert_eq!(
-            inst.pi_sidecar_source(),
-            None,
-            "no source is the safe answer"
-        );
-        assert!(
-            !inst.uses_pi_session_sidecar(),
-            "a pane with no resolvable source does not publish"
-        );
-        assert!(
-            !inst.supports_session_poller(),
-            "and must not poll, which would read the host sidecar"
-        );
-        assert!(inst.pi_published_conversation(true).is_none());
+            assert_eq!(
+                inst.pi_sidecar_source(),
+                None,
+                "no source is the safe answer"
+            );
+            assert!(
+                !inst.uses_pi_session_sidecar(),
+                "a pane with no resolvable source does not publish"
+            );
+            assert!(
+                !inst.supports_session_poller(),
+                "and must not poll, which would read the host sidecar"
+            );
+            assert!(inst.pi_published_conversation(true).is_none());
 
-        let host = tool_instance("pi", "/tmp/pi-unresolvable");
-        assert!(matches!(
-            host.pi_sidecar_source(),
-            Some(SessionSidecarSource::HostHooks(_))
-        ));
-    }
+            let host = tool_instance("pi", "/tmp/pi-unresolvable");
+            assert!(matches!(
+                host.pi_sidecar_source(),
+                Some(SessionSidecarSource::HostHooks(_))
+            ));
+        }
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_home(temp.path());
 
-    #[test]
-    #[serial_test::serial]
-    fn reloaded_sandbox_session_still_finds_its_sidecar() {
-        let temp = tempfile::tempdir().unwrap();
-        let _home = crate::session::test_support::isolate_home(temp.path());
+            let mut inst = tool_instance("pi", "/tmp/pi-reload");
+            inst.sandbox_info = Some(test_sandbox("aoe-pi-reload", None));
+            admit_sandbox_fixture(&inst);
+            inst.mark_pi_extension_launched_for_test();
 
-        let mut inst = tool_instance("pi", "/tmp/pi-reload");
-        inst.sandbox_info = Some(test_sandbox("aoe-pi-reload", None));
-        admit_sandbox_fixture(&inst);
-        inst.mark_pi_extension_launched_for_test();
+            let reloaded: Instance =
+                serde_json::from_str(&serde_json::to_string(&inst).unwrap()).unwrap();
+            assert!(
+                !reloaded.uses_pi_session_sidecar(),
+                "nothing published yet, so nothing to find"
+            );
 
-        let reloaded: Instance =
-            serde_json::from_str(&serde_json::to_string(&inst).unwrap()).unwrap();
-        assert!(
-            !reloaded.uses_pi_session_sidecar(),
-            "nothing published yet, so nothing to find"
-        );
+            let dir = reloaded
+                .pi_sidecar_source()
+                .and_then(|s| match s {
+                    crate::session::instance::SessionSidecarSource::SandboxDir(d) => Some(d),
+                    _ => None,
+                })
+                .expect("a sandboxed pane has a bind-backed sidecar");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("session_id"),
+                "01a053b6-c470-78de-9d8f-bc00ef05332a\n",
+            )
+            .unwrap();
 
-        let dir = reloaded
-            .pi_sidecar_source()
-            .and_then(|s| match s {
-                crate::session::instance::SessionSidecarSource::SandboxDir(d) => Some(d),
-                _ => None,
-            })
-            .expect("a sandboxed pane has a bind-backed sidecar");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("session_id"),
-            "01a053b6-c470-78de-9d8f-bc00ef05332a\n",
-        )
-        .unwrap();
-
-        assert!(
-            reloaded.uses_pi_session_sidecar(),
-            "the published file is what a reloaded session has to go on"
-        );
-        assert!(
-            reloaded.supports_session_poller(),
-            "poller repair must stay available after a reload"
-        );
-        assert_eq!(
-            reloaded
-                .pi_published_conversation(true)
-                .as_ref()
-                .map(|observation| observation.sid.as_str()),
-            Some("01a053b6-c470-78de-9d8f-bc00ef05332a"),
-            "and the final flush must read it"
-        );
+            assert!(
+                reloaded.uses_pi_session_sidecar(),
+                "the published file is what a reloaded session has to go on"
+            );
+            assert!(
+                reloaded.supports_session_poller(),
+                "poller repair must stay available after a reload"
+            );
+            assert_eq!(
+                reloaded
+                    .pi_published_conversation(true)
+                    .as_ref()
+                    .map(|observation| observation.sid.as_str()),
+                Some("01a053b6-c470-78de-9d8f-bc00ef05332a"),
+                "and the final flush must read it"
+            );
+        }
     }
 
     #[test]
@@ -738,86 +737,86 @@ pi = "~/.pi-personal"
 
     #[test]
     #[serial_test::serial]
-    fn pi_only_calls_a_transcript_missing_when_its_store_was_readable() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-        let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
-        let leaf = format!("2026-01-01T00-00-00-000Z_{id}.jsonl");
+    fn pi_calls_a_transcript_missing_only_when_its_store_was_readable() {
+        {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+            let leaf = format!("2026-01-01T00-00-00-000Z_{id}.jsonl");
 
-        let mut inst = tool_instance("pi", "/tmp/pi-store");
-        inst.agent_session_id = Some(id.to_string());
-        inst.sandbox_info = Some(test_sandbox("aoe-pi-store", None));
-        inst.pi_session_path = Some(format!("/root/.pi/agent/sessions/--proj--/{leaf}"));
-        admit_sandbox_fixture(&inst);
+            let mut inst = tool_instance("pi", "/tmp/pi-store");
+            inst.agent_session_id = Some(id.to_string());
+            inst.sandbox_info = Some(test_sandbox("aoe-pi-store", None));
+            inst.pi_session_path = Some(format!("/root/.pi/agent/sessions/--proj--/{leaf}"));
+            admit_sandbox_fixture(&inst);
 
-        assert!(
-            !inst.pi_recorded_transcript_missing(),
-            "an uninspectable store is not evidence the conversation is gone"
-        );
-        assert_eq!(inst.pi_resumable_transcript(), None);
-
-        let store = inst.sandbox_capture_store_dir().expect("bind dir");
-        let sessions = store.join("agent").join("sessions").join("--proj--");
-        std::fs::create_dir_all(&sessions).unwrap();
-
-        assert!(
-            inst.pi_recorded_transcript_missing(),
-            "a readable store with no file is the pane's own answer"
-        );
-
-        std::fs::write(sessions.join(&leaf), "{}\n").unwrap();
-        assert!(!inst.pi_recorded_transcript_missing());
-        assert_eq!(
-            inst.pi_resumable_transcript(),
-            Some(format!("/root/.pi/agent/sessions/--proj--/{leaf}")),
-            "the pane resumes its own transcript by the path it published"
-        );
-
-        inst.pi_session_path = Some(format!("/home/u/.pi/agent/sessions/--proj--/{leaf}"));
-        assert!(!inst.pi_recorded_transcript_missing());
-    }
-
-    #[test]
-    fn pi_never_calls_a_transcript_missing_on_a_store_it_could_not_ask_about() {
-        let temp = tempfile::tempdir().unwrap();
-        let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
-        let leaf = format!("2026-01-01T00-00-00-000Z_{id}.jsonl");
-        let store = temp.path().join("sessions");
-
-        let mut inst = tool_instance("pi", "/tmp/pi-host-store");
-        inst.agent_session_id = Some(id.to_string());
-        inst.pi_session_path = Some(store.join(&leaf).to_string_lossy().into_owned());
-
-        assert!(
-            !inst.pi_recorded_transcript_missing(),
-            "a store directory that is not there says nothing about the conversation"
-        );
-
-        std::fs::create_dir_all(&store).unwrap();
-        assert!(
-            inst.pi_recorded_transcript_missing(),
-            "a readable store with no file is the pane's own answer"
-        );
-
-        std::fs::write(store.join(&leaf), "{}\n").unwrap();
-        assert!(!inst.pi_recorded_transcript_missing());
-
-        let not_a_dir = temp.path().join("occupied");
-        std::fs::write(&not_a_dir, "").unwrap();
-        inst.pi_session_path = Some(not_a_dir.join(&leaf).to_string_lossy().into_owned());
-        assert!(
-            !inst.pi_recorded_transcript_missing(),
-            "a store path that is not a directory says nothing about the conversation"
-        );
-        inst.pi_session_path = Some(store.join(&leaf).to_string_lossy().into_owned());
-
-        if !nix::unistd::Uid::effective().is_root() {
-            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).unwrap();
-            let denied = !inst.pi_recorded_transcript_missing();
-            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
             assert!(
-                denied,
-                "a transcript AoE is not allowed to stat must not read as gone"
+                !inst.pi_recorded_transcript_missing(),
+                "an uninspectable store is not evidence the conversation is gone"
             );
+            assert_eq!(inst.pi_resumable_transcript(), None);
+
+            let store = inst.sandbox_capture_store_dir().expect("bind dir");
+            let sessions = store.join("agent").join("sessions").join("--proj--");
+            std::fs::create_dir_all(&sessions).unwrap();
+
+            assert!(
+                inst.pi_recorded_transcript_missing(),
+                "a readable store with no file is the pane's own answer"
+            );
+
+            std::fs::write(sessions.join(&leaf), "{}\n").unwrap();
+            assert!(!inst.pi_recorded_transcript_missing());
+            assert_eq!(
+                inst.pi_resumable_transcript(),
+                Some(format!("/root/.pi/agent/sessions/--proj--/{leaf}")),
+                "the pane resumes its own transcript by the path it published"
+            );
+
+            inst.pi_session_path = Some(format!("/home/u/.pi/agent/sessions/--proj--/{leaf}"));
+            assert!(!inst.pi_recorded_transcript_missing());
+        }
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+            let leaf = format!("2026-01-01T00-00-00-000Z_{id}.jsonl");
+            let store = temp.path().join("sessions");
+
+            let mut inst = tool_instance("pi", "/tmp/pi-host-store");
+            inst.agent_session_id = Some(id.to_string());
+            inst.pi_session_path = Some(store.join(&leaf).to_string_lossy().into_owned());
+
+            assert!(
+                !inst.pi_recorded_transcript_missing(),
+                "a store directory that is not there says nothing about the conversation"
+            );
+
+            std::fs::create_dir_all(&store).unwrap();
+            assert!(
+                inst.pi_recorded_transcript_missing(),
+                "a readable store with no file is the pane's own answer"
+            );
+
+            std::fs::write(store.join(&leaf), "{}\n").unwrap();
+            assert!(!inst.pi_recorded_transcript_missing());
+
+            let not_a_dir = temp.path().join("occupied");
+            std::fs::write(&not_a_dir, "").unwrap();
+            inst.pi_session_path = Some(not_a_dir.join(&leaf).to_string_lossy().into_owned());
+            assert!(
+                !inst.pi_recorded_transcript_missing(),
+                "a store path that is not a directory says nothing about the conversation"
+            );
+            inst.pi_session_path = Some(store.join(&leaf).to_string_lossy().into_owned());
+
+            if !nix::unistd::Uid::effective().is_root() {
+                std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).unwrap();
+                let denied = !inst.pi_recorded_transcript_missing();
+                std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+                assert!(
+                    denied,
+                    "a transcript AoE is not allowed to stat must not read as gone"
+                );
+            }
         }
     }
 
@@ -961,77 +960,77 @@ pi = "~/.pi-personal"
     }
 
     #[test]
-    fn pi_resumes_by_published_path_only_for_its_own_transcript() {
-        let temp = tempfile::tempdir().unwrap();
-        let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
-        let other = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
-        let mine = temp
-            .path()
-            .join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
-        std::fs::write(&mine, "{}\n").unwrap();
-        let theirs = temp
-            .path()
-            .join(format!("2026-01-01T00-00-00-000Z_{other}.jsonl"));
-        std::fs::write(&theirs, "{}\n").unwrap();
+    fn pi_resumes_by_published_path_and_relaunches_unwritten_pins_as_new() {
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+            let other = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+            let mine = temp
+                .path()
+                .join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
+            std::fs::write(&mine, "{}\n").unwrap();
+            let theirs = temp
+                .path()
+                .join(format!("2026-01-01T00-00-00-000Z_{other}.jsonl"));
+            std::fs::write(&theirs, "{}\n").unwrap();
 
-        let mut inst = tool_instance("pi", "/tmp/pi-path");
-        inst.agent_session_id = Some(id.to_string());
+            let mut inst = tool_instance("pi", "/tmp/pi-path");
+            inst.agent_session_id = Some(id.to_string());
 
-        assert_eq!(
-            inst.pi_resumable_transcript(),
-            None,
-            "no path published yet"
-        );
-
-        inst.pi_session_path = Some(mine.to_string_lossy().to_string());
-        assert_eq!(
-            inst.pi_resumable_transcript().as_deref(),
-            Some(mine.to_string_lossy().as_ref()),
-            "the pane's own transcript resumes by path"
-        );
-
-        inst.pi_session_path = Some(theirs.to_string_lossy().to_string());
-        assert_eq!(
-            inst.pi_resumable_transcript(),
-            None,
-            "a path for another conversation must not be resumed"
-        );
-
-        inst.agent_session_id = Some("aaaaaaaa".to_string());
-        inst.pi_session_path = Some(mine.to_string_lossy().to_string());
-        assert_eq!(inst.pi_resumable_transcript(), None, "partial pin");
-        inst.agent_session_id = Some(id.to_string());
-
-        inst.pi_session_path = Some(
-            temp.path()
-                .join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl.gone"))
-                .to_string_lossy()
-                .to_string(),
-        );
-        assert_eq!(inst.pi_resumable_transcript(), None, "the file must exist");
-    }
-
-    #[test]
-    fn pi_relaunch_of_an_unwritten_pin_uses_the_creating_flag() {
-        let inst = tool_instance("pi", "/tmp/pi-pinned");
-
-        let minted = Some("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa");
-        for (label, pinnable, sid, explicit, expected) in [
-            ("minted, pinnable", true, minted, false, false),
-            ("minted, old binary", false, minted, true, true),
-            ("user-pinned partial", true, Some("aaaaaaaa"), true, true),
-            ("user-pinned full uuid", true, minted, true, true),
-            ("no id", false, None, false, false),
-        ] {
             assert_eq!(
-                inst.resume_flag_arm_is_existing(None, sid.is_some(), pinnable, sid, explicit),
-                expected,
-                "{label}"
+                inst.pi_resumable_transcript(),
+                None,
+                "no path published yet"
             );
-        }
 
-        let claude = tool_instance("claude", "/tmp/pi-pinned");
-        assert!(claude.resume_flag_arm_is_existing(None, true, true, minted, false));
-        assert!(!claude.pi_session_id_pinnable());
+            inst.pi_session_path = Some(mine.to_string_lossy().to_string());
+            assert_eq!(
+                inst.pi_resumable_transcript().as_deref(),
+                Some(mine.to_string_lossy().as_ref()),
+                "the pane's own transcript resumes by path"
+            );
+
+            inst.pi_session_path = Some(theirs.to_string_lossy().to_string());
+            assert_eq!(
+                inst.pi_resumable_transcript(),
+                None,
+                "a path for another conversation must not be resumed"
+            );
+
+            inst.agent_session_id = Some("aaaaaaaa".to_string());
+            inst.pi_session_path = Some(mine.to_string_lossy().to_string());
+            assert_eq!(inst.pi_resumable_transcript(), None, "partial pin");
+            inst.agent_session_id = Some(id.to_string());
+
+            inst.pi_session_path = Some(
+                temp.path()
+                    .join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl.gone"))
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            assert_eq!(inst.pi_resumable_transcript(), None, "the file must exist");
+        }
+        {
+            let inst = tool_instance("pi", "/tmp/pi-pinned");
+
+            let minted = Some("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa");
+            for (label, pinnable, sid, explicit, expected) in [
+                ("minted, pinnable", true, minted, false, false),
+                ("minted, old binary", false, minted, true, true),
+                ("user-pinned partial", true, Some("aaaaaaaa"), true, true),
+                ("user-pinned full uuid", true, minted, true, true),
+                ("no id", false, None, false, false),
+            ] {
+                assert_eq!(
+                    inst.resume_flag_arm_is_existing(None, sid.is_some(), pinnable, sid, explicit),
+                    expected,
+                    "{label}"
+                );
+            }
+
+            let claude = tool_instance("claude", "/tmp/pi-pinned");
+            assert!(claude.resume_flag_arm_is_existing(None, true, true, minted, false));
+            assert!(!claude.pi_session_id_pinnable());
+        }
     }
 }

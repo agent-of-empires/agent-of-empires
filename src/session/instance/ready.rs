@@ -130,79 +130,79 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ensure_pane_ready_refuses_before_reaching_tmux() {
-        // (status, structured view, expected refusal)
-        let cases = [
-            (
-                Status::Creating,
-                false,
-                EnsureReadyError::Transient(Status::Creating),
-            ),
-            (
-                Status::Deleting,
-                false,
-                EnsureReadyError::Transient(Status::Deleting),
-            ),
-            (Status::Idle, true, EnsureReadyError::StructuredView),
-        ];
-        for (status, structured, want) in cases {
-            let mut inst = Instance::new("test", "/tmp/test");
-            inst.status = status;
-            if structured {
-                inst.view = View::Structured;
-            }
-            let error = inst.ensure_pane_ready().unwrap_err();
-            assert_eq!(format!("{error:?}"), format!("{want:?}"));
-        }
-    }
-
-    /// Real-tmux integration: an alive pane yields AlreadyAlive with no
-    /// status/start_time mutations. Skipped if tmux isn't installed.
-    // Serialized: this test creates and kills a real tmux session.
-    #[test]
     #[serial_test::serial]
-    fn test_ensure_pane_ready_alive_pane_is_noop() {
-        if crate::tmux::tmux_command().arg("-V").output().is_err() {
-            eprintln!("tmux not available; skipping");
-            return;
+    fn ensure_pane_ready_refuses_bad_ids_and_leaves_live_panes_alone() {
+        {
+            // (status, structured view, expected refusal)
+            let cases = [
+                (
+                    Status::Creating,
+                    false,
+                    EnsureReadyError::Transient(Status::Creating),
+                ),
+                (
+                    Status::Deleting,
+                    false,
+                    EnsureReadyError::Transient(Status::Deleting),
+                ),
+                (Status::Idle, true, EnsureReadyError::StructuredView),
+            ];
+            for (status, structured, want) in cases {
+                let mut inst = Instance::new("test", "/tmp/test");
+                inst.status = status;
+                if structured {
+                    inst.view = View::Structured;
+                }
+                let error = inst.ensure_pane_ready().unwrap_err();
+                assert_eq!(format!("{error:?}"), format!("{want:?}"));
+            }
         }
+        // Real-tmux integration: an alive pane yields AlreadyAlive with no
+        // status/start_time mutations. Skipped if tmux isn't installed.
+        // Serialized: this test creates and kills a real tmux session.
+        {
+            if crate::tmux::tmux_command().arg("-V").output().is_err() {
+                eprintln!("tmux not available; skipping");
+                return;
+            }
 
-        let mut inst = Instance::new("ensure_alive_test", "/tmp/test");
-        let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", &tmux_name])
-            .output();
-        let created = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &tmux_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep",
-                "60",
-            ])
-            .status();
-        if !created.map(|s| s.success()).unwrap_or(false) {
-            eprintln!("tmux new-session failed; skipping");
-            return;
+            let mut inst = Instance::new("ensure_alive_test", "/tmp/test");
+            let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+            let created = crate::tmux::tmux_command()
+                .args([
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &tmux_name,
+                    "-x",
+                    "80",
+                    "-y",
+                    "24",
+                    "sleep",
+                    "60",
+                ])
+                .status();
+            if !created.map(|s| s.success()).unwrap_or(false) {
+                eprintln!("tmux new-session failed; skipping");
+                return;
+            }
+            crate::tmux::refresh_session_cache();
+
+            inst.status = Status::Running;
+            let prev_start = inst.last_start_time;
+            let prev_status = inst.status;
+
+            let outcome = inst.ensure_pane_ready().expect("ensure_pane_ready ok");
+            assert_eq!(outcome, EnsureReadyOutcome::AlreadyAlive);
+            assert_eq!(inst.last_start_time, prev_start);
+            assert_eq!(inst.status, prev_status);
+
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
         }
-        crate::tmux::refresh_session_cache();
-
-        inst.status = Status::Running;
-        let prev_start = inst.last_start_time;
-        let prev_status = inst.status;
-
-        let outcome = inst.ensure_pane_ready().expect("ensure_pane_ready ok");
-        assert_eq!(outcome, EnsureReadyOutcome::AlreadyAlive);
-        assert_eq!(inst.last_start_time, prev_start);
-        assert_eq!(inst.status, prev_status);
-
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", &tmux_name])
-            .output();
     }
 }

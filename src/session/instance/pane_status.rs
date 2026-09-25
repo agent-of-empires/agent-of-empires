@@ -269,94 +269,94 @@ mod tests {
     }
 
     #[test]
-    fn pane_agent_content_ignores_bare_shells_and_substring_matches() {
-        let many_lines = (0..10)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        // A verbose MOTD is still a bare shell, even past the line-count threshold.
-        let motd_then_prompt = "Welcome to Ubuntu 22.04 LTS\n\
-            System load:  0.5\n\
-            Memory usage: 42%\n\
-            Disk usage:   67%\n\
-            Swap usage:   0%\n\
-            Temperature:  45C\n\
-            2 updates available\n\
-            user@host:~$ ";
-        let cases: &[(&str, &str, bool)] = &[
-            ("$ ", "opencode", false),
-            ("user@host:~$ ", "opencode", false),
-            ("\n\n$ \n", "opencode", false),
-            ("", "opencode", false),
-            ("   \n  \n  ", "opencode", false),
-            (AGENT_UI, "opencode", true),
-            (&many_lines, "vibe", true),
-            (motd_then_prompt, "opencode", false),
-            (
-                "line1\nline2\nline3\nline4\nline5\nline6\n# ",
-                "opencode",
-                false,
-            ),
-            (
-                "line1\nline2\nline3\nline4\nline5\nline6\n\u{276f}",
-                "opencode",
-                false,
-            ),
-            // A short tool name matches a word, not any substring that contains it.
-            ("api endpoint ready", "pi", false),
-            ("pipeline started", "pi", false),
-            ("pi file saved", "pi", true),
-            ("done\npi>", "pi", true),
-            ("OpenCode v1.0", "opencode", true),
-            // Agents are also recognized by their binary alias.
-            ("agy ready", "antigravity", true),
-        ];
-        for (content, tool, want) in cases {
-            assert_eq!(
-                pane_has_agent_content(content, tool),
-                *want,
-                "{tool}: {content:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn detected_status_resolves_dead_panes_and_untrusted_shell_commands() {
-        const BARE: &str = "Welcome\nuser@host:~$ ";
-        // (detected, is_dead, is_shell_stale, has_command_override, pane, want)
-        let cases: &[(Status, bool, bool, bool, &str, Status)] = &[
-            // A stale shell keeps Idle only while the agent UI is still on screen.
-            (Status::Idle, false, true, false, AGENT_UI, Status::Idle),
-            (Status::Idle, false, true, false, BARE, Status::Error),
-            (Status::Waiting, false, true, false, BARE, Status::Error),
-            (
-                Status::Idle,
-                false,
-                true,
-                false,
-                "Restoring...",
-                Status::Unknown,
-            ),
-            (Status::Idle, false, true, false, "", Status::Unknown),
-            (Status::Idle, true, false, false, "", Status::Error),
-            (Status::Idle, true, true, true, "", Status::Error),
-            // A wrapped agent still rendering its TUI keeps Idle so status hooks fire.
-            (Status::Idle, false, true, true, "$ ", Status::Unknown),
-            (Status::Idle, false, false, true, AGENT_UI, Status::Idle),
-        ];
-        for (detected, is_dead, is_shell_stale, has_override, pane, want) in cases {
-            assert_eq!(
-                resolve_detected_status(
-                    *detected,
-                    *is_dead,
-                    *is_shell_stale,
-                    *has_override,
-                    pane,
+    fn pane_content_and_detected_status_ignore_shells_and_dead_panes() {
+        {
+            let many_lines = (0..10)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // A verbose MOTD is still a bare shell, even past the line-count threshold.
+            let motd_then_prompt = "Welcome to Ubuntu 22.04 LTS\n\
+                System load:  0.5\n\
+                Memory usage: 42%\n\
+                Disk usage:   67%\n\
+                Swap usage:   0%\n\
+                Temperature:  45C\n\
+                2 updates available\n\
+                user@host:~$ ";
+            let cases: &[(&str, &str, bool)] = &[
+                ("$ ", "opencode", false),
+                ("user@host:~$ ", "opencode", false),
+                ("\n\n$ \n", "opencode", false),
+                ("", "opencode", false),
+                ("   \n  \n  ", "opencode", false),
+                (AGENT_UI, "opencode", true),
+                (&many_lines, "vibe", true),
+                (motd_then_prompt, "opencode", false),
+                (
+                    "line1\nline2\nline3\nline4\nline5\nline6\n# ",
                     "opencode",
+                    false,
                 ),
-                *want,
-                "{detected:?} dead={is_dead} stale={is_shell_stale} override={has_override} {pane:?}"
-            );
+                (
+                    "line1\nline2\nline3\nline4\nline5\nline6\n\u{276f}",
+                    "opencode",
+                    false,
+                ),
+                // A short tool name matches a word, not any substring that contains it.
+                ("api endpoint ready", "pi", false),
+                ("pipeline started", "pi", false),
+                ("pi file saved", "pi", true),
+                ("done\npi>", "pi", true),
+                ("OpenCode v1.0", "opencode", true),
+                // Agents are also recognized by their binary alias.
+                ("agy ready", "antigravity", true),
+            ];
+            for (content, tool, want) in cases {
+                assert_eq!(
+                    pane_has_agent_content(content, tool),
+                    *want,
+                    "{tool}: {content:?}"
+                );
+            }
+        }
+        {
+            const BARE: &str = "Welcome\nuser@host:~$ ";
+            // (detected, is_dead, is_shell_stale, has_command_override, pane, want)
+            let cases: &[(Status, bool, bool, bool, &str, Status)] = &[
+                // A stale shell keeps Idle only while the agent UI is still on screen.
+                (Status::Idle, false, true, false, AGENT_UI, Status::Idle),
+                (Status::Idle, false, true, false, BARE, Status::Error),
+                (Status::Waiting, false, true, false, BARE, Status::Error),
+                (
+                    Status::Idle,
+                    false,
+                    true,
+                    false,
+                    "Restoring...",
+                    Status::Unknown,
+                ),
+                (Status::Idle, false, true, false, "", Status::Unknown),
+                (Status::Idle, true, false, false, "", Status::Error),
+                (Status::Idle, true, true, true, "", Status::Error),
+                // A wrapped agent still rendering its TUI keeps Idle so status hooks fire.
+                (Status::Idle, false, true, true, "$ ", Status::Unknown),
+                (Status::Idle, false, false, true, AGENT_UI, Status::Idle),
+            ];
+            for (detected, is_dead, is_shell_stale, has_override, pane, want) in cases {
+                assert_eq!(
+                    resolve_detected_status(
+                        *detected,
+                        *is_dead,
+                        *is_shell_stale,
+                        *has_override,
+                        pane,
+                        "opencode",
+                    ),
+                    *want,
+                    "{detected:?} dead={is_dead} stale={is_shell_stale} override={has_override} {pane:?}"
+                );
+            }
         }
     }
 }

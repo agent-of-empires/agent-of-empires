@@ -494,51 +494,126 @@ mod tests {
 
     #[test]
     #[serial]
-    fn persist_session_to_storage_is_cas_guarded() {
-        for (prior, expected, disk) in [
-            (Some("old"), SidWrite::Applied, "new"),
-            (Some("stale"), SidWrite::Skipped, "old"),
-        ] {
-            let profile = "cas-persist";
-            let mut inst = make_inst(profile, "title");
-            inst.agent_session_id = Some("old".to_string());
-            let (_temp, _home, _) = seeded(profile, &[&inst]);
-            let write = persist_session_to_storage(
+    fn persist_session_to_storage_is_cas_guarded_and_writes_absent_sids() {
+        {
+            for (prior, expected, disk) in [
+                (Some("old"), SidWrite::Applied, "new"),
+                (Some("stale"), SidWrite::Skipped, "old"),
+            ] {
+                let profile = "cas-persist";
+                let mut inst = make_inst(profile, "title");
+                inst.agent_session_id = Some("old".to_string());
+                let (_temp, _home, _) = seeded(profile, &[&inst]);
+                let write = persist_session_to_storage(
+                    profile,
+                    &inst.id,
+                    &observation("new"),
+                    &expected_state(prior, ResumeIntent::Default),
+                    &FileWatchService::noop(),
+                );
+                assert_eq!(write, expected);
+                assert_eq!(disk_sid(profile, &inst.id).as_deref(), Some(disk));
+            }
+        }
+        {
+            let temp = tempdir().unwrap();
+            let profile = "persist-none-sid";
+            let storage = Storage::new_for_test_path(
                 profile,
-                &inst.id,
-                &observation("new"),
-                &expected_state(prior, ResumeIntent::Default),
-                &FileWatchService::noop(),
+                temp.path()
+                    .join("profiles")
+                    .join(profile)
+                    .join("sessions.json"),
             );
-            assert_eq!(write, expected);
-            assert_eq!(disk_sid(profile, &inst.id).as_deref(), Some(disk));
+            let mut inst = make_inst(profile, "title");
+            let on_disk = inst.clone();
+            storage
+                .update(|i, g| {
+                    *i = vec![on_disk.clone()];
+                    *g = GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
+                        .get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            let outcome = inst.persist_session_id_with_storage(
+                &storage,
+                &expected_state(None, ResumeIntent::Default),
+            );
+            assert_eq!(outcome, SidPersistOutcome::Published);
+            let loaded = storage.load().unwrap();
+            assert_eq!(
+                (loaded.len(), loaded[0].agent_session_id.clone()),
+                (1, None)
+            );
+            assert_eq!(loaded[0].resume_intent, ResumeIntent::Default);
         }
     }
 
     #[test]
     #[serial]
-    fn captured_foreign_sid_cannot_replace_a_pinned_conversation() {
-        const OTHER_SID: &str = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
-        let profile = "capture-pinned-foreign";
-        let mut inst = make_inst(profile, "pinned");
-        inst.agent_session_id = Some(VALID_SID.into());
-        inst.resume_intent = ResumeIntent::Use(VALID_SID.into());
-        let (_temp, _home, storage) = seeded(profile, &[&inst]);
-        let expected = inst.conversation_state();
+    fn pinned_conversation_rejects_foreign_capture_and_keeps_a_peer_repin() {
+        {
+            const OTHER_SID: &str = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
+            let profile = "capture-pinned-foreign";
+            let mut inst = make_inst(profile, "pinned");
+            inst.agent_session_id = Some(VALID_SID.into());
+            inst.resume_intent = ResumeIntent::Use(VALID_SID.into());
+            let (_temp, _home, storage) = seeded(profile, &[&inst]);
+            let expected = inst.conversation_state();
 
-        assert_eq!(
-            persist_session_with_storage(&storage, &inst.id, &observation(OTHER_SID), &expected),
-            SidWrite::PinnedForeign
-        );
-        let disk = storage.load().unwrap();
-        assert_eq!(disk[0].agent_session_id.as_deref(), Some(VALID_SID));
-        assert_eq!(disk[0].resume_intent, ResumeIntent::Use(VALID_SID.into()));
+            assert_eq!(
+                persist_session_with_storage(
+                    &storage,
+                    &inst.id,
+                    &observation(OTHER_SID),
+                    &expected
+                ),
+                SidWrite::PinnedForeign
+            );
+            let disk = storage.load().unwrap();
+            assert_eq!(disk[0].agent_session_id.as_deref(), Some(VALID_SID));
+            assert_eq!(disk[0].resume_intent, ResumeIntent::Use(VALID_SID.into()));
 
-        assert_eq!(
-            persist_session_with_storage(&storage, &inst.id, &observation(VALID_SID), &expected),
-            SidWrite::Applied,
-            "the pin must still accept its own conversation"
-        );
+            assert_eq!(
+                persist_session_with_storage(
+                    &storage,
+                    &inst.id,
+                    &observation(VALID_SID),
+                    &expected
+                ),
+                SidWrite::Applied,
+                "the pin must still accept its own conversation"
+            );
+        }
+        {
+            const PEER_SID: &str = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
+            let profile = "finalize-peer-repin";
+            let mut inst = make_inst(profile, "pinned Claude");
+            inst.tool = "claude".into();
+            inst.agent_session_id = Some(VALID_SID.into());
+            inst.resume_intent = ResumeIntent::Use(VALID_SID.into());
+            let (_temp, _home, storage) = seeded(profile, &[&inst]);
+            let expected = inst.conversation_state();
+
+            // A peer changes only the intent while this launch is in flight. A
+            // SID-only CAS would consume the peer's new pin as if this launch won.
+            storage
+                .update(|instances, _| {
+                    instances[0].resume_intent = ResumeIntent::Use(PEER_SID.into());
+                    Ok(())
+                })
+                .unwrap();
+            inst.identity_publisher_launched = true;
+            assert_eq!(
+                inst.persist_session_id_with_storage(&storage, &expected),
+                SidPersistOutcome::Published
+            );
+            let disk = storage.load().unwrap();
+            assert_eq!(disk[0].resume_intent, ResumeIntent::Use(PEER_SID.into()));
+            assert_eq!(inst.resume_intent, disk[0].resume_intent);
+            assert_eq!(inst.agent_session_id, disk[0].agent_session_id);
+        }
     }
 
     #[test]
@@ -802,73 +877,6 @@ mod tests {
         );
     }
 
-    #[test]
-    #[serial]
-    fn persist_session_id_writes_none_atomically_when_sid_absent() {
-        let temp = tempdir().unwrap();
-        let profile = "persist-none-sid";
-        let storage = Storage::new_for_test_path(
-            profile,
-            temp.path()
-                .join("profiles")
-                .join(profile)
-                .join("sessions.json"),
-        );
-        let mut inst = make_inst(profile, "title");
-        let on_disk = inst.clone();
-        storage
-            .update(|i, g| {
-                *i = vec![on_disk.clone()];
-                *g = GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
-                    .get_all_groups();
-                Ok(())
-            })
-            .unwrap();
-
-        let outcome = inst.persist_session_id_with_storage(
-            &storage,
-            &expected_state(None, ResumeIntent::Default),
-        );
-        assert_eq!(outcome, SidPersistOutcome::Published);
-        let loaded = storage.load().unwrap();
-        assert_eq!(
-            (loaded.len(), loaded[0].agent_session_id.clone()),
-            (1, None)
-        );
-        assert_eq!(loaded[0].resume_intent, ResumeIntent::Default);
-    }
-
-    #[test]
-    #[serial]
-    fn finalize_cas_loss_preserves_peer_repin_instead_of_promoting_it() {
-        const PEER_SID: &str = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
-        let profile = "finalize-peer-repin";
-        let mut inst = make_inst(profile, "pinned Claude");
-        inst.tool = "claude".into();
-        inst.agent_session_id = Some(VALID_SID.into());
-        inst.resume_intent = ResumeIntent::Use(VALID_SID.into());
-        let (_temp, _home, storage) = seeded(profile, &[&inst]);
-        let expected = inst.conversation_state();
-
-        // A peer changes only the intent while this launch is in flight. A
-        // SID-only CAS would consume the peer's new pin as if this launch won.
-        storage
-            .update(|instances, _| {
-                instances[0].resume_intent = ResumeIntent::Use(PEER_SID.into());
-                Ok(())
-            })
-            .unwrap();
-        inst.identity_publisher_launched = true;
-        assert_eq!(
-            inst.persist_session_id_with_storage(&storage, &expected),
-            SidPersistOutcome::Published
-        );
-        let disk = storage.load().unwrap();
-        assert_eq!(disk[0].resume_intent, ResumeIntent::Use(PEER_SID.into()));
-        assert_eq!(inst.resume_intent, disk[0].resume_intent);
-        assert_eq!(inst.agent_session_id, disk[0].agent_session_id);
-    }
-
     /// Store routing is not conversation identity: a pinned conversation is still captured
     /// when its launch exports a default store the pin was recorded without (#4119).
     #[test]
@@ -1033,65 +1041,64 @@ mod tests {
 
         #[test]
         #[serial]
-        fn omp_launch_without_capture_plan_publishes_tombstone_generation() {
-            let temp = tempdir().unwrap();
-            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-            let profile = "omp-plan-failure-tombstone";
-            let old_generation = "omp-old-generation";
-            let mut inst = omp_inst(profile, "omp-plan-failure");
-            inst.omp_capture_generation = Some(old_generation.to_string());
-            seed(profile, &[&inst]);
+        fn omp_publication_tombstones_planless_launches_and_flushes_without_tmux() {
+            {
+                let temp = tempdir().unwrap();
+                let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+                let profile = "omp-plan-failure-tombstone";
+                let old_generation = "omp-old-generation";
+                let mut inst = omp_inst(profile, "omp-plan-failure");
+                inst.omp_capture_generation = Some(old_generation.to_string());
+                seed(profile, &[&inst]);
 
-            assert!(inst.publish_omp_launch_generation(profile, None, Some(old_generation)));
-            let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
-            assert!(disk[0].omp_capture_generation.is_some());
-            assert_eq!(disk[0].omp_capture_generation, inst.omp_capture_generation);
-            assert_ne!(
-                disk[0].omp_capture_generation.as_deref(),
-                Some(old_generation)
-            );
-            assert_eq!(
-                persist_session_to_storage(
-                    profile,
-                    &inst.id,
-                    &crate::session::poller::SessionIdObservation::omp(
-                        "019342ab-1234-7def-8901-abcdef012349".into(),
-                        old_generation.into(),
+                assert!(inst.publish_omp_launch_generation(profile, None, Some(old_generation)));
+                let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
+                assert!(disk[0].omp_capture_generation.is_some());
+                assert_eq!(disk[0].omp_capture_generation, inst.omp_capture_generation);
+                assert_ne!(
+                    disk[0].omp_capture_generation.as_deref(),
+                    Some(old_generation)
+                );
+                assert_eq!(
+                    persist_session_to_storage(
+                        profile,
+                        &inst.id,
+                        &crate::session::poller::SessionIdObservation::omp(
+                            "019342ab-1234-7def-8901-abcdef012349".into(),
+                            old_generation.into(),
+                        ),
+                        &inst.conversation_state(),
+                        &FileWatchService::noop(),
                     ),
-                    &inst.conversation_state(),
-                    &FileWatchService::noop(),
-                ),
-                SidWrite::Skipped
-            );
-        }
+                    SidWrite::Skipped
+                );
+            }
+            {
+                let temp = tempdir().unwrap();
+                let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+                let profile = "omp-restart-final-flush";
+                let generation = "omp-restart-generation";
+                let sid = "019342ab-1234-7def-8901-abcdef012348";
+                let mut inst = omp_inst(profile, "omp-restart-flush");
+                inst.omp_capture_generation = Some(generation.to_string());
+                inst.status = Status::Stopped;
+                seed(profile, &[&inst]);
 
-        #[test]
-        #[serial]
-        fn stopped_poller_flush_persists_newest_omp_observation_without_tmux() {
-            let temp = tempdir().unwrap();
-            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-            let profile = "omp-restart-final-flush";
-            let generation = "omp-restart-generation";
-            let sid = "019342ab-1234-7def-8901-abcdef012348";
-            let mut inst = omp_inst(profile, "omp-restart-flush");
-            inst.omp_capture_generation = Some(generation.to_string());
-            inst.status = Status::Stopped;
-            seed(profile, &[&inst]);
+                let poller = crate::session::poller::SessionPoller::new("unused-tmux".to_string());
+                poller.inject_test_observation(
+                    &inst.id,
+                    crate::session::poller::SessionIdObservation::omp(
+                        sid.to_owned(),
+                        generation.to_owned(),
+                    ),
+                );
+                inst.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
+                inst.stop_and_flush_poller();
 
-            let poller = crate::session::poller::SessionPoller::new("unused-tmux".to_string());
-            poller.inject_test_observation(
-                &inst.id,
-                crate::session::poller::SessionIdObservation::omp(
-                    sid.to_owned(),
-                    generation.to_owned(),
-                ),
-            );
-            inst.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
-            inst.stop_and_flush_poller();
-
-            assert!(inst.session_id_poller.is_none());
-            assert_eq!(inst.agent_session_id.as_deref(), Some(sid));
-            assert_eq!(disk_sid(profile, &inst.id).as_deref(), Some(sid));
+                assert!(inst.session_id_poller.is_none());
+                assert_eq!(inst.agent_session_id.as_deref(), Some(sid));
+                assert_eq!(disk_sid(profile, &inst.id).as_deref(), Some(sid));
+            }
         }
 
         #[test]
@@ -1131,137 +1138,136 @@ mod tests {
 
         #[test]
         #[serial]
-        fn finalize_publish_applied_writes_omp_metadata() {
-            if no_tmux() {
-                return;
-            }
-            let temp = tempdir().unwrap();
-            let _home_guard = crate::session::test_support::isolate_home(temp.path());
+        fn finalize_publish_writes_omp_metadata_and_backfills_only_generationless_panes() {
+            {
+                if no_tmux() {
+                    return;
+                }
+                let temp = tempdir().unwrap();
+                let _home_guard = crate::session::test_support::isolate_home(temp.path());
 
-            let profile = "publish-applied";
-            let mut inst = omp_inst(profile, "fpaw");
-            inst.pending_host_env = vec![
-                ("OMP_PROFILE".to_string(), "work".to_string()),
-                ("PI_CONFIG_DIR".to_string(), "/custom".to_string()),
-            ];
-            let context = crate::session::capture::resolve_omp_store_layout_with_environment(
-                std::collections::HashMap::from([
-                    ("HOME".into(), temp.path().display().to_string()),
-                    ("OMP_PROFILE".into(), "work".into()),
-                    ("PI_CONFIG_DIR".into(), "/custom".into()),
-                ]),
-                &inst.project_path,
-                &inst.omp_capture_options().unwrap(),
-            )
-            .unwrap();
-            let plan = inst
-                .resolve_omp_capture_plan(&context, None)
-                .expect("OMP launch plan");
-            let expected_layout = plan.layout.clone();
-            seed(profile, &[&inst]);
-
-            let tmux = TmuxSession::create(&inst.id, &inst.title);
-            // Config drift after the snapshot: finalize publishes the transported plan.
-            inst.pending_host_env = vec![(
-                "PI_CODING_AGENT_SESSION_DIR".to_string(),
-                "/must-not-be-reread".to_string(),
-            )];
-            inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(
-                tmux.name(),
-                profile,
-                &ConversationState {
-                    session_id: None.map(str::to_owned),
-                    intent: ResumeIntent::Default,
-                    ..inst.conversation_state()
-                },
-                Some(crate::session::capture::OmpCaptureMetadata {
-                    layout: plan.layout,
-                    launched_at_ms: 1000,
-                    launch_id: plan.launch_id.clone(),
-                    launch_marker: plan.launch_marker.clone(),
-                    routing_fingerprint: plan.routing_fingerprint.clone(),
-                    container_runtime: plan.container_runtime,
-                }),
-                false,
-            )
-            .unwrap();
-
-            assert_eq!(captured_env(tmux.name()).as_deref(), Some(VALID_SID));
-            let metadata: crate::session::capture::OmpCaptureMetadata = serde_json::from_str(
-                &hidden_env(tmux.name(), crate::tmux::env::AOE_OMP_CAPTURE_META_KEY)
-                    .expect("typed OMP capture metadata must survive poller reconstruction"),
-            )
-            .unwrap();
-            assert_eq!(metadata.launched_at_ms, 1000);
-            assert_eq!(metadata.layout, expected_layout);
-            assert!(metadata.layout.sessions.is_absolute());
-            assert!(metadata.layout.terminal_sessions.is_absolute());
-            assert!(metadata.layout.managed_sessions.is_absolute());
-            assert_eq!(metadata.launch_id, plan.launch_id);
-        }
-
-        #[test]
-        #[serial]
-        fn only_a_generationless_omp_pane_backfills_legacy_metadata() {
-            if no_tmux() {
-                return;
-            }
-            let temp = tempdir().unwrap();
-            let _home_guard = crate::session::test_support::isolate_home(temp.path());
-
-            let mut inst = omp_inst("omp-legacy-metadata", "legacy-omp");
-            inst.agent_session_id = Some(VALID_SID.to_string());
-            let tmux = TmuxSession::create(&inst.id, &inst.title);
-            let meta_key = crate::tmux::env::AOE_OMP_CAPTURE_META_KEY;
-            assert!(hidden_env(tmux.name(), meta_key).is_none());
-
-            let expected_launch = crate::tmux::Session::from_name(tmux.name())
-                .created_at_ms()
+                let profile = "publish-applied";
+                let mut inst = omp_inst(profile, "fpaw");
+                inst.pending_host_env = vec![
+                    ("OMP_PROFILE".to_string(), "work".to_string()),
+                    ("PI_CONFIG_DIR".to_string(), "/custom".to_string()),
+                ];
+                let context = crate::session::capture::resolve_omp_store_layout_with_environment(
+                    std::collections::HashMap::from([
+                        ("HOME".into(), temp.path().display().to_string()),
+                        ("OMP_PROFILE".into(), "work".into()),
+                        ("PI_CONFIG_DIR".into(), "/custom".into()),
+                    ]),
+                    &inst.project_path,
+                    &inst.omp_capture_options().unwrap(),
+                )
                 .unwrap();
-            let options = inst.omp_capture_options().unwrap();
-            let metadata = inst
-                .omp_capture_metadata(tmux.name(), &options, None)
-                .expect("legacy pane should migrate");
-            assert_eq!(metadata.launched_at_ms, expected_launch);
-            assert_eq!(
-                metadata.launch_id,
-                format!("legacy-{}-{expected_launch}", inst.id)
-            );
-            assert!(metadata.layout.managed_sessions.is_absolute());
-            let persisted: crate::session::capture::OmpCaptureMetadata =
-                serde_json::from_str(&hidden_env(tmux.name(), meta_key).expect("backfilled"))
-                    .unwrap();
-            assert_eq!(
-                serde_json::to_value(persisted).unwrap(),
-                serde_json::to_value(metadata).unwrap()
-            );
-            inst.omp_capture_generation = Some("modern-generation".to_string());
-            assert!(inst
-                .omp_capture_metadata(tmux.name(), &options, None)
-                .is_none());
+                let plan = inst
+                    .resolve_omp_capture_plan(&context, None)
+                    .expect("OMP launch plan");
+                let expected_layout = plan.layout.clone();
+                seed(profile, &[&inst]);
 
-            // A current pane missing its hidden launch snapshot fails closed.
-            let mut modern = omp_inst("omp-modern-missing-metadata", "modern-omp");
-            let generation = "modern-launch-generation";
-            modern.omp_capture_generation = Some(generation.to_string());
-            let tmux = TmuxSession::create(&modern.id, &modern.title);
-            let status = crate::tmux::tmux_command()
-                .args([
-                    "set-environment",
-                    "-t",
+                let tmux = TmuxSession::create(&inst.id, &inst.title);
+                // Config drift after the snapshot: finalize publishes the transported plan.
+                inst.pending_host_env = vec![(
+                    "PI_CODING_AGENT_SESSION_DIR".to_string(),
+                    "/must-not-be-reread".to_string(),
+                )];
+                inst.agent_session_id = Some(VALID_SID.to_string());
+                inst.finalize_launch(
                     tmux.name(),
-                    crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY,
-                    generation,
-                ])
-                .status()
+                    profile,
+                    &ConversationState {
+                        session_id: None.map(str::to_owned),
+                        intent: ResumeIntent::Default,
+                        ..inst.conversation_state()
+                    },
+                    Some(crate::session::capture::OmpCaptureMetadata {
+                        layout: plan.layout,
+                        launched_at_ms: 1000,
+                        launch_id: plan.launch_id.clone(),
+                        launch_marker: plan.launch_marker.clone(),
+                        routing_fingerprint: plan.routing_fingerprint.clone(),
+                        container_runtime: plan.container_runtime,
+                    }),
+                    false,
+                )
                 .unwrap();
-            assert!(status.success());
-            let options = modern.omp_capture_options().unwrap();
-            assert!(modern
-                .omp_capture_metadata(tmux.name(), &options, None)
-                .is_none());
-            assert!(hidden_env(tmux.name(), meta_key).is_none());
+
+                assert_eq!(captured_env(tmux.name()).as_deref(), Some(VALID_SID));
+                let metadata: crate::session::capture::OmpCaptureMetadata = serde_json::from_str(
+                    &hidden_env(tmux.name(), crate::tmux::env::AOE_OMP_CAPTURE_META_KEY)
+                        .expect("typed OMP capture metadata must survive poller reconstruction"),
+                )
+                .unwrap();
+                assert_eq!(metadata.launched_at_ms, 1000);
+                assert_eq!(metadata.layout, expected_layout);
+                assert!(metadata.layout.sessions.is_absolute());
+                assert!(metadata.layout.terminal_sessions.is_absolute());
+                assert!(metadata.layout.managed_sessions.is_absolute());
+                assert_eq!(metadata.launch_id, plan.launch_id);
+            }
+            {
+                if no_tmux() {
+                    return;
+                }
+                let temp = tempdir().unwrap();
+                let _home_guard = crate::session::test_support::isolate_home(temp.path());
+
+                let mut inst = omp_inst("omp-legacy-metadata", "legacy-omp");
+                inst.agent_session_id = Some(VALID_SID.to_string());
+                let tmux = TmuxSession::create(&inst.id, &inst.title);
+                let meta_key = crate::tmux::env::AOE_OMP_CAPTURE_META_KEY;
+                assert!(hidden_env(tmux.name(), meta_key).is_none());
+
+                let expected_launch = crate::tmux::Session::from_name(tmux.name())
+                    .created_at_ms()
+                    .unwrap();
+                let options = inst.omp_capture_options().unwrap();
+                let metadata = inst
+                    .omp_capture_metadata(tmux.name(), &options, None)
+                    .expect("legacy pane should migrate");
+                assert_eq!(metadata.launched_at_ms, expected_launch);
+                assert_eq!(
+                    metadata.launch_id,
+                    format!("legacy-{}-{expected_launch}", inst.id)
+                );
+                assert!(metadata.layout.managed_sessions.is_absolute());
+                let persisted: crate::session::capture::OmpCaptureMetadata =
+                    serde_json::from_str(&hidden_env(tmux.name(), meta_key).expect("backfilled"))
+                        .unwrap();
+                assert_eq!(
+                    serde_json::to_value(persisted).unwrap(),
+                    serde_json::to_value(metadata).unwrap()
+                );
+                inst.omp_capture_generation = Some("modern-generation".to_string());
+                assert!(inst
+                    .omp_capture_metadata(tmux.name(), &options, None)
+                    .is_none());
+
+                // A current pane missing its hidden launch snapshot fails closed.
+                let mut modern = omp_inst("omp-modern-missing-metadata", "modern-omp");
+                let generation = "modern-launch-generation";
+                modern.omp_capture_generation = Some(generation.to_string());
+                let tmux = TmuxSession::create(&modern.id, &modern.title);
+                let status = crate::tmux::tmux_command()
+                    .args([
+                        "set-environment",
+                        "-t",
+                        tmux.name(),
+                        crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY,
+                        generation,
+                    ])
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+                let options = modern.omp_capture_options().unwrap();
+                assert!(modern
+                    .omp_capture_metadata(tmux.name(), &options, None)
+                    .is_none());
+                assert!(hidden_env(tmux.name(), meta_key).is_none());
+            }
         }
 
         #[test]

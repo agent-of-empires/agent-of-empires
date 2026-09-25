@@ -586,68 +586,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hook_mount_source_is_restored_for_agent_without_hooks() {
-        let mut inst = Instance::new("agent without hooks", "/tmp/test");
-        inst.id = format!("restart-hooks-{}", Uuid::new_v4().simple());
-        inst.tool = "bash".to_string();
+    fn container_launch_restores_hook_mounts_and_pins_the_workdir() {
+        {
+            let mut inst = Instance::new("agent without hooks", "/tmp/test");
+            inst.id = format!("restart-hooks-{}", Uuid::new_v4().simple());
+            inst.tool = "bash".to_string();
 
-        let hook_dir = crate::hooks::ensure_instance_dir_path(&inst.id).unwrap();
-        crate::hooks::cleanup_hook_status_dir(&inst.id);
-        assert!(!hook_dir.exists());
+            let hook_dir = crate::hooks::ensure_instance_dir_path(&inst.id).unwrap();
+            crate::hooks::cleanup_hook_status_dir(&inst.id);
+            assert!(!hook_dir.exists());
 
-        inst.ensure_container_hook_mount_source();
-        assert!(hook_dir.is_dir());
+            inst.ensure_container_hook_mount_source();
+            assert!(hook_dir.is_dir());
 
-        crate::hooks::cleanup_hook_status_dir(&inst.id);
-    }
+            crate::hooks::cleanup_hook_status_dir(&inst.id);
+        }
+        // Regression for issue #2414: a sandboxed worktree session's
+        // `container_workdir()` must stay pinned to what the container was created
+        // with, even after the host worktree's git linkage breaks.
+        // When the worktree's admin entry under `<main>/.git/worktrees/<name>` is
+        // pruned, the `.git` file's gitdir no longer resolves, `compute_volume_paths`
+        // can't find the main repo, and it silently collapses to
+        // `/workspace/<basename>` (a path the container never mounted), so a
+        // `docker exec -w` dies with `chdir to cwd ... no such file or directory`.
+        // The create-time-pinned `SandboxInfo::container_workdir` defends against
+        // that drift.
+        {
+            use tempfile::TempDir;
+            let root = TempDir::new().unwrap();
+            // An orphaned worktree: a `.git` file whose gitdir points nowhere,
+            // exactly the state a pruned admin entry leaves behind.
+            let worktree = root.path().join("myrepo-worktrees").join("contexec");
+            std::fs::create_dir_all(&worktree).unwrap();
+            std::fs::write(
+                worktree.join(".git"),
+                "gitdir: ../../does-not-exist/.git/worktrees/contexec\n",
+            )
+            .unwrap();
 
-    /// Regression for issue #2414: a sandboxed worktree session's
-    /// `container_workdir()` must stay pinned to what the container was created
-    /// with, even after the host worktree's git linkage breaks.
-    ///
-    /// When the worktree's admin entry under `<main>/.git/worktrees/<name>` is
-    /// pruned, the `.git` file's gitdir no longer resolves, `compute_volume_paths`
-    /// can't find the main repo, and it silently collapses to
-    /// `/workspace/<basename>` (a path the container never mounted), so a
-    /// `docker exec -w` dies with `chdir to cwd ... no such file or directory`.
-    /// The create-time-pinned `SandboxInfo::container_workdir` defends against
-    /// that drift.
-    #[test]
-    fn container_workdir_stays_pinned_when_worktree_linkage_breaks() {
-        use tempfile::TempDir;
-        let root = TempDir::new().unwrap();
-        // An orphaned worktree: a `.git` file whose gitdir points nowhere,
-        // exactly the state a pruned admin entry leaves behind.
-        let worktree = root.path().join("myrepo-worktrees").join("contexec");
-        std::fs::create_dir_all(&worktree).unwrap();
-        std::fs::write(
-            worktree.join(".git"),
-            "gitdir: ../../does-not-exist/.git/worktrees/contexec\n",
-        )
-        .unwrap();
+            let mut inst = Instance::new("contexec", worktree.to_str().unwrap());
+            inst.sandbox_info = Some(SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "img".to_string(),
+                container_name: "aoe-sandbox-test".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            });
 
-        let mut inst = Instance::new("contexec", worktree.to_str().unwrap());
-        inst.sandbox_info = Some(SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "img".to_string(),
-            container_name: "aoe-sandbox-test".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        });
+            // Bug reproduction: with nothing pinned, the live recompute can't resolve
+            // the orphaned worktree and falls back to the basename. This is the path
+            // that produced the `chdir to cwd ("/workspace/contexec")` failure.
+            assert_eq!(inst.container_workdir(), "/workspace/contexec");
 
-        // Bug reproduction: with nothing pinned, the live recompute can't resolve
-        // the orphaned worktree and falls back to the basename. This is the path
-        // that produced the `chdir to cwd ("/workspace/contexec")` failure.
-        assert_eq!(inst.container_workdir(), "/workspace/contexec");
-
-        // Fix: the value the container was actually built with is returned
-        // verbatim, so the exec targets a path that exists in the container.
-        let pinned = "/workspace/myrepo-worktrees/contexec".to_string();
-        inst.sandbox_info.as_mut().unwrap().container_workdir = Some(pinned.clone());
-        assert_eq!(inst.container_workdir(), pinned);
+            // Fix: the value the container was actually built with is returned
+            // verbatim, so the exec targets a path that exists in the container.
+            let pinned = "/workspace/myrepo-worktrees/contexec".to_string();
+            inst.sandbox_info.as_mut().unwrap().container_workdir = Some(pinned.clone());
+            assert_eq!(inst.container_workdir(), pinned);
+        }
     }
 
     #[test]

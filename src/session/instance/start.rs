@@ -559,36 +559,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn start_with_size_opts_returns_skipped_for_structured() {
-        let mut inst = Instance::new("Test", "/tmp/test");
-        inst.view = View::Structured;
-        let outcome = inst.start_with_size_opts(None, false).unwrap();
-        assert_eq!(outcome, LaunchSidOutcome::Skipped);
+    fn start_with_size_opts_skips_structured_and_rejects_tampered_ids() {
+        {
+            let mut inst = Instance::new("Test", "/tmp/test");
+            inst.view = View::Structured;
+            let outcome = inst.start_with_size_opts(None, false).unwrap();
+            assert_eq!(outcome, LaunchSidOutcome::Skipped);
+        }
+        {
+            for poisoned in ["; rm -rf $HOME #", "../etc", ""] {
+                let mut instance = instance_with_id(poisoned);
+                let result = instance.start_with_size_opts(None, false);
+                let err = match result {
+                    Ok(_) => panic!("must refuse tampered id at launch (id={poisoned:?})"),
+                    Err(e) => e,
+                };
+                assert!(
+                    err.to_string().contains("AOE_INSTANCE_ID"),
+                    "error must surface validator failure for id={poisoned:?}, got: {err}"
+                );
+                assert!(
+                    !instance.tmux_session().map(|s| s.exists()).unwrap_or(false),
+                    "no tmux session must exist after refusal for id={poisoned:?}"
+                );
+            }
+        }
     }
 
     fn instance_with_id(id: &str) -> Instance {
         let mut inst = Instance::new("tampered-id-test", "/tmp");
         inst.id = id.to_string();
         inst
-    }
-
-    #[test]
-    fn start_with_size_opts_rejects_tampered_instance_id() {
-        for poisoned in ["; rm -rf $HOME #", "../etc", ""] {
-            let mut instance = instance_with_id(poisoned);
-            let result = instance.start_with_size_opts(None, false);
-            let err = match result {
-                Ok(_) => panic!("must refuse tampered id at launch (id={poisoned:?})"),
-                Err(e) => e,
-            };
-            assert!(
-                err.to_string().contains("AOE_INSTANCE_ID"),
-                "error must surface validator failure for id={poisoned:?}, got: {err}"
-            );
-            assert!(
-                !instance.tmux_session().map(|s| s.exists()).unwrap_or(false),
-                "no tmux session must exist after refusal for id={poisoned:?}"
-            );
-        }
     }
 }
