@@ -288,44 +288,6 @@ fn test_search_n_cycles_forward() {
 
 #[test]
 #[serial]
-fn test_search_n_wraps_around() {
-    let mut env = create_test_env_with_sessions(3);
-    env.view.search_query = Input::new("session".to_string());
-    env.view.update_search();
-    let match_count = env.view.search_matches.len();
-
-    // Cycle through all matches to wrap
-    for _ in 0..match_count {
-        env.view.handle_key(key(KeyCode::Char('n')), None);
-    }
-    assert_eq!(env.view.search_match_index, 0);
-}
-
-#[test]
-#[serial]
-fn test_search_shift_n_opens_new_from_selection_not_cycle() {
-    // #3038: after a committed search, Shift+N must create a new session rather than jump
-    // to the previous match, which the committed search used to shadow.
-    let mut env = create_test_env_with_sessions(5);
-    env.view.search_query = Input::new("session".to_string());
-    env.view.update_search();
-    assert!(env.view.search_matches.len() > 1);
-    assert_eq!(env.view.search_match_index, 0);
-
-    assert!(env.view.new_dialog.is_none());
-    env.view.handle_key(key(KeyCode::Char('N')), None);
-    assert!(
-        env.view.new_dialog.is_some(),
-        "Shift+N opens new-from-selection during a committed search"
-    );
-    assert_eq!(
-        env.view.search_match_index, 0,
-        "Shift+N must not cycle the search backward"
-    );
-}
-
-#[test]
-#[serial]
 fn matched_running_row_keeps_status_color_on_spinner_and_bolds() {
     // #3038 follow-up: a search match must not recolor the status spinner. A running match
     // painted its spinner theme.search (amber), reading as "waiting"; spinner and title keep

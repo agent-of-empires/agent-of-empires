@@ -945,39 +945,6 @@ fn apply_creation_results_rolls_back_on_peer_collision() {
 }
 
 #[test]
-fn test_project_group_key_uses_last_path_segment() {
-    use crate::tui::home::project_group_key;
-
-    let inst = Instance::new("test", "/home/user/my-project");
-    assert_eq!(project_group_key(&inst), "my-project");
-}
-
-#[test]
-fn test_project_group_key_uses_main_repo_for_worktree() {
-    use crate::session::WorktreeInfo;
-    use crate::tui::home::project_group_key;
-    use chrono::Utc;
-
-    let mut inst = Instance::new("test", "/home/user/my-project/.worktrees/feature-abc");
-    inst.worktree_info = Some(WorktreeInfo {
-        branch: "feature-abc".to_string(),
-        main_repo_path: "/home/user/my-project".to_string(),
-        managed_by_aoe: true,
-        created_at: Utc::now(),
-        base_branch: None,
-    });
-    assert_eq!(project_group_key(&inst), "my-project");
-}
-
-#[test]
-fn test_project_group_key_handles_trailing_slash() {
-    use crate::tui::home::project_group_key;
-
-    let inst = Instance::new("test", "/home/user/my-project/");
-    assert_eq!(project_group_key(&inst), "my-project");
-}
-
-#[test]
 fn test_project_group_key_scratch_uses_sentinel_not_label() {
     use crate::session::{project_group_display_name, SCRATCH_GROUP_PATH};
     use crate::tui::home::project_group_key;

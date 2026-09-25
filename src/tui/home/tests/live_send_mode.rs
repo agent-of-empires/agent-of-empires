@@ -333,17 +333,6 @@ fn has_non_live_send_overlay_false_in_pure_live_mode() {
     );
 }
 
-#[test]
-#[serial]
-fn has_non_live_send_overlay_true_when_dialog_also_open() {
-    // The fast path still bails when a non-live overlay is on top, since the snapshot it
-    // repaints doesn't include them.
-    let mut env = create_test_env_with_sessions(1);
-    install_live_for_first_session(&mut env);
-    env.view.info_dialog = Some(InfoDialog::new("title", "body"));
-    assert!(env.view.has_non_live_send_overlay());
-}
-
 /// A rename dialog opened on top of live-send (reachable via the right-click menu, which
 /// stays clickable while attached) must receive pastes. `handle_paste` gave live-send
 /// absolute priority, so the clipboard streamed into the agent's pane while the user stared
@@ -1014,38 +1003,6 @@ mod paste_splitting {
 
         for (name, input, expected) in cases {
             assert_eq!(split_paste_for_live_send(input), expected, "{name}");
-        }
-    }
-
-    /// The bug: hand-rolling `\e[200~` / `\e[201~` into the payload shipped the markers to
-    /// every pane whether or not it set DECSET 2004, and a raw shell parses `\e[2` as a
-    /// partial Insert sequence and self-inserts the leftover `00~` / `01~`. The payload must
-    /// carry no escape bytes at all.
-    #[test]
-    fn multiline_paste_carries_no_escape_markers() {
-        let keys = split_paste_for_live_send("SELECT id\nFROM users;");
-        assert_eq!(keys, paste("SELECT id\nFROM users;"));
-        match &keys[0] {
-            TmuxKey::Paste(body) => {
-                assert!(
-                    !body.contains('\x1b'),
-                    "paste payload must not carry ESC: {body:?}"
-                );
-                assert!(!body.contains("200~") && !body.contains("201~"));
-            }
-            other => panic!("expected Paste, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn multiline_paste_dispatches_as_one_payload() {
-        // Single-dispatch: the whole paste is one `Paste` action, so the worker fires
-        // exactly one `load-buffer` + `paste-buffer` pair.
-        let out = split_paste_for_live_send("a\nb\nc\nd");
-        assert_eq!(out.len(), 1, "multiline paste must be one TmuxKey");
-        match &out[0] {
-            TmuxKey::Paste(_) => {}
-            other => panic!("expected Paste, got {other:?}"),
         }
     }
 

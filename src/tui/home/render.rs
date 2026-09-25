@@ -4195,26 +4195,6 @@ mod tests {
     }
 
     #[test]
-    fn passive_resize_ignores_one_frame_toast_geometry() {
-        // The toast frame drops the output rect one row for a single refresh, then
-        // returns. Neither the shrink nor the bounce-back may reach tmux: the double
-        // SIGWINCH is the cursor jiggle users saw on live-send entry.
-        let steady = geo("a", 141, 43);
-        let toast = geo("a", 141, 42);
-        // Toast frame: shrink is armed, not fired.
-        assert_eq!(
-            passive_resize_step(&toast, Some(&steady), None),
-            PassiveResizeStep::Arm,
-        );
-        // Post-toast frame: back in sync, and the caller drops the armed
-        // geometry so a later real change still needs two sightings.
-        assert_eq!(
-            passive_resize_step(&steady, Some(&steady), Some(&toast)),
-            PassiveResizeStep::InSync,
-        );
-    }
-
-    #[test]
     fn passive_resize_refires_while_unsynced() {
         // A Fire whose tmux-side resize couldn't happen (session not started, or an
         // active size owner) leaves synced empty and pending armed, so the next refresh

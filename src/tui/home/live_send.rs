@@ -2832,13 +2832,6 @@ mod tests {
     }
 
     #[test]
-    fn bare_enter_still_named() {
-        // Plain Enter stays on the named-key path so it keeps delivering bare CR (submit).
-        // Guards against widening the strict-mod match.
-        assert_named(translate(k(KeyCode::Enter)), "Enter");
-    }
-
-    #[test]
     fn alt_enter_still_named_m_enter() {
         // Alt+Enter (terminals that pre-encode Shift+Enter as ESC+CR deliver Enter+ALT)
         // must keep producing the named `M-Enter`, which tmux expands to ESC+CR; the

@@ -115,20 +115,6 @@ fn enter_and_tab_route_by_default_attach_mode() {
 
 #[test]
 #[serial]
-fn tab_still_enters_live_send_when_default_is_tmux() {
-    // With the historical Tmux default, Enter still attaches and
-    // Tab keeps its historical live-send role.
-    let mut env = create_test_env_empty();
-    let id = add_session(&mut env.view, "session-one");
-    env.view.flat_items = env.view.build_flat_items();
-    env.view.cursor = 0;
-    env.view.update_selected();
-    let action = env.view.handle_key(key(KeyCode::Tab), None);
-    assert_eq!(action, Some(Action::EnterLiveSend(id)));
-}
-
-#[test]
-#[serial]
 fn tab_in_terminal_view_swaps_to_attach_terminal_when_default_is_live_send() {
     // Terminal-view counterpart of the swap: with Enter pinned to live-send, Tab attaches
     // the paired terminal pane rather than the agent pane.

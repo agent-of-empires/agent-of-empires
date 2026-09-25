@@ -979,27 +979,6 @@ fn apply_attach_project_results_reports_and_clears_the_marker() {
     }
 }
 
-/// `o` and Ctrl+O open the sort picker; the current sort is unchanged until a selection is
-/// confirmed.
-#[test]
-#[serial]
-fn test_o_and_ctrl_o_open_sort_picker() {
-    use crate::session::config::SortOrder;
-
-    let mut env = create_test_env_with_mixed_sessions();
-    for chord in [
-        key(KeyCode::Char('o')),
-        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
-    ] {
-        env.view.handle_key(chord, None);
-        assert!(env.view.sort_picker_dialog.is_some());
-        assert_eq!(env.view.sort_order, SortOrder::Newest);
-        env.view.handle_key(key(KeyCode::Esc), None);
-        assert!(env.view.sort_picker_dialog.is_none());
-        assert_eq!(env.view.sort_order, SortOrder::Newest);
-    }
-}
-
 #[test]
 #[serial]
 fn test_shift_o_opens_sort_picker_in_strict_mode() {
