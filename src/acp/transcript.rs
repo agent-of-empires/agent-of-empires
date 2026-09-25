@@ -777,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn notice_and_divider_rows_render_per_event() {
+    fn notice_divider_and_control_events_render_per_event() {
         let resets_at = at(1_767_225_600);
         let switched = Event::AgentSwitched {
             from: "claude".into(),
@@ -864,6 +864,51 @@ mod tests {
             let got = row(&m, id);
             assert_eq!((got.kind, got.text.as_str()), (kind, text.as_str()), "{id}");
         }
+
+        // Control-only events produce no rows.
+        let m = fold([
+            Event::PlanUpdated {
+                plan: crate::acp::state::Plan {
+                    plan_id: "p".into(),
+                    version: 1,
+                    steps: Vec::new(),
+                },
+            },
+            Event::ThinkingEnded,
+            Event::RawAgentUpdate {
+                payload: serde_json::json!({"x": 1}),
+            },
+            Event::TodoListUpdated { todos: Vec::new() },
+            Event::ConversationCompactionStarted,
+        ]);
+        assert!(m.rows().is_empty());
+        assert_eq!(m.last_seq(), 5);
+
+        // A context-reset divider needs a reason or a prior prompt.
+        let reset = |reason: &str| Event::SessionContextReset {
+            reason: reason.into(),
+        };
+        assert!(fold([reset("")]).rows().is_empty());
+        assert!(fold([reset("session/load failed: bad id")])
+            .rows()
+            .is_empty());
+
+        let isolated = fold([reset("Sandbox native history was isolated")]);
+        let last = isolated.rows().last().unwrap();
+        assert_eq!(last.kind, TranscriptRowKind::ContextReset);
+        assert!(last.text.contains("isolated"));
+
+        let m = fold([prompt("hi"), reset("session/load failed: bad id")]);
+        let last = m.rows().last().unwrap();
+        assert_eq!(
+            (last.kind, last.text.as_str()),
+            (
+                TranscriptRowKind::ContextReset,
+                "session/load failed: bad id"
+            )
+        );
+        let m = fold([prompt("hi"), reset("")]);
+        assert!(m.rows().last().unwrap().text.contains("context reset"));
     }
 
     #[test]
@@ -925,30 +970,8 @@ mod tests {
         );
         let payload = diff_row.diff_comments.as_ref().expect("payload");
         assert!(payload.is_multi_repo && payload.intro == "look");
-    }
 
-    /// A rate-limit resume continuation replays a prompt the user already saw
-    /// once, before the park (#3028, #4040): it must not appear twice, yet it
-    /// still opens a fresh turn so `empty_output` and divider suppression
-    /// behave like a real prompt.
-    #[test]
-    fn synthesized_prompt_renders_no_row_but_still_opens_the_turn() {
-        let ev = Event::UserPromptSent {
-            text: "run the nightly task".into(),
-            attachments: Vec::new(),
-            prompt_id: None,
-            synthesized: true,
-        };
-        let mut m = TranscriptModel::new();
-        let deltas = m.apply_event(1, &ev);
-        assert!(deltas.is_empty());
-        assert!(m.rows().is_empty());
-        assert!(m.turn_active);
-        assert!(!m.turn_has_output);
-    }
-
-    #[test]
-    fn message_chunks_share_a_group_until_another_event_breaks_it() {
+        // Message chunks share a group until another event breaks it.
         let m = fold([
             chunk("Hello"),
             chunk(", world"),
@@ -964,10 +987,25 @@ mod tests {
         assert_eq!(msgs[0].text, "Hello");
         assert_eq!(msgs[0].group_id, msgs[1].group_id);
         assert_ne!(msgs[1].group_id, msgs[2].group_id);
+
+        // A synthesized resume prompt (#3028, #4040) renders no row but still
+        // opens the turn.
+        let ev = Event::UserPromptSent {
+            text: "run the nightly task".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+            synthesized: true,
+        };
+        let mut m = TranscriptModel::new();
+        let deltas = m.apply_event(1, &ev);
+        assert!(deltas.is_empty());
+        assert!(m.rows().is_empty());
+        assert!(m.turn_active);
+        assert!(!m.turn_has_output);
     }
 
     #[test]
-    fn tool_completion_rows_pick_their_text_and_stay_unique() {
+    fn tool_rows_pick_their_text_stay_unique_and_synthesize_late_starts() {
         let m = fold([
             started(tool("t-1", "Bash")),
             completed("t-1", false, "abc\ndef\n"),
@@ -1054,10 +1092,8 @@ mod tests {
             },
         );
         assert!(row(&m, "done-task-1").async_subagent);
-    }
 
-    #[test]
-    fn late_frames_synthesize_a_tool_start() {
+        // Late frames synthesize a tool start.
         let m = fold([completed("orphan-1", false, "done output")]);
         assert_eq!(
             kinds(&m),
@@ -1305,54 +1341,5 @@ mod tests {
             "a steered prompt keeps the turn's output"
         );
         assert_eq!(count(&m, TranscriptRowKind::UserPrompt), 2);
-    }
-
-    #[test]
-    fn context_reset_divider_needs_a_reason_or_a_prior_prompt() {
-        let reset = |reason: &str| Event::SessionContextReset {
-            reason: reason.into(),
-        };
-        assert!(fold([reset("")]).rows().is_empty());
-        assert!(fold([reset("session/load failed: bad id")])
-            .rows()
-            .is_empty());
-
-        let isolated = fold([reset("Sandbox native history was isolated")]);
-        let last = isolated.rows().last().unwrap();
-        assert_eq!(last.kind, TranscriptRowKind::ContextReset);
-        assert!(last.text.contains("isolated"));
-
-        let m = fold([prompt("hi"), reset("session/load failed: bad id")]);
-        let last = m.rows().last().unwrap();
-        assert_eq!(
-            (last.kind, last.text.as_str()),
-            (
-                TranscriptRowKind::ContextReset,
-                "session/load failed: bad id"
-            )
-        );
-        let m = fold([prompt("hi"), reset("")]);
-        assert!(m.rows().last().unwrap().text.contains("context reset"));
-    }
-
-    #[test]
-    fn control_only_events_produce_no_rows() {
-        let m = fold([
-            Event::PlanUpdated {
-                plan: crate::acp::state::Plan {
-                    plan_id: "p".into(),
-                    version: 1,
-                    steps: Vec::new(),
-                },
-            },
-            Event::ThinkingEnded,
-            Event::RawAgentUpdate {
-                payload: serde_json::json!({"x": 1}),
-            },
-            Event::TodoListUpdated { todos: Vec::new() },
-            Event::ConversationCompactionStarted,
-        ]);
-        assert!(m.rows().is_empty());
-        assert_eq!(m.last_seq(), 5);
     }
 }

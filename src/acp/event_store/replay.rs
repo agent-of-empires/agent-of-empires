@@ -185,27 +185,24 @@ mod tests {
         let past_end = store.replay_page("s-1", u64::MAX, Some(1000));
         assert!(past_end.events.is_empty() && !past_end.has_more);
         assert_eq!((past_end.highest_seq, past_end.lowest_seq), (10, Some(1)));
-    }
 
-    #[test]
-    fn page_cursor_advances_past_a_corrupt_row() {
-        let (_tmp, store) = open_store(1000);
-        store.record("s-1", 1, &Event::ThinkingStarted).unwrap();
+        // The cursor advances past a corrupt row.
+        store.record("bad", 1, &Event::ThinkingStarted).unwrap();
         store
             .conn()
             .execute(
                 "INSERT INTO acp_events (session_id, seq, event_json, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params!["s-1", 2_i64, "{not valid event json", 0_i64],
+                rusqlite::params!["bad", 2_i64, "{not valid event json", 0_i64],
             )
             .unwrap();
-        store.record("s-1", 3, &Event::ThinkingEnded).unwrap();
+        store.record("bad", 3, &Event::ThinkingEnded).unwrap();
 
-        let page1 = store.replay_page("s-1", 0, Some(2));
+        let page1 = store.replay_page("bad", 0, Some(2));
         assert_eq!(seqs(&page1.events), [1]);
         assert_eq!(page1.last_scanned_seq, Some(2));
         assert!(page1.has_more);
-        let page2 = store.replay_page("s-1", 2, Some(2));
+        let page2 = store.replay_page("bad", 2, Some(2));
         assert_eq!(seqs(&page2.events), [3]);
         assert!(!page2.has_more);
     }
