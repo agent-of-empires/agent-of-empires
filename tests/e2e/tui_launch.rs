@@ -3,9 +3,12 @@ use std::time::Duration;
 
 use crate::harness::{require_tmux, TuiTestHarness};
 
+/// The TUI starts on the empty home screen with the palette hint, and the
+/// palette opens, closes, and runs a fuzzy-matched command. Quitting is covered
+/// by the harness's own `tui_input_barrier_handles_shell_metacharacters_in_home`.
 #[test]
 #[parallel]
-fn test_tui_launches_and_shows_home_screen() {
+fn test_tui_launches_and_drives_the_command_palette() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("launch");
@@ -13,30 +16,22 @@ fn test_tui_launches_and_shows_home_screen() {
 
     h.wait_for(" aoe ");
     h.assert_screen_contains("No sessions yet");
-    // Status bar should be visible. ^K Cmds is priority-1 (kept even on
-    // narrow footers) and the caret glyph is distinctive enough to survive
-    // any future reshuffling.
+    // ^K Cmds is priority-1, kept even on narrow footers.
     h.assert_screen_contains("^K Cmds");
-}
 
-#[test]
-#[parallel]
-fn test_tui_quit_with_q() {
-    require_tmux!();
+    h.send_keys("C-k");
+    h.wait_for("Commands");
+    // Settings/Quit may scroll off a 30-row terminal; the top group is visible.
+    h.assert_screen_contains("Actions");
+    h.assert_screen_contains("Rename");
+    h.send_keys("Escape");
+    h.wait_for_absent("Commands", Duration::from_secs(5));
 
-    let mut h = TuiTestHarness::new("quit");
-    h.spawn_tui();
-
-    h.wait_for(" aoe ");
-    // `q` opens the quit confirmation (on by default, #1569); it does not
-    // exit on its own anymore.
-    h.send_keys("q");
-    h.wait_for("Quit Agent of Empires");
-    // Confirm to actually exit.
-    h.send_keys("y");
-    h.wait_for_exit(Duration::from_secs(5));
-    assert!(
-        !h.session_alive(),
-        "session should have exited after confirming quit"
-    );
+    h.send_keys("C-k");
+    h.wait_for("Commands");
+    h.type_text("set");
+    h.wait_for("Open settings");
+    h.send_keys("Enter");
+    h.wait_for_absent("Commands", Duration::from_secs(5));
+    h.wait_for("Settings");
 }

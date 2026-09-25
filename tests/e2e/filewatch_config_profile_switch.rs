@@ -55,17 +55,17 @@ confirm_before_quit = true
     h.send_keys("Escape");
 }
 
-/// Deleting and recreating a profile under the same name must leave exactly
-/// one live config subscription for that profile so the next peer edit still
-/// refreshes the running TUI.
+/// A profile created from the picker gets a live config subscription, and
+/// deleting and recreating it under the same name leaves exactly one, so peer
+/// edits refresh the running TUI both times.
 #[test]
 #[serial(file_watch)]
-fn delete_then_recreate_same_name_propagates_via_watcher() {
+fn create_then_recreate_same_name_propagates_via_watcher() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("filewatch_config_recreate");
     let recycled = "scratch_recycle";
-    let config_dir = app_dir_in(h.home_path());
+    let profile_dir = app_dir_in(h.home_path()).join("profiles").join(recycled);
 
     h.enable_e2e_debug_signals();
     h.spawn_tui();
@@ -80,7 +80,14 @@ fn delete_then_recreate_same_name_propagates_via_watcher() {
     h.wait_for_absent("Profiles", Duration::from_secs(5));
     h.assert_screen_contains("[scratch_recycle]");
 
-    let profile_dir = config_dir.join("profiles").join(recycled);
+    let baseline = h.read_watcher_config_refresh_count();
+    std::fs::write(
+        profile_dir.join("config.toml"),
+        "[session]\nconfirm_before_quit = false\n",
+    )
+    .expect("peer-write created profile config.toml");
+    h.wait_for_watcher_config_refresh_above(baseline, Duration::from_secs(5));
+
     std::fs::remove_dir_all(&profile_dir).expect("remove first incarnation");
     std::fs::create_dir_all(&profile_dir).expect("recreate same-name dir");
 
@@ -98,45 +105,6 @@ confirm_before_quit = true
     // tolerates that worst case while the deterministic counter
     // signal gates the assertion.
     h.wait_for_watcher_config_refresh_above(baseline, Duration::from_secs(8));
-
-    h.send_keys("q");
-    h.wait_for_timeout("Quit Agent of Empires", Duration::from_secs(8));
-    h.send_keys("Escape");
-}
-
-#[test]
-#[serial(file_watch)]
-fn create_profile_then_peer_edit_propagates_via_watcher() {
-    require_tmux!();
-
-    let mut h = TuiTestHarness::new("filewatch_config_profile_create");
-    let new_profile = "scratch_create";
-    let config_dir = app_dir_in(h.home_path());
-    let profile_dir = config_dir.join("profiles").join(new_profile);
-
-    h.enable_e2e_debug_signals();
-    h.spawn_tui();
-    h.wait_for(" aoe ");
-
-    h.send_keys("P");
-    h.wait_for("Profiles");
-    h.send_keys("n");
-    h.wait_for("New Profile");
-    h.type_text(new_profile);
-    h.send_keys("Enter");
-    h.wait_for_absent("Profiles", Duration::from_secs(5));
-    h.assert_screen_contains("[scratch_create]");
-
-    let baseline = h.read_watcher_config_refresh_count();
-    std::fs::write(
-        profile_dir.join("config.toml"),
-        r#"[session]
-confirm_before_quit = true
-"#,
-    )
-    .expect("peer-write created profile config.toml");
-
-    h.wait_for_watcher_config_refresh_above(baseline, Duration::from_secs(5));
 
     h.send_keys("q");
     h.wait_for_timeout("Quit Agent of Empires", Duration::from_secs(8));

@@ -175,52 +175,48 @@ api_version = 2
         locked.tree_hash
     );
 
+    let needs_update = || async {
+        update_check::outdated()
+            .await
+            .into_iter()
+            .find(|s| s.id == "acme.local")
+            .expect("present")
+            .needs_update
+    };
+    assert!(!needs_update().await, "fresh install is current");
+    // Editing the local source tree diverges its re-hash from the lock.
+    std::fs::write(dir.join("added.txt"), "changed").unwrap();
+    assert!(needs_update().await, "local tree change detected");
+
     install::uninstall("acme.local").unwrap();
     assert!(load_registry().get("acme.local").is_none());
     assert!(Lockfile::load().unwrap().get("acme.local").is_none());
 }
 
+/// Install refuses a manifest in the reserved `aoe.` namespace and one that
+/// asks for a capability this build does not support.
 #[tokio::test]
 #[serial]
-async fn reserved_namespace_is_rejected() {
+async fn invalid_manifests_are_rejected() {
     let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    let dir = write_plugin_dir(
-        src.path(),
-        r#"
-id = "aoe.evil"
-name = "Evil"
-version = "0.1.0"
-api_version = 2
-"#,
-    );
-    let err = install::install(dir.to_str().unwrap(), true)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("reserved namespace"), "got: {err}");
-}
-
-#[tokio::test]
-#[serial]
-async fn unknown_capability_is_rejected() {
-    let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    let dir = write_plugin_dir(
-        src.path(),
-        r#"
-id = "acme.future"
-name = "Future"
-version = "0.1.0"
-api_version = 2
-capabilities = ["totally.unknown"]
-"#,
-    );
-    let err = install::install(dir.to_str().unwrap(), true)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("does not support"), "got: {err}");
+    for (manifest, expected) in [
+        (
+            "id = \"aoe.evil\"\nname = \"Evil\"\nversion = \"0.1.0\"\napi_version = 2\n",
+            "reserved namespace",
+        ),
+        (
+            "id = \"acme.future\"\nname = \"Future\"\nversion = \"0.1.0\"\napi_version = 2\ncapabilities = [\"totally.unknown\"]\n",
+            "does not support",
+        ),
+    ] {
+        let src = tempfile::tempdir().unwrap();
+        let dir = write_plugin_dir(src.path(), manifest);
+        let err = install::install(dir.to_str().unwrap(), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expected), "got: {err}");
+    }
 }
 
 #[tokio::test]
@@ -677,11 +673,19 @@ api_version = 2
 "#,
     );
     let tree_hash = agent_of_empires::plugin::integrity::tree_hash(&dir).unwrap();
-    write_featured(
+    // The tree is the second vetted release; an earlier listed release must not
+    // un-verify it.
+    write_featured_versions(
         src.path(),
         "agent-of-empires.official",
         dir.to_str().unwrap(),
-        &tree_hash,
+        &[
+            (
+                "0.9.0",
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+            ("1.0.0", &tree_hash),
+        ],
     );
 
     install::install(dir.to_str().unwrap(), true).await.unwrap();
@@ -735,45 +739,6 @@ api_version = 2
     let plugin = reg.get("acme.featured").expect("installed");
     assert_ne!(plugin.validation.as_str(), "featured");
     assert_eq!(plugin.validation.as_str(), "local");
-
-    std::env::remove_var("AOE_FEATURED_INDEX_PATH");
-}
-
-#[tokio::test]
-#[serial]
-async fn featured_second_vetted_version_verifies() {
-    let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    let dir = write_plugin_dir(
-        src.path(),
-        r#"
-id = "agent-of-empires.official"
-name = "Official"
-version = "1.1.0"
-api_version = 2
-"#,
-    );
-    let tree_hash = agent_of_empires::plugin::integrity::tree_hash(&dir).unwrap();
-    // The actual tree is the second vetted release; an earlier release is also
-    // listed and must not un-verify this one.
-    write_featured_versions(
-        src.path(),
-        "agent-of-empires.official",
-        dir.to_str().unwrap(),
-        &[
-            (
-                "1.0.0",
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            ),
-            ("1.1.0", &tree_hash),
-        ],
-    );
-
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
-
-    let reg = load_registry();
-    let plugin = reg.get("agent-of-empires.official").expect("installed");
-    assert_eq!(plugin.validation.as_str(), "featured");
 
     std::env::remove_var("AOE_FEATURED_INDEX_PATH");
 }
@@ -900,13 +865,14 @@ asset = "bin-${os}-${arch}"
 }
 
 /// Build steps run in the FINAL installed directory (not the staging tree that
-/// is renamed away), so a build artifact lands at `<plugins_dir>/<id>`. Uses a
-/// bare `sh` launch command (resolves on PATH) so install's post-build
-/// entrypoint check passes without the build having to produce an executable.
+/// is renamed away), so a build artifact lands at `<plugins_dir>/<id>`, and a
+/// step whose `platforms` excludes the host OS is skipped. Uses a bare `sh`
+/// launch command (resolves on PATH) so install's post-build entrypoint check
+/// passes without the build having to produce an executable.
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
-async fn build_step_runs_in_final_dir() {
+async fn build_steps_run_in_final_dir_for_matching_platforms() {
     let _home = isolate();
     let src = tempfile::tempdir().unwrap();
     let dir = write_plugin_dir(
@@ -924,40 +890,6 @@ system = true
 
 [[runtime.build]]
 command = ["cp", "aoe-plugin.toml", "build-marker"]
-"#,
-    );
-
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
-
-    let installed = agent_of_empires::plugin::plugins_dir()
-        .unwrap()
-        .join("acme.built");
-    assert!(
-        installed.join("build-marker").exists(),
-        "build step ran with cwd = the final plugin dir"
-    );
-}
-
-/// A build step whose `platforms` excludes the host OS is skipped, so its
-/// artifact is never produced and install still succeeds.
-#[cfg(unix)]
-#[tokio::test]
-#[serial]
-async fn build_step_skipped_on_non_matching_platform() {
-    let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    let dir = write_plugin_dir(
-        src.path(),
-        r#"
-id = "acme.skip"
-name = "Skip"
-version = "0.1.0"
-api_version = 2
-
-[runtime]
-kind = "command"
-command = ["sh"]
-system = true
 
 [[runtime.build]]
 command = ["cp", "aoe-plugin.toml", "should-not-exist"]
@@ -969,10 +901,10 @@ platforms = ["windows"]
 
     let installed = agent_of_empires::plugin::plugins_dir()
         .unwrap()
-        .join("acme.skip");
+        .join("acme.built");
     assert!(
-        installed.exists(),
-        "install succeeds with all steps skipped"
+        installed.join("build-marker").exists(),
+        "build step ran with cwd = the final plugin dir"
     );
     assert!(
         !installed.join("should-not-exist").exists(),
@@ -1213,59 +1145,6 @@ api_version = 2
 
 #[tokio::test]
 #[serial]
-async fn outdated_detects_new_github_commit() {
-    let _home = isolate();
-    let base = tempfile::tempdir().unwrap();
-    make_bare_repo(
-        base.path(),
-        "acme",
-        "upd",
-        &[("aoe-plugin.toml", PLAIN_MANIFEST)],
-    );
-    // Branch tracking is now an explicit-ref opt-in: `@main` follows the default
-    // branch (no release resolution), which these update-mechanics tests need.
-    install::install("gh:acme/upd@main", true).await.unwrap();
-
-    let before = update_check::outdated().await;
-    let s = before.iter().find(|s| s.id == "acme.upd").expect("present");
-    assert!(!s.needs_update, "fresh install is current: {s:?}");
-    assert!(s.error.is_none(), "no check error: {s:?}");
-
-    // Advance the remote; the same manifest stays so it is a clean update.
-    push_new_commit(base.path(), "acme", "upd", &[("extra.txt", "new")]);
-    let after = update_check::outdated().await;
-    let s = after.iter().find(|s| s.id == "acme.upd").expect("present");
-    assert!(s.needs_update, "new commit detected: {s:?}");
-
-    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
-}
-
-#[tokio::test]
-#[serial]
-async fn outdated_detects_changed_local_tree() {
-    let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    let dir = write_plugin_dir(src.path(), PLAIN_MANIFEST);
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
-
-    let before = update_check::outdated().await;
-    assert!(
-        !before
-            .iter()
-            .find(|s| s.id == "acme.upd")
-            .unwrap()
-            .needs_update
-    );
-
-    // Edit the local source tree; the re-hash should diverge from the lock.
-    std::fs::write(dir.join("added.txt"), "changed").unwrap();
-    let after = update_check::outdated().await;
-    let s = after.iter().find(|s| s.id == "acme.upd").expect("present");
-    assert!(s.needs_update, "local tree change detected: {s:?}");
-}
-
-#[tokio::test]
-#[serial]
 async fn auto_update_applies_clean_github_update() {
     let _home = isolate();
     let base = tempfile::tempdir().unwrap();
@@ -1279,9 +1158,18 @@ async fn auto_update_applies_clean_github_update() {
     // Branch tracking is now an explicit-ref opt-in: `@main` follows the default
     // branch (no release resolution), which these update-mechanics tests need.
     install::install("gh:acme/upd@main", true).await.unwrap();
+    let before = update_check::outdated().await;
+    let s = before.iter().find(|s| s.id == "acme.upd").expect("present");
+    assert!(
+        !s.needs_update && s.error.is_none(),
+        "fresh install is current: {s:?}"
+    );
 
     // A clean (no consent change) newer version on the remote.
     push_new_commit(base.path(), "acme", "upd", &[("aoe-plugin.toml", &v2)]);
+    let after = update_check::outdated().await;
+    let s = after.iter().find(|s| s.id == "acme.upd").expect("present");
+    assert!(s.needs_update, "new commit detected: {s:?}");
     let rec = std::sync::Arc::new(RecordingNotifier::default());
     let notifier: std::sync::Arc<dyn auto_update::UpdateNotifier> = rec.clone();
     let summary = auto_update::sweep(Some(&notifier)).await;

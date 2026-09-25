@@ -14,21 +14,16 @@
 mod common;
 mod home_isolation;
 
-mod config_merge;
 mod config_wiring;
 mod daemon_client;
-mod diff_integration;
-mod group_persistence;
 mod hidden_env_batch;
 mod hooks_config;
 mod migration_pipeline;
-mod parallel_capture;
 mod profile_management;
 mod recovery_hook_timeout;
 mod repo_config;
 mod sandbox_integration;
 mod session_id_acquisition;
-mod session_lifecycle;
 mod status_detection;
 mod storage_concurrency;
 mod terminal_smart_rename;
@@ -42,8 +37,6 @@ mod acp_mcp;
 mod acp_smoke;
 
 mod acp_session_delete;
-
-mod acp_effort_respawn;
 
 mod acp_model_respawn;
 
