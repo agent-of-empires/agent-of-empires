@@ -239,14 +239,24 @@ capabilities = ["net"]
 "#,
     );
     install::install(dir.to_str().unwrap(), true).await.unwrap();
+    assert!(load_registry().get("acme.regrant").unwrap().active());
 
-    // Grow the capability set on disk so the grant no longer covers the
-    // manifest; reload the process-global registry the install API consults.
+    // The grant pins the manifest bytes: a comment-only edit revokes it.
     let installed = agent_of_empires::plugin::plugins_dir()
         .unwrap()
         .join("acme.regrant")
         .join("aoe-plugin.toml");
-    let text = std::fs::read_to_string(&installed).unwrap().replace(
+    let mut text = std::fs::read_to_string(&installed).unwrap();
+    text.push_str("\n# tampered\n");
+    std::fs::write(&installed, &text).unwrap();
+    assert!(load_registry()
+        .get("acme.regrant")
+        .unwrap()
+        .needs_reapproval());
+
+    // Grow the capability set on disk too; reload the process-global registry
+    // the install API consults.
+    let text = text.replace(
         "capabilities = [\"net\"]",
         "capabilities = [\"net\", \"notifications\"]",
     );

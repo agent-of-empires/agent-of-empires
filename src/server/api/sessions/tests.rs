@@ -356,6 +356,13 @@ mod cityhall_capability {
                 "plain-tool",
                 None,
             ));
+            // Built-in agents resolve via the registry without reading config.
+            assert!(agent_is_acp_capable(
+                "default",
+                std::path::Path::new("/nonexistent"),
+                "claude",
+                None,
+            ));
         }
     }
 }
