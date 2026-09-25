@@ -1247,10 +1247,14 @@ impl Instance {
                     })
                     .flatten();
                 let recorded = recorded_execution.and_then(|execution| execution.stores.first().cloned());
-                let root = absolute(recorded
+                // The same root is exported here and recorded on the binding
+                // below, and the binding canonicalizes it either way: resolve
+                // it now so the routed value and the stored one name one path,
+                // as the sibling namespaces already do.
+                let root = inputs.canonical_path(&absolute(recorded
                     .or_else(|| declared.clone())
                     .or_else(|| value("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()).map(PathBuf::from))
-                    .unwrap_or_else(|| home.join(".claude")));
+                    .unwrap_or_else(|| home.join(".claude"))))?;
                 let default = crate::session::capture::is_default_claude_store(&root, &home);
                 let explicit = recorded_execution
                     .and_then(|execution| execution.exported_default_store)
@@ -2567,5 +2571,54 @@ mod tests {
                 "{name} must refuse a valued verbosity override"
             );
         }
+    }
+
+    /// The exported `CLAUDE_CONFIG_DIR` and the store recorded on the binding
+    /// must name one identity: a symlinked declaration would otherwise route
+    /// the agent through the alias while persisting the resolved path.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn claude_store_route_and_binding_share_one_canonical_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _config_dir = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let real = temp.path().join("real-store");
+        let alias = temp.path().join("alias-store");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let profile = "claude-store-route-identity";
+        let path =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "[session.agent_config_dir]\nclaude = {:?}\n",
+                alias.to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
+        let mut inst = Instance::new("claude-route-identity", temp.path().to_str().unwrap());
+        inst.source_profile = profile.into();
+        inst.tool = "claude".into();
+        inst.view = crate::session::View::Structured;
+
+        let native = inst.resolve_native_execution(None).unwrap();
+
+        let resolved = real.canonicalize().unwrap();
+        assert_eq!(native.binding.stores, vec![resolved.clone()]);
+        let routed = native
+            .routing
+            .iter()
+            .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+            .map(|(_, value)| value.as_deref());
+        assert_eq!(routed, Some(resolved.to_str()));
     }
 }
