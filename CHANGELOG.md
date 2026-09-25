@@ -4,6 +4,16 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.17.2](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.17.2) - 2026-09-25
+
+
+
+### Bug Fixes
+
+- **tui:** Skip ineligible poller repairs in [#4133](https://github.com/agent-of-empires/agent-of-empires/pull/4133) by [@jerome-benoit](https://github.com/jerome-benoit) ([`15f9cc9`](https://github.com/agent-of-empires/agent-of-empires/commit/15f9cc99cd0f9264daa81dee750253a2822f13f5))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/agent-of-empires/compare/v1.17.1...v1.17.2
 ## [1.17.1](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.17.1) - 2026-09-25
 
 

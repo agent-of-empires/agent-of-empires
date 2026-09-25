@@ -608,25 +608,25 @@ impl Instance {
         &mut self,
         snapshot: &crate::tmux::LiveSessionSnapshot,
     ) -> bool {
-        // Structured sessions have ACP workers rather than tmux panes.
+        let now = std::time::Instant::now();
+        // Keep cheap eligibility checks ahead of support resolution. A parked row without a
+        // live agent falls out at the pane check, while a no-kill parked row remains repairable.
         if self.is_structured()
-            || !self.supports_session_poller()
             || self.session_id_poller_is_running()
             || self
                 .session_id_poller_retry_after
-                .is_some_and(|deadline| std::time::Instant::now() < deadline)
+                .is_some_and(|deadline| now < deadline)
+            || !self.poller_repair.due(now)
             // Agent pane, not any pane: a terminal outliving the agent is not
             // something a session-id poller can follow.
             || !self.has_live_agent_pane_in(snapshot)
         {
             return false;
         }
-        let now = std::time::Instant::now();
-        // A failed attempt schedules the next one (5 s doubling to 60 s), so an over-budget fleet
-        // is not re-probed — and re-warned — for every session on every 2 s tick.
-        if !self.poller_repair.due(now) {
+        if !self.supports_session_poller() {
             return false;
         }
+        let repair_now = std::time::Instant::now();
         self.session_id_poller = None;
         match self.maybe_start_poller() {
             // `install_poller` cleared the schedule.
@@ -638,11 +638,11 @@ impl Instance {
                 false
             }
             PollerStart::BudgetExhausted => {
-                self.defer_poller_repair(now, "budget exhausted");
+                self.defer_poller_repair(repair_now, "budget exhausted");
                 false
             }
             PollerStart::SpawnFailed => {
-                self.defer_poller_repair(now, "start failed");
+                self.defer_poller_repair(repair_now, "start failed");
                 false
             }
         }
@@ -1300,6 +1300,143 @@ mod tests {
             inst.session_id_poller.is_some(),
             "decline must happen before the handle is cleared"
         );
+    }
+    #[test]
+    #[serial_test::serial]
+    fn repair_preserves_live_parked_rows_for_no_kill_transitions() {
+        let app = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(app.path());
+        let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
+
+        for (label, parked) in [("trashed", 1_u8), ("archived", 2), ("both", 3)] {
+            let mut inst =
+                Instance::new(&format!("repair-{label}"), &format!("/tmp/repair-{label}"));
+            inst.source_profile = "repair-parked".into();
+            inst.tool = "claude".into();
+            inst.status = Status::Running;
+            if parked & 1 != 0 {
+                inst.trash();
+            }
+            if parked & 2 != 0 {
+                inst.archive();
+            }
+            // Keep the status stale to prove lifecycle metadata is not a blanket poller gate.
+            inst.status = Status::Running;
+            let no_live = crate::tmux::LiveSessionSnapshot::from_parts(
+                Some(Vec::new()),
+                Some(std::collections::HashMap::new()),
+            );
+            assert!(!inst.repair_session_id_poller_if_needed(&no_live));
+            assert!(inst.session_id_poller.is_none());
+
+            let live = crate::tmux::LiveSessionSnapshot::from_parts(
+                Some(vec![crate::tmux::Session::generate_name(
+                    &inst.id,
+                    &inst.title,
+                )]),
+                Some(std::collections::HashMap::new()),
+            );
+            assert!(inst.repair_session_id_poller_if_needed(&live));
+            assert!(inst.session_id_poller_is_running());
+            inst.stop_poller();
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn repair_checks_live_pane_before_resolving_support() {
+        let app = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(app.path());
+        let profile = "repair-guard-order";
+        let config_path =
+            crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            config_path,
+            "[[agents.claude.status_rules]]\nstatus = \"running\"\ncontains = \"repair-sentinel\"\n",
+        )
+        .unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
+
+        for (label, parked) in [
+            ("active", 0_u8),
+            ("trashed", 1),
+            ("archived", 2),
+            ("both", 3),
+        ] {
+            assert!(!crate::tmux::status_rules::has_rules(profile, "claude"));
+            let mut inst = Instance::new(
+                &format!("repair-guard-order-{label}"),
+                &format!("/tmp/repair-guard-order-{label}"),
+            );
+            inst.source_profile = profile.into();
+            inst.tool = "claude".into();
+            if parked & 1 != 0 {
+                inst.trash();
+            }
+            if parked & 2 != 0 {
+                inst.archive();
+            }
+            let live = crate::tmux::LiveSessionSnapshot::from_parts(
+                Some(Vec::new()),
+                Some(std::collections::HashMap::new()),
+            );
+
+            assert!(!inst.repair_session_id_poller_if_needed(&live));
+            assert!(
+                !crate::tmux::status_rules::has_rules(profile, "claude"),
+                "repair resolved support for {label} row without a live agent pane"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn repair_keeps_live_stopped_and_errored_rows_eligible() {
+        let app = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(app.path());
+        let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
+
+        for status in [Status::Stopped, Status::Error] {
+            let mut inst = Instance::new("repair-status", "/tmp/repair-status");
+            inst.source_profile = "repair-status".into();
+            inst.tool = "claude".into();
+            inst.status = status;
+            let live = crate::tmux::LiveSessionSnapshot::from_parts(
+                Some(vec![crate::tmux::Session::generate_name(
+                    &inst.id,
+                    &inst.title,
+                )]),
+                Some(std::collections::HashMap::new()),
+            );
+
+            assert!(inst.repair_session_id_poller_if_needed(&live));
+            assert!(inst.session_id_poller_is_running());
+            inst.stop_poller();
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn repair_keeps_live_pi_rows_eligible() {
+        let app = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(app.path());
+        let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
+        let mut inst = Instance::new("repair-pi", "/tmp/repair-pi");
+        inst.source_profile = "repair-pi".into();
+        inst.tool = "pi".into();
+        inst.mark_pi_extension_launched_for_test();
+        let live = crate::tmux::LiveSessionSnapshot::from_parts(
+            Some(vec![crate::tmux::Session::generate_name(
+                &inst.id,
+                &inst.title,
+            )]),
+            Some(std::collections::HashMap::new()),
+        );
+
+        assert!(inst.repair_session_id_poller_if_needed(&live));
+        assert!(inst.session_id_poller_is_running());
+        inst.stop_poller();
     }
 
     /// The live arm is decisive and the derived arm is the fallback only when the scan found

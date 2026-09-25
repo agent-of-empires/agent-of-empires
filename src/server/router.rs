@@ -63,6 +63,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             get(api::session_diff_files),
         )
         .route("/api/sessions/{id}/diff/file", get(api::session_diff_file))
+        .route(
+            "/api/sessions/{id}/diff/file/raw",
+            get(api::session_diff_file_raw),
+        )
         .route("/api/sessions/{id}/file", get(api::session_file))
         .route(
             "/api/sessions/{id}/artifacts/{*path}",

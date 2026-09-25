@@ -5,8 +5,14 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { DiffFileList } from "../DiffFileList";
 import type { RepoBase, RichDiffFile } from "../../../lib/types";
 
-const mock = vi.hoisted(() => ({ fetchBranches: vi.fn(), setSessionDiffBase: vi.fn() }));
+const mock = vi.hoisted(() => ({
+  fetchBranches: vi.fn(),
+  setSessionDiffBase: vi.fn(),
+  sessionDiffRawFileUrl: (id: string, path: string, repo?: string) => `${id}:${repo ?? ""}:${path}`,
+}));
 vi.mock("../../../lib/api", () => mock);
+const openInNewTab = vi.hoisted(() => vi.fn());
+vi.mock("../../../lib/openInNewTab", () => ({ openInNewTab }));
 
 const file = (over: Partial<RichDiffFile> & { path: string }): RichDiffFile => ({
   old_path: null,
@@ -44,6 +50,7 @@ beforeEach(() => {
   window.localStorage.clear();
   mock.fetchBranches.mockReset();
   mock.setSessionDiffBase.mockReset().mockResolvedValue({});
+  openInNewTab.mockReset().mockResolvedValue({ ok: true });
   Element.prototype.scrollIntoView = vi.fn();
 });
 
@@ -172,6 +179,32 @@ describe("copy relative path", () => {
     renderList({ files: [file({ path: "a.ts" })] });
     fireEvent.contextMenu(screen.getByText("Changes"));
     expect(screen.queryByText("Copy relative path")).toBeNull();
+  });
+});
+
+describe("open file", () => {
+  const menuItems = () => screen.getAllByRole("menuitem").map((b) => b.textContent);
+
+  it("opens a shared path from the repo whose row was right-clicked", () => {
+    setSettings({ diffViewMode: "flat" });
+    renderList({
+      files: [file({ path: "same.txt", repo_name: "api" }), file({ path: "same.txt", repo_name: "web" })],
+      perRepoBases: [
+        { repo_name: "api", base_branch: "main" },
+        { repo_name: "web", base_branch: "main" },
+      ],
+      sessionId: "s1",
+    });
+    fireEvent.contextMenu(screen.getAllByText("same.txt")[1]!);
+    expect(menuItems()).toEqual(["Open file", "Copy relative path"]);
+    fireEvent.click(screen.getByText("Open file"));
+    expect(openInNewTab).toHaveBeenCalledWith("s1:web:same.txt", "same.txt");
+  });
+
+  it("offers only the copy on a directory row", () => {
+    renderList({ files: [file({ path: "src/app/foo.rs" })], sessionId: "s1" });
+    fireEvent.contextMenu(row("src"));
+    expect(menuItems()).toEqual(["Copy relative path"]);
   });
 });
 
