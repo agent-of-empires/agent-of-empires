@@ -443,72 +443,44 @@ api_version = 2
     std::env::remove_var("AOE_UPDATE_API_BASE");
 }
 
+/// An unverified GitHub install bails without --yes on a non-terminal stdin
+/// rather than installing un-audited code: a bare repo with no release falls
+/// back to the default branch (the releases API 404s), and an explicit `@ref`
+/// is never verified.
 #[tokio::test]
 #[serial]
-async fn github_no_ref_no_release_bails_without_yes() {
+async fn unverified_github_sources_require_confirmation_without_yes() {
     let _home = isolate();
-    let base = tempfile::tempdir().unwrap();
-    make_bare_repo(
-        base.path(),
-        "acme",
-        "norel",
-        &[(
-            "aoe-plugin.toml",
-            r#"
-id = "acme.norel"
-name = "NoRel"
-version = "1.0.0"
-api_version = 2
-"#,
-        )],
-    );
-    // A releases API with no matching route returns 404 -> no release found ->
-    // default-branch fallback, which is unverified and (non-interactively,
-    // without --yes) must bail rather than silently install.
-    let server = spawn_latest_release("other", "repo", "v9").await;
+    for (repo, source) in [
+        ("norel", "gh:acme/norel"),
+        ("widget", "gh:acme/widget@main"),
+    ] {
+        let base = tempfile::tempdir().unwrap();
+        let id = format!("acme.{repo}");
+        make_bare_repo(
+            base.path(),
+            "acme",
+            repo,
+            &[(
+                "aoe-plugin.toml",
+                &format!(
+                    "id = \"{id}\"\nname = \"{repo}\"\nversion = \"1.0.0\"\napi_version = 2\n"
+                ),
+            )],
+        );
+        let server = spawn_latest_release("other", "repo", "v9").await;
 
-    let err = install::install("gh:acme/norel", false)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("unverified"), "got: {err}");
-    assert!(load_registry().get("acme.norel").is_none());
+        let err = install::install(source, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unverified"), "{source}: {err}");
+        assert!(load_registry().get(&id).is_none(), "{source}");
 
-    server.abort();
+        server.abort();
+    }
     std::env::remove_var("AOE_GITHUB_CLONE_BASE");
     std::env::remove_var("AOE_UPDATE_API_BASE");
-}
-
-#[tokio::test]
-#[serial]
-async fn explicit_ref_requires_confirmation_without_yes() {
-    let _home = isolate();
-    let base = tempfile::tempdir().unwrap();
-    make_bare_repo(
-        base.path(),
-        "acme",
-        "widget",
-        &[(
-            "aoe-plugin.toml",
-            r#"
-id = "acme.widget"
-name = "Widget"
-version = "1.0.0"
-api_version = 2
-"#,
-        )],
-    );
-
-    // An explicit `@ref` is unverified; without --yes on a non-terminal stdin it
-    // bails rather than installing un-audited code.
-    let err = install::install("gh:acme/widget@main", false)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("unverified"), "got: {err}");
-    assert!(load_registry().get("acme.widget").is_none());
-
-    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
 }
 
 #[tokio::test]
@@ -622,123 +594,61 @@ fn write_featured(dir: &Path, id: &str, source: &str, tree_hash: &str) -> PathBu
     write_featured_versions(dir, id, source, &[("1.0.0", tree_hash)])
 }
 
+/// Only a vetted featured release lifts the reserved-namespace gate. The same
+/// unvetted pin on a non-reserved id still installs, labelled by its source.
 #[tokio::test]
 #[serial]
-async fn featured_verified_reserved_namespace_installs() {
-    let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    // A reserved-namespace id is normally rejected; a matching featured pin
-    // lifts it.
-    let dir = write_plugin_dir(
-        src.path(),
-        r#"
-id = "agent-of-empires.official"
-name = "Official"
-version = "1.0.0"
-api_version = 2
-"#,
-    );
-    let tree_hash = agent_of_empires::plugin::integrity::tree_hash(&dir).unwrap();
-    // The tree is the second vetted release; an earlier listed release must not
-    // un-verify it.
-    write_featured_versions(
-        src.path(),
-        "agent-of-empires.official",
-        dir.to_str().unwrap(),
-        &[
-            (
-                "0.9.0",
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-            ),
-            ("1.0.0", &tree_hash),
-        ],
-    );
+async fn featured_pins_gate_the_reserved_namespace() {
+    const UNVETTED: &str =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    // (id, pin the installed tree, expected validation or refusal fragment)
+    let cases: [(&str, bool, Result<&str, &str>); 3] = [
+        ("agent-of-empires.official", true, Ok("featured")),
+        ("acme.featured", false, Ok("local")),
+        ("agent-of-empires.official", false, Err("reserved")),
+    ];
+    for (id, vetted, expected) in cases {
+        let _home = isolate();
+        let src = tempfile::tempdir().unwrap();
+        let dir = write_plugin_dir(
+            src.path(),
+            &format!("id = \"{id}\"\nname = \"Pinned\"\nversion = \"1.0.0\"\napi_version = 2\n"),
+        );
+        let tree_hash = agent_of_empires::plugin::integrity::tree_hash(&dir).unwrap();
+        // The installed tree is the second listed release, so an earlier vetted
+        // release must not un-verify it.
+        let current = if vetted { tree_hash.as_str() } else { UNVETTED };
+        write_featured_versions(
+            src.path(),
+            id,
+            dir.to_str().unwrap(),
+            &[("0.9.0", UNVETTED), ("1.0.0", current)],
+        );
 
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
-
-    let reg = load_registry();
-    let plugin = reg.get("agent-of-empires.official").expect("installed");
-    assert_eq!(plugin.validation.as_str(), "featured");
-    let lock = Lockfile::load().unwrap();
-    let locked = lock.get("agent-of-empires.official").unwrap();
-    assert_eq!(locked.trust, "featured");
-    assert_eq!(locked.tree_hash, tree_hash);
-
-    std::env::remove_var("AOE_FEATURED_INDEX_PATH");
-}
-
-#[tokio::test]
-#[serial]
-async fn featured_unvetted_version_installs_as_community() {
-    let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    let dir = write_plugin_dir(
-        src.path(),
-        r#"
-id = "acme.featured"
-name = "Featured"
-version = "1.0.0"
-api_version = 2
-"#,
-    );
-    // The id is featured but pinned to a different (unvetted) hash. For a
-    // non-reserved id this is not tamper-refuse: it installs as an unvetted
-    // version (community).
-    write_featured(
-        src.path(),
-        "acme.featured",
-        dir.to_str().unwrap(),
-        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    );
-
-    let report = install::install(dir.to_str().unwrap(), true).await.unwrap();
-    assert_eq!(
-        report.validation.as_str(),
-        "local",
-        "the install report surfaces a local-directory install as local"
-    );
-
-    // It installs (not refused) and is not featured. The non-featured label
-    // ("local" here, since the install source is a local dir; "community" for a
-    // gh: install) is derived from the source, not the hash mismatch.
-    let reg = load_registry();
-    let plugin = reg.get("acme.featured").expect("installed");
-    assert_ne!(plugin.validation.as_str(), "featured");
-    assert_eq!(plugin.validation.as_str(), "local");
-
-    std::env::remove_var("AOE_FEATURED_INDEX_PATH");
-}
-
-#[tokio::test]
-#[serial]
-async fn featured_reserved_namespace_unvetted_is_refused() {
-    let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    // A reserved-namespace id at an unvetted hash is still refused: only a
-    // vetted release lifts the reserved-namespace gate.
-    let dir = write_plugin_dir(
-        src.path(),
-        r#"
-id = "agent-of-empires.official"
-name = "Official"
-version = "1.0.0"
-api_version = 2
-"#,
-    );
-    write_featured(
-        src.path(),
-        "agent-of-empires.official",
-        dir.to_str().unwrap(),
-        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    );
-
-    let err = install::install(dir.to_str().unwrap(), true)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("reserved"), "got: {err}");
-    assert!(load_registry().get("agent-of-empires.official").is_none());
-
+        let result = install::install(dir.to_str().unwrap(), true).await;
+        match expected {
+            Ok(validation) => {
+                let report = result.unwrap_or_else(|e| panic!("{id} vetted={vetted}: {e}"));
+                assert_eq!(report.validation.as_str(), validation, "{id}");
+                let reg = load_registry();
+                assert_eq!(
+                    reg.get(id).expect("installed").validation.as_str(),
+                    validation
+                );
+                if validation == "featured" {
+                    let lock = Lockfile::load().unwrap();
+                    let locked = lock.get(id).unwrap();
+                    assert_eq!(locked.trust, "featured");
+                    assert_eq!(locked.tree_hash, tree_hash);
+                }
+            }
+            Err(fragment) => {
+                let err = result.expect_err("an unvetted reserved id must be refused");
+                assert!(err.to_string().contains(fragment), "got: {err}");
+                assert!(load_registry().get(id).is_none());
+            }
+        }
+    }
     std::env::remove_var("AOE_FEATURED_INDEX_PATH");
 }
 

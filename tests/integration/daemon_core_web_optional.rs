@@ -40,49 +40,30 @@ async fn status_for(uri: &str) -> StatusCode {
     app.oneshot(req).await.unwrap().status()
 }
 
-/// The REST surface is unconditional: a Node-free `cargo build` still answers
-/// it. This is the whole point of making the daemon core, so it is asserted in
-/// both feature corners rather than only under `web`.
+/// The REST surface is unconditional, so a Node-free `cargo build` still
+/// answers it. The SPA fallback and `/assets/*` live behind `web`: with it a
+/// browser path reaches the embedded `index.html`, without it every dashboard
+/// path must 404 rather than serve a stale or empty shell.
 #[tokio::test]
 #[serial_test::parallel]
-async fn api_routes_are_served_without_the_dashboard_bundle() {
-    assert_eq!(
-        status_for("/api/sessions").await,
-        StatusCode::OK,
-        "the daemon API must not depend on the dashboard bundle"
-    );
-}
-
-/// The SPA fallback and the Vite output live behind `web`. Without it a
-/// browser path must 404 rather than serve a stale or empty shell.
-#[cfg(not(feature = "web"))]
-#[tokio::test]
-#[serial_test::parallel]
-async fn dashboard_routes_are_absent_without_web() {
-    for uri in ["/", "/sessions", "/assets/index-abc123.js", "/sw.js"] {
-        assert_eq!(
-            status_for(uri).await,
-            StatusCode::NOT_FOUND,
-            "{uri} must 404 in a build without the dashboard bundle"
-        );
+async fn only_dashboard_routes_depend_on_the_web_feature() {
+    let dashboard = if cfg!(feature = "web") {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    };
+    let mut cases = vec![
+        ("/api/sessions", StatusCode::OK),
+        ("/", dashboard),
+        ("/sessions", dashboard),
+    ];
+    if !cfg!(feature = "web") {
+        cases.extend([
+            ("/assets/index-abc123.js", StatusCode::NOT_FOUND),
+            ("/sw.js", StatusCode::NOT_FOUND),
+        ]);
     }
-}
-
-/// With `web` the same paths resolve: `/assets/*` and the SPA fallback are
-/// registered, so a browser path reaches the embedded `index.html` instead of
-/// falling through to axum's default 404.
-#[cfg(feature = "web")]
-#[tokio::test]
-#[serial_test::parallel]
-async fn spa_fallback_serves_the_bundle_with_web() {
-    assert_eq!(
-        status_for("/").await,
-        StatusCode::OK,
-        "the SPA fallback must serve index.html when the bundle is embedded"
-    );
-    assert_eq!(
-        status_for("/sessions").await,
-        StatusCode::OK,
-        "an unknown browser path must fall back to index.html, not 404"
-    );
+    for (uri, expected) in cases {
+        assert_eq!(status_for(uri).await, expected, "{uri}");
+    }
 }
