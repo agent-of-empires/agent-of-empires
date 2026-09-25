@@ -6241,146 +6241,83 @@ codex-work = "{}"
         );
     }
 
+    /// The profile decides codex sandbox hooks: disabling them installs nothing, and a custom
+    /// wrapper detected as codex gets them even when the global setting is off.
     #[test]
     #[serial_test::serial]
-    fn test_build_container_config_respects_profile_hooks_disabled() {
-        let temp_home = TempDir::new().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+    fn test_build_container_config_codex_hooks_follow_the_profile() {
+        // (profile, profile config, global hooks, tool, hooks installed)
+        for (profile, profile_config, global_hooks, tool, installed) in [
+            (
+                "sandbox-hooks-disabled",
+                "[session]\nagent_status_hooks = false\n",
+                true,
+                "codex",
+                false,
+            ),
+            (
+                "sandbox-wrapped-codex",
+                "[session]\nagent_status_hooks = true\nagent_detect_as = { \"wrapped-codex\" = \"codex\" }\n",
+                false,
+                "wrapped-codex",
+                true,
+            ),
+        ] {
+            let (_hg, _, _tmp_base) = BaseGuard::ready();
+            let temp_home = TempDir::new().unwrap();
+            let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+            crate::session::config::update_config(|global| {
+                global.session.agent_status_hooks = global_hooks;
+            })
+            .unwrap();
+            let profile_dir = crate::session::get_profile_dir(profile).unwrap();
+            fs::write(profile_dir.join("config.toml"), profile_config).unwrap();
+            let project_dir = TempDir::new().unwrap();
+            git2::Repository::init(project_dir.path()).unwrap();
+            let instance_id = format!("{profile}-test");
+            // build_container_config installs the profile's agent_detect_as globally.
+            let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
+            let config = build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &test_sandbox_info(),
+                ContainerAgentSelection::new(tool, None),
+                false,
+                &instance_id,
+                None,
+                profile,
+            )
+            .unwrap();
 
-        let profile_dir = crate::session::get_profile_dir("sandbox-hooks-disabled").unwrap();
-        fs::write(
-            profile_dir.join("config.toml"),
-            "[session]\nagent_status_hooks = false\n",
-        )
-        .unwrap();
-
-        let project_dir = TempDir::new().unwrap();
-        git2::Repository::init(project_dir.path()).unwrap();
-
-        let sandbox_info = crate::session::instance::SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test:latest".to_string(),
-            container_name: "test-container".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        };
-        let instance_id = "codex-sandbox-hooks-disabled-test";
-        let config = build_container_config(
-            project_dir.path().to_str().unwrap(),
-            &sandbox_info,
-            ContainerAgentSelection::new("codex", None),
-            false,
-            instance_id,
-            None,
-            "sandbox-hooks-disabled",
-        )
-        .unwrap();
-
-        let codex_sandbox = temp_home
-            .path()
-            .join(".codex")
-            .join(SANDBOX_PRIVATE_SUBDIR)
-            .join(instance_id);
-        assert!(!codex_sandbox.join("config.toml").exists());
-
-        let hook_dir =
-            crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
-        // Lexical is correct here: hooks are disabled, the instance dir is
-        // never created, so canonicalize would fail and no mount can match.
-        assert!(
-            !config
-                .volumes
-                .iter()
-                .any(|v| v.host_path == hook_dir.to_string_lossy()),
-            "status hook directory should not be mounted when profile disables hooks"
-        );
-        crate::hooks::cleanup_hook_status_dir(instance_id);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_build_container_config_uses_detected_codex_for_custom_wrapper_hooks() {
-        let (_hg, _, _tmp_base) = BaseGuard::ready();
-        let temp_home = TempDir::new().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
-
-        crate::session::config::update_config(|global| {
-            global.session.agent_status_hooks = false;
-        })
-        .unwrap();
-
-        let profile_dir = crate::session::get_profile_dir("sandbox-wrapped-codex").unwrap();
-        fs::write(
-            profile_dir.join("config.toml"),
-            r#"[session]
-agent_status_hooks = true
-agent_detect_as = { "wrapped-codex" = "codex" }
-"#,
-        )
-        .unwrap();
-
-        let project_dir = TempDir::new().unwrap();
-        git2::Repository::init(project_dir.path()).unwrap();
-
-        let sandbox_info = crate::session::instance::SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test:latest".to_string(),
-            container_name: "test-container".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        };
-        let instance_id = "wrapped-codex-sandbox-hooks-test";
-        // resolve_config_or_warn inside build_container_config installs the
-        // profile overlay's agent_detect_as into the process-global
-        // registry; restore the prior entries afterwards.
-        let _registry =
-            crate::tmux::status_rules::ProfileRegistryGuard::take("sandbox-wrapped-codex");
-        let config = build_container_config(
-            project_dir.path().to_str().unwrap(),
-            &sandbox_info,
-            ContainerAgentSelection::new("wrapped-codex", None),
-            false,
-            instance_id,
-            None,
-            "sandbox-wrapped-codex",
-        )
-        .unwrap();
-
-        let codex_sandbox = temp_home
-            .path()
-            .join(".codex")
-            .join(SANDBOX_PRIVATE_SUBDIR)
-            .join(instance_id);
-        assert!(codex_sandbox.join("hooks.json").exists());
-        assert!(config.volumes.iter().any(|v| {
-            v.host_path == codex_sandbox.to_string_lossy()
-                && v.container_path == format!("/root/.codex/{instance_id}")
-        }));
-
-        let codex_hooks = fs::read_to_string(codex_sandbox.join("hooks.json")).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&codex_hooks).unwrap();
-        assert!(parsed["hooks"]["PreToolUse"].is_array());
-        assert!(codex_hooks.contains("aoe-hooks"));
-
-        let hook_dir =
-            crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
-        // Canonicalize for comparison (handles /var -> /private/var on macOS);
-        // the mount source is the resolved real path since #3240.
-        let hook_dir = hook_dir.canonicalize().unwrap();
-        assert!(
-            config
-                .volumes
-                .iter()
-                .any(|v| v.host_path == hook_dir.to_string_lossy()),
-            "status hook directory should be mounted for custom Codex wrappers"
-        );
-        crate::hooks::cleanup_hook_status_dir(instance_id);
+            let codex_sandbox = temp_home
+                .path()
+                .join(".codex")
+                .join(SANDBOX_PRIVATE_SUBDIR)
+                .join(&instance_id);
+            assert!(!codex_sandbox.join("config.toml").exists(), "{profile}");
+            assert_eq!(codex_sandbox.join("hooks.json").exists(), installed, "{profile}");
+            if installed {
+                let codex_hooks = fs::read_to_string(codex_sandbox.join("hooks.json")).unwrap();
+                let parsed: serde_json::Value = serde_json::from_str(&codex_hooks).unwrap();
+                assert!(parsed["hooks"]["PreToolUse"].is_array());
+                assert!(codex_hooks.contains("aoe-hooks"));
+                assert!(config.volumes.iter().any(|v| {
+                    v.host_path == codex_sandbox.to_string_lossy()
+                        && v.container_path == format!("/root/.codex/{instance_id}")
+                }));
+            }
+            let hook_dir = crate::hooks::hook_status_dir(&instance_id).unwrap();
+            // Without hooks the directory is never created, so compare lexically.
+            let hook_dir = hook_dir.canonicalize().unwrap_or(hook_dir);
+            assert_eq!(
+                config
+                    .volumes
+                    .iter()
+                    .any(|v| v.host_path == hook_dir.to_string_lossy()),
+                installed,
+                "{profile}: status hook directory mount"
+            );
+            crate::hooks::cleanup_hook_status_dir(&instance_id);
+        }
     }
 
     #[test]

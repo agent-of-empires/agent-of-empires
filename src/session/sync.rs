@@ -1262,27 +1262,47 @@ mod tests {
         assert_eq!(instances[1].agent_session_id, None);
     }
 
+    /// A queued observation (fresh or a correction) is persisted without waiting out the
+    /// timeout, and a launch without a poller returns at once (#3169).
     #[test]
     #[serial]
-    fn cli_capture_persists_poller_observation_to_disk() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-
-        let profile = "sync-cli-capture";
-        let mut inst = Instance::new("cli-capture-title", "/tmp/x");
-        inst.source_profile = profile.to_string();
-        inst.agent_session_id = None;
-        seed_instance_on_disk(profile, &inst);
-
+    fn cli_capture_drains_queued_observations_without_waiting() {
         let fresh = "019342ab-1234-7def-8901-abcdef012345";
-        attach_poller_with_update(&mut inst, fresh);
+        let corrected = "019342ab-1234-7def-8901-cccccccccccc";
+        // (initial sid, poller observation, expected sid)
+        for (initial, observed, expected) in [
+            (None, Some(fresh), Some(fresh)),
+            (Some("already-here"), Some(corrected), Some(corrected)),
+            (None, None, None),
+        ] {
+            let temp = tempdir().unwrap();
+            let _guard = storage_home_guard(&temp);
+            let profile = "sync-cli-capture";
+            let mut inst = Instance::new("cli-capture-title", "/tmp/x");
+            inst.source_profile = profile.to_string();
+            inst.agent_session_id = initial.map(str::to_string);
+            seed_instance_on_disk(profile, &inst);
+            if let Some(observed) = observed {
+                attach_poller_with_update(&mut inst, observed);
+            }
 
-        let file_watch = FileWatchService::noop();
-        capture_launched_session_id_blocking(&mut inst, &file_watch, Duration::from_secs(2), false);
+            let start = Instant::now();
+            capture_launched_session_id_blocking(
+                &mut inst,
+                &FileWatchService::noop(),
+                Duration::from_secs(30),
+                false,
+            );
 
-        assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
-        let loaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert_eq!(loaded[0].agent_session_id.as_deref(), Some(fresh));
+            assert!(start.elapsed() < Duration::from_secs(1), "{observed:?}");
+            assert_eq!(inst.agent_session_id.as_deref(), expected);
+            let loaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
+            assert_eq!(
+                loaded[0].agent_session_id.as_deref(),
+                expected.or(initial),
+                "{observed:?}"
+            );
+        }
     }
 
     // The sidecar names the pane, so a conversation started inside it with `/new` is this session's
@@ -1666,58 +1686,6 @@ mod tests {
             Some(published),
             "the transcript path must be durable before any teardown runs"
         );
-    }
-
-    #[test]
-    #[serial]
-    fn cli_capture_drains_a_queued_correction_before_returning() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-
-        let profile = "sync-cli-noop";
-        let mut inst = Instance::new("cli-capture-noop-title", "/tmp/x");
-        inst.source_profile = profile.to_string();
-        inst.agent_session_id = Some("already-here".to_string());
-        seed_instance_on_disk(profile, &inst);
-        let corrected = "019342ab-1234-7def-8901-cccccccccccc";
-        attach_poller_with_update(&mut inst, corrected);
-
-        let file_watch = FileWatchService::noop();
-        let start = Instant::now();
-        capture_launched_session_id_blocking(
-            &mut inst,
-            &file_watch,
-            Duration::from_secs(30),
-            false,
-        );
-
-        assert!(start.elapsed() < Duration::from_secs(1));
-        assert_eq!(inst.agent_session_id.as_deref(), Some(corrected));
-        let loaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert_eq!(loaded[0].agent_session_id.as_deref(), Some(corrected));
-    }
-
-    #[test]
-    #[serial]
-    fn cli_capture_returns_immediately_without_a_poller() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-
-        let mut inst = Instance::new("cli-capture-nopoller-title", "/tmp/x");
-        inst.source_profile = "sync-cli-nopoller".to_string();
-        inst.agent_session_id = None;
-
-        let file_watch = FileWatchService::noop();
-        let start = Instant::now();
-        capture_launched_session_id_blocking(
-            &mut inst,
-            &file_watch,
-            Duration::from_secs(30),
-            false,
-        );
-
-        assert!(start.elapsed() < Duration::from_secs(1));
-        assert_eq!(inst.agent_session_id, None);
     }
 
     #[test]

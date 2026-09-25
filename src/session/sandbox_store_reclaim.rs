@@ -1163,25 +1163,35 @@ mod tests {
         );
     }
 
+    /// Neither an unproven store nor an owned one whose ownership was revoked mid-deletion
+    /// may be reclaimed: both hold native context aoe cannot prove it created.
     #[test]
-    fn orphan_cleanup_preserves_uncertified_original() {
-        let directory = tempfile::tempdir().unwrap();
-        let app = directory.path().join("app");
-        let home = directory.path().join("home");
-        fs::create_dir_all(&app).unwrap();
-        app_with_rows(&app, &[]);
-        let root = unproven_store(&home, "4444444444444444", 0);
-        fs::create_dir_all(root.join("projects")).unwrap();
-        fs::write(
-            root.join("projects/original.jsonl"),
-            b"UNCERTIFIED_ORIGINAL_CONTEXT",
-        )
-        .unwrap();
-        reclaim_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
-        assert_eq!(
-            fs::read(root.join("projects/original.jsonl")).unwrap(),
-            b"UNCERTIFIED_ORIGINAL_CONTEXT"
-        );
+    fn a_pass_preserves_stores_without_certified_ownership() {
+        type Setup = fn(&Path, &Path) -> PathBuf;
+        let cases: [(&str, Setup); 2] = [
+            ("projects/original.jsonl", |_, home| {
+                unproven_store(home, "4444444444444444", 0)
+            }),
+            ("new-native-context", |app, home| {
+                let id = "6666666666666666";
+                let root = owned_store(app, home, id, 0);
+                let anchor = AnchoredDir::open(&root).unwrap();
+                content::revoke_content_root(app, id, &anchor).unwrap();
+                root
+            }),
+        ];
+        for (file, setup) in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let app = directory.path().join("app");
+            let home = directory.path().join("home");
+            fs::create_dir_all(&app).unwrap();
+            app_with_rows(&app, &[]);
+            let path = setup(&app, &home).join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"UNCERTIFIED_CONTEXT").unwrap();
+            reclaim_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), b"UNCERTIFIED_CONTEXT", "{file}");
+        }
     }
 
     #[test]
@@ -1212,28 +1222,5 @@ mod tests {
             b"REPLACEMENT_ORIGINAL"
         );
         assert!(outcome.removed.is_empty());
-    }
-
-    #[test]
-    fn interrupted_deletion_does_not_reuse_revoked_ownership() {
-        let directory = tempfile::tempdir().unwrap();
-        let app = directory.path().join("app");
-        let home = directory.path().join("home");
-        fs::create_dir_all(&app).unwrap();
-        app_with_rows(&app, &[]);
-        let id = "6666666666666666";
-        let root = owned_store(&app, &home, id, 0);
-        let anchor = AnchoredDir::open(&root).unwrap();
-        content::revoke_content_root(&app, id, &anchor).unwrap();
-        fs::write(
-            root.join("new-native-context"),
-            b"UNPROVEN_AFTER_INTERRUPTION",
-        )
-        .unwrap();
-        reclaim_in(&app, &[], &home, NO_GRACE, &gone).unwrap();
-        assert_eq!(
-            fs::read(root.join("new-native-context")).unwrap(),
-            b"UNPROVEN_AFTER_INTERRUPTION"
-        );
     }
 }
