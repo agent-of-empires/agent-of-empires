@@ -764,10 +764,7 @@ pub(super) fn apply_claude_store_pin(
             .filter(|value| !value.is_empty())
     };
     let home = value("HOME").map(std::path::PathBuf::from);
-    let default = home
-        .as_deref()
-        .is_some_and(|home| crate::session::capture::is_default_claude_store(&pin.store, home));
-    let export = !default || pin.exported_default_store == Some(true);
+    let export = crate::session::capture::exports_claude_store(pin, home.as_deref());
     environment.retain(|(key, _)| key != "CLAUDE_CONFIG_DIR");
     if export {
         environment.push((

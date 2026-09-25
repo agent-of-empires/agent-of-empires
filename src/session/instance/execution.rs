@@ -38,10 +38,7 @@ pub struct ExecutionBinding {
 
 impl PartialEq for ExecutionBinding {
     fn eq(&self, other: &Self) -> bool {
-        self.key("") == other.key("")
-            && self.configuration == other.configuration
-            && self.cwd == other.cwd
-            && self.cwd_filesystem == other.cwd_filesystem
+        self.identity() == other.identity()
     }
 }
 
@@ -49,14 +46,31 @@ impl Eq for ExecutionBinding {}
 
 impl std::hash::Hash for ExecutionBinding {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.key("").hash(state);
-        self.configuration.hash(state);
-        self.cwd.hash(state);
-        self.cwd_filesystem.hash(state);
+        self.identity().hash(state);
     }
 }
 
 impl ExecutionBinding {
+    fn identity(
+        &self,
+    ) -> (
+        &str,
+        &[PathBuf],
+        &[ExecutionLocation],
+        &std::path::Path,
+        &str,
+        &str,
+    ) {
+        (
+            &self.agent,
+            &self.stores,
+            &self.configuration,
+            &self.cwd,
+            &self.cwd_filesystem,
+            &self.filesystem,
+        )
+    }
+
     pub(crate) fn key<'a>(&'a self, sid: &'a str) -> ConversationKey<'a> {
         ConversationKey {
             session_id: sid,
@@ -1244,7 +1258,8 @@ impl Instance {
                         let selected_alias = self.is_explicit_claude_store_alias(&root, &home);
                         let exported_this_store = value("CLAUDE_CONFIG_DIR")
                             .filter(|value| !value.is_empty())
-                            .is_some_and(|value| absolute(PathBuf::from(value)) == root);
+                            .and_then(|value| inputs.canonical_path(&absolute(PathBuf::from(value))).ok())
+                            .is_some_and(|value| inputs.canonical_path(&root).ok().as_ref() == Some(&value));
                         selected_alias || exported_this_store
                     });
                 let export = inputs.container.is_some() || explicit || !default;

@@ -51,6 +51,13 @@ pub(crate) fn is_default_claude_store(store: &Path, home: &Path) -> bool {
     identity(store) == identity(&home.join(".claude"))
 }
 
+/// Whether the effective route for `pin` exports `CLAUDE_CONFIG_DIR` at `home`.
+pub(crate) fn exports_claude_store(pin: &ClaudeStorePin, home: Option<&Path>) -> bool {
+    !home.is_some_and(|home| {
+        is_default_claude_store(&pin.store, home) && pin.exported_default_store != Some(true)
+    })
+}
+
 /// The store and export provenance pinned by a conversation binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeStorePin {

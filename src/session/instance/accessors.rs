@@ -666,7 +666,7 @@ impl Instance {
             let Some(binding) = binding else {
                 return false;
             };
-            if binding.session_id != sid {
+            if binding.session_id != sid || !binding.is_known() {
                 return false;
             }
             let Some(execution) = binding.execution.as_ref() else {

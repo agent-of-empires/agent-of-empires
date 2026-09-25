@@ -89,10 +89,6 @@ pub(super) fn request_env_denyreason(key: &str) -> Option<&'static str> {
     })
 }
 
-fn allowlist_env_denyreason(key: &str) -> Option<&'static str> {
-    provider_env_denyreason(key)
-}
-
 /// Trusted operator config may set infrastructure keys (as a terminal pane
 /// can); only aoe's token and the daemon to runner carrier are banned. Shared
 /// with the runner's spawn so the policies cannot drift.
@@ -170,7 +166,7 @@ pub(super) fn allowlisted_env_pairs(config: &SpawnConfig) -> Vec<(String, String
     };
     let mut pairs = Vec::new();
     for name in allowlist {
-        if let Some(reason) = allowlist_env_denyreason(name) {
+        if let Some(reason) = provider_env_denyreason(name) {
             warn!(target: "acp", key = %name, reason, "ignoring env allowlist entry");
             continue;
         }
@@ -228,12 +224,12 @@ pub(super) fn apply_env_filter(
         cmd.env(key, value);
         keys.provider.push(key.clone());
     }
-    apply_claude_store_route(cmd, config);
+
     keys
 }
 
 /// Applies the pin after ambient, inherited, allowlist, and provider layers.
-fn apply_claude_store_route(cmd: &mut std::process::Command, config: &SpawnConfig) {
+pub(super) fn apply_claude_store_route(cmd: &mut std::process::Command, config: &SpawnConfig) {
     let Some(pin) = config.claude_store_pin.as_ref() else {
         return;
     };
@@ -246,10 +242,7 @@ fn apply_claude_store_route(cmd: &mut std::process::Command, config: &SpawnConfi
         .or_else(|| effective_env_value(cmd, "HOME").filter(|value| !value.is_empty()))
         .or_else(|| std::env::var("HOME").ok().filter(|value| !value.is_empty()))
         .map(PathBuf::from);
-    let should_export = !home.is_some_and(|home| {
-        crate::session::capture::is_default_claude_store(&pin.store, &home)
-            && pin.exported_default_store != Some(true)
-    });
+    let should_export = crate::session::capture::exports_claude_store(pin, home.as_deref());
     if should_export {
         cmd.env("CLAUDE_CONFIG_DIR", &pin.store);
     } else {
@@ -472,6 +465,7 @@ mod tests {
         let mut cmd = std::process::Command::new("/bin/true");
         cmd.env_clear();
         apply_env_filter(&mut cmd, config, &[]);
+        apply_claude_store_route(&mut cmd, config);
         cmd.get_envs()
             .filter_map(|(k, v)| {
                 Some((
