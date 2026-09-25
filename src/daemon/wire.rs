@@ -276,7 +276,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_response_decodes_with_only_an_id() {
+    fn session_rows_and_envelope_decode_from_minimal_payloads() {
         let row: SessionResponse = serde_json::from_str(r#"{"id":"a"}"#).unwrap();
         assert_eq!(row.id, "a");
         assert_eq!(row.status, "");
@@ -287,10 +287,7 @@ mod tests {
         assert_eq!(row.context_resume, None);
 
         assert!(serde_json::from_str::<SessionResponse>(r#"{"title":"no id"}"#).is_err());
-    }
 
-    #[test]
-    fn sessions_envelope_decodes_without_workspace_ordering() {
         let envelope: SessionsEnvelope =
             serde_json::from_str(r#"{"sessions":[{"id":"a"}]}"#).unwrap();
         assert_eq!(envelope.sessions.len(), 1);
