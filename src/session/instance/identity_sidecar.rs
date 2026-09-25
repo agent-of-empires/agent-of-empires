@@ -289,6 +289,7 @@ impl Instance {
         })
     }
 
+    /// Whether this conversation still owns the observation's Pi transcript path.
     pub(crate) fn observation_is_current_pi_path(
         &self,
         observation: &crate::session::poller::SessionIdObservation,

@@ -587,7 +587,8 @@ fn drain_poller(inst: &Instance) -> Option<SessionIdObservation> {
         .map(|(_instance_id, observation)| observation)
 }
 
-/// Inspect the sticky poller mailbox without cloning its pending observation.
+/// Drain newly queued observations into the sticky mailbox, then test the pending one without
+/// cloning it. The predicate sees only the newest observation.
 pub(crate) fn pending_poller_observation_matches(
     inst: &Instance,
     predicate: impl FnOnce(&SessionIdObservation) -> bool,
@@ -1490,6 +1491,7 @@ mod tests {
                 agent: "pi".into(),
                 stores: vec!["/tmp/pi-store".into()],
                 configuration: Vec::new(),
+                exported_default_store: false,
                 cwd: "/tmp/pi-stale-after-failed-path".into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),

@@ -640,7 +640,8 @@ impl SessionPoller {
         self.pending_observation.clone()
     }
 
-    /// Inspect the sticky mailbox without cloning its pending observation.
+    /// Drain newly queued observations into the sticky mailbox, then test the pending one without
+    /// cloning it. The predicate sees only the newest observation.
     pub(crate) fn pending_observation_matches(
         &mut self,
         predicate: impl FnOnce(&SessionIdObservation) -> bool,

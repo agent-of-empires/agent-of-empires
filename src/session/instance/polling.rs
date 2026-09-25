@@ -26,6 +26,7 @@ fn clear_after_final_pi_drain_hook() {
 }
 
 #[cfg(test)]
+#[must_use = "binds the Pi drain hook cleanup to this guard's lifetime"]
 pub(crate) struct FinalPiDrainHookGuard;
 
 #[cfg(test)]
