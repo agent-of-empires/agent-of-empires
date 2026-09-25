@@ -63,30 +63,22 @@ test.describe("Mobile soft-keyboard Backspace autorepeat", () => {
     await expect.poll(() => handle.liveMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
   }
 
-  test("holding Backspace sends one DEL per autorepeat tick", async ({ page }) => {
+  test("a Backspace tap sends one DEL and holding it sends one DEL per autorepeat tick", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await openSession(page, handle);
-
-    const start = handle.liveMessages.length;
-    await fireDeleteBackward(page, 5);
-
-    // Core bug: pre-fix this stream produced a single DEL (or none); post-fix
-    // each tick maps to one DEL.
-    await expect.poll(() => delCount(handle, start), { timeout: 5_000 }).toBe(5);
-  });
-
-  test("single Backspace tap sends exactly one DEL (no double-delete)", async ({ page }) => {
-    const handle = await mockTerminalApis(page);
-    await openSession(page, handle);
-
-    const start = handle.liveMessages.length;
-    await fireDeleteBackward(page, 1);
 
     // A single native edit must not be forwarded twice.
+    const start = handle.liveMessages.length;
+    await fireDeleteBackward(page, 1);
     await expect.poll(() => delCount(handle, start), { timeout: 5_000 }).toBe(1);
     await observeFor(page, 200, async () => {
       expect(delCount(handle, start)).toBe(1);
     });
+
+    // Core bug: pre-fix a held stream produced a single DEL (or none); post-fix
+    // each tick maps to one DEL.
+    await fireDeleteBackward(page, 5);
+    await expect.poll(() => delCount(handle, start), { timeout: 5_000 }).toBe(6);
   });
 
   test("Backspace during IME composition is not forwarded", async ({ page }) => {

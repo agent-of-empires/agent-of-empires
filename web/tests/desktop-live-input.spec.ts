@@ -46,28 +46,9 @@ test.describe("Desktop live terminal input", () => {
     await expect(pane).not.toHaveAttribute("data-pane-focused", "true");
   });
 
-  test("Ctrl+V pastes as a bracketed paste instead of sending a literal ^V", async ({ page }) => {
-    // #2384: Ctrl+V falls through to the native paste event instead of sending ^V.
-    const handle = await mockTerminalApis(page);
-    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
-    await page.goto("/");
-    await clickSidebarSession(page, "pinch-test");
-    await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
-    await page.locator("[data-live-terminal]").first().click();
-    await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
-
-    await page.evaluate(() => navigator.clipboard.writeText("pasted text"));
-    const before = handle.liveMessages.length;
-    await page.keyboard.press("Control+v");
-
-    await expect
-      .poll(() => handle.liveMessages.slice(before).map((m) => m.toString("utf8")))
-      .toContainEqual("\x1b[200~pasted text\x1b[201~");
-    const sentCtrlV = handle.liveMessages.slice(before).some((m) => m.toString("utf8") === "\x16");
-    expect(sentCtrlV).toBe(false);
-  });
-
-  test("Ctrl+Shift+C copies the terminal selection without sending ^C", async ({ page }) => {
+  test("Ctrl+Shift+C copies the selection without ^C, and Ctrl+V pastes as a bracketed paste without ^V", async ({
+    page,
+  }) => {
     // #2384: Ctrl+Shift+C copies the DOM selection; the focused hidden input would copy nothing, and Ctrl+C stays SIGINT.
     const handle = await mockTerminalApis(page);
     await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
@@ -110,6 +91,18 @@ test.describe("Desktop live terminal input", () => {
     await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(selected);
     const sentSigint = handle.liveMessages.slice(before).some((m) => m.toString("utf8") === "\x03");
     expect(sentSigint).toBe(false);
+
+    // #2384: Ctrl+V falls through to the native paste event instead of sending ^V.
+    await page.evaluate(() => navigator.clipboard.writeText("pasted text"));
+    await page.evaluate(() => window.getSelection()?.removeAllRanges());
+    await page.locator("[data-live-terminal]").first().click();
+    await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
+    const beforePaste = handle.liveMessages.length;
+    await page.keyboard.press("Control+v");
+    await expect
+      .poll(() => handle.liveMessages.slice(beforePaste).map((m) => m.toString("utf8")))
+      .toContainEqual("\x1b[200~pasted text\x1b[201~");
+    expect(handle.liveMessages.slice(beforePaste).some((m) => m.toString("utf8") === "\x16")).toBe(false);
   });
 
   test("an agent OSC 52 copy reaches the browser clipboard after mouse release", async ({ page }) => {

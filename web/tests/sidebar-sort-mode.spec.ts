@@ -63,7 +63,7 @@ async function selectSortMode(page: Page, mode: string): Promise<void> {
 }
 
 test.describe("Sidebar sort picker (#1418, #1640)", () => {
-  test("selecting last-activity reorders desc and persists", async ({ page, context }) => {
+  test("last-activity reorders desc, persists, and drops drag affordances until manual returns", async ({ page }) => {
     const sessions: MockSession[] = [
       {
         id: "s-old",
@@ -81,18 +81,34 @@ test.describe("Sidebar sort picker (#1418, #1640)", () => {
         last_accessed_at: "2025-04-15T00:00:00Z",
       },
     ];
+    const puts: string[][] = [];
     await mockApis(
       page,
       () => sessions,
       () => ["/tmp/repo::feature/old", "/tmp/repo::feature/new"],
+      (order) => puts.push(order),
     );
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
     await expect.poll(() => readWorkspaceTitles(page), { timeout: 8000 }).toEqual(["old-ws", "new-ws"]);
 
+    const handles = page.locator("[aria-roledescription='Press and hold to reorder']");
+    const draggableHeaders = page.locator("[data-testid='sidebar-group-header'][data-draggable='true']");
+    await expect(handles).toHaveCount(2);
+    await expect(draggableHeaders).not.toHaveCount(0);
+
     await selectSortMode(page, "lastActivity");
     await expect.poll(() => readWorkspaceTitles(page), { timeout: 4000 }).toEqual(["new-ws", "old-ws"]);
+
+    // Row and group-header drag affordances are gone, and a drag attempt PUTs nothing.
+    await expect(handles).toHaveCount(0);
+    await expect(draggableHeaders).toHaveCount(0);
+    const sourceBox = (await page.locator("[data-testid='sidebar-session-row']").nth(1).boundingBox())!;
+    await page.mouse.move(sourceBox.x + sourceBox.width - 4, sourceBox.y + sourceBox.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(sourceBox.x + 4, sourceBox.y + 4, { steps: 6 });
+    await page.mouse.up();
 
     const stored = await page.evaluate(() => window.localStorage.getItem("aoe-sidebar-sort-mode"));
     expect(stored).toBe("lastActivity");
@@ -103,58 +119,8 @@ test.describe("Sidebar sort picker (#1418, #1640)", () => {
 
     await selectSortMode(page, "manual");
     await expect.poll(() => readWorkspaceTitles(page), { timeout: 4000 }).toEqual(["old-ws", "new-ws"]);
-    // suppress unused-binding lint without changing the signature
-    void context;
-  });
-
-  test("row and group-header drag affordances are absent in last-activity mode", async ({ page }) => {
-    const sessions: MockSession[] = [
-      {
-        id: "s1",
-        title: "alpha",
-        project_path: "/tmp/repo",
-        branch: "feature/a",
-        created_at: "2025-01-01T00:00:00Z",
-      },
-      {
-        id: "s2",
-        title: "beta",
-        project_path: "/tmp/repo",
-        branch: "feature/b",
-        created_at: "2025-02-01T00:00:00Z",
-      },
-    ];
-    const puts: string[][] = [];
-    await mockApis(
-      page,
-      () => sessions,
-      () => ["/tmp/repo::feature/a", "/tmp/repo::feature/b"],
-      (order) => puts.push(order),
-    );
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-
-    await expect(page.locator("[aria-roledescription='Press and hold to reorder']")).toHaveCount(2, { timeout: 8000 });
-
-    const draggableHeaders = page.locator("[data-testid='sidebar-group-header'][data-draggable='true']");
-    await expect(draggableHeaders).not.toHaveCount(0);
-    await selectSortMode(page, "lastActivity");
-
-    await expect(page.locator("[aria-roledescription='Press and hold to reorder']")).toHaveCount(0);
-    await expect(draggableHeaders).toHaveCount(0);
-
-    const rows = page.locator("[data-testid='sidebar-session-row']");
-    const sourceBox = await rows.nth(1).boundingBox();
-    if (!sourceBox) throw new Error("row missing");
-    await page.mouse.move(sourceBox.x + sourceBox.width - 4, sourceBox.y + sourceBox.height / 2);
-    await page.mouse.down();
-    await page.mouse.move(sourceBox.x + 4, sourceBox.y + 4, { steps: 6 });
-    await page.mouse.up();
-
-    await selectSortMode(page, "manual");
-    await expect(page.locator("[aria-roledescription='Press and hold to reorder']")).toHaveCount(2);
-
-    expect(puts.length).toBe(0);
+    await expect(handles).toHaveCount(2);
+    expect(puts).toEqual([]);
   });
 
   // #1836, #2214: the trigger uses the shared portaled Tooltip, not a native title, and the list gains a separator.

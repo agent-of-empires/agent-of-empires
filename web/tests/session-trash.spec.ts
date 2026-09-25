@@ -74,29 +74,11 @@ test.describe("Multi-session workspace trash", () => {
     list: dialog.locator('[data-testid="delete-session-affected-list"]'),
   });
 
-  test("live workspace Delete presents workspace trash scope (#2538)", async ({ page }) => {
+  // #2538: the dialog is workspace-shaped and trash-first when any live session defaults to Trash.
+  test("live workspace Delete presents workspace trash scope, trash-first if any session defaults to Trash (#2538)", async ({
+    page,
+  }) => {
     const handle = await install(
-      page,
-      workspace(
-        { id: "sess-a", groupPath: "alpha", trashed: false },
-        { id: "sess-b", groupPath: "alpha", trashed: false },
-      ),
-    );
-    await page.goto("/");
-
-    const dialog = await openDeleteDialogFromRow(page, sessionRows(page).first());
-    await expect(dialog.locator("#delete-session-dialog-title")).toContainText("Delete Workspace");
-    await expect(dialog).toContainText("Move this workspace to Trash?");
-    await expect(affected(dialog).count).toContainText("all 2 sessions");
-    await expect(affected(dialog).list).toContainText("sess-a");
-    await expect(affected(dialog).list).toContainText("sess-b");
-
-    await confirmDelete(dialog);
-    await expect.poll(() => [...handle.trashedIds].sort(), { timeout: 10_000 }).toEqual(["sess-a", "sess-b"]);
-  });
-
-  test("workspace Delete uses trash-first when any live session defaults to Trash (#2538)", async ({ page }) => {
-    await install(
       page,
       workspace(
         { id: "sess-a", groupPath: "alpha", trashed: false, deleteToTrash: false },
@@ -106,8 +88,15 @@ test.describe("Multi-session workspace trash", () => {
     await page.goto("/");
 
     const dialog = await openDeleteDialogFromRow(page, sessionRows(page).first());
-    await expect(dialog).toContainText("Move this workspace to Trash?", { timeout: 5_000 });
+    await expect(dialog.locator("#delete-session-dialog-title")).toContainText("Delete Workspace");
+    await expect(dialog).toContainText("Move this workspace to Trash?");
     await expect(dialog.locator('[data-testid="delete-session-permanent"]')).toBeVisible();
+    await expect(affected(dialog).count).toContainText("all 2 sessions");
+    await expect(affected(dialog).list).toContainText("sess-a");
+    await expect(affected(dialog).list).toContainText("sess-b");
+
+    await confirmDelete(dialog);
+    await expect.poll(() => [...handle.trashedIds].sort(), { timeout: 10_000 }).toEqual(["sess-a", "sess-b"]);
   });
 
   test("stop, start, and delete on a group slice act only on that row's sessions (#4019)", async ({ page }) => {

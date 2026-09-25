@@ -72,7 +72,9 @@ test.describe("chat bubble overflow", () => {
   });
 });
 
-test("send message via Enter renders the streamed agent response as one message", async ({ page }) => {
+test("Enter sends a multi-line message that keeps its line breaks and renders the streamed response as one message", async ({
+  page,
+}) => {
   const mock = await mockAcpSession(page, {
     title: "story-send-enter",
     onPrompt: () => [
@@ -86,7 +88,7 @@ test("send message via Enter renders the streamed agent response as one message"
   await waitForComposerConnected(page);
 
   const composer = composerBox(page);
-  await composer.fill("hello agent");
+  await composer.fill("hello agent\nline b\nline c");
   await composer.press("Enter");
 
   await expect(page.getByText("Hello from fake ACP agent.")).toBeVisible({
@@ -95,21 +97,10 @@ test("send message via Enter renders the streamed agent response as one message"
   // The clear can land after the streamed chunk renders.
   await expect(composer).toHaveValue("", { timeout: 5_000 });
 
-  expect(mock.promptBodies.map((b) => b.text)).toEqual(["hello agent"]);
-});
-
-// #1472: single newlines survive in the sent user bubble.
-test("single newlines in a user message render as line breaks", async ({ page }) => {
-  const mock = await mockAcpSession(page, { title: "story-single-newline" });
-  await openStructuredSession(page, mock);
-  await waitForComposerConnected(page);
-
-  const composer = composerBox(page);
-  await composer.fill("line a\nline b\nline c");
-  await composer.press("Enter");
-
-  const userBubble = page.locator("div.rounded-br-sm").filter({ hasText: "line a" });
-  await expect(userBubble).toBeVisible({ timeout: 10_000 });
+  expect(mock.promptBodies.map((b) => b.text)).toEqual(["hello agent\nline b\nline c"]);
+  // #1472: single newlines survive in the sent user bubble.
+  const userBubble = page.locator("div.rounded-br-sm").filter({ hasText: "hello agent" });
+  await expect(userBubble).toBeVisible();
   await expect(userBubble.locator("br")).toHaveCount(2);
   await expect(userBubble).toContainText("line b");
   await expect(userBubble).toContainText("line c");
