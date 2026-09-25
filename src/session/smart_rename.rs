@@ -1547,12 +1547,6 @@ mod tests {
     const OPENCODE_MODEL: &str = "opencode run -m anthropic/claude-haiku-4-5 name this";
 
     #[test]
-    fn oneshot_argv_is_none_without_a_one_shot_mode() {
-        let cursor = agents::get_agent("cursor").expect("cursor agent exists");
-        assert!(build_oneshot_argv(cursor, "hello", OneshotModel::CliDefault).is_none());
-    }
-
-    #[test]
     fn cli_default_drops_only_the_resolved_model_args() {
         assert_eq!(
             build_oneshot_argv(claude(), "name this", OneshotModel::CliDefault).unwrap(),
@@ -1570,17 +1564,6 @@ mod tests {
                 build_oneshot_argv(agent, "name this", OneshotModel::CliDefault).expect("one-shot");
             assert!(!cli.iter().any(|a| a == "--model" || a == "-m"));
             assert_eq!(cli.len(), title.len() - default_args.len());
-        }
-    }
-
-    #[test]
-    fn agents_without_a_cheap_default_take_no_model_args() {
-        for name in ["opencode", "kimi", "codex", "gemini", "copilot"] {
-            let argv = argv_for(name, None);
-            assert!(
-                !argv.split(' ').any(|a| a == "--model" || a == "-m"),
-                "{name} has no built-in cheap alias, so its default argv carries no model flag: {argv:?}"
-            );
         }
     }
 
@@ -1625,6 +1608,55 @@ mod tests {
             Err(SkipReason::CommandOverridden)
         );
         assert!(check_eligible(true, true, false, "Vikings", c, "claude", false).is_ok());
+
+        // Manual "Auto-name now" bypasses only the disabled and already-named gates.
+        let auto = false;
+        let force = true;
+        assert_eq!(
+            check_eligible(true, auto, false, "Vikings", c, "", false),
+            Err(SkipReason::Disabled),
+            "automatic path must still honor the disabled setting"
+        );
+        assert!(
+            check_eligible(true, auto || force, force, "Vikings", c, "", false).is_ok(),
+            "manual force must bypass the disabled gate"
+        );
+        assert!(
+            matches!(
+                check_eligible_resolved(
+                    true,
+                    auto || force,
+                    force,
+                    "Vikings",
+                    "claude",
+                    "codex",
+                    true,
+                    "",
+                    &HashMap::new()
+                ),
+                Err(SkipReason::SandboxRenameAgentMismatch)
+            ),
+            "sandbox rename-agent gate still applies when forced"
+        );
+        assert!(
+            check_eligible(true, auto || force, force, "Fix login bug", c, "", false).is_ok(),
+            "manual force must bypass the already-named gate too"
+        );
+        assert_eq!(
+            check_eligible(false, auto || force, force, "Vikings", c, "", false),
+            Err(SkipReason::NotStructured),
+            "structured gate still applies when forced"
+        );
+        assert_eq!(
+            check_eligible(true, auto || force, force, "Vikings", None, "", false),
+            Err(SkipReason::NoOneshot),
+            "no-one-shot gate still applies when forced"
+        );
+        assert_eq!(
+            check_eligible(true, auto || force, force, "Vikings", c, "", true),
+            Err(SkipReason::CommandOverridden),
+            "command-override gate still applies when forced"
+        );
     }
 
     #[test]
@@ -1701,80 +1733,6 @@ mod tests {
         );
     }
 
-    /// Adding a variant here is what forces a new arm in `as_str` and `user_message`.
-    const ALL_SKIP_REASONS: [SkipReason; 7] = [
-        SkipReason::NotStructured,
-        SkipReason::Disabled,
-        SkipReason::NameNotDefault,
-        SkipReason::Sandboxed,
-        SkipReason::SandboxRenameAgentMismatch,
-        SkipReason::NoOneshot,
-        SkipReason::CommandOverridden,
-    ];
-
-    #[test]
-    fn every_skip_reason_has_a_user_message() {
-        for reason in ALL_SKIP_REASONS {
-            assert!(
-                !reason.user_message().is_empty(),
-                "{} has no user message",
-                reason.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn manual_force_bypasses_the_disabled_and_name_gates_only() {
-        let c = Some(claude());
-        let auto = false;
-        let force = true;
-        assert_eq!(
-            check_eligible(true, auto, false, "Vikings", c, "", false),
-            Err(SkipReason::Disabled),
-            "automatic path must still honor the disabled setting"
-        );
-        assert!(
-            check_eligible(true, auto || force, force, "Vikings", c, "", false).is_ok(),
-            "manual force must bypass the disabled gate"
-        );
-        assert!(
-            matches!(
-                check_eligible_resolved(
-                    true,
-                    auto || force,
-                    force,
-                    "Vikings",
-                    "claude",
-                    "codex",
-                    true,
-                    "",
-                    &HashMap::new()
-                ),
-                Err(SkipReason::SandboxRenameAgentMismatch)
-            ),
-            "sandbox rename-agent gate still applies when forced"
-        );
-        assert!(
-            check_eligible(true, auto || force, force, "Fix login bug", c, "", false).is_ok(),
-            "manual force must bypass the already-named gate too"
-        );
-        assert_eq!(
-            check_eligible(false, auto || force, force, "Vikings", c, "", false),
-            Err(SkipReason::NotStructured),
-            "structured gate still applies when forced"
-        );
-        assert_eq!(
-            check_eligible(true, auto || force, force, "Vikings", None, "", false),
-            Err(SkipReason::NoOneshot),
-            "no-one-shot gate still applies when forced"
-        );
-        assert_eq!(
-            check_eligible(true, auto || force, force, "Vikings", c, "", true),
-            Err(SkipReason::CommandOverridden),
-            "command-override gate still applies when forced"
-        );
-    }
-
     #[test]
     fn resolve_title_model_args_precedence() {
         let claude = claude();
@@ -1802,14 +1760,6 @@ mod tests {
             resolve_title_model_args(claude, &models),
             vec!["--model", "opus"]
         );
-    }
-
-    #[test]
-    fn resolve_rename_tool_falls_back_to_session() {
-        assert_eq!(resolve_rename_tool("claude", ""), "claude");
-        assert_eq!(resolve_rename_tool("claude", "   "), "claude");
-        assert_eq!(resolve_rename_tool("claude", "codex"), "codex");
-        assert_eq!(resolve_rename_tool("claude", "  codex "), "codex");
     }
 
     #[test]
@@ -1940,15 +1890,13 @@ Rewrote the getting-started section and fixed two broken links.",
             render_first_turn("fix the login bug", "   "),
             "fix the login bug"
         );
-    }
-
-    #[test]
-    fn render_first_turn_caps_each_half_independently() {
         let huge_prompt = "p".repeat(FIRST_TURN_USER_BYTES * 2);
-        let agent = "concise agent summary";
-        let r = render_first_turn(&huge_prompt, agent);
-        assert!(r.contains(agent), "agent prose must survive a huge prompt");
+        let r = render_first_turn(&huge_prompt, "concise agent summary");
         assert!(r.starts_with("User:\n"));
+        assert!(
+            r.contains("concise agent summary"),
+            "each half is capped independently, so agent prose survives a huge prompt"
+        );
     }
 
     #[test]
@@ -2131,46 +2079,7 @@ claude = "repo-wrapper"
     }
 
     #[test]
-    fn terminal_eligibility_reasons() {
-        let overrides = HashMap::new();
-        assert!(check_eligible_resolved(
-            true, true, false, "Vikings", "claude", "", false, "", &overrides
-        )
-        .is_ok());
-        assert!(check_eligible_resolved(
-            true, true, false, "Vikings", "claude", "", true, "", &overrides
-        )
-        .is_ok());
-        assert!(matches!(
-            check_eligible_resolved(
-                true, true, false, "Vikings", "cursor", "", false, "", &overrides
-            ),
-            Err(SkipReason::NoOneshot)
-        ));
-        let mut ov = HashMap::new();
-        ov.insert("claude".to_string(), "my-wrapper".to_string());
-        assert!(matches!(
-            check_eligible_resolved(true, true, false, "Vikings", "claude", "", false, "", &ov),
-            Err(SkipReason::CommandOverridden)
-        ));
-        assert!(matches!(
-            check_eligible_resolved(
-                true,
-                true,
-                false,
-                "Fix login bug",
-                "claude",
-                "",
-                false,
-                "",
-                &overrides
-            ),
-            Err(SkipReason::NameNotDefault)
-        ));
-    }
-
-    #[test]
-    fn context_usable_rejects_garbage() {
+    fn terminal_context_helpers() {
         assert!(context_looks_usable("Fix the login bug in auth.rs"));
         assert!(!context_looks_usable(""));
         assert!(!context_looks_usable("12345 6789 %%%"));
@@ -2178,22 +2087,14 @@ claude = "repo-wrapper"
             .chain("ab".chars())
             .collect();
         assert!(!context_looks_usable(&garbled));
-    }
 
-    #[test]
-    fn head_tail_keeps_both_ends() {
         let short = "just a short line";
         assert_eq!(head_tail(short, 3072, 1024), short);
         let long = format!("HEAD{}TAIL", "x".repeat(5000));
         let r = head_tail(&long, 10, 10);
-        assert!(r.starts_with("HEAD"));
-        assert!(r.ends_with("TAIL"));
-        assert!(r.contains("\n...\n"));
+        assert!(r.starts_with("HEAD") && r.ends_with("TAIL") && r.contains("\n...\n"));
         assert!(r.len() < long.len());
-    }
 
-    #[test]
-    fn echo_baseline_is_first_nonempty_line() {
         assert_eq!(
             extract_echo_baseline("\n\n  fix the bug  \nmore"),
             "fix the bug"

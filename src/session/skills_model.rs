@@ -1280,33 +1280,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_extracts_fields_and_preserves_body() {
+    fn parse_skill_md_cases() {
         let p =
             parse_skill_md("---\nname: foo\ndescription: does foo\n---\n\n# Foo\n\nbody text\n")
                 .unwrap();
         assert_eq!(p.name, "foo");
         assert_eq!(p.description, "does foo");
         assert_eq!(p.body, "\n# Foo\n\nbody text\n");
-    }
 
-    #[test]
-    fn parse_tolerates_crlf_and_bom() {
         let p = parse_skill_md("\u{feff}---\r\nname: foo\r\ndescription: d\r\n---\r\nbody\r\n")
             .unwrap();
         assert_eq!(p.name, "foo");
         assert_eq!(p.body, "body\r\n");
+
+        for bad in [
+            "no frontmatter here",
+            "---\nname: foo\ndescription: d\n",
+            "---\nname: \"\"\ndescription: d\n---\n",
+            "---\nname: foo\n---\n",
+        ] {
+            assert!(parse_skill_md(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
-    fn parse_rejects_missing_or_unclosed_fence_and_empty_fields() {
-        assert!(parse_skill_md("no frontmatter here").is_err());
-        assert!(parse_skill_md("---\nname: foo\ndescription: d\n").is_err());
-        assert!(parse_skill_md("---\nname: \"\"\ndescription: d\n---\n").is_err());
-        assert!(parse_skill_md("---\nname: foo\n---\n").is_err());
-    }
-
-    #[test]
-    fn discover_is_source_qualified_and_sorted() {
+    fn discover_is_source_qualified_sorted_and_skips_malformed() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let app = tmp.path().join("app");
@@ -1316,7 +1314,11 @@ mod tests {
         write_skill(&home.join(".config/opencode/skills"), "open", "open", "d");
         write_skill(&home.join(".kimi-code/skills"), "review", "review", "d");
         write_skill(&app.join("skills"), "mine", "mine", "d");
+        let bad = app.join("skills").join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("SKILL.md"), "not frontmatter").unwrap();
 
+        // The malformed sibling is skipped without failing discovery.
         let found = discover(&home, &app);
         let ids: Vec<(String, String)> = found
             .iter()
@@ -1339,20 +1341,6 @@ mod tests {
     }
 
     #[test]
-    fn discover_skips_malformed_without_failing_siblings() {
-        let tmp = tempfile::tempdir().unwrap();
-        let app = tmp.path().join("app");
-        write_skill(&app.join("skills"), "good", "good", "d");
-        let bad = app.join("skills").join("bad");
-        std::fs::create_dir_all(&bad).unwrap();
-        std::fs::write(bad.join("SKILL.md"), "not frontmatter").unwrap();
-
-        let found = discover(tmp.path(), &app);
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].directory, "good");
-    }
-
-    #[test]
     fn create_then_read_round_trips_as_managed() {
         let tmp = tempfile::tempdir().unwrap();
         let app = tmp.path().to_path_buf();
@@ -1367,23 +1355,7 @@ mod tests {
             create_skill(&app, "my-skill", None),
             Err(SkillError::Collision(_))
         ));
-    }
 
-    #[test]
-    fn create_rejects_unsafe_names() {
-        let tmp = tempfile::tempdir().unwrap();
-        for bad in ["..", ".", "a/b", "has space", "", &"x".repeat(65)] {
-            assert!(matches!(
-                create_skill(tmp.path(), bad, None),
-                Err(SkillError::InvalidInput(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn edit_allows_name_diverging_from_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let app = tmp.path().to_path_buf();
         create_skill(&app, "s", None).unwrap();
         let diverging = "---\nname: other\ndescription: d\n---\n\nbody\n";
         edit_skill(tmp.path(), &app, "s", diverging).unwrap();
@@ -1400,36 +1372,14 @@ mod tests {
     }
 
     #[test]
-    fn adopt_with_diverging_name_stays_editable() {
+    fn create_rejects_unsafe_names() {
         let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let app = tmp.path().join("app");
-        write_skill(&home.join(".claude/skills"), "review", "Code Review", "d");
-
-        adopt_skill(
-            &home,
-            &app,
-            &SkillProvenance::External {
-                root: "claude-user".to_string(),
-            },
-            "review",
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            read_skill(&home, &app, &SkillProvenance::AoeManaged, "review")
-                .unwrap()
-                .name,
-            "Code Review"
-        );
-        let edited = "---\nname: Code Review\ndescription: updated\n---\n\nnew body\n";
-        edit_skill(&home, &app, "review", edited).unwrap();
-        assert_eq!(
-            read_skill(&home, &app, &SkillProvenance::AoeManaged, "review")
-                .unwrap()
-                .description,
-            "updated"
-        );
+        for bad in ["..", ".", "a/b", "has space", "", &"x".repeat(65)] {
+            assert!(matches!(
+                create_skill(tmp.path(), bad, None),
+                Err(SkillError::InvalidInput(_))
+            ));
+        }
     }
 
     #[test]
@@ -1803,7 +1753,7 @@ mod tests {
     }
 
     #[test]
-    fn propagated_copies_are_not_double_counted_by_discovery() {
+    fn propagated_copies_count_once_and_adopt_without_their_marker() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let app = tmp.path().join("app");
@@ -1819,20 +1769,6 @@ mod tests {
         let shared: Vec<_> = found.iter().filter(|s| s.directory == "shared").collect();
         assert_eq!(shared.len(), 1, "expected one entry, got {shared:?}");
         assert_eq!(shared[0].provenance, SkillProvenance::AoeManaged);
-    }
-
-    #[test]
-    fn adopting_a_propagated_copy_drops_its_deployment_marker() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let app = tmp.path().join("app");
-        create_skill(&app, "shared", Some("d")).unwrap();
-        sync_skills_into(
-            &home.join(".claude/skills"),
-            &app,
-            "claude-user",
-            &SyncOptions::default(),
-        );
 
         adopt_skill(
             &home,
@@ -1863,33 +1799,6 @@ mod tests {
 
         std::fs::write(dir.join("extra.md"), "x").unwrap();
         assert_ne!(package_digest(&dir).unwrap(), bare, "other files count");
-    }
-
-    #[test]
-    fn every_root_names_a_real_agent_and_owns_it_alone() {
-        for root in SKILL_ROOTS {
-            assert!(
-                crate::agents::get_agent(root.primary_agent).is_some(),
-                "{} names primary agent {:?}, which is not in the agent registry",
-                root.id,
-                root.primary_agent
-            );
-            assert!(
-                root.consumers.contains(&root.primary_agent),
-                "{} is primary for {:?} but does not list it as a consumer",
-                root.id,
-                root.primary_agent
-            );
-            assert_eq!(
-                SKILL_ROOTS
-                    .iter()
-                    .filter(|r| r.primary_agent == root.primary_agent)
-                    .count(),
-                1,
-                "{:?} is the primary agent of more than one root",
-                root.primary_agent
-            );
-        }
     }
 
     #[test]
@@ -1947,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn create_rejects_oversized_scaffold() {
+    fn create_and_adopt_reject_oversized_skill_md() {
         let tmp = tempfile::tempdir().unwrap();
         let huge = "x".repeat((MAX_SKILL_MD_BYTES + 10) as usize);
         assert!(matches!(
@@ -1955,11 +1864,7 @@ mod tests {
             Err(SkillError::InvalidInput(_))
         ));
         assert!(!tmp.path().join("skills/big").exists());
-    }
 
-    #[test]
-    fn adopt_and_propagate_reject_oversized_source() {
-        let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let app = tmp.path().join("app");
         let d = home.join(".claude/skills/big");

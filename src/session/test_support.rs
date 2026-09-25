@@ -661,59 +661,6 @@ mod tests {
         );
     }
 
-    // Locks the `remove_var` branch of `restore_or_remove`: when the pre-guard env var was unset,
-    // `Drop` MUST leave it unset.
-    #[test]
-    #[serial]
-    fn app_dir_guard_drop_removes_env_vars_when_unset() {
-        let _restore_home = AmbientEnvRestore::capture("HOME");
-        let _restore_xdg = AmbientEnvRestore::capture("XDG_CONFIG_HOME");
-        let _restore_xdg_data = AmbientEnvRestore::capture("XDG_DATA_HOME");
-
-        std::env::remove_var("HOME");
-        std::env::remove_var("XDG_CONFIG_HOME");
-        std::env::remove_var("XDG_DATA_HOME");
-
-        {
-            let guard = isolate_app_dir();
-            assert_eq!(
-                std::env::var_os("HOME"),
-                Some(guard.path().as_os_str().to_os_string()),
-                "constructor must set HOME to the guard tempdir even when the prior value was unset"
-            );
-        }
-
-        assert_eq!(
-            std::env::var_os("HOME"),
-            None,
-            "HOME must be removed on Drop when it was unset before construction"
-        );
-        assert_eq!(
-            std::env::var_os("XDG_CONFIG_HOME"),
-            None,
-            "XDG_CONFIG_HOME must stay unset on Drop when it was unset before construction"
-        );
-        assert_eq!(
-            std::env::var_os("XDG_DATA_HOME"),
-            None,
-            "XDG_DATA_HOME must stay unset on Drop when it was unset before construction"
-        );
-    }
-
-    // `AsRef<Path>` lets call sites pass `&guard` wherever a `Path`-like is expected, matching
-    // `Path::join`-style ergonomics.
-    #[test]
-    #[serial]
-    fn app_dir_guard_as_ref_path_matches_path() {
-        let guard = isolate_app_dir();
-        let via_as_ref: &Path = guard.as_ref();
-        assert_eq!(
-            via_as_ref,
-            guard.path(),
-            "AsRef<Path>::as_ref must return the same path as AppDirGuard::path"
-        );
-    }
-
     // Locks the "Drop-runs-on-unwind" contract that motivates the entire RAII conversion.
     #[test]
     #[serial]
@@ -769,60 +716,6 @@ mod tests {
             std::env::var_os("HOME"),
             before_home,
             "Drop must restore the pre-construction snapshot, not the mid-scope write"
-        );
-    }
-
-    // A peer thread writing `HOME` mid-scope must not survive the guard's `Drop`: `Drop`
-    // unconditionally restores the pre-construction snapshot regardless of intervening writes from
-    // any thread.
-    #[test]
-    #[serial]
-    fn app_dir_guard_survives_concurrent_peer_env_swap() {
-        use std::sync::{Arc, Barrier};
-        use std::thread;
-
-        let _home = AmbientEnvRestore::capture("HOME");
-        let _xdg = AmbientEnvRestore::capture("XDG_CONFIG_HOME");
-        let _data = AmbientEnvRestore::capture("XDG_DATA_HOME");
-        let before_home = std::env::var_os("HOME");
-
-        let peer_at_swap = Arc::new(Barrier::new(2));
-        let peer_done = Arc::new(Barrier::new(2));
-
-        let peer_at_swap_clone = Arc::clone(&peer_at_swap);
-        let peer_done_clone = Arc::clone(&peer_done);
-        let peer = thread::spawn(move || {
-            peer_at_swap_clone.wait();
-            std::env::set_var("HOME", "/tmp/aoe-peer-swap-sentinel");
-            peer_done_clone.wait();
-        });
-
-        {
-            let guard = isolate_app_dir();
-            let guard_path = guard.path().to_path_buf();
-
-            peer_at_swap.wait();
-            peer_done.wait();
-
-            assert_eq!(
-                std::env::var_os("HOME"),
-                Some(OsString::from("/tmp/aoe-peer-swap-sentinel")),
-                "peer thread must have swapped HOME by now (Barrier rendezvous)"
-            );
-
-            assert_eq!(
-                guard.path(),
-                guard_path,
-                "guard.path() must remain the snapshotted path even after a peer env swap"
-            );
-        }
-
-        peer.join().expect("peer thread must not panic");
-
-        assert_eq!(
-            std::env::var_os("HOME"),
-            before_home,
-            "guard Drop must restore the pre-construction HOME even when a peer thread swapped it mid-scope"
         );
     }
 

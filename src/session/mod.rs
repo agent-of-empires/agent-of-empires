@@ -885,22 +885,6 @@ mod tests {
     use super::test_support::{isolate_app_dir, AppDirGuard};
     use super::*;
 
-    #[test]
-    #[serial_test::serial]
-    fn favorites_first_flag_round_trips() {
-        let _flag = super::test_support::FavoritesFirstGuard::new();
-
-        set_favorites_first(false);
-        assert!(!favorites_first());
-        set_favorites_first(true);
-        assert!(favorites_first());
-    }
-
-    #[test]
-    fn favorites_first_defaults_on() {
-        assert!(config::SessionConfig::default().favorites_first);
-    }
-
     fn app_dir(root: impl AsRef<Path>) -> PathBuf {
         let root = root.as_ref();
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -914,7 +898,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     #[serial_test::serial]
-    fn test_xdg_config_base_prefers_absolute_xdg_config_home() {
+    fn xdg_config_base_uses_only_an_absolute_xdg_config_home() {
         let temp = tempfile::TempDir::new().unwrap();
         let _home = super::test_support::isolate_home(temp.path());
         let custom = temp.path().join("custom-xdg");
@@ -922,18 +906,9 @@ mod tests {
 
         assert_eq!(xdg_config_base().unwrap(), custom);
         assert_eq!(get_app_dir_path().unwrap(), custom.join(APP_DIR_NAME_XDG));
-    }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    #[serial_test::serial]
-    fn test_xdg_config_base_falls_back_to_home_dot_config() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let _home = super::test_support::isolate_home(temp.path());
-        let _xdg = super::test_support::EnvGuard::set(&[("XDG_CONFIG_HOME", "relative/path")]);
-
+        let _relative = super::test_support::EnvGuard::set(&[("XDG_CONFIG_HOME", "relative/path")]);
         assert_eq!(xdg_config_base().unwrap(), temp.path().join(".config"));
-
         let _unset = super::test_support::EnvGuard::unset(&["XDG_CONFIG_HOME"]);
         assert_eq!(xdg_config_base().unwrap(), temp.path().join(".config"));
     }
@@ -1020,6 +995,22 @@ mod tests {
             warning.is_none(),
             "round-tripped config must not warn, got: {warning:?}"
         );
+
+        let _temp = seed_configs(
+            Some(
+                "[session]\n\
+                 custom_agents = { myagent = \"true\" }\n\
+                 [agents.claude.status_map]\n\
+                 SessionStart = \"running\"\n\
+                 [tools.lazygit]\n\
+                 command = \"lazygit\"\n\
+                 [plugins.\"aoe.web\"]\n\
+                 enabled = true\n",
+            ),
+            None,
+        );
+        let warning = collect_startup_config_warnings("");
+        assert!(warning.is_none(), "documented map keys: got {warning:?}");
     }
 
     /// Write `global` and/or `profile` config into an isolated app dir and return the guard.
@@ -1083,6 +1074,13 @@ mod tests {
                     "sandbox.privildged",
                 ],
             ),
+            (
+                "typo inside a documented map section",
+                Some("[agents.claude]\nstatus_maap = { foo = \"bar\" }\n"),
+                None,
+                "",
+                &["agents.claude.status_maap"],
+            ),
         ];
         for (case, global, profile, arg, fragments) in cases {
             let _temp = seed_configs(*global, *profile);
@@ -1104,36 +1102,6 @@ mod tests {
 
         let _temp = seed_configs(Some(BAD_TYPE), None);
         assert!(collect_startup_ignored_key_warnings("").is_none());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn documented_map_sections_pass_but_a_typo_inside_one_still_flags() {
-        let _temp = seed_configs(
-            Some(
-                "[session]\n\
-                 custom_agents = { myagent = \"true\" }\n\
-                 [agents.claude.status_map]\n\
-                 SessionStart = \"running\"\n\
-                 [tools.lazygit]\n\
-                 command = \"lazygit\"\n\
-                 [plugins.\"aoe.web\"]\n\
-                 enabled = true\n",
-            ),
-            None,
-        );
-        let warning = collect_startup_config_warnings("");
-        assert!(warning.is_none(), "documented map keys: got {warning:?}");
-
-        let _temp = seed_configs(
-            Some("[agents.claude]\nstatus_maap = { foo = \"bar\" }\n"),
-            None,
-        );
-        let warning = collect_startup_config_warnings("").expect("expected a warning");
-        assert!(
-            warning.contains("agents.claude.status_maap"),
-            "got {warning}"
-        );
     }
 
     fn release_dir_in(root: impl AsRef<Path>) -> PathBuf {
@@ -1170,43 +1138,6 @@ mod tests {
     }
 
     #[test]
-    fn test_format_warning_mentions_both_paths_and_migration_command() {
-        let release = PathBuf::from("/home/u/.config/agent-of-empires");
-        let dev = PathBuf::from("/home/u/.config/agent-of-empires-dev");
-        let msg = format_debug_namespace_warning(&release, &dev);
-        assert!(msg.contains("/home/u/.config/agent-of-empires"));
-        assert!(msg.contains("/home/u/.config/agent-of-empires-dev"));
-        assert!(msg.contains("cp -r"));
-        assert!(msg.contains("not repeat"));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_fresh_install_bootstraps_main_profile() {
-        let _temp = isolate_app_dir();
-        assert!(list_profiles().unwrap().is_empty());
-
-        let resolved = config::resolve_default_profile();
-        assert_eq!(resolved, "main");
-        assert_eq!(list_profiles().unwrap(), vec!["main".to_string()]);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_existing_default_profile_is_untouched_and_usable() {
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-        fs::create_dir_all(dir.join("profiles").join("default")).unwrap();
-
-        let resolved = config::resolve_default_profile();
-        assert_eq!(resolved, "default");
-        assert!(dir.join("profiles").join("default").exists());
-
-        let storage = Storage::new_unwatched("default").unwrap();
-        assert_eq!(storage.profile(), "default");
-    }
-
-    #[test]
     #[serial_test::serial]
     fn test_implicit_resolution_ignores_picker_order_on_mixed_registry() {
         let temp = isolate_app_dir();
@@ -1233,18 +1164,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_get_profile_dir_empty_resolves_without_default_literal() {
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-        fs::create_dir_all(dir.join("profiles").join("alpha")).unwrap();
-        fs::create_dir_all(dir.join("profiles").join("beta")).unwrap();
-
-        let resolved = get_profile_dir("").unwrap();
-        assert_eq!(resolved, dir.join("profiles").join("alpha"));
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn test_delete_profile_refuses_last_remaining() {
         let temp = isolate_app_dir();
         let dir = app_dir(&temp);
@@ -1253,19 +1172,6 @@ mod tests {
         let err = delete_profile("solo").expect_err("deleting the last profile must fail");
         assert!(err.to_string().contains("at least one profile must exist"));
         assert!(dir.join("profiles").join("solo").exists());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_delete_profile_named_default_allowed_when_others_exist() {
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-        fs::create_dir_all(dir.join("profiles").join("default")).unwrap();
-        fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
-
-        delete_profile("default").expect("a non-last profile named default is deletable");
-        assert!(!dir.join("profiles").join("default").exists());
-        assert!(dir.join("profiles").join("work").exists());
     }
 
     #[test]

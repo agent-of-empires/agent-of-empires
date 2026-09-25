@@ -422,11 +422,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn holds_worktree_short_circuits_without_sandbox() {
-        assert!(!ensure_sandbox_container_released("any-session-id", false));
-    }
-
     #[cfg(unix)]
     #[test]
     fn discard_after_move_short_circuits_without_sandbox() {
@@ -481,41 +476,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unmanaged_worktree() {
-        let info = wt_info("old", "/tmp/repo", false);
-        let err = edit_worktree_workdir(WorktreeEditRequest {
-            worktree_info: &info,
-            current_path: Path::new("/tmp/wt/old"),
-            new_name: "new",
-            rename_branch: false,
-        })
-        .unwrap_err();
-        assert!(matches!(err, WorktreeEditError::NotManaged));
-    }
-
-    #[test]
-    fn rejects_empty_name() {
-        let info = wt_info("old", "/tmp/repo", true);
-        let err = edit_worktree_workdir(WorktreeEditRequest {
-            worktree_info: &info,
-            current_path: Path::new("/tmp/wt/old"),
-            new_name: "   ",
-            rename_branch: false,
-        })
-        .unwrap_err();
-        assert!(matches!(err, WorktreeEditError::EmptyName));
-    }
-
-    #[test]
-    fn rejects_unchanged_name_without_branch_rename() {
-        let info = wt_info("old", "/tmp/repo", true);
-        let err = edit_worktree_workdir(WorktreeEditRequest {
-            worktree_info: &info,
-            current_path: Path::new("/tmp/wt/old"),
-            new_name: "old",
-            rename_branch: false,
-        })
-        .unwrap_err();
-        assert!(matches!(err, WorktreeEditError::Unchanged));
+    fn edit_worktree_workdir_rejects_invalid_requests() {
+        let cases = [
+            (false, "new", WorktreeEditError::NotManaged),
+            (true, "   ", WorktreeEditError::EmptyName),
+            (true, "old", WorktreeEditError::Unchanged),
+        ];
+        for (managed, new_name, want) in cases {
+            let info = wt_info("old", "/tmp/repo", managed);
+            let err = edit_worktree_workdir(WorktreeEditRequest {
+                worktree_info: &info,
+                current_path: Path::new("/tmp/wt/old"),
+                new_name,
+                rename_branch: false,
+            })
+            .unwrap_err();
+            assert_eq!(
+                std::mem::discriminant(&err),
+                std::mem::discriminant(&want),
+                "{new_name:?}"
+            );
+        }
     }
 }

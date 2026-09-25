@@ -1032,26 +1032,22 @@ mod tests {
     }
 
     #[test]
-    fn plan_refuses_a_scratch_session() {
-        let mut inst = Instance::new("Scratchpad", "/tmp/scratch/abc");
-        inst.scratch = true;
+    fn plan_refuses_states_that_are_never_attachable() {
+        let mut scratch = Instance::new("Scratchpad", "/tmp/scratch/abc");
+        scratch.scratch = true;
         let Err(err) = plan(
-            &inst,
+            &scratch,
             "default",
             Path::new("/tmp/definitely-not-a-repo"),
             ExistingBranch::Refuse,
         ) else {
             panic!("a scratch session has no repo to attach to");
         };
-        let msg = format!("{err:#}");
         assert!(
-            msg.contains("scratch session"),
-            "the scratch refusal must win over the not-a-git-repo error: {msg}"
+            format!("{err:#}").contains("scratch session"),
+            "the scratch refusal must win over the not-a-git-repo error: {err:#}"
         );
-    }
 
-    #[test]
-    fn plan_refuses_states_that_are_never_attachable() {
         let attempt = |inst: &Instance| {
             let Err(err) = plan(
                 inst,
@@ -1355,65 +1351,47 @@ mod tests {
     }
 
     #[test]
-    fn repo_leaf_name_uses_the_main_repo_directory() {
+    fn reject_duplicate_cases() {
         assert_eq!(repo_leaf_name(Path::new("/tmp/src/frontend")), "frontend");
         assert_eq!(repo_leaf_name(Path::new("/")), "repo");
-    }
 
-    #[test]
-    fn duplicate_by_main_repo_path_is_rejected() {
-        let inst = workspace_instance();
-        let err = reject_duplicate(&inst, Path::new("/tmp/src/backend"), "backend-alias")
-            .expect_err("the same repo must not attach twice");
-        assert!(
-            err.to_string().contains("already attached"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn duplicate_by_leaf_name_is_rejected_case_insensitively() {
-        let inst = workspace_instance();
-        let err = reject_duplicate(&inst, Path::new("/other/src/BackEnd"), "BackEnd")
-            .expect_err("a colliding directory leaf must not attach");
-        assert!(
-            err.to_string().contains("collide on disk"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn attaching_the_sessions_own_repo_is_rejected() {
-        let mut inst = Instance::new("WT", "/tmp/worktrees/feature");
-        inst.worktree_info = Some(WorktreeInfo {
+        let workspace = workspace_instance();
+        let mut own = Instance::new("WT", "/tmp/worktrees/feature");
+        own.worktree_info = Some(WorktreeInfo {
             branch: "feature/abc".to_string(),
             main_repo_path: "/tmp/src/backend".to_string(),
             managed_by_aoe: true,
             created_at: Utc::now(),
             base_branch: None,
         });
-        let err = reject_duplicate(&inst, Path::new("/tmp/src/backend"), "backend")
-            .expect_err("the session's own repo must not attach to itself");
-        assert!(
-            err.to_string().contains("already this session's own repo"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn a_genuinely_new_repo_is_accepted() {
-        let inst = workspace_instance();
-        reject_duplicate(&inst, Path::new("/tmp/src/frontend"), "frontend").unwrap();
-    }
-
-    #[test]
-    fn plain_session_branch_comes_from_the_title() {
-        assert_eq!(
-            branch_for_plain_session("Fix the auth bug"),
-            "fix-the-auth-bug"
-        );
-        assert!(!branch_for_plain_session("").is_empty());
-        assert!(!branch_for_plain_session("///").is_empty());
+        // (session, repo, leaf, expected error fragment)
+        let cases = [
+            (
+                &workspace,
+                "/tmp/src/backend",
+                "backend-alias",
+                "already attached",
+            ),
+            (
+                &workspace,
+                "/other/src/BackEnd",
+                "BackEnd",
+                "collide on disk",
+            ),
+            (
+                &own,
+                "/tmp/src/backend",
+                "backend",
+                "already this session's own repo",
+            ),
+        ];
+        for (inst, repo, leaf, want) in cases {
+            let err = reject_duplicate(inst, Path::new(repo), leaf)
+                .expect_err("duplicate must be rejected")
+                .to_string();
+            assert!(err.contains(want), "{repo} {leaf}: {err}");
+        }
+        reject_duplicate(&workspace, Path::new("/tmp/src/frontend"), "frontend").unwrap();
     }
 
     #[test]
@@ -1431,5 +1409,12 @@ mod tests {
         assert_eq!(session_branch(&wt), Some("fix/xyz"));
 
         assert_eq!(session_branch(&Instance::new("Plain", "/tmp/plain")), None);
+
+        assert_eq!(
+            branch_for_plain_session("Fix the auth bug"),
+            "fix-the-auth-bug"
+        );
+        assert!(!branch_for_plain_session("").is_empty());
+        assert!(!branch_for_plain_session("///").is_empty());
     }
 }
