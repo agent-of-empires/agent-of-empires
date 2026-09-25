@@ -1148,6 +1148,14 @@ pub async fn create_session(
                 .await
         }
         Err(e) => {
+            // A failed creation can still have committed and rolled back
+            // durable state (a borrowed row the rollback released, a profile
+            // adopted by a peer). `adopt_committed_profiles` only requests a
+            // publish, so without this the cached runtime snapshot can still
+            // advertise the phantom row for up to a publish interval after the
+            // response is sent. Symmetric with the success arm, which
+            // publishes through `created_session_response`.
+            let _ = state.runtime.publish(&state).await;
             if e.is::<crate::server::session_service::CreationCancelled>() {
                 let code = crate::daemon::ApiErrorCode::CreationCancelled;
                 return (code.status(), code.header()).into_response();

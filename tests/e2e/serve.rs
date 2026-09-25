@@ -602,6 +602,136 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
     }
 }
 
+/// The rollback is durable before the create request is answered, and so must
+/// the snapshot `GET /api/sessions` serves: the failure arm publishes
+/// synchronously, so the very first read after the response is already clean.
+/// A publish only requested by the rollback (the ~2s background interval) made
+/// this window observable, which is why there is no sleep here: a wait would
+/// hide exactly the regression this test names.
+#[cfg(unix)]
+#[tokio::test]
+#[parallel]
+async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
+    use agent_of_empires::daemon::{
+        ApiErrorCode, CreateSessionBody, DaemonClient, DaemonClientError, RuntimeSnapshot,
+    };
+    require_tmux!();
+    let mut h = TuiTestHarness::new_in_tmp("cancelled_creation_publish");
+    h.set_env("AGENT_OF_EMPIRES_PROFILE", "default");
+    h.stop_daemon_on_drop();
+    let agent = h
+        .install_path_command("creation-agent")
+        .join("creation-agent");
+    std::fs::write(&agent, "#!/bin/sh\nexec sleep 120\n").unwrap();
+    let app = crate::harness::app_dir_in(h.home_path());
+    let config_path = app.join("config.toml");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    let entered = h.home_path().join("launch-entered");
+    let release = h.home_path().join("launch-release");
+    config.push_str(&format!(
+        "\n[session.custom_agents]\ncreation-agent = {}\n",
+        serde_json::to_string(agent.to_str().unwrap()).unwrap()
+    ));
+    std::fs::write(&config_path, &config).unwrap();
+
+    let daemon = h.run_cli(&["serve", "--core-only", "--daemon"]);
+    assert!(
+        daemon.status.success(),
+        "{}",
+        String::from_utf8_lossy(&daemon.stderr)
+    );
+    let socket = app.join("daemon/api.sock");
+    let sdk = DaemonClient::new_unix(&socket).unwrap();
+    let epoch = sdk.runtime_info().await.unwrap().epoch;
+    let http = reqwest::Client::builder()
+        .unix_socket(socket.clone())
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+
+    let owner_body: CreateSessionBody = serde_json::from_value(serde_json::json!({
+        "title":"rollback owner", "path":"", "tool":"creation-agent", "scratch":true,
+        "profile":"default",
+    }))
+    .unwrap();
+    let owner = sdk
+        .create_session(&owner_body, &epoch)
+        .await
+        .unwrap()
+        .outcome;
+    let repo = git2::Repository::init(&owner.project_path).unwrap();
+    let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+    let tree_id = repo.index().unwrap().write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+        .unwrap();
+
+    // The gate hook is configured only now: the owner creation above must
+    // launch normally, and the borrower's launch is the one cancelled.
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    let gate = format!(
+        "touch {entered:?}; i=0; while [ ! -f {release:?} ] && [ \"$i\" -lt 400 ]; do i=$((i+1)); sleep 0.05; done; test -f {release:?}"
+    );
+    config.push_str(&format!(
+        "\n[hooks]\non_launch = [{}]\n",
+        serde_json::to_string(&gate).unwrap()
+    ));
+    std::fs::write(&config_path, &config).unwrap();
+
+    let body: CreateSessionBody = serde_json::from_value(serde_json::json!({
+        "title":"rollback borrower", "path":owner.project_path, "tool":"creation-agent",
+        "profile":"default", "worktree_enabled":true, "worktree_branch":"rollback-borrower",
+        "create_new_branch":true,
+    }))
+    .unwrap();
+    let cancel = async {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !entered.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the create reached its launch hooks");
+        let rows = sdk.list_sessions(None).await.unwrap().sessions;
+        let pending = rows.iter().find(|row| row.id != owner.id).unwrap();
+        sdk.cancel_creation(&pending.id, &epoch).await.unwrap();
+        std::fs::write(&release, "continue").unwrap();
+    };
+    let (result, ()) = tokio::join!(sdk.create_session(&body, &epoch), cancel);
+    assert!(
+        matches!(&result, Err(DaemonClientError::Status { code: Some(ApiErrorCode::CreationCancelled), body, .. }) if body.is_empty()),
+        "expected a cancelled creation, got {result:?}"
+    );
+
+    // No sleep between the failure response and either read: the rollback is
+    // already durable, so the snapshot that served it must be too.
+    let rows = sdk.list_sessions(None).await.unwrap().sessions;
+    assert_eq!(
+        rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        vec![owner.id.as_str()],
+        "the rolled-back creation was still served by GET /api/sessions"
+    );
+    let snapshot: RuntimeSnapshot = http
+        .get("http://localhost/api/runtime/snapshot")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot
+            .contents
+            .sessions
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![owner.id.as_str()],
+        "the runtime snapshot still advertises the rolled-back row"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 #[parallel]
