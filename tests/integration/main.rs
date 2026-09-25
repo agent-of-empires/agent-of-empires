@@ -58,6 +58,8 @@ mod acp_runner_orphan;
 mod agent_lifecycle_cli;
 mod build_cache_config;
 mod build_version_rerun;
+mod cli_read_pack;
+mod cli_read_server;
 mod daemon_core_web_optional;
 mod filewatch_config_editor_burst;
 mod filewatch_tui_adapter_lifetime;

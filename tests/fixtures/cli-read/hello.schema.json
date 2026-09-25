@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aoe.invalid/schemas/cli-read/v151/hello.schema.json",
+  "title": "cli-read v151 Hello data",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "runtime_epoch",
+    "prebind_instance_id",
+    "namespace",
+    "owner",
+    "local_owner",
+    "health",
+    "profiles",
+    "status_freshness",
+    "runtime_instance_id"
+  ],
+  "properties": {
+    "protocol_version": { "const": 2 },
+    "runtime_epoch": { "$ref": "#/$defs/uuid" },
+    "prebind_instance_id": { "$ref": "#/$defs/uuid" },
+    "runtime_instance_id": { "$ref": "#/$defs/uuid" },
+    "namespace": { "$ref": "#/$defs/namespace" },
+    "owner": { "$ref": "#/$defs/owner" },
+    "local_owner": { "type": "boolean" },
+    "health": { "$ref": "#/$defs/aggregate_health" },
+    "profiles": { "type": "array", "items": { "$ref": "#/$defs/profile_read" } },
+    "status_freshness": { "$ref": "#/$defs/status_freshness" }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "namespace": { "type": "string", "pattern": "^(debug|release):[a-z0-9._-]{1,200}$" },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "safe_text": {
+      "type": "string",
+      "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]*$"
+    },
+    "absolute_path": {
+      "type": "string",
+      "pattern": "^/([^/\\u0000-\\u001f\\u007f-\\u009f]+(/[^/\\u0000-\\u001f\\u007f-\\u009f]+)*)?$"
+    },
+    "group_path": {
+      "type": "string",
+      "pattern": "^[^/\\u0000-\\u001f\\u007f-\\u009f]+(/[^/\\u0000-\\u001f\\u007f-\\u009f]+)*$"
+    },
+    "health_code": {
+      "type": "string",
+      "enum": ["enumeration", "profile_enumeration", "metadata", "profile_data"]
+    },
+    "aggregate_health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["healthy", "degraded"] },
+        "code": { "$ref": "#/$defs/health_code" }
+      },
+      "oneOf": [
+        {
+          "properties": { "kind": { "const": "healthy" } },
+          "required": ["kind"],
+          "not": { "required": ["code"] }
+        },
+        {
+          "properties": { "kind": { "const": "degraded" } },
+          "required": ["kind", "code"]
+        }
+      ]
+    },
+    "component_health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["healthy", "degraded"] },
+        "code": { "$ref": "#/$defs/health_code" }
+      },
+      "oneOf": [
+        {
+          "properties": { "kind": { "const": "healthy" } },
+          "required": ["kind"],
+          "not": { "required": ["code"] }
+        },
+        {
+          "properties": { "kind": { "const": "degraded" } },
+          "required": ["kind", "code"]
+        }
+      ]
+    },
+    "profile_health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_enumeration", "metadata", "profile_data"],
+      "properties": {
+        "profile_enumeration": { "$ref": "#/$defs/component_health" },
+        "metadata": { "$ref": "#/$defs/component_health" },
+        "profile_data": { "$ref": "#/$defs/component_health" }
+      }
+    },
+    "status_freshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "revision", "observed_at"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["unobserved", "observed", "unavailable"] },
+        "revision": { "type": ["integer", "null"], "minimum": 0 },
+        "observed_at": {
+          "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "kind": { "const": "unobserved" },
+            "revision": { "const": 0 },
+            "observed_at": { "type": "null" }
+          }
+        },
+        {
+          "properties": {
+            "kind": { "const": "observed" },
+            "revision": { "type": "integer", "minimum": 1 },
+            "observed_at": { "$ref": "#/$defs/timestamp" }
+          }
+        },
+        {
+          "properties": {
+            "kind": { "const": "unavailable" },
+            "revision": { "type": "null" },
+            "observed_at": { "type": "null" }
+          }
+        }
+      ]
+    },
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "uid"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["local_owner", "remote"] },
+        "uid": { "type": ["integer", "null"], "minimum": 0 }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "kind": { "const": "local_owner" },
+            "uid": { "type": "integer", "minimum": 0 }
+          }
+        },
+        {
+          "properties": { "kind": { "const": "remote" }, "uid": { "type": "null" } }
+        }
+      ]
+    },
+    "group_read": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "path", "children"],
+      "properties": {
+        "name": { "$ref": "#/$defs/safe_text" },
+        "path": { "$ref": "#/$defs/group_path" },
+        "children": { "type": "array", "items": { "$ref": "#/$defs/safe_text" } }
+      }
+    },
+    "project_read": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "path", "scope", "default_base_branch"],
+      "properties": {
+        "name": { "$ref": "#/$defs/safe_text" },
+        "path": { "$ref": "#/$defs/absolute_path" },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": { "kind": { "type": "string", "enum": ["global", "profile"] } }
+        },
+        "default_base_branch": {
+          "oneOf": [{ "$ref": "#/$defs/safe_text" }, { "type": "null" }]
+        }
+      }
+    },
+    "profile_read": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "groups", "projects", "health"],
+      "properties": {
+        "name": { "$ref": "#/$defs/safe_text" },
+        "groups": { "type": "array", "items": { "$ref": "#/$defs/group_read" } },
+        "projects": { "type": "array", "items": { "$ref": "#/$defs/project_read" } },
+        "health": { "$ref": "#/$defs/profile_health" }
+      }
+    }
+  }
+}
