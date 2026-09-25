@@ -3290,6 +3290,51 @@ async fn list_sessions_applies_project_smart_rename_override_to_worktree_session
     assert_eq!(states, ["inactive", "inactive", "pending"]);
 }
 
+// A scratch session has no stable path to key a project-registry override on, so its
+// smart-rename override lives on `session.scratch_smart_rename` in Config instead (#4138 review).
+#[tokio::test]
+#[serial_test::serial]
+async fn list_sessions_applies_scratch_smart_rename_setting_from_config() {
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+
+    crate::session::config::update_config(|cfg| {
+        cfg.session.scratch_smart_rename = crate::session::config::ScratchSmartRenameMode::Off;
+    })
+    .unwrap();
+
+    let scratch_dir = tempfile::tempdir().expect("scratch dir");
+    let mut scratch_inst = Instance::new("Vikings", scratch_dir.path().to_str().unwrap());
+    scratch_inst.tool = "claude".to_string();
+    scratch_inst.source_profile = "default".to_string();
+    scratch_inst.view = crate::session::View::Structured;
+    scratch_inst.scratch = true;
+
+    let state = crate::server::test_support::build_test_app_state(vec![scratch_inst]);
+    let resp = list_sessions(
+        axum::extract::State(state),
+        axum::extract::Query(ListSessionsQuery { state: None }),
+    )
+    .await
+    .into_response();
+    let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let states: Vec<&str> = envelope["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["smart_rename"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        states,
+        ["inactive"],
+        "scratch_smart_rename=Off forces the override even though the global smart_rename \
+         toggle defaults on; a path-based project override would never match a scratch session"
+    );
+}
+
 /// #4084 review: deleting one session of a shared managed worktree, through
 /// either delete endpoint, removes that record but keeps the worktree and
 /// branch a surviving session still works in. A dirty worktree kept this way
