@@ -98,6 +98,35 @@ fn fork_from_selection_offers_a_preallocated_parent_and_explains_the_refusal() {
     );
 }
 
+/// A recorded id whose binding was never attested names a conversation AoE cannot
+/// prove, so the refusal must offer the recovery assertion instead of telling the
+/// user to send a message and start over.
+#[test]
+#[serial]
+fn fork_from_selection_reports_an_unverified_recorded_conversation() {
+    let mut env = create_test_env_empty();
+    let mut inst = observed_fork_parent("claude");
+    inst.agent_session_binding = Some(crate::session::ConversationBinding::unknown(
+        "parent-1111-2222-3333-444444444444",
+    ));
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id);
+
+    env.view.open_fork_from_selection();
+
+    assert!(
+        env.view.new_dialog.is_none(),
+        "an unverified parent must not open a fork dialog"
+    );
+    let dialog = env.view.info_dialog.as_ref().expect("info dialog");
+    assert_eq!(dialog.title(), "Conversation not verified");
+    assert_eq!(
+        dialog.message(),
+        "This session records a conversation id, but it was never verified against a native agent. Run 'aoe session set-session-id <session> <id>' on it to qualify it."
+    );
+}
+
 #[test]
 #[serial]
 fn fork_denied_for_resume_only_agent_shows_info() {

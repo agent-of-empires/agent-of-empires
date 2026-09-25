@@ -300,21 +300,24 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             crate::session::capture::generate_session_uuid(),
         )
         .map_err(|denied| {
-            // A pre-pinned id is refused like a parent with no session at all, so the
-            // text is built once and shared by both refusals.
-            let no_parent_session = format!(
-                "Nothing to fork: session '{}' has no captured agent session yet. Start a conversation in it first.",
-                source.title
-            );
+            // A pre-pinned id is refused like a parent with no session at all, so both
+            // refusals share one message. Built per arm: the fork-capable refusal
+            // discards it.
+            let no_parent_session = || {
+                format!(
+                    "Nothing to fork: session '{}' has no captured agent session yet. Start a conversation in it first.",
+                    source.title
+                )
+            };
             let message = match denied {
                 crate::session::ForkDenied::AgentCannotFork => format!(
                     "Agent '{}' does not support forking. Forkable agents: claude, codex, opencode.",
                     parent_agent
                 ),
-                crate::session::ForkDenied::NoParentSession => no_parent_session,
+                crate::session::ForkDenied::NoParentSession => no_parent_session(),
                 crate::session::ForkDenied::UnqualifiedParent { provenance } => {
                     if matches!(provenance, crate::session::ConversationProvenance::Preallocated) {
-                        no_parent_session
+                        no_parent_session()
                     } else {
                         let recorded = parent_binding
                             .as_ref()

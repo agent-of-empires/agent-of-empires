@@ -23,8 +23,7 @@ pub enum ForkSeed {
 pub enum ForkDenied {
     /// The agent's CLI has no fork capability (terminal path).
     AgentCannotFork,
-    /// No captured session id to fork from yet (the parent never started a
-    /// conversation, or its id hasn't been observed).
+    /// No conversation id is recorded for the parent at all.
     NoParentSession,
     /// A conversation id is recorded, but the binding that would prove which
     /// native conversation it names was never attested, so the id cannot be

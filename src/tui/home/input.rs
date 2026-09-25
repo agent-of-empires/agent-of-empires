@@ -419,10 +419,9 @@ fn slice_line_columns(line: &ratatui::text::Line, from: u16, to_excl: u16, width
     crate::tui::components::text::line_columns(line, width).slice(from, to_excl.min(width))
 }
 
-/// The refusal a terminal fork shows when the parent has never captured a conversation.
-/// Shared by [`crate::session::ForkDenied::NoParentSession`] and the pre-pinned
-/// `UnqualifiedParent` case, which differ from an unverified id only in that no pin
-/// could qualify one.
+/// The refusal shown when there is no captured conversation to fork from: a terminal
+/// parent with nothing recorded, a pre-pinned id that no capture can qualify, or a
+/// structured parent with no captured ACP session id.
 fn no_captured_conversation_dialog() -> InfoDialog {
     InfoDialog::new(
         "Nothing to fork yet",
@@ -3056,10 +3055,7 @@ impl HomeView {
                 return;
             }
             let Some(acp_id) = parent_acp_session_id.filter(|s| !s.is_empty()) else {
-                self.info_dialog = Some(InfoDialog::new(
-                        "Nothing to fork yet",
-                        "This session has no captured conversation to fork from. Send it at least one message first.",
-                    ));
+                self.info_dialog = Some(no_captured_conversation_dialog());
                 return;
             };
             crate::session::ForkSeed::Structured {
