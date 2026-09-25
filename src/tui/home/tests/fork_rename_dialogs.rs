@@ -86,9 +86,15 @@ fn fork_from_selection_offers_a_preallocated_parent_and_explains_the_refusal() {
         env.view.new_dialog.is_none(),
         "an unqualified pre-pinned parent must not open a fork dialog"
     );
-    assert!(
-        env.view.info_dialog.is_some(),
-        "an explanatory info dialog is shown instead"
+    let dialog = env.view.info_dialog.as_ref().expect("info dialog");
+    assert_eq!(
+        dialog.title(),
+        "Nothing to fork yet",
+        "a pre-pinned id has never started a conversation, so it must not be told to pin one"
+    );
+    assert_eq!(
+        dialog.message(),
+        "This session has no captured conversation to fork from. Send it at least one message first."
     );
 }
 

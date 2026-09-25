@@ -48,14 +48,14 @@ Disabling `agent_status_hooks` removes status writers only; identity hooks decla
 
 ## Common explicit resume and fork refusals
 
-Every row below refuses the explicit operation only: a plain start or restart in the same context is degraded, not refused. The refusal re-arms on the next launch.
+Every row below refuses the explicit operation only: a plain, unpinned start or restart in the same context is degraded, not refused. The refusal re-arms on the next launch.
 
 | Context | `set-session-id` | Fork | Remedy |
 |---------|------------------|------|--------|
 | Unsandboxed Codex on a macOS host | Refused | Refused | None yet; run Codex in a managed container |
 | Codex signed in with a ChatGPT login | Refused | Refused | A local OpenAI API key, per [Codex](#supported-managed-contexts) |
-| OpenCode with neither `OPENCODE_DB` nor `OPENCODE_DISABLE_CHANNEL_DB` set to `1` or `true` | Refused | Refused | [OpenCode](#supported-managed-contexts) |
-| Any agent in an Apple Container sandbox | Refused | Refused | None; use the Docker runtime |
+| OpenCode with no usable database | Refused | Refused | Set `OPENCODE_DB`, or `OPENCODE_DISABLE_CHANNEL_DB` to `1`/`true`, per [OpenCode](#supported-managed-contexts) |
+| Any agent in an Apple Container sandbox | Refused | Refused | None; run in a managed Docker or Podman container |
 | An opaque wrapper missing `session.agent_execution_as` or `session.agent_config_dir` | Refused | Refused | Declare the wrapper contract, per [Execution identity and wrappers](#execution-identity-and-wrappers) |
 
 ## Pinning or resetting a conversation

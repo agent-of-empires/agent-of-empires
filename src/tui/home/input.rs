@@ -419,6 +419,17 @@ fn slice_line_columns(line: &ratatui::text::Line, from: u16, to_excl: u16, width
     crate::tui::components::text::line_columns(line, width).slice(from, to_excl.min(width))
 }
 
+/// The refusal a terminal fork shows when the parent has never captured a conversation.
+/// Shared by [`crate::session::ForkDenied::NoParentSession`] and the pre-pinned
+/// `UnqualifiedParent` case, which differ from an unverified id only in that no pin
+/// could qualify one.
+fn no_captured_conversation_dialog() -> InfoDialog {
+    InfoDialog::new(
+        "Nothing to fork yet",
+        "This session has no captured conversation to fork from. Send it at least one message first.",
+    )
+}
+
 impl HomeView {
     pub fn is_diff_open(&self) -> bool {
         self.diff_view.is_some()
@@ -3069,28 +3080,23 @@ impl HomeView {
                     return;
                 }
                 Err(crate::session::ForkDenied::NoParentSession) => {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Nothing to fork yet",
-                        "This session has no captured conversation to fork from. Send it at least one message first.",
-                    ));
+                    self.info_dialog = Some(no_captured_conversation_dialog());
                     return;
                 }
                 Err(crate::session::ForkDenied::UnqualifiedParent { provenance }) => {
-                    let preallocated = matches!(
-                        provenance,
-                        crate::session::ConversationProvenance::Preallocated
+                    self.info_dialog = Some(
+                        if matches!(
+                            provenance,
+                            crate::session::ConversationProvenance::Preallocated
+                        ) {
+                            no_captured_conversation_dialog()
+                        } else {
+                            InfoDialog::new(
+                                "Conversation not verified",
+                                "This session records a conversation id, but it was never verified against a native agent. Run 'aoe session set-session-id <session> <id>' on it to qualify it.",
+                            )
+                        },
                     );
-                    self.info_dialog = Some(if preallocated {
-                        InfoDialog::new(
-                            "Nothing to fork yet",
-                            "This session has no captured conversation to fork from. Send it at least one message first.",
-                        )
-                    } else {
-                        InfoDialog::new(
-                            "Conversation not verified",
-                            "This session records a conversation id, but it was never verified against a native agent. Run 'aoe session set-session-id <session> <id>' on it to qualify it.",
-                        )
-                    });
                     return;
                 }
             }
