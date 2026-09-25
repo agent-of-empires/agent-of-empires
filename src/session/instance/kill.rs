@@ -576,6 +576,7 @@ mod tests {
             agent: "claude".into(),
             stores: vec![home.path().join("store")],
             configuration: Vec::new(),
+            exported_default_store: false,
             cwd: home.path().into(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),

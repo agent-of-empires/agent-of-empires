@@ -53,13 +53,6 @@ pub(crate) fn is_default_claude_store(store: &Path, home: &Path) -> bool {
     identity(store) == identity(&home.join(".claude"))
 }
 
-/// The global config file a host Claude binding records in `configuration`
-/// when `CLAUDE_CONFIG_DIR` is exported for the default store: the store alone
-/// cannot tell an explicit selection from the implicit, unexported default.
-pub(crate) fn exported_default_claude_config(store: &Path, home: &Path) -> Option<PathBuf> {
-    is_default_claude_store(store, home).then(|| store.join(".claude.json"))
-}
-
 /// The store a host Claude worker is pinned to by its selected conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeStorePin {
@@ -72,7 +65,7 @@ impl ClaudeStorePin {
     pub(crate) fn of(execution: &crate::session::ExecutionBinding) -> Option<Self> {
         Some(Self {
             store: execution.stores.first()?.clone(),
-            explicit: !execution.configuration.is_empty(),
+            explicit: execution.exported_default_store,
         })
     }
 }

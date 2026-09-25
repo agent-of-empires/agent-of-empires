@@ -30,6 +30,11 @@ pub struct ExecutionBinding {
     pub cwd: PathBuf,
     pub cwd_filesystem: String,
     pub filesystem: String,
+    /// The launch exported the store's routing variable although the store is the
+    /// agent's implicit default, so later launches keep exporting it (Claude, #4119).
+    /// Routing only; not part of the execution identity.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exported_default_store: bool,
 }
 
 impl ExecutionBinding {
@@ -1196,6 +1201,7 @@ impl Instance {
         let mut pi_root = None;
         let mut pi_transcript_path = None;
         let mut namespace_arguments = Vec::new();
+        let mut exported_default_store = false;
         let mut roots = match agent.name {
             "claude" => {
                 // The recorded binding names the store this conversation
@@ -1211,36 +1217,33 @@ impl Instance {
                             .filter(|execution| !execution.stores.is_empty())
                     })
                     .flatten();
-                let exported = value("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty());
+                let exported = value("CLAUDE_CONFIG_DIR")
+                    .filter(|value| !value.is_empty())
+                    .map(|value| absolute(PathBuf::from(value)));
+                // `~/.claude` spelled out selects nothing beyond Claude's own default.
+                let selected = declared
+                    .clone()
+                    .filter(|declared| *declared != crate::git::template::lexical_normalize(&home.join(".claude")));
                 // Only an implicit default store leaves `CLAUDE_CONFIG_DIR` unset (#4119). A
-                // recorded store is explicit when its binding lists the exported config or the
-                // environment still names it.
+                // recorded store stays explicit when its launch exported it or a selector names it.
                 let explicit = match recorded {
                     Some(execution) => {
-                        !execution.configuration.is_empty()
-                            || exported.as_ref().is_some_and(|dir| {
-                                inputs.canonical_path(&absolute(PathBuf::from(dir))).ok().as_ref()
-                                    == Some(&execution.stores[0])
+                        execution.exported_default_store
+                            || [&exported, &selected].into_iter().flatten().any(|dir| {
+                                inputs.canonical_path(dir).ok().as_ref() == Some(&execution.stores[0])
                             })
                     }
-                    None => {
-                        declared.as_ref().is_some_and(|declared| {
-                            *declared != crate::git::template::lexical_normalize(&home.join(".claude"))
-                        }) || exported.is_some()
-                    }
+                    None => selected.is_some() || exported.is_some(),
                 };
                 let root = absolute(recorded
                     .map(|execution| execution.stores[0].clone())
                     .or_else(|| declared.clone())
-                    .or_else(|| exported.map(PathBuf::from))
+                    .or(exported)
                     .unwrap_or_else(|| home.join(".claude")));
                 let pinned = root.to_str().context("native store is not UTF-8")?.to_owned();
-                let export = inputs.container.is_some()
-                    || explicit
-                    || !crate::session::capture::is_default_claude_store(&root, &home);
-                if export && inputs.container.is_none() {
-                    configuration.extend(crate::session::capture::exported_default_claude_config(&root, &home));
-                }
+                let default = crate::session::capture::is_default_claude_store(&root, &home);
+                let export = inputs.container.is_some() || explicit || !default;
+                exported_default_store = export && default && inputs.container.is_none();
                 routing.push(("CLAUDE_CONFIG_DIR".into(), export.then_some(pinned)));
                 vec![root]
             }
@@ -1729,6 +1732,7 @@ impl Instance {
                 agent: agent.name.into(),
                 stores,
                 configuration,
+                exported_default_store,
                 cwd: cwd.path,
                 cwd_filesystem: cwd.filesystem,
                 filesystem: filesystem.context("native conversation store is unavailable")?,
@@ -2237,20 +2241,12 @@ impl Instance {
             *primary = crate::session::capture::canonicalize_or_raw(
                 store.to_str().context("store path must be UTF-8")?,
             );
-            // An explicit store is exported even when it aliases the default.
+            // A store named other than `~/.claude` is exported even when it aliases the default.
             let home = super::hooks::host_home(&self.resolved_host_environment())
                 .context("native HOME is unavailable")?;
-            execution.configuration =
-                crate::session::capture::exported_default_claude_config(primary, &home)
-                    .and_then(|file| {
-                        crate::session::capture::canonicalize_allowing_missing_leaf(&file)
-                    })
-                    .map(|path| ExecutionLocation {
-                        filesystem: "host".into(),
-                        path,
-                    })
-                    .into_iter()
-                    .collect();
+            execution.exported_default_store = crate::git::template::lexical_normalize(store)
+                != crate::git::template::lexical_normalize(&home.join(".claude"))
+                && crate::session::capture::is_default_claude_store(primary, &home);
         }
         Ok(ConversationBinding {
             session_id: sid.into(),
@@ -2314,10 +2310,17 @@ mod tests {
             cwd: root.join("cwd"),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: false,
         };
         let host = binding(&real);
         let host_alias = binding(&alias);
         assert!(Instance::execution_identity_matches(&host, &host_alias));
+        // Store routing does not change which conversation a binding names.
+        let exported = ExecutionBinding {
+            exported_default_store: true,
+            ..host_alias.clone()
+        };
+        assert!(Instance::execution_identity_matches(&host, &exported));
 
         let mut runtime_cwd = host.clone();
         runtime_cwd.cwd_filesystem = "runtime:docker:test".into();

@@ -1509,14 +1509,17 @@ mod tests {
             );
 
             // Resuming a conversation recorded in the default store keeps it unset, also from
-            // a binding recorded before configuration listed an exported default store.
+            // a binding recorded before the export was, and that binding still validates.
             let mut asserted = inst.asserted_resume_binding(sid, None).unwrap();
             inst.resume_binding = Some(asserted.clone());
             inst.resume_intent = ResumeIntent::Use(sid.into());
             assert_eq!(routed(&inst).0, expected, "exported={exported:?}");
-            asserted.execution.as_mut().unwrap().configuration.clear();
+            asserted.execution.as_mut().unwrap().exported_default_store = false;
             inst.resume_binding = Some(asserted);
-            assert_eq!(routed(&inst).0, expected, "legacy exported={exported:?}");
+            let (legacy, execution) = routed(&inst);
+            assert_eq!(legacy, expected, "legacy exported={exported:?}");
+            inst.validate_conversation_target(&execution.binding, Some(sid))
+                .unwrap();
         }
     }
 
@@ -1577,11 +1580,13 @@ mod tests {
             );
         };
 
+        let literal = temp.path().join(".claude");
         for (profile, store, expected) in [
             ("undeclared", None, None),
             ("literal", None, None),
             ("alias", None, Some(&work)),
             ("undeclared", Some(&work), Some(&work)),
+            ("undeclared", Some(&literal), None),
         ] {
             let mut inst = Instance::new("claude-alias-store", "/tmp");
             inst.source_profile = profile.into();
@@ -1596,12 +1601,27 @@ mod tests {
                 "profile={profile} store={store:?}"
             );
             // The next launch resumes from the binding this launch's capture records.
-            capture(&mut inst, binding);
+            capture(&mut inst, binding.clone());
             inst.source_profile = "undeclared".into();
             assert_eq!(
                 routed(&inst).0.as_ref(),
                 expected,
                 "profile={profile} store={store:?}"
+            );
+            // A binding recorded before the export was kept it only while a selector names it.
+            capture(
+                &mut inst,
+                crate::session::ExecutionBinding {
+                    exported_default_store: false,
+                    ..binding
+                },
+            );
+            inst.source_profile = profile.into();
+            let legacy = if store.is_some() { None } else { expected };
+            assert_eq!(
+                routed(&inst).0.as_ref(),
+                legacy,
+                "legacy profile={profile} store={store:?}"
             );
         }
     }
