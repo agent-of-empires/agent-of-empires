@@ -700,10 +700,22 @@ mod tests {
                 .filter_map(|entry| entry["command"].as_str())
                 .collect();
             assert!(
+                !commands.contains(&LEGACY_STATUS_CMD),
+                "{var} override must not keep the legacy status writer; got: {commands:?}"
+            );
+            assert!(
+                commands.iter().any(|cmd| {
+                    cmd.contains("case \"$AOE_INSTANCE_ID\"") && cmd.contains("/status")
+                }),
+                "{var} override must carry the hardened status writer; got: {commands:?}"
+            );
+            // Only Codex's `SessionStart` also publishes the pane's native id.
+            assert_eq!(
                 commands
                     .iter()
-                    .any(|cmd| cmd.contains("case \"$AOE_INSTANCE_ID\"")),
-                "{var} override must be reached and rewritten; got: {commands:?}"
+                    .any(|cmd| cmd.contains("__extract-session-id")),
+                var == "CODEX_HOME",
+                "{var} identity publisher; got: {commands:?}"
             );
             assert!(
                 !home.join(default).exists(),
