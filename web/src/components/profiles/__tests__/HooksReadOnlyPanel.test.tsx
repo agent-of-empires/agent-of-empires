@@ -16,12 +16,16 @@ describe("HooksReadOnlyPanel", () => {
     expect(container.querySelectorAll("input, textarea, button, select")).toHaveLength(0);
   });
 
-  it.each<[string, Hooks, Hooks, string[]]>([
-    ["a profile override", { on_create: ["echo hi"] }, {}, ["echo hi", "Profile override"]],
-    ["an inherited global command", {}, { on_launch: ["echo global"] }, ["echo global", "Inherited from global"]],
-    ["an explicit empty override", { on_destroy: [] }, { on_destroy: ["docker compose down"] }, ["Overridden: none"]],
-  ])("labels %s", (_, profile, global, texts) => {
-    const { getByText } = render(<HooksReadOnlyPanel groups={buildEffectiveHooks(profile, global)} />);
-    for (const text of texts) expect(getByText(text)).toBeTruthy();
+  it("labels profile overrides, inherited globals, and explicit empty overrides", () => {
+    const cases: [Hooks, Hooks, string[]][] = [
+      [{ on_create: ["echo hi"] }, {}, ["echo hi", "Profile override"]],
+      [{}, { on_launch: ["echo global"] }, ["echo global", "Inherited from global"]],
+      [{ on_destroy: [] }, { on_destroy: ["docker compose down"] }, ["Overridden: none"]],
+    ];
+    for (const [profile, global, texts] of cases) {
+      const { getByText, unmount } = render(<HooksReadOnlyPanel groups={buildEffectiveHooks(profile, global)} />);
+      for (const text of texts) expect(getByText(text)).toBeTruthy();
+      unmount();
+    }
   });
 });

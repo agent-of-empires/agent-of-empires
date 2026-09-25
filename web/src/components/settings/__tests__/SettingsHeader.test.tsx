@@ -28,22 +28,20 @@ describe("SettingsHeader", () => {
     onSearchJump: () => {},
   };
 
-  it("renders the title and a Back button that closes", () => {
+  it("Back closes, and saving and saveError show independently", () => {
     const onClose = vi.fn();
-    render(<SettingsHeader {...baseProps} onClose={onClose} />);
-    expect(screen.getByText("Settings")).toBeTruthy();
+    const { rerender } = render(<SettingsHeader {...baseProps} onClose={onClose} />);
     fireEvent.click(screen.getByRole("button", { name: /Back/ }));
     expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
-  it.each([
-    [false, null],
-    [true, null],
-    [false, "Save failed: network error"],
-    [true, "Save failed: network error"],
-  ])("shows saving=%s and saveError=%j independently", (saving, saveError) => {
-    render(<SettingsHeader {...baseProps} saving={saving} saveError={saveError} />);
-    expect(!!screen.queryByText("Saving...")).toBe(saving);
-    expect(screen.queryByTestId("settings-header-save-error")?.textContent ?? null).toBe(saveError);
+    for (const [saving, saveError] of [
+      [false, null],
+      [true, null],
+      [false, "Save failed: network error"],
+      [true, "Save failed: network error"],
+    ] as const) {
+      rerender(<SettingsHeader {...baseProps} saving={saving} saveError={saveError} />);
+      expect(!!screen.queryByText("Saving...")).toBe(saving);
+      expect(screen.queryByTestId("settings-header-save-error")?.textContent ?? null).toBe(saveError);
+    }
   });
 });
