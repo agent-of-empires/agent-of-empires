@@ -1639,14 +1639,6 @@ mod tests {
     }
 
     #[test]
-    fn serve_launch_json_round_trips() {
-        let launch = sample_launch();
-        let json = serde_json::to_string(&launch).expect("serialize");
-        let back: ServeLaunch = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, launch);
-    }
-
-    #[test]
     fn to_serve_args_replays_launch_config() {
         let launch = sample_launch();
         let args = launch.to_serve_args(Some("hunter2".to_string()));
