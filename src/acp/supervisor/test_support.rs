@@ -54,6 +54,28 @@ impl<S: BroadcastSink> Supervisor<S> {
             .epoch()
     }
 
+    /// Occupy a slot with a fake worker already carrying what a real drain
+    /// publishes before the assigned frame reaches the listener: the
+    /// agent-assigned id, and the store the launch observed (#4127).
+    pub(crate) async fn test_insert_worker_with_native_handoff(
+        &self,
+        session_id: &str,
+        acp_session_id: &str,
+        store: Option<crate::session::ExecutionBinding>,
+    ) -> u64 {
+        let (mut client, _tx) = AcpClient::fake_for_test(AcpSessionId(format!("acp-{session_id}")));
+        client.native_store = store;
+        let lease = self
+            .test_install_handle(session_id, client, WorkerKind::Stdio, None)
+            .await;
+        let mut workers = self.workers.lock().await;
+        workers
+            .get_mut(session_id)
+            .expect("test worker")
+            .native_session_id = Some(acp_session_id.to_string());
+        lease.epoch()
+    }
+
     /// Replace a fixture's client under a fresh respawn epoch, as a respawn does.
     pub(crate) async fn test_respawn_worker(&self, session_id: &str) -> u64 {
         let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(format!("acp-{session_id}")));

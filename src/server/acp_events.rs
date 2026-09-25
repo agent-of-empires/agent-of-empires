@@ -327,6 +327,23 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                 };
                 inst.source_profile.clone()
             };
+            // #4127: the worker's own store is the only observation of the
+            // route this launch applied. Read it for the id the worker just
+            // assigned — the drain published the worker's handle before the
+            // frame reached here, so a fresh spawn, a respawn and a reattach
+            // all answer, and a worker that never assigned an id attests
+            // nothing. Read before the save so the closure and the in-memory
+            // mirror attest the same observation.
+            let observed = match acp_change.as_ref() {
+                Some(AcpSessionChange::Assigned(new_id)) => {
+                    state
+                        .acp_supervisor
+                        .native_handoff_store(&frame.session_id, new_id)
+                        .await
+                }
+                _ => None,
+            };
+            let observed_mirror = observed.clone();
             let session_id = frame.session_id.clone();
             let change = acp_change.clone();
             let file_watch = state.file_watch.clone();
@@ -339,6 +356,11 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     else {
                         return Ok(None);
                     };
+                    // Stamped before `apply_acp_session_change`, whose
+                    // same-id arm returns without touching the row: a first
+                    // `session/load` reattaching a legacy session must still
+                    // attest the route its launch observed.
+                    inst.attest_launch_default_store(observed.as_ref());
                     apply_acp_session_change(inst, &session_id, change.as_ref());
                     Ok(Some((
                         inst.acp_session_id.clone(),
@@ -363,6 +385,11 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                         state
                             .mutation_epoch
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // The saved row is the durable one; the in-memory row
+                        // must attest the same route or the next save would
+                        // write a binding whose marker the launch already
+                        // settled. Idempotent, so the mirror is safe.
+                        inst.attest_launch_default_store(observed_mirror.as_ref());
                     }
                 }
                 Ok(Ok(None)) => {}
@@ -1536,6 +1563,96 @@ mod tests {
             "and the mark must be durable, which is the #3181 fix; a memory-only \
              mark is dropped by the next reload"
         );
+    }
+
+    /// #4127: a first `session/load` reattaching a legacy session re-assigns the
+    /// very id the row already carries, so `apply_acp_session_change` takes its
+    /// same-id arm and returns without persisting anything. The route the
+    /// launch applied must still be attested there — on disk and in memory — or
+    /// the legacy binding keeps deriving it from the configuration as it
+    /// stands, which is the guess #4127 forbids.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_attests_the_observed_store_on_a_reused_acp_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let store = temp.path().join(".claude");
+        std::fs::create_dir_all(&store).expect("store");
+
+        let profile = "acp-listener-attested-store";
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let binding = |marker: Option<bool>| crate::session::ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![store.clone()],
+                configuration: Vec::new(),
+                cwd: temp.path().to_path_buf(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: marker,
+            }),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        };
+        let mut inst = Instance::new("acp-session", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        inst.agent_session_id = Some(sid.into());
+        inst.acp_session_id = Some("attested-acp-id".to_string());
+        // Legacy: no routing marker at all.
+        inst.agent_session_binding = Some(binding(None));
+        let id = inst.id.clone();
+        seed_profile_store(profile, vec![inst.clone()]);
+        let state = test_support::build_test_app_state(vec![inst]);
+
+        // What the drain published before the frame: the assigned id, and the
+        // store route this launch actually applied.
+        let observed = binding(Some(true)).execution.unwrap();
+        state
+            .acp_supervisor
+            .test_insert_worker_with_native_handoff(&id, "attested-acp-id", Some(observed))
+            .await;
+
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+        await_subscribed(&state).await;
+
+        state
+            .acp_events_tx
+            .send(AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq: 1,
+                event: Arc::new(crate::acp::Event::AcpSessionAssigned {
+                    acp_session_id: "attested-acp-id".to_string(),
+                }),
+                worker_generation: None,
+            })
+            .expect("listener is subscribed");
+
+        let row = await_row(
+            &state,
+            &id,
+            attested_marker,
+            "the reused acp session id returned before the attestation",
+        )
+        .await;
+        listener.abort();
+        let _ = listener.await;
+
+        assert_eq!(row.acp_session_id.as_deref(), Some("attested-acp-id"));
+        assert!(
+            attested_marker(&load_profile_row(profile, &id).expect("row")),
+            "the attestation must be durable, or the next reload derives the \
+             route from the configuration again"
+        );
+    }
+
+    /// Whether the row's own agent binding carries the attested route.
+    fn attested_marker(row: &Instance) -> bool {
+        row.agent_session_binding
+            .as_ref()
+            .and_then(|binding| binding.execution.as_ref())
+            .is_some_and(|execution| execution.exported_default_store == Some(true))
     }
 
     /// #4001: after a daemon restart the control cache is cold, and the

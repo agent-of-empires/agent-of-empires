@@ -137,6 +137,75 @@ impl ConversationBinding {
     }
 }
 
+/// Attest the default-store route a launch observed onto a binding written
+/// before routing provenance existed (#4127).
+///
+/// The marker records what a worker was actually launched with, so only an
+/// observed launch may write it: a request never persists a guess about the
+/// configuration as it stands, and a marker already written is never
+/// overwritten. The observation must be a single-store host Claude launch
+/// carrying its own marker, and it must name the same store as the target, so
+/// a different agent, filesystem, or store attests nothing. Stores are compared
+/// canonically because two spellings of one directory are one store.
+///
+/// Nothing else about the binding moves — not the session id, the provenance,
+/// the transcript path, the store, the cwd — which is what keeps the
+/// conversation identity stable: `identity()` excludes the marker, so stamping
+/// it cannot reclassify the conversation it describes.
+pub(crate) fn attest_observed_default_store(
+    binding: &mut ConversationBinding,
+    observed: Option<&ExecutionBinding>,
+) -> bool {
+    let Some(observed) = observed.filter(|o| o.agent == "claude" && o.filesystem == "host")
+    else {
+        return false;
+    };
+    let Some(observed_store) = single_store(&observed.stores) else {
+        return false;
+    };
+    let Some(observed_marker) = observed.exported_default_store else {
+        return false;
+    };
+    if !binding.is_known() {
+        return false;
+    }
+    let Some(execution) = binding.execution.as_mut() else {
+        return false;
+    };
+    if execution.exported_default_store.is_some() {
+        return false;
+    }
+    if execution.agent != observed.agent || execution.filesystem != observed.filesystem {
+        return false;
+    }
+    let same_store = match single_store(&execution.stores) {
+        Some(target) => same_canonical_store(target, observed_store),
+        None => false,
+    };
+    if !same_store {
+        return false;
+    }
+    execution.exported_default_store = Some(observed_marker);
+    true
+}
+
+fn single_store(stores: &[PathBuf]) -> Option<&std::path::Path> {
+    match stores {
+        [store] => Some(store.as_path()),
+        _ => None,
+    }
+}
+
+fn same_canonical_store(left: &std::path::Path, right: &std::path::Path) -> bool {
+    match (
+        crate::session::capture::canonicalize_allowing_missing_leaf(left),
+        crate::session::capture::canonicalize_allowing_missing_leaf(right),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ConversationKey<'a> {
     session_id: &'a str,
@@ -2393,6 +2462,139 @@ mod tests {
             hasher.finish()
         };
         assert_eq!(digest(&legacy), digest(&exported));
+    }
+
+    /// #4127: a binding written before routing provenance existed adopts the
+    /// route a launch attested, and nothing else about it moves.
+    #[cfg(unix)]
+    #[test]
+    fn attest_observed_default_store_stamps_only_the_attested_route() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("claude");
+        std::fs::create_dir_all(&store).unwrap();
+        let observed = ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![store.clone()],
+            configuration: Vec::new(),
+            cwd: temp.path().to_path_buf(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: Some(true),
+        };
+        let legacy = |agent: &str, filesystem: &str, store: PathBuf| ConversationBinding {
+            session_id: "sid-1".into(),
+            execution: Some(ExecutionBinding {
+                agent: agent.into(),
+                stores: vec![store],
+                configuration: Vec::new(),
+                cwd: temp.path().to_path_buf(),
+                cwd_filesystem: "host".into(),
+                filesystem: filesystem.into(),
+                exported_default_store: None,
+            }),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: Some(temp.path().join("transcript.jsonl")),
+        };
+        let marker = |binding: &ConversationBinding| {
+            binding
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.exported_default_store)
+        };
+        let without_marker = |binding: &ConversationBinding| {
+            let mut execution = binding.execution.clone().unwrap();
+            execution.exported_default_store = None;
+            (
+                binding.session_id.clone(),
+                binding.provenance.clone(),
+                binding.transcript_path.clone(),
+                execution,
+            )
+        };
+
+        // Two spellings of one store are one store, so the marker is written.
+        let mut binding = legacy("claude", "host", temp.path().join("claude/"));
+        let before = binding.clone();
+        assert!(attest_observed_default_store(
+            &mut binding,
+            Some(&observed)
+        ));
+        assert_eq!(marker(&binding), Some(true));
+        assert_eq!(without_marker(&binding), without_marker(&before));
+        assert_eq!(binding, before, "the marker is not part of the identity");
+
+        // Idempotent, and a marker already attested is never overwritten.
+        assert!(!attest_observed_default_store(
+            &mut binding,
+            Some(&observed)
+        ));
+        let mut attested = binding.clone();
+        attested.execution.as_mut().unwrap().exported_default_store = Some(false);
+        let downgrade = ExecutionBinding {
+            exported_default_store: Some(false),
+            ..observed.clone()
+        };
+        assert!(!attest_observed_default_store(
+            &mut attested,
+            Some(&downgrade)
+        ));
+        assert_eq!(marker(&attested), Some(false));
+
+        let other_store = temp.path().join("other");
+        let refusals = [
+            ("codex", "host", store.clone(), observed.clone()),
+            (
+                "claude",
+                "container:session",
+                store.clone(),
+                observed.clone(),
+            ),
+            (
+                "claude",
+                "host",
+                other_store,
+                observed.clone(),
+            ),
+            (
+                "claude",
+                "host",
+                store.clone(),
+                ExecutionBinding {
+                    stores: vec![store.clone(), temp.path().join("second")],
+                    ..observed.clone()
+                },
+            ),
+            (
+                "claude",
+                "host",
+                store.clone(),
+                ExecutionBinding {
+                    exported_default_store: None,
+                    ..observed.clone()
+                },
+            ),
+        ];
+        for (agent, filesystem, store, observed) in refusals {
+            let mut binding = legacy(agent, filesystem, store);
+            assert!(
+                !attest_observed_default_store(&mut binding, Some(&observed)),
+                "agent={agent} filesystem={filesystem} stores={:?}",
+                observed.stores
+            );
+            assert_eq!(marker(&binding), None);
+        }
+
+        // A binding no observation qualified, and an observation nobody
+        // reported, attest nothing.
+        let mut unknown = legacy("claude", "host", store.clone());
+        unknown.provenance = ConversationProvenance::Unknown;
+        assert!(!attest_observed_default_store(
+            &mut unknown,
+            Some(&observed)
+        ));
+        let mut binding = legacy("claude", "host", store);
+        assert!(!attest_observed_default_store(&mut binding, None));
+        assert_eq!(marker(&binding), None);
     }
 
     fn hermes_fixture() -> (tempfile::TempDir, NativeLaunchInputs, rusqlite::Connection) {

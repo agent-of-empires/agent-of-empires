@@ -564,9 +564,14 @@ mod tests {
             .unwrap();
         assert_eq!(req.model.as_deref(), Some("claude-opus-5"));
     }
+
+    /// #4127: a request is not an observation. Building one derives the route
+    /// it will carry, but only a launch that attests one may write the marker,
+    /// so the row keeps deriving it and a later alias declaration still reaches
+    /// the next launch.
     #[tokio::test]
     #[serial_test::serial]
-    async fn legacy_claude_store_provenance_is_derived_for_each_resume() {
+    async fn a_resume_request_derives_the_route_without_persisting_a_guess() {
         let (home, state, project) = test_state("s-legacy-routing");
         let profile = "legacy-acp-routing";
         let store = home.path().join(".claude");

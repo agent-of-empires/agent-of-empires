@@ -648,6 +648,34 @@ impl Instance {
         Some(pin)
     }
 
+    /// Attest the store route an observed launch applied onto both bindings
+    /// this session persists (#4127). A resume carries whichever of them its
+    /// intent adopted, and a sandboxed session routes to an isolated store the
+    /// host's Claude namespace says nothing about, so it attests nothing.
+    /// Idempotent: the second call finds the marker written and returns false.
+    pub(crate) fn attest_launch_default_store(
+        &mut self,
+        observed: Option<&ExecutionBinding>,
+    ) -> bool {
+        if self.is_sandboxed() {
+            return false;
+        }
+        let Some(observed) = observed else {
+            return false;
+        };
+        let mut attested = false;
+        for binding in [
+            self.agent_session_binding.as_mut(),
+            self.resume_binding.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            attested |= super::execution::attest_observed_default_store(binding, Some(observed));
+        }
+        attested
+    }
+
     fn resolved_handoff_binding(
         &self,
         sid: &str,
@@ -1137,5 +1165,70 @@ mod tests {
         assert!(error.to_string().contains("--mcp-config"), "{error:#}");
         assert_eq!(inst.view, View::Structured);
         assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
+    }
+
+    /// #4127: the launch's route reaches both bindings a resume may persist,
+    /// and a sandboxed session, whose store is the container's, attests nothing.
+    #[test]
+    fn attest_launch_default_store_stamps_both_bindings_and_skips_a_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("claude");
+        std::fs::create_dir_all(&store).unwrap();
+        let legacy = || ConversationBinding {
+            session_id: "sid-abc".into(),
+            execution: Some(ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![store.clone()],
+                configuration: Vec::new(),
+                cwd: temp.path().to_path_buf(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            }),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        };
+        let observed = ExecutionBinding {
+            exported_default_store: Some(true),
+            ..legacy().execution.unwrap()
+        };
+        let markers = |inst: &Instance| {
+            [
+                inst.agent_session_binding.as_ref(),
+                inst.resume_binding.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|binding| {
+                binding
+                    .execution
+                    .as_ref()
+                    .and_then(|execution| execution.exported_default_store)
+            })
+            .collect::<Vec<_>>()
+        };
+
+        let mut inst = Instance::new("claude", temp.path().to_str().unwrap());
+        inst.agent_session_binding = Some(legacy());
+        inst.resume_binding = Some(legacy());
+        assert_eq!(markers(&inst), vec![None, None]);
+        assert!(inst.attest_launch_default_store(Some(&observed)));
+        assert_eq!(markers(&inst), vec![Some(true), Some(true)]);
+        assert!(!inst.attest_launch_default_store(Some(&observed)));
+
+        let mut sandboxed = Instance::new("claude", temp.path().to_str().unwrap());
+        sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine".to_string(),
+            container_name: "attest-sandbox".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        sandboxed.agent_session_binding = Some(legacy());
+        assert!(!sandboxed.attest_launch_default_store(Some(&observed)));
+        assert_eq!(markers(&sandboxed), vec![None]);
     }
 }
