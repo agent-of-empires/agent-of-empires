@@ -482,9 +482,146 @@ pub async fn update_project(
     }
 }
 
+/// Scratch sessions have no stable filesystem path to key a `projects.json` entry on, so their
+/// `smart_rename` override lives in a dedicated bundle instead (see
+/// [`crate::session::projects::load_scratch_overrides_merged`]). `worktree_enabled` is never
+/// surfaced here: scratch sessions never offer worktrees.
+#[derive(Serialize)]
+pub struct ScratchOverridesResponse {
+    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smart_rename: Option<bool>,
+}
+
+#[tracing::instrument(target = "http.api.projects", skip_all, fields(scope = q.scope.as_deref().unwrap_or("merged")))]
+pub async fn get_scratch_overrides(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ListQuery>,
+) -> impl IntoResponse {
+    let (scope_label, result) = match q.scope.as_deref() {
+        Some("global") => (
+            "global",
+            projects::load_scratch_overrides(&state.profile, ProjectScope::Global),
+        ),
+        Some("profile") => (
+            "profile",
+            projects::load_scratch_overrides(&state.profile, ProjectScope::Profile),
+        ),
+        Some(other) => {
+            tracing::warn!(target: "http.api.projects", scope = other, "rejected bad scope");
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "bad_scope",
+                format!(
+                    "Unknown scope '{}'. Use 'global', 'profile', or omit.",
+                    other
+                ),
+            );
+        }
+        None => (
+            "merged",
+            projects::load_scratch_overrides_merged(&state.profile),
+        ),
+    };
+
+    match result {
+        Ok(overrides) => Json(ScratchOverridesResponse {
+            scope: scope_label.to_string(),
+            smart_rename: overrides.smart_rename,
+        })
+        .into_response(),
+        Err(e) => {
+            tracing::error!(target: "http.api.projects", error = %e, "load_failed");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "load_failed",
+                e.to_string(),
+            )
+        }
+    }
+}
+
+fn parse_scratch_overrides_patch(
+    body: &serde_json::Value,
+) -> Result<Option<bool>, (&'static str, &'static str)> {
+    match body.get("smart_rename") {
+        None => Err(("no_fields", "provide smart_rename (boolean or null)")),
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(("bad_field", "smart_rename must be a boolean or null")),
+    }
+}
+
+#[tracing::instrument(target = "http.api.projects", skip_all, fields(scope = q.scope.as_deref().unwrap_or("global")))]
+pub async fn update_scratch_overrides(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DeleteQuery>,
+    body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = super::cityhall_block(&state) {
+        tracing::warn!(target: "http.api.projects", reason = "cityhall_mode", "rejected update");
+        return resp;
+    }
+    if state.read_only {
+        tracing::warn!(target: "http.api.projects", reason = "read_only", "rejected update");
+        return read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let scope = match q.scope.as_deref() {
+        Some("profile") => ProjectScope::Profile,
+        Some("global") | None => ProjectScope::Global,
+        Some(other) => {
+            tracing::warn!(target: "http.api.projects", scope = other, "rejected bad scope");
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "bad_scope",
+                format!("Unknown scope '{}'. Use 'global' or 'profile'.", other),
+            );
+        }
+    };
+
+    let smart_rename = match parse_scratch_overrides_patch(&body) {
+        Ok(v) => v,
+        Err((err, msg)) => {
+            tracing::warn!(target: "http.api.projects", reason = err, "rejected update");
+            return api_error(StatusCode::BAD_REQUEST, err, msg);
+        }
+    };
+
+    match projects::update_scratch_overrides(&state.profile, scope, |ov| {
+        ov.smart_rename = smart_rename;
+    }) {
+        Ok(overrides) => {
+            tracing::info!(target: "http.api.projects", scope = scope.as_str(), smart_rename = ?overrides.smart_rename, "updated scratch overrides");
+            Json(ScratchOverridesResponse {
+                scope: scope.as_str().to_string(),
+                smart_rename: overrides.smart_rename,
+            })
+            .into_response()
+        }
+        Err(RegistryError::Other(e)) => {
+            tracing::error!(target: "http.api.projects", error = %e, "update_failed");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "update_failed",
+                e.to_string(),
+            )
+        }
+        Err(RegistryError::Conflict(msg) | RegistryError::NotFound(msg)) => {
+            // update_scratch_overrides operates on a single object, never a keyed lookup, so
+            // these variants can't occur; keep the match exhaustive against RegistryError.
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "update_failed", msg)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_project_patch, OverridesPatch, ProjectPatch};
+    use super::{parse_project_patch, parse_scratch_overrides_patch, OverridesPatch, ProjectPatch};
     use serde_json::json;
 
     #[test]
@@ -583,6 +720,30 @@ mod tests {
         assert_eq!(
             parse_project_patch(&json!({"overrides": "nope"})),
             Err(("bad_field", "overrides must be an object"))
+        );
+    }
+
+    #[test]
+    fn scratch_overrides_patch_requires_smart_rename_key() {
+        assert_eq!(
+            parse_scratch_overrides_patch(&json!({})),
+            Err(("no_fields", "provide smart_rename (boolean or null)"))
+        );
+    }
+
+    #[test]
+    fn scratch_overrides_patch_parses_smart_rename() {
+        assert_eq!(
+            parse_scratch_overrides_patch(&json!({"smart_rename": true})),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            parse_scratch_overrides_patch(&json!({"smart_rename": null})),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_scratch_overrides_patch(&json!({"smart_rename": "nope"})),
+            Err(("bad_field", "smart_rename must be a boolean or null"))
         );
     }
 }

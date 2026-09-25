@@ -9,7 +9,7 @@ use tui_input::Input;
 use super::{DialogResult, InfoDialog};
 use crate::session::config::update_app_state;
 use crate::session::projects;
-use crate::session::{Project, ProjectScope};
+use crate::session::{Project, ProjectOverrides, ProjectScope};
 use crate::tui::components::set_prefixed_input_cursor_position;
 use crate::tui::styles::Theme;
 
@@ -22,6 +22,12 @@ enum Mode {
 pub struct ProjectsDialog {
     profile: String,
     items: Vec<Project>,
+    /// Scratch sessions have no stable path to key a `projects.json` entry on, so their
+    /// `smart_rename` override lives in a dedicated per-scope bundle instead. Rendered as two
+    /// permanent rows after `items` (indices `items.len()` and `items.len() + 1`), editable in
+    /// place rather than through the add form.
+    scratch_global: ProjectOverrides,
+    scratch_profile: ProjectOverrides,
     selected: usize,
     mode: Mode,
     add_input: Input,
@@ -49,6 +55,8 @@ impl ProjectsDialog {
         let mut dialog = Self {
             profile: profile.to_string(),
             items: Vec::new(),
+            scratch_global: ProjectOverrides::default(),
+            scratch_profile: ProjectOverrides::default(),
             selected: 0,
             mode: Mode::Browse,
             add_input: Input::default(),
@@ -90,14 +98,35 @@ impl ProjectsDialog {
         match projects::load_merged(&self.profile) {
             Ok(items) => {
                 self.items = items;
-                if self.selected >= self.items.len() {
-                    self.selected = self.items.len().saturating_sub(1);
+                if self.selected >= self.total_rows() {
+                    self.selected = self.total_rows().saturating_sub(1);
                 }
                 self.error = None;
             }
             Err(e) => {
                 self.error = Some(format!("Failed to load projects: {}", e));
             }
+        }
+        self.scratch_global = projects::load_scratch_overrides(&self.profile, ProjectScope::Global)
+            .unwrap_or_default();
+        self.scratch_profile =
+            projects::load_scratch_overrides(&self.profile, ProjectScope::Profile)
+                .unwrap_or_default();
+    }
+
+    /// Registered projects plus the two permanent scratch-settings rows.
+    fn total_rows(&self) -> usize {
+        self.items.len() + 2
+    }
+
+    /// The scratch row selected, if any: `(scope, current smart_rename override)`.
+    fn selected_scratch_row(&self) -> Option<(ProjectScope, Option<bool>)> {
+        if self.selected == self.items.len() {
+            Some((ProjectScope::Global, self.scratch_global.smart_rename))
+        } else if self.selected == self.items.len() + 1 {
+            Some((ProjectScope::Profile, self.scratch_profile.smart_rename))
+        } else {
+            None
         }
     }
 
@@ -120,9 +149,7 @@ impl ProjectsDialog {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => DialogResult::Cancel,
             KeyCode::Down | KeyCode::Char('j') => {
-                if !self.items.is_empty() {
-                    self.selected = (self.selected + 1).min(self.items.len() - 1);
-                }
+                self.selected = (self.selected + 1).min(self.total_rows() - 1);
                 DialogResult::Continue
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -142,6 +169,31 @@ impl ProjectsDialog {
                         }
                         Err(e) => self.error = Some(format!("Remove failed: {}", e)),
                     }
+                }
+                DialogResult::Continue
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                if self.selected_scratch_row().is_some() =>
+            {
+                let (scope, current) = self.selected_scratch_row().expect("checked above");
+                let next = if key.code == KeyCode::Left {
+                    match current {
+                        None => Some(false),
+                        Some(false) => Some(true),
+                        Some(true) => None,
+                    }
+                } else {
+                    match current {
+                        None => Some(true),
+                        Some(true) => Some(false),
+                        Some(false) => None,
+                    }
+                };
+                match projects::update_scratch_overrides(&self.profile, scope, |ov| {
+                    ov.smart_rename = next;
+                }) {
+                    Ok(_) => self.reload(),
+                    Err(e) => self.error = Some(format!("Update failed: {}", e)),
                 }
                 DialogResult::Continue
             }
@@ -321,7 +373,7 @@ impl ProjectsDialog {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let dialog_width: u16 = 76;
-        let list_height: u16 = (self.items.len() as u16).clamp(3, 12);
+        let list_height: u16 = (self.total_rows() as u16).clamp(3, 14);
         let adding_extra: u16 = if matches!(self.mode, Mode::Adding) {
             5
         } else {
@@ -348,43 +400,81 @@ impl ProjectsDialog {
             .constraints(constraints)
             .split(inner);
 
-        if self.items.is_empty() {
-            let p = Paragraph::new("No registered projects. Press 'a' to add one.")
-                .style(Style::default().fg(theme.dimmed));
-            frame.render_widget(p, chunks[0]);
-        } else {
-            let lines: Vec<Line> = self
-                .items
-                .iter()
-                .enumerate()
-                .map(|(idx, project)| {
-                    let style = if idx == self.selected {
-                        Style::default().fg(theme.accent).bold()
-                    } else {
-                        Style::default().fg(theme.text)
-                    };
-                    let scope_style = if idx == self.selected {
-                        Style::default().fg(theme.accent)
-                    } else {
-                        Style::default().fg(theme.dimmed)
-                    };
-                    let mut spans = vec![
-                        Span::styled(if idx == self.selected { "› " } else { "  " }, style),
-                        Span::styled(project.name.clone(), style),
-                        Span::raw(" "),
-                        Span::styled(format!("[{}]", project.scope.as_str()), scope_style),
-                        Span::raw("  "),
-                        Span::styled(project.path.clone(), Style::default().fg(theme.dimmed)),
-                    ];
-                    if let Some(base) = &project.default_base_branch {
-                        spans.push(Span::styled(
-                            format!("  base:{}", base),
-                            Style::default().fg(theme.dimmed),
-                        ));
-                    }
-                    Line::from(spans)
-                })
-                .collect();
+        {
+            let mut lines: Vec<Line> = if self.items.is_empty() {
+                vec![Line::from(Span::styled(
+                    "No registered projects. Press 'a' to add one.",
+                    Style::default().fg(theme.dimmed),
+                ))]
+            } else {
+                self.items
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, project)| {
+                        let style = if idx == self.selected {
+                            Style::default().fg(theme.accent).bold()
+                        } else {
+                            Style::default().fg(theme.text)
+                        };
+                        let scope_style = if idx == self.selected {
+                            Style::default().fg(theme.accent)
+                        } else {
+                            Style::default().fg(theme.dimmed)
+                        };
+                        let mut spans = vec![
+                            Span::styled(if idx == self.selected { "› " } else { "  " }, style),
+                            Span::styled(project.name.clone(), style),
+                            Span::raw(" "),
+                            Span::styled(format!("[{}]", project.scope.as_str()), scope_style),
+                            Span::raw("  "),
+                            Span::styled(project.path.clone(), Style::default().fg(theme.dimmed)),
+                        ];
+                        if let Some(base) = &project.default_base_branch {
+                            spans.push(Span::styled(
+                                format!("  base:{}", base),
+                                Style::default().fg(theme.dimmed),
+                            ));
+                        }
+                        Line::from(spans)
+                    })
+                    .collect()
+            };
+
+            let scratch_row = |label: &str, idx: usize, smart_rename: Option<bool>| {
+                let selected = idx == self.selected;
+                let style = if selected {
+                    Style::default().fg(theme.accent).bold()
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                let value = match smart_rename {
+                    None => "(use global default)",
+                    Some(true) => "on",
+                    Some(false) => "off",
+                };
+                Line::from(vec![
+                    Span::styled(if selected { "› " } else { "  " }, style),
+                    Span::styled(label.to_string(), style),
+                    Span::raw("  "),
+                    Span::styled("smart rename:", Style::default().fg(theme.dimmed)),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("< {} >", value),
+                        Style::default().fg(theme.accent).bold(),
+                    ),
+                ])
+            };
+            lines.push(scratch_row(
+                "Scratch sessions [global]",
+                self.items.len(),
+                self.scratch_global.smart_rename,
+            ));
+            lines.push(scratch_row(
+                "Scratch sessions [profile]",
+                self.items.len() + 1,
+                self.scratch_profile.smart_rename,
+            ));
+
             frame.render_widget(Paragraph::new(lines), chunks[0]);
         }
 
@@ -738,6 +828,57 @@ mod tests {
         assert!(
             dialog.non_git_notice.is_none(),
             "a git repo add should not warn"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn scratch_rows_are_navigable_and_editable_independent_of_scope() {
+        let temp = tempdir().unwrap();
+        let _home = isolate_home(temp.path());
+
+        // One real project, so the scratch rows land at indices 1 and 2.
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        add_dir(&mut ProjectsDialog::new("test"), &repo);
+
+        let mut dialog = ProjectsDialog::new("test");
+        assert_eq!(dialog.total_rows(), 3);
+        assert_eq!(dialog.selected, 0);
+
+        dialog.handle_key(key(KeyCode::Down));
+        assert_eq!(dialog.selected, 1, "lands on the global scratch row");
+        dialog.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            dialog.scratch_global.smart_rename,
+            Some(true),
+            "Right cycles None -> Some(true)"
+        );
+        assert_eq!(
+            dialog.scratch_profile.smart_rename, None,
+            "the profile row is untouched"
+        );
+
+        dialog.handle_key(key(KeyCode::Down));
+        assert_eq!(dialog.selected, 2, "lands on the profile scratch row");
+        dialog.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            dialog.scratch_profile.smart_rename,
+            Some(false),
+            "Left cycles None -> Some(false)"
+        );
+
+        // Down is clamped at the last row; delete on a scratch row is a no-op.
+        dialog.handle_key(key(KeyCode::Down));
+        assert_eq!(dialog.selected, 2);
+        dialog.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(dialog.items.len(), 1, "delete does not touch scratch rows");
+
+        let merged = crate::session::projects::load_scratch_overrides_merged("test").unwrap();
+        assert_eq!(
+            merged.smart_rename,
+            Some(false),
+            "persisted profile override shadows the persisted global one"
         );
     }
 }

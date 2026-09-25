@@ -335,6 +335,16 @@ export interface ProjectOverrides {
   smart_rename?: boolean;
 }
 
+/**
+ * Scratch sessions have no stable path to key a `projects.json` entry on, so their
+ * `smart_rename` override lives in a dedicated bundle. `worktree_enabled` is never surfaced
+ * here: scratch sessions never offer worktrees.
+ */
+export interface ScratchOverrides {
+  scope: "global" | "profile" | "merged";
+  smart_rename?: boolean;
+}
+
 export interface ProjectInfo {
   name: string;
   path: string;

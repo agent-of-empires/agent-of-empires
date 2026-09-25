@@ -11,6 +11,7 @@ import type {
   GroupInfo,
   ProjectInfo,
   ProjectOverrides,
+  ScratchOverrides,
   DockerStatusResponse,
   CreateSessionRequest,
   ClaudeSessionSummary,
@@ -1248,19 +1249,22 @@ export async function listClaudeSessions(): Promise<ClaudeSessionSummary[]> {
   return (await fetchJson<ClaudeSessionSummary[]>("/api/claude-sessions")) ?? [];
 }
 
+/** Error bodies may be JSON `{message}` or plain text. */
+function parseApiErrorText(text: string, status: number): string {
+  try {
+    return JSON.parse(text).message || `Server error (${status})`;
+  } catch {
+    return text || `Server error (${status})`;
+  }
+}
+
 type ProjectResult = { ok: boolean; error?: string; project?: ProjectInfo };
 
-/** Error bodies may be JSON `{message}` or plain text. */
 async function projectRequest(url: string, init: RequestInit, returnsProject = true): Promise<ProjectResult> {
   try {
     const res = await fetch(url, init);
     if (!res.ok) {
-      const text = await res.text();
-      try {
-        return { ok: false, error: JSON.parse(text).message || `Server error (${res.status})` };
-      } catch {
-        return { ok: false, error: text || `Server error (${res.status})` };
-      }
+      return { ok: false, error: parseApiErrorText(await res.text(), res.status) };
     }
     return returnsProject ? { ok: true, project: (await res.json()) as ProjectInfo } : { ok: true };
   } catch (e) {
@@ -1305,6 +1309,37 @@ export function updateProject(
 /** Unpinning keeps the registry entry; it only drops from the sidebar. */
 export function setProjectPinned(name: string, scope: "global" | "profile", pinned: boolean): Promise<ProjectResult> {
   return projectRequest(projectPath(name, scope), jsonInit("PATCH", { pinned }));
+}
+
+type ScratchOverridesResult = { ok: boolean; error?: string; overrides?: ScratchOverrides };
+
+async function scratchOverridesRequest(url: string, init: RequestInit): Promise<ScratchOverridesResult> {
+  try {
+    const res = await fetch(url, init);
+    if (!res.ok) {
+      return { ok: false, error: parseApiErrorText(await res.text(), res.status) };
+    }
+    return { ok: true, overrides: (await res.json()) as ScratchOverrides };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** Omitting `scope` returns the merged (profile-shadows-global) bundle. `null` means the request failed. */
+export async function fetchScratchOverrides(scope?: "global" | "profile"): Promise<ScratchOverrides | null> {
+  const url = scope ? `/api/projects/scratch/overrides?scope=${scope}` : "/api/projects/scratch/overrides";
+  return await fetchJson<ScratchOverrides>(url);
+}
+
+/** Pass `null` to clear the override and inherit the global default. */
+export function updateScratchOverrides(
+  scope: "global" | "profile",
+  smartRename: boolean | null,
+): Promise<ScratchOverridesResult> {
+  return scratchOverridesRequest(
+    `/api/projects/scratch/overrides?scope=${scope}`,
+    jsonInit("PATCH", { smart_rename: smartRename }),
+  );
 }
 
 export async function fetchDockerStatus(): Promise<DockerStatusResponse> {

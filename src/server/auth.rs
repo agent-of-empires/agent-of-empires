@@ -1207,6 +1207,7 @@ mod tests {
             (Method::POST, "/api/projects"),
             (Method::DELETE, "/api/projects/myproj"),
             (Method::PATCH, "/api/projects/myproj"),
+            (Method::PATCH, "/api/projects/scratch/overrides"),
             (Method::POST, "/api/push/subscribe"),
             (Method::POST, "/api/push/unsubscribe"),
             // Cosmetic UI state and the update banner grant no capability; the

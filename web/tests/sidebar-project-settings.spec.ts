@@ -12,6 +12,7 @@ interface MockSession {
   id: string;
   title: string;
   project_path: string;
+  scratch?: boolean;
 }
 
 interface MockProject {
@@ -33,6 +34,7 @@ async function mockApis(page: Page, sessions: MockSession[], projects: MockProje
           title: s.title,
           project_path: s.project_path,
           group_path: s.project_path,
+          scratch: s.scratch ?? false,
           tool: "claude",
           status: "Idle",
           yolo_mode: false,
@@ -111,5 +113,26 @@ test.describe("Sidebar active-project settings (#4036)", () => {
     await expect(page.getByTestId("project-form-modal")).toBeVisible();
     await expect(page.getByText("Edit project 'repo-a'")).toBeVisible();
     expect(posted).toBe(false);
+  });
+
+  test("Edit settings on the synthetic Scratch group opens its own settings dialog, not the project form", async ({
+    page,
+  }) => {
+    await mockApis(page, [{ id: "s-1", title: "Scratch chat", project_path: "/tmp/scratch/s-1", scratch: true }], []);
+    await page.route("**/api/projects/scratch/overrides*", (r) => {
+      if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
+      return r.fulfill({ json: { scope: "merged" } });
+    });
+    await page.goto("/");
+    await expect(page.locator("header")).toBeVisible();
+
+    const header = page.locator("[data-testid='sidebar-group-header']").filter({ hasText: "Scratch" });
+    await expect(header).toBeVisible();
+    await header.click({ button: "right" });
+    await page.locator("[data-testid='sidebar-group-context-menu-settings']").click();
+
+    await expect(page.getByTestId("scratch-overrides-modal")).toBeVisible();
+    await expect(page.getByText("Scratch session settings")).toBeVisible();
+    await expect(page.getByTestId("project-form-modal")).toHaveCount(0);
   });
 });
