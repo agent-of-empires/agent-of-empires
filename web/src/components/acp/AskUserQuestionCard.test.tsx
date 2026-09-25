@@ -275,6 +275,34 @@ describe("AskUserQuestionCard rendering", () => {
     expect(prompt.className).not.toContain("truncate");
   });
 
+  it("renders a plain free-text field as a multiline textarea", () => {
+    renderCard([q({ field_key: "name" })]);
+    expect(screen.getByPlaceholderText("Type your answer").tagName).toBe("TEXTAREA");
+  });
+
+  it("inserts a newline on Shift+Enter in the free-text textarea instead of submitting", () => {
+    const onResolve = renderCard([q({ field_key: "name" })]);
+    const textarea = screen.getByPlaceholderText("Type your answer");
+    expect(fireEvent.keyDown(textarea, { key: "Enter", shiftKey: true })).toBe(true);
+    expect(onResolve).not.toHaveBeenCalled();
+  });
+
+  it("does not submit the free-text textarea on Enter during IME composition", () => {
+    const onResolve = renderCard([q({ field_key: "name" })]);
+    const textarea = screen.getByPlaceholderText("Type your answer");
+    fireEvent.change(textarea, { target: { value: "Ada" } });
+    expect(fireEvent.keyDown(textarea, { key: "Enter", isComposing: true })).toBe(true);
+    expect(onResolve).not.toHaveBeenCalled();
+  });
+
+  it("submits the free-text textarea on Enter without Shift", () => {
+    const onResolve = renderCard([q({ field_key: "name" })]);
+    const textarea = screen.getByPlaceholderText("Type your answer");
+    fireEvent.change(textarea, { target: { value: "Ada" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(onResolve).toHaveBeenCalledWith({ action: "accept", answers: { name: "Ada" } });
+  });
+
   // Older adapters flattened `"<label> — <description>"` into the title; a structured
   // description (even empty) wins, and null falls back to the split.
   it.each([
