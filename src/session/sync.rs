@@ -1081,67 +1081,50 @@ mod tests {
         assert_eq!(loaded[0].resume_probe_failed_sid, None);
     }
 
+    /// Invalid, excluded, stopped-session and pin-contradicting observations (#2709) are
+    /// filtered without touching the row.
     #[test]
     #[serial]
-    fn drain_filters_invalid_or_excluded_sid_and_leaves_state_unchanged() {
+    fn drain_filters_rejected_observations_and_leaves_state_unchanged() {
         let temp = tempdir().unwrap();
         let _guard = storage_home_guard(&temp);
+        let own = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
+        let peer = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
         let excluded = "019342ab-1234-7def-8901-abcdef012345";
-        for (profile, observed) in [
-            ("sync-filtered-validation", "bad sid!"),
-            ("sync-filtered-excludes", excluded),
-        ] {
+        let cases: [(&str, &str, fn(&mut Instance)); 4] = [
+            ("validation", "bad sid!", |_| {}),
+            ("excludes", excluded, |_| {}),
+            ("stopped", peer, |inst| inst.status = Status::Stopped),
+            ("use-pin", peer, |inst| {
+                inst.resume_intent = ResumeIntent::Use(inst.agent_session_id.clone().unwrap())
+            }),
+        ];
+        for (case, observed, configure) in cases {
+            let profile = format!("sync-filtered-{case}");
             let mut inst = Instance::new("sync-filtered-title", "/tmp/x");
-            inst.source_profile = profile.to_string();
-            inst.agent_session_id = Some("original-sid".to_string());
+            inst.source_profile = profile.clone();
+            inst.agent_session_id = Some(own.to_string());
             inst.retroactive_capture_excludes
                 .insert(crate::session::ConversationBinding::unknown(
                     excluded.to_string(),
                 ));
-            seed_instance_on_disk(profile, &inst);
+            configure(&mut inst);
+            seed_instance_on_disk(&profile, &inst);
             attach_poller_with_update(&mut inst, observed);
 
             let file_watch = FileWatchService::noop();
             let mut instances = vec![inst];
             let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
 
-            assert_eq!(
-                outcome.filtered,
-                vec![instances[0].id.clone()],
-                "{observed}"
-            );
-            assert!(outcome.applied.is_empty());
-            assert!(outcome.rolled_back.is_empty());
+            assert_eq!(outcome.filtered, vec![instances[0].id.clone()], "{case}");
+            assert!(outcome.applied.is_empty(), "{case}");
+            assert!(outcome.rolled_back.is_empty(), "{case}");
             assert_eq!(
                 instances[0].agent_session_id.as_deref(),
-                Some("original-sid")
+                Some(own),
+                "{case}"
             );
         }
-    }
-
-    #[test]
-    #[serial]
-    fn drain_rejects_observed_sid_for_stopped_session() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-
-        let own = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
-        let peer = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
-        let mut inst = Instance::new("stopped-title", "/tmp/x");
-        inst.source_profile = "sync-stopped".to_string();
-        inst.agent_session_id = Some(own.to_string());
-        inst.status = Status::Stopped;
-        seed_instances_on_disk("sync-stopped", &[&inst]);
-
-        attach_poller_with_update(&mut inst, peer);
-
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
-
-        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
-        assert!(outcome.applied.is_empty());
-        assert_eq!(instances[0].agent_session_id.as_deref(), Some(own));
     }
 
     #[test]
@@ -1179,31 +1162,6 @@ mod tests {
             Some(crate::session::LifecycleOperation::Trash)
         );
         assert_eq!(stored[0].lifecycle_generation, 1);
-    }
-
-    #[test]
-    #[serial]
-    fn drain_rejects_observed_sid_contradicting_use_pin() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-
-        let pin = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
-        let peer = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
-        let mut inst = Instance::new("pinned-title", "/tmp/x");
-        inst.source_profile = "sync-pinned".to_string();
-        inst.agent_session_id = Some(pin.to_string());
-        inst.resume_intent = ResumeIntent::Use(pin.to_string());
-        seed_instances_on_disk("sync-pinned", &[&inst]);
-
-        attach_poller_with_update(&mut inst, peer);
-
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
-
-        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
-        assert!(outcome.applied.is_empty());
-        assert_eq!(instances[0].agent_session_id.as_deref(), Some(pin));
     }
 
     #[test]

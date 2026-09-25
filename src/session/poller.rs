@@ -850,15 +850,12 @@ mod tests {
         configure_session_id_poller_max_threads(400);
         assert!(!budget.exhausted_now());
         assert!(budget.try_acquire().is_some());
-    }
 
-    #[test]
-    fn zero_ceiling_keeps_the_default() {
-        let _budget = test_support::IsolatedBudget::with_ceiling(7);
         configure_session_id_poller_max_threads(0);
         assert_eq!(
             session_id_poller_max_threads(),
-            DEFAULT_SESSION_ID_POLLER_MAX_THREADS
+            DEFAULT_SESSION_ID_POLLER_MAX_THREADS,
+            "zero keeps the default"
         );
     }
 
@@ -939,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_backoff_doubles_to_a_minute_and_holds() {
+    fn repair_backoff_doubles_to_a_minute_reminds_at_the_cap_and_resets() {
         let mut b = PollerRepairBackoff::default();
         let now = Instant::now();
         assert!(b.due(now), "a fresh schedule is due immediately");
@@ -972,31 +969,19 @@ mod tests {
                 "not due one millisecond early"
             );
         }
-    }
 
-    #[test]
-    fn repair_backoff_reminds_every_tenth_deferral_at_the_cap() {
-        let mut b = PollerRepairBackoff::default();
-        let now = Instant::now();
-        for _ in 0..5 {
-            b.defer(now);
-        }
         let mut logged_at = Vec::new();
-        for _ in 0..25 {
+        for _ in 0..23 {
             if b.defer(now).is_some() {
                 logged_at.push(b.deferrals());
             }
         }
-        assert_eq!(logged_at, vec![10, 20, 30]);
-    }
+        assert_eq!(
+            logged_at,
+            vec![10, 20, 30],
+            "reminds every tenth at the cap"
+        );
 
-    #[test]
-    fn repair_backoff_reset_clears_the_schedule() {
-        let mut b = PollerRepairBackoff::default();
-        let now = Instant::now();
-        b.defer(now);
-        b.defer(now);
-        assert!(!b.due(now));
         b.reset();
         assert_eq!(b, PollerRepairBackoff::default());
         assert!(b.due(now));

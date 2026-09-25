@@ -889,13 +889,15 @@ mod tests {
     }
 
     #[test]
-    fn relocate_leaves_a_default_branch_checkout_in_place() {
+    fn a_default_branch_checkout_is_never_planned_or_relocated() {
         if !git_available() {
             return;
         }
         let (_tmp, mut inst) = default_branch_worktree_instance();
         let original = inst.project_path.clone();
         inst.trash();
+        assert_eq!(plan_trashed_reconcile(&inst), ReconcilePlan::Nothing);
+        assert!(!reconcile_trashed_location(&mut inst));
 
         let out = relocate_worktree_to_trash(&mut inst);
         assert!(
@@ -905,17 +907,6 @@ mod tests {
         assert_eq!(inst.project_path, original);
         assert!(inst.pre_trash_project_path.is_none());
         assert!(PathBuf::from(&original).exists());
-    }
-
-    #[test]
-    fn a_default_branch_checkout_is_never_planned_for_relocation() {
-        if !git_available() {
-            return;
-        }
-        let (_tmp, mut inst) = default_branch_worktree_instance();
-        inst.trash();
-        assert_eq!(plan_trashed_reconcile(&inst), ReconcilePlan::Nothing);
-        assert!(!reconcile_trashed_location(&mut inst));
     }
 
     #[test]
@@ -1072,7 +1063,38 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_gitdir_link_is_not_mistaken_for_a_stranded_checkout() {
+    fn stat_failures_and_relative_gitdir_links_are_not_stranded_checkouts() {
+        let stat_tmp = tempfile::TempDir::new().unwrap();
+        let worktree = stat_tmp.path().join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let loop_a = stat_tmp.path().join("loop_a");
+        let loop_b = stat_tmp.path().join("loop_b");
+        std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
+        std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
+        assert!(
+            loop_a.try_exists().is_err(),
+            "the fixture must actually produce a stat error"
+        );
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", loop_a.display()),
+        )
+        .unwrap();
+
+        assert!(
+            !is_stranded_checkout(&worktree),
+            "a stat failure must stay retriable, not become terminal"
+        );
+
+        std::fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                stat_tmp.path().join("definitely-gone").display()
+            ),
+        )
+        .unwrap();
+        assert!(is_stranded_checkout(&worktree));
         if !git_available() {
             return;
         }
@@ -1127,38 +1149,6 @@ mod tests {
             "a live checkout with a relative gitdir link must not read as stranded"
         );
         std::fs::remove_dir_all(worktree.join(&target)).unwrap();
-        assert!(is_stranded_checkout(&worktree));
-    }
-
-    #[test]
-    fn a_stat_failure_on_the_admin_dir_is_not_a_stranded_checkout() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let worktree = tmp.path().join("wt");
-        std::fs::create_dir_all(&worktree).unwrap();
-        let loop_a = tmp.path().join("loop_a");
-        let loop_b = tmp.path().join("loop_b");
-        std::os::unix::fs::symlink(&loop_b, &loop_a).unwrap();
-        std::os::unix::fs::symlink(&loop_a, &loop_b).unwrap();
-        assert!(
-            loop_a.try_exists().is_err(),
-            "the fixture must actually produce a stat error"
-        );
-        std::fs::write(
-            worktree.join(".git"),
-            format!("gitdir: {}\n", loop_a.display()),
-        )
-        .unwrap();
-
-        assert!(
-            !is_stranded_checkout(&worktree),
-            "a stat failure must stay retriable, not become terminal"
-        );
-
-        std::fs::write(
-            worktree.join(".git"),
-            format!("gitdir: {}\n", tmp.path().join("definitely-gone").display()),
-        )
-        .unwrap();
         assert!(is_stranded_checkout(&worktree));
     }
 
@@ -1232,54 +1222,20 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn profile_sweep_leaves_a_consistent_profile_untouched() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-        let storage = crate::session::Storage::new_unwatched("default").unwrap();
-        let mut plain = Instance::new("plain", "/tmp/plain");
-        plain.trash();
-        let (_tmp, mut relocated) = if git_available() {
-            let (tmp, mut inst) = real_worktree_instance();
-            inst.trash();
-            assert!(matches!(
-                relocate_worktree_to_trash(&mut inst),
-                RelocateOutcome::Relocated { .. }
-            ));
-            (Some(tmp), Some(inst))
-        } else {
-            (None, None)
-        };
-        let ids: Vec<String> = std::iter::once(plain.id.clone())
-            .chain(relocated.as_ref().map(|inst| inst.id.clone()))
-            .collect();
-        storage
-            .update(|instances, _groups| {
-                instances.push(plain.clone());
-                if let Some(inst) = relocated.take() {
-                    instances.push(inst);
-                }
-                Ok(())
-            })
-            .unwrap();
-
-        assert!(reconcile_trashed_profile("default").unwrap().is_empty());
-        for stored in storage.load().unwrap() {
-            assert!(ids.contains(&stored.id));
-            assert_eq!(
-                stored.lifecycle_generation, 0,
-                "a row needing nothing must not be reserved"
-            );
-            assert!(stored.lifecycle_reservation.is_none());
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn profile_sweep_heals_every_row_that_needs_it() {
+    fn profile_sweep_heals_every_row_that_needs_it_and_nothing_else() {
         if !git_available() {
             return;
         }
         let _guard = crate::session::test_support::isolate_app_dir();
         let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let mut plain = Instance::new("plain", "/tmp/plain");
+        plain.trash();
+        storage
+            .update(|instances, _groups| {
+                instances.push(plain.clone());
+                Ok(())
+            })
+            .unwrap();
         let mut keeps = Vec::new();
         let mut originals = Vec::new();
         for _ in 0..2 {
@@ -1308,10 +1264,29 @@ mod tests {
             );
             assert!(row.lifecycle_reservation.is_none());
         }
+        let generations = |rows: &[Instance]| -> Vec<(String, u64)> {
+            rows.iter()
+                .map(|row| (row.id.clone(), row.lifecycle_generation))
+                .collect()
+        };
+        let plain_row = stored.iter().find(|row| row.id == plain.id).unwrap();
+        assert_eq!(
+            (
+                plain_row.lifecycle_generation,
+                plain_row.lifecycle_reservation.is_none()
+            ),
+            (0, true),
+            "a row needing nothing must not be reserved"
+        );
 
         assert!(
             reconcile_trashed_profile("default").unwrap().is_empty(),
             "the sweep is idempotent"
+        );
+        assert_eq!(
+            generations(&storage.load().unwrap()),
+            generations(&stored),
+            "a consistent profile is left untouched"
         );
     }
 
