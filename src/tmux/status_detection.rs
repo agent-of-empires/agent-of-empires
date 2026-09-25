@@ -1568,18 +1568,18 @@ Do you want to proceed?\n\
             ],
         );
 
-        assert_eq!(
-            detect_via_manifest("claude", "", "", hook(Status::Waiting, None)),
-            Status::Waiting
+        // Non-running hooks pass through whatever the pane shows.
+        assert_hook_all(
+            "claude",
+            hook(Status::Waiting, None),
+            Status::Waiting,
+            &[""],
         );
-        assert_eq!(
-            detect_via_manifest(
-                "claude",
-                "Do you want to proceed?\n1. Yes",
-                "",
-                hook(Status::Idle, None)
-            ),
-            Status::Idle
+        assert_hook_all(
+            "claude",
+            hook(Status::Idle, None),
+            Status::Idle,
+            &["Do you want to proceed?\n1. Yes"],
         );
     }
 
@@ -1814,62 +1814,27 @@ report the issue.
             ],
         );
 
-        let pane = r#"
->> Code review started: staged changes <<
-
-<< Code review finished >>
-
-› Implement the review comment
-
-I’ll inspect the status detection path first and then adjust the idle override.
-"#;
-
-        assert_eq!(
-            detect_via_manifest("codex", pane, "", hook(Status::Running, secs(0))),
-            Status::Running
-        );
-
-        assert_eq!(
-            detect_via_manifest(
-                "codex",
+        // Generic pane states never override a running codex hook.
+        assert_hook_all(
+            "codex",
+            running_now,
+            Status::Running,
+            &[
+                "\n>> Code review started: staged changes <<\n\n<< Code review finished >>\n\n\
+                 › Implement the review comment\n\n\
+                 I’ll inspect the status detection path first and then adjust the idle override.\n",
                 "run this command? (y/n)",
-                "",
-                hook(Status::Running, secs(0))
-            ),
-            Status::Running
-        );
-        assert_eq!(
-            detect_via_manifest(
-                "codex",
                 "› Write tests for @filename",
-                "",
-                hook(Status::Running, secs(0))
-            ),
-            Status::Running
+                "file saved",
+            ],
         );
-        assert_eq!(
-            detect_via_manifest("codex", "file saved", "", hook(Status::Running, secs(0))),
-            Status::Running
-        );
-
-        let pane = "\
-  Question 1/1 (1 unanswered)
-  Pick one
-
-  › 1. Apple
-    2. Banana
-
-  tab to add notes | enter to submit answer | esc to interrupt
-";
-
-        assert_eq!(
-            detect_via_manifest("codex", pane, "", hook(Status::Waiting, secs(0))),
-            Status::Waiting
-        );
-        assert_eq!(
-            detect_via_manifest("codex", pane, "", hook(Status::Idle, secs(0))),
-            Status::Waiting
-        );
+        // Only running hooks are overridden by a question on screen.
+        let question =
+            "  Question 1/1 (1 unanswered)\n  Pick one\n\n  › 1. Apple\n    2. Banana\n\n\
+                        \x20 tab to add notes | enter to submit answer | esc to interrupt\n";
+        for status in [Status::Waiting, Status::Idle] {
+            assert_hook_all("codex", hook(status, secs(0)), Status::Waiting, &[question]);
+        }
     }
 
     #[test]

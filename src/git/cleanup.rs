@@ -1052,15 +1052,6 @@ mod tests {
 
     #[test]
     fn test_list_dirty_files_returns_untracked_and_modified() {
-        let (_clean_dir, repo_path) = init_repo_with_commit();
-        assert!(dirty_worktree_message(&repo_path).is_none(), "clean tree");
-
-        std::fs::write(repo_path.join("scratch.log"), "data").unwrap();
-        let msg = dirty_worktree_message(&repo_path).expect("dirty tree");
-        for expected in ["modified or untracked files", "--force", "scratch.log"] {
-            assert!(msg.contains(expected), "{expected} missing from {msg}");
-        }
-
         let (_dir, repo_path) = init_repo_with_commit();
 
         // Untracked file
@@ -1096,6 +1087,18 @@ mod tests {
 
         let not_a_repo = tempfile::TempDir::new().unwrap();
         assert!(list_dirty_files(not_a_repo.path()).is_empty());
+    }
+
+    #[test]
+    fn dirty_worktree_message_describes_only_a_dirty_tree() {
+        let (_dir, repo_path) = init_repo_with_commit();
+        assert!(dirty_worktree_message(&repo_path).is_none(), "clean tree");
+
+        std::fs::write(repo_path.join("scratch.log"), "data").unwrap();
+        let msg = dirty_worktree_message(&repo_path).expect("dirty tree");
+        for expected in ["modified or untracked files", "--force", "scratch.log"] {
+            assert!(msg.contains(expected), "{expected} missing from {msg}");
+        }
     }
 
     #[test]

@@ -662,6 +662,70 @@ mod tests {
 
     #[test]
     #[serial(hook_base)]
+    fn instance_subdir_creates_with_0o700_when_absent() {
+        let (_g, base, _tmp) = BaseGuard::fresh();
+        make_correct_base(&base);
+        let fd = open_instance_dir("test_inst_a").unwrap();
+        let st = fstat(&fd).unwrap();
+        assert_eq!(st.st_mode & 0o7777, 0o700);
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn write_short_then_read_file_at_roundtrip() {
+        let (_g, base, _tmp) = BaseGuard::fresh();
+        make_correct_base(&base);
+        let dir = open_instance_dir("rt").unwrap();
+        write_short(dir.as_fd(), "status", b"running").unwrap();
+        let bytes = read_file_at(dir.as_fd(), "status", 64).unwrap().unwrap();
+        assert_eq!(bytes, b"running");
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn write_atomic_renames_atomically() {
+        let (_g, base, _tmp) = BaseGuard::fresh();
+        make_correct_base(&base);
+        let dir = open_instance_dir("atomic_rt").unwrap();
+        let uuid = b"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        write_atomic(dir.as_fd(), "session_id", uuid).unwrap();
+        let bytes = read_file_at(dir.as_fd(), "session_id", 64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes, uuid);
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn read_file_at_returns_none_when_absent() {
+        let (_g, base, _tmp) = BaseGuard::fresh();
+        make_correct_base(&base);
+        let dir = open_instance_dir("ronone").unwrap();
+        let got = read_file_at(dir.as_fd(), "missing", 64).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn open_instance_dir_read_only_returns_none_for_absent() {
+        let (_g, base, _tmp) = BaseGuard::fresh();
+        make_correct_base(&base);
+        // Note: read_only does NOT mkdir; absent means None.
+        let got = open_instance_dir_read_only("missing_inst").unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn cleanup_handles_nonexistent_instance() {
+        let (_g, base, _tmp) = BaseGuard::fresh();
+        make_correct_base(&base);
+        // Must not panic, must not error.
+        remove_instance_dir("never_existed").unwrap();
+    }
+
+    #[test]
+    #[serial(hook_base)]
     fn init_rejects_symlink_at_base() {
         let (_g, base, tmp) = BaseGuard::fresh();
         let target = tmp.path().join("decoy");
@@ -751,32 +815,6 @@ mod tests {
             after_first,
             "second call must reuse cached error, not re-attempt open"
         );
-    }
-
-    #[test]
-    #[serial(hook_base)]
-    fn instance_dir_is_private_and_round_trips_files() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
-        make_correct_base(&base);
-        assert!(open_instance_dir_read_only("rt").unwrap().is_none());
-        let dir = open_instance_dir("rt").unwrap();
-        assert_eq!(fstat(&dir).unwrap().st_mode & 0o7777, 0o700);
-        assert!(read_file_at(dir.as_fd(), "status", 64).unwrap().is_none());
-
-        write_short(dir.as_fd(), "status", b"running").unwrap();
-        assert_eq!(
-            read_file_at(dir.as_fd(), "status", 64).unwrap().unwrap(),
-            b"running"
-        );
-        let uuid = b"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        write_atomic(dir.as_fd(), "session_id", uuid).unwrap();
-        assert_eq!(
-            read_file_at(dir.as_fd(), "session_id", 64)
-                .unwrap()
-                .unwrap(),
-            uuid
-        );
-        remove_instance_dir("never_existed").unwrap();
     }
 
     #[test]

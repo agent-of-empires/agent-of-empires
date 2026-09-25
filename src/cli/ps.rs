@@ -707,30 +707,6 @@ mod tests {
     }
 
     #[test]
-    fn row_field_helpers() {
-        assert_eq!(normalize_tmux_state(Status::Running), "running");
-        assert_eq!(normalize_tmux_state(Status::Waiting), "waiting");
-        assert_eq!(normalize_tmux_state(Status::Idle), "idle");
-        assert_eq!(normalize_tmux_state(Status::Unknown), "idle");
-        assert_eq!(normalize_tmux_state(Status::Starting), "idle");
-        assert_eq!(normalize_tmux_state(Status::Creating), "idle");
-        assert_eq!(normalize_tmux_state(Status::Stopped), "dead");
-        assert_eq!(normalize_tmux_state(Status::Error), "dead");
-        assert_eq!(normalize_tmux_state(Status::Deleting), "dead");
-        assert_eq!(format_age(None), "-");
-        assert_eq!(format_age(Some(5)), "5s");
-        assert_eq!(format_age(Some(59)), "59s");
-        assert_eq!(format_age(Some(60)), "1m");
-        assert_eq!(format_age(Some(3599)), "59m");
-        assert_eq!(format_age(Some(3600)), "1h");
-        assert_eq!(format_age(Some(86399)), "23h");
-        assert_eq!(format_age(Some(86400)), "1d");
-        assert_eq!(tmux_id_suffix("aoe_My_Session_abcd1234"), Some("abcd1234"));
-        assert_eq!(tmux_id_suffix("aoe__abcd1234"), Some("abcd1234"));
-        assert_eq!(tmux_id_suffix("nounderscore"), None);
-    }
-
-    #[test]
     fn merge_joins_each_substrate_to_its_instance() {
         let instances = vec![inst("abcd1234ef567890", "My Session")];
         let tmux = vec![tmux_state("aoe_My_Session_abcd1234", Status::Running)];
@@ -758,6 +734,38 @@ mod tests {
         assert_eq!(rows[0].pid, Some(7));
         assert_eq!(rows[0].age_secs, Some(1000));
         assert!(!rows[0].is_orphan);
+    }
+
+    #[test]
+    fn normalize_tmux_state_maps_every_status() {
+        assert_eq!(normalize_tmux_state(Status::Running), "running");
+        assert_eq!(normalize_tmux_state(Status::Waiting), "waiting");
+        assert_eq!(normalize_tmux_state(Status::Idle), "idle");
+        assert_eq!(normalize_tmux_state(Status::Unknown), "idle");
+        assert_eq!(normalize_tmux_state(Status::Starting), "idle");
+        assert_eq!(normalize_tmux_state(Status::Creating), "idle");
+        assert_eq!(normalize_tmux_state(Status::Stopped), "dead");
+        assert_eq!(normalize_tmux_state(Status::Error), "dead");
+        assert_eq!(normalize_tmux_state(Status::Deleting), "dead");
+    }
+
+    #[test]
+    fn format_age_scales_units() {
+        assert_eq!(format_age(None), "-");
+        assert_eq!(format_age(Some(5)), "5s");
+        assert_eq!(format_age(Some(59)), "59s");
+        assert_eq!(format_age(Some(60)), "1m");
+        assert_eq!(format_age(Some(3599)), "59m");
+        assert_eq!(format_age(Some(3600)), "1h");
+        assert_eq!(format_age(Some(86399)), "23h");
+        assert_eq!(format_age(Some(86400)), "1d");
+    }
+
+    #[test]
+    fn tmux_id_suffix_extracts_trailing_id() {
+        assert_eq!(tmux_id_suffix("aoe_My_Session_abcd1234"), Some("abcd1234"));
+        assert_eq!(tmux_id_suffix("aoe__abcd1234"), Some("abcd1234"));
+        assert_eq!(tmux_id_suffix("nounderscore"), None);
     }
 
     #[test]

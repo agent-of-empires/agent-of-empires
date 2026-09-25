@@ -257,50 +257,110 @@ mod tests {
         assert_eq!(sorted.len(), ids.len(), "tip ids must be unique");
     }
 
+    fn web_unseen_ids(seen: &[String], signals: &TipSignals) -> Vec<&'static str> {
+        eligible_unseen(TipSurface::Web, seen, signals)
+            .iter()
+            .map(|t| t.id)
+            .collect()
+    }
+
     #[test]
-    fn earned_tip_gates_on_threshold_until_seen_or_used() {
+    fn earned_tip_suppressed_once_n_used() {
         let tip = by_id("new-from-selection").unwrap();
-        let threshold = NEW_FROM_SELECTION_TIP_THRESHOLD;
-        assert!(tip.is_earned());
-        for (count, expected) in [
-            (0, false),
-            (threshold - 1, false),
-            (threshold, true),
-            (threshold + 5, true),
-        ] {
-            assert_eq!(
-                tip.is_eligible(TipSurface::Tui, &signals(count)),
-                expected,
-                "{count}"
-            );
-        }
-
-        let base = unseen_count(TipSurface::Tui, &[], &signals(0));
-        assert_eq!(
-            unseen_count(TipSurface::Tui, &[], &signals(threshold)),
-            base + 1
-        );
-        assert!(next_earned_pop(TipSurface::Tui, &[], &signals(0)).is_none());
-        let pop = next_earned_pop(TipSurface::Tui, &[], &signals(threshold));
-        assert_eq!(pop.map(|t| t.id), Some("new-from-selection"));
-
-        let seen = vec!["new-from-selection".to_string()];
-        assert_eq!(
-            unseen_count(TipSurface::Tui, &seen, &signals(threshold)),
-            base
-        );
-        assert!(next_earned_pop(TipSurface::Tui, &seen, &signals(threshold)).is_none());
-
         let used = TipSignals {
-            new_session_with_selection_count: threshold + 5,
+            new_session_with_selection_count: NEW_FROM_SELECTION_TIP_THRESHOLD + 5,
             used_new_from_selection: true,
             ..TipSignals::default()
         };
         assert!(!tip.is_eligible(TipSurface::Tui, &used));
-        assert!(!eligible_unseen(TipSurface::Tui, &[], &used)
+        let unseen: Vec<&str> = eligible_unseen(TipSurface::Tui, &[], &used)
             .iter()
-            .any(|t| t.id == "new-from-selection"));
+            .map(|t| t.id)
+            .collect();
+        assert!(!unseen.contains(&"new-from-selection"));
         assert!(next_earned_pop(TipSurface::Tui, &[], &used).is_none());
+    }
+
+    #[test]
+    fn earned_tip_gates_on_threshold() {
+        let tip = by_id("new-from-selection").unwrap();
+        assert!(tip.is_earned());
+        assert!(!tip.is_eligible(TipSurface::Tui, &signals(0)));
+        assert!(!tip.is_eligible(
+            TipSurface::Tui,
+            &signals(NEW_FROM_SELECTION_TIP_THRESHOLD - 1)
+        ));
+        assert!(tip.is_eligible(TipSurface::Tui, &signals(NEW_FROM_SELECTION_TIP_THRESHOLD)));
+        assert!(tip.is_eligible(
+            TipSurface::Tui,
+            &signals(NEW_FROM_SELECTION_TIP_THRESHOLD + 5)
+        ));
+    }
+
+    #[test]
+    fn unseen_count_tracks_eligibility_and_seen() {
+        let base = unseen_count(TipSurface::Tui, &[], &signals(0));
+        assert_eq!(
+            unseen_count(
+                TipSurface::Tui,
+                &[],
+                &signals(NEW_FROM_SELECTION_TIP_THRESHOLD)
+            ),
+            base + 1
+        );
+
+        let seen = vec!["new-from-selection".to_string()];
+        assert_eq!(
+            unseen_count(
+                TipSurface::Tui,
+                &seen,
+                &signals(NEW_FROM_SELECTION_TIP_THRESHOLD)
+            ),
+            base
+        );
+    }
+
+    #[test]
+    fn next_earned_pop_only_when_eligible_and_unseen() {
+        assert!(next_earned_pop(TipSurface::Tui, &[], &signals(0)).is_none());
+
+        let pop = next_earned_pop(
+            TipSurface::Tui,
+            &[],
+            &signals(NEW_FROM_SELECTION_TIP_THRESHOLD),
+        );
+        assert_eq!(pop.map(|t| t.id), Some("new-from-selection"));
+
+        let seen = vec!["new-from-selection".to_string()];
+        assert!(next_earned_pop(
+            TipSurface::Tui,
+            &seen,
+            &signals(NEW_FROM_SELECTION_TIP_THRESHOLD)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn surfaces_do_not_leak_across() {
+        let earned = signals(NEW_FROM_SELECTION_TIP_THRESHOLD);
+
+        let web = eligible(TipSurface::Web, &earned);
+        assert!(web.iter().any(|t| t.id == "install-dashboard-pwa"));
+        assert!(!web.iter().any(|t| t.id == "new-from-selection"));
+
+        let tui = eligible(TipSurface::Tui, &earned);
+        assert!(tui.iter().any(|t| t.id == "new-from-selection"));
+        assert!(!tui.iter().any(|t| t.id == "install-dashboard-pwa"));
+    }
+
+    #[test]
+    fn web_rotation_tips_are_eligible_by_default() {
+        let all = web_unseen_ids(&[], &signals(0));
+        assert!(all.contains(&"install-dashboard-pwa"));
+        assert!(all.len() > 1, "more than just the PWA tip ships on the web");
+        let seen = vec!["install-dashboard-pwa".to_string()];
+        assert_eq!(web_unseen_ids(&seen, &signals(0)).len(), all.len() - 1);
+        assert!(next_earned_pop(TipSurface::Web, &[], &signals(0)).is_none());
     }
 
     #[test]
@@ -319,29 +379,5 @@ mod tests {
             };
             assert_eq!(tip.is_eligible(TipSurface::Tui, &signals), expected);
         }
-    }
-
-    #[test]
-    fn surfaces_do_not_leak_and_web_rotation_is_eligible_by_default() {
-        let earned = signals(NEW_FROM_SELECTION_TIP_THRESHOLD);
-        let web = eligible(TipSurface::Web, &earned);
-        assert!(web.iter().any(|t| t.id == "install-dashboard-pwa"));
-        assert!(!web.iter().any(|t| t.id == "new-from-selection"));
-        let tui = eligible(TipSurface::Tui, &earned);
-        assert!(tui.iter().any(|t| t.id == "new-from-selection"));
-        assert!(!tui.iter().any(|t| t.id == "install-dashboard-pwa"));
-
-        let web_unseen_ids = |seen: &[String]| -> Vec<&'static str> {
-            eligible_unseen(TipSurface::Web, seen, &signals(0))
-                .iter()
-                .map(|t| t.id)
-                .collect()
-        };
-        let all = web_unseen_ids(&[]);
-        assert!(all.contains(&"install-dashboard-pwa"));
-        assert!(all.len() > 1, "more than just the PWA tip ships on the web");
-        let seen = vec!["install-dashboard-pwa".to_string()];
-        assert_eq!(web_unseen_ids(&seen).len(), all.len() - 1);
-        assert!(next_earned_pop(TipSurface::Web, &[], &signals(0)).is_none());
     }
 }

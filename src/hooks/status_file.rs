@@ -260,12 +260,47 @@ mod tests {
 
     #[test]
     #[serial_test::serial(hook_base)]
-    fn test_read_hook_status_age() {
+    fn test_read_hook_status_age_fresh_after_write() {
         let (_g, _, _tmp) = BaseGuard::ready();
-        assert_eq!(read_hook_status_age("age_fresh"), None);
         write_status_via_guard("age_fresh", "running");
         let age = read_hook_status_age("age_fresh").expect("age present after write");
-        assert!(age < Duration::from_secs(5), "got {age:?}");
+        assert!(
+            age < Duration::from_secs(5),
+            "just-written status should be fresh, got {age:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_read_hook_status_age_none_when_absent() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        assert_eq!(read_hook_status_age("age_absent_instance"), None);
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_cleanup_existing_dir() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        write_status_via_guard("cleanup_existing", "running");
+        let dir = base.join("cleanup_existing");
+        assert!(dir.exists());
+        cleanup_hook_status_dir("cleanup_existing");
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_cleanup_nonexistent_dir() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        cleanup_hook_status_dir("nonexistent_cleanup_test");
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_hook_status_dir_path() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let dir = hook_status_dir("abc123").expect("test id must be allowlist-safe");
+        assert_eq!(dir, base.join("abc123"));
     }
 
     #[test]
@@ -277,19 +312,6 @@ mod tests {
         std::os::unix::fs::symlink("/nonexistent/target", base.join("dangling").join("status"))
             .unwrap();
         assert_eq!(read_hook_status("dangling"), None);
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn test_cleanup_hook_status_dir() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        write_status_via_guard("cleanup_existing", "running");
-        let dir = hook_status_dir("cleanup_existing").expect("allowlist-safe id");
-        assert_eq!(dir, base.join("cleanup_existing"));
-        assert!(dir.exists());
-        cleanup_hook_status_dir("cleanup_existing");
-        assert!(!dir.exists());
-        cleanup_hook_status_dir("nonexistent_cleanup_test");
     }
 
     #[test]

@@ -971,6 +971,89 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_changed_files_no_changes() {
+        let (dir, _repo) = setup_test_repo();
+        let files = compute_changed_files(dir.path(), "HEAD").unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_compute_changed_files_with_modification() {
+        let (dir, _repo) = setup_test_repo();
+
+        // Modify the file
+        let file_path = dir.path().join("test.txt");
+        fs::write(&file_path, "line 1 modified\nline 2\nline 3\n").unwrap();
+
+        let files = compute_changed_files(dir.path(), "HEAD").unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, FileStatus::Modified);
+        assert_eq!(files[0].path, Path::new("test.txt"));
+    }
+
+    #[test]
+    fn test_compute_changed_files_with_addition() {
+        let (dir, _repo) = setup_test_repo();
+
+        // Add a new file
+        let new_file = dir.path().join("new.txt");
+        fs::write(&new_file, "new content\n").unwrap();
+
+        let files = compute_changed_files(dir.path(), "HEAD").unwrap();
+        assert!(files.iter().any(|f| f.status == FileStatus::Untracked));
+    }
+
+    #[test]
+    fn test_compute_file_contents_modified() {
+        let (dir, _repo) = setup_test_repo();
+
+        let file_path = dir.path().join("test.txt");
+        fs::write(&file_path, "line 1 modified\nline 2\nline 3\nnew line 4\n").unwrap();
+
+        let c = compute_file_contents(dir.path(), Path::new("test.txt"), "HEAD").unwrap();
+
+        assert!(!c.is_binary);
+        assert_eq!(c.status, FileStatus::Modified);
+        assert_eq!(c.old_content, "line 1\nline 2\nline 3\n");
+        assert_eq!(
+            c.new_content,
+            "line 1 modified\nline 2\nline 3\nnew line 4\n"
+        );
+        // Server-computed unified diff with git-style headers.
+        assert!(c.patch.contains("--- a/test.txt"));
+        assert!(c.patch.contains("+++ b/test.txt"));
+        assert!(c.patch.contains("@@"));
+        assert!(c.patch.contains("-line 1\n"));
+        assert!(c.patch.contains("+line 1 modified\n"));
+    }
+
+    #[test]
+    fn test_compute_file_contents_added() {
+        let (dir, _repo) = setup_test_repo();
+
+        fs::write(dir.path().join("brand_new.txt"), "hello\nworld\n").unwrap();
+
+        let c = compute_file_contents(dir.path(), Path::new("brand_new.txt"), "HEAD").unwrap();
+
+        assert_eq!(c.status, FileStatus::Added);
+        assert!(c.old_content.is_empty());
+        assert_eq!(c.new_content, "hello\nworld\n");
+    }
+
+    #[test]
+    fn test_compute_file_contents_deleted() {
+        let (dir, _repo) = setup_test_repo();
+
+        fs::remove_file(dir.path().join("test.txt")).unwrap();
+
+        let c = compute_file_contents(dir.path(), Path::new("test.txt"), "HEAD").unwrap();
+
+        assert_eq!(c.status, FileStatus::Deleted);
+        assert_eq!(c.old_content, "line 1\nline 2\nline 3\n");
+        assert!(c.new_content.is_empty());
+    }
+
+    #[test]
     fn check_merge_base_status_warns_only_where_no_base_exists() {
         let (branching, _repo) = setup_branching_repo();
         let (plain, _repo) = setup_test_repo();
@@ -1025,69 +1108,6 @@ mod tests {
             status.unwrap().contains("No common ancestor"),
             "Warning should mention no common ancestor"
         );
-    }
-
-    #[test]
-    fn test_compute_changed_files_against_head() {
-        let (dir, _repo) = setup_test_repo();
-        assert!(compute_changed_files(dir.path(), "HEAD")
-            .unwrap()
-            .is_empty());
-
-        fs::write(
-            dir.path().join("test.txt"),
-            "line 1 modified\nline 2\nline 3\n",
-        )
-        .unwrap();
-        fs::write(dir.path().join("new.txt"), "new content\n").unwrap();
-        let files = compute_changed_files(dir.path(), "HEAD").unwrap();
-        let status_of = |path: &str| {
-            files
-                .iter()
-                .find(|f| f.path == Path::new(path))
-                .map(|f| f.status)
-        };
-        assert_eq!(status_of("test.txt"), Some(FileStatus::Modified));
-        assert_eq!(status_of("new.txt"), Some(FileStatus::Untracked));
-    }
-
-    #[test]
-    fn test_compute_file_contents_reports_each_side() {
-        let (dir, _repo) = setup_test_repo();
-        fs::write(
-            dir.path().join("test.txt"),
-            "line 1 modified\nline 2\nline 3\nnew line 4\n",
-        )
-        .unwrap();
-        let c = compute_file_contents(dir.path(), Path::new("test.txt"), "HEAD").unwrap();
-        assert!(!c.is_binary);
-        assert_eq!(c.status, FileStatus::Modified);
-        assert_eq!(c.old_content, "line 1\nline 2\nline 3\n");
-        assert_eq!(
-            c.new_content,
-            "line 1 modified\nline 2\nline 3\nnew line 4\n"
-        );
-        for header in [
-            "--- a/test.txt",
-            "+++ b/test.txt",
-            "@@",
-            "-line 1\n",
-            "+line 1 modified\n",
-        ] {
-            assert!(c.patch.contains(header), "{header:?} in {}", c.patch);
-        }
-
-        fs::write(dir.path().join("brand_new.txt"), "hello\nworld\n").unwrap();
-        let c = compute_file_contents(dir.path(), Path::new("brand_new.txt"), "HEAD").unwrap();
-        assert_eq!(c.status, FileStatus::Added);
-        assert!(c.old_content.is_empty());
-        assert_eq!(c.new_content, "hello\nworld\n");
-
-        fs::remove_file(dir.path().join("test.txt")).unwrap();
-        let c = compute_file_contents(dir.path(), Path::new("test.txt"), "HEAD").unwrap();
-        assert_eq!(c.status, FileStatus::Deleted);
-        assert_eq!(c.old_content, "line 1\nline 2\nline 3\n");
-        assert!(c.new_content.is_empty());
     }
 
     #[test]

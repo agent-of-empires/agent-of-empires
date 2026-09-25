@@ -2199,33 +2199,23 @@ mod tests {
 
     #[test]
     fn raw_byte_batches_chunk_and_roundtrip_in_order() {
-        let payload: Vec<u8> = (0..=255u8)
-            .cycle()
-            .take(MAX_RAW_BYTES_PER_SEND + 10)
-            .collect();
-        let batches = raw_byte_batches(&payload);
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].len(), MAX_RAW_BYTES_PER_SEND);
-        assert_eq!(batches[1].len(), 10);
-        assert_eq!(batches[0][0], "00");
-        assert_eq!(batches[0][255], "ff");
-        let last = payload[payload.len() - 1];
-        assert_eq!(batches[1][9], format!("{:02x}", last));
-
-        assert!(raw_byte_batches(&[]).is_empty());
-
-        let payload: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
-        let batches = raw_byte_batches(&payload);
-        assert!(batches.len() > 1);
-        for batch in &batches {
-            assert!(batch.len() <= MAX_RAW_BYTES_PER_SEND);
+        for len in [0, MAX_RAW_BYTES_PER_SEND + 10, 100_000] {
+            let payload: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+            let batches = raw_byte_batches(&payload);
+            assert_eq!(batches.len(), len.div_ceil(MAX_RAW_BYTES_PER_SEND), "{len}");
+            assert!(batches[..batches.len().saturating_sub(1)]
+                .iter()
+                .all(|batch| batch.len() == MAX_RAW_BYTES_PER_SEND));
+            let roundtrip: Vec<u8> = batches
+                .iter()
+                .flatten()
+                .map(|h| {
+                    assert_eq!(h.len(), 2, "{h:?} is not two hex digits");
+                    u8::from_str_radix(h, 16).unwrap()
+                })
+                .collect();
+            assert_eq!(roundtrip, payload, "{len}");
         }
-        let roundtrip: Vec<u8> = batches
-            .iter()
-            .flatten()
-            .map(|h| u8::from_str_radix(h, 16).unwrap())
-            .collect();
-        assert_eq!(roundtrip, payload);
     }
 
     #[test]
@@ -2372,22 +2362,36 @@ mod tests {
 
     #[test]
     fn pane_segments_split_by_sentinel_and_drop_bad_geometry() {
-        let raw = "@@s@@ 0 0 6 2\nleft1\nleft2\n@@s@@ 7 0 6 2\nright1\nright2\n";
-        let panes = parse_pane_segments(raw, "@@s@@");
-        assert_eq!(panes.len(), 2);
-        assert_eq!(panes[0].geom.left, 0);
-        assert_eq!(panes[1].geom.left, 7);
-        assert_eq!(panes[0].rows.len(), 2);
-        assert!(panes[0].rows[0].contains("left1"));
-        assert!(panes[1].rows[1].contains("right2"));
-
-        let raw = "@@s@@ bogus\norphan\n@@s@@ 0 0 4 1\nkeep\n";
-        let panes = parse_pane_segments(raw, "@@s@@");
-        assert_eq!(panes.len(), 1);
-        assert_eq!(panes[0].geom.width, 4);
-        assert!(panes[0].rows[0].contains("keep"));
-
-        assert!(parse_pane_segments("just some output\n", "@@s@@").is_empty());
+        // raw capture -> (left, width, first row) per kept pane
+        let cases: [(&str, &[(u16, u16, &str)]); 3] = [
+            (
+                "@@s@@ 0 0 6 2\nleft1\nleft2\n@@s@@ 7 0 6 2\nright1\nright2\n",
+                &[(0, 6, "left1"), (7, 6, "right1")],
+            ),
+            (
+                "@@s@@ bogus\norphan\n@@s@@ 0 0 4 1\nkeep\n",
+                &[(0, 4, "keep")],
+            ),
+            ("just some output\n", &[]),
+        ];
+        for (raw, expected) in cases {
+            let panes = parse_pane_segments(raw, "@@s@@");
+            let got: Vec<(u16, u16, String)> = panes
+                .iter()
+                .map(|p| {
+                    let row = crate::tmux::utils::strip_ansi(&p.rows[0]);
+                    (p.geom.left, p.geom.width, row.trim_end().to_string())
+                })
+                .collect();
+            let expected: Vec<(u16, u16, String)> = expected
+                .iter()
+                .map(|&(left, width, row)| (left, width, row.to_string()))
+                .collect();
+            assert_eq!(got, expected, "{raw:?}");
+            assert!(panes
+                .iter()
+                .all(|p| p.rows.len() == usize::from(p.geom.height)));
+        }
     }
 
     #[test]
@@ -2442,27 +2446,41 @@ mod tests {
 
     #[test]
     fn merge_cursor_probes_trusts_position_only_without_drift() {
-        let before = PaneCursor::parse("3 2 1 24 120 80 1 1 1").unwrap();
-        let after = PaneCursor::parse("5 4 1 24 120 80 1 1 1").unwrap();
-        let merged = merge_cursor_probes(Some(before), Some(after)).expect("both probes => Some");
-        assert_eq!((merged.x, merged.y), (5, 4));
-        assert!(merged.position_reliable);
-
-        let before = PaneCursor::parse("3 2 1 24 120 80 1 1 1").unwrap();
-        let after = PaneCursor::parse("3 2 1 24 137 80 1 1 1").unwrap();
-        let merged = merge_cursor_probes(Some(before), Some(after)).expect("both probes => Some");
-        assert!(!merged.position_reliable);
-        assert!(merged.alternate_on && merged.mouse_tracking && merged.mouse_sgr);
-
-        let before = PaneCursor::parse("3 2 1 24 120 80 1 0 0").unwrap();
-        let after = PaneCursor::parse("3 2 1 30 120 80 1 0 0").unwrap();
-        let merged = merge_cursor_probes(Some(before), Some(after)).expect("both probes => Some");
-        assert!(!merged.position_reliable);
-
-        let c = PaneCursor::parse("3 2 1 24 120 80 1 1 1").unwrap();
-        assert!(merge_cursor_probes(None, Some(c)).is_none());
-        assert!(merge_cursor_probes(Some(c), None).is_none());
-        assert!(merge_cursor_probes(None, None).is_none());
+        let probe = |line: &str| PaneCursor::parse(line);
+        // (before, after) -> (x, y, position_reliable) of the merged probe
+        let cases = [
+            (
+                "3 2 1 24 120 80 1 1 1",
+                "5 4 1 24 120 80 1 1 1",
+                Some((5, 4, true)),
+            ),
+            // History growth or a pane resize between probes is drift.
+            (
+                "3 2 1 24 120 80 1 1 1",
+                "3 2 1 24 137 80 1 1 1",
+                Some((3, 2, false)),
+            ),
+            (
+                "3 2 1 24 120 80 1 0 0",
+                "3 2 1 30 120 80 1 0 0",
+                Some((3, 2, false)),
+            ),
+            ("", "3 2 1 24 120 80 1 1 1", None),
+            ("3 2 1 24 120 80 1 1 1", "", None),
+            ("", "", None),
+        ];
+        for (before, after, expected) in cases {
+            let merged = merge_cursor_probes(probe(before), probe(after));
+            assert_eq!(
+                merged.map(|m| (m.x, m.y, m.position_reliable)),
+                expected,
+                "{before:?} -> {after:?}"
+            );
+            if let Some(merged) = merged {
+                assert_eq!(merged.alternate_on, probe(after).unwrap().alternate_on);
+                assert_eq!(merged.mouse_sgr, probe(after).unwrap().mouse_sgr);
+            }
+        }
     }
 
     #[test]
@@ -4333,7 +4351,11 @@ mod tests {
             !respawned_again,
             "respawn_dead_pane should report no-op on live pane"
         );
+    }
 
+    #[test]
+    #[serial_test::serial]
+    fn test_respawn_dead_pane_no_session() {
         let session = Session::from_name("aoe_test_nonexistent_session_xyz");
         let result = session
             .respawn_dead_pane("/tmp", Some("zsh"))

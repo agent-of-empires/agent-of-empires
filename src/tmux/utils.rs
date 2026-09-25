@@ -576,9 +576,14 @@ mod tests {
                 "status_bar={status_bar:?} mouse={mouse:?} clipboard={clipboard:?}"
             );
         }
+    }
 
-        // A user tmux.conf defers only the options it sets.
+    #[test]
+    #[serial_test::serial]
+    fn test_user_config_silent_on_option_still_applies_auto() {
         use crate::session::config::{resolve_tmux_setting, TmuxSetting, TmuxSettingAction};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let tmux_conf = tmp.path().join(".tmux.conf");
 
         let config = Config::default();

@@ -990,26 +990,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_log_path_and_sink() {
-        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
-        let dir = std::path::PathBuf::from("/tmp/aoe-test");
-        assert_eq!(resolve_log_path(&cfg, &dir), dir.join("debug.log"));
-        cfg.file_path = "/var/log/aoe.log".into();
-        assert_eq!(
-            resolve_log_path(&cfg, &dir),
-            std::path::PathBuf::from("/var/log/aoe.log")
-        );
-
-        cfg.output = crate::session::config::SinkKind::Stdout;
-        let tui = resolve_sink(&cfg, &dir, ProcessContext::Tui);
-        assert!(matches!(tui.target, SubscriberTarget::File(_, _)));
-        assert!(tui.warning.is_some(), "coercion should surface a warning");
-        let serve = resolve_sink(&cfg, &dir, ProcessContext::ServeForeground);
-        assert!(matches!(serve.target, SubscriberTarget::Stdout));
-        assert!(serve.warning.is_none());
-    }
-
-    #[test]
     fn rotation_writer_rotates_at_threshold() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("debug.log");
@@ -1056,11 +1036,6 @@ mod tests {
                 ".{n} with keep_count=2"
             );
         }
-        assert_eq!(
-            RotationPolicy::from(&make_cfg(RotationKind::Size, 50, 0)).keep_count,
-            1,
-            "keep_count=0 must clamp to 1"
-        );
     }
 
     #[test]
@@ -1084,5 +1059,51 @@ mod tests {
         );
         let size = std::fs::metadata(&path).unwrap().len();
         assert!(size > 64, "file should have grown past threshold");
+    }
+
+    #[test]
+    fn resolve_log_path_relative_joins_app_dir() {
+        let cfg = make_cfg(RotationKind::Size, 50, 5);
+        let dir = std::path::PathBuf::from("/tmp/aoe-test");
+        assert_eq!(resolve_log_path(&cfg, &dir), dir.join("debug.log"));
+    }
+
+    #[test]
+    fn resolve_log_path_absolute_used_verbatim() {
+        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
+        cfg.file_path = "/var/log/aoe.log".into();
+        let dir = std::path::PathBuf::from("/tmp/aoe-test");
+        assert_eq!(
+            resolve_log_path(&cfg, &dir),
+            std::path::PathBuf::from("/var/log/aoe.log")
+        );
+    }
+
+    #[test]
+    fn resolve_sink_tui_with_stdout_coerces_to_file_with_warning() {
+        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
+        cfg.output = crate::session::config::SinkKind::Stdout;
+        let dir = std::path::PathBuf::from("/tmp/aoe-test");
+        let r = resolve_sink(&cfg, &dir, ProcessContext::Tui);
+        assert!(matches!(r.target, SubscriberTarget::File(_, _)));
+        assert!(r.warning.is_some(), "coercion should surface a warning");
+    }
+
+    #[test]
+    fn resolve_sink_serve_foreground_honors_stdout() {
+        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
+        cfg.output = crate::session::config::SinkKind::Stdout;
+        let dir = std::path::PathBuf::from("/tmp/aoe-test");
+        let r = resolve_sink(&cfg, &dir, ProcessContext::ServeForeground);
+        assert!(matches!(r.target, SubscriberTarget::Stdout));
+        assert!(r.warning.is_none());
+    }
+
+    #[test]
+    fn rotation_policy_clamps_keep_count_zero_to_one() {
+        let mut cfg = make_cfg(RotationKind::Size, 50, 0);
+        cfg.keep_count = 0;
+        let policy = RotationPolicy::from(&cfg);
+        assert_eq!(policy.keep_count, 1, "keep_count=0 must clamp to 1");
     }
 }
