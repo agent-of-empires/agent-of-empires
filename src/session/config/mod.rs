@@ -3603,61 +3603,31 @@ mod model_value_quoting_tests {
     use super::*;
 
     #[test]
-    fn a_context_window_suffix_is_quoted() {
-        assert_eq!(
-            quote_model_value_in_args("--model claude-x[1m]"),
-            "--model 'claude-x[1m]'"
-        );
-        assert_eq!(
-            quote_model_value_in_args("--model=claude-x[1m]"),
-            "--model='claude-x[1m]'"
-        );
-        assert_eq!(
-            quote_model_value_in_args("-m claude-x[1m]"),
-            "-m 'claude-x[1m]'"
-        );
-    }
-
-    #[test]
-    fn an_ordinary_model_id_is_left_alone() {
-        // Quoting everything would change every existing command line.
-        for args in ["--model claude-opus-4-8", "-m gpt-5", "--model=sonnet"] {
-            assert_eq!(quote_model_value_in_args(args), args);
-        }
-    }
-
-    #[test]
-    fn other_arguments_are_never_rewritten() {
-        let args = "--verbose --model claude-x[1m] --flag value";
-        let got = quote_model_value_in_args(args);
-        assert_eq!(got, "--verbose --model 'claude-x[1m]' --flag value");
-    }
-
-    #[test]
-    fn unrelated_whitespace_and_quoting_survive_byte_for_byte() {
-        // A tokenize/join round trip would collapse the double space here and
-        // re-wrap an already double-quoted model value, changing what the
-        // agent receives even though neither token needed rewriting.
+    fn only_an_unquoted_context_window_model_value_is_quoted() {
         let cases = [
+            ("--model claude-x[1m]", "--model 'claude-x[1m]'"),
+            ("--model=claude-x[1m]", "--model='claude-x[1m]'"),
+            ("-m claude-x[1m]", "-m 'claude-x[1m]'"),
+            (
+                "--verbose --model claude-x[1m] --flag value",
+                "--verbose --model 'claude-x[1m]' --flag value",
+            ),
+            // Quoting everything would change every existing command line.
+            ("--model claude-opus-4-8", "--model claude-opus-4-8"),
+            ("-m gpt-5", "-m gpt-5"),
+            ("--model=sonnet", "--model=sonnet"),
+            // A tokenize/join round trip would collapse the double space and
+            // re-wrap an already double-quoted value.
             ("--prompt \"hello  world\"", "--prompt \"hello  world\""),
             ("--model \"gpt-5\"", "--model \"gpt-5\""),
             ("--flag1   --flag2", "--flag1   --flag2"),
+            ("--model 'claude-x[1m]'", "--model 'claude-x[1m]'"),
+            ("--model", "--model"),
+            ("", ""),
         ];
         for (input, expected) in cases {
             assert_eq!(quote_model_value_in_args(input), expected, "{input:?}");
         }
-    }
-
-    #[test]
-    fn an_already_quoted_value_is_not_nested() {
-        let args = "--model 'claude-x[1m]'";
-        assert_eq!(quote_model_value_in_args(args), args);
-    }
-
-    #[test]
-    fn a_dangling_flag_is_harmless() {
-        assert_eq!(quote_model_value_in_args("--model"), "--model");
-        assert_eq!(quote_model_value_in_args(""), "");
     }
 }
 
@@ -4275,19 +4245,14 @@ mod tests {
     }
 
     #[test]
-    fn test_session_config_confirm_before_quit_defaults_on() {
-        // Default-on so existing users get the accidental-exit guard
-        // without opting in (#1569).
-        assert!(SessionConfig::default().confirm_before_quit);
-    }
-
-    #[test]
     fn test_default_on_guards_absent_from_toml_default_on() {
         // An older config.toml with no key for a default-on guard must
         // deserialize to the enabled default, not false. A plain
         // `#[serde(default)]` would give `bool::default()` here and silently
         // strand every pre-existing config on the old behavior.
         let session: SessionConfig = toml::from_str("").unwrap();
+        // Default-on so existing users get the accidental-exit guard (#1569).
+        assert!(SessionConfig::default().confirm_before_quit);
         assert!(session.confirm_before_quit, "confirm_before_quit (#1569)");
         assert!(session.confirm_delete, "confirm_delete (#3364)");
         assert!(session.host_tab_title, "host_tab_title (#3444)");
@@ -4379,21 +4344,19 @@ mod tests {
     // Tests for the config.toml / state.toml split and update_config /
     // update_app_state (#2306-adjacent: long-running-process clobber fix).
 
+    /// App state lives in state.toml alone: `update_config` never writes an
+    /// `[app_state]` table into config.toml, and `Config::load` picks the
+    /// state up from state.toml.
+    /// With no state.toml, app state defaults rather than falling back to an
+    /// `[app_state]` table an older build left in config.toml.
+    /// config.toml and state.toml are each read fresh under a lock, so an
+    /// external process's edit to an unrelated field survives (#2821).
     #[test]
     #[serial_test::serial]
-    fn update_config_preserves_concurrent_external_edit() {
+    fn update_config_and_app_state_preserve_concurrent_external_edits() {
         let _guard = crate::session::test_support::isolate_app_dir();
 
-        update_config(|c| {
-            c.default_profile = "a1".to_string();
-            c.session.confirm_before_quit = true;
-        })
-        .unwrap();
-
-        // Simulate an external `aoe` process writing an unrelated field
-        // directly to disk between our load and our next `update_config`
-        // call below. `update_config` loads fresh internally, so this must
-        // survive.
+        update_config(|c| c.default_profile = "a1".to_string()).unwrap();
         let mut external = Config::load().unwrap();
         external.session.confirm_delete = false;
         let table = toml::Table::try_from(&external).unwrap();
@@ -4402,30 +4365,80 @@ mod tests {
             toml::to_string_pretty(&table).unwrap().as_bytes(),
         )
         .unwrap();
-
-        update_config(|c| {
-            c.default_profile = "a2".to_string();
-        })
-        .unwrap();
-
-        let final_config = Config::load().unwrap();
-        assert_eq!(
-            final_config.default_profile, "a2",
-            "the field update_config touched must be applied"
-        );
+        update_config(|c| c.default_profile = "a2".to_string()).unwrap();
+        let config = Config::load().unwrap();
+        assert_eq!(config.default_profile, "a2");
         assert!(
-            !final_config.session.confirm_delete,
-            "an external process's concurrent edit to an unrelated field must survive"
+            !config.session.confirm_delete,
+            "config.toml external edit lost"
+        );
+
+        update_app_state(|s| s.has_seen_welcome = true).unwrap();
+        let mut external = AppStateConfig::load().unwrap();
+        external.last_seen_version = Some("1.0.0".to_string());
+        let table = toml::Table::try_from(&external).unwrap();
+        super::super::atomic_write(
+            &state_path().unwrap(),
+            toml::to_string_pretty(&table).unwrap().as_bytes(),
+        )
+        .unwrap();
+        update_app_state(|s| s.has_seen_welcome = false).unwrap();
+        let state = AppStateConfig::load().unwrap();
+        assert!(!state.has_seen_welcome);
+        assert_eq!(
+            state.last_seen_version.as_deref(),
+            Some("1.0.0"),
+            "state.toml external edit lost"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_config_and_app_state_concurrent_increments_lose_no_updates() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let n_threads = 16usize;
+        update_config(|c| c.session.snooze_duration_minutes = 1).unwrap();
+        update_app_state(|s| s.home_list_width = Some(0)).unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..n_threads {
+                scope.spawn(|| {
+                    update_config(|c| c.session.snooze_duration_minutes += 1).unwrap();
+                });
+                scope.spawn(|| {
+                    update_app_state(|s| {
+                        s.home_list_width = Some(s.home_list_width.unwrap_or(0) + 1);
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        assert_eq!(
+            Config::load().unwrap().session.snooze_duration_minutes as usize,
+            1 + n_threads,
+            "config.toml increment lost"
+        );
+        assert_eq!(
+            AppStateConfig::load().unwrap().home_list_width,
+            Some(n_threads as u16),
+            "state.toml increment lost"
         );
     }
 
     /// App state lives in state.toml alone: `update_config` never writes an
-    /// `[app_state]` table into config.toml, and `Config::load` picks the
-    /// state up from state.toml.
+    /// `[app_state]` table into config.toml, and `Config::load` neither falls
+    /// back to one an older build left there nor misses state.toml (#2821).
     #[test]
     #[serial_test::serial]
-    fn app_state_is_written_to_state_toml_not_config_toml() {
+    fn app_state_lives_in_state_toml_not_config_toml() {
         let _guard = crate::session::test_support::isolate_app_dir();
+
+        fs::create_dir_all(get_app_dir().unwrap()).unwrap();
+        fs::write(
+            config_path().unwrap(),
+            "[app_state]\nhas_seen_welcome = true\n",
+        )
+        .unwrap();
+        assert!(!Config::load().unwrap().app_state.has_seen_welcome);
 
         update_config(|config| {
             config.app_state.has_seen_welcome = true;
@@ -4436,129 +4449,7 @@ mod tests {
         let table: toml::Table = raw.parse().unwrap();
         assert!(!table.contains_key("app_state"), "config.toml: {raw}");
 
-        update_app_state(|state| {
-            state.has_seen_welcome = true;
-        })
-        .unwrap();
+        update_app_state(|state| state.has_seen_welcome = true).unwrap();
         assert!(Config::load().unwrap().app_state.has_seen_welcome);
-    }
-
-    /// With no state.toml, app state defaults rather than falling back to an
-    /// `[app_state]` table an older build left in config.toml.
-    #[test]
-    #[serial_test::serial]
-    fn config_load_ignores_app_state_in_config_toml() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-
-        fs::create_dir_all(get_app_dir().unwrap()).unwrap();
-        fs::write(
-            config_path().unwrap(),
-            "[app_state]\nhas_seen_welcome = true\n",
-        )
-        .unwrap();
-
-        assert!(!Config::load().unwrap().app_state.has_seen_welcome);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn update_config_concurrent_increments_lose_no_updates() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-
-        update_config(|c| {
-            c.session.snooze_duration_minutes = 1;
-        })
-        .unwrap();
-
-        let n_threads = 16usize;
-        std::thread::scope(|scope| {
-            for _ in 0..n_threads {
-                scope.spawn(|| {
-                    update_config(|c| {
-                        c.session.snooze_duration_minutes += 1;
-                    })
-                    .unwrap();
-                });
-            }
-        });
-
-        let loaded = Config::load().unwrap();
-        assert_eq!(
-            loaded.session.snooze_duration_minutes as usize,
-            1 + n_threads,
-            "every concurrent update_config increment must be observed, none lost"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn update_app_state_preserves_concurrent_external_edit() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-
-        update_app_state(|s| {
-            s.has_seen_welcome = true;
-            s.has_seen_web_tour = true;
-        })
-        .unwrap();
-
-        // Simulate an external `aoe` process (e.g. the TUI while `aoe serve`
-        // is also running) writing an unrelated field directly to disk
-        // between our load and our next `update_app_state` call below.
-        // `update_app_state` now loads fresh under a cross-process flock,
-        // so this must survive.
-        let mut external = AppStateConfig::load().unwrap();
-        external.last_seen_version = Some("1.0.0".to_string());
-        let table = toml::Table::try_from(&external).unwrap();
-        super::super::atomic_write(
-            &state_path().unwrap(),
-            toml::to_string_pretty(&table).unwrap().as_bytes(),
-        )
-        .unwrap();
-
-        update_app_state(|s| {
-            s.has_seen_welcome = false;
-        })
-        .unwrap();
-
-        let final_state = AppStateConfig::load().unwrap();
-        assert!(
-            !final_state.has_seen_welcome,
-            "the field update_app_state touched must be applied"
-        );
-        assert_eq!(
-            final_state.last_seen_version,
-            Some("1.0.0".to_string()),
-            "an external process's concurrent edit to an unrelated field must survive"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn update_app_state_concurrent_increments_lose_no_updates() {
-        let _guard = crate::session::test_support::isolate_app_dir();
-
-        update_app_state(|s| {
-            s.home_list_width = Some(0);
-        })
-        .unwrap();
-
-        let n_threads = 16usize;
-        std::thread::scope(|scope| {
-            for _ in 0..n_threads {
-                scope.spawn(|| {
-                    update_app_state(|s| {
-                        s.home_list_width = Some(s.home_list_width.unwrap_or(0) + 1);
-                    })
-                    .unwrap();
-                });
-            }
-        });
-
-        let loaded = AppStateConfig::load().unwrap();
-        assert_eq!(
-            loaded.home_list_width,
-            Some(n_threads as u16),
-            "every concurrent update_app_state increment must be observed, none lost"
-        );
     }
 }

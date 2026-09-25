@@ -4223,6 +4223,7 @@ mod tests {
 
     #[test]
     fn the_freshest_credential_wins_an_overwrite() {
+        let far = credential(now_ms() + 2 * CREDENTIAL_EXPIRY_HORIZON.as_millis() as u64);
         let cases = [
             (credential(2000), credential(1000), false),
             (credential(1000), credential(2000), true),
@@ -4234,6 +4235,9 @@ mod tests {
             // leftover expiry reaches, and a credential always replaces it.
             (credential(1000), blanked_credential(9000), false),
             (blanked_credential(9000), credential(1000), true),
+            // A planted far-future expiry never outranks a real one.
+            (credential(now_ms()), far.clone(), false),
+            (far, credential(now_ms()), true),
         ];
         for (existing, incoming, overwrite) in cases {
             assert_eq!(
@@ -4284,14 +4288,6 @@ mod tests {
         fs::create_dir(&shared).unwrap();
         prepare();
         assert!(shared.is_dir());
-    }
-
-    #[test]
-    fn an_implausible_expiry_never_outranks_a_real_one() {
-        let far = credential(now_ms() + 2 * CREDENTIAL_EXPIRY_HORIZON.as_millis() as u64);
-        let real = credential(now_ms());
-        assert!(!should_overwrite_credential(&real, &far));
-        assert!(should_overwrite_credential(&far, &real));
     }
 
     #[test]
@@ -5394,39 +5390,44 @@ volume_ignores = ["node_modules"]
     // every launch.
     #[test]
     #[serial_test::serial]
-    fn test_build_container_config_yolo_trusts_codex_project_only_in_yolo() {
-        let home = IsolatedHome::new();
-
-        let project_dir = TempDir::new().unwrap();
-        git2::Repository::init(project_dir.path()).unwrap();
-
-        let instance_id = "codex-yolo-trust-test";
-        let config = Build::new("codex")
-            .yolo(true)
-            .instance(instance_id)
-            .run(project_dir.path())
-            .unwrap();
-
-        let codex_config = home
-            .path()
-            .join(".codex")
-            .join(SANDBOX_PRIVATE_SUBDIR)
-            .join(instance_id)
-            .join("config.toml");
-        assert!(
-            codex_config.exists(),
-            "yolo codex sandbox must write config.toml"
-        );
-        let parsed: toml::Value =
-            toml::from_str(&fs::read_to_string(&codex_config).unwrap()).unwrap();
-        let projects = parsed["projects"].as_table().unwrap();
-        // The trust key is the in-container working dir, not the host path.
-        assert_eq!(
-            projects[&config.working_dir]["trust_level"].as_str(),
-            Some("trusted")
-        );
-
-        crate::hooks::cleanup_hook_status_dir(instance_id);
+    fn test_build_container_config_yolo_seeds_codex_and_gemini_folder_trust() {
+        for (tool, dir, file) in [
+            ("codex", ".codex", "config.toml"),
+            ("gemini", ".gemini", "settings.json"),
+        ] {
+            let home = IsolatedHome::new();
+            let project_dir = TempDir::new().unwrap();
+            git2::Repository::init(project_dir.path()).unwrap();
+            let instance_id = format!("{tool}-yolo-trust-test");
+            let config = Build::new(tool)
+                .yolo(true)
+                .instance(&instance_id)
+                .run(project_dir.path())
+                .unwrap();
+            let path = home
+                .path()
+                .join(dir)
+                .join(SANDBOX_PRIVATE_SUBDIR)
+                .join(&instance_id)
+                .join(file);
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("yolo {tool} sandbox must write {file}: {err}"));
+            if tool == "codex" {
+                let parsed: toml::Value = toml::from_str(&text).unwrap();
+                // The trust key is the in-container working dir, not the host path.
+                assert_eq!(
+                    parsed["projects"][config.working_dir.as_str()]["trust_level"].as_str(),
+                    Some("trusted")
+                );
+            } else {
+                let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(
+                    parsed["security"]["folderTrust"]["enabled"],
+                    serde_json::Value::Bool(false)
+                );
+            }
+            crate::hooks::cleanup_hook_status_dir(&instance_id);
+        }
     }
 
     // Claude Code's folder-trust dialog is keyed on the git root, so every
@@ -5700,158 +5701,90 @@ codex-work = "{}"
 
     #[test]
     #[serial_test::serial]
-    fn test_build_container_config_yolo_disables_gemini_folder_trust() {
-        let (_hg, _, _tmp_base) = BaseGuard::ready();
-        let temp_home = TempDir::new().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+    fn test_ensure_folder_trust_config_restores_trust_after_refresh() {
+        // (agent, config dir, file, host content, staged sandbox trust, host key, trust pointer, trust value)
+        let cases = [
+            (
+                "codex",
+                ".codex",
+                "config.toml",
+                r#"model = "host""#,
+                "[projects.\"/workspace/project\"]\ntrust_level = \"trusted\"\n",
+                "/model",
+                "/projects/~1workspace~1project/trust_level",
+                serde_json::json!("trusted"),
+            ),
+            (
+                "gemini",
+                ".gemini",
+                "settings.json",
+                r#"{"theme":"host"}"#,
+                r#"{"security":{"folderTrust":{"enabled":false}}}"#,
+                "/theme",
+                "/security/folderTrust/enabled",
+                serde_json::json!(false),
+            ),
+        ];
+        for (agent, dir, file, host, staged, host_key, trust, trusted) in cases {
+            let (_hg, _, _tmp_base) = BaseGuard::ready();
+            let temp_home = TempDir::new().unwrap();
+            let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+            let agent_dir = temp_home.path().join(dir);
+            let instance_id = format!("{agent}-yolo-refresh-test");
+            let sandbox = agent_dir.join(SANDBOX_PRIVATE_SUBDIR).join(&instance_id);
+            fs::create_dir_all(&sandbox).unwrap();
+            fs::write(agent_dir.join(file), host).unwrap();
+            fs::write(sandbox.join(file), staged).unwrap();
+            certify_fixture_content(&sandbox, dir).unwrap();
+            let read = || -> serde_json::Value {
+                let text = fs::read_to_string(sandbox.join(file)).unwrap();
+                if file.ends_with(".toml") {
+                    serde_json::to_value(toml::from_str::<toml::Value>(&text).unwrap()).unwrap()
+                } else {
+                    serde_json::from_str(&text).unwrap()
+                }
+            };
 
-        let project_dir = TempDir::new().unwrap();
-        git2::Repository::init(project_dir.path()).unwrap();
+            refresh_agent_configs_for_instance(
+                &crate::session::config::effective_profile(""),
+                &instance_id,
+                agent,
+                None,
+                CredentialFold::Freshest,
+                Path::new("/workspace"),
+            );
+            let refreshed = read();
+            assert_eq!(
+                refreshed.pointer(host_key),
+                Some(&serde_json::json!("host")),
+                "{agent}"
+            );
+            assert_eq!(
+                refreshed.pointer(trust),
+                None,
+                "{agent}: refresh drops staged trust"
+            );
 
-        let sandbox_info = crate::session::instance::SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test:latest".to_string(),
-            container_name: "test-container".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        };
-        build_container_config(
-            project_dir.path().to_str().unwrap(),
-            &sandbox_info,
-            ContainerAgentSelection::new("gemini", None),
-            true,
-            "gemini-yolo-trust-test",
-            None,
-            "",
-        )
-        .unwrap();
-
-        let gemini_settings = temp_home
-            .path()
-            .join(".gemini")
-            .join(SANDBOX_PRIVATE_SUBDIR)
-            .join("gemini-yolo-trust-test")
-            .join("settings.json");
-        assert!(
-            gemini_settings.exists(),
-            "yolo gemini sandbox must write settings.json"
-        );
-        let parsed: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&gemini_settings).unwrap()).unwrap();
-        assert_eq!(
-            parsed["security"]["folderTrust"]["enabled"],
-            serde_json::Value::Bool(false)
-        );
-
-        crate::hooks::cleanup_hook_status_dir("gemini-yolo-trust-test");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_ensure_folder_trust_config_restores_codex_after_refresh() {
-        let (_hg, _, _tmp_base) = BaseGuard::ready();
-        let temp_home = TempDir::new().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
-
-        let codex_dir = temp_home.path().join(".codex");
-        let instance_id = "codex-yolo-refresh-test";
-        let codex_sandbox = codex_dir.join(SANDBOX_PRIVATE_SUBDIR).join(instance_id);
-        fs::create_dir_all(&codex_sandbox).unwrap();
-        fs::write(codex_dir.join("config.toml"), r#"model = "host""#).unwrap();
-        fs::write(
-            codex_sandbox.join("config.toml"),
-            r#"[projects."/workspace/project"]
-    trust_level = "trusted"
-    "#,
-        )
-        .unwrap();
-        certify_fixture_content(&codex_sandbox, ".codex").unwrap();
-        refresh_agent_configs_for_instance(
-            &crate::session::config::effective_profile(""),
-            instance_id,
-            "codex",
-            None,
-            CredentialFold::Freshest,
-            Path::new("/workspace"),
-        );
-        let refreshed: toml::Value =
-            toml::from_str(&fs::read_to_string(codex_sandbox.join("config.toml")).unwrap())
-                .unwrap();
-        assert_eq!(refreshed["model"].as_str(), Some("host"));
-        assert!(refreshed.get("projects").is_none());
-
-        ensure_folder_trust_config_for_active_agent(
-            "codex",
-            None,
-            "",
-            instance_id,
-            "/workspace/project",
-            true,
-        );
-        let restored: toml::Value =
-            toml::from_str(&fs::read_to_string(codex_sandbox.join("config.toml")).unwrap())
-                .unwrap();
-        assert_eq!(restored["model"].as_str(), Some("host"));
-        assert_eq!(
-            restored["projects"]["/workspace/project"]["trust_level"].as_str(),
-            Some("trusted")
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_ensure_folder_trust_config_restores_gemini_after_refresh() {
-        let (_hg, _, _tmp_base) = BaseGuard::ready();
-        let temp_home = TempDir::new().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
-
-        let gemini_dir = temp_home.path().join(".gemini");
-        let gemini_sandbox = gemini_dir
-            .join(SANDBOX_PRIVATE_SUBDIR)
-            .join("gemini-yolo-refresh-test");
-        fs::create_dir_all(&gemini_sandbox).unwrap();
-        fs::write(gemini_dir.join("settings.json"), r#"{"theme":"host"}"#).unwrap();
-        fs::write(
-            gemini_sandbox.join("settings.json"),
-            r#"{"security":{"folderTrust":{"enabled":false}}}"#,
-        )
-        .unwrap();
-        certify_fixture_content(&gemini_sandbox, ".gemini").unwrap();
-        refresh_agent_configs_for_instance(
-            &crate::session::config::effective_profile(""),
-            "gemini-yolo-refresh-test",
-            "gemini",
-            None,
-            CredentialFold::Freshest,
-            Path::new("/workspace"),
-        );
-        let refreshed: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(gemini_sandbox.join("settings.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(refreshed["theme"].as_str(), Some("host"));
-        assert!(refreshed["security"]["folderTrust"]["enabled"].is_null());
-
-        ensure_folder_trust_config_for_active_agent(
-            "gemini",
-            None,
-            "",
-            "gemini-yolo-refresh-test",
-            "/workspace/project",
-            true,
-        );
-        let restored: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(gemini_sandbox.join("settings.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(restored["theme"].as_str(), Some("host"));
-        assert_eq!(
-            restored["security"]["folderTrust"]["enabled"].as_bool(),
-            Some(false)
-        );
+            ensure_folder_trust_config_for_active_agent(
+                agent,
+                None,
+                "",
+                &instance_id,
+                "/workspace/project",
+                true,
+            );
+            let restored = read();
+            assert_eq!(
+                restored.pointer(host_key),
+                Some(&serde_json::json!("host")),
+                "{agent}"
+            );
+            assert_eq!(
+                restored.pointer(trust),
+                Some(&trusted),
+                "{agent}: trust restored"
+            );
+        }
     }
 
     #[test]
@@ -6197,66 +6130,6 @@ codex-work = "{}"
     // aoe-hooks agent.
     #[test]
     #[serial_test::serial]
-    fn test_build_container_config_installs_hooks_into_selected_kiro_agent() {
-        let (_hg, _, _tmp_base) = BaseGuard::ready();
-        let temp_home = TempDir::new().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
-
-        let project_dir = TempDir::new().unwrap();
-        git2::Repository::init(project_dir.path()).unwrap();
-
-        let kiro = crate::agents::get_agent("kiro").unwrap();
-        let sidecar = kiro.sidecar_hooks.as_ref().unwrap();
-        let sandbox_info = crate::session::instance::SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test:latest".to_string(),
-            container_name: "test-container".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        };
-        let instance_id = "kiro-selected-agent-sandbox-test";
-        build_container_config(
-            project_dir.path().to_str().unwrap(),
-            &sandbox_info,
-            ContainerAgentSelection::new("kiro", None).with_selected_agent(Some("custom-agent")),
-            false,
-            instance_id,
-            None,
-            "",
-        )
-        .unwrap();
-
-        // Hooks land in the selected agent's staged sandbox config...
-        let selected_config = temp_home
-            .path()
-            .join(".kiro")
-            .join(SANDBOX_PRIVATE_SUBDIR)
-            .join(instance_id)
-            .join("agents/custom-agent.json");
-        assert!(
-            selected_config.exists(),
-            "selected-agent sandbox hook config should be installed at {}",
-            selected_config.display()
-        );
-        assert!(fs::read_to_string(&selected_config)
-            .unwrap()
-            .contains("aoe-hooks"));
-
-        // ...NOT the standalone aoe-hooks sandbox agent.
-        let standalone = temp_home.path().join(sidecar.sandbox_config_subpath);
-        assert!(
-            !standalone.exists(),
-            "standalone aoe-hooks sandbox config must not be written when an agent is selected"
-        );
-
-        crate::hooks::cleanup_hook_status_dir(instance_id);
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn test_build_container_config_resolves_selected_kiro_agent_by_name_in_sandbox() {
         // The host `.kiro/agents` dir is staged into `.kiro/sandbox/agents`
         // before hook install, so a prefixed agent file (filename != name) must
@@ -6327,6 +6200,18 @@ codex-work = "{}"
         assert!(
             !stem_clone.exists(),
             "must not create a filename-stem clone the CLI never loads"
+        );
+        let standalone = temp_home.path().join(
+            crate::agents::get_agent("kiro")
+                .unwrap()
+                .sidecar_hooks
+                .as_ref()
+                .unwrap()
+                .sandbox_config_subpath,
+        );
+        assert!(
+            !standalone.exists(),
+            "standalone aoe-hooks sandbox config must not be written when an agent is selected"
         );
 
         crate::hooks::cleanup_hook_status_dir(instance_id);
@@ -7207,106 +7092,67 @@ volume_ignores = ["target"]
     }
 
     #[test]
-    fn stranded_volumes_are_the_moved_paths_old_names() {
-        let stranded = stranded_named_ignore_volumes(
-            &moved_config(),
-            "sess1",
-            Some("/workspace/otari-worktrees/905"),
-        );
-
-        // Exactly the volume the reporter found orphaned, and not the main repo's,
-        // whose container path a worktree move leaves alone. The literal suffix is
-        // the same `DefaultHasher` canary as in `containers::runtime_base`: a
-        // toolchain bump that changed it would orphan every existing named volume.
-        assert_eq!(
-            stranded,
-            vec!["aoe-vi-sess1-workspace-otari-worktrees-905-target-31ddd0322290"]
-        );
-    }
-
-    #[test]
-    fn a_mount_that_did_not_move_is_never_stranded_by_one_that_did() {
-        // The main repo's `**/bin` is absent from the host this run, so the config
-        // does not mount it. Its container path did not move, so its volume is a
-        // live cache the next matching create re-attaches, not a strand.
-        let mut config = moved_config();
-        config.named_ignore_volumes.remove(0);
-
-        let stranded =
-            stranded_named_ignore_volumes(&config, "sess1", Some("/workspace/otari-worktrees/905"));
-
-        assert_eq!(
-            stranded,
-            vec!["aoe-vi-sess1-workspace-otari-worktrees-905-target-31ddd0322290"],
-            "a config gap under an unmoved mount must not name anything"
-        );
-    }
-
-    #[test]
-    fn a_remap_onto_a_live_volume_is_not_a_strand() {
-        // The previous workdir can be the mount root of a mount that survived: a
-        // session whose worktree leaf slugs to the repo's own name, whose pin was
-        // taken while the linkage was broken. The remap then lands exactly on the
-        // main repo's volume, which the create is about to mount.
-        let config = ContainerConfig {
+    fn stranded_volumes_are_only_the_moved_paths_old_names() {
+        // The literal suffix is the same `DefaultHasher` canary as in
+        // `containers::runtime_base`: a toolchain bump that changed it would orphan
+        // every existing named volume.
+        const MOVED: &str = "aoe-vi-sess1-workspace-otari-worktrees-905-target-31ddd0322290";
+        let moved_from = Some("/workspace/otari-worktrees/905");
+        // The main repo's `**/bin` is absent from the host this run; its container
+        // path did not move, so its volume is a live cache, not a strand.
+        let mut unmounted_main = moved_config();
+        unmounted_main.named_ignore_volumes.remove(0);
+        // A worktree leaf that slugs to the repo's own name remaps onto the main
+        // repo's volume, which the create is about to mount.
+        let remap = ContainerConfig {
             working_dir: "/workspace/otari-worktrees/otari".to_string(),
-            named_ignore_volumes: vec![
-                NamedVolumeMount {
-                    volume_name: named_volume_for("sess1", "/workspace/otari/target"),
-                    container_path: "/workspace/otari/target".to_string(),
-                },
-                NamedVolumeMount {
-                    volume_name: named_volume_for(
-                        "sess1",
-                        "/workspace/otari-worktrees/otari/target",
-                    ),
-                    container_path: "/workspace/otari-worktrees/otari/target".to_string(),
-                },
-            ],
+            named_ignore_volumes: [
+                "/workspace/otari/target",
+                "/workspace/otari-worktrees/otari/target",
+            ]
+            .into_iter()
+            .map(|path| NamedVolumeMount {
+                volume_name: named_volume_for("sess1", path),
+                container_path: path.to_string(),
+            })
+            .collect(),
             named_ignore_volumes_authoritative: true,
             ..Default::default()
         };
-
-        assert!(
-            stranded_named_ignore_volumes(&config, "sess1", Some("/workspace/otari")).is_empty(),
-            "a volume the create re-attaches must never be named for deletion"
-        );
-    }
-
-    #[test]
-    fn nothing_is_stranded_without_evidence_of_a_move() {
+        // The workdir is provisional too, so the apparent move may be nothing but
+        // a find_main_repo failure.
         let degraded = ContainerConfig {
             named_ignore_volumes_authoritative: false,
             ..moved_config()
         };
-        let previous = Some("/workspace/otari-worktrees/905");
 
-        for (case, config, previous_workdir) in [
+        for (case, config, previous_workdir, expected) in [
+            ("a moved worktree", moved_config(), moved_from, vec![MOVED]),
             (
-                // An edited volume_ignores, or a glob that matched nothing, changes
-                // the config without moving a mount.
+                "an unmounted unmoved mount",
+                unmounted_main,
+                moved_from,
+                vec![MOVED],
+            ),
+            (
+                "a remap onto a live volume",
+                remap,
+                Some("/workspace/otari"),
+                vec![],
+            ),
+            (
                 "the workdir did not move",
                 moved_config(),
                 Some("/workspace/otari-worktrees/rev-912"),
+                vec![],
             ),
-            (
-                // A session that never had a container, and the attach path, which
-                // clears the pin.
-                "no pinned workdir",
-                moved_config(),
-                None,
-            ),
-            (
-                // The workdir is provisional too, so the apparent move may be
-                // nothing but a find_main_repo failure.
-                "a degraded mount resolve",
-                degraded,
-                previous,
-            ),
+            ("no pinned workdir", moved_config(), None, vec![]),
+            ("a degraded mount resolve", degraded, moved_from, vec![]),
         ] {
-            assert!(
-                stranded_named_ignore_volumes(&config, "sess1", previous_workdir).is_empty(),
-                "{case} must not name a volume for deletion"
+            assert_eq!(
+                stranded_named_ignore_volumes(&config, "sess1", previous_workdir),
+                expected,
+                "{case}"
             );
         }
     }

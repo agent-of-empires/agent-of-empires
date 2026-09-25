@@ -833,18 +833,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_env_kv_lines_filters_and_later_wins() {
+    fn parse_env_kv_lines_filters_later_wins_and_never_logs_a_malformed_key() {
+        let logs = crate::session::test_support::LogCapture::start();
         assert_eq!(
             parse_env_kv_lines(
                 "minting...\n\nGH_TOKEN=a=b=c\n9BAD=x\nNO_EQUALS\n  SPACED  =v\nK=first\r\nK=second\r\n"
             ),
             pairs(&[("GH_TOKEN", "a=b=c"), ("SPACED", "v"), ("K", "second")])
         );
-    }
-
-    #[test]
-    fn parse_env_kv_lines_does_not_log_malformed_key() {
-        let logs = crate::session::test_support::LogCapture::start();
         assert!(parse_env_kv_lines("https://token:topsecret@example.test?x=ignored\n").is_empty());
         let logs = logs.contents();
         assert!(logs.contains("invalid environment key"), "{logs}");
