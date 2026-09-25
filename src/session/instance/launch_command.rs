@@ -481,7 +481,13 @@ impl Instance {
                 }
                 // A stored id no context can attest is a deviation, not routine: warn.
                 Err(error) if managed => {
-                    tracing::warn!(target: "session.store", error = %error, "no attestable execution context for recorded conversation '{}'; launching with the agent's own resume flags, restore the execution context it was captured in", self.agent_session_id.as_deref().unwrap_or_default());
+                    // The `managed` arm above leaves only a Default launch, which
+                    // records an id by definition.
+                    let recorded = self
+                        .agent_session_id
+                        .as_deref()
+                        .expect("a managed default launch records a conversation id");
+                    tracing::warn!(target: "session.store", error = %error, recorded, "no attestable execution context for a recorded conversation; launching with the agent's own resume flags");
                     None
                 }
                 Err(error) => {
