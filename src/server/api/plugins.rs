@@ -918,20 +918,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_plugin_icon_path_serves_a_file_inside_the_install_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("icon.png"), b"fake png bytes").unwrap();
-        let resolved = resolve_plugin_icon_path(dir.path(), "icon.png").expect("resolves");
-        assert_eq!(
-            resolved,
-            dir.path().canonicalize().unwrap().join("icon.png")
-        );
-    }
-
-    #[test]
-    fn resolve_plugin_icon_path_rejects_traversal_and_absolute_paths() {
+    fn resolve_plugin_icon_path_confines_to_the_install_dir() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("icon.png"), b"x").unwrap();
+        assert_eq!(
+            resolve_plugin_icon_path(dir.path(), "icon.png"),
+            Some(dir.path().canonicalize().unwrap().join("icon.png"))
+        );
         // screenshot_path_ok's shape check rejects "../secret.png" before any
         // filesystem access, so no sibling file is needed to prove containment.
         for bad in [
