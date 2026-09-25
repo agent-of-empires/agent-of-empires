@@ -586,16 +586,13 @@ impl Instance {
         let unresolved = "ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal";
         let resolved = match asserted {
             Some(asserted) => Ok(Some(asserted)),
-            None => worker
-                .map(|worker| self.resolved_handoff_binding(&sid, worker))
-                .transpose()
-                .map(Option::flatten),
+            None => worker.map_or(Ok(None), |worker| {
+                self.resolved_handoff_binding(&sid, worker)
+            }),
         };
-        let binding = match resolved {
-            Ok(Some(binding)) => binding,
-            Ok(None) => return Err(anyhow::anyhow!(unresolved)),
-            Err(error) => return Err(error.context(unresolved)),
-        };
+        let binding = resolved
+            .context(unresolved)?
+            .ok_or_else(|| anyhow::anyhow!(unresolved))?;
         self.adopt_conversation_state(ConversationState {
             session_id: Some(sid.clone()),
             binding: Some(binding.clone()),
