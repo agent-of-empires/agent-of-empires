@@ -2392,6 +2392,16 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         .iter()
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+    if inst
+        .lifecycle_reservation
+        .as_ref()
+        .is_some_and(|reservation| {
+            reservation.op == LifecycleOperation::Attach
+                && inst.has_fresh_lifecycle_reservation(chrono::Utc::now())
+        })
+    {
+        bail!("Session is attaching a project; wait for the attach to finish before renaming its worktree");
+    }
     let mut inst = inst.clone();
     if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
         &storage,

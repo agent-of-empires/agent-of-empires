@@ -97,7 +97,7 @@ pub(crate) async fn attach_project(
         let repo = repo_path.to_path_buf();
         let file_watch = state.file_watch.clone();
         tokio::task::spawn_blocking(move || {
-            let storage = Storage::new(&profile, file_watch).map_err(|e| e.to_string())?;
+            let storage = Storage::open(&profile, file_watch).map_err(|e| e.to_string())?;
             let instances = storage.load().map_err(|e| format!("{e:#}"))?;
             let instance = instances
                 .into_iter()

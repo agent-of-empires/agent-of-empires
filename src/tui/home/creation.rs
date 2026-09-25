@@ -303,6 +303,12 @@ impl HomeView {
                 let authoritative = match storage.load() {
                     Ok(authoritative) => authoritative,
                     Err(error) => {
+                        cleanup_creation_resources(
+                            &instance,
+                            created_worktree.as_ref(),
+                            &created_workspace_worktrees,
+                            None,
+                        );
                         self.info_dialog = Some(InfoDialog::sized_to_fit(
                             "Creation Failed",
                             &format!("Failed to read profile storage: {error}"),
@@ -312,6 +318,21 @@ impl HomeView {
                         return None;
                     }
                 };
+                if let Err(error) = crate::session::validate_managed_workspace(&instance) {
+                    cleanup_creation_resources(
+                        &instance,
+                        created_worktree.as_ref(),
+                        &created_workspace_worktrees,
+                        None,
+                    );
+                    self.info_dialog = Some(InfoDialog::sized_to_fit(
+                        "Creation Failed",
+                        &format!("Managed workspace validation failed: {error}"),
+                    ));
+                    self.new_dialog = None;
+                    let _ = self.reload();
+                    return None;
+                }
                 if manages_worktree
                     && crate::session::find_duplicate_session(
                         authoritative.iter(),
@@ -332,6 +353,12 @@ impl HomeView {
                         &instance.id,
                         &candidate_paths,
                     ) {
+                        cleanup_creation_resources(
+                            &instance,
+                            created_worktree.as_ref(),
+                            &created_workspace_worktrees,
+                            None,
+                        );
                         self.info_dialog = Some(InfoDialog::sized_to_fit(
                             "Creation Failed",
                             &format!("Session path is already claimed: {error}"),

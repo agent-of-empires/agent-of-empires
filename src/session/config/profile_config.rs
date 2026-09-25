@@ -117,7 +117,17 @@ pub(crate) fn overrides_ignored_keys(overrides: &serde_json::Value) -> Vec<Strin
 
 /// Save profile-specific config
 pub fn save_profile_config(profile: &str, config: &ProfileConfig) -> Result<()> {
-    let path = get_profile_config_path(profile)?;
+    let path = get_profile_dir(profile)?.join("config.toml");
+    let _identity_lock = crate::session::acquire_session_identity_lock()?;
+    let _namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
+    let _profile_storage_lock = crate::session::storage::acquire_storage_flock(
+        path.parent().expect("profile config path has a parent"),
+        crate::session::storage::STORAGE_LOCK_FILENAME,
+    )?;
+    anyhow::ensure!(
+        path.parent().is_some_and(|parent| parent.exists()),
+        "profile '{profile}' does not exist"
+    );
     let content = toml::to_string_pretty(config)?;
     crate::session::atomic_write(&path, content.as_bytes())?;
     Ok(())

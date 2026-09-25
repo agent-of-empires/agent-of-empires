@@ -390,15 +390,37 @@ pub async fn trash_session(
         };
         (instance.source_profile.clone(), instance.clone())
     };
+    let recovery_profile = profile.clone();
 
     let reserve_profile = profile.clone();
     let reserve_id = id.clone();
     let file_watch = state.file_watch.clone();
+    let reservation_snapshot = snapshot.clone();
     let (storage, identity_lock, lifecycle_lock, generation) = match tokio::task::spawn_blocking(
         move || -> anyhow::Result<_> {
+            let _workspace_claim_lock = crate::session::acquire_session_workspace_claim_lock()?;
             let identity_lock = crate::session::acquire_session_identity_lock()?;
             let storage = Storage::open(&reserve_profile, file_watch)?;
             let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&reserve_id)?;
+            if reservation_snapshot.has_managed_worktree_or_workspace() {
+                let mut candidate_paths =
+                    vec![std::path::PathBuf::from(&reservation_snapshot.project_path)];
+                if let Some(workspace) = &reservation_snapshot.workspace_info {
+                    candidate_paths.push(std::path::PathBuf::from(&workspace.workspace_dir));
+                }
+                candidate_paths.extend(
+                    reservation_snapshot
+                        .all_repos()
+                        .iter()
+                        .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
+                );
+                crate::session::deletion::ensure_unclaimed_paths(&reserve_id, &candidate_paths)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                        "trash skipped because worktree ownership is shared or unknown: {error}"
+                    )
+                    })?;
+            }
             let generation = storage.update(|instances, _groups| {
                 let Some(instance) = instances
                     .iter_mut()
@@ -466,25 +488,37 @@ pub async fn trash_session(
                 instance.kill_all_tmux_sessions_locked();
             }
         }
-        if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
-            &work_id,
-            &[std::path::PathBuf::from(&instance.project_path)],
-        ) {
-            storage.update(|instances, _groups| {
-                if let Some(stored) = instances
-                    .iter_mut()
-                    .find(|candidate| candidate.id == work_id)
-                {
-                    stored.release_lifecycle_reservation_if_owned(
-                        LifecycleOperation::Trash,
-                        generation,
-                    );
-                }
-                Ok(())
-            })?;
-            return Err(anyhow::anyhow!(
-                "trash skipped because worktree ownership is shared or unknown: {error}"
-            ));
+        if instance.has_managed_worktree_or_workspace() {
+            let mut candidate_paths = vec![std::path::PathBuf::from(&instance.project_path)];
+            if let Some(workspace) = &instance.workspace_info {
+                candidate_paths.push(std::path::PathBuf::from(&workspace.workspace_dir));
+            }
+            candidate_paths.extend(
+                instance
+                    .all_repos()
+                    .iter()
+                    .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
+            );
+            if let Err(error) =
+                crate::session::deletion::ensure_unclaimed_paths(&work_id, &candidate_paths)
+            {
+                storage.update(|instances, _groups| {
+                    if let Some(stored) = instances
+                        .iter_mut()
+                        .find(|candidate| candidate.id == work_id)
+                    {
+                        stored.untrash();
+                        stored.release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Trash,
+                            generation,
+                        );
+                    }
+                    Ok(())
+                })?;
+                return Err(anyhow::anyhow!(
+                    "trash skipped because worktree ownership is shared or unknown: {error}"
+                ));
+            }
         }
         let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
         let relocation = match &outcome {
@@ -527,6 +561,31 @@ pub async fn trash_session(
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
             tracing::warn!(target: "http.api.sessions", session = %id, "trash transition failed: {error}");
+            let durable = tokio::task::spawn_blocking({
+                let profile = recovery_profile.clone();
+                let id = id.clone();
+                move || {
+                    Storage::open_unwatched(&profile)
+                        .ok()?
+                        .load()
+                        .ok()?
+                        .into_iter()
+                        .find(|instance| instance.id == id)
+                }
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(durable) = durable {
+                let mut instances = state.instances.write().await;
+                if let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) {
+                    instance.trashed_at = durable.trashed_at;
+                    instance.project_path = durable.project_path;
+                    instance.pre_trash_project_path = durable.pre_trash_project_path;
+                    instance.lifecycle_generation = durable.lifecycle_generation;
+                    instance.lifecycle_reservation = durable.lifecycle_reservation;
+                }
+            }
             return persist_failed_response();
         }
         Err(error) => {

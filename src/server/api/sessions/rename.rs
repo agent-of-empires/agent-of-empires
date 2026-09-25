@@ -670,6 +670,18 @@ pub async fn set_worktree_name(
             let storage = Storage::new(&lock_profile, lock_file_watch)?;
             let lifecycle = storage.acquire_instance_lifecycle_lock(&lock_id)?;
             let instances = storage.load()?;
+            if instances.iter().any(|instance| {
+                instance.id == lock_id
+                    && instance
+                        .lifecycle_reservation
+                        .as_ref()
+                        .is_some_and(|reservation| {
+                            reservation.op == crate::session::LifecycleOperation::Attach
+                                && instance.has_fresh_lifecycle_reservation(chrono::Utc::now())
+                        })
+            }) {
+                anyhow::bail!("session is attaching a project");
+            }
             Ok((lifecycle, storage, instances))
         },
     )

@@ -896,6 +896,24 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         return Err(e);
     }
 
+    let _workspace_claim_lock = match crate::session::acquire_session_workspace_claim_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            cleanup_partial_session(
+                &path,
+                instance.worktree_info.as_ref(),
+                instance.workspace_info.as_ref(),
+                args.create_branch,
+                if instance.scratch {
+                    Some(std::path::Path::new(&instance.project_path))
+                } else {
+                    None
+                },
+                instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
+            );
+            return Err(error);
+        }
+    };
     let _identity_lock = match acquire_session_identity_lock() {
         Ok(lock) => lock,
         Err(error) => {
@@ -932,7 +950,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             return Err(error);
         }
     };
-    if !args.scratch && !path.exists() {
+    if let Err(error) = crate::session::validate_managed_workspace(&instance) {
         cleanup_partial_session(
             &path,
             instance.worktree_info.as_ref(),
@@ -941,7 +959,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             None,
             instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
         );
-        bail!("Project path disappeared before the session was persisted");
+        bail!("Managed workspace validation failed before the session was persisted: {error}");
     }
     let manages_worktree = instance
         .worktree_info
@@ -959,6 +977,18 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         if let Err(error) =
             crate::session::deletion::ensure_unclaimed_paths(&instance.id, &candidate_paths)
         {
+            cleanup_partial_session(
+                &path,
+                instance.worktree_info.as_ref(),
+                instance.workspace_info.as_ref(),
+                args.create_branch,
+                if instance.scratch {
+                    Some(std::path::Path::new(&instance.project_path))
+                } else {
+                    None
+                },
+                instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
+            );
             bail!("Session path is already claimed by another session: {error}");
         }
     }
@@ -1186,6 +1216,27 @@ fn cleanup_partial_session(
     scratch_dir: Option<&std::path::Path>,
     container_session_id: Option<&str>,
 ) {
+    let mut candidate_paths = vec![path.to_path_buf()];
+    if let Some(ws) = workspace_info {
+        candidate_paths.push(std::path::PathBuf::from(&ws.workspace_dir));
+        candidate_paths.extend(
+            ws.repos
+                .iter()
+                .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
+        );
+    }
+    let peer_claimed = match crate::session::deletion::paths_in_use_except(&[]) {
+        crate::session::deletion::PathsInUse::Unknown(_) => true,
+        crate::session::deletion::PathsInUse::Known(paths) => {
+            let paths = crate::session::deletion::PathsInUse::Known(paths);
+            candidate_paths
+                .iter()
+                .any(|candidate| paths.covers_destructive(candidate))
+        }
+    };
+    if peer_claimed {
+        return;
+    }
     if let Some(session_id) = container_session_id {
         let container = crate::containers::DockerContainer::from_session_id(session_id);
         if let crate::containers::Teardown::Failed(e) = container.teardown(session_id) {

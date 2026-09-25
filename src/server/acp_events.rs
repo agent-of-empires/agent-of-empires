@@ -331,7 +331,7 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             let change = acp_change.clone();
             let file_watch = state.file_watch.clone();
             let saved = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                let storage = crate::session::Storage::new(&profile, file_watch)?;
+                let storage = crate::session::Storage::open(&profile, file_watch)?;
                 storage.update(|all, _| {
                     let Some(inst) = all
                         .iter_mut()

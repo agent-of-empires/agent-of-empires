@@ -3,8 +3,9 @@
 use crate::session::builder::{self, InstanceParams};
 use crate::session::conversation_carry;
 use crate::session::{
-    acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, list_profiles,
-    GroupMovePlan, Instance, Item, LifecycleOperation, Status, Storage,
+    acquire_session_identity_lock, acquire_session_workspace_claim_lock, duplicate_session_error,
+    is_duplicate_session, list_profiles, GroupMovePlan, Instance, Item, LifecycleOperation, Status,
+    Storage,
 };
 use crate::tui::deletion_poller::DeletionRequest;
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
@@ -243,7 +244,6 @@ impl HomeView {
         // `structured` is applied post-build (mirrors the web create
         // handler); read it off before the params conversion consumes data.
         let structured = data.structured;
-        let is_scratch = data.scratch;
         let params = InstanceParams::from(data);
 
         let build_result = builder::build_instance(
@@ -265,6 +265,18 @@ impl HomeView {
             .as_ref()
             .is_some_and(|worktree| worktree.managed_by_aoe)
             || instance.workspace_info.is_some();
+        let _workspace_claim_lock = match acquire_session_workspace_claim_lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                builder::cleanup_instance(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return Err(error);
+            }
+        };
         let _identity_lock = match acquire_session_identity_lock() {
             Ok(lock) => lock,
             Err(error) => {
@@ -277,7 +289,7 @@ impl HomeView {
                 return Err(error);
             }
         };
-        if !is_scratch && !std::path::Path::new(&instance.project_path).exists() {
+        if let Err(error) = crate::session::validate_managed_workspace(&instance) {
             builder::cleanup_instance(
                 &instance,
                 created_worktree.as_ref(),
@@ -285,7 +297,7 @@ impl HomeView {
                 None,
             );
             return Err(anyhow::anyhow!(
-                "Project path disappeared before the session was persisted"
+                "Managed workspace validation failed before the session was persisted: {error}"
             ));
         }
         if manages_worktree {
@@ -299,6 +311,12 @@ impl HomeView {
             if let Err(error) =
                 crate::session::deletion::ensure_unclaimed_paths(&instance.id, &candidate_paths)
             {
+                builder::cleanup_instance(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
                 return Err(anyhow::anyhow!(
                     "Session path is already claimed by another session: {error}"
                 ));
@@ -1950,6 +1968,21 @@ impl HomeView {
             let profile = storage.profile().to_string();
             let storage = Storage::open_unwatched(&profile)?;
             let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(id)?;
+            if request_instance.has_managed_worktree_or_workspace() {
+                let mut candidate_paths =
+                    vec![std::path::PathBuf::from(&request_instance.project_path)];
+                if let Some(workspace) = &request_instance.workspace_info {
+                    candidate_paths.push(std::path::PathBuf::from(&workspace.workspace_dir));
+                }
+                candidate_paths.extend(
+                    request_instance
+                        .all_repos()
+                        .iter()
+                        .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
+                );
+                crate::session::deletion::ensure_unclaimed_paths(id, &candidate_paths)
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+            }
             storage.update(|instances, _groups| {
                 let stored = instances
                     .iter_mut()

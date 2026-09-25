@@ -888,6 +888,32 @@ pub fn cleanup_instance(
     created_workspace_worktrees: &[CreatedWorktree],
     protected_owner: Option<&Instance>,
 ) {
+    let mut candidate_paths = vec![std::path::PathBuf::from(&instance.project_path)];
+    if let Some(workspace) = &instance.workspace_info {
+        candidate_paths.push(std::path::PathBuf::from(&workspace.workspace_dir));
+        candidate_paths.extend(
+            workspace
+                .repos
+                .iter()
+                .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
+        );
+    }
+    let peer_claimed = match crate::session::deletion::paths_in_use_except(&[instance.id.as_str()])
+    {
+        crate::session::deletion::PathsInUse::Unknown(_) => true,
+        crate::session::deletion::PathsInUse::Known(paths) => {
+            let paths = crate::session::deletion::PathsInUse::Known(paths);
+            candidate_paths
+                .iter()
+                .any(|path| paths.covers_destructive(path))
+        }
+    };
+    if peer_claimed {
+        return;
+    }
+    let protection = CleanupProtection {
+        owner: protected_owner,
+    };
     // The loser may never have reached storage, so lifecycle-coordinated stop cannot reserve its
     // row.
     instance.kill_all_tmux_sessions_without_lifecycle_row();
@@ -902,39 +928,35 @@ pub fn cleanup_instance(
         }
     }
 
-    let protection = CleanupProtection {
-        owner: protected_owner,
-    };
-
-    // Scratch dirs are provisioned eagerly inside `build_instance` (well before this helper's other
-    // cleanup targets exist), so an abort between provisioning and the caller finishing the session
-    // would otherwise leak the directory on disk.
-    if instance.scratch {
-        let scratch_path = PathBuf::from(&instance.project_path);
-        if !protection.references_path(&scratch_path)
-            && super::scratch::is_scratch_path(&scratch_path)
-        {
-            if let Err(e) = std::fs::remove_dir_all(&scratch_path) {
-                tracing::warn!(
-                    target: "session.create",
-                    "Failed to clean up scratch dir: {}",
-                    e
-                );
+    if !peer_claimed {
+        // Scratch dirs are provisioned eagerly inside `build_instance` (well before this helper's other
+        // cleanup targets exist), so an abort between provisioning and the caller finishing the session
+        // would otherwise leak the directory on disk.
+        if instance.scratch {
+            let scratch_path = PathBuf::from(&instance.project_path);
+            if !protection.references_path(&scratch_path)
+                && super::scratch::is_scratch_path(&scratch_path)
+            {
+                if let Err(e) = std::fs::remove_dir_all(&scratch_path) {
+                    tracing::warn!(
+                        target: "session.create",
+                        "Failed to clean up scratch dir: {}",
+                        e
+                    );
+                }
             }
         }
-    }
-
-    if let Some(worktree) = created_worktree {
-        cleanup_created_worktree(worktree, "worktree", &protection);
-    }
-
-    for worktree in created_workspace_worktrees {
-        cleanup_created_worktree(worktree, "workspace worktree", &protection);
-    }
-    if let Some(workspace) = &instance.workspace_info {
-        let workspace_dir = Path::new(&workspace.workspace_dir);
-        if !protection.references_path(workspace_dir) {
-            let _ = std::fs::remove_dir_all(workspace_dir);
+        if let Some(worktree) = created_worktree {
+            cleanup_created_worktree(worktree, "worktree", &protection);
+        }
+        for worktree in created_workspace_worktrees {
+            cleanup_created_worktree(worktree, "workspace worktree", &protection);
+        }
+        if let Some(workspace) = &instance.workspace_info {
+            let workspace_dir = Path::new(&workspace.workspace_dir);
+            if !protection.references_path(workspace_dir) {
+                let _ = std::fs::remove_dir_all(workspace_dir);
+            }
         }
     }
 }

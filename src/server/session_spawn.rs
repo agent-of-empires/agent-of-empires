@@ -337,6 +337,18 @@ pub(crate) async fn spawn_structured_session(
             return Err(anyhow::anyhow!("on_create hook failed: {e:#}{hint}"));
         }
 
+        let _workspace_claim_lock = match crate::session::acquire_session_workspace_claim_lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                builder::cleanup_instance(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return Err(error);
+            }
+        };
         let identity_lock = match crate::session::acquire_session_identity_lock() {
             Ok(lock) => lock,
             Err(error) => {
@@ -361,7 +373,7 @@ pub(crate) async fn spawn_structured_session(
                 return Err(error);
             }
         };
-        if !scratch && !std::path::Path::new(&instance.project_path).exists() {
+        if let Err(error) = crate::session::validate_managed_workspace(&instance) {
             builder::cleanup_instance(
                 &instance,
                 created_worktree.as_ref(),
@@ -369,7 +381,7 @@ pub(crate) async fn spawn_structured_session(
                 None,
             );
             return Err(anyhow::anyhow!(
-                "Project path disappeared before the session was persisted"
+                "Managed workspace validation failed before the session was persisted: {error}"
             ));
         }
         let manages_worktree = instance
@@ -389,6 +401,12 @@ pub(crate) async fn spawn_structured_session(
                 &instance.id,
                 &candidate_paths,
             ) {
+                builder::cleanup_instance(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
                 return Err(anyhow::anyhow!(
                     "Session path is already claimed by another session: {error}"
                 ));

@@ -25,6 +25,34 @@ const INSTANCE_LIFECYCLE_LOCK_PREFIX: &str = ".instance-lifecycle-";
 /// Sidecar lock for every mutation that can create or change a session's `(title,
 /// project_path)` identity.
 const SESSION_IDENTITY_LOCK_FILENAME: &str = ".title-mutation.lock";
+/// Sidecar lock for claims on managed workspace paths.
+const SESSION_WORKSPACE_CLAIM_LOCK_FILENAME: &str = ".workspace-claim.lock";
+/// Sidecar lock for profile namespace rename/delete and storage writes.
+const PROFILE_NAMESPACE_LOCK_FILENAME: &str = ".profile-namespace.lock";
+#[cfg(unix)]
+type DirectoryIdentity = (u64, u64);
+#[cfg(not(unix))]
+type DirectoryIdentity = ();
+
+fn directory_identity(path: &Path) -> Result<DirectoryIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("reading profile directory identity {}", path.display()))?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fs::metadata(path)
+            .with_context(|| format!("reading profile directory {}", path.display()))?;
+        Ok(())
+    }
+}
+
+pub(crate) fn acquire_profile_namespace_lock() -> Result<StorageFlock> {
+    acquire_storage_flock(&get_app_dir()?, PROFILE_NAMESPACE_LOCK_FILENAME)
+}
 /// Sidecar lock prefix for one session's title persistence plus tmux rekey.
 const SESSION_TITLE_LOCK_PREFIX: &str = ".session-title-";
 
@@ -536,6 +564,11 @@ pub(crate) fn acquire_session_identity_lock() -> Result<StorageFlock> {
     acquire_storage_flock(&get_app_dir()?, SESSION_IDENTITY_LOCK_FILENAME)
 }
 
+/// Serialize path ownership claims without holding the global identity lock over Git work.
+pub(crate) fn acquire_session_workspace_claim_lock() -> Result<StorageFlock> {
+    acquire_storage_flock(&get_app_dir()?, SESSION_WORKSPACE_CLAIM_LOCK_FILENAME)
+}
+
 /// Serialize one session's title commit and post-commit tmux rekey across profiles and
 /// processes.
 pub(crate) fn acquire_session_title_lock(instance_id: &str) -> Result<StorageFlock> {
@@ -678,6 +711,7 @@ pub struct Storage {
     sessions_path: PathBuf,
     save_lock: Arc<Mutex<()>>,
     file_watch: Arc<FileWatchService>,
+    profile_identity: Option<DirectoryIdentity>,
     #[cfg(test)]
     fail_writes_for_test: bool,
 }
@@ -802,6 +836,7 @@ impl Storage {
             sessions_path,
             save_lock,
             file_watch,
+            profile_identity: Some(directory_identity(&profile_dir)?),
             #[cfg(test)]
             fail_writes_for_test: false,
         })
@@ -819,6 +854,7 @@ impl Storage {
             sessions_path,
             save_lock: save_lock_for(profile),
             file_watch: FileWatchService::noop(),
+            profile_identity: None,
             fail_writes_for_test: false,
         }
     }
@@ -835,6 +871,7 @@ impl Storage {
             sessions_path,
             save_lock,
             file_watch,
+            profile_identity: Some(directory_identity(&profile_dir)?),
             #[cfg(test)]
             fail_writes_for_test: false,
         })
@@ -1055,6 +1092,32 @@ impl Storage {
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
+        self.verify_profile_identity()?;
+        self.update_after_namespace_lock(f)
+    }
+
+    /// Update while the caller already owns the workspace claim lock.
+    pub(crate) fn update_under_workspace_claim_lock<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.verify_profile_identity()?;
+        self.update_after_namespace_lock(f)
+    }
+
+    /// Update while the caller already owns the workspace claim and profile namespace locks.
+    pub(crate) fn update_under_profile_namespace_lock<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        self.verify_profile_identity()?;
+        self.update_after_namespace_lock(f)
+    }
+
+    fn update_after_namespace_lock<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
         #[cfg(test)]
         let _mu = crate::session::test_support::lock_reporting_contention(&self.save_lock, || {
             report_lock_contention_for_test(&self.sessions_path)
@@ -1076,7 +1139,31 @@ impl Storage {
             crate::migrations::v027_isolate_sandbox_stores::LOCK,
         )?;
         let _flock = acquire_storage_flock(profile_dir, STORAGE_LOCK_FILENAME)?;
+        self.verify_profile_identity()?;
         self.update_under_lock(f)
+    }
+
+    fn verify_profile_identity(&self) -> Result<()> {
+        let Some(expected) = self.profile_identity else {
+            return Ok(());
+        };
+        let profile_dir = self.sessions_path.parent().ok_or_else(|| {
+            anyhow!(
+                "sessions_path missing parent: {}",
+                self.sessions_path.display()
+            )
+        })?;
+        let actual = directory_identity(profile_dir).with_context(|| {
+            format!(
+                "profile namespace is no longer available: {}",
+                profile_dir.display()
+            )
+        })?;
+        anyhow::ensure!(
+            actual == expected,
+            "profile namespace changed while this Storage writer was open"
+        );
+        Ok(())
     }
 
     /// Apply one storage mutation while the caller already owns this profile's
@@ -2281,6 +2368,9 @@ where
         }
     }
 
+    let _namespace = acquire_profile_namespace_lock()?;
+    source_storage.verify_profile_identity()?;
+    target_storage.verify_profile_identity()?;
     with_two_storage_locks(source_storage, target_storage, || {
         let (source_instances, _source_groups) = source_storage.load_with_groups()?;
         let (target_instances, _) = target_storage.load_with_groups()?;
@@ -2878,6 +2968,24 @@ mod tests {
 
         crate::session::create_profile("known").unwrap();
         assert_eq!(Storage::open_unwatched("known").unwrap().profile(), "known");
+    }
+
+    #[test]
+    #[serial]
+    fn stale_storage_writer_cannot_recreate_renamed_or_deleted_profile() {
+        let temp = tempdir().unwrap();
+        let guard = setup_test_home(temp.path());
+        crate::session::create_profile("old").unwrap();
+        crate::session::create_profile("other").unwrap();
+        let stale = Storage::open_unwatched("old").unwrap();
+        crate::session::rename_profile("old", "renamed").unwrap();
+        assert!(stale.update(|_, _| Ok(())).is_err());
+        assert!(!guard.path().join("profiles/old").exists());
+
+        let stale_delete = Storage::open_unwatched("other").unwrap();
+        crate::session::delete_profile("other").unwrap();
+        assert!(stale_delete.update(|_, _| Ok(())).is_err());
+        assert!(!guard.path().join("profiles/other").exists());
     }
 
     #[test]

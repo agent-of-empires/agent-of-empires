@@ -67,12 +67,28 @@ async fn purge_session_artifacts(
     };
     let file_watch = state.file_watch.clone();
     let reserve_profile = profile.clone();
-    let reservation = tokio::task::spawn_blocking(move || {
-        let storage = Storage::new(&reserve_profile, file_watch)
-            .map_err(|e| format!("Storage init failed before session teardown: {e}"))?;
-        crate::session::deletion::PurgeTransaction::reserve(storage, delete_request)
-            .map_err(|e| format!("Failed to reserve session purge: {e}"))
-    })
+    let reservation = tokio::task::spawn_blocking(
+        move || -> Result<crate::session::deletion::PurgeReservation, String> {
+            let storage = Storage::open(&reserve_profile, file_watch)
+                .map_err(|e| format!("Storage init failed before session teardown: {e}"))?;
+            let reservation =
+                crate::session::deletion::PurgeTransaction::reserve(storage, delete_request)
+                    .map_err(|e| format!("Failed to reserve session purge: {e}"))?;
+            match reservation {
+                crate::session::deletion::PurgeReservation::Reserved(transaction) => {
+                    match transaction.preflight_ownership() {
+                        Ok(transaction) => Ok(
+                            crate::session::deletion::PurgeReservation::Reserved(transaction),
+                        ),
+                        Err(result) => Ok(crate::session::deletion::PurgeReservation::Rejected(
+                            *result,
+                        )),
+                    }
+                }
+                rejected => Ok(rejected),
+            }
+        },
+    )
     .await
     .map_err(|e| format!("Deletion reservation task failed: {e}"))??;
     let transaction = match reservation {
@@ -109,7 +125,7 @@ async fn purge_session_artifacts(
         .await
         .map_err(|e| format!("Deletion hook task failed: {e}"))?;
 
-    let transcript_purged = instance.is_structured();
+    let transcript_purged = transaction.instance().is_structured();
 
     let deletion_result = if transcript_purged {
         // Commit the row removal before deleting the ACP transcript, so a lost

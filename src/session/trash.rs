@@ -239,6 +239,7 @@ pub struct TrashResult {
     pub session_id: String,
     pub relocation: Option<TrashRelocation>,
     pub relocate_warning: Option<String>,
+    pub authoritative: Option<Instance>,
 }
 
 /// Execute and commit a TUI trash transition under one per-instance flock.
@@ -247,6 +248,11 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
         session_id: request.session_id.clone(),
         relocation: None,
         relocate_warning: Some(reason),
+        authoritative: None,
+    };
+    let _workspace_claim_lock = match crate::session::acquire_session_workspace_claim_lock() {
+        Ok(lock) => lock,
+        Err(error) => return failed(format!("could not acquire workspace claim lock: {error}")),
     };
     let _identity_lock = match crate::session::acquire_session_identity_lock() {
         Ok(lock) => lock,
@@ -278,25 +284,48 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
     if !owns {
         return failed("trash lifecycle reservation was superseded before teardown".to_string());
     }
-    if let Err(error) = crate::session::deletion::ensure_unclaimed_paths(
-        &request.session_id,
-        &[PathBuf::from(&request.instance.project_path)],
-    ) {
-        let _ = storage.update(|instances, _groups| {
-            if let Some(stored) = instances
-                .iter_mut()
-                .find(|instance| instance.id == request.session_id)
-            {
-                stored.release_lifecycle_reservation_if_owned(
-                    crate::session::LifecycleOperation::Trash,
-                    request.generation,
-                );
-            }
-            Ok(())
-        });
-        return failed(format!(
-            "trash skipped because worktree ownership is shared or unknown: {error}"
-        ));
+    if request.instance.has_managed_worktree_or_workspace() {
+        let mut candidate_paths = vec![PathBuf::from(&request.instance.project_path)];
+        if let Some(workspace) = &request.instance.workspace_info {
+            candidate_paths.push(PathBuf::from(&workspace.workspace_dir));
+        }
+        candidate_paths.extend(
+            request
+                .instance
+                .all_repos()
+                .iter()
+                .map(|repo| PathBuf::from(&repo.worktree_path)),
+        );
+        if let Err(error) =
+            crate::session::deletion::ensure_unclaimed_paths(&request.session_id, &candidate_paths)
+        {
+            let _ = storage.update(|instances, _groups| {
+                if let Some(stored) = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == request.session_id)
+                {
+                    stored.untrash();
+                    stored.release_lifecycle_reservation_if_owned(
+                        crate::session::LifecycleOperation::Trash,
+                        request.generation,
+                    );
+                }
+                Ok(())
+            });
+            let authoritative = storage.load().ok().and_then(|instances| {
+                instances
+                    .into_iter()
+                    .find(|instance| instance.id == request.session_id)
+            });
+            return TrashResult {
+                session_id: request.session_id.clone(),
+                relocation: None,
+                relocate_warning: Some(format!(
+                    "trash skipped because worktree ownership is shared or unknown: {error}"
+                )),
+                authoritative,
+            };
+        }
     }
 
     let mut inst = request.instance.clone();
@@ -330,6 +359,11 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
         return failed(format!("could not commit trash transition: {error}"));
     }
 
+    let authoritative = storage.load().ok().and_then(|instances| {
+        instances
+            .into_iter()
+            .find(|instance| instance.id == request.session_id)
+    });
     TrashResult {
         session_id: request.session_id.clone(),
         relocation,
@@ -337,6 +371,7 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
             RelocateOutcome::Failed { reason } => Some(reason),
             RelocateOutcome::Relocated { .. } | RelocateOutcome::Skipped => None,
         },
+        authoritative,
     }
 }
 
@@ -1560,6 +1595,61 @@ mod tests {
 
     // Regression (#the-d-key): trashing must run the sandbox container-stop step BEFORE relocating
     // the worktree.
+    #[test]
+    #[serial_test::serial]
+    fn trash_ownership_rejection_untrashes_and_releases_reservation() {
+        let _app_guard = crate::session::test_support::isolate_app_dir();
+        let owner = crate::session::Storage::new_unwatched("owner").unwrap();
+        let other = crate::session::Storage::new_unwatched("other").unwrap();
+        let mut instance = Instance::new("session", "/tmp/session");
+        instance.source_profile = "owner".to_string();
+        instance.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "feature/shared".to_string(),
+            main_repo_path: "/tmp/main".to_string(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+        owner
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        other
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let generation = owner
+            .update(|instances, _groups| {
+                let row = instances
+                    .iter_mut()
+                    .find(|row| row.id == instance.id)
+                    .unwrap();
+                let generation = row
+                    .try_acquire_lifecycle_reservation(
+                        crate::session::LifecycleOperation::Trash,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        Utc::now(),
+                    )
+                    .unwrap();
+                row.trash();
+                Ok(generation)
+            })
+            .unwrap();
+        let result = perform_trash(&TrashRequest {
+            session_id: instance.id.clone(),
+            instance: instance.clone(),
+            generation,
+        });
+        assert!(result.relocate_warning.is_some());
+        let stored = owner.load().unwrap().into_iter().next().unwrap();
+        assert!(!stored.is_trashed());
+        assert!(stored.lifecycle_reservation.is_none());
+    }
+
     #[test]
     fn trash_prep_stops_container_before_relocating() {
         if !git_available() {

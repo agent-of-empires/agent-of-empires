@@ -11,6 +11,7 @@ use std::sync::mpsc;
 use std::thread;
 
 pub(in crate::tui) struct IdentityGuard {
+    _workspace_claim_lock: crate::session::StorageFlock,
     _lock: crate::session::StorageFlock,
 }
 
@@ -163,11 +164,6 @@ impl CreationPoller {
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
         let warnings = build_result.warnings;
-        let manages_worktree = instance
-            .worktree_info
-            .as_ref()
-            .is_some_and(|worktree| worktree.managed_by_aoe)
-            || instance.workspace_info.is_some();
 
         let has_on_create = hooks
             .as_ref()
@@ -283,20 +279,35 @@ impl CreationPoller {
             }
         }
 
+        let workspace_claim_lock = match crate::session::acquire_session_workspace_claim_lock() {
+            Ok(lock) => lock,
+            Err(error) => {
+                builder::cleanup_instance(
+                    &instance,
+                    created_worktree.as_ref(),
+                    &created_workspace_worktrees,
+                    None,
+                );
+                return CreationResult::Error(format!("{error:#}"));
+            }
+        };
         let identity_guard = match crate::session::acquire_session_identity_lock() {
             Ok(lock) => {
-                if manages_worktree && !std::path::Path::new(&instance.project_path).exists() {
+                if let Err(error) = crate::session::validate_managed_workspace(&instance) {
                     builder::cleanup_instance(
                         &instance,
                         created_worktree.as_ref(),
                         &created_workspace_worktrees,
                         None,
                     );
-                    return CreationResult::Error(
-                        "Project path disappeared before the session was persisted".to_string(),
-                    );
+                    return CreationResult::Error(format!(
+                        "Managed workspace validation failed before persistence: {error}"
+                    ));
                 }
-                Some(IdentityGuard { _lock: lock })
+                Some(IdentityGuard {
+                    _lock: lock,
+                    _workspace_claim_lock: workspace_claim_lock,
+                })
             }
             Err(error) => {
                 builder::cleanup_instance(

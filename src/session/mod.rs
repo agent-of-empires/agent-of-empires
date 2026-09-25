@@ -97,6 +97,41 @@ pub(crate) use storage::acquire_session_identity_lock;
 pub(crate) use storage::observe_lock_contention_for_test;
 pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};
 
+/// Check that every path a non-scratch session will use is present and inspectable.
+pub(crate) fn validate_managed_workspace(instance: &Instance) -> Result<(), String> {
+    if instance.scratch {
+        return Ok(());
+    }
+
+    let mut paths = vec![std::path::PathBuf::from(&instance.project_path)];
+    if let Some(workspace) = &instance.workspace_info {
+        paths.push(std::path::PathBuf::from(&workspace.workspace_dir));
+        paths.extend(
+            workspace
+                .repos
+                .iter()
+                .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
+        );
+    }
+    for path in paths {
+        match path.try_exists() {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(format!(
+                    "managed workspace path is missing: {}",
+                    path.display()
+                ))
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect managed workspace path {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Process-wide cache of the `session.unread_indicator` toggle (default on).
@@ -142,9 +177,10 @@ pub use projects::{Project, ProjectOverrides, ProjectScope};
 pub use recovery::HookTimeoutScope;
 pub use scope::SessionScope;
 pub(crate) use storage::{
-    acquire_session_title_lock, acquire_storage_flock, acquire_storage_shared_flock, atomic_write,
-    read_file_no_follow, replace_file_no_follow, resolve_symlink_chain, try_acquire_storage_flock,
-    GroupMovePlan, StorageFlock, STORAGE_LOCK_FILENAME,
+    acquire_session_title_lock, acquire_session_workspace_claim_lock, acquire_storage_flock,
+    acquire_storage_shared_flock, atomic_write, read_file_no_follow, replace_file_no_follow,
+    resolve_symlink_chain, try_acquire_storage_flock, GroupMovePlan, StorageFlock,
+    STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,
@@ -642,6 +678,7 @@ fn validate_new_profile_name(name: &str) -> Result<()> {
 pub fn create_profile(name: &str) -> Result<()> {
     validate_new_profile_name(name)?;
     let _identity_lock = acquire_session_identity_lock()?;
+    let _profile_namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
 
     let profiles = list_profiles()?;
     if profiles.contains(&name.to_string()) {
@@ -656,6 +693,7 @@ pub fn create_profile(name: &str) -> Result<()> {
 pub fn delete_profile(name: &str) -> Result<()> {
     validate_profile_name(name)?;
     let _identity_lock = acquire_session_identity_lock()?;
+    let _profile_namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
 
     let base = get_app_dir()?;
     let profile_dir = base.join("profiles").join(name);
@@ -663,6 +701,10 @@ pub fn delete_profile(name: &str) -> Result<()> {
     if !profile_dir.exists() {
         anyhow::bail!("Profile '{}' does not exist", name);
     }
+    let _profile_storage_lock = crate::session::storage::acquire_storage_flock(
+        &profile_dir,
+        crate::session::storage::STORAGE_LOCK_FILENAME,
+    )?;
 
     // The invariant is "at least one profile must exist", a count, not a name.
     // Any profile is deletable as long as deleting it would not leave zero.
@@ -680,6 +722,7 @@ pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
     validate_profile_name(old_name)?;
     validate_new_profile_name(new_name)?;
     let _identity_lock = acquire_session_identity_lock()?;
+    let _profile_namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
 
     let base = get_app_dir()?;
     let old_dir = base.join("profiles").join(old_name);
@@ -691,6 +734,10 @@ pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
     if new_dir.exists() {
         anyhow::bail!("Profile '{}' already exists", new_name);
     }
+    let _old_profile_storage_lock = crate::session::storage::acquire_storage_flock(
+        &old_dir,
+        crate::session::storage::STORAGE_LOCK_FILENAME,
+    )?;
 
     fs::rename(&old_dir, &new_dir)?;
 
@@ -922,6 +969,38 @@ mod tests {
     use super::test_support::{isolate_app_dir, AppDirGuard};
     use super::*;
 
+    #[test]
+    fn managed_workspace_validator_checks_each_workspace_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let worktree = workspace.join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let mut instance = Instance::new("workspace", workspace.to_str().unwrap());
+        instance.workspace_info = Some(WorkspaceInfo {
+            branch: "feature".to_string(),
+            workspace_dir: workspace.to_string_lossy().to_string(),
+            repos: vec![WorkspaceRepo {
+                name: "repo".to_string(),
+                source_path: temp.path().join("source").to_string_lossy().to_string(),
+                branch: "feature".to_string(),
+                worktree_path: worktree.to_string_lossy().to_string(),
+                main_repo_path: temp.path().join("source").to_string_lossy().to_string(),
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
+            }],
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+        assert!(validate_managed_workspace(&instance).is_ok());
+        std::fs::remove_dir(&worktree).unwrap();
+        let error = validate_managed_workspace(&instance).unwrap_err();
+        assert!(
+            error.contains("managed workspace path is missing"),
+            "unexpected error: {error}"
+        );
+    }
     #[test]
     #[serial_test::serial]
     fn favorites_first_flag_round_trips() {
