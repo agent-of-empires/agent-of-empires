@@ -2250,7 +2250,9 @@ impl Instance {
             let selected_home = super::hooks::host_home(&self.resolved_host_environment())
                 .context("native HOME is unavailable")?;
             execution.exported_default_store = Some(
-                crate::session::capture::is_default_claude_store(primary, &selected_home),
+                crate::git::template::lexical_normalize(store)
+                    != crate::git::template::lexical_normalize(&selected_home.join(".claude"))
+                    && crate::session::capture::is_default_claude_store(primary, &selected_home),
             );
         }
         Ok(ConversationBinding {

@@ -1514,7 +1514,7 @@ mod tests {
             inst.resume_binding = Some(asserted.clone());
             inst.resume_intent = ResumeIntent::Use(sid.into());
             assert_eq!(routed(&inst).0, expected, "exported={exported:?}");
-            asserted.execution.as_mut().unwrap().exported_default_store = Some(false);
+            asserted.execution.as_mut().unwrap().exported_default_store = None;
             inst.resume_binding = Some(asserted);
             let (legacy, execution) = routed(&inst);
             assert_eq!(legacy, expected, "legacy exported={exported:?}");
@@ -1612,7 +1612,7 @@ mod tests {
             capture(
                 &mut inst,
                 crate::session::ExecutionBinding {
-                    exported_default_store: Some(false),
+                    exported_default_store: None,
                     ..binding
                 },
             );
