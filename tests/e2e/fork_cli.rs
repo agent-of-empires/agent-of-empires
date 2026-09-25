@@ -240,7 +240,7 @@ fn fork_with_native_selector_is_refused_at_launch() {
 /// agent-specific), an agent with no fork capability, flags that change the
 /// working directory or carry their own resume/fork flags, a parent with no
 /// captured conversation, a parent whose recorded conversation was never
-/// attested, and a parent whose own fork has not launched. Each refusal fires
+/// qualified, and a parent whose own fork has not launched. Each refusal fires
 /// before provisioning, so nothing is persisted or left on disk.
 #[test]
 #[parallel]
@@ -252,59 +252,75 @@ fn fork_from_refusals_persist_nothing() {
         Bare,
         /// Forked but never launched: a synthetic id plus a live Fork intent.
         UnlaunchedFork,
-        /// A pre-v1.17 row: an id is stored, but its binding was never
-        /// attested, so the fork is refused as unqualified.
+        /// A pre-v1.17 row: an id is stored, but no binding qualifies it, so
+        /// the fork is refused as unqualified.
         LegacyUnqualified,
     }
     struct Case {
         parent: Parent,
+        /// The parent title, which the refused remedy quotes back verbatim.
+        title: &'static str,
         args: &'static [&'static str],
-        expect: &'static str,
+        expect: String,
     }
     let cases = [
         Case {
             // gemini is resume-only, so the parent uses it too and the
             // unforkable-agent gate is the only possible rejection.
             parent: Parent::Seeded("gemini"),
+            title: "Parent",
             args: &["--tool", "gemini"],
-            expect: "does not support forking",
+            expect: "does not support forking".into(),
         },
         Case {
             parent: Parent::Seeded("claude"),
+            title: "Parent",
             args: &["--worktree", "wt-branch"],
-            expect: "--worktree",
+            expect: "--worktree".into(),
         },
         Case {
             parent: Parent::Seeded("claude"),
+            title: "Parent",
             args: &["--scratch"],
-            expect: "--scratch",
+            expect: "--scratch".into(),
         },
         Case {
             parent: Parent::Seeded("claude"),
+            title: "Parent",
             args: &["--sandbox"],
-            expect: "--sandbox",
+            expect: "--sandbox".into(),
         },
         Case {
             // A terminal fork cannot carry its state onto a structured session.
             // `--scratch` makes a late rejection observable as a leaked dir.
             parent: Parent::Seeded("claude"),
+            title: "Parent",
             args: &["--scratch", "--structured-view"],
-            expect: "cannot be combined with",
+            expect: "cannot be combined with".into(),
         },
         Case {
             parent: Parent::Bare,
+            title: "Parent",
             args: &[],
-            expect: "Nothing to fork",
+            expect: "Nothing to fork".into(),
         },
         Case {
             parent: Parent::UnlaunchedFork,
+            title: "Parent",
             args: &[],
-            expect: "its own fork has not launched yet",
+            expect: "its own fork has not launched yet".into(),
         },
         Case {
             parent: Parent::LegacyUnqualified,
+            // A space in the title, so both remedy arguments must be quoted
+            // for the pasted command to run.
+            title: "Legacy Parent",
             args: &[],
-            expect: "set-session-id",
+            expect: format!(
+                "aoe session set-session-id {} {}",
+                shell_words::quote("Legacy Parent"),
+                PARENT_AGENT_ID
+            ),
         },
     ];
 
@@ -313,7 +329,7 @@ fn fork_from_refusals_persist_nothing() {
         h.install_path_command("gemini");
         let project = h.project_path();
         match case.parent {
-            Parent::Seeded(tool) => seed_parent(&h, &project, "Parent", tool),
+            Parent::Seeded(tool) => seed_parent(&h, &project, case.title, tool),
             Parent::Bare => {
                 h.run_cli_ok(&[
                     "add",
@@ -321,7 +337,7 @@ fn fork_from_refusals_persist_nothing() {
                     "--cmd",
                     "claude",
                     "-t",
-                    "Parent",
+                    case.title,
                 ]);
             }
             Parent::LegacyUnqualified => {
@@ -331,9 +347,9 @@ fn fork_from_refusals_persist_nothing() {
                     "--cmd",
                     "claude",
                     "-t",
-                    "Parent",
+                    case.title,
                 ]);
-                patch_session(&h, "Parent", |session| {
+                patch_session(&h, case.title, |session| {
                     session["agent_session_id"] = json!(PARENT_AGENT_ID);
                     session["agent_session_binding"] = json!({
                         "session_id": PARENT_AGENT_ID,
@@ -349,9 +365,9 @@ fn fork_from_refusals_persist_nothing() {
                     "--cmd",
                     "claude",
                     "-t",
-                    "Parent",
+                    case.title,
                 ]);
-                patch_session(&h, "Parent", |session| {
+                patch_session(&h, case.title, |session| {
                     session["agent_session_id"] = json!("99999999-8888-7777-6666-555555555555");
                     session["resume_intent"] =
                         json!({ "kind": "Fork", "value": { "from": PARENT_AGENT_ID } });
@@ -365,11 +381,11 @@ fn fork_from_refusals_persist_nothing() {
             args.push(project.to_str().unwrap());
         }
         args.extend_from_slice(case.args);
-        args.extend_from_slice(&["-t", "Child", "--fork-from", "Parent"]);
+        args.extend_from_slice(&["-t", "Child", "--fork-from", case.title]);
 
         let stderr = h.run_cli_err(&args);
         assert!(
-            stderr.contains(case.expect),
+            stderr.contains(&case.expect),
             "{args:?}: expected {:?} in:\n{stderr}",
             case.expect
         );
