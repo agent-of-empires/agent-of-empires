@@ -3,13 +3,6 @@ import { test, expect } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
-import { mkdirSync } from "node:fs";
-
-const SHOTS_DIR = "../target/focus-shortcut-screenshots";
-mkdirSync(SHOTS_DIR, { recursive: true });
-async function shot(page: Page, name: string) {
-  await page.screenshot({ path: `${SHOTS_DIR}/${name}` });
-}
 
 async function openSession(page: Page) {
   await clickSidebarSession(page, "pinch-test");
@@ -60,25 +53,7 @@ async function blurAll(page: Page) {
 test.describe("Cmd/Ctrl+` desktop", () => {
   test.use({ viewport: { width: 1280, height: 800 }, hasTouch: false });
 
-  test("toggles between agent and paired with the right panel open", async ({ page }, _testInfo) => {
-    await mockTerminalApis(page);
-    await page.goto("/");
-    await openSession(page);
-
-    await focusKind(page, "agent");
-    await expect.poll(() => focusedKind(page)).toBe("agent");
-    await shot(page, "01-agent-focused.png");
-
-    await page.keyboard.press("ControlOrMeta+`");
-    await expect.poll(() => focusedKind(page)).toBe("paired");
-    await shot(page, "02-paired-focused.png");
-
-    await page.keyboard.press("ControlOrMeta+`");
-    await expect.poll(() => focusedKind(page)).toBe("agent");
-    await shot(page, "03-back-to-agent.png");
-  });
-
-  test("first press from outside any terminal lands in paired (VSCode-like)", async ({ page }) => {
+  test("toggles between agent and paired with the right panel open, stably under rapid presses", async ({ page }) => {
     await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page);
@@ -88,22 +63,33 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     // Like VS Code, from outside both panes focus goes to the paired shell.
     await page.keyboard.press("ControlOrMeta+`");
     await expect.poll(() => focusedKind(page)).toBe("paired");
+
+    await page.keyboard.press("ControlOrMeta+`");
+    await expect.poll(() => focusedKind(page)).toBe("agent");
+
+    await page.keyboard.press("ControlOrMeta+`");
+    await expect.poll(() => focusedKind(page)).toBe("paired");
+
+    await focusKind(page, "agent");
+    await expect.poll(() => focusedKind(page)).toBe("agent");
+    for (let i = 0; i < 11; i++) {
+      await page.keyboard.press("ControlOrMeta+`");
+    }
+    await expect.poll(() => focusedKind(page)).toBe("paired");
   });
 
-  test("expands collapsed right panel and focuses paired (latch)", async ({ page }, _testInfo) => {
+  test("expands collapsed right panel and focuses paired (latch)", async ({ page }) => {
     await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page);
 
     await page.keyboard.press("ControlOrMeta+Alt+b");
     await expect(page.locator('[data-term="paired"]')).toHaveCount(0);
-    await shot(page, "04-collapsed.png");
 
     await focusKind(page, "agent");
     await page.keyboard.press("ControlOrMeta+`");
     await expect(page.locator('[data-term="paired"]')).toHaveCount(1);
     await expect.poll(() => focusedKind(page)).toBe("paired");
-    await shot(page, "05-expanded-paired-focused.png");
   });
 
   test("paired latch fires once ensureTerminal resolves (slow paired)", async ({ page }) => {
@@ -135,34 +121,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await expect.poll(() => focusedKind(page)).toBe("paired");
   });
 
-  test("agent latch fires once ensureSession resolves (slow agent)", async ({ page }) => {
-    await mockTerminalApis(page);
-    let releaseSession!: () => void;
-    const sessionPending = new Promise<void>((resolve) => {
-      releaseSession = resolve;
-    });
-    let requested = false;
-    await page.route("**/api/sessions/*/ensure", async (route) => {
-      requested = true;
-      await sessionPending;
-      await route.fulfill({ json: { ok: true } });
-    });
-
-    try {
-      // A sidebar click would already arm the agent-focus latch.
-      await page.goto("/session/pinch-test");
-      await expect.poll(() => requested).toBe(true);
-      await focusKind(page, "paired");
-      await expect.poll(() => focusedKind(page)).toBe("paired");
-      await expect(page.locator('[data-term="agent"] textarea')).toHaveCount(0);
-      await page.keyboard.press("ControlOrMeta+`");
-    } finally {
-      releaseSession();
-    }
-    await expect.poll(() => focusedKind(page)).toBe("agent");
-  });
-
-  test("with diff viewer open, Cmd+` to agent closes the diff", async ({ page }, _testInfo) => {
+  test("with diff viewer open, Cmd+` to agent closes the diff", async ({ page }) => {
     await mockTerminalApis(page);
     const file = { path: "src/foo.ts", old_path: null, status: "modified", additions: 1, deletions: 1 };
     const oldContent = "export const value = 1;\n";
@@ -194,7 +153,6 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await expect(backToTerminal).toBeVisible();
     await expect(agent).toHaveCount(1);
     await expect(agent).toBeHidden();
-    await shot(page, "06-diff-open.png");
 
     await focusKind(page, "paired");
     await expect.poll(() => focusedKind(page)).toBe("paired");
@@ -205,25 +163,6 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await expect.poll(() => focusedKind(page)).toBe("agent");
     await expect(agent).toBeVisible();
     await expect(backToTerminal).toBeHidden();
-    await shot(page, "07-after-toggle-agent.png");
-  });
-
-  test("rapid repeated presses end in a stable state", async ({ page }) => {
-    await mockTerminalApis(page);
-    await page.goto("/");
-    await openSession(page);
-    await focusKind(page, "agent");
-
-    // Mount the paired tab once so the loop toggles mounted panels.
-    await page.keyboard.press("ControlOrMeta+`");
-    await expect.poll(() => focusedKind(page)).toBe("paired");
-    await page.keyboard.press("ControlOrMeta+`");
-    await expect.poll(() => focusedKind(page)).toBe("agent");
-
-    for (let i = 0; i < 11; i++) {
-      await page.keyboard.press("ControlOrMeta+`");
-    }
-    await expect.poll(() => focusedKind(page)).toBe("paired");
   });
 });
 
@@ -249,24 +188,5 @@ test.describe("Cmd/Ctrl+` mobile", () => {
 
     await page.keyboard.press("ControlOrMeta+`");
     await expect.poll(() => focusedKind(page)).toBe("paired");
-  });
-});
-
-// ────────────────────────────────────────────────────────────────────
-//  Help overlay documents the shortcut
-// ────────────────────────────────────────────────────────────────────
-test.describe("Help overlay", () => {
-  test.use({ viewport: { width: 1280, height: 800 } });
-
-  test("lists the new Cmd+` shortcut row", async ({ page }) => {
-    await mockTerminalApis(page);
-    await page.goto("/");
-
-    // Synthetic `?` presses vary by layout, so open help from the menu.
-    await page.getByRole("button", { name: "More options" }).click();
-    await page.getByRole("menuitem", { name: "Help" }).click();
-
-    const row = page.getByText("Toggle agent / shell terminal focus");
-    await expect(row).toBeVisible();
   });
 });

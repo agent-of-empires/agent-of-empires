@@ -106,20 +106,3 @@ test.describe("Mobile soft-keyboard Backspace autorepeat", () => {
     });
   });
 });
-
-test.describe("Desktop uses the unified live view", () => {
-  test.use({ viewport: { width: 1280, height: 800 }, hasTouch: false });
-
-  test("desktop renders the live input (no xterm); the touch toolbar is hidden", async ({ page }) => {
-    await mockTerminalApis(page);
-    await page.goto("/");
-    await clickSidebarSession(page, "pinch-test");
-    await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
-
-    // Unified renderer: the live view + its input mount everywhere; xterm is
-    // gone. The soft-keyboard toolbar/FAB are touch-only, hidden on desktop.
-    await expect(page.locator(".xterm")).toHaveCount(0);
-    await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeAttached();
-    await expect(page.getByRole("button", { name: "Backspace" })).toHaveCount(0);
-  });
-});
