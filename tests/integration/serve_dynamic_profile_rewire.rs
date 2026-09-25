@@ -1,7 +1,7 @@
 //! Dynamic per-profile disk-watch rewire. Two layers of coverage:
 //!
 //! * Lower layer (the overwrite and rename tests below):
-//!   drives `add_profile_disk_watch` / `remove_profile_disk_watch` / `rename_profile_disk_watch` directly against an in-process
+//!   drives `add_profile_disk_watch` / `rename_profile_disk_watch` directly against an in-process
 //!   `AppState`, asserting `disk_watch_handles` insert/remove under the
 //!   canonical drop-then-abort order. Observable only at this layer
 //!   because the handles map is daemon-internal state that the HTTP
