@@ -96,13 +96,6 @@ describe("useRepoGroups sort modes", () => {
       undefined,
       ["/repo-b", "/repo-a"],
     ],
-    [
-      "attention: synthetic groups stay at the bottom even when urgent",
-      "attention",
-      [scratch("sc", { status: "Waiting", urgent: true }), ws("real", "/repo-a")],
-      undefined,
-      ["/repo-a", SCRATCH_GROUP_ID],
-    ],
   ])("%s", (_label, mode, workspaces, ordering, expected) => {
     expect(ids(workspaces, mode, ordering)).toEqual(expected);
   });

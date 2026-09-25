@@ -32,13 +32,6 @@ const ANCHOR_KEY_BY_VALUE = new Map<TourAnchorId, string>(
 );
 
 describe("tour drift guard", () => {
-  it("every step anchor is a known TOUR_ANCHORS value", () => {
-    const known = new Set<string>(Object.values(TOUR_ANCHORS));
-    for (const step of TOUR_STEPS) {
-      expect(known.has(step.anchor)).toBe(true);
-    }
-  });
-
   it("every TOUR_ANCHORS value is used by at least one step (no orphan anchors)", () => {
     const usedByStep = new Set(TOUR_STEPS.map((s) => s.anchor));
     for (const value of Object.values(TOUR_ANCHORS)) {

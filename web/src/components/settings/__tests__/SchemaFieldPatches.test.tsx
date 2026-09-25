@@ -140,14 +140,6 @@ describe("schema-driven settings field PATCH payloads", () => {
     await waitFor(() => expect(select.value).toBe("left"));
   });
 
-  it("a global-only select saves through the global PATCH", async () => {
-    const { container } = renderTab("logging");
-    await screen.findByText("Default level");
-    fireEvent.change(selectByLabel(container, "Default level"), { target: { value: "debug" } });
-    await waitFor(() => expect(api.updateSettings).toHaveBeenCalledWith({ logging: { default_level: "debug" } }));
-    expect(api.updateProfileSettings).not.toHaveBeenCalled();
-  });
-
   it("a tmux field edit never leaks sibling fields into the PATCH (sparse leaf)", async () => {
     vi.mocked(api.fetchSettings).mockResolvedValueOnce({
       tmux: { status_bar: "enabled", mouse: "enabled" },

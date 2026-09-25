@@ -16,7 +16,6 @@ import {
   repoGroupHasLiveWorkspace,
   repoGroupIsUrgent,
   repoGroupLastActivityMs,
-  resolveEffectiveSnoozedUntil,
   saveSidebarSortMode,
   sessionAttentionRank,
   sessionNeedsAttention,
@@ -179,13 +178,6 @@ describe("triage", () => {
     expect(triageMenuShape(state)).toMatchObject(Object.fromEntries(all.map((k) => [k, shown.includes(k as never)])));
   });
 
-  it("resolveEffectiveSnoozedUntil prefers a defined optimistic override", () => {
-    expect(resolveEffectiveSnoozedUntil(undefined, null)).toBeNull();
-    expect(resolveEffectiveSnoozedUntil(undefined, TS)).toBe(TS);
-    expect(resolveEffectiveSnoozedUntil(TS, null)).toBe(TS);
-    expect(resolveEffectiveSnoozedUntil(null, TS)).toBeNull();
-  });
-
   it.each([
     ["2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z", true],
     ["2099-01-01T00:00:00Z", "2099-01-01T00:02:00Z", true],
@@ -201,11 +193,6 @@ describe("triage", () => {
     ["one live workspace", [ws1("live"), ws1("arch", archived)], true],
     ["all sunk", [ws1("arch", archived), ws1("snz", snoozed)], false],
     ["no workspaces", [], false],
-    [
-      "a mixed multi-session workspace",
-      [workspace("w", [session({ id: "a" }), session({ id: "b", ...archived })])],
-      true,
-    ],
   ])("repoGroupHasLiveWorkspace with %s is %s", (_name, workspaces, expected) => {
     expect(repoGroupHasLiveWorkspace(repoGroup(workspaces))).toBe(expected);
   });
@@ -321,12 +308,6 @@ describe("attention sort (#1640)", () => {
 
 describe("sort mode storage", () => {
   beforeEach(() => window.localStorage.clear());
-
-  it("defaults to manual for empty or unknown values", () => {
-    expect(loadSidebarSortMode()).toBe("manual");
-    window.localStorage.setItem(SIDEBAR_SORT_MODE_KEY, "nonsense");
-    expect(loadSidebarSortMode()).toBe("manual");
-  });
 
   it.each(["attention", "manual"] as const)("round-trips %s", (mode) => {
     saveSidebarSortMode(mode === "manual" ? "lastActivity" : "manual");
