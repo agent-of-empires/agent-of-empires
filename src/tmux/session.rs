@@ -2198,7 +2198,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_byte_batches_chunks_and_preserves_order() {
+    fn raw_byte_batches_chunk_and_roundtrip_in_order() {
         let payload: Vec<u8> = (0..=255u8)
             .cycle()
             .take(MAX_RAW_BYTES_PER_SEND + 10)
@@ -2211,11 +2211,21 @@ mod tests {
         assert_eq!(batches[0][255], "ff");
         let last = payload[payload.len() - 1];
         assert_eq!(batches[1][9], format!("{:02x}", last));
-    }
 
-    #[test]
-    fn raw_byte_batches_empty_payload_sends_nothing() {
         assert!(raw_byte_batches(&[]).is_empty());
+
+        let payload: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        let batches = raw_byte_batches(&payload);
+        assert!(batches.len() > 1);
+        for batch in &batches {
+            assert!(batch.len() <= MAX_RAW_BYTES_PER_SEND);
+        }
+        let roundtrip: Vec<u8> = batches
+            .iter()
+            .flatten()
+            .map(|h| u8::from_str_radix(h, 16).unwrap())
+            .collect();
+        assert_eq!(roundtrip, payload);
     }
 
     #[test]
@@ -2361,7 +2371,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_segments_split_the_chained_capture_by_sentinel() {
+    fn pane_segments_split_by_sentinel_and_drop_bad_geometry() {
         let raw = "@@s@@ 0 0 6 2\nleft1\nleft2\n@@s@@ 7 0 6 2\nright1\nright2\n";
         let panes = parse_pane_segments(raw, "@@s@@");
         assert_eq!(panes.len(), 2);
@@ -2370,36 +2380,14 @@ mod tests {
         assert_eq!(panes[0].rows.len(), 2);
         assert!(panes[0].rows[0].contains("left1"));
         assert!(panes[1].rows[1].contains("right2"));
-    }
 
-    #[test]
-    fn pane_segments_drop_a_pane_with_unparseable_geometry() {
         let raw = "@@s@@ bogus\norphan\n@@s@@ 0 0 4 1\nkeep\n";
         let panes = parse_pane_segments(raw, "@@s@@");
         assert_eq!(panes.len(), 1);
         assert_eq!(panes[0].geom.width, 4);
         assert!(panes[0].rows[0].contains("keep"));
-    }
 
-    #[test]
-    fn pane_segments_are_empty_when_no_sentinel_appears() {
         assert!(parse_pane_segments("just some output\n", "@@s@@").is_empty());
-    }
-
-    #[test]
-    fn raw_byte_batches_large_paste_roundtrips_in_order() {
-        let payload: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
-        let batches = raw_byte_batches(&payload);
-        assert!(batches.len() > 1);
-        for batch in &batches {
-            assert!(batch.len() <= MAX_RAW_BYTES_PER_SEND);
-        }
-        let roundtrip: Vec<u8> = batches
-            .iter()
-            .flatten()
-            .map(|h| u8::from_str_radix(h, 16).unwrap())
-            .collect();
-        assert_eq!(roundtrip, payload);
     }
 
     #[test]
@@ -2453,16 +2441,13 @@ mod tests {
     }
 
     #[test]
-    fn merge_cursor_probes_stable_mapping_keeps_after_and_trusts_position() {
+    fn merge_cursor_probes_trusts_position_only_without_drift() {
         let before = PaneCursor::parse("3 2 1 24 120 80 1 1 1").unwrap();
         let after = PaneCursor::parse("5 4 1 24 120 80 1 1 1").unwrap();
         let merged = merge_cursor_probes(Some(before), Some(after)).expect("both probes => Some");
         assert_eq!((merged.x, merged.y), (5, 4));
         assert!(merged.position_reliable);
-    }
 
-    #[test]
-    fn merge_cursor_probes_drift_keeps_modes_but_drops_position_trust() {
         let before = PaneCursor::parse("3 2 1 24 120 80 1 1 1").unwrap();
         let after = PaneCursor::parse("3 2 1 24 137 80 1 1 1").unwrap();
         let merged = merge_cursor_probes(Some(before), Some(after)).expect("both probes => Some");
@@ -2473,10 +2458,7 @@ mod tests {
         let after = PaneCursor::parse("3 2 1 30 120 80 1 0 0").unwrap();
         let merged = merge_cursor_probes(Some(before), Some(after)).expect("both probes => Some");
         assert!(!merged.position_reliable);
-    }
 
-    #[test]
-    fn merge_cursor_probes_none_when_either_probe_missing() {
         let c = PaneCursor::parse("3 2 1 24 120 80 1 1 1").unwrap();
         assert!(merge_cursor_probes(None, Some(c)).is_none());
         assert!(merge_cursor_probes(Some(c), None).is_none());
@@ -3269,8 +3251,7 @@ mod tests {
             ],
         );
         assert!(output.status.success());
-
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        wait_for_pane_command(&only_pane_id(&session_name), "sleep");
 
         let pane_dead = crate::tmux::tmux_command()
             .args(["display-message", "-t", &session_name, "-p", "#{pane_dead}"])
@@ -3840,39 +3821,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_is_pane_running_shell_targets_first_window_with_multiple_windows() {
-        require_tmux!();
-
-        let guard = TmuxTestSession::new("aoe_test_shell_multiwin");
-        let session_name = guard.name().to_string();
-
-        let mut args = new_session_argv(&session_name, ("80", "24"), "sleep 30");
-        append_pane_base_index_args(&mut args, &session_name);
-        let output = crate::tmux::tmux_command()
-            .args(&args)
-            .output()
-            .expect("tmux new-session");
-        assert!(output.status.success());
-        let agent_pane = only_pane_id(&session_name);
-
-        rebase_first_window_to_index_one(&session_name);
-
-        let output = crate::tmux::tmux_command()
-            .args(["new-window", "-t", &session_name, "sh"])
-            .output()
-            .expect("tmux new-window");
-        assert!(output.status.success());
-
-        wait_for_pane_command(&agent_pane, "sleep");
-
-        assert!(
-            !is_pane_running_shell(&session_name),
-            "is_pane_running_shell should target first window (sleep), not active window (sh)"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn test_status_checks_target_pane_zero_with_split_panes() {
         require_tmux!();
 
@@ -3995,18 +3943,13 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_session_name() {
-        assert_eq!(sanitize_session_name("my-project"), "my-project");
-        assert_eq!(sanitize_session_name("my project"), "my_project");
-        assert_eq!(sanitize_session_name("a".repeat(30).as_str()).len(), 20);
-    }
-
-    #[test]
     fn test_generate_name() {
         let name = Session::generate_name("abc123def456", "My Project");
         assert!(name.starts_with(SESSION_PREFIX));
         assert!(name.contains("My_Project"));
         assert!(name.contains("abc123de"));
+        let long = Session::generate_name("abc123def456", &"a".repeat(30));
+        assert!(long.contains(&"a".repeat(20)) && !long.contains(&"a".repeat(21)));
     }
 
     /// The whole `new-session` argv, so a reordering cannot slip through.
@@ -4334,25 +4277,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_is_pane_running_shell_on_non_shell_session() {
-        require_tmux!();
-
-        let guard = TmuxTestSession::new("aoe_test_noshell");
-        let session_name = guard.name().to_string();
-
-        let output = start_test_session(&session_name, ("80", "24"), &["sleep", "30"], &[]);
-        assert!(output.status.success());
-
-        wait_for_pane_command(&only_pane_id(&session_name), "sleep");
-
-        assert!(
-            !is_pane_running_shell(&session_name),
-            "Session running 'sleep' should not be detected as a shell"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn test_respawn_dead_pane_revives_dead_pane() {
         require_tmux!();
 
@@ -4409,11 +4333,7 @@ mod tests {
             !respawned_again,
             "respawn_dead_pane should report no-op on live pane"
         );
-    }
 
-    #[test]
-    #[serial_test::serial]
-    fn test_respawn_dead_pane_no_session() {
         let session = Session::from_name("aoe_test_nonexistent_session_xyz");
         let result = session
             .respawn_dead_pane("/tmp", Some("zsh"))

@@ -1385,70 +1385,44 @@ mod tests {
     const HARDCODED: &str = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
 
     #[test]
-    fn override_launch_binary_uses_command_override() {
-        let mut session = SessionConfig::default();
-        session
-            .agent_command_override
-            .insert("opencode".to_string(), "opencode-plannotator".to_string());
-        assert_eq!(
-            override_launch_binary("opencode", &session).as_deref(),
-            Some("opencode-plannotator")
-        );
+    fn override_launch_binary_takes_the_override_program() {
+        for (override_cmd, expected) in [
+            (None, None),
+            (Some("opencode-plannotator"), Some("opencode-plannotator")),
+            (Some("ocp run sp"), Some("ocp")),
+            (
+                Some("\"/opt/My Wrapper/opencode\" --mode plan"),
+                Some("/opt/My Wrapper/opencode"),
+            ),
+        ] {
+            let mut session = SessionConfig::default();
+            if let Some(cmd) = override_cmd {
+                session
+                    .agent_command_override
+                    .insert("opencode".to_string(), cmd.to_string());
+            }
+            assert_eq!(
+                override_launch_binary("opencode", &session).as_deref(),
+                expected,
+                "{override_cmd:?}"
+            );
+        }
     }
 
     #[test]
-    fn override_launch_binary_takes_first_word_of_multiword_override() {
-        let mut session = SessionConfig::default();
-        session
-            .agent_command_override
-            .insert("opencode".to_string(), "ocp run sp".to_string());
-        assert_eq!(
-            override_launch_binary("opencode", &session).as_deref(),
-            Some("ocp")
-        );
-    }
-
-    #[test]
-    fn override_launch_binary_honors_quoted_path() {
-        let mut session = SessionConfig::default();
-        session.agent_command_override.insert(
-            "opencode".to_string(),
-            "\"/opt/My Wrapper/opencode\" --mode plan".to_string(),
-        );
-        assert_eq!(
-            override_launch_binary("opencode", &session).as_deref(),
-            Some("/opt/My Wrapper/opencode")
-        );
-    }
-
-    #[test]
-    fn override_launch_binary_none_without_override() {
-        let session = SessionConfig::default();
-        assert_eq!(override_launch_binary("opencode", &session), None);
-    }
-
-    #[test]
-    fn flag_overrides_everything() {
-        let image = resolve_sandbox_image(Some(" custom:flag "), "repo:merged", HARDCODED);
-        assert_eq!(image, "custom:flag");
-    }
-
-    #[test]
-    fn merged_default_used_when_no_flag() {
-        let image = resolve_sandbox_image(None, "ghcr.io/example/custom:latest", HARDCODED);
-        assert_eq!(image, "ghcr.io/example/custom:latest");
-    }
-
-    #[test]
-    fn whitespace_merged_falls_back_to_hardcoded() {
-        let image = resolve_sandbox_image(None, "   ", HARDCODED);
-        assert_eq!(image, HARDCODED);
-    }
-
-    #[test]
-    fn empty_merged_falls_back_to_hardcoded() {
-        let image = resolve_sandbox_image(None, "", HARDCODED);
-        assert_eq!(image, HARDCODED);
+    fn resolve_sandbox_image_prefers_flag_then_merged_then_hardcoded() {
+        for (flag, merged, expected) in [
+            (Some(" custom:flag "), "repo:merged", "custom:flag"),
+            (
+                None,
+                "ghcr.io/example/custom:latest",
+                "ghcr.io/example/custom:latest",
+            ),
+            (None, "   ", HARDCODED),
+            (None, "", HARDCODED),
+        ] {
+            assert_eq!(resolve_sandbox_image(flag, merged, HARDCODED), expected);
+        }
     }
 
     mod profile_guard {

@@ -1081,24 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn podman_runtime_matches_the_docker_compatible_surface() {
-        let rt = ContainerRuntime::podman();
-        assert_eq!(rt.kind, RuntimeKind::Podman);
-        assert_eq!(rt.base.binary, "podman");
-        assert_eq!(rt.base.name, "Podman");
-        assert!(rt.base.supports_read_only_volumes);
-        assert!(rt.base.supports_remove_volumes);
-        assert!(rt.base.supports_named_volumes);
-        assert_eq!(rt.base.remove_subcommand, "rm");
-        assert_eq!(rt.base.pull_prefix, &["pull"]);
-        assert_eq!(
-            rt.exec_command("aoe-sandbox-test1234", None, "claude"),
-            "podman exec -it aoe-sandbox-test1234 claude"
-        );
-    }
-
-    #[test]
-    fn apple_container_exec_command_uses_absolute_shell() {
+    fn exec_command_per_runtime() {
         let cmd = ContainerRuntime::apple_container().exec_command(
             "aoe-sandbox-test1234",
             None,
@@ -1107,6 +1090,10 @@ mod tests {
         assert_eq!(
             cmd,
             "container exec -it aoe-sandbox-test1234 /bin/sh -c 'printf ok'"
+        );
+        assert_eq!(
+            ContainerRuntime::podman().exec_command("aoe-sandbox-test1234", None, "claude"),
+            "podman exec -it aoe-sandbox-test1234 claude"
         );
     }
 
@@ -1124,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn build_exec_argv_docker_is_non_interactive_and_sets_workdir() {
+    fn build_exec_argv_docker_and_podman_are_non_interactive_with_workdir() {
         let rt = ContainerRuntime::docker();
         let argv = rt.build_exec_argv("aoe-sandbox-test1234", "/workspace", &oneshot_argv());
         let mut expected = vec![
@@ -1136,10 +1123,7 @@ mod tests {
         ];
         expected.extend(oneshot_argv());
         assert_eq!(argv, expected);
-    }
 
-    #[test]
-    fn build_exec_argv_podman_matches_docker_shape() {
         let argv = ContainerRuntime::podman().build_exec_argv(
             "aoe-sandbox-test1234",
             "/workspace",

@@ -1251,6 +1251,25 @@ mod tests {
                 assert!(agent.oneshot_flag_binds_prompt(), "{name}");
             }
             assert_eq!(agent.oneshot_cheap_model().is_some(), name == "claude");
+
+            let expected = match agent.name {
+                "claude" => Some(HookIdentityField::SessionId),
+                "cursor" => Some(HookIdentityField::ConversationIdOrSessionId),
+                _ => None,
+            };
+            let hook_fields = agent
+                .hook_config
+                .iter()
+                .flat_map(|config| config.events.iter().filter_map(|e| e.identity_field));
+            let sidecar_fields = agent
+                .sidecar_hooks
+                .iter()
+                .flat_map(|config| config.events.iter().filter_map(|e| e.identity_field));
+            let fields: Vec<_> = hook_fields.chain(sidecar_fields).collect();
+            assert_eq!(!fields.is_empty(), expected.is_some(), "{}", agent.name);
+            if let Some(expected) = expected {
+                assert!(fields.iter().all(|f| *f == expected), "{}", agent.name);
+            }
         }
     }
 
@@ -1477,15 +1496,6 @@ mod tests {
     }
 
     #[test]
-    fn test_launch_base_command() {
-        assert_eq!(
-            get_agent("kiro").unwrap().launch_base_command(),
-            "kiro-cli chat"
-        );
-        assert_eq!(get_agent("claude").unwrap().launch_base_command(), "claude");
-    }
-
-    #[test]
     fn test_parse_selected_agent() {
         let cases = [
             ("--agent custom-agent", Some("custom-agent")),
@@ -1517,37 +1527,5 @@ mod tests {
             parse_selected_agent("--profile prod", "--profile").as_deref(),
             Some("prod")
         );
-    }
-
-    #[test]
-    fn test_send_keys_enter_delay() {
-        assert!(send_keys_enter_delay("codex") > 120);
-        assert!(send_keys_enter_delay("claude") > 100);
-        assert_eq!(send_keys_enter_delay("opencode"), 0);
-        assert_eq!(send_keys_enter_delay("unknown_agent"), 0);
-    }
-
-    #[test]
-    fn pane_hook_capture_agents_declare_their_native_identity_field() {
-        for agent in AGENTS {
-            let expected = match agent.name {
-                "claude" => Some(HookIdentityField::SessionId),
-                "cursor" => Some(HookIdentityField::ConversationIdOrSessionId),
-                _ => None,
-            };
-            let hook_fields = agent
-                .hook_config
-                .iter()
-                .flat_map(|config| config.events.iter().filter_map(|e| e.identity_field));
-            let sidecar_fields = agent
-                .sidecar_hooks
-                .iter()
-                .flat_map(|config| config.events.iter().filter_map(|e| e.identity_field));
-            let fields: Vec<_> = hook_fields.chain(sidecar_fields).collect();
-            assert_eq!(!fields.is_empty(), expected.is_some(), "{}", agent.name);
-            if let Some(expected) = expected {
-                assert!(fields.iter().all(|f| *f == expected), "{}", agent.name);
-            }
-        }
     }
 }

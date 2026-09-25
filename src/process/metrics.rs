@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn pressure_band_from_headroom_only() {
+    fn pressure_band_takes_the_worst_of_headroom_psi_and_macos_level() {
         let cases = [
             (0.0, PressureBand::Ok),
             (0.69, PressureBand::Ok),
@@ -531,10 +531,7 @@ mod tests {
                 "headroom fraction {frac}"
             );
         }
-    }
 
-    #[test]
-    fn pressure_band_escalates_on_psi_when_headroom_calm() {
         // Headroom alone is Ok (50% used); PSI drives the band up.
         let mut mem = sample_with_fraction(0.50);
         assert_eq!(pressure_band(&mem), PressureBand::Ok);
@@ -551,10 +548,7 @@ mod tests {
             ..sample_with_fraction(0.50)
         };
         assert_eq!(pressure_band(&mem_io), PressureBand::Critical);
-    }
 
-    #[test]
-    fn pressure_band_from_macos_level() {
         let cases = [
             (1u8, PressureBand::Ok),
             (2, PressureBand::Warn),
@@ -567,20 +561,14 @@ mod tests {
             };
             assert_eq!(pressure_band(&mem), expected, "macos level {level}");
         }
-    }
 
-    #[test]
-    fn pressure_band_takes_worst_of_inputs() {
         // Critical headroom must not be softened by a calm PSI reading.
         let mem = MemorySample {
             psi_mem_some_avg10: Some(1.0),
             ..sample_with_fraction(0.95)
         };
         assert_eq!(pressure_band(&mem), PressureBand::Critical);
-    }
 
-    #[test]
-    fn pressure_band_default_sample_is_ok() {
         assert_eq!(pressure_band(&MemorySample::default()), PressureBand::Ok);
     }
 

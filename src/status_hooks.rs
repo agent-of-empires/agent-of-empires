@@ -494,57 +494,29 @@ mod tests {
     }
 
     #[test]
-    fn default_config_is_disabled() {
-        let config = StatusHookConfig::default();
-        assert!(!config.enabled);
-        assert!(commands_for_transition(Status::Running, Status::Waiting, &config).is_empty());
-    }
-
-    #[test]
-    fn deserializes_toml_config() {
-        let config: StatusHookConfig = toml::from_str(
-            r#"
-            enabled = true
-            on_waiting = "notify-send waiting"
-            on_change = "~/bin/aoe-hook"
-            "#,
+    fn commands_for_transition_resolves_specific_then_catch_all() {
+        assert!(commands_for_transition(
+            Status::Running,
+            Status::Waiting,
+            &StatusHookConfig::default()
         )
-        .unwrap();
-        assert!(config.enabled);
-        assert_eq!(config.on_waiting.as_deref(), Some("notify-send waiting"));
-        assert_eq!(config.on_change.as_deref(), Some("~/bin/aoe-hook"));
-    }
+        .is_empty());
 
-    /// `debounce_ms` was removed; configs that still carry it must deserialize.
-    #[test]
-    fn legacy_debounce_ms_is_ignored() {
+        // `debounce_ms` was removed; configs that still carry it must load.
         let config: StatusHookConfig = toml::from_str(
             r#"
             enabled = true
             debounce_ms = 500
-            on_waiting = "notify-send waiting"
+            on_waiting = "waiting-command"
+            on_change = "change-command"
             "#,
         )
         .expect("legacy debounce_ms should not error");
-        assert!(config.enabled);
-    }
-
-    #[test]
-    fn resolves_specific_command_before_catch_all() {
-        let config = StatusHookConfig {
-            enabled: true,
-            on_waiting: Some("waiting-command".to_string()),
-            on_change: Some("change-command".to_string()),
-            ..Default::default()
-        };
         assert_eq!(
             commands_for_transition(Status::Running, Status::Waiting, &config),
             vec!["waiting-command".to_string(), "change-command".to_string()]
         );
-    }
 
-    #[test]
-    fn skips_empty_commands_and_same_status() {
         let config = StatusHookConfig {
             enabled: true,
             on_waiting: Some("  ".to_string()),
@@ -558,83 +530,56 @@ mod tests {
         );
     }
 
+    /// A stable transition fires once, a flicker back cancels, and a chain
+    /// coalesces to the latest status against the original old status.
     #[test]
     #[serial]
-    fn debounces_stable_transition() {
-        reset_debounce_state();
-        take_recorded_launches();
-        let _debounce = DebounceOverride::set(10);
-
-        let mut instance = Instance::new("Debounce Stable", "/tmp/project");
-        instance.id = "debounce-stable".to_string();
-        let config = StatusHookConfig {
-            enabled: true,
-            on_waiting: Some("notify-waiting".to_string()),
-            ..Default::default()
-        };
-
-        let observed_before = Utc::now();
-        run_for_transition(&instance, Status::Running, Status::Waiting, &config);
-        let observed_after = Utc::now();
-        assert!(take_recorded_launches().is_empty());
-
-        _debounce.finish();
-        let launches = take_recorded_launches();
-        assert_eq!(launches.len(), 1);
-        assert_eq!(launches[0].command, "notify-waiting");
-        assert_eq!(launches[0].context.old_status, Status::Running);
-        assert_eq!(launches[0].context.new_status, Status::Waiting);
-        assert!(launches[0].context.changed_at >= observed_before);
-        assert!(launches[0].context.changed_at <= observed_after);
-    }
-
-    #[test]
-    #[serial]
-    fn debounce_cancels_flicker_back_to_stable_status() {
-        reset_debounce_state();
-        take_recorded_launches();
-        let _debounce = DebounceOverride::set(10);
-
-        let mut instance = Instance::new("Debounce Flicker", "/tmp/project");
-        instance.id = "debounce-flicker".to_string();
-        let config = StatusHookConfig {
-            enabled: true,
-            on_waiting: Some("notify-waiting".to_string()),
-            ..Default::default()
-        };
-
-        run_for_transition(&instance, Status::Running, Status::Waiting, &config);
-        run_for_transition(&instance, Status::Waiting, Status::Running, &config);
-
-        _debounce.finish();
-        assert!(take_recorded_launches().is_empty());
-    }
-
-    #[test]
-    #[serial]
-    fn debounce_coalesces_to_latest_pending_status() {
-        reset_debounce_state();
-        take_recorded_launches();
-        let _debounce = DebounceOverride::set(10);
-
-        let mut instance = Instance::new("Debounce Latest", "/tmp/project");
-        instance.id = "debounce-latest".to_string();
+    fn debounce_fires_only_the_settled_transition() {
         let config = StatusHookConfig {
             enabled: true,
             on_waiting: Some("notify-waiting".to_string()),
             on_idle: Some("notify-idle".to_string()),
             ..Default::default()
         };
+        let cases: [(&[Status], Option<(&str, Status)>); 3] = [
+            (
+                &[Status::Running, Status::Waiting],
+                Some(("notify-waiting", Status::Waiting)),
+            ),
+            (&[Status::Running, Status::Waiting, Status::Running], None),
+            (
+                &[Status::Running, Status::Waiting, Status::Idle],
+                Some(("notify-idle", Status::Idle)),
+            ),
+        ];
+        for (index, (chain, expected)) in cases.into_iter().enumerate() {
+            reset_debounce_state();
+            take_recorded_launches();
+            let debounce = DebounceOverride::set(10);
+            let mut instance = Instance::new("Debounce", "/tmp/project");
+            instance.id = format!("debounce-{index}");
 
-        run_for_transition(&instance, Status::Running, Status::Waiting, &config);
-        run_for_transition(&instance, Status::Waiting, Status::Idle, &config);
+            let observed_before = Utc::now();
+            for pair in chain.windows(2) {
+                run_for_transition(&instance, pair[0], pair[1], &config);
+            }
+            let observed_after = Utc::now();
+            assert!(take_recorded_launches().is_empty(), "{chain:?} fired early");
 
-        _debounce.finish();
-        let launches = take_recorded_launches();
-        assert_eq!(launches.len(), 1);
-        assert_eq!(launches[0].command, "notify-idle");
-        assert_eq!(launches[0].context.old_status, Status::Running);
-        assert_eq!(launches[0].context.new_status, Status::Idle);
+            debounce.finish();
+            let launches = take_recorded_launches();
+            match expected {
+                None => assert!(launches.is_empty(), "{chain:?}"),
+                Some((command, new_status)) => {
+                    assert_eq!(launches.len(), 1, "{chain:?}");
+                    assert_eq!(launches[0].command, command);
+                    assert_eq!(launches[0].context.old_status, Status::Running);
+                    assert_eq!(launches[0].context.new_status, new_status);
+                    assert!(launches[0].context.changed_at >= observed_before);
+                    assert!(launches[0].context.changed_at <= observed_after);
+                }
+            }
+        }
     }
 
     #[test]

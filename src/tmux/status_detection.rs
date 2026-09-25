@@ -993,31 +993,82 @@ path: /workspace/secrets.env
         assert_all(
             detect_antigravity_status,
             Status::Idle,
-            &["file saved", "random output text"],
+            &[
+                "file saved",
+                "random output text",
+                "Running tests completed successfully.",
+                "Reading config.toml finished.",
+                "Editing src/session/instance.rs done.",
+                "Testing finished with success.",
+            ],
         );
-    }
-
-    #[test]
-    fn test_detect_cursor_status_idle_on_completed_activity_phrases() {
-        for content in [
-            "Running tests completed successfully.\n\n→ Add a follow-up",
-            "Reading config.toml finished.\n\n→ Add a follow-up",
-            "Editing src/app.rs done.\n\n→ Add a follow-up",
-            "Testing finished with success.\n\n→ Add a follow-up",
-        ] {
-            assert_eq!(detect_cursor_status(content), Status::Idle);
+        let completed = [
+            "Running tests completed successfully.",
+            "Reading config.toml finished.",
+            "Editing src/app.rs done.",
+            "Testing finished with success.",
+        ];
+        for tail in ["\n\n→ Add a follow-up", "\n  Composer 2.5"] {
+            for phrase in completed {
+                assert_eq!(
+                    detect_cursor_status(&format!("{phrase}{tail}")),
+                    Status::Idle,
+                    "{phrase}{tail}"
+                );
+            }
         }
-    }
+        assert_all(
+            detect_hermes_status,
+            Status::Waiting,
+            &[
+                "⚠️  DANGEROUS COMMAND: rm -rf /tmp\n[o]nce  |  [s]ession  |  [a]lways  |  [d]eny\nChoice [o/s/a/D]:",
+                "dangerous command detected\nproceed?",
+            ],
+        );
+        assert_all(
+            detect_omp_status,
+            Status::Idle,
+            &["plain command output", "", " \n\t\n"],
+        );
+        assert_all(
+            detect_vibe_status,
+            Status::Waiting,
+            &[
+                "↑↓ navigate  Enter select  ESC reject",
+                "⚠ bash command\nExecute this?",
+                "› Yes\n  Yes and always allow bash for this session\n  No and tell the agent",
+            ],
+        );
+        let padded = format!(
+            "✶ Working… (4s · ↓ 88 tokens)\n  esc to interrupt\n{}",
+            "\n".repeat(40)
+        );
+        assert_eq!(detect_claude_status(&padded), Status::Running);
 
-    #[test]
-    fn test_detect_cursor_status_idle_on_completed_activity_without_prompt() {
-        for content in [
-            "Running tests completed successfully.\n  Composer 2.5",
-            "Reading config.toml finished.\n  Composer 2.5",
-            "Editing src/app.rs done.\n  Composer 2.5",
-            "Testing finished with success.\n  Composer 2.5",
+        // ANSI is stripped before matching, including Claude 2.1.118's per-word colouring.
+        for (tool, pane, expected) in [
+            (
+                "claude",
+                "\x1b[38;5;174m✶\x1b[39m \x1b[38;5;180mWorking…\x1b[38;5;174m \x1b[38;5;246m(4s · ↓\x1b[39m \x1b[38;5;246m88 tokens)\x1b[39m\n\x1b[39m  \x1b[38;5;246mesc\x1b[39m \x1b[38;5;246mto\x1b[39m \x1b[38;5;246minterrupt\x1b[39m",
+                Status::Running,
+            ),
+            (
+                "opencode",
+                "\x1b[38;2;39;62;94m⬝⬝⬝⬝⬝⬝⬝⬝\x1b[0m  \x1b[38;2;238;238;238mesc \x1b[38;2;128;128;128minterrupt\x1b[0m",
+                Status::Running,
+            ),
+            (
+                "opencode",
+                "\x1b[38;2;255;255;255m⠋\x1b[0m generating",
+                Status::Running,
+            ),
+            ("unknown_tool", "Processing ⠋", Status::Idle),
         ] {
-            assert_eq!(detect_cursor_status(content), Status::Idle);
+            assert_eq!(
+                detect_status_from_content_in("", pane, tool),
+                expected,
+                "{tool}: {pane:?}"
+            );
         }
     }
 
@@ -1125,15 +1176,6 @@ path: /workspace/secrets.env
                 "{name}"
             );
         }
-    }
-
-    #[test]
-    fn test_detect_claude_status_finds_signal_above_blank_padding() {
-        let mut content = String::from("✶ Working… (4s · ↓ 88 tokens)\n  esc to interrupt\n");
-        for _ in 0..40 {
-            content.push('\n');
-        }
-        assert_eq!(detect_claude_status(&content), Status::Running);
     }
 
     /// Pane shape against the hook's last word, for Claude Code.
@@ -1380,6 +1422,20 @@ Do you want to proceed?\n\
   ⏸ plan mode on (shift+tab to cycle) · ← for agents",
             ],
         );
+
+        assert_eq!(
+            detect_via_manifest("claude", "", "", hook(Status::Waiting, None)),
+            Status::Waiting
+        );
+        assert_eq!(
+            detect_via_manifest(
+                "claude",
+                "Do you want to proceed?\n1. Yes",
+                "",
+                hook(Status::Idle, None)
+            ),
+            Status::Idle
+        );
     }
 
     /// Pane shape against the hook's last word, for Codex.
@@ -1612,22 +1668,62 @@ report the issue.
 "#,
             ],
         );
-    }
 
-    #[test]
-    fn test_reconcile_claude_hook_status_passes_non_running_through() {
+        let pane = r#"
+>> Code review started: staged changes <<
+
+<< Code review finished >>
+
+› Implement the review comment
+
+I’ll inspect the status detection path first and then adjust the idle override.
+"#;
+
         assert_eq!(
-            detect_via_manifest("claude", "", "", hook(Status::Waiting, None)),
-            Status::Waiting
+            detect_via_manifest("codex", pane, "", hook(Status::Running, secs(0))),
+            Status::Running
+        );
+
+        assert_eq!(
+            detect_via_manifest(
+                "codex",
+                "run this command? (y/n)",
+                "",
+                hook(Status::Running, secs(0))
+            ),
+            Status::Running
         );
         assert_eq!(
             detect_via_manifest(
-                "claude",
-                "Do you want to proceed?\n1. Yes",
+                "codex",
+                "› Write tests for @filename",
                 "",
-                hook(Status::Idle, None)
+                hook(Status::Running, secs(0))
             ),
-            Status::Idle
+            Status::Running
+        );
+        assert_eq!(
+            detect_via_manifest("codex", "file saved", "", hook(Status::Running, secs(0))),
+            Status::Running
+        );
+
+        let pane = "\
+  Question 1/1 (1 unanswered)
+  Pick one
+
+  › 1. Apple
+    2. Banana
+
+  tab to add notes | enter to submit answer | esc to interrupt
+";
+
+        assert_eq!(
+            detect_via_manifest("codex", pane, "", hook(Status::Waiting, secs(0))),
+            Status::Waiting
+        );
+        assert_eq!(
+            detect_via_manifest("codex", pane, "", hook(Status::Idle, secs(0))),
+            Status::Waiting
         );
     }
 
@@ -2246,40 +2342,6 @@ Do you want to proceed?\n\
     }
 
     #[test]
-    fn test_detect_claude_status_handles_v2_1_118_per_word_ansi() {
-        let ansi_running = "\x1b[38;5;174m✶\x1b[39m \x1b[38;5;180mWorking…\x1b[38;5;174m \x1b[38;5;246m(4s · ↓\x1b[39m \x1b[38;5;246m88 tokens)\x1b[39m\n\x1b[39m  \x1b[38;5;246mesc\x1b[39m \x1b[38;5;246mto\x1b[39m \x1b[38;5;246minterrupt\x1b[39m";
-        assert_eq!(
-            detect_status_from_content_in("", ansi_running, "claude"),
-            Status::Running,
-            "Per-word ANSI coloring must not prevent Running detection for Claude Code"
-        );
-    }
-
-    #[test]
-    fn test_detect_status_from_content_unknown_tool_returns_idle() {
-        let status = detect_status_from_content_in("", "Processing ⠋", "unknown_tool");
-        assert_eq!(status, Status::Idle);
-    }
-
-    #[test]
-    fn test_detect_status_strips_ansi_before_matching() {
-        let ansi_running =
-            "\x1b[38;2;39;62;94m⬝⬝⬝⬝⬝⬝⬝⬝\x1b[0m  \x1b[38;2;238;238;238mesc \x1b[38;2;128;128;128minterrupt\x1b[0m";
-        assert_eq!(
-            detect_status_from_content_in("", ansi_running, "opencode"),
-            Status::Running,
-            "ANSI codes around 'esc interrupt' should not prevent Running detection"
-        );
-
-        let ansi_spinner = "\x1b[38;2;255;255;255m⠋\x1b[0m generating";
-        assert_eq!(
-            detect_status_from_content_in("", ansi_spinner, "opencode"),
-            Status::Running,
-            "ANSI codes around spinner chars should not prevent Running detection"
-        );
-    }
-
-    #[test]
     fn test_detect_vibe_status_running() {
         assert_eq!(detect_vibe_status("processing ⠋"), Status::Running);
         assert_eq!(detect_vibe_status("⠹"), Status::Running);
@@ -2305,91 +2367,6 @@ Do you want to proceed?\n\
 
         assert_eq!(detect_vibe_status("Working…"), Status::Running);
         assert_eq!(detect_vibe_status("Loading..."), Status::Running);
-    }
-
-    #[test]
-    fn test_detect_vibe_status_waiting() {
-        assert_eq!(
-            detect_vibe_status("↑↓ navigate  Enter select  ESC reject"),
-            Status::Waiting
-        );
-        assert_eq!(
-            detect_vibe_status("⚠ bash command\nExecute this?"),
-            Status::Waiting
-        );
-        assert_eq!(
-            detect_vibe_status(
-                "› Yes\n  Yes and always allow bash for this session\n  No and tell the agent"
-            ),
-            Status::Waiting
-        );
-    }
-
-    #[test]
-    fn test_reconcile_codex_hook_status_keeps_running_after_completed_review_with_plain_new_output()
-    {
-        let pane = r#"
->> Code review started: staged changes <<
-
-<< Code review finished >>
-
-› Implement the review comment
-
-I’ll inspect the status detection path first and then adjust the idle override.
-"#;
-
-        assert_eq!(
-            detect_via_manifest("codex", pane, "", hook(Status::Running, secs(0))),
-            Status::Running
-        );
-    }
-
-    #[test]
-    fn test_reconcile_codex_hook_status_does_not_use_generic_pane_states() {
-        assert_eq!(
-            detect_via_manifest(
-                "codex",
-                "run this command? (y/n)",
-                "",
-                hook(Status::Running, secs(0))
-            ),
-            Status::Running
-        );
-        assert_eq!(
-            detect_via_manifest(
-                "codex",
-                "› Write tests for @filename",
-                "",
-                hook(Status::Running, secs(0))
-            ),
-            Status::Running
-        );
-        assert_eq!(
-            detect_via_manifest("codex", "file saved", "", hook(Status::Running, secs(0))),
-            Status::Running
-        );
-    }
-
-    #[test]
-    fn test_reconcile_codex_hook_status_only_overrides_running_hooks() {
-        let pane = "\
-  Question 1/1 (1 unanswered)
-  Pick one
-
-  › 1. Apple
-    2. Banana
-
-  tab to add notes | enter to submit answer | esc to interrupt
-";
-
-        assert_eq!(
-            detect_via_manifest("codex", pane, "", hook(Status::Waiting, secs(0))),
-            Status::Waiting
-        );
-        assert_eq!(
-            detect_via_manifest("codex", pane, "", hook(Status::Idle, secs(0))),
-            Status::Waiting
-        );
     }
 
     #[test]
@@ -2580,14 +2557,6 @@ Final prose line.\n";
             .expect("omp manifest");
         assert_eq!(detection.status, Some(Status::Idle));
         assert!(!detection.visible);
-    }
-
-    #[test]
-    fn test_detect_omp_status_idle_without_prompt() {
-        let panes = ["plain command output", "", " \n\t\n"];
-        for pane in panes {
-            assert_eq!(detect_omp_status(pane), Status::Idle, "case: {pane:?}");
-        }
     }
 
     #[test]
@@ -3477,32 +3446,6 @@ Final prose line.\n";
         ];
         for pane in &cases {
             assert_eq!(detect_omp_status(pane), Status::Idle, "case: {pane:?}");
-        }
-    }
-
-    #[test]
-    fn test_detect_hermes_status_waiting_on_approval() {
-        assert_eq!(
-            detect_hermes_status(
-                "⚠️  DANGEROUS COMMAND: rm -rf /tmp\n[o]nce  |  [s]ession  |  [a]lways  |  [d]eny\nChoice [o/s/a/D]:"
-            ),
-            Status::Waiting
-        );
-        assert_eq!(
-            detect_hermes_status("dangerous command detected\nproceed?"),
-            Status::Waiting
-        );
-    }
-
-    #[test]
-    fn test_detect_antigravity_status_idle_on_completed_activity_phrases() {
-        for content in [
-            "Running tests completed successfully.",
-            "Reading config.toml finished.",
-            "Editing src/session/instance.rs done.",
-            "Testing finished with success.",
-        ] {
-            assert_eq!(detect_antigravity_status(content), Status::Idle);
         }
     }
 }

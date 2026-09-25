@@ -707,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_tmux_state_maps_every_status() {
+    fn row_field_helpers() {
         assert_eq!(normalize_tmux_state(Status::Running), "running");
         assert_eq!(normalize_tmux_state(Status::Waiting), "waiting");
         assert_eq!(normalize_tmux_state(Status::Idle), "idle");
@@ -717,10 +717,6 @@ mod tests {
         assert_eq!(normalize_tmux_state(Status::Stopped), "dead");
         assert_eq!(normalize_tmux_state(Status::Error), "dead");
         assert_eq!(normalize_tmux_state(Status::Deleting), "dead");
-    }
-
-    #[test]
-    fn format_age_scales_units() {
         assert_eq!(format_age(None), "-");
         assert_eq!(format_age(Some(5)), "5s");
         assert_eq!(format_age(Some(59)), "59s");
@@ -729,10 +725,6 @@ mod tests {
         assert_eq!(format_age(Some(3600)), "1h");
         assert_eq!(format_age(Some(86399)), "23h");
         assert_eq!(format_age(Some(86400)), "1d");
-    }
-
-    #[test]
-    fn tmux_id_suffix_extracts_trailing_id() {
         assert_eq!(tmux_id_suffix("aoe_My_Session_abcd1234"), Some("abcd1234"));
         assert_eq!(tmux_id_suffix("aoe__abcd1234"), Some("abcd1234"));
         assert_eq!(tmux_id_suffix("nounderscore"), None);
@@ -885,10 +877,7 @@ mod tests {
         ] {
             assert!(table.contains(cell), "table missing {cell}: {table}");
         }
-    }
 
-    #[test]
-    fn session_cell_truncates_long_titles_and_drops_orphan_titles() {
         let cell = session_cell(&row(
             "abcd1234ef567890",
             "A very long session title that exceeds the budget",
@@ -956,6 +945,15 @@ mod tests {
             table.contains(&model_cell),
             "absent model renders as a dash cell of width {COL_MODEL}: {table}"
         );
+
+        let cases = [
+            ("1.9.5+gabc123", false, "1.9.5+gabc123"),
+            ("1.9.4+gdeadbe", true, "1.9.4+gdeadbe (stale)"),
+            ("", true, "<legacy> (stale)"),
+        ];
+        for (version, stale, expected) in cases {
+            assert_eq!(render_build_cell(version, stale), expected, "{version:?}");
+        }
     }
 
     #[test]
@@ -1020,18 +1018,6 @@ mod tests {
         assert_eq!(obj["substrate"], "acp");
         assert!(obj["last_attached_at"].is_null());
         assert!(obj["detached_at"].is_null());
-    }
-
-    #[test]
-    fn render_build_cell_cases() {
-        let cases = [
-            ("1.9.5+gabc123", false, "1.9.5+gabc123"),
-            ("1.9.4+gdeadbe", true, "1.9.4+gdeadbe (stale)"),
-            ("", true, "<legacy> (stale)"),
-        ];
-        for (version, stale, expected) in cases {
-            assert_eq!(render_build_cell(version, stale), expected, "{version:?}");
-        }
     }
 
     #[test]

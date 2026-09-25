@@ -237,15 +237,12 @@ mod tests {
     use super::{completion_refresh_hint, daemon_restart_hint};
 
     #[test]
-    fn hint_points_at_regen_and_eval_alternative() {
+    fn hints_name_their_recovery_commands() {
         let hint = completion_refresh_hint();
         assert!(hint.contains("aoe completion"));
         assert!(hint.contains("guides/shell-completions"));
         assert!(hint.to_lowercase().contains("eval"));
-    }
 
-    #[test]
-    fn daemon_hint_mentions_restart_and_respawn() {
         let hint = daemon_restart_hint();
         assert!(hint.contains("WARNING:"));
         assert!(hint.contains("aoe serve --restart"));

@@ -750,7 +750,7 @@ mod tests {
 
     #[tokio::test]
     #[serial(file_watch)]
-    async fn subscribe_channel_fires_on_real_write_and_demuxes() {
+    async fn subscribe_channel_demuxes_and_filters_real_writes() {
         let dir = TempDir::new().unwrap();
         let svc = FileWatchService::new().expect("init");
         let (mut rx_a, _ha) = svc.subscribe_channel(exact(dir.path(), "a"), 8).unwrap();
@@ -762,20 +762,9 @@ mod tests {
             .expect("channel open");
         assert_eq!(ev.path.file_name(), Some(OsStr::new("a")));
         assert_eq!(ev.source, EventSource::Kernel);
-        assert!(
-            timeout(NEG_WAIT, rx_b.recv()).await.is_err(),
-            "b subscription must not see a's event"
-        );
-    }
-
-    #[tokio::test]
-    #[serial(file_watch)]
-    async fn subscribe_channel_filters_tempfiles_and_unmatched_paths() {
-        let dir = TempDir::new().unwrap();
-        let svc = FileWatchService::new().expect("init");
         let tmp_path = dir.path().join("runtime_filter.tmp");
         let matcher = FileMatcher::AnyOf(vec![dir.path().join("runtime_filter"), tmp_path.clone()]);
-        let (mut rx, _h) = svc.subscribe_channel(spec(dir.path(), matcher), 8).unwrap();
+        let (mut rx_filtered, _hf) = svc.subscribe_channel(spec(dir.path(), matcher), 8).unwrap();
         for name in ["runtime_filter.tmp", "something-else"] {
             let processed = test_support::observe_kernel_path(&svc, &dir.path().join(name));
             write_file(dir.path(), name, "x");
@@ -785,8 +774,12 @@ mod tests {
                 .expect("observer remains live");
         }
         assert!(
-            timeout(NEG_WAIT, rx.recv()).await.is_err(),
+            timeout(NEG_WAIT, rx_filtered.recv()).await.is_err(),
             "tempfile and unmatched events must be filtered"
+        );
+        assert!(
+            rx_b.try_recv().is_err(),
+            "b subscription must not see a's event"
         );
     }
 
@@ -997,7 +990,7 @@ mod tests {
 
     #[tokio::test]
     #[serial(file_watch)]
-    async fn notify_local_change_delivers_local_first_and_tolerates_late_kernel_echo() {
+    async fn notify_local_change_delivers_local_first_under_debounce() {
         let dir = TempDir::new().unwrap();
         let svc = FileWatchService::new().expect("init");
         let target = write_file(dir.path(), "local-coalesce", "seed");
@@ -1018,10 +1011,6 @@ mod tests {
             .expect("channel open");
         assert_eq!(first.path.file_name(), target.file_name());
         assert_eq!(first.source, EventSource::Local);
-        if let Ok(Some(second)) = timeout(KERNEL_WAIT, rx.recv()).await {
-            assert_eq!(second.path.file_name(), target.file_name());
-            assert_eq!(second.source, EventSource::Kernel);
-        }
     }
 
     #[tokio::test]
