@@ -12,7 +12,6 @@ import {
   fetchSettings,
   getSettingsSchema,
   setDefaultProfile,
-  updateProfileSettings,
   updateSettings,
   updateTheme,
 } from "../lib/api";
@@ -375,7 +374,7 @@ export function SettingsView({
   const loadSettings = useCallback(() => {
     if (!selectedProfile) return;
     const seq = ++loadSeq.current;
-    fetchSettings(selectedProfile)
+    fetchSettings({ profile: selectedProfile })
       .then((s) => {
         if (seq !== loadSeq.current) return;
         if (s) setSettings(s);
@@ -397,7 +396,7 @@ export function SettingsView({
       setSaveError(null);
       const patch = { [section]: { [field]: value } };
       const saveGlobally = schema.some((d) => d.section === section && d.field === field && !d.profile_overridable);
-      const ok = saveGlobally ? await updateSettings(patch) : await updateProfileSettings(selectedProfile, patch);
+      const ok = await updateSettings(saveGlobally ? "machine" : { profile: selectedProfile }, patch);
       setSaving(false);
       if (!ok) {
         setSaveError("Failed to save, please try again");

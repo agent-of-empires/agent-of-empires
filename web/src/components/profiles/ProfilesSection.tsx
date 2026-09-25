@@ -8,7 +8,7 @@ import {
   getProfileSettings,
   renameProfile,
   setDefaultProfile,
-  updateProfileSettings,
+  updateSettings,
 } from "../../lib/api";
 import type { HooksOverride, ProfileInfo, ProfileSettingsResponse } from "../../lib/types";
 import { buildEffectiveHooks } from "../../lib/profileHooks";
@@ -57,7 +57,7 @@ export function ProfilesSection({ readOnly }: Props) {
       setError(err);
     };
     if (!name) return clear(null);
-    Promise.all([getProfileSettings(name), fetchSettings()])
+    Promise.all([getProfileSettings(name), fetchSettings("machine")])
       .then(([profile, global]) => {
         if (seq !== loadSeq.current) return;
         setProfileSettings(profile);
@@ -125,7 +125,7 @@ export function ProfilesSection({ readOnly }: Props) {
   const handleSaveDescription = async () => {
     setError(null);
     const trimmed = description.trim();
-    if (!(await updateProfileSettings(selected, { description: trimmed ? trimmed : null }))) {
+    if (!(await updateSettings({ profile: selected }, { description: trimmed ? trimmed : null }))) {
       return setError("Failed to save description");
     }
     descriptionDirty.current = false;

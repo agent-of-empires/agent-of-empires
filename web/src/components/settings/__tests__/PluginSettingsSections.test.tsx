@@ -89,7 +89,7 @@ describe("PluginSettingsSections", () => {
     render(<PluginSettingsSections schema={SCHEMA} settings={{ plugins: {} }} onSaved={onSaved} />);
     fireEvent.click(screen.getByRole("switch"));
     await waitFor(() => {
-      expect(updateSettings).toHaveBeenCalledWith({ "plugin:acme.kit": { enabled: false } });
+      expect(updateSettings).toHaveBeenCalledWith("machine", { "plugin:acme.kit": { enabled: false } });
     });
     expect(onSaved).toHaveBeenCalled();
   });

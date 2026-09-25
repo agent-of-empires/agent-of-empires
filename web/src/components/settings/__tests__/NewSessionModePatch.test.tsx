@@ -4,7 +4,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
-import { updateProfileSettings } from "../../../lib/api";
+import { updateSettings } from "../../../lib/api";
 import type { SettingsFieldDescriptor } from "../../../lib/types";
 import { SchemaSection } from "../SchemaSection";
 
@@ -50,7 +50,7 @@ describe("New Session Mode setting", () => {
         section="session"
         schema={[NEW_SESSION_MODE_FIELD]}
         values={{}}
-        onSaveField={(_section, field, value) => updateProfileSettings("main", { session: { [field]: value } })}
+        onSaveField={(_section, field, value) => updateSettings({ profile: "main" }, { session: { [field]: value } })}
       />,
     );
     await screen.findByText("New Session Mode");

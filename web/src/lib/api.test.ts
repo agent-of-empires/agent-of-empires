@@ -72,9 +72,18 @@ const requestCases: RequestCase[] = [
   ["GET /api/sessions/s1/diff/file?path=src%2Fa+b.ts", () => api.getSessionFileContents("s1", "src/a b.ts")],
   ["GET /api/sessions/s1/diff/file?path=a.ts&repo=myrepo", () => api.getSessionFileContents("s1", "a.ts", "myrepo")],
   ["GET /api/sessions/s1/file?path=a+b.ts", () => api.getSessionFile("s1", "a b.ts")],
-  ["GET /api/settings", () => api.fetchSettings()],
-  ["GET /api/settings?profile=my%20profile", () => api.fetchSettings("my profile")],
-  ["PATCH /api/settings", () => api.updateSettings({ a: 1 }), { body: { a: 1 }, result: true }],
+  ["GET /api/settings", () => api.fetchSettings("machine")],
+  ["GET /api/settings?profile=my%20profile", () => api.fetchSettings({ profile: "my profile" })],
+  ["PATCH /api/settings", () => api.updateSettings("machine", { a: 1 }), { body: { a: 1 }, result: true }],
+  [
+    "PATCH /api/profiles/p/settings",
+    () => {
+      // An unavailable schema defers the section guard to the server.
+      api.resetSettingsSchemaCache();
+      return api.updateSettings({ profile: "p" }, { description: "d" });
+    },
+    { respond: empty(503), body: { description: "d" } },
+  ],
   ["PATCH /api/theme", () => api.updateTheme({ name: "dracula" }), { body: { name: "dracula" }, result: true }],
   ["PATCH /api/theme", () => api.updateTheme({ color_mode: "palette" }), { body: { color_mode: "palette" } }],
   ["GET /api/app-state/web-ui-state", () => api.getWebUiState(), { respond: json({ k: "v" }), result: { k: "v" } }],
@@ -1027,7 +1036,7 @@ describe("profile settings write guard", () => {
   ])("refuses %s without sending", async (_name, updates) => {
     fetchSpy.mockResolvedValueOnce(json(schema));
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    expect(await api.updateProfileSettings("work", updates)).toBe(false);
+    expect(await api.updateSettings({ profile: "work" }, updates)).toBe(false);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(errSpy).toHaveBeenCalled();
     errSpy.mockRestore();
@@ -1035,14 +1044,14 @@ describe("profile settings write guard", () => {
 
   it("PATCHes an allowed section", async () => {
     fetchSpy.mockResolvedValueOnce(json(schema)).mockResolvedValueOnce(empty());
-    expect(await api.updateProfileSettings("work", { description: "mine" })).toBe(true);
+    expect(await api.updateSettings({ profile: "work" }, { description: "mine" })).toBe(true);
     expect(lastCall()).toMatchObject({ url: "/api/profiles/work/settings", init: { method: "PATCH" } });
     expect(bodyOf(lastCall().init)).toEqual({ description: "mine" });
   });
 
   it("defers to the server when the schema is unavailable", async () => {
     fetchSpy.mockResolvedValueOnce(empty(503)).mockResolvedValueOnce(empty());
-    expect(await api.updateProfileSettings("work", { hooks: {} })).toBe(true);
+    expect(await api.updateSettings({ profile: "work" }, { hooks: {} })).toBe(true);
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     expect(lastCall().url).toBe("/api/profiles/work/settings");
   });

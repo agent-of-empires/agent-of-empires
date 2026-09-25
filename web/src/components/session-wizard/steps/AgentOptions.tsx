@@ -120,7 +120,7 @@ export function AgentOptions({
       if (!profileName) return;
 
       try {
-        const settings = await fetchSettings(profileName);
+        const settings = await fetchSettings({ profile: profileName });
         if (settings) {
           onApplyProfileDefaults({
             ...profileDefaults(settings, "", data.tool),

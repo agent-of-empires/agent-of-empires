@@ -177,7 +177,7 @@ describe("SessionWizard last-project memory", () => {
     fetchSettings.mockResolvedValue({ sandbox: { enabled_by_default: true } });
     const { getByText } = renderWizard();
 
-    await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith(undefined));
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("machine"));
     await clickLaunch(getByText);
 
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));

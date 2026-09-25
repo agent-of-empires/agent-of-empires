@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchProfiles, fetchSettings, getSettingsSchema, updateProfileSettings, updateSettings } from "../lib/api";
+import { fetchSettings, getSettingsSchema, updateSettings, type SettingsScope } from "../lib/api";
+import { activeSettingsScope } from "../lib/appSettings";
 import { reportError, reportInfo } from "../lib/toastBus";
 import type { CommandAction } from "../components/command-palette/types";
 import type { SettingsFieldDescriptor } from "../lib/types";
@@ -19,7 +20,7 @@ function sectionToTab(section: string): string {
 export function useSettingsCommands({ open, readOnly, onOpenSettingsTab }: Args): CommandAction[] {
   const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
   const [values, setValues] = useState<Record<string, unknown>>({});
-  const [defaultProfile, setDefaultProfile] = useState("default");
+  const [activeScope, setActiveScope] = useState<SettingsScope>("machine");
   const [reloadNonce, setReloadNonce] = useState(0);
   const request = useMemo(() => ({ open, reloadNonce }), [open, reloadNonce]);
   const [loadedRequest, setLoadedRequest] = useState<typeof request | null>(null);
@@ -28,14 +29,13 @@ export function useSettingsCommands({ open, readOnly, onOpenSettingsTab }: Args)
     if (!request.open) return;
     let cancelled = false;
     void (async () => {
-      const [s, profiles] = await Promise.all([getSettingsSchema(), fetchProfiles()]);
+      const [s, scope] = await Promise.all([getSettingsSchema(), activeSettingsScope()]);
       if (cancelled) return;
       if (s) setSchema(s);
-      const profile = profiles.find((p) => p.is_default)?.name ?? "default";
-      const settings = await fetchSettings(profile);
+      const settings = await fetchSettings(scope);
       if (cancelled) return;
       if (settings) {
-        setDefaultProfile(profile);
+        setActiveScope(scope);
         setValues(settings as Record<string, unknown>);
         setLoadedRequest(request);
       }
@@ -66,25 +66,24 @@ export function useSettingsCommands({ open, readOnly, onOpenSettingsTab }: Args)
 
       if (inlineToggle) {
         const isOn = current === true;
-        const scope = f.profile_overridable ? defaultProfile : "Global";
+        const scope: SettingsScope = f.profile_overridable ? activeScope : "machine";
+        const scopeLabel = scope === "machine" ? "Global" : scope.profile;
         actions.push({
           id,
           title: f.label,
-          subtitle: `${isOn ? "On" : "Off"} · ${scope}`,
+          subtitle: `${isOn ? "On" : "Off"} · ${scopeLabel}`,
           group: "Settings",
           keywords,
           perform: () => {
             const next = !isOn;
             void (async () => {
               const patch = { [f.section]: { [f.field]: next } };
-              const ok = f.profile_overridable
-                ? await updateProfileSettings(defaultProfile, patch)
-                : await updateSettings(patch);
+              const ok = await updateSettings(scope, patch);
               if (!ok) {
                 reportError(`Failed to update ${f.label}`);
                 return;
               }
-              const where = f.profile_overridable ? ` (profile ${defaultProfile})` : "";
+              const where = scope === "machine" ? "" : ` (profile ${scope.profile})`;
               reportInfo(`${f.label} ${next ? "enabled" : "disabled"}${where}`);
               setReloadNonce((n) => n + 1);
             })();
@@ -103,5 +102,5 @@ export function useSettingsCommands({ open, readOnly, onOpenSettingsTab }: Args)
       });
     }
     return actions;
-  }, [schema, values, defaultProfile, readOnly, onOpenSettingsTab, loadedRequest, request]);
+  }, [schema, values, activeScope, readOnly, onOpenSettingsTab, loadedRequest, request]);
 }

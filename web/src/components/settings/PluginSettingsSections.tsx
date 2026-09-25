@@ -34,7 +34,7 @@ export function PluginSettingsSections({ schema, settings, onSaved }: Props) {
   if (sections.length === 0) return null;
 
   const save = async (section: string, field: string, value: unknown): Promise<boolean> => {
-    const ok = await updateSettings({ [section]: { [field]: value } });
+    const ok = await updateSettings("machine", { [section]: { [field]: value } });
     if (ok) onSaved();
     return ok;
   };

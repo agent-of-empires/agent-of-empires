@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { fetchSettings, fetchSounds, fetchSoundBlob } from "../lib/api";
+import { fetchSounds, fetchSoundBlob } from "../lib/api";
+import { fetchActiveSettings } from "../lib/appSettings";
 
 interface SoundSettings {
   enabled?: boolean;
@@ -36,7 +37,7 @@ async function loadSettings(): Promise<SoundSettings | null> {
   if (cachedSettings && now - cachedSettingsAt < SETTINGS_TTL_MS) {
     return cachedSettings;
   }
-  const data = await fetchSettings();
+  const data = await fetchActiveSettings();
   const sound = data?.sound as SoundSettings | undefined;
   cachedSettings = sound ?? null;
   cachedSettingsAt = now;

@@ -52,7 +52,7 @@ const THEME_SCHEMA = [
 ];
 
 const updateTheme = vi.fn(() => Promise.resolve(true));
-const updateProfileSettings = vi.fn(() => Promise.resolve(true));
+const updateSettings = vi.fn(() => Promise.resolve(true));
 
 vi.mock("../../lib/api", () => ({
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
@@ -63,7 +63,7 @@ vi.mock("../../lib/api", () => ({
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),
   deleteProfile: vi.fn(() => Promise.resolve(true)),
-  updateProfileSettings: (name: string, updates: Record<string, unknown>) => updateProfileSettings(name, updates),
+  updateSettings: (scope: unknown, updates: Record<string, unknown>) => updateSettings(scope, updates),
   updateTheme: (patch: Record<string, unknown>) => updateTheme(patch),
   fetchThemes: vi.fn(() => Promise.resolve(["empire", "dracula"])),
 }));
@@ -76,7 +76,7 @@ vi.mock("../../hooks/useResolvedTheme", () => ({
 afterEach(() => {
   cleanup();
   updateTheme.mockClear();
-  updateProfileSettings.mockClear();
+  updateSettings.mockClear();
   dispatchThemePickerChanged.mockClear();
 });
 
@@ -109,7 +109,7 @@ describe("SettingsView theme tab save routing", () => {
       target: { value: "dracula" },
     });
     await waitFor(() => expect(updateTheme).toHaveBeenCalledWith({ name: "dracula" }));
-    expect(updateProfileSettings).not.toHaveBeenCalled();
+    expect(updateSettings).not.toHaveBeenCalled();
   });
 
   it("writes color mode to /api/theme too", async () => {
@@ -119,7 +119,7 @@ describe("SettingsView theme tab save routing", () => {
       target: { value: "palette" },
     });
     await waitFor(() => expect(updateTheme).toHaveBeenCalledWith({ color_mode: "palette" }));
-    expect(updateProfileSettings).not.toHaveBeenCalled();
+    expect(updateSettings).not.toHaveBeenCalled();
   });
 
   // Ported from live settings-theme-color-mode.spec.ts.
@@ -151,9 +151,12 @@ describe("SettingsView theme tab save routing", () => {
     fireEvent.change(idle, { target: { value: "5" } });
     fireEvent.blur(idle);
     await waitFor(() =>
-      expect(updateProfileSettings).toHaveBeenCalledWith("main", {
-        theme: { idle_decay_minutes: 5 },
-      }),
+      expect(updateSettings).toHaveBeenCalledWith(
+        { profile: "main" },
+        {
+          theme: { idle_decay_minutes: 5 },
+        },
+      ),
     );
     expect(updateTheme).not.toHaveBeenCalled();
   });

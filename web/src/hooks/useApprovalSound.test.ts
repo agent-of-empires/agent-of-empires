@@ -3,12 +3,14 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 
-const fetchSettings = vi.fn();
+const fetchActiveSettings = vi.fn();
 const fetchSounds = vi.fn();
 const fetchSoundBlob = vi.fn();
 
+vi.mock("../lib/appSettings", () => ({
+  fetchActiveSettings: (...args: unknown[]) => fetchActiveSettings(...args),
+}));
 vi.mock("../lib/api", () => ({
-  fetchSettings: (...args: unknown[]) => fetchSettings(...args),
   fetchSounds: (...args: unknown[]) => fetchSounds(...args),
   fetchSoundBlob: (...args: unknown[]) => fetchSoundBlob(...args),
 }));
@@ -42,7 +44,7 @@ describe("useApprovalSound", () => {
     vi.useFakeTimers();
     audioInstances = [];
     playImpl = () => Promise.resolve();
-    fetchSettings.mockReset().mockResolvedValue({ sound: { enabled: true, volume: 1.0, on_approval: "ding" } });
+    fetchActiveSettings.mockReset().mockResolvedValue({ sound: { enabled: true, volume: 1.0, on_approval: "ding" } });
     fetchSounds.mockReset().mockResolvedValue(["ding", "chime"]);
     fetchSoundBlob.mockReset().mockResolvedValue(new Blob(["audio"], { type: "audio/wav" }));
     vi.stubGlobal("Audio", FakeAudio);
@@ -101,7 +103,7 @@ describe("useApprovalSound", () => {
     ],
     ["the blob fetch returns null", undefined, () => fetchSoundBlob.mockResolvedValue(null)],
   ])("stays silent when %s", async (_label, settings, arrange) => {
-    if (settings) fetchSettings.mockResolvedValue(settings);
+    if (settings) fetchActiveSettings.mockResolvedValue(settings);
     arrange?.();
     await walk(1);
     expect(audioInstances).toHaveLength(0);
@@ -111,14 +113,14 @@ describe("useApprovalSound", () => {
     ["mode.specific", { mode: { specific: "chime" } }],
     ["a random pick", { mode: "random" }],
   ])("resolves the sound from %s", async (_label, sound) => {
-    fetchSettings.mockResolvedValue({ sound: { enabled: true, ...sound } });
+    fetchActiveSettings.mockResolvedValue({ sound: { enabled: true, ...sound } });
     vi.spyOn(Math, "random").mockReturnValue(0.99);
     await walk(1);
     expect(fetchSoundBlob).toHaveBeenCalledWith("chime");
   });
 
   it.each([1.5, undefined])("clamps volume %s into the 0..1 audio range", async (volume) => {
-    fetchSettings.mockResolvedValue({ sound: { enabled: true, on_approval: "ding", volume } });
+    fetchActiveSettings.mockResolvedValue({ sound: { enabled: true, on_approval: "ding", volume } });
     await walk(1);
     expect(audioInstances[0]!.volume).toBe(1);
   });
@@ -132,7 +134,7 @@ describe("useApprovalSound", () => {
   it("caches settings and the blob URL across plays", async () => {
     await walk(1, 0, 1);
     expect(audioInstances).toHaveLength(2);
-    expect(fetchSettings).toHaveBeenCalledTimes(1);
+    expect(fetchActiveSettings).toHaveBeenCalledTimes(1);
     expect(fetchSoundBlob).toHaveBeenCalledTimes(1);
     expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
   });
@@ -148,7 +150,7 @@ describe("useApprovalSound", () => {
       rerender(count);
       await flushPlayback();
     }
-    expect(fetchSettings).toHaveBeenCalledTimes(2);
+    expect(fetchActiveSettings).toHaveBeenCalledTimes(2);
     expect(fetchSoundBlob).toHaveBeenCalledTimes(2);
   });
 });

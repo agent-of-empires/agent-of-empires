@@ -62,7 +62,6 @@ vi.mock("../../../lib/api", () => ({
   fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ tmux: {}, logging: {}, session: {}, sound: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(SCHEMA)),
-  updateProfileSettings: vi.fn(() => Promise.resolve(true)),
   updateSettings: vi.fn(() => Promise.resolve(true)),
   updateTheme: vi.fn(() => Promise.resolve(true)),
   fetchThemes: vi.fn(() => Promise.resolve([])),
@@ -128,11 +127,14 @@ describe("schema-driven settings field PATCH payloads", () => {
     for (const value of ["right", "left"]) {
       fireEvent.change(select, { target: { value } });
       await waitFor(() =>
-        expect(api.updateSettings).toHaveBeenLastCalledWith({ session: { sidebar_position: value } }),
+        expect(api.updateSettings).toHaveBeenLastCalledWith("machine", { session: { sidebar_position: value } }),
       );
       expect(select.value).toBe(value);
     }
-    expect(api.updateProfileSettings).not.toHaveBeenCalled();
+    expect(api.updateSettings).not.toHaveBeenCalledWith(
+      expect.objectContaining({ profile: expect.any(String) }),
+      expect.anything(),
+    );
 
     vi.mocked(api.updateSettings).mockResolvedValueOnce(false);
     fireEvent.change(select, { target: { value: "right" } });
@@ -149,11 +151,14 @@ describe("schema-driven settings field PATCH payloads", () => {
     await screen.findByText(label);
     fireEvent.change(selectByLabel(container, label), { target: { value } });
     if (tab === "logging") {
-      await waitFor(() => expect(api.updateSettings).toHaveBeenCalledWith(patch));
-      expect(api.updateProfileSettings).not.toHaveBeenCalled();
+      await waitFor(() => expect(api.updateSettings).toHaveBeenCalledWith("machine", patch));
+      expect(api.updateSettings).not.toHaveBeenCalledWith(
+        expect.objectContaining({ profile: expect.any(String) }),
+        expect.anything(),
+      );
     } else {
-      await waitFor(() => expect(api.updateProfileSettings).toHaveBeenCalledWith("main", patch));
-      expect(api.updateSettings).not.toHaveBeenCalled();
+      await waitFor(() => expect(api.updateSettings).toHaveBeenCalledWith({ profile: "main" }, patch));
+      expect(api.updateSettings).not.toHaveBeenCalledWith("machine", expect.anything());
     }
   });
 
@@ -172,12 +177,15 @@ describe("schema-driven settings field PATCH payloads", () => {
       target: { value: "disabled" },
     });
 
-    await waitFor(() => expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalled());
-    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      tmux: { status_bar: "disabled" },
-    });
+    await waitFor(() => expect(vi.mocked(api.updateSettings)).toHaveBeenCalled());
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+      { profile: "main" },
+      {
+        tmux: { status_bar: "disabled" },
+      },
+    );
     // No call carries the untouched `mouse` field.
-    for (const [, updates] of vi.mocked(api.updateProfileSettings).mock.calls) {
+    for (const [, updates] of vi.mocked(api.updateSettings).mock.calls) {
       expect((updates as { tmux?: Record<string, unknown> }).tmux).not.toHaveProperty("mouse");
     }
   });
@@ -189,9 +197,12 @@ describe("schema-driven settings field PATCH payloads", () => {
     commit(numberInputByLabel(container, "Snooze Duration (minutes)"), "12");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        session: { snooze_duration_minutes: 12 },
-      }),
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+        { profile: "main" },
+        {
+          session: { snooze_duration_minutes: 12 },
+        },
+      ),
     );
   });
 
@@ -219,7 +230,7 @@ describe("schema-driven settings field PATCH payloads", () => {
     commit(input, "120");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith("machine", {
         session: { session_id_poller_max_threads: 120 },
       }),
     );
@@ -232,9 +243,12 @@ describe("schema-driven settings field PATCH payloads", () => {
     clickToggle(container, "Enabled");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        sound: { enabled: true },
-      }),
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+        { profile: "main" },
+        {
+          sound: { enabled: true },
+        },
+      ),
     );
   });
 });

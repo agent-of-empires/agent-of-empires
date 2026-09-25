@@ -98,7 +98,7 @@ import { IdleDecayWindowContext, parseIdleDecayWindowMs } from "./lib/idleDecay"
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
 import { parseSessionRowTagMode, SessionRowTagContext, type SessionRowTagMode } from "./lib/sessionRowTag";
 import { parseSessionColorsEnabled, SessionColorsContext } from "./lib/sessionColors";
-import { fetchActiveProfileSettings } from "./lib/appSettings";
+import { fetchActiveSettings } from "./lib/appSettings";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
@@ -199,7 +199,7 @@ export default function App() {
   }, []);
 
   const refreshAppSettings = useCallback(async () => {
-    applyAppSettings(await fetchActiveProfileSettings());
+    applyAppSettings(await fetchActiveSettings());
   }, [applyAppSettings]);
 
   useEffect(() => {
@@ -2122,7 +2122,7 @@ function AppContent({
   const [tourSeenKnown, setTourSeenKnown] = useState(false);
 
   useEffect(() => {
-    fetchSettings().then((settings) => {
+    fetchSettings("machine").then((settings) => {
       // Fetch failed: leave the seen state unknown so the tour does not
       // auto-launch over an error/recovery screen. The menu trigger still works.
       if (!settings) return;

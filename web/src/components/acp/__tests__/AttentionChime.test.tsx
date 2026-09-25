@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render } from "@testing-library/react";
 
 vi.mock("../../../lib/api", () => ({
+  fetchProfiles: vi.fn(async () => []),
   fetchSettings: vi.fn(async () => ({
     sound: { enabled: true, volume: 1, on_approval: "approval" },
   })),
