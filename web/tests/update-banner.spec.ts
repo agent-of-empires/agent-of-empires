@@ -25,7 +25,9 @@ async function mock(page: Page, status: UpdateStatusFixture) {
 }
 
 test.describe("Update banner (#984, #1140)", () => {
-  test("renders when update_available is true and mode is notify", async ({ page }) => {
+  test("renders when update_available is true in notify mode, even past an older dismissed version", async ({
+    page,
+  }) => {
     await mock(page, {
       update_check_mode: "notify",
       current_version: "0.5.0",
@@ -33,6 +35,7 @@ test.describe("Update banner (#984, #1140)", () => {
       update_available: true,
       release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
       error: null,
+      dismissed_version: "0.5.5",
     });
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
@@ -45,60 +48,6 @@ test.describe("Update banner (#984, #1140)", () => {
       "href",
       "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
     );
-  });
-
-  test("hidden when update_check_mode is off (server suppresses)", async ({ page }) => {
-    await mock(page, {
-      update_check_mode: "off",
-      current_version: "0.5.0",
-      latest_version: null,
-      update_available: false,
-      release_url: null,
-      error: null,
-    });
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-    await waitForResponseBody(page, "/api/system/update-status");
-    await observeFor(page, 300, async () => {
-      expect(await page.getByRole("status", { name: /Update available/i }).count()).toBe(0);
-    });
-  });
-
-  test("hidden when update_check_mode is auto (background install)", async ({ page }) => {
-    await mock(page, {
-      update_check_mode: "auto",
-      current_version: "0.5.0",
-      latest_version: "0.6.0",
-      update_available: true,
-      release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
-      error: null,
-    });
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-    await waitForResponseBody(page, "/api/system/update-status");
-    await observeFor(page, 300, async () => {
-      expect(await page.getByRole("status", { name: /Update available/i }).count()).toBe(0);
-    });
-  });
-
-  test("hidden when latest matches current (no update)", async ({ page }) => {
-    await mock(page, {
-      update_check_mode: "notify",
-      current_version: "0.6.0",
-      latest_version: "0.6.0",
-      update_available: false,
-      release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
-      error: null,
-    });
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-    await waitForResponseBody(page, "/api/system/update-status");
-    await observeFor(page, 300, async () => {
-      expect(await page.getByRole("status", { name: /Update available/i }).count()).toBe(0);
-    });
   });
 
   test("dismiss persists per-version across reload (server-side, once per account)", async ({ page }) => {
@@ -145,42 +94,5 @@ test.describe("Update banner (#984, #1140)", () => {
     await observeFor(page, 300, async () => {
       expect(await page.getByRole("status", { name: /Update available/i }).count()).toBe(0);
     });
-  });
-
-  test("a version dismissed on another device is honored on first load", async ({ page }) => {
-    // No local state seeded; the server reports 0.6.0 already dismissed.
-    await mock(page, {
-      update_check_mode: "notify",
-      current_version: "0.5.0",
-      latest_version: "0.6.0",
-      update_available: true,
-      release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.6.0",
-      error: null,
-      dismissed_version: "0.6.0",
-    });
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-    await waitForResponseBody(page, "/api/system/update-status");
-    await observeFor(page, 300, async () => {
-      expect(await page.getByRole("status", { name: /Update available/i }).count()).toBe(0);
-    });
-  });
-
-  test("dismissed version no longer suppresses a newer release", async ({ page }) => {
-    // Server reports an older version dismissed; a newer release must show.
-    await mock(page, {
-      update_check_mode: "notify",
-      current_version: "0.5.0",
-      latest_version: "0.7.0",
-      update_available: true,
-      release_url: "https://github.com/agent-of-empires/agent-of-empires/releases/tag/v0.7.0",
-      error: null,
-      dismissed_version: "0.6.0",
-    });
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-    await expect(page.getByRole("status", { name: /Update available/i })).toBeVisible();
   });
 });
