@@ -575,11 +575,20 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
             assert!(repo
                 .find_branch("borrower", git2::BranchType::Local)
                 .is_err());
-            let rows = sdk.list_sessions(None).await.unwrap().sessions;
-            assert_eq!(
-                rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
-                vec![owner.id.as_str()]
-            );
+            // The refusal reaches the client before the rollback purge lands,
+            // so the row list converges rather than arriving with the error.
+            // Sampling it once passes on an idle machine and fails on a loaded
+            // runner.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let rows = loop {
+                let rows = sdk.list_sessions(None).await.unwrap().sessions;
+                let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+                if ids == [owner.id.clone()] || std::time::Instant::now() >= deadline {
+                    break ids;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            };
+            assert_eq!(rows, vec![owner.id.clone()], "{stage}");
             assert_eq!(
                 std::fs::read_to_string(marker).unwrap(),
                 "must survive the owner purge"
