@@ -153,11 +153,11 @@ pub(super) fn build_sandbox_docker_argv(
     let request_auth = config
         .provider_env
         .iter()
-        .filter(|&(key, _)| request_env_denyreason(key).is_none() && !is_host_only_path_env(key))
+        .filter(|&(key, _)| request_env_denyreason(key).is_none() && forwards_into_container(key))
         .cloned();
     let adapter_allowlist = allowlisted_env_pairs(config)
         .into_iter()
-        .filter(|(key, _)| !is_host_only_path_env(key));
+        .filter(|(key, _)| forwards_into_container(key));
     for (key, value) in request_auth.chain(adapter_allowlist) {
         if seen_keys.insert(key.clone()) {
             docker_args.push("-e".into());
@@ -177,6 +177,22 @@ pub(super) fn build_sandbox_docker_argv(
         docker_args,
         inherit_env,
     })
+}
+
+/// A path-valued key names nothing inside the container, so a sandboxed launch
+/// drops it. `docs/structured-view.md` documents the drop, so name the key and
+/// the reason in the log rather than losing it silently.
+fn forwards_into_container(key: &str) -> bool {
+    if !is_host_only_path_env(key) {
+        return true;
+    }
+    tracing::warn!(
+        target: "acp",
+        key = %key,
+        reason = "names a host path and nothing inside the container",
+        "dropping host-only path variable from a sandboxed launch"
+    );
+    false
 }
 
 /// The `cwd` for `session/new` / `session/load` / `session/fork`. A sandboxed
