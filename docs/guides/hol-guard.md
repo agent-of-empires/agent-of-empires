@@ -29,8 +29,8 @@ HOL Guard is configured through the agent's own integration. AoE continues to ma
 
 ## Sandboxed sessions
 
-AoE sandbox sessions run inside an isolated container and use a private per-session agent store. A HOL Guard installation on the host is not automatically available inside that container.
+AoE sandbox sessions run inside an isolated container and use a private per-session agent store. Before creating the sandbox, complete the Codex setup above; AoE copies Codex's `config.toml` and `hooks.json` into that store.
 
-For sandbox use, build a custom AoE sandbox image that includes Python, pipx, and HOL Guard, then configure Guard for the agent inside the sandbox environment. See [Container Sandbox](sandbox.md) for custom images and per-session agent stores.
+For sandbox use, build a custom AoE sandbox image that includes Python, pipx, and the `hol-guard` executable on `PATH`. The hook runs inside the container, so installing HOL Guard only on the host or only during image construction does not configure the mounted per-session store. See [Container Sandbox](sandbox.md) for custom images and per-session agent stores.
 
 AoE repository lifecycle hooks are separate from the agent integration used by HOL Guard.
