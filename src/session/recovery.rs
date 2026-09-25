@@ -405,38 +405,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_recently_restarted_includes_fresh_excludes_missing() {
+    fn recently_restarted_snapshot_and_gc_drop_expired_marks() {
         let map = new_recently_restarted();
-        mark_recently_restarted(&map, "abc");
-        let snap = snapshot_recently_restarted(&map);
-        assert!(snap.contains("abc"));
-        assert!(!snap.contains("other"));
-    }
-
-    #[test]
-    fn snapshot_recently_restarted_excludes_expired() {
-        let map = new_recently_restarted();
-        let stale = Instant::now() - RECENTLY_RESTARTED_TTL * 2;
-        {
-            let mut g = map.write().unwrap();
-            g.insert("stale".into(), stale);
-        }
+        map.write()
+            .unwrap()
+            .insert("stale".into(), Instant::now() - RECENTLY_RESTARTED_TTL * 2);
         mark_recently_restarted(&map, "fresh");
         let snap = snapshot_recently_restarted(&map);
-        assert!(!snap.contains("stale"));
         assert!(snap.contains("fresh"));
-    }
-
-    #[test]
-    fn recently_restarted_gc_removes_stale_entries() {
-        let map = new_recently_restarted();
-        let stale = Instant::now() - RECENTLY_RESTARTED_TTL * 3;
-        let fresh = Instant::now();
-        {
-            let mut g = map.write().unwrap();
-            g.insert("stale".into(), stale);
-            g.insert("fresh".into(), fresh);
-        }
+        assert!(!snap.contains("stale") && !snap.contains("other"));
+        assert!(
+            map.read().unwrap().contains_key("stale"),
+            "snapshot is read-only"
+        );
         gc_recently_restarted(&map);
         let g = map.read().unwrap();
         assert!(!g.contains_key("stale"));
@@ -586,9 +567,10 @@ mod tests {
     }
 
     #[test]
-    fn snoozed_instance_is_not_recovery_candidate_until_expiry() {
+    fn snoozed_or_probe_failed_instance_is_not_recovery_candidate_until_cleared() {
+        let sid = "22222222-2222-4222-8222-222222222222".to_string();
         let mut inst = Instance::new("snoozed", "/tmp/test");
-        inst.agent_session_id = Some("22222222-2222-4222-8222-222222222222".into());
+        inst.agent_session_id = Some(sid.clone());
         inst.snooze(30);
         assert!(
             !is_recovery_candidate(&inst),
@@ -599,6 +581,14 @@ mod tests {
             is_recovery_candidate(&inst),
             "expired snooze must restore recovery eligibility"
         );
+
+        inst.resume_probe_failed_sid = Some(sid);
+        assert!(
+            !is_recovery_candidate(&inst),
+            "startup recovery must not loop on an ambiguously failed resume sid"
+        );
+        inst.resume_probe_failed_sid = None;
+        assert!(is_recovery_candidate(&inst));
     }
 
     #[test]
@@ -805,42 +795,19 @@ mod tests {
     }
 
     #[test]
-    fn resume_probe_failed_sid_is_not_recovery_candidate_until_user_action_changes_state() {
-        let sid = "44444444-4444-4444-8444-444444444444".to_string();
-        let mut inst = Instance::new("resume-failed", "/tmp/test");
-        inst.agent_session_id = Some(sid.clone());
-        inst.resume_probe_failed_sid = Some(sid.clone());
-
-        assert!(
-            !is_recovery_candidate(&inst),
-            "startup recovery must not loop on an ambiguously failed resume sid"
-        );
-
-        inst.resume_probe_failed_sid = None;
-        assert!(
-            is_recovery_candidate(&inst),
-            "clearing the marker through an explicit path restores recovery eligibility"
-        );
-    }
-
-    #[test]
     fn recovery_lock_acquires_and_releases() {
         let temp = tempfile::TempDir::new().unwrap();
         let path = temp.path().join(".recovery.lock");
 
         let first = try_acquire_recovery_lock_at(&path).unwrap();
         assert!(first.is_some(), "acquisition should succeed");
+        assert!(try_acquire_recovery_lock_at(&path).unwrap().is_none());
         drop(first);
 
-        let mut second = try_acquire_recovery_lock_at(&path).unwrap();
-        for _ in 0..20 {
-            if second.is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-            second = try_acquire_recovery_lock_at(&path).unwrap();
-        }
-        assert!(second.is_some(), "re-acquisition after drop should succeed");
+        assert!(
+            try_acquire_recovery_lock_at(&path).unwrap().is_some(),
+            "re-acquisition after drop should succeed"
+        );
     }
 
     fn hook_timeout(cmd: &str, timeout_secs: u64) -> anyhow::Error {
@@ -851,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn format_recovery_last_error_classifies_a_hook_timeout_anywhere_in_the_chain() {
+    fn recovery_error_classifies_a_hook_timeout_anywhere_in_the_chain_and_stamps_it() {
         assert_eq!(
             format_recovery_last_error(&hook_timeout("sleep 60", 30)),
             "on_launch hook timed out after 30s: sleep 60",
@@ -867,15 +834,10 @@ mod tests {
             format_recovery_last_error(&anyhow::anyhow!("tmux session is gone")),
             "recovery cascade: tmux session is gone",
         );
-    }
 
-    #[test]
-    fn stamp_recovery_error_sets_error_status_and_operator_fields() {
         let mut inst = Instance::new("timeout", "/tmp/test");
         let before = std::time::Instant::now();
-
         stamp_recovery_error(&mut inst, &hook_timeout("sleep 60", 30));
-
         assert_eq!(inst.status, super::super::Status::Error);
         assert_eq!(
             inst.last_error.as_deref(),

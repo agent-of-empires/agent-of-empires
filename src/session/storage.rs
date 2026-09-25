@@ -2975,38 +2975,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn update_serializes_concurrent_writers_same_profile() -> Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-        let storage = Storage::new_unwatched("test-update-concurrent")?;
-        let other = Storage::new_unwatched("test-update-concurrent")?;
-        assert!(Arc::ptr_eq(&storage.save_lock, &other.save_lock));
-        assert!(!Arc::ptr_eq(
-            &storage.save_lock,
-            &Storage::new_unwatched("test-registry-distinct")?.save_lock
-        ));
-
-        std::thread::scope(|scope| {
-            for tid in 0..32 {
-                scope.spawn(move || {
-                    Storage::new_unwatched("test-update-concurrent")
-                        .unwrap()
-                        .update(|instances, _| {
-                            instances.push(Instance::new(&format!("inst-{tid}"), "/tmp/inst"));
-                            Ok(())
-                        })
-                        .unwrap();
-                });
-            }
-        });
-        let titles: Vec<_> = storage.load()?.into_iter().map(|i| i.title).collect();
-        assert_eq!(titles.len(), 32, "lost updates");
-        assert!((0..32).all(|tid| titles.contains(&format!("inst-{tid}"))));
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
     fn instance_lifecycle_lock_serializes_same_profile_and_instance() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());

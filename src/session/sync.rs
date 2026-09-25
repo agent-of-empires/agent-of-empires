@@ -1083,62 +1083,40 @@ mod tests {
 
     #[test]
     #[serial]
-    fn drain_filters_invalid_sid_and_leaves_state_unchanged() {
+    fn drain_filters_invalid_or_excluded_sid_and_leaves_state_unchanged() {
         let temp = tempdir().unwrap();
         let _guard = storage_home_guard(&temp);
-
-        let profile = "sync-filtered-validation";
-        let mut inst = Instance::new("sync-validation-title", "/tmp/x");
-        inst.source_profile = profile.to_string();
-        inst.agent_session_id = Some("original-sid".to_string());
-        seed_instance_on_disk(profile, &inst);
-
-        attach_poller_with_update(&mut inst, "bad sid!");
-
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
-
-        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
-        assert!(outcome.applied.is_empty());
-        assert!(outcome.rolled_back.is_empty());
-        assert_eq!(
-            instances[0].agent_session_id.as_deref(),
-            Some("original-sid")
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn drain_filters_sid_present_in_retroactive_capture_excludes() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-
-        let profile = "sync-filtered-excludes";
         let excluded = "019342ab-1234-7def-8901-abcdef012345";
+        for (profile, observed) in [
+            ("sync-filtered-validation", "bad sid!"),
+            ("sync-filtered-excludes", excluded),
+        ] {
+            let mut inst = Instance::new("sync-filtered-title", "/tmp/x");
+            inst.source_profile = profile.to_string();
+            inst.agent_session_id = Some("original-sid".to_string());
+            inst.retroactive_capture_excludes
+                .insert(crate::session::ConversationBinding::unknown(
+                    excluded.to_string(),
+                ));
+            seed_instance_on_disk(profile, &inst);
+            attach_poller_with_update(&mut inst, observed);
 
-        let mut inst = Instance::new("sync-excludes-title", "/tmp/x");
-        inst.source_profile = profile.to_string();
-        inst.agent_session_id = Some("original-sid".to_string());
-        inst.retroactive_capture_excludes
-            .insert(crate::session::ConversationBinding::unknown(
-                excluded.to_string(),
-            ));
-        seed_instance_on_disk(profile, &inst);
+            let file_watch = FileWatchService::noop();
+            let mut instances = vec![inst];
+            let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
 
-        attach_poller_with_update(&mut inst, excluded);
-
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
-
-        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
-        assert!(outcome.applied.is_empty());
-        assert!(outcome.rolled_back.is_empty());
-        assert_eq!(
-            instances[0].agent_session_id.as_deref(),
-            Some("original-sid")
-        );
+            assert_eq!(
+                outcome.filtered,
+                vec![instances[0].id.clone()],
+                "{observed}"
+            );
+            assert!(outcome.applied.is_empty());
+            assert!(outcome.rolled_back.is_empty());
+            assert_eq!(
+                instances[0].agent_session_id.as_deref(),
+                Some("original-sid")
+            );
+        }
     }
 
     #[test]

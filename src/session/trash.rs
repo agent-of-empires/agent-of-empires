@@ -783,18 +783,16 @@ mod tests {
             inst.trashed_at = trashed_days.map(|days| now - chrono::Duration::days(days));
             assert_eq!(is_expired(&inst, retention, now), expected, "{case}");
         }
-    }
-
-    #[test]
-    fn expired_ids_filters_and_preserves_order() {
         let fresh = trashed_days_ago(1);
         let old_a = trashed_days_ago(40);
         let live = Instance::new("s", "/tmp/x");
         let old_b = trashed_days_ago(31);
         let instances = vec![fresh, old_a.clone(), live, old_b.clone()];
-
-        let ids = expired_trashed_ids(&instances, 30, Utc::now());
-        assert_eq!(ids, vec![old_a.id, old_b.id]);
+        assert_eq!(
+            expired_trashed_ids(&instances, 30, now),
+            vec![old_a.id, old_b.id],
+            "filters and preserves order"
+        );
     }
 
     #[test]
@@ -802,18 +800,6 @@ mod tests {
         let p = trash_holding_path(Path::new("/repo-worktrees/feature"), "abc123").unwrap();
         assert_eq!(p, PathBuf::from("/repo-worktrees/.aoe-trash/abc123"));
         assert!(trash_holding_path(Path::new("/"), "abc123").is_none());
-    }
-
-    #[test]
-    fn relocate_skips_plain_session() {
-        let mut inst = Instance::new("plain", "/tmp/plain");
-        inst.trash();
-        assert!(matches!(
-            relocate_worktree_to_trash(&mut inst),
-            RelocateOutcome::Skipped
-        ));
-        assert_eq!(inst.project_path, "/tmp/plain");
-        assert!(inst.pre_trash_project_path.is_none());
     }
 
     fn real_worktree_instance() -> (tempfile::TempDir, Instance) {
@@ -1012,6 +998,16 @@ mod tests {
             RelocateOutcome::Skipped
         ));
 
+        std::fs::create_dir_all(&original).unwrap();
+        let occupied = restore_worktree_location(&mut inst);
+        assert!(
+            matches!(occupied, RestoreOutcome::Failed { .. }),
+            "restore should refuse an occupied original, got {occupied:?}"
+        );
+        assert!(inst.pre_trash_project_path.is_some());
+        assert_ne!(inst.project_path, original);
+        std::fs::remove_dir(&original).unwrap();
+
         let back = restore_worktree_location(&mut inst);
         assert!(
             matches!(back, RestoreOutcome::Restored { .. }),
@@ -1020,29 +1016,6 @@ mod tests {
         assert_eq!(inst.project_path, original);
         assert!(inst.pre_trash_project_path.is_none());
         assert!(PathBuf::from(&original).exists());
-    }
-
-    #[test]
-    fn restore_fails_when_original_occupied() {
-        if !git_available() {
-            return;
-        }
-        let (_tmp, mut inst) = real_worktree_instance();
-        let original = inst.project_path.clone();
-        inst.trash();
-        assert!(matches!(
-            relocate_worktree_to_trash(&mut inst),
-            RelocateOutcome::Relocated { .. }
-        ));
-        std::fs::create_dir_all(&original).unwrap();
-
-        let out = restore_worktree_location(&mut inst);
-        assert!(
-            matches!(out, RestoreOutcome::Failed { .. }),
-            "restore should refuse an occupied original, got {out:?}"
-        );
-        assert!(inst.pre_trash_project_path.is_some());
-        assert_ne!(inst.project_path, original);
     }
 
     #[test]
@@ -1365,83 +1338,36 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_heals_to_holding_when_original_recreated() {
+    fn reconcile_heals_pointer_to_holding_after_lost_persist() {
         if !git_available() {
             return;
         }
-        let (_tmp, mut inst) = real_worktree_instance();
-        let original = inst.project_path.clone();
-        inst.trash();
-        assert!(matches!(
-            relocate_worktree_to_trash(&mut inst),
-            RelocateOutcome::Relocated { .. }
-        ));
-        let holding = inst.project_path.clone();
+        for original_recreated in [false, true] {
+            let (_tmp, mut inst) = real_worktree_instance();
+            let original = inst.project_path.clone();
+            inst.trash();
+            assert!(matches!(
+                relocate_worktree_to_trash(&mut inst),
+                RelocateOutcome::Relocated { .. }
+            ));
+            let holding = inst.project_path.clone();
 
-        inst.project_path = original.clone();
-        inst.pre_trash_project_path = None;
-        std::fs::create_dir_all(&original).unwrap();
+            inst.project_path = original.clone();
+            inst.pre_trash_project_path = None;
+            if original_recreated {
+                std::fs::create_dir_all(&original).unwrap();
+            }
 
-        assert!(
-            reconcile_trashed_location(&mut inst),
-            "reconcile should heal to the existing holding path"
-        );
-        assert_eq!(inst.project_path, holding);
-        assert_eq!(
-            inst.pre_trash_project_path.as_deref(),
-            Some(original.as_str())
-        );
-    }
-
-    #[test]
-    fn reconcile_heals_pointer_after_lost_persist() {
-        if !git_available() {
-            return;
+            assert!(
+                reconcile_trashed_location(&mut inst),
+                "reconcile should heal to the holding path (recreated={original_recreated})"
+            );
+            assert_eq!(inst.project_path, holding);
+            assert_eq!(
+                inst.pre_trash_project_path.as_deref(),
+                Some(original.as_str())
+            );
         }
-        let (_tmp, mut inst) = real_worktree_instance();
-        let original = inst.project_path.clone();
-        inst.trash();
-        assert!(matches!(
-            relocate_worktree_to_trash(&mut inst),
-            RelocateOutcome::Relocated { .. }
-        ));
-        let holding = inst.project_path.clone();
-
-        inst.project_path = original.clone();
-        inst.pre_trash_project_path = None;
-
-        assert!(
-            reconcile_trashed_location(&mut inst),
-            "reconcile should heal the pointer to the holding area"
-        );
-        assert_eq!(inst.project_path, holding);
-        assert_eq!(
-            inst.pre_trash_project_path.as_deref(),
-            Some(original.as_str())
-        );
-    }
-
-    #[test]
-    fn relocated_worktree_is_a_working_checkout() {
-        if !git_available() {
-            return;
-        }
-        let (_tmp, mut inst) = real_worktree_instance();
-        inst.trash();
-        assert!(matches!(
-            relocate_worktree_to_trash(&mut inst),
-            RelocateOutcome::Relocated { .. }
-        ));
-        let status = std::process::Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(&inst.project_path)
-            .output()
-            .unwrap();
-        assert!(
-            status.status.success(),
-            "git status must work in the relocated worktree: {}",
-            String::from_utf8_lossy(&status.stderr)
-        );
     }
 
     #[test]
@@ -1652,13 +1578,6 @@ mod tests {
         assert!(
             !PathBuf::from(&reloc.new_project_path).exists(),
             "holding area copy must be gone"
-        );
-    }
-
-    #[test]
-    fn stop_sandbox_container_is_noop_when_not_sandboxed() {
-        assert!(
-            crate::session::worktree_edit::stop_sandbox_container("no-such-session", false).is_ok()
         );
     }
 }

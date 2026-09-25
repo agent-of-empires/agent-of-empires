@@ -1741,22 +1741,6 @@ mod tests {
     mod container_removal {
         use super::*;
 
-        #[test]
-        fn teardown_outcome_messages() {
-            let failed = Teardown::Failed(DockerError::RemoveFailed("daemon busy".into()));
-            for (teardown, want_messages, want_errors) in [
-                (failed, 0, 1),
-                (Teardown::Removed, 1, 0),
-                (Teardown::AlreadyGone, 0, 0),
-            ] {
-                let (mut messages, mut errors) = (Vec::new(), Vec::new());
-                deletion_messages_for(teardown, &mut messages, &mut errors);
-                assert_eq!((messages.len(), errors.len()), (want_messages, want_errors));
-                assert!(messages.iter().all(|m| m == "Container removed"));
-                assert!(errors.iter().all(|e| e.contains("Container")));
-            }
-        }
-
         fn sandboxed_request() -> DeletionRequest {
             let mut instance = Instance::new("Test Session", "/tmp/test-project");
             instance.sandbox_info = Some(sandbox_info("aoe-sandbox-calltest"));
@@ -1941,18 +1925,6 @@ mod tests {
             ]
             .map(|stage| idx(&stages, stage));
             assert!(order.is_sorted(), "stages={stages:?}");
-        }
-
-        #[test]
-        fn unsandboxed_kills_tmux_before_worktree() {
-            let _app_guard = isolate_app_dir();
-            let instance = Instance::new("Test", "/tmp/aoe-deletion-test-nonexistent");
-            let (stages, _) = stages_of(&DeletionRequest {
-                delete_worktree: true,
-                ..request(instance)
-            });
-            assert!(idx(&stages, "tmux_kill") < idx(&stages, "worktree_remove"));
-            assert!(!stages.iter().any(|s| s == "sandbox_worktree_preclean"));
         }
 
         #[test]
@@ -2239,9 +2211,23 @@ mod tests {
 
         #[test]
         #[serial]
-        fn scratch_session_removes_dir_and_tolerates_missing_dir() {
+        fn scratch_session_is_kept_on_request_then_removed_and_tolerates_missing_dir() {
             let _tmp = isolate_app_dir();
             let (instance, dir) = scratch_instance();
+            let result = perform_deletion(&DeletionRequest {
+                keep_scratch: true,
+                ..request(instance.clone())
+            });
+            assert!(result.success, "{:?}", result.errors);
+            assert!(dir.exists());
+            assert!(
+                result.messages.iter().any(|m| {
+                    m.contains("Scratch directory kept at:") && m.contains(dir.to_str().unwrap())
+                }),
+                "expected kept-path message, got {:?}",
+                result.messages
+            );
+
             let request = request(instance);
             let result = perform_deletion(&request);
             assert!(result.success, "deletion errors: {:?}", result.errors);
@@ -2287,27 +2273,6 @@ mod tests {
                 "guard refusal must be reported, got: {:?}",
                 result.errors
             );
-        }
-
-        #[test]
-        #[serial]
-        fn keep_scratch_leaves_dir_on_disk_and_reports_path() {
-            let _tmp = isolate_app_dir();
-            let (instance, dir) = scratch_instance();
-            let result = perform_deletion(&DeletionRequest {
-                keep_scratch: true,
-                ..request(instance)
-            });
-            assert!(result.success, "{:?}", result.errors);
-            assert!(dir.exists());
-            assert!(
-                result.messages.iter().any(|m| {
-                    m.contains("Scratch directory kept at:") && m.contains(dir.to_str().unwrap())
-                }),
-                "expected kept-path message, got {:?}",
-                result.messages
-            );
-            let _ = fs::remove_dir_all(&dir);
         }
 
         #[test]

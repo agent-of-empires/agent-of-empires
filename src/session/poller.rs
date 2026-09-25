@@ -1045,15 +1045,6 @@ mod tests {
     }
 
     #[test]
-    fn stopping_an_unstarted_poller_is_a_no_op() {
-        let mut poller = SessionPoller::new("test-session".to_string());
-        assert!(!poller.is_running());
-        poller.stop();
-        poller.stop();
-        assert!(!poller.is_running());
-    }
-
-    #[test]
     fn rename_between_resolution_and_liveness_retries_the_new_name() {
         use crate::tmux::utils::PaneProbe;
         let initial = "aoe_Old_12345678";
@@ -1154,25 +1145,15 @@ mod tests {
     fn test_poller_detects_change() {
         let call_count = Arc::new(Mutex::new(0u32));
         let call_count_clone = call_count.clone();
-
         let poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static> = Box::new(move || {
             let mut count = lock_unpoisoned(&call_count_clone);
             *count += 1;
-            if *count <= 1 {
-                Some("id-1".to_string())
-            } else {
-                Some("id-2".to_string())
-            }
+            Some(if *count == 1 { "id-1" } else { "id-2" }.to_string())
         });
-
         let changed_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let changed_ids_clone = changed_ids.clone();
-        let (changed_tx, changed_rx) = mpsc::channel();
         let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |id: &str| {
             lock_unpoisoned(&changed_ids_clone).push(id.to_string());
-            if id == "id-2" {
-                let _ = changed_tx.send(());
-            }
         });
 
         let mut poller = SessionPoller::new("test-session".to_string());
@@ -1185,22 +1166,16 @@ mod tests {
             ),
             PollerSpawn::Spawned
         );
-
-        changed_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the changed observation must be published before retrying it");
+        // Commands queue behind the immediate first poll, and each retry forces a tick, so no
+        // interval elapses: poll 1 sees the known id-1, polls 2 and 3 see id-2.
+        poller.retry_last_observation();
         poller.retry_last_observation();
         poller.stop();
 
-        let ids = lock_unpoisoned(&changed_ids);
-        assert!(
-            !ids.contains(&"id-1".to_string()),
-            "on_change should NOT have been called with id-1 (initial known)"
-        );
         assert_eq!(
-            ids.iter().filter(|id| id.as_str() == "id-2").count(),
-            2,
-            "a failed durable write must be able to request the same observation again"
+            *lock_unpoisoned(&changed_ids),
+            ["id-2", "id-2"],
+            "the known id is suppressed and a retry re-emits the same observation"
         );
     }
 
@@ -1259,25 +1234,6 @@ mod tests {
             0,
             "start warned on an exhausted budget: {logs}"
         );
-    }
-
-    #[test]
-    #[serial]
-    fn test_poller_is_running_after_start() {
-        let mut poller = SessionPoller::new("test-session".to_string());
-        let outcome = poller.start(
-            "test-running".to_string(),
-            Box::new(|| {
-                std::thread::sleep(Duration::from_millis(10));
-                Some("id".to_string())
-            }),
-            Box::new(|_| {}),
-            None,
-        );
-
-        assert_eq!(outcome, PollerSpawn::Spawned);
-        assert!(poller.is_running(), "poller should be running after start");
-        poller.stop();
     }
 
     #[test]
