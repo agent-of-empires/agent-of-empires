@@ -2249,43 +2249,32 @@ mod tests {
             );
         }
 
+        /// The scratch guard refuses a scratch row pointing outside the scratch root, and a
+        /// non-scratch row under the app dir is never treated as scratch.
         #[test]
         #[serial]
-        fn tampered_project_path_does_not_get_removed() {
+        fn scratch_cleanup_leaves_paths_outside_its_root_alone() {
             let _tmp = isolate_app_dir();
-            let bystander =
-                std::env::temp_dir().join(format!("important-data-{}", uuid::Uuid::new_v4()));
-            fs::create_dir(&bystander).expect("create bystander");
-            fs::write(bystander.join("file.txt"), b"keep me").unwrap();
+            let app_dir = crate::session::get_app_dir().unwrap();
+            for (scratch, parent) in [(true, std::env::temp_dir()), (false, app_dir)] {
+                let dir = parent.join(format!("aoe-scratch-guard-{}", uuid::Uuid::new_v4()));
+                fs::create_dir(&dir).unwrap();
+                fs::write(dir.join("file.txt"), b"keep me").unwrap();
 
-            let mut instance = Instance::new("Tampered", bystander.to_str().unwrap());
-            instance.scratch = true;
-            let result = perform_deletion(&request(instance));
+                let mut instance = Instance::new("Guarded", dir.to_str().unwrap());
+                instance.scratch = scratch;
+                let result = perform_deletion(&request(instance));
 
-            let survived = bystander.join("file.txt").exists();
-            let _ = fs::remove_dir_all(&bystander);
-            assert!(
-                survived,
-                "guard must refuse a path outside the scratch root"
-            );
-            assert!(
-                result.errors.iter().any(|e| e.contains("scratch guard")),
-                "guard refusal must be reported, got: {:?}",
-                result.errors
-            );
-        }
-
-        #[test]
-        #[serial]
-        fn non_scratch_session_under_app_dir_is_untouched() {
-            let _tmp = isolate_app_dir();
-            let dir = crate::session::get_app_dir()
-                .unwrap()
-                .join(format!("non-scratch-{}", uuid::Uuid::new_v4()));
-            fs::create_dir(&dir).expect("create non-scratch test dir");
-            let _ = perform_deletion(&request(Instance::new("Regular", dir.to_str().unwrap())));
-            assert!(dir.exists());
-            let _ = fs::remove_dir_all(&dir);
+                let survived = dir.join("file.txt").exists();
+                let _ = fs::remove_dir_all(&dir);
+                assert!(survived, "scratch={scratch}: {dir:?} must survive");
+                assert_eq!(
+                    result.errors.iter().any(|e| e.contains("scratch guard")),
+                    scratch,
+                    "scratch={scratch}: {:?}",
+                    result.errors
+                );
+            }
         }
     }
 }

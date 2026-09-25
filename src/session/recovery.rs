@@ -586,41 +586,66 @@ mod tests {
         }
     }
 
+    /// A live agent is detected by its sid in argv (#2994), or for a hook agent by the instance
+    /// marker plus its executable rather than the captured sid (#3678).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn orphaned_agent_process_alive_detects_live_agent_by_sid() {
-        let sid = format!("22222222-2222-4222-8222-{:012}", std::process::id());
-        let mut inst = Instance::new("orphan-sid", "/tmp/test");
-        inst.id = format!("orphansid{:012}", std::process::id());
-        inst.tool = "opencode".to_string();
-        inst.agent_session_id = Some(sid.clone());
-
-        let mut child = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg("sleep 30; true")
-            .arg(&sid)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn orphan-agent stand-in");
-
-        let mut detected = false;
-        for _ in 0..100 {
-            if orphaned_agent_process_alive(&inst) {
-                detected = true;
-                break;
+    fn orphaned_agent_process_alive_detects_a_live_agent() {
+        let bin = tempfile::tempdir().unwrap();
+        let agent = bin.path().join("claude");
+        std::fs::write(&agent, "#!/bin/sh\nsleep 10\n").unwrap();
+        // (tool, sid, found by the sid in argv rather than marker plus executable)
+        for (tool, sid, by_sid) in [
+            (
+                "opencode",
+                format!("22222222-2222-4222-8222-{:012}", std::process::id()),
+                true,
+            ),
+            (
+                "claude",
+                "66666666-7777-4888-8999-000000000000".to_string(),
+                false,
+            ),
+        ] {
+            // Reading another process's environment needs /proc.
+            if !by_sid && !cfg!(target_os = "linux") {
+                continue;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            let mut inst = Instance::new("orphan", "/tmp/test");
+            inst.id = format!("orphan{tool}{:012}", std::process::id());
+            inst.tool = tool.to_string();
+            inst.agent_session_id = Some(sid.clone());
+            let mut command = std::process::Command::new("/bin/sh");
+            if by_sid {
+                command.arg("-c").arg("sleep 30; true").arg(&sid);
+            } else {
+                command
+                    .arg(&agent)
+                    .env(crate::tmux::env::AOE_INSTANCE_ID_KEY, &inst.id);
+            }
+            let mut child = command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn orphan-agent stand-in");
+
+            let mut detected = false;
+            for _ in 0..100 {
+                if orphaned_agent_process_alive(&inst) {
+                    detected = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(
+                detected,
+                "{tool}: a live agent must be detected as an orphan"
+            );
         }
-
-        let _ = child.kill();
-        let _ = child.wait();
-
-        assert!(
-            detected,
-            "a live agent carrying the sid in argv must be detected as an orphan",
-        );
     }
 
     #[cfg(target_os = "linux")]
@@ -698,41 +723,6 @@ mod tests {
             executable.as_deref(),
             Some("claude-personal"),
             "the needle must be the token the wrapper's process really shows"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn orphaned_hook_agent_requires_env_and_executable_not_captured_sid() {
-        let mut inst = Instance::new("orphan-env-agent", "/tmp/test");
-        inst.id = format!("orphanboth{:012}", std::process::id());
-        inst.agent_session_id = Some("66666666-7777-4888-8999-000000000000".to_string());
-        let bin = tempfile::tempdir().unwrap();
-        let agent = bin.path().join("claude");
-        std::fs::write(&agent, "#!/bin/sh\nsleep 10\n").unwrap();
-        let mut child = std::process::Command::new("/bin/sh")
-            .arg(&agent)
-            .env(crate::tmux::env::AOE_INSTANCE_ID_KEY, &inst.id)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn orphan-agent stand-in");
-
-        let mut detected = false;
-        for _ in 0..100 {
-            if orphaned_agent_process_alive(&inst) {
-                detected = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        let _ = child.kill();
-        let _ = child.wait();
-        assert!(
-            detected,
-            "instance marker and executable must detect the live agent"
         );
     }
 

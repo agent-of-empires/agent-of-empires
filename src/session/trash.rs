@@ -1290,34 +1290,19 @@ mod tests {
         );
     }
 
+    /// A markerless row whose pointer was lost is healed to the holding path, whether or not
+    /// the original path was recreated; one already pointing at holding is left alone.
     #[test]
-    fn reconcile_skips_markerless_row_already_in_holding() {
+    fn reconcile_heals_a_markerless_pointer_to_holding_only_when_it_is_lost() {
         if !git_available() {
             return;
         }
-        let (_tmp, mut inst) = real_worktree_instance();
-        inst.trash();
-        assert!(matches!(
-            relocate_worktree_to_trash(&mut inst),
-            RelocateOutcome::Relocated { .. }
-        ));
-        let holding = inst.project_path.clone();
-        inst.pre_trash_project_path = None;
-
-        assert!(
-            !reconcile_trashed_location(&mut inst),
-            "a markerless row already in holding must be left alone"
-        );
-        assert_eq!(inst.project_path, holding);
-        assert!(!PathBuf::from(&holding).join(".aoe-trash").exists());
-    }
-
-    #[test]
-    fn reconcile_heals_pointer_to_holding_after_lost_persist() {
-        if !git_available() {
-            return;
-        }
-        for original_recreated in [false, true] {
+        // (pointer left at the original path, original recreated, healed)
+        for (lost, recreated, healed) in [
+            (false, false, false),
+            (true, false, true),
+            (true, true, true),
+        ] {
             let (_tmp, mut inst) = real_worktree_instance();
             let original = inst.project_path.clone();
             inst.trash();
@@ -1326,25 +1311,27 @@ mod tests {
                 RelocateOutcome::Relocated { .. }
             ));
             let holding = inst.project_path.clone();
-
-            inst.project_path = original.clone();
+            if lost {
+                inst.project_path = original.clone();
+            }
             inst.pre_trash_project_path = None;
-            if original_recreated {
+            if recreated {
                 std::fs::create_dir_all(&original).unwrap();
             }
 
-            assert!(
-                reconcile_trashed_location(&mut inst),
-                "reconcile should heal to the holding path (recreated={original_recreated})"
-            );
-            assert_eq!(inst.project_path, holding);
+            let case = format!("lost={lost} recreated={recreated}");
+            assert_eq!(reconcile_trashed_location(&mut inst), healed, "{case}");
+            assert_eq!(inst.project_path, holding, "{case}");
             assert_eq!(
                 inst.pre_trash_project_path.as_deref(),
-                Some(original.as_str())
+                healed.then_some(original.as_str()),
+                "{case}"
             );
+            if !healed {
+                assert!(!PathBuf::from(&holding).join(".aoe-trash").exists());
+            }
         }
     }
-
     #[test]
     fn purge_removes_relocated_worktree() {
         let _app_guard = crate::session::test_support::isolate_app_dir();
