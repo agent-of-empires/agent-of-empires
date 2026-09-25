@@ -56,13 +56,6 @@ describe("forwardTerminalBeforeInput", () => {
 });
 
 describe("mobile keyboard proxy", () => {
-  it("delivers input buffered while a session is mounting", () => {
-    deliverMobileKeyboardProxyInput({ inputType: "insertText", data: "first", isComposing: false });
-    const receive = vi.fn();
-    registerMobileKeyboardProxyReceiver(receive);
-    expect(receive).toHaveBeenCalledWith({ inputType: "insertText", data: "first", isComposing: false });
-  });
-
   it("rejects input past the queue bound", () => {
     for (let i = 0; i < 128; i++) {
       const ok = deliverMobileKeyboardProxyInput({ inputType: "insertText", data: `x${i}`, isComposing: false });

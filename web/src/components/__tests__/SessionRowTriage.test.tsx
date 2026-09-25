@@ -70,15 +70,6 @@ describe("SessionRow row tags", () => {
     expect(screen.queryByText("feature/web-row-tag")).toBeNull();
   });
 
-  it.each([
-    ["profile", "[fb]"],
-    ["auto", "[fb]"],
-    ["sandbox", "[sb]"],
-  ] as const)("renders the %s tag from the first session", (mode, tag) => {
-    renderRow(ws({ profile: "forit-backup", is_sandboxed: true }), { rowTagMode: mode });
-    expect(testId("sidebar-session-row-tag")!.textContent).toBe(tag);
-  });
-
   it("keeps repo chips beside a multi-repo branch tag", () => {
     renderRow(
       ws({

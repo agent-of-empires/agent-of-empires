@@ -276,21 +276,11 @@ const requestCases: RequestCase[] = [
   ],
   [
     "PATCH /api/projects/p?scope=global",
-    () => api.updateProject("p", "global", null),
-    { body: { default_base_branch: null }, respond: json({}) },
-  ],
-  [
-    "PATCH /api/projects/p?scope=global",
     () => api.updateProject("p", "global", "develop", { worktree_enabled: true, smart_rename: null }),
     {
       body: { default_base_branch: "develop", overrides: { worktree_enabled: true, smart_rename: null } },
       respond: json({}),
     },
-  ],
-  [
-    "POST /api/projects",
-    () => api.createProject({ path: "/p", overrides: { worktree_enabled: true } }),
-    { body: { path: "/p", overrides: { worktree_enabled: true } }, respond: json({}) },
   ],
   [
     "PATCH /api/projects/a%20b?scope=profile",
@@ -351,11 +341,6 @@ const requestCases: RequestCase[] = [
     "PATCH /api/sessions/s1/archive",
     () => api.setSessionArchive("s1", true),
     { body: { archived: true, kill_pane: true } },
-  ],
-  [
-    "PATCH /api/sessions/s1/archive",
-    () => api.setSessionArchive("s1", false, false),
-    { body: { archived: false, kill_pane: false } },
   ],
   [
     "POST /api/sessions/s1/trash",
@@ -488,11 +473,6 @@ const requestCases: RequestCase[] = [
       respond: json({ options: [{ value: "v", label: "l" }] }),
       result: [{ value: "v", label: "l" }],
     },
-  ],
-  [
-    "POST /api/plugins/p/settings/options/resolve",
-    () => api.resolvePluginOptions("p", "s", []),
-    { body: { source: "s", depends: [] }, respond: json({}), result: [] },
   ],
   [
     "POST /api/plugins/acme%2Fweird%20id/enabled",

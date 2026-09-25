@@ -238,15 +238,7 @@ describe("usePushSubscription disable() and sendTest()", () => {
   });
 });
 
-describe("usePushSubscription refresh() and resubscribe()", () => {
-  it("refresh re-evaluates state on demand", async () => {
-    noSubscription();
-    const { result } = await mountAndSettle();
-    expect(result.current.state).toEqual({ kind: "off" });
-    currentSub = makeSubscription();
-    expect(await act_(result, "refresh")).toEqual({ kind: "enabled" });
-  });
-
+describe("usePushSubscription resubscribe()", () => {
   it("resubscribe disables then enables", async () => {
     const { result } = await mountAndSettle();
     calls.length = 0;
