@@ -343,40 +343,40 @@ mod tests {
     }
 
     #[test]
-    fn aoe_owned_cwds_are_detected_for_worktrees_workspaces_and_scratch() {
-        {
-            assert_eq!(strip_placeholders("{repo-name}-worktrees"), "-worktrees");
-            assert_eq!(strip_placeholders("{branch}"), "");
-            assert_eq!(strip_placeholders(".."), "..");
-            let markers = vec!["-worktrees".to_string(), "-workspace-".to_string()];
-            assert!(cwd_under_worktree(
-                "/Users/me/aoe/agent-of-empires-worktrees/Saracens",
-                &markers
-            ));
-            assert!(cwd_under_worktree(
-                "/Users/me/aoe/agent-of-empires-worktrees/Saracens/sub",
-                &markers
-            ));
-            assert!(cwd_under_worktree(
-                "/Users/me/aoe/soft-close-grace-window-workspace-55406399",
-                &markers
-            ));
-            assert!(!cwd_under_worktree("/Users/me/projects/alpha", &markers));
-            assert!(!cwd_under_worktree("/Users/me/projects/alpha", &[]));
-        }
-        {
-            assert!(cwd_is_aoe_scratch(
-                "/Users/me/.agent-of-empires/scratch/5c8d250f60ec4328"
-            ));
-            assert!(cwd_is_aoe_scratch(
-                "/Users/me/.agent-of-empires-dev/scratch/abcd"
-            ));
-            assert!(cwd_is_aoe_scratch(
-                "/home/me/.config/agent-of-empires/scratch/abcd"
-            ));
-            assert!(!cwd_is_aoe_scratch("/Users/me/projects/scratch"));
-            assert!(!cwd_is_aoe_scratch("/Users/me/projects/alpha"));
-        }
+    fn cwd_under_worktree_matches_worktree_and_workspace_dirs() {
+        assert_eq!(strip_placeholders("{repo-name}-worktrees"), "-worktrees");
+        assert_eq!(strip_placeholders("{branch}"), "");
+        assert_eq!(strip_placeholders(".."), "..");
+        let markers = vec!["-worktrees".to_string(), "-workspace-".to_string()];
+        assert!(cwd_under_worktree(
+            "/Users/me/aoe/agent-of-empires-worktrees/Saracens",
+            &markers
+        ));
+        assert!(cwd_under_worktree(
+            "/Users/me/aoe/agent-of-empires-worktrees/Saracens/sub",
+            &markers
+        ));
+        assert!(cwd_under_worktree(
+            "/Users/me/aoe/soft-close-grace-window-workspace-55406399",
+            &markers
+        ));
+        assert!(!cwd_under_worktree("/Users/me/projects/alpha", &markers));
+        assert!(!cwd_under_worktree("/Users/me/projects/alpha", &[]));
+    }
+
+    #[test]
+    fn aoe_scratch_detected_in_both_namespaces() {
+        assert!(cwd_is_aoe_scratch(
+            "/Users/me/.agent-of-empires/scratch/5c8d250f60ec4328"
+        ));
+        assert!(cwd_is_aoe_scratch(
+            "/Users/me/.agent-of-empires-dev/scratch/abcd"
+        ));
+        assert!(cwd_is_aoe_scratch(
+            "/home/me/.config/agent-of-empires/scratch/abcd"
+        ));
+        assert!(!cwd_is_aoe_scratch("/Users/me/projects/scratch"));
+        assert!(!cwd_is_aoe_scratch("/Users/me/projects/alpha"));
     }
 
     fn summary(id: &str, cwd: &str) -> ClaudeSessionSummary {

@@ -159,14 +159,13 @@ mod tests {
     }
 
     #[test]
-    fn scan_parses_root_headers_and_skips_noise_and_hostile_entries() {
-        {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let sessions = tmp.path().join("sessions");
-            std::fs::create_dir(&sessions).unwrap();
-            assert!(scanned_ids(tmp.path()).is_empty());
-            write_prime_session(&sessions, "aaa.jsonl", "id-valid", "/tmp/proj");
-            for (name, content) in [
+    fn scan_parses_root_headers_and_skips_noise() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        assert!(scanned_ids(tmp.path()).is_empty());
+        write_prime_session(&sessions, "aaa.jsonl", "id-valid", "/tmp/proj");
+        for (name, content) in [
             ("bbb.jsonl", "{\"type\":\"model_change\",\"id\":\"x\"}\n".to_string()),
             ("ccc.jsonl", "not json at all\n".to_string()),
             ("ddd.jsonl", "{\"type\":\"session\",\"id\":\"id-nocwd\",\"rlmDepth\":0}\n".to_string()),
@@ -181,34 +180,34 @@ mod tests {
         ] {
             std::fs::write(sessions.join(name), content).unwrap();
         }
-            assert!(
-                scan_prime_agent_sessions(&tmp.path().join("nope"), Path::new("sessions"))
-                    .is_empty()
-            );
-            assert_eq!(scanned_ids(tmp.path()), vec!["id-valid"]);
+        assert!(
+            scan_prime_agent_sessions(&tmp.path().join("nope"), Path::new("sessions")).is_empty()
+        );
+        assert_eq!(scanned_ids(tmp.path()), vec!["id-valid"]);
 
-            for index in 0..=PRIME_AGENT_MAX_SESSION_FILES {
-                std::fs::write(sessions.join(format!("{index:04}.txt")), b"noise").unwrap();
-            }
-            assert!(scanned_ids(tmp.path()).is_empty());
+        for index in 0..=PRIME_AGENT_MAX_SESSION_FILES {
+            std::fs::write(sessions.join(format!("{index:04}.txt")), b"noise").unwrap();
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
+        assert!(scanned_ids(tmp.path()).is_empty());
+    }
 
-            let tmp = tempfile::TempDir::new().unwrap();
-            let sessions = tmp.path().join("sessions");
-            std::fs::create_dir(&sessions).unwrap();
-            super::super::test_support::make_fifo(&sessions.join("fifo.jsonl"));
-            let outside = tempfile::tempdir().unwrap();
-            let target = write_prime_session(outside.path(), "peer.jsonl", "peer-id", "/workspace");
-            symlink(&target, sessions.join("link.jsonl")).unwrap();
-            assert!(scanned_ids(tmp.path()).is_empty());
+    #[cfg(unix)]
+    #[test]
+    fn scan_rejects_fifo_symlinks_and_symlinked_directory() {
+        use std::os::unix::fs::symlink;
 
-            let store = tempfile::tempdir().unwrap();
-            symlink(outside.path(), store.path().join("sessions")).unwrap();
-            assert!(scanned_ids(store.path()).is_empty());
-        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        super::super::test_support::make_fifo(&sessions.join("fifo.jsonl"));
+        let outside = tempfile::tempdir().unwrap();
+        let target = write_prime_session(outside.path(), "peer.jsonl", "peer-id", "/workspace");
+        symlink(&target, sessions.join("link.jsonl")).unwrap();
+        assert!(scanned_ids(tmp.path()).is_empty());
+
+        let store = tempfile::tempdir().unwrap();
+        symlink(outside.path(), store.path().join("sessions")).unwrap();
+        assert!(scanned_ids(store.path()).is_empty());
     }
 
     #[test]
