@@ -24,24 +24,14 @@ afterEach(() => {
 });
 
 describe("getOrCreateDeviceBindingSecret", () => {
-  it("generates a 43-char base64url secret on first call and persists it", () => {
+  it("generates a base64url secret once, persists it, and rehydrates it after a cold cache", () => {
     const secret = getOrCreateDeviceBindingSecret();
     expect(secret).toMatch(/^[A-Za-z0-9_-]{43}=?$/);
     expect(window.localStorage.getItem(STORAGE_KEY)).toBe(secret);
-  });
-
-  it("returns the same value on subsequent calls (memoised)", () => {
-    const first = getOrCreateDeviceBindingSecret();
-    const second = getOrCreateDeviceBindingSecret();
-    expect(second).toBe(first);
-  });
-
-  it("hydrates from localStorage when the in-memory cache is cold", () => {
-    const first = getOrCreateDeviceBindingSecret();
+    expect(getOrCreateDeviceBindingSecret()).toBe(secret);
     __resetDeviceBindingForTests();
     expect(__getCachedDeviceBindingSecretForTests()).toBeNull();
-    const second = getOrCreateDeviceBindingSecret();
-    expect(second).toBe(first);
+    expect(getOrCreateDeviceBindingSecret()).toBe(secret);
   });
 
   it("regenerates on garbled stored value", () => {

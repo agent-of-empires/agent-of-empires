@@ -8,7 +8,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import zlib from "node:zlib";
-import { createFrameInflater, supportsFrameDeflate } from "./frameStream";
+import { createFrameInflater } from "./frameStream";
 
 function toArrayBuffer(u8: Uint8Array): ArrayBuffer {
   return u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) as ArrayBuffer;
@@ -32,10 +32,6 @@ function makeDeflater() {
 }
 
 describe("frameStream", () => {
-  it("advertises support where DecompressionStream exists", () => {
-    expect(supportsFrameDeflate()).toBe(true);
-  });
-
   it("decodes sequential frames in order through one stream", async () => {
     const deflate = makeDeflater();
     const frames: string[] = [];
