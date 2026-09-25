@@ -834,16 +834,32 @@ fn find_by_idempotency_key_matches_trashed_but_not_missing() {
 
 #[test]
 fn fork_from_builds_terminal_seed_for_claude() {
-    // A non-structured fork resolves through `terminal_fork_seed`; a claude
-    // parent id yields a Terminal seed with a fresh, valid child id.
-    let seed = resolve_create_fork_seed("claude", "parent-uuid", false)
+    let parent_binding = crate::session::ConversationBinding {
+        session_id: "parent-uuid".into(),
+        execution: Some(crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec!["/tmp/claude-store".into()],
+            configuration: Vec::new(),
+            exported_default_store: false,
+            cwd: "/tmp".into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        }),
+        provenance: crate::session::ConversationProvenance::Observed,
+        transcript_path: None,
+    };
+    let mut parent = crate::session::Instance::new("parent", "/tmp");
+    parent.agent_session_id = Some(parent_binding.session_id.clone());
+    parent.agent_session_binding = Some(parent_binding.clone());
+
+    let seed = resolve_create_fork_seed("parent-uuid", false, &[parent])
         .expect("claude terminal fork allowed");
     match seed {
         crate::session::ForkSeed::Terminal {
-            parent_agent_session_id,
+            parent,
             child_session_id,
         } => {
-            assert_eq!(parent_agent_session_id, "parent-uuid");
+            assert_eq!(*parent, parent_binding);
             assert!(crate::session::capture::is_valid_session_id(
                 &child_session_id
             ));
@@ -854,10 +870,7 @@ fn fork_from_builds_terminal_seed_for_claude() {
 
 #[test]
 fn fork_from_builds_structured_seed_when_view_is_structured() {
-    // A structured fork carries the parent's acp_session_id onto a Structured
-    // seed; the builder turns that into the one-shot fork_pending marker and the
-    // live session/fork handshake mints the child id.
-    let seed = resolve_create_fork_seed("claude", "parent-acp-id", true)
+    let seed = resolve_create_fork_seed("parent-acp-id", true, &[])
         .expect("structured fork seed is always allowed at create time");
     assert_eq!(
         seed,
@@ -2021,7 +2034,7 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
         live.omp_capture_generation.as_deref(),
         Some("omp-generation-restart")
     );
-    assert!(live.session_id_poller.is_some());
+    assert!(live.session_id_poller_is_running());
     assert_eq!(live.last_start_time, started.last_start_time);
 
     let mut generation_converged = before.clone();
@@ -2032,7 +2045,6 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
         generation_converged.agent_session_id.as_deref(),
         Some("peer-sid")
     );
-    assert!(generation_converged.session_id_poller.is_some());
 
     let mut peer_relaunched = before.clone();
     peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
@@ -2041,13 +2053,11 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
         peer_relaunched.omp_capture_generation.as_deref(),
         Some("peer-generation")
     );
-    assert!(std::sync::Arc::ptr_eq(
-        peer_relaunched
-            .session_id_poller
-            .as_ref()
-            .expect("running restart poller"),
-        &restarted_poller,
-    ));
+    let mut peer = before.clone();
+    peer.pi_session_path = Some("/peer/transcript.jsonl".into());
+    let expected = peer.conversation_state();
+    apply_post_restart_identity_sync(&mut peer, &before, &started);
+    assert_eq!(peer.conversation_state(), expected);
     restarted_poller
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2206,13 +2216,19 @@ fn restart_sync_rejects_an_older_lifecycle_generation() {
     let mut started = before.clone();
     started.status = Status::Error;
     started.agent_session_id = Some("stale-restart-sid".to_string());
-    started.retroactive_capture_excludes = ["stale-exclusion".to_string()].into();
+    started.retroactive_capture_excludes = [crate::session::ConversationBinding::unknown(
+        "stale-exclusion".to_string(),
+    )]
+    .into();
 
     let mut live = before.clone();
     live.lifecycle_generation = 5;
     live.status = Status::Running;
     live.agent_session_id = Some("newer-restart-sid".to_string());
-    live.retroactive_capture_excludes = ["newer-exclusion".to_string()].into();
+    live.retroactive_capture_excludes = [crate::session::ConversationBinding::unknown(
+        "newer-exclusion".to_string(),
+    )]
+    .into();
 
     assert!(!apply_post_restart_sync(&mut live, &before, &started));
     apply_cascade_state_sync(&mut live, &before, &started);
@@ -2222,7 +2238,10 @@ fn restart_sync_rejects_an_older_lifecycle_generation() {
     assert_eq!(live.agent_session_id.as_deref(), Some("newer-restart-sid"));
     assert_eq!(
         live.retroactive_capture_excludes,
-        ["newer-exclusion".to_string()].into()
+        [crate::session::ConversationBinding::unknown(
+            "newer-exclusion".to_string()
+        )]
+        .into()
     );
 }
 
@@ -2896,6 +2915,217 @@ async fn diff_file_rejects_workspace_with_no_repos() {
     .await
     .into_response();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// "Open file" in the diff list: the raw route serves the selected repo's
+/// current worktree bytes, typed so passive files render in the tab while
+/// scriptable or unrenderable ones download, and refuses whatever the confined
+/// reader refuses.
+mod diff_file_raw {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::extract::Query;
+    use axum::http::header;
+
+    fn state_for(inst: Instance, cityhall: bool) -> Arc<crate::server::AppState> {
+        if cityhall {
+            crate::server::test_support::build_test_app_state_cityhall(vec![inst])
+        } else {
+            crate::server::test_support::build_test_app_state(vec![inst])
+        }
+    }
+
+    fn single_repo(dir: &std::path::Path) -> Instance {
+        let mut inst = Instance::new("raw", dir.to_str().unwrap());
+        inst.id = "raw".to_string();
+        inst
+    }
+
+    async fn get(
+        state: &Arc<crate::server::AppState>,
+        id: &str,
+        path: &str,
+        repo: Option<&str>,
+    ) -> axum::response::Response {
+        session_diff_file_raw(
+            State(state.clone()),
+            Path(id.to_string()),
+            Query(FileDiffQuery {
+                path: path.to_string(),
+                repo: repo.map(str::to_string),
+            }),
+        )
+        .await
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn renders_passive_types_and_downloads_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        // (file name, bytes, Content-Type, Content-Disposition)
+        let cases: [(&str, &[u8], &str, Option<&str>); 10] = [
+            (
+                "report.pdf",
+                b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n",
+                "application/pdf",
+                None,
+            ),
+            ("shot.png", b"\x89PNG\r\n\x1a\n\0\0", "image/png", None),
+            ("notes.txt", b"hello\n", "text/plain; charset=utf-8", None),
+            // mime_guess calls `.ts` a video type; the text shows as text.
+            (
+                "main.ts",
+                b"export const a = 1;\n",
+                "text/plain; charset=utf-8",
+                None,
+            ),
+            (
+                "page.html",
+                b"<script>alert(1)</script>",
+                "application/octet-stream",
+                Some("attachment"),
+            ),
+            (
+                "d.svg",
+                b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+                "application/octet-stream",
+                Some("attachment"),
+            ),
+            (
+                "data.xml",
+                b"<a/>",
+                "application/octet-stream",
+                Some("attachment"),
+            ),
+            (
+                "feed.rss",
+                b"<rss/>",
+                "application/octet-stream",
+                Some("attachment"),
+            ),
+            (
+                "archive.zip",
+                b"PK\x03\x04\0\0",
+                "application/zip",
+                Some("attachment"),
+            ),
+            (
+                "blob.unknown",
+                b"\0\x01\x02",
+                "application/octet-stream",
+                Some("attachment"),
+            ),
+        ];
+        for (name, bytes, _, _) in cases {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        let state = state_for(single_repo(dir.path()), false);
+
+        for (name, bytes, content_type, disposition) in cases {
+            let resp = get(&state, "raw", name, None).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{name}");
+            let headers = resp.headers();
+            assert_eq!(
+                headers.get(header::CONTENT_TYPE).unwrap(),
+                content_type,
+                "{name}"
+            );
+            assert_eq!(
+                headers
+                    .get(header::CONTENT_DISPOSITION)
+                    .map(|v| v.to_str().unwrap()),
+                disposition,
+                "{name}"
+            );
+            assert_eq!(
+                headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+                "nosniff",
+                "{name}"
+            );
+            assert_eq!(
+                headers.get(header::CACHE_CONTROL).unwrap(),
+                "no-store",
+                "{name}"
+            );
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(&body[..], bytes, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_paths_the_confined_reader_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "KEY").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("link")).unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        let absolute = dir.path().join("a.txt");
+        let state = state_for(single_repo(dir.path()), false);
+
+        // (path, repo, status)
+        for (path, repo, status) in [
+            ("deleted.txt", None, StatusCode::NOT_FOUND),
+            ("../secret", None, StatusCode::BAD_REQUEST),
+            (absolute.to_str().unwrap(), None, StatusCode::BAD_REQUEST),
+            ("", None, StatusCode::BAD_REQUEST),
+            ("sub", None, StatusCode::BAD_REQUEST),
+            ("link", None, StatusCode::FORBIDDEN),
+            ("a.txt", Some("other"), StatusCode::BAD_REQUEST),
+        ] {
+            let resp = get(&state, "raw", path, repo).await;
+            assert_eq!(resp.status(), status, "path={path:?} repo={repo:?}");
+        }
+
+        assert_eq!(
+            get(&state, "missing", "a.txt", None).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        let cityhall = state_for(single_repo(dir.path()), true);
+        assert_eq!(
+            get(&cityhall, "raw", "a.txt", None).await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// Workspace members can share a relative path, so `?repo=` must pick the
+    /// worktree, and an omitted one means the first member.
+    #[tokio::test]
+    async fn reads_from_the_named_workspace_repo() {
+        let ws = tempfile::tempdir().unwrap();
+        let member = |name: &str| {
+            let worktree = ws.path().join(name);
+            std::fs::create_dir(&worktree).unwrap();
+            std::fs::write(worktree.join("same.txt"), name).unwrap();
+            crate::session::WorkspaceRepo {
+                name: name.to_string(),
+                source_path: format!("/src/{name}"),
+                branch: "feature/x".to_string(),
+                worktree_path: worktree.to_string_lossy().into_owned(),
+                main_repo_path: format!("/src/{name}"),
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
+            }
+        };
+        let mut inst = single_repo(ws.path());
+        inst.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "feature/x".to_string(),
+            workspace_dir: ws.path().to_string_lossy().into_owned(),
+            repos: vec![member("api"), member("web")],
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+        let state = state_for(inst, false);
+
+        for (repo, expected) in [(Some("web"), "web"), (Some("api"), "api"), (None, "api")] {
+            let resp = get(&state, "raw", "same.txt", repo).await;
+            assert_eq!(resp.status(), StatusCode::OK, "repo={repo:?}");
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(&body[..], expected.as_bytes(), "repo={repo:?}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -3576,4 +3806,135 @@ async fn list_sessions_applies_project_smart_rename_override_to_worktree_session
         .map(|s| s["smart_rename"].as_str().unwrap())
         .collect();
     assert_eq!(states, ["inactive", "inactive", "pending"]);
+}
+
+/// #4084 review: deleting one session of a shared managed worktree, through
+/// either delete endpoint, removes that record but keeps the worktree and
+/// branch a surviving session still works in. A dirty worktree kept this way
+/// does not block the delete (#4108); one nothing keeps still does.
+#[tokio::test]
+#[serial_test::serial]
+async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
+    use axum::body::to_bytes;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    // (workspace endpoint, dirty, survivor also selected)
+    for (workspace_endpoint, dirty, both_selected) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, true, true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        let main_repo = tmp.path().join("main");
+        let checkout = tmp.path().join("shared");
+        std::fs::create_dir_all(&main_repo).unwrap();
+        git(&main_repo, &["init", "-b", "main"]);
+        git(&main_repo, &["commit", "--allow-empty", "-m", "init"]);
+        git(
+            &main_repo,
+            &["worktree", "add", "-b", "feat", checkout.to_str().unwrap()],
+        );
+
+        let profile = "shared-worktree-4084";
+        let mk = |title: &str, managed: bool| {
+            let mut inst = Instance::new(title, checkout.to_str().unwrap());
+            inst.source_profile = profile.to_string();
+            let mut info = worktree("feat", main_repo.to_string_lossy(), None);
+            info.managed_by_aoe = managed;
+            inst.worktree_info = Some(info);
+            inst
+        };
+        let owner = mk("owner", true);
+        let survivor = mk("survivor", false);
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances.extend([owner.clone(), survivor.clone()]);
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![
+            owner.clone(),
+            survivor.clone(),
+        ]);
+        if dirty {
+            std::fs::write(checkout.join("wip.txt"), "unsaved").unwrap();
+        }
+        let mut session_ids = vec![owner.id.clone()];
+        if both_selected {
+            session_ids.push(survivor.id.clone());
+        }
+
+        let resp = if workspace_endpoint {
+            delete_workspace(
+                State(state.clone()),
+                Some(Json(DeleteWorkspaceBody {
+                    session_ids,
+                    delete_worktree: true,
+                    delete_branch: true,
+                    ..Default::default()
+                })),
+            )
+            .await
+            .into_response()
+        } else {
+            delete_session(
+                State(state.clone()),
+                Path(owner.id.clone()),
+                Some(Json(DeleteSessionBody {
+                    delete_worktree: true,
+                    delete_branch: true,
+                    ..Default::default()
+                })),
+            )
+            .await
+            .into_response()
+        };
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let case = format!("endpoint {workspace_endpoint}, dirty {dirty}: {body}");
+        if both_selected {
+            assert_eq!(status, StatusCode::CONFLICT, "{case}");
+            assert_eq!(body["error"], "dirty_worktree", "{case}");
+            assert_eq!(storage.load().unwrap().len(), 2, "{case}");
+            continue;
+        }
+        assert_eq!(status, StatusCode::OK, "{case}");
+        assert!(
+            body["messages"].to_string().contains("another session"),
+            "the kept worktree must be reported: {body}"
+        );
+
+        assert!(
+            checkout.join(".git").exists(),
+            "shared worktree was removed: {case}"
+        );
+        assert_eq!(checkout.join("wip.txt").exists(), dirty, "{case}");
+        let branches = std::process::Command::new("git")
+            .args(["branch", "--list", "feat"])
+            .current_dir(&main_repo)
+            .output()
+            .unwrap();
+        assert!(!branches.stdout.is_empty(), "shared branch was deleted");
+        let stored: Vec<String> = storage.load().unwrap().into_iter().map(|i| i.id).collect();
+        assert_eq!(stored, vec![survivor.id.clone()]);
+        assert!(state
+            .instances
+            .read()
+            .await
+            .iter()
+            .all(|i| i.id != owner.id));
+    }
 }

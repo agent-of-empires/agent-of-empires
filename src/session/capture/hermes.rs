@@ -166,7 +166,8 @@ pub(crate) fn hermes_poll_fn_sandboxed_store(
     container_cwd: String,
     instance_id: String,
     capture_floor: SystemTime,
-    extra_excludes: HashSet<String>,
+    extra_excludes: HashSet<crate::session::ConversationBinding>,
+    source: Option<crate::session::ExecutionBinding>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     let started_after = capture_floor
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -181,7 +182,7 @@ pub(crate) fn hermes_poll_fn_sandboxed_store(
         let scan =
             read_hermes_sessions_from_sqlite(&root.path().join(db_relative), Some(started_after))
                 .ok()?;
-        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes, source.as_ref());
         select_hermes_session_id(&scan, &container_cwd, &exclusion)
             .ok()
             .and_then(super::validated_session_id)
@@ -202,6 +203,7 @@ mod tests {
             "current".to_string(),
             capture_floor(floor),
             HashSet::new(),
+            None,
         )
     }
 

@@ -344,3 +344,7 @@ export function configOptionsUpdated(options: unknown[]) {
 export function configOptionSwitchFailed(config_id: string, value: string, reason: string) {
   return { ConfigOptionSwitchFailed: { config_id, value, reason } };
 }
+
+export function usageUpdated(usage: { used: number; size: number; cost: { amount: number; currency: string } | null }) {
+  return { UsageUpdated: { usage } };
+}

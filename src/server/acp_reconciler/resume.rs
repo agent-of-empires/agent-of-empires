@@ -15,14 +15,14 @@ use crate::process::worker_registry;
 use crate::server::session_service::SessionService;
 use crate::session::Instance;
 
-/// A structured view session that needs a worker, snapshotted so resume tasks
-/// need not hold the instances lock.
+/// A structured view session that needs a worker, snapshotted at the tick so
+/// resume tasks need not re-scan the instance list. Anything that a later pick
+/// can change is re-read in `build_spawn_request`, not carried here.
 #[derive(Clone)]
 pub(super) struct ResumeTarget {
     pub(super) id: String,
     tool: String,
     agent_override: Option<String>,
-    model: Option<String>,
     pub(super) project_path: String,
     stored_acp_session_id: Option<String>,
     source_profile: String,
@@ -38,7 +38,6 @@ impl ResumeTarget {
             id: inst.id.clone(),
             tool: inst.tool.clone(),
             agent_override: inst.agent_name.clone(),
-            model: inst.agent_model.clone(),
             project_path: inst.project_path.clone(),
             stored_acp_session_id: inst.acp_session_id.clone(),
             source_profile: inst.source_profile.clone(),
@@ -314,10 +313,20 @@ async fn build_spawn_request(
 ) -> Result<SpawnRequest, ()> {
     let supervisor = &service.acp_supervisor;
     let inst_lock = service.instance_lock(&target.id).await;
-    // Re-read under the session lock: a worktree rename holds it across the
-    // move, so a snapshotted path could be stale (#2260). Released before
-    // ensure_container, which takes the same lock.
-    let (cwd, seed_history_replay, fork_from, acp_mode_id, acp_effort) = {
+    // Re-read under the session lock, for two reasons. A worktree rename holds
+    // it across the move, so a snapshotted path could be stale (#2260); and the
+    // persisted selectors can be re-picked after the tick snapshotted
+    // this target, which the handshake then re-asserts at the agent. Released
+    // before ensure_container, which takes the same lock.
+    let (
+        cwd,
+        seed_history_replay,
+        fork_from,
+        acp_mode_id,
+        acp_effort,
+        agent_model,
+        claude_store_pin,
+    ) = {
         let _guard = inst_lock.lock().await;
         let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
@@ -329,6 +338,9 @@ async fn build_spawn_request(
             inst.fork_pending.clone(),
             inst.acp_mode_id.clone(),
             inst.acp_effort.clone(),
+            inst.agent_model.clone(),
+            inst.selected_claude_conversation()
+                .and_then(|(_, execution)| crate::session::capture::ClaudeStorePin::of(execution)),
         )
     };
     let agent = supervisor
@@ -363,18 +375,20 @@ async fn build_spawn_request(
         cwd,
         additional_dirs: vec![],
         provider_env: vec![],
-        model: target.model.clone(),
+        model: agent_model,
         // `acp_effort` only holds a user-set effort, so presence is its provenance.
         effort_explicit: acp_effort.is_some(),
         effort: acp_effort,
         stored_acp_session_id: target.stored_acp_session_id.clone(),
         fork_from,
+        sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
         sandbox_info,
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,
         acp_mode_id,
         agent_command_override: command_override_for_spawn(&target.tool, &target.command),
         seed_history_replay,
+        claude_store_pin,
     })
 }
 
@@ -449,8 +463,13 @@ pub(crate) async fn trigger_resume_background(
                 return;
             };
             let agent = req.agent.clone();
-            if let Err(e) = service.acp_supervisor.spawn_inner(req, reservation).await {
-                report_spawn_failure(&service, &target.id, &agent, &e).await;
+            match service.acp_supervisor.spawn_inner(req, reservation).await {
+                // The supervisor already parked the session; a startup error would bury it,
+                // and a prompt into a live limit lands here by design now that one can wake a
+                // parked session. Same exemption `resume_one` makes.
+                Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::RateLimited(_)))
+                | Ok(()) => {}
+                Err(e) => report_spawn_failure(&service, &target.id, &agent, &e).await,
             }
         },
     );
@@ -528,6 +547,23 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(req.effort, None);
+
+        // The model too: a pick landing after the tick snapshotted its targets
+        // must reach the worker the tick is about to start. The handshake
+        // re-asserts whatever the request carries, so a snapshot read here does
+        // not merely miss the pick, it pushes the replaced value at the agent.
+        state
+            .instances
+            .write()
+            .await
+            .iter_mut()
+            .find(|i| i.id == "sess-moved")
+            .expect("fixture")
+            .agent_model = Some("claude-opus-5".to_string());
+        let req = build_spawn_request(&state.session_service, &target)
+            .await
+            .unwrap();
+        assert_eq!(req.model.as_deref(), Some("claude-opus-5"));
     }
 
     /// A live stale worker must never be classified dead, which would lose its PID.

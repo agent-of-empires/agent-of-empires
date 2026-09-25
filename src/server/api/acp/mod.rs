@@ -111,6 +111,7 @@ fn spawn_request_for(
         effort_explicit: instance.acp_effort.is_some(),
         stored_acp_session_id: instance.acp_session_id.clone(),
         fork_from: instance.fork_pending.clone(),
+        sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
         sandbox_info,
         // Passed even without sandboxing so agent_acp_cmd and worker env
         // resolve from the session's profile.
@@ -122,6 +123,9 @@ fn spawn_request_for(
             &instance.command,
         ),
         seed_history_replay: instance.import_pending == Some(true),
+        claude_store_pin: instance
+            .selected_claude_conversation()
+            .and_then(|(_, execution)| crate::session::capture::ClaudeStorePin::of(execution)),
     }
 }
 
@@ -223,6 +227,15 @@ mod tests {
             inst.status = crate::session::Status::Idle;
             inst.acp_load_session_capable = Some(true);
             let id = inst.id.clone();
+            if which == "disable" {
+                crate::session::Storage::new_unwatched(&inst.source_profile)
+                    .unwrap()
+                    .update(|rows, _| {
+                        rows.push(inst.clone());
+                        Ok(())
+                    })
+                    .unwrap();
+            }
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
             let delivering = state.session_service.prompt_submission(&id).await;
@@ -261,5 +274,321 @@ mod tests {
                 assert_eq!(inst.acp_load_session_capable, None);
             }
         }
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_handoff_rejects_an_acp_identity_changed_on_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let _path = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let _home = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("CLAUDE_CONFIG_DIR", temp.path().join(".claude")),
+        ]);
+        let profile = "handoff-cas";
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        for changed in [Some("22222222-2222-4222-8222-222222222222"), None] {
+            let mut inst = crate::session::Instance::new("handoff", temp.path().to_str().unwrap());
+            inst.source_profile = profile.into();
+            inst.tool = "claude".into();
+            inst.command = "claude".into();
+            inst.agent_name = Some("claude-agent-acp".into());
+            inst.resume_binding = Some(inst.asserted_resume_binding(sid, None).unwrap());
+            inst.resume_intent = crate::session::ResumeIntent::Use(sid.into());
+            inst.view = crate::session::View::Structured;
+            inst.acp_session_id = Some(sid.into());
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+            inst.acp_session_id = changed.map(str::to_owned);
+            storage
+                .update(|rows, _| {
+                    *rows = vec![inst.clone()];
+                    Ok(())
+                })
+                .unwrap();
+
+            let response = acp_disable(State(state.clone()), Path(id.clone()))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let rows = storage.load().unwrap();
+            let row = rows.iter().find(|row| row.id == id).unwrap();
+            assert_eq!(row.view, crate::session::View::Structured);
+            assert_eq!(row.acp_session_id.as_deref(), changed);
+            assert_eq!(
+                state.instances.read().await[0].view,
+                crate::session::View::Structured
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn terminal_handoff_cas_follows_the_adopted_durable_row_through_a_reload() {
+        use std::{future::Future, task::Poll, time::Duration};
+
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                for (reload, expected_status) in [
+                    (None, StatusCode::OK),
+                    (Some(false), StatusCode::CONFLICT),
+                    (Some(true), StatusCode::OK),
+                ] {
+                    let profile = "handoff-reload";
+                    let mut cached = crate::session::Instance::new(
+                        "handoff",
+                        temp.path().join("missing").to_str().unwrap(),
+                    );
+                    cached.tool = "shell".into();
+                    cached.source_profile = profile.into();
+                    let id = cached.id.clone();
+                    let mut durable = cached.clone();
+                    durable.view = crate::session::View::Structured;
+                    durable.acp_session_id = Some("11111111-1111-4111-8111-111111111111".into());
+                    let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+                    storage
+                        .update(|all, _| {
+                            *all = vec![durable.clone()];
+                            Ok(())
+                        })
+                        .unwrap();
+                    let state = crate::server::test_support::build_test_app_state(vec![cached]);
+                    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                    let (release_tx, release_rx) = std::sync::mpsc::channel();
+                    let holder = tokio::task::spawn_blocking(move || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    });
+                    entered_rx.await.unwrap();
+                    let lock = state.instance_lock(&id).await;
+                    let mut handler = Box::pin(acp_disable(State(state.clone()), Path(id.clone())));
+                    std::future::poll_fn(|cx| {
+                        assert!(handler.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                    assert!(lock.try_lock().is_err());
+                    if let Some(same_identity) = reload {
+                        let mut fresh = durable;
+                        if !same_identity {
+                            fresh.acp_session_id =
+                                Some("22222222-2222-4222-8222-222222222222".into());
+                        }
+                        crate::server::reload::reload_state_instances_from_disk(
+                            &state,
+                            vec![fresh],
+                            Vec::new(),
+                            crate::server::state::StatusSource::DiskOnly,
+                            state
+                                .mutation_epoch
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                        )
+                        .await;
+                    }
+                    release_tx.send(()).unwrap();
+                    holder.await.unwrap();
+                    let response = tokio::time::timeout(Duration::from_secs(10), handler)
+                        .await
+                        .unwrap()
+                        .into_response();
+                    assert_eq!(response.status(), expected_status, "reload={reload:?}");
+                    let expected_sid = if expected_status == StatusCode::OK {
+                        None
+                    } else {
+                        Some("22222222-2222-4222-8222-222222222222".to_string())
+                    };
+                    let expected_view = if expected_status == StatusCode::OK {
+                        crate::session::View::Terminal
+                    } else {
+                        crate::session::View::Structured
+                    };
+                    let cached = state.instances.read().await;
+                    assert_eq!(cached[0].view, expected_view);
+                    assert_eq!(cached[0].acp_session_id, expected_sid);
+                    let durable_rows = storage.load().unwrap();
+                    assert_eq!(durable_rows[0].view, expected_view);
+                    let durable_sid = if expected_status == StatusCode::OK {
+                        None
+                    } else {
+                        Some("11111111-1111-4111-8111-111111111111".to_string())
+                    };
+                    assert_eq!(durable_rows[0].acp_session_id, durable_sid);
+                }
+            });
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_handoff_does_not_lock_other_sessions_during_storage_contention() {
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "handoff-contention";
+        let mut inst =
+            crate::session::Instance::new("handoff", temp.path().join("missing").to_str().unwrap());
+        inst.tool = "shell".into();
+        inst.source_profile = profile.into();
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = Some("original-acp".into());
+        inst.agent_session_id = Some("native-preserved".into());
+        let id = inst.id.clone();
+        let expected = inst.conversation_state();
+        let mut other = crate::session::Instance::new("other", "/tmp/other");
+        other.source_profile = profile.into();
+        other.view = crate::session::View::Structured;
+        let other_id = other.id.clone();
+        let rows = vec![inst, other];
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|all, _| {
+                *all = rows.clone();
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(rows);
+        let listener = tokio::spawn(crate::server::acp_events::acp_event_listener(state.clone()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.acp_events_tx.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = tokio::task::spawn_blocking(move || {
+            storage
+                .update(|_, _| {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                    Ok(())
+                })
+                .unwrap();
+        });
+        entered_rx.await.unwrap();
+        let lock = state.instance_lock(&id).await;
+        let handler = tokio::spawn({
+            let state = state.clone();
+            let id = id.clone();
+            async move { acp_disable(State(state), Path(id)).await.into_response() }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while lock.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for (seq, event) in [
+            crate::acp::Event::AcpSessionAssigned {
+                acp_session_id: "late".into(),
+            },
+            crate::acp::Event::SessionContextReset {
+                reason: "late".into(),
+            },
+            crate::acp::Event::SessionCleared,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            state
+                .acp_events_tx
+                .send(crate::server::AcpBroadcastFrame {
+                    session_id: id.clone(),
+                    seq: seq as u64 + 1,
+                    event: Arc::new(event),
+                    worker_generation: None,
+                })
+                .unwrap();
+        }
+        let accessible = tokio::time::timeout(Duration::from_secs(2), async {
+            let rows = state.instances.read().await;
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .acp_session_id
+                    .as_deref(),
+                Some("original-acp")
+            );
+            drop(rows);
+            let mut rows = state.instances.write().await;
+            rows.iter_mut()
+                .find(|row| row.id == other_id)
+                .unwrap()
+                .title = "edited during contention".into();
+        })
+        .await;
+        let still_waiting = !handler.is_finished();
+        release_tx.send(()).unwrap();
+        holder.await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(10), handler)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            accessible.is_ok(),
+            "storage contention blocked the global instance cache"
+        );
+        assert!(still_waiting);
+        assert_eq!(response.status(), StatusCode::OK);
+        state
+            .acp_events_tx
+            .send(crate::server::AcpBroadcastFrame {
+                session_id: other_id.clone(),
+                seq: 1,
+                event: Arc::new(crate::acp::Event::AcpSessionAssigned {
+                    acp_session_id: "drained".into(),
+                }),
+                worker_generation: None,
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|row| row.id == other_id)
+                    .unwrap()
+                    .acp_session_id
+                    .as_deref()
+                    == Some("drained")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        listener.abort();
+        let rows = state.instances.read().await;
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.view, crate::session::View::Terminal);
+        assert_eq!(row.acp_session_id, None);
+        assert!(expected.matches(row));
+        drop(rows);
+        let rows = crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.view, crate::session::View::Terminal);
+        assert_eq!(row.acp_session_id, None);
+        assert!(expected.matches(row));
     }
 }

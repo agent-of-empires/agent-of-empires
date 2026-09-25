@@ -81,6 +81,20 @@ describe("plugin slots", () => {
     await waitFor(() => expect(container.querySelector("svg")).toBeTruthy());
   });
 
+  it("row-badge link click does not bubble to an ancestor's onClick", () => {
+    entriesRef.current = [
+      rowBadge({ text: "PR #12", icon: "git-pull-request-arrow", href: "https://github.com/o/r/pull/12" }),
+    ];
+    const rowClick = vi.fn();
+    render(
+      <div onClick={rowClick}>
+        <PluginRowBadges sessionId="s1" />
+      </div>,
+    );
+    fireEvent.click(screen.getByRole("link", { name: /PR #12/ }));
+    expect(rowClick).not.toHaveBeenCalled();
+  });
+
   it("row-badge with an unknown icon or unsafe href renders plain text", () => {
     entriesRef.current = [
       rowBadge({ items: [{ text: "evil", icon: "not-a-real-icon", href: "javascript:alert(1)" }] }),
@@ -402,15 +416,71 @@ describe("pane blocks", () => {
     const two = renderBlocks({
       kind: "columns",
       children: [
-        { kind: "section", title: "DIFF", children: [{ kind: "row", value: "+842 -317" }] },
-        { kind: "section", title: "LINKED", children: [{ kind: "row", prefix: "#3180", label: "Stale daemon" }] },
+        {
+          kind: "section",
+          title: "DIFF",
+          value: "SUM-001",
+          children: [{ kind: "row", value: "+842 -317", color: "#00ff00" }],
+        },
+        {
+          kind: "section",
+          title: "LINKED",
+          children: [
+            {
+              kind: "row",
+              prefix: "#3180",
+              label: "Stale daemon",
+              badges: [{ text: "LONGBADGE", color: "#ff0000" }],
+            },
+          ],
+        },
       ],
     });
-    expect(two.getByTestId("plugin-pane-columns").className).toContain("grid-cols-2");
-    expect(screen.getByText("Stale daemon")).toBeTruthy();
+    expect(two.getByTestId("plugin-pane-columns").classList.contains("grid-cols-2")).toBe(true);
+    expect(two.getByTestId("plugin-pane-columns").classList.contains("sm:grid-cols-2")).toBe(false);
+    expect(screen.getByText("Stale daemon").className).toContain("wrap-anywhere");
+    expect(screen.getByText("+842 -317").className).toContain("wrap-anywhere");
+    expect(screen.getByText("+842 -317").className).not.toContain("shrink-0");
+    expect(screen.getByText("+842 -317").style.color).toBe("rgb(0, 255, 0)");
+    expect(screen.getByText("SUM-001").className).toContain("wrap-anywhere");
+    expect(screen.getByText("#3180").className).toContain("wrap-anywhere");
+    expect(screen.getByText("LONGBADGE").className).toContain("wrap-anywhere");
+    expect(screen.getByText("LONGBADGE").style.color).toBe("rgb(255, 0, 0)");
     two.unmount();
     const one = renderBlocks({ kind: "columns", children: [{ kind: "section", title: "DIFF" }] });
-    expect(one.getByTestId("plugin-pane-columns").className).toContain("grid-cols-1");
+    expect(one.getByTestId("plugin-pane-columns").classList.contains("grid-cols-1")).toBe(true);
+    one.unmount();
+    renderBlocks({
+      kind: "columns",
+      children: [
+        {
+          kind: "section",
+          title: "DIFF",
+          value: "SEC-1",
+          children: [{ kind: "row", prefix: "#99", label: "Solo row", value: "42", badges: [{ text: "B1" }] }],
+        },
+      ],
+    });
+    expect(screen.getByText("Solo row").className).toContain("truncate");
+    expect(screen.getByText("42").className).toContain("shrink-0");
+    expect(screen.getByText("#99").className).toContain("shrink-0");
+    expect(screen.getByText("SEC-1").className).not.toContain("wrap-anywhere");
+    expect(screen.getByText("B1").className).not.toContain("wrap-anywhere");
+  });
+
+  it("a single-child columns block inherits wrap from an outer column instead of resetting to truncate", () => {
+    renderBlocks({
+      kind: "columns",
+      children: [
+        {
+          kind: "section",
+          title: "NESTED",
+          children: [{ kind: "columns", children: [{ kind: "row", label: "Nested row" }] }],
+        },
+        { kind: "section", title: "OTHER" },
+      ],
+    });
+    expect(screen.getByText("Nested row").className).toContain("wrap-anywhere");
   });
 
   it("collapsible sections render uncontrolled details; plain sections stay <section>", () => {

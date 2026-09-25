@@ -24,6 +24,19 @@ const field = (
 ) => descriptor({ section, field: name, category: section, label, widget, ...extra });
 
 const SCHEMA = [
+  field(
+    "session",
+    "sidebar_position",
+    "Sidebar Position",
+    {
+      kind: "select",
+      options: [
+        { value: "left", label: "Left" },
+        { value: "right", label: "Right" },
+      ],
+    },
+    { profile_overridable: false },
+  ),
   field("tmux", "status_bar", "Status Bar", { kind: "select", options: TMUX_MODES }),
   field("tmux", "mouse", "Mouse Support", { kind: "select", options: TMUX_MODES }),
   field(
@@ -50,6 +63,7 @@ vi.mock("../../../lib/api", () => ({
   fetchSettings: vi.fn(() => Promise.resolve({ tmux: {}, logging: {}, session: {}, sound: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(SCHEMA)),
   updateProfileSettings: vi.fn(() => Promise.resolve(true)),
+  updateSettings: vi.fn(() => Promise.resolve(true)),
   updateTheme: vi.fn(() => Promise.resolve(true)),
   fetchThemes: vi.fn(() => Promise.resolve([])),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
@@ -97,6 +111,33 @@ function clickToggle(container: HTMLElement, label: string) {
 describe("schema-driven settings field PATCH payloads", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(api.fetchSettings).mockResolvedValue({
+      tmux: {},
+      logging: {},
+      session: { sidebar_position: "left" },
+      sound: {},
+    } as never);
+  });
+
+  it("saves Sidebar Position globally and reloads the saved value after a failed edit", async () => {
+    const { container } = renderTab("session");
+    await screen.findByText("Sidebar Position");
+    const select = selectByLabel(container, "Sidebar Position");
+    await waitFor(() => expect(select.value).toBe("left"));
+
+    for (const value of ["right", "left"]) {
+      fireEvent.change(select, { target: { value } });
+      await waitFor(() =>
+        expect(api.updateSettings).toHaveBeenLastCalledWith({ session: { sidebar_position: value } }),
+      );
+      expect(select.value).toBe(value);
+    }
+    expect(api.updateProfileSettings).not.toHaveBeenCalled();
+
+    vi.mocked(api.updateSettings).mockResolvedValueOnce(false);
+    fireEvent.change(select, { target: { value: "right" } });
+    await screen.findByText("Failed to save, please try again");
+    await waitFor(() => expect(select.value).toBe("left"));
   });
 
   it.each([
@@ -107,7 +148,13 @@ describe("schema-driven settings field PATCH payloads", () => {
     const { container } = renderTab(tab);
     await screen.findByText(label);
     fireEvent.change(selectByLabel(container, label), { target: { value } });
-    await waitFor(() => expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", patch));
+    if (tab === "logging") {
+      await waitFor(() => expect(api.updateSettings).toHaveBeenCalledWith(patch));
+      expect(api.updateProfileSettings).not.toHaveBeenCalled();
+    } else {
+      await waitFor(() => expect(api.updateProfileSettings).toHaveBeenCalledWith("main", patch));
+      expect(api.updateSettings).not.toHaveBeenCalled();
+    }
   });
 
   it("a tmux field edit never leaks sibling fields into the PATCH (sparse leaf)", async () => {
@@ -172,7 +219,7 @@ describe("schema-driven settings field PATCH payloads", () => {
     commit(input, "120");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({
         session: { session_id_poller_max_threads: 120 },
       }),
     );

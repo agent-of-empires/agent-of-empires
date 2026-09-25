@@ -9,6 +9,8 @@ export interface TrashSession {
   id: string;
   title?: string;
   trashed: boolean;
+  /** Defaults to Stopped when trashed, else Running. */
+  status?: string;
   groupPath?: string;
   projectPath?: string;
   branch?: string | null;
@@ -51,7 +53,7 @@ function sessionPayload(s: TrashSession) {
     title: s.title,
     project_path: s.projectPath,
     group_path: s.groupPath ?? s.projectPath ?? `/tmp/${s.id}`,
-    status: s.trashed ? "Stopped" : "Running",
+    status: s.status ?? (s.trashed ? "Stopped" : "Running"),
     branch: s.branch ?? null,
     main_repo_path: s.mainRepoPath ?? null,
     is_sandboxed: sandboxed,

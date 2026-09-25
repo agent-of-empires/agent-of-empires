@@ -487,12 +487,15 @@ pub(crate) async fn spawn_structured_session(
                             effort_explicit,
                             stored_acp_session_id,
                             fork_from,
+                            sandbox_continuation:
+                                crate::acp::supervisor::SandboxContinuation::Persisted,
                             sandbox_info,
                             source_profile: source_profile_for_spawn,
                             yolo_mode,
                             acp_mode_id,
                             agent_command_override: command_override,
                             seed_history_replay,
+                            claude_store_pin: None,
                         })
                         .await
                     {

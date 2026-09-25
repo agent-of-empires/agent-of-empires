@@ -9,7 +9,7 @@ pub enum ForkSeed {
     /// Terminal fork: resume `parent_agent_session_id` with the agent's fork
     /// flag, writing to the pre-generated `child_session_id`.
     Terminal {
-        parent_agent_session_id: String,
+        parent: Box<crate::session::ConversationBinding>,
         child_session_id: String,
     },
     /// Structured fork: send ACP `session/fork` against
@@ -42,26 +42,29 @@ pub fn structured_fork_capable(tool: &str, agent_name: Option<&str>) -> bool {
         && get_agent(resolved).is_some_and(|a| matches!(a.fork_strategy, ForkStrategy::ClaudeFork))
 }
 
-/// True when `tool` is a terminal agent whose CLI can fork (claude/codex/ opencode).
-pub fn terminal_agent_can_fork(tool: &str) -> bool {
-    get_agent(tool).is_some_and(|a| !matches!(a.fork_strategy, ForkStrategy::Unsupported))
+/// Whether a canonical native agent supports terminal forking.
+pub fn terminal_agent_can_fork(agent: &str) -> bool {
+    get_agent(agent).is_some_and(|a| !matches!(a.fork_strategy, ForkStrategy::Unsupported))
 }
 
-/// Decide whether a TERMINAL session can be forked, and if so produce the seed.
+/// Decide whether a terminal session can be forked, and produce its one-shot seed.
 pub fn terminal_fork_seed(
-    tool: &str,
-    parent_agent_session_id: Option<&str>,
+    parent: Option<&crate::session::ConversationBinding>,
     child_session_id: String,
 ) -> Result<ForkSeed, ForkDenied> {
-    let agent = get_agent(tool).ok_or(ForkDenied::AgentCannotFork)?;
+    let parent = parent
+        .filter(|parent| parent.is_known())
+        .ok_or(ForkDenied::NoParentSession)?;
+    let agent = parent
+        .execution
+        .as_ref()
+        .and_then(|execution| get_agent(&execution.agent))
+        .ok_or(ForkDenied::AgentCannotFork)?;
     if matches!(agent.fork_strategy, ForkStrategy::Unsupported) {
         return Err(ForkDenied::AgentCannotFork);
     }
-    let parent = parent_agent_session_id
-        .filter(|s| !s.is_empty())
-        .ok_or(ForkDenied::NoParentSession)?;
     Ok(ForkSeed::Terminal {
-        parent_agent_session_id: parent.to_string(),
+        parent: Box::new(parent.clone()),
         child_session_id,
     })
 }
@@ -69,35 +72,46 @@ pub fn terminal_fork_seed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
 
     #[test]
-    fn claude_with_parent_id_yields_terminal_seed() {
-        let seed = terminal_fork_seed("claude", Some("parent-uuid"), "child-uuid".into());
+    fn fork_requires_a_proven_parent_and_matching_native_capability() {
+        let mut parent = ConversationBinding {
+            session_id: "parent-uuid".into(),
+            execution: Some(ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec!["/store".into()],
+                configuration: Vec::new(),
+                exported_default_store: false,
+                cwd: "/work".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            }),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        };
+        assert!(matches!(
+            terminal_fork_seed(Some(&parent), "child-uuid".into()),
+            Ok(ForkSeed::Terminal { .. })
+        ));
+        for provenance in [
+            ConversationProvenance::Unknown,
+            ConversationProvenance::Preallocated,
+        ] {
+            parent.provenance = provenance;
+            assert_eq!(
+                terminal_fork_seed(Some(&parent), "child-uuid".into()),
+                Err(ForkDenied::NoParentSession)
+            );
+        }
+        parent.provenance = ConversationProvenance::Observed;
+        parent.execution.as_mut().unwrap().agent = "gemini".into();
         assert_eq!(
-            seed,
-            Ok(ForkSeed::Terminal {
-                parent_agent_session_id: "parent-uuid".into(),
-                child_session_id: "child-uuid".into(),
-            })
-        );
-    }
-
-    #[test]
-    fn resume_only_agent_is_denied() {
-        assert_eq!(
-            terminal_fork_seed("gemini", Some("parent-uuid"), "child-uuid".into()),
+            terminal_fork_seed(Some(&parent), "child-uuid".into()),
             Err(ForkDenied::AgentCannotFork)
         );
-    }
-
-    #[test]
-    fn missing_parent_id_is_denied() {
         assert_eq!(
-            terminal_fork_seed("claude", None, "child-uuid".into()),
-            Err(ForkDenied::NoParentSession)
-        );
-        assert_eq!(
-            terminal_fork_seed("claude", Some(""), "child-uuid".into()),
+            terminal_fork_seed(None, "child-uuid".into()),
             Err(ForkDenied::NoParentSession)
         );
     }

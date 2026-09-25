@@ -2,21 +2,37 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useClampedMenuPosition } from "../../lib/menuPosition";
 import { writeClipboard } from "../../lib/clipboard";
+import { sessionDiffRawFileUrl } from "../../lib/api";
+import { openInNewTab } from "../../lib/openInNewTab";
 import { toastBus } from "../../lib/toastBus";
+import type { RichDiffFile } from "../../lib/types";
 
 export interface PathMenuState {
   x: number;
   y: number;
   path: string;
+  /** The changed file under a file row; a directory row has none and only copies its path. */
+  file?: RichDiffFile;
 }
 
 interface Props {
   menu: PathMenuState | null;
+  /** Opening a file needs the session; without one the menu only copies. */
+  sessionId?: string | null;
   onClose: () => void;
 }
 
-/** "Copy relative path" menu at the click position, clamped to the viewport. */
-export function CopyPathContextMenu({ menu, onClose }: Props) {
+const ITEM =
+  "w-full px-3 py-1.5 text-left text-[13px] text-text-secondary hover:bg-surface-800 cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent";
+
+function openFailureMessage(path: string, status?: number): string {
+  if (status === 404) return `${path} is not in the worktree`;
+  if (status === 413) return `${path} is too large to open (over 50 MiB)`;
+  return `Couldn't open ${path}`;
+}
+
+/** Changed-file actions at the click position, clamped to the viewport. */
+export function DiffFileContextMenu({ menu, sessionId, onClose }: Props) {
   const menuRef = useRef<HTMLDivElement | null>(null);
 
   // Local position so the clamp can nudge it on-screen before paint.
@@ -54,11 +70,18 @@ export function CopyPathContextMenu({ menu, onClose }: Props) {
 
   if (!menu || !pos) return null;
 
-  const path = menu.path;
+  const { path, file } = menu;
   const copy = () => {
     void writeClipboard(path).then((ok) => {
       if (ok) toastBus.handler?.info(`Copied ${path}`);
       else toastBus.handler?.error("Couldn't copy path to clipboard");
+    });
+    onClose();
+  };
+  const openFile = (id: string, target: RichDiffFile) => {
+    const name = target.path.slice(target.path.lastIndexOf("/") + 1);
+    void openInNewTab(sessionDiffRawFileUrl(id, target.path, target.repo_name), name).then((result) => {
+      if (!result.ok) toastBus.handler?.error(openFailureMessage(target.path, result.status));
     });
     onClose();
   };
@@ -71,12 +94,18 @@ export function CopyPathContextMenu({ menu, onClose }: Props) {
       style={{ left: pos.x, top: pos.y }}
       onContextMenu={(e) => e.preventDefault()}
     >
-      <button
-        type="button"
-        role="menuitem"
-        onClick={copy}
-        className="w-full px-3 py-1.5 text-left text-[13px] text-text-secondary hover:bg-surface-800 cursor-pointer"
-      >
+      {file && sessionId && (
+        <button
+          type="button"
+          role="menuitem"
+          disabled={file.status === "deleted"}
+          onClick={() => openFile(sessionId, file)}
+          className={ITEM}
+        >
+          Open file
+        </button>
+      )}
+      <button type="button" role="menuitem" onClick={copy} className={ITEM}>
         Copy relative path
       </button>
     </div>,

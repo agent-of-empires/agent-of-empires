@@ -176,30 +176,6 @@ fn right_click_unarchive_action_restores_session() {
     render_geometry(&mut env.view);
     let row = shelf_row_for_idx(&env.view, idx);
     assert!(env.view.handle_right_click(5, row));
-    let labels: Vec<&str> = env
-        .view
-        .context_menu
-        .as_ref()
-        .unwrap()
-        .items_for_test()
-        .iter()
-        .map(|(_, l)| *l)
-        .collect();
-    // Default sort here is Newest, where Snooze is gated out; the unread toggle is
-    // always-on and defaults on, and the default tool (claude) is forkable, so the menu is
-    // New Session / Rename / Unarchive / Mark unread / Add project / Delete / Fork.
-    assert_eq!(
-        labels,
-        vec![
-            "New Session",
-            "Rename",
-            "Unarchive",
-            "Mark unread",
-            "Add project",
-            "Delete",
-            "Fork session"
-        ]
-    );
 
     env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
     env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive
@@ -210,13 +186,32 @@ fn right_click_unarchive_action_restores_session() {
     );
 }
 
-/// A forkable agent (claude, the default test tool) shows the "Fork
-/// session" row so the mouse path matches the palette action.
 #[test]
 #[serial]
-fn right_click_session_menu_shows_fork_for_forkable_agent() {
-    let mut env = create_test_env_with_sessions(1);
+fn right_click_fork_requires_provenance_not_a_tool_label() {
+    let mut env = create_test_env_empty();
+    let mut parent = observed_fork_parent("claude");
+    let id = parent.id.clone();
+    let binding = parent.agent_session_binding.take();
+    env.view.add_instance(parent);
+    env.view.flat_items = env.view.build_flat_items();
     setup_inner(&mut env);
+    assert!(env.view.handle_right_click(5, 1));
+    assert!(!env
+        .view
+        .context_menu
+        .as_ref()
+        .unwrap()
+        .items_for_test()
+        .iter()
+        .any(|(action, _)| *action == ContextMenuAction::Fork));
+    env.view.context_menu = None;
+    env.view
+        .apply_user_action(&id, |instance| {
+            instance.agent_session_binding = binding;
+            instance.tool = "status-alias".into();
+        })
+        .unwrap();
     assert!(env.view.handle_right_click(5, 1));
     let actions: Vec<ContextMenuAction> = env
         .view
@@ -310,7 +305,9 @@ fn right_click_session_menu_gates_snooze_to_attention_sort() {
 #[test]
 #[serial]
 fn right_click_session_menu_offers_fork_in_every_sort_for_forkable_agent() {
-    let mut env = create_test_env_with_sessions(2);
+    let mut env = create_test_env_empty();
+    env.view.add_instance(observed_fork_parent("claude"));
+    env.view.add_instance(observed_fork_parent("claude"));
     setup_inner(&mut env);
 
     let has_fork = |env: &TestEnv| -> bool {

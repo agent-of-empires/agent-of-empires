@@ -4,6 +4,7 @@
 use crate::acp::control_protocol::{self, ControlBody, SessionReplayed};
 use crate::acp::state::Event;
 use agent_client_protocol::schema::v1::PromptResponse;
+use agent_client_protocol::JsonRpcMessage as _;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -39,8 +40,31 @@ pub(super) struct DaemonControlClient {
     sessions_established: AtomicU64,
     sessions_replayed: watch::Sender<u64>,
     completion: Arc<std::sync::Mutex<PromptCompletion>>,
+    /// A matched local outcome held until the crate reaches its
+    /// [`PromptCompletedMarker`].
+    settled: Arc<std::sync::Mutex<Option<LocalOutcome>>>,
     raw_fd: RawFd,
 }
+
+type LocalOutcome = (
+    oneshot::Sender<control_protocol::PromptOutcome>,
+    control_protocol::PromptOutcome,
+);
+
+/// Daemon-minted notification written to the crate after a local prompt's
+/// `PromptCompleted`. The crate handles notifications in order, so the waiter
+/// resolves only after the updates the agent sent before its reply, such as a
+/// rate-limit reset, have been applied.
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    agent_client_protocol::JsonRpcNotification,
+)]
+#[notification(method = "_aoe/prompt_completed")]
+pub(super) struct PromptCompletedMarker {}
 
 enum PromptCompletion {
     Adopted,
@@ -183,6 +207,13 @@ impl DaemonControlClient {
             .send_modify(|replayed| *replayed += 1);
     }
 
+    pub(super) fn deliver_prompt_completion(&self, _: PromptCompletedMarker) {
+        let settled = self.settled.lock().expect("settled mutex poisoned").take();
+        if let Some((tx, outcome)) = settled {
+            let _ = tx.send(outcome);
+        }
+    }
+
     /// Transfer terminal ownership before the command loop arms a local turn.
     pub(super) fn supersede_adopted_turn(&self) {
         let mut completion = self.completion.lock().expect("completion mutex poisoned");
@@ -314,6 +345,8 @@ pub(super) async fn connect_runner_control_v3(
     let (hs_tx, hs_rx) = mpsc::channel::<ControlBody>(8);
     let completion = Arc::new(std::sync::Mutex::new(PromptCompletion::Adopted));
     let reader_completion = completion.clone();
+    let settled = Arc::new(std::sync::Mutex::new(None));
+    let reader_settled = settled.clone();
     let reader_session = session_label.clone();
     let reader_shim_write = shim_write.clone();
     let reader_correlation = correlation.clone();
@@ -377,7 +410,15 @@ pub(super) async fn connect_runner_control_v3(
                         }
                     };
                     if let Some(tx) = waiter {
-                        let _ = tx.send(outcome);
+                        *reader_settled.lock().expect("settled mutex poisoned") = Some((tx, outcome));
+                        let marker = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": PromptCompletedMarker::default().method(),
+                            "params": {},
+                        });
+                        if !shim_write_line(&reader_shim_write, &marker).await {
+                            return;
+                        }
                     } else {
                         debug!(
                             target: "acp.protocol",
@@ -633,6 +674,7 @@ pub(super) async fn connect_runner_control_v3(
             sessions_established: AtomicU64::new(0),
             sessions_replayed: watch::Sender::new(0),
             completion,
+            settled,
             raw_fd,
         }),
         crate_side,
@@ -817,20 +859,28 @@ mod tests {
         }
 
         /// The reader forwards Notify only after handling every earlier frame,
-        /// so this is a deterministic barrier.
+        /// so this is a deterministic barrier. Completion markers ahead of it
+        /// are handled as the crate would.
         async fn drain(&mut self) {
             self.send(ControlBody::Notify {
                 method: "test/barrier".into(),
                 params: serde_json::json!({}),
             })
             .await;
-            let mut line = String::new();
-            tokio::time::timeout(Duration::from_secs(2), self.transport.read_line(&mut line))
-                .await
-                .expect("control reader must reach the notification barrier")
-                .unwrap();
-            let notification: serde_json::Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(notification["method"], "test/barrier");
+            loop {
+                let mut line = String::new();
+                tokio::time::timeout(Duration::from_secs(2), self.transport.read_line(&mut line))
+                    .await
+                    .expect("control reader must reach the notification barrier")
+                    .unwrap();
+                let notification: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if notification["method"] == "test/barrier" {
+                    return;
+                }
+                assert_eq!(notification["method"], "_aoe/prompt_completed");
+                self.client
+                    .deliver_prompt_completion(PromptCompletedMarker::default());
+            }
         }
 
         fn assert_local_terminal_ownership(&mut self) {
@@ -1546,14 +1596,16 @@ mod tests {
         let _ = fake.await;
     }
 
-    /// The runner's session reply precedes the replay it follows; a load must
-    /// not count as replayed until the crate has applied that replay (#4016).
+    /// A load must not count as replayed until the crate has applied the replay
+    /// sent after the session reply (#4016), and a prompt must not resolve
+    /// before the updates sent ahead of its completion, such as a rate-limit
+    /// reset, have been applied.
     #[tokio::test]
-    async fn session_replayed_waits_for_replay_sent_after_the_reply() {
+    async fn barriers_wait_for_updates_applied_by_the_crate() {
         use super::super::session_identity::SessionIngressNotification;
         use agent_client_protocol::{ByteStreams, Client};
         use futures_util::FutureExt as _;
-        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
         use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1574,6 +1626,23 @@ mod tests {
             while let Some(frame) = control_protocol::read_frame(&mut peer).await.unwrap() {
                 match frame {
                     ControlBody::Attach { .. } => {}
+                    ControlBody::Prompt { .. } => {
+                        for body in [
+                            ControlBody::PromptStarted { prompt_req_id: 1 },
+                            ControlBody::Notify {
+                                method: "session/update".into(),
+                                params: serde_json::json!({"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"live"}}}),
+                            },
+                            ControlBody::PromptCompleted {
+                                prompt_req_id: 1,
+                                outcome: end("end_turn"),
+                            },
+                        ] {
+                            control_protocol::write_frame(&mut peer, &body)
+                                .await
+                                .unwrap();
+                        }
+                    }
                     ControlBody::EstablishSession { .. } => {
                         for body in [
                             ControlBody::SessionReady {
@@ -1608,10 +1677,17 @@ mod tests {
             )
             .await
             .unwrap();
-            let (entered_tx, entered_rx) = oneshot::channel::<()>();
-            let (release_tx, release_rx) = oneshot::channel::<()>();
-            let gate = Arc::new(Mutex::new(Some((entered_tx, release_rx))));
-            let applied = Arc::new(AtomicBool::new(false));
+            // Each update blocks its handler until the test releases it.
+            let (gate_tx, gate_rx) =
+                mpsc::unbounded_channel::<(oneshot::Sender<()>, oneshot::Receiver<()>)>();
+            let gate = Arc::new(Mutex::new(gate_rx));
+            let arm = || {
+                let (entered_tx, entered_rx) = oneshot::channel::<()>();
+                let (release_tx, release_rx) = oneshot::channel::<()>();
+                gate_tx.send((entered_tx, release_rx)).unwrap();
+                (entered_rx, release_tx)
+            };
+            let applied = Arc::new(AtomicUsize::new(0));
             let marker_client = client.clone();
             let (read, write) = tokio::io::split(crate_side);
             Client
@@ -1629,12 +1705,15 @@ mod tests {
                                     SessionIngressNotification::Replayed(marker) => {
                                         control.mark_session_replayed(marker);
                                     }
+                                    SessionIngressNotification::PromptCompleted(marker) => {
+                                        control.deliver_prompt_completion(marker);
+                                    }
                                     SessionIngressNotification::Update(_) => {
-                                        if let Some((entered, release)) = gate.lock().await.take() {
-                                            entered.send(()).unwrap();
-                                            release.await.unwrap();
-                                        }
-                                        applied.store(true, AtomicOrdering::Relaxed);
+                                        let (entered, release) =
+                                            gate.lock().await.recv().await.unwrap();
+                                        entered.send(()).unwrap();
+                                        release.await.unwrap();
+                                        applied.fetch_add(1, AtomicOrdering::Relaxed);
                                     }
                                 }
                                 Ok(())
@@ -1646,6 +1725,7 @@ mod tests {
                 .connect_with(
                     ByteStreams::new(write.compat_write(), read.compat()),
                     |_connection| async move {
+                        let (entered_rx, release_tx) = arm();
                         client
                             .establish_session("session/load", serde_json::json!({}))
                             .await
@@ -1659,7 +1739,24 @@ mod tests {
                         );
                         release_tx.send(()).unwrap();
                         replayed.await;
-                        assert!(applied.load(AtomicOrdering::Relaxed));
+                        assert_eq!(applied.load(AtomicOrdering::Relaxed), 1);
+
+                        let (entered_rx, release_tx) = arm();
+                        let mut completion = client.prompt(serde_json::json!({})).await;
+                        entered_rx.await.unwrap();
+                        // Wait for the reader to match the completion while the
+                        // crate is still applying the update sent before it.
+                        while client.settled.lock().unwrap().is_none() {
+                            assert_eq!(
+                                completion.try_recv(),
+                                Err(oneshot::error::TryRecvError::Empty),
+                                "a prompt must not resolve before its updates are applied"
+                            );
+                            tokio::task::yield_now().await;
+                        }
+                        release_tx.send(()).unwrap();
+                        assert_eq!(completion.await.unwrap(), end("end_turn"));
+                        assert_eq!(applied.load(AtomicOrdering::Relaxed), 2);
                         client.shutdown();
                         Ok(())
                     },

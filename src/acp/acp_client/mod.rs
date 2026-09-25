@@ -93,6 +93,7 @@ pub struct AcpClient {
     _child: Option<Arc<Mutex<tokio::process::Child>>>,
     /// The detached runner this client launched, which its lease owns.
     runner_pid: Option<u32>,
+    pub(crate) native_store: Option<crate::session::ExecutionBinding>,
 }
 
 /// What the connection task needs to serve agent fs/* and terminal/* requests.
@@ -203,6 +204,7 @@ impl Launch {
             pending_responders,
             _child: child,
             runner_pid: None,
+            native_store: None,
         };
         (client, ready_rx)
     }
@@ -221,6 +223,7 @@ impl AcpClient {
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
             runner_pid: None,
+            native_store: None,
         };
         (client, event_tx)
     }
@@ -405,14 +408,15 @@ impl AcpClient {
             // runner's process group first or its children leak (#1689).
             crate::process::worker_registry::terminate_and_wait(&session_id.0).await;
             let runner_sandbox = sandbox.as_ref().map(|(handle, _)| handle);
-            let runner_pid =
+            let (runner_pid, native_store) =
                 spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
             let mut client = Self::connect_via_socket(socket_path, launch(sandbox)).await?;
             client.runner_pid = Some(runner_pid);
+            client.native_store = native_store;
             return Ok(client);
         }
 
-        let mut child = spawn_subprocess(&config)?;
+        let (mut child, native_store) = spawn_subprocess(&config)?;
         let stdin = child
             .stdin
             .take()
@@ -426,8 +430,9 @@ impl AcpClient {
         let (label, install_binary) = (launch.session_id.0.clone(), launch.install_binary.clone());
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
         let events = mpsc::channel(64);
-        let (client, ready_rx) = launch.start(events, transport, Some(child.clone()), None);
+        let (mut client, ready_rx) = launch.start(events, transport, Some(child.clone()), None);
         wait_for_handshake(&label, ready_rx, Some(&child), &install_binary).await?;
+        client.native_store = native_store;
         Ok(client)
     }
 

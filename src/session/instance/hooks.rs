@@ -92,9 +92,11 @@ impl Instance {
                 &self.extra_args,
             ))?;
         }
-        let agent = self.resolved_agent();
+        let agent = self.status_agent();
         self.ensure_disclosed_host_hook_path(agent)?;
-        self.install_agent_status_hooks(agent);
+        if self.is_sandboxed() {
+            self.install_agent_status_hooks(agent, None);
+        }
         self.ensure_host_folder_trust(agent);
         self.propagate_managed_skills();
 
@@ -256,7 +258,11 @@ impl Instance {
     }
 
     /// Install optional status hooks and mandatory authoritative identity hooks.
-    fn install_agent_status_hooks(&mut self, agent: Option<&'static crate::agents::AgentDef>) {
+    pub(super) fn install_agent_status_hooks(
+        &mut self,
+        agent: Option<&'static crate::agents::AgentDef>,
+        execution: Option<&super::execution::NativeExecution>,
+    ) {
         self.identity_publisher_launched = false;
         let config = crate::session::config::profile_config::resolve_config_or_warn(
             &self.effective_profile(),
@@ -292,8 +298,14 @@ impl Instance {
         let Some(home) = host_home(&environment) else {
             return;
         };
-        let installed =
-            self.install_host_hooks(agent, &home, &config.session, &environment, &events);
+        let installed = self.install_host_hooks(
+            agent,
+            &home,
+            &config.session,
+            &environment,
+            &events,
+            execution,
+        );
         self.identity_publisher_launched =
             events.iter().any(|event| event.identity_field.is_some())
                 && installed
@@ -308,6 +320,7 @@ impl Instance {
         session_cfg: &crate::session::config::SessionConfig,
         host_environment: &[String],
         events: &[crate::agents::ResolvedHookEvent],
+        execution: Option<&super::execution::NativeExecution>,
     ) -> bool {
         if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
             return self.install_sidecar_host_hooks(
@@ -321,8 +334,26 @@ impl Instance {
         let Some(hook_cfg) = agent.hook_config.as_ref() else {
             return false;
         };
-        let path =
-            generic_host_config_path_for(&self.tool, hook_cfg, home, session_cfg, host_environment);
+        let selected_root = execution
+            .filter(|execution| execution.agent.name == "claude" && !events.is_empty())
+            .and_then(|execution| {
+                execution
+                    .routing
+                    .iter()
+                    .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+            })
+            .and_then(|(_, value)| value.as_deref());
+        let path = selected_root
+            .map(|root| Path::new(root).join("settings.json"))
+            .unwrap_or_else(|| {
+                generic_host_config_path_for(
+                    &self.tool,
+                    hook_cfg,
+                    home,
+                    session_cfg,
+                    host_environment,
+                )
+            });
         match hook_cfg.format {
             crate::agents::HookFormat::CodexJson => {
                 match crate::hooks::install_codex_json_hooks(
@@ -387,7 +418,7 @@ impl Instance {
                 if let Some(name) =
                     crate::agents::parse_selected_agent(&self.selected_agent_args(), selected.flag)
                 {
-                    let Some(agent) = self.resolved_agent() else {
+                    let Some(agent) = self.status_agent() else {
                         return false;
                     };
                     let config_path = sidecar_host_config_path_for(
@@ -420,7 +451,7 @@ impl Instance {
             }
         }
 
-        let Some(agent) = self.resolved_agent() else {
+        let Some(agent) = self.status_agent() else {
             return false;
         };
         let config_path = sidecar_host_config_path_for(
@@ -893,7 +924,7 @@ mod tests {
             host_home(&inst.resolved_host_environment()).as_deref(),
             Some(profile_home.path())
         );
-        inst.install_agent_status_hooks(crate::agents::get_agent("cursor"));
+        inst.install_agent_status_hooks(crate::agents::get_agent("cursor"), None);
 
         assert!(profile_home.path().join(".cursor/hooks.json").is_file());
         assert!(!process_home.path().join(".cursor/hooks.json").exists());
@@ -928,7 +959,7 @@ mod tests {
         let mut inst = Instance::new("wrapped", "/tmp/test");
         inst.tool = "my-codex-wrapper".to_string();
         inst.detect_as = "codex".to_string();
-        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
+        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as), None);
 
         assert_aoe_codex_hooks(&tmp.path().join(".codex").join("hooks.json"));
         assert!(!tmp.path().join(".codex").join("config.toml").exists());
@@ -960,7 +991,7 @@ mod tests {
             "CODEX_HOME".to_string(),
             resolved_codex_home.to_string_lossy().into_owned(),
         )];
-        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
+        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as), None);
 
         assert_aoe_codex_hooks(&resolved_codex_home.join("hooks.json"));
         assert!(!profile_codex_home.join("hooks.json").exists());
@@ -996,7 +1027,14 @@ mod tests {
             )];
             let environment = inst.resolved_host_environment();
             let home = host_home(&environment).unwrap();
-            inst.install_host_hooks(agent, &home, &profile_config.session, &environment, &events);
+            inst.install_host_hooks(
+                agent,
+                &home,
+                &profile_config.session,
+                &environment,
+                &events,
+                None,
+            );
 
             codex_home.join("hooks.json").exists()
         });
@@ -1015,7 +1053,7 @@ mod tests {
 
         let mut inst = hook_inst("codex");
         inst.source_profile = "hooks-disabled".to_string();
-        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
+        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as), None);
 
         assert!(!tmp.path().join(".codex").join("hooks.json").exists());
     }
@@ -1031,7 +1069,7 @@ mod tests {
         let error = inst
             .ensure_disclosed_host_hook_path(crate::agents::get_agent("cursor"))
             .unwrap_err();
-        inst.install_agent_status_hooks(crate::agents::get_agent("cursor"));
+        inst.install_agent_status_hooks(crate::agents::get_agent("cursor"), None);
 
         assert!(error.to_string().contains("have not been acknowledged"));
         assert!(!tmp.path().join(".cursor/hooks.json").exists());
@@ -1054,7 +1092,7 @@ agent_status_hooks = false
         let agent = crate::agents::get_agent("gemini");
 
         inst.ensure_disclosed_host_hook_path(agent).unwrap();
-        inst.install_agent_status_hooks(agent);
+        inst.install_agent_status_hooks(agent, None);
 
         assert!(!tmp.path().join(".gemini/settings.json").exists());
         assert!(!inst.identity_publisher_launched);
@@ -1080,7 +1118,7 @@ agent_status_hooks = false
         acknowledge_hooks();
         let mut inst = hook_inst("cursor");
         inst.source_profile = "identity-only-hooks".to_string();
-        inst.install_agent_status_hooks(crate::agents::get_agent("cursor"));
+        inst.install_agent_status_hooks(crate::agents::get_agent("cursor"), None);
 
         let hooks_path = custom_config.join("hooks.json");
         let hooks: serde_json::Value =
@@ -1155,7 +1193,7 @@ agent_status_hooks = false
         acknowledge_hooks();
         let mut inst = hook_inst("codex");
         inst.source_profile = "hooks-enabled".to_string();
-        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
+        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as), None);
 
         assert_aoe_codex_hooks(&tmp.path().join(".codex").join("hooks.json"));
     }
@@ -1289,7 +1327,7 @@ agent_status_hooks = false
         acknowledge_hooks();
 
         let mut inst = hook_inst("gemini");
-        inst.install_agent_status_hooks(crate::agents::get_agent("gemini"));
+        inst.install_agent_status_hooks(crate::agents::get_agent("gemini"), None);
         let path = tmp.path().join(".gemini/settings.json");
         let mut settings: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -1310,7 +1348,7 @@ agent_status_hooks = false
         inst.source_profile = profile.to_string();
         inst.ensure_disclosed_host_hook_path(crate::agents::get_agent("gemini"))
             .unwrap();
-        inst.install_agent_status_hooks(crate::agents::get_agent("gemini"));
+        inst.install_agent_status_hooks(crate::agents::get_agent("gemini"), None);
 
         let content = std::fs::read_to_string(path).unwrap();
         assert!(content.contains("printf foreign"));
@@ -1327,7 +1365,7 @@ agent_status_hooks = false
         acknowledge_hooks();
 
         let mut inst = hook_inst("codex");
-        inst.install_agent_status_hooks(crate::agents::get_agent("codex"));
+        inst.install_agent_status_hooks(crate::agents::get_agent("codex"), None);
         let path = tmp.path().join(".codex/hooks.json");
         let mut settings: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -1351,7 +1389,7 @@ agent_status_hooks = false
         inst.source_profile = profile.to_string();
         inst.ensure_disclosed_host_hook_path(crate::agents::get_agent("codex"))
             .unwrap();
-        inst.install_agent_status_hooks(crate::agents::get_agent("codex"));
+        inst.install_agent_status_hooks(crate::agents::get_agent("codex"), None);
 
         let content = std::fs::read_to_string(path).unwrap();
         assert!(content.contains("printf foreign"));
@@ -1396,7 +1434,7 @@ agent_status_hooks = false
             ];
             inst.ensure_disclosed_host_hook_path(crate::agents::get_agent(tool))
                 .unwrap();
-            inst.install_agent_status_hooks(crate::agents::get_agent(tool));
+            inst.install_agent_status_hooks(crate::agents::get_agent(tool), None);
 
             let path = root.join(filename);
             assert!(

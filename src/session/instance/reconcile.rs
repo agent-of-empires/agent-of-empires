@@ -37,12 +37,15 @@ impl Instance {
             disk.last_error_check = self.last_error_check;
             disk.last_error = self.last_error.take();
         }
+        if self.active_execution != disk.active_execution {
+            self.stop_poller();
+            self.session_id_poller = None;
+        }
         disk.last_start_time = self.last_start_time;
         disk.session_id_poller = self.session_id_poller.take();
         disk.session_id_poller_retry_after = self.session_id_poller_retry_after;
         // Preserve the serde-skipped backoff so reloads cannot trigger an early retry.
         disk.poller_repair = self.poller_repair.clone();
-        disk.retroactive_capture_excludes = std::mem::take(&mut self.retroactive_capture_excludes);
         disk.pane_dead_observed = self.pane_dead_observed;
         disk.force_fresh_next_launch = self.force_fresh_next_launch;
         disk.pending_host_env = std::mem::take(&mut self.pending_host_env);
@@ -61,11 +64,14 @@ impl Instance {
         Ok(true)
     }
 
-    /// Closes the data-loss window where `/clear` writes the sidecar but the daemon crashes before
-    /// the next poll tick persists it.
+    /// Flush the previous pane's publication before its source is retired.
     pub(super) fn reconcile_sidecar_into_disk(&mut self) {
+        if self.source_capture_backend() == Some(crate::agents::SessionCaptureBackend::Pi) {
+            self.absorb_published_pi_session();
+            return;
+        }
         if !matches!(
-            self.resolved_capture_backend(),
+            self.source_capture_backend(),
             Some(
                 crate::agents::SessionCaptureBackend::Claude
                     | crate::agents::SessionCaptureBackend::HookSidecar
@@ -76,28 +82,36 @@ impl Instance {
         if !matches!(self.resume_intent, ResumeIntent::Default) {
             return;
         }
-        let Some(fresh) = crate::hooks::read_hook_session_id_any_age(&self.id) else {
+        let Some(observation) = super::execution::hook_session_observation(
+            &self.id,
+            self.active_execution.as_ref(),
+            None,
+        ) else {
             return;
         };
-        if Some(&fresh) == self.agent_session_id.as_ref() {
+        let fresh = &observation.sid;
+        let binding = self.observed_binding(&observation);
+        if Some(fresh) == self.agent_session_id.as_ref() && self.agent_session_binding == binding {
             return;
         }
-        if self.retroactive_capture_excludes.contains(&fresh) {
+        if self.is_capture_excluded(fresh, observation.source.as_ref()) {
             return;
         }
         let profile = self.effective_profile();
-        let baseline = self.agent_session_id.as_deref();
+        let baseline = self.conversation_state();
         match persist_session_to_storage(
             &profile,
             &self.id,
-            &fresh,
-            baseline,
+            &observation,
+            &baseline,
             &self.resolve_file_watch(),
         ) {
             SidWrite::Applied => {
-                self.agent_session_id = Some(fresh);
+                self.set_agent_conversation(Some(observation.sid), binding, None);
             }
-            SidWrite::Skipped => {
+            // A pinned-foreign publication is a deliberate non-write; like a
+            // divergence skip, it carries no update worth reconciling.
+            SidWrite::Skipped | SidWrite::PinnedForeign => {
                 // Peer wrote between reconcile and CAS; reload to converge.
                 self.reconcile_from_disk();
             }
@@ -292,7 +306,7 @@ mod tests {
             inst.agent_session_id = Some("disk-sid".to_string());
             if c.exclude_sidecar {
                 inst.retroactive_capture_excludes
-                    .insert(SIDECAR_TEST_FRESH_UUID.to_string());
+                    .insert(ConversationBinding::unknown(SIDECAR_TEST_FRESH_UUID));
             }
             let storage = seeded(profile, &inst);
             if let Some(peer) = c.peer_sid {

@@ -6,7 +6,6 @@ use crate::agents::SessionCaptureBackend;
 use crate::session::config::container_config::PRIME_AGENT_DIR_IN_CONTAINER;
 
 const PRIME_AGENT_HEADER_MAX_BYTES: u64 = 64 * 1024;
-const PRIME_AGENT_SETTINGS_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
 pub(super) struct PrimeAgentLaunchOptions {
@@ -74,36 +73,13 @@ fn parse_prime_agent_launch_options(words: &[String]) -> Option<PrimeAgentLaunch
     Some(options)
 }
 
-fn resolve_prime_agent_path(value: &str, cwd: &Path) -> PathBuf {
+fn resolve_prime_agent_path(value: &str, cwd: &Path, home: &Path) -> PathBuf {
     let expanded = match value.strip_prefix('~') {
-        Some("") => PathBuf::from("/root"),
-        Some(rest) if rest.starts_with('/') => Path::new("/root").join(&rest[1..]),
+        Some("") => home.to_path_buf(),
+        Some(rest) if rest.starts_with('/') => home.join(&rest[1..]),
         _ => PathBuf::from(value),
     };
     crate::git::template::lexical_normalize(&cwd.join(expanded))
-}
-
-fn read_prime_agent_settings(
-    path: &Path,
-) -> anyhow::Result<Option<serde_json::Map<String, serde_json::Value>>> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Prime Agent settings path has no parent"))?;
-    let leaf = path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("Prime Agent settings path has no file name"))?;
-    let root = crate::session::AnchoredDir::open(parent)?;
-    let Some(bytes) = root.read_regular(Path::new(leaf), PRIME_AGENT_SETTINGS_MAX_BYTES)? else {
-        anyhow::bail!("Prime Agent settings are not a bounded regular file");
-    };
-    Ok(serde_json::from_slice::<serde_json::Value>(&bytes)
-        .ok()
-        .and_then(|settings| settings.as_object().cloned()))
 }
 
 fn validated_prime_root_publication(
@@ -179,6 +155,10 @@ impl Instance {
         if !self.launch_invokes_resolved_agent_directly(agent) {
             return None;
         }
+        self.prime_agent_launch_options()
+    }
+
+    fn prime_agent_launch_options(&self) -> Option<PrimeAgentLaunchOptions> {
         let parsed = parse_launch_command(self.get_tool_command())?;
         let mut words = parsed.words;
         words.extend(shell_words::split(&self.extra_args).ok()?);
@@ -219,21 +199,6 @@ impl Instance {
         store: PathBuf,
         options: PrimeAgentLaunchOptions,
     ) -> anyhow::Result<PrimeAgentCapturePlan> {
-        anyhow::ensure!(
-            config.uses_default_container_home(),
-            "Prime capture requires the default container HOME"
-        );
-
-        let launch_cwd = PathBuf::from(self.container_workdir());
-        let container_cwd = options.cwd.as_deref().map_or_else(
-            || launch_cwd.clone(),
-            |cwd| resolve_prime_agent_path(cwd, &launch_cwd),
-        );
-        anyhow::ensure!(
-            container_cwd.is_absolute(),
-            "Prime working directory is not absolute"
-        );
-
         let environment_value = |key: &str| {
             config
                 .environment
@@ -241,57 +206,148 @@ impl Instance {
                 .find(|entry| entry.key() == key)
                 .map(|entry| entry.value())
         };
+        anyhow::ensure!(
+            config.uses_default_container_home(),
+            "Prime capture requires the default container HOME"
+        );
+        Self::resolve_prime_agent_layout(
+            store,
+            options,
+            Path::new(&self.container_workdir()),
+            (Path::new("/root"), Path::new(PRIME_AGENT_DIR_IN_CONTAINER)),
+            environment_value("PRIME_AGENT_SESSION_DIR")
+                .or_else(|| environment_value("PRIME_AGENT_CODING_AGENT_SESSION_DIR")),
+            |path, writable| config.host_path_for_container_path(path, writable),
+        )
+    }
+
+    pub(super) fn prime_agent_launch_plan_from_inputs(
+        &self,
+        inputs: &super::execution::NativeLaunchInputs,
+        agent_dir: &Path,
+        home: &Path,
+    ) -> anyhow::Result<PrimeAgentCapturePlan> {
+        let root = inputs.canonical_path(agent_dir)?;
+        let store = if let Some(container) = &inputs.container {
+            anyhow::ensure!(
+                home == Path::new("/root"),
+                "Prime capture requires the default container HOME"
+            );
+            container
+                .host_path(&root, true)
+                .context("Prime store is not mounted from a writable local filesystem")?
+        } else {
+            root.clone()
+        };
+        let mut options = self
+            .prime_agent_launch_options()
+            .context("Prime launch options do not support a managed conversation")?;
+        if let Some(cwd) = options.cwd.as_deref() {
+            let cwd = resolve_prime_agent_path(cwd, &inputs.cwd, home);
+            options.cwd = Some(
+                inputs
+                    .canonical_path(&cwd)?
+                    .to_str()
+                    .context("Prime working directory is not UTF-8")?
+                    .to_owned(),
+            );
+        }
+        Self::resolve_prime_agent_layout(
+            store,
+            options,
+            &inputs.cwd,
+            (home, &root),
+            inputs
+                .environment
+                .get("PRIME_AGENT_SESSION_DIR")
+                .or_else(|| {
+                    inputs
+                        .environment
+                        .get("PRIME_AGENT_CODING_AGENT_SESSION_DIR")
+                })
+                .map(String::as_str),
+            |path, writable| {
+                let path = inputs.canonical_path(path).ok()?;
+                match &inputs.container {
+                    Some(container) => container.host_path(&path, writable),
+                    None => Some(path),
+                }
+            },
+        )
+    }
+
+    fn resolve_prime_agent_layout(
+        store: PathBuf,
+        options: PrimeAgentLaunchOptions,
+        launch_cwd: &Path,
+        (home, agent_dir): (&Path, &Path),
+        environment_session_dir: Option<&str>,
+        host_path_for: impl Fn(&Path, bool) -> Option<PathBuf>,
+    ) -> anyhow::Result<PrimeAgentCapturePlan> {
+        let container_cwd = options.cwd.as_deref().map_or_else(
+            || launch_cwd.to_path_buf(),
+            |cwd| resolve_prime_agent_path(cwd, launch_cwd, home),
+        );
+        anyhow::ensure!(
+            container_cwd.is_absolute(),
+            "Prime working directory is not absolute"
+        );
         let configured_session_dir = options
             .session_dir
             .filter(|value| !value.is_empty())
             .or_else(|| {
-                environment_value("PRIME_AGENT_SESSION_DIR")
-                    .or_else(|| environment_value("PRIME_AGENT_CODING_AGENT_SESSION_DIR"))
+                environment_session_dir
                     .filter(|value| !value.is_empty())
-                    .map(str::to_string)
+                    .map(str::to_owned)
             });
-
-        let session_dir_value = match configured_session_dir {
-            Some(value) => value,
-            None => {
-                let read_settings = |container_path: PathBuf, scope: &str| {
-                    let host_path = config
-                        .host_path_for_container_path(&container_path, false)
-                        .with_context(|| {
-                            format!("{scope} Prime settings are not mapped to a readable host path")
-                        })?;
-                    read_prime_agent_settings(&host_path).with_context(|| {
-                        format!("cannot safely read Prime settings {}", host_path.display())
-                    })
-                };
-                let global = read_settings(
-                    Path::new(PRIME_AGENT_DIR_IN_CONTAINER).join("settings.json"),
-                    "global",
-                )?;
-                let project =
-                    read_settings(container_cwd.join(".prime/agent/settings.json"), "project")?;
-                let setting = |settings: &Option<serde_json::Map<String, serde_json::Value>>| {
-                    settings.as_ref().and_then(|s| s.get("sessionDir")).cloned()
-                };
-                match setting(&project).or_else(|| setting(&global)) {
-                    Some(serde_json::Value::String(value)) => value,
-                    Some(serde_json::Value::Null) | None => {
-                        format!("{PRIME_AGENT_DIR_IN_CONTAINER}/sessions")
-                    }
-                    Some(_) => {
-                        anyhow::bail!("Prime sessionDir setting is neither a string nor null")
-                    }
+        let session_dir_value = if let Some(value) = configured_session_dir {
+            value
+        } else {
+            let global_container_path = agent_dir.join("settings.json");
+            let project_container_path = container_cwd.join(".prime/agent/settings.json");
+            let global_host_path = host_path_for(&global_container_path, false)
+                .context("global Prime settings are not mapped to a readable host path")?;
+            let project_host_path = host_path_for(&project_container_path, false)
+                .context("project Prime settings are not mapped to a readable host path")?;
+            let global =
+                super::session_id::read_session_settings(&global_host_path).with_context(|| {
+                    format!(
+                        "cannot safely read Prime settings {}",
+                        global_host_path.display()
+                    )
+                })?;
+            let project = super::session_id::read_session_settings(&project_host_path)
+                .with_context(|| {
+                    format!(
+                        "cannot safely read Prime settings {}",
+                        project_host_path.display()
+                    )
+                })?;
+            match project
+                .as_ref()
+                .and_then(|settings| settings.get("sessionDir"))
+                .or_else(|| {
+                    global
+                        .as_ref()
+                        .and_then(|settings| settings.get("sessionDir"))
+                }) {
+                Some(serde_json::Value::String(value)) => value.clone(),
+                Some(serde_json::Value::Null) | None => {
+                    format!(
+                        "{}/sessions",
+                        agent_dir.to_str().context("Prime store is not UTF-8")?
+                    )
                 }
+                Some(_) => anyhow::bail!("Prime sessionDir setting is neither a string nor null"),
             }
         };
-
-        let container_session_dir = resolve_prime_agent_path(&session_dir_value, &container_cwd);
+        let container_session_dir =
+            resolve_prime_agent_path(&session_dir_value, &container_cwd, home);
         let session_dir = container_session_dir
-            .strip_prefix(Path::new(PRIME_AGENT_DIR_IN_CONTAINER))
+            .strip_prefix(agent_dir)
             .context("Prime session directory is outside the managed store")?
             .to_path_buf();
-        let mapped = config
-            .host_path_for_container_path(&container_session_dir, true)
+        let mapped = host_path_for(&container_session_dir, true)
             .context("Prime session directory is not mapped to a writable host path")?;
         anyhow::ensure!(
             mapped == store.join(&session_dir),
@@ -309,6 +365,16 @@ impl Instance {
     }
 
     pub(super) fn prime_root_publication(&self) -> Option<PrimeRootPublication> {
+        if let Some(active) = &self.active_execution {
+            let Some(CaptureContext::Prime {
+                plan,
+                sidecar: Some(_),
+            }) = &active.capture
+            else {
+                return None;
+            };
+            return validated_prime_root_publication(plan, &self.id);
+        }
         let plan = self.prime_agent_capture_plan(self.prime_agent_capture_options()?)
             .inspect_err(|error| {
                 tracing::debug!(target: "session.capture", session = %self.id, reason = %format_args!("{error:#}"),
@@ -318,15 +384,51 @@ impl Instance {
         validated_prime_root_publication(&plan, &self.id)
     }
 
-    /// The published root, unless excluded: `Some(Some(id))` when ready,
-    /// `Some(None)` when its transcript is still empty.
+    pub(super) fn prime_root_observation(
+        &self,
+        sid: String,
+    ) -> crate::session::poller::SessionIdObservation {
+        let mut observation =
+            crate::session::poller::SessionIdObservation::instance_sidecar(sid, None);
+        if let Some(active) = self.active_execution.as_ref().filter(|active| {
+            matches!(
+                active.capture,
+                Some(CaptureContext::Prime {
+                    sidecar: Some(_),
+                    ..
+                })
+            )
+        }) {
+            observation.execution = Some(active.clone());
+            observation.source = Some(active.binding.clone());
+        }
+        observation
+    }
+
+    pub(super) fn prime_published_conversation(
+        &self,
+    ) -> Option<crate::session::poller::SessionIdObservation> {
+        let PrimeRootPublication::Ready(sid) = self.prime_root_publication()? else {
+            return None;
+        };
+        Some(self.prime_root_observation(sid))
+    }
+
     pub(super) fn attributable_prime_root(&self) -> Option<Option<String>> {
         match self.prime_root_publication()? {
-            PrimeRootPublication::Ready(id) if !self.retroactive_capture_excludes.contains(&id) => {
+            PrimeRootPublication::Ready(id)
+                if !self.is_capture_excluded(
+                    &id,
+                    self.active_execution.as_ref().map(|active| &active.binding),
+                ) =>
+            {
                 Some(Some(id))
             }
             PrimeRootPublication::Pending(id)
-                if !self.retroactive_capture_excludes.contains(&id) =>
+                if !self.is_capture_excluded(
+                    &id,
+                    self.active_execution.as_ref().map(|active| &active.binding),
+                ) =>
             {
                 Some(None)
             }
@@ -341,10 +443,14 @@ impl Instance {
         let Some(target) = self.attributable_prime_root() else {
             return false;
         };
-        if self.agent_session_id == target {
+        let binding = target.as_ref().and_then(|sid| {
+            self.prime_root_observation(sid.clone())
+                .conversation_binding()
+        });
+        if self.agent_session_id == target && self.agent_session_binding == binding {
             return false;
         }
-        self.agent_session_id = target;
+        self.set_agent_conversation(target, binding, None);
         true
     }
 
@@ -369,6 +475,7 @@ mod tests {
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
         let mut inst = tool_instance("prime-agent", "/tmp/test");
         inst.sandbox_info = Some(test_sandbox("test", Some("/workspace/test")));
+        admit_sandbox_fixture(&inst);
 
         assert_eq!(inst.try_retroactive_capture(), None);
         std::fs::create_dir_all(inst.sandbox_capture_store_dir().unwrap()).unwrap();
@@ -387,6 +494,7 @@ mod tests {
         std::fs::create_dir_all(project.join(".prime/agent")).unwrap();
         let mut inst = tool_instance("prime-agent", project.to_str().unwrap());
         inst.sandbox_info = Some(test_sandbox("prime-plan", Some("/workspace/project")));
+        admit_sandbox_fixture(&inst);
         let store = inst.sandbox_capture_store_dir().unwrap();
         std::fs::create_dir_all(&store).unwrap();
         let mut config = inst.build_container_config().unwrap();
@@ -588,21 +696,16 @@ mod tests {
         });
         assert!(inst.prime_agent_capture_plan_with(&config, store).is_none());
     }
-
     #[test]
     #[serial_test::serial]
     fn prime_unmaterialized_root_never_resumes_previous_history() {
-        if which::which("node").is_err() {
-            eprintln!("skipping: node not found on PATH");
-            return;
-        }
         let tmp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let mut inst = tool_instance("prime-agent", project.to_str().unwrap());
         inst.sandbox_info = Some(test_sandbox("prime-empty", Some("/workspace/project")));
-        inst.build_launch_command().unwrap();
+        admit_sandbox_fixture(&inst);
         let plan = inst
             .prime_agent_capture_plan(inst.prime_agent_capture_options().unwrap())
             .unwrap();
@@ -619,356 +722,276 @@ mod tests {
             )
         };
         std::fs::write(sessions.join("old.jsonl"), header(old)).unwrap();
-        inst.agent_session_id = Some(old.to_string());
-        let prepared = inst.prepare_launch_command().unwrap();
-        let persisted = serde_json::to_string(&inst).unwrap();
-        let sidecar = plan
+        let record = plan
             .store
             .join("aoe-session")
             .join(&inst.id)
-            .join("session_id");
-        let script = r#"
-import { pathToFileURL } from "node:url";
-const extension = (await import(pathToFileURL(process.argv[1]).href)).default;
-let publish;
-extension({ on(event, callback) { if (event === "session_start") publish = callback; } });
-await publish({}, { sessionManager: {
-  getSessionId: () => process.argv[2],
-  getSessionFile: () => process.argv[3],
-  getHeader: () => ({ rlmDepth: 0, cwd: "/workspace/project" }),
-} });
-"#;
-        let output = std::process::Command::new("node")
-            .args(["--input-type=module", "--eval", script])
-            .arg(plan.store.join("extensions/aoe-session-id.js"))
-            .arg(new)
-            .arg(plan.container_session_dir.join("new.jsonl"))
-            .env("AOE_SESSION_ID_FILE", &sidecar)
-            .env("AOE_SESSION_ROOT_ONLY", "1")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let poll = crate::session::capture::prime_agent_poll_fn_sandboxed(
-            inst.prime_root_sidecar_poll_fn(plan.clone()),
-            plan.store.clone(),
-            plan.session_dir.clone(),
-            plan.container_cwd.clone(),
-            inst.id.clone(),
-            0.0,
-            HashSet::new(),
-        );
+            .join("root_session");
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        std::fs::write(
+            &record,
+            serde_json::json!({
+                "id": new,
+                "path": plan.container_session_dir.join("new.jsonl"),
+                "cwd": "/workspace/project",
+                "rlmDepth": 0
+            })
+            .to_string(),
+        )
+        .unwrap();
+        inst.agent_session_id = Some(old.to_string());
+
         assert_eq!(
-            poll(),
-            None,
-            "an empty new root must suppress fallback to old history"
+            inst.prime_root_publication(),
+            Some(PrimeRootPublication::Pending(new.to_string()))
         );
-        for (intent, expected) in [
-            (
-                ResumeIntent::Use(old.to_string()),
-                (Some(old.to_string()), true),
-            ),
-            (ResumeIntent::Cleared, (None, false)),
-            (
-                ResumeIntent::Fork {
-                    from: old.to_string(),
-                },
-                (Some(old.to_string()), false),
-            ),
-        ] {
-            let mut explicit = inst.clone();
-            explicit.resume_intent = intent;
-            assert_eq!(explicit.acquire_session_id_with(&|_| None), expected);
-        }
-        let refreshed = inst
-            .refresh_prepared_prime_launch_after_pane_stop(prepared)
-            .unwrap();
-        assert!(!refreshed.command.as_deref().unwrap().contains("--resume"));
-        for _ in 0..2 {
-            inst.clear_pane_identity_sidecar();
-            let mut restarted: Instance = serde_json::from_str(&persisted).unwrap();
-            let mut command = "prime-agent".to_string();
-            assert!(!restarted.apply_session_flags(&mut command, "test").unwrap());
-            assert_eq!(command, "prime-agent");
-            assert_eq!(restarted.agent_session_id, None);
-        }
-        std::fs::create_dir(sessions.join("new.jsonl")).unwrap();
-        assert_eq!(
-            poll().as_deref(),
-            Some(old),
-            "a non-regular leaf is not an empty root"
-        );
-        let mut uncertain: Instance = serde_json::from_str(&persisted).unwrap();
-        assert_eq!(
-            uncertain.acquire_session_id_with(&|_| None),
-            (Some(old.to_string()), true)
-        );
-        std::fs::remove_dir(sessions.join("new.jsonl")).unwrap();
-        let unavailable = sessions.with_extension("unavailable");
-        std::fs::rename(&sessions, &unavailable).unwrap();
-        let mut uncertain: Instance = serde_json::from_str(&persisted).unwrap();
-        assert_eq!(
-            uncertain.acquire_session_id_with(&|_| None),
-            (Some(old.to_string()), true)
-        );
-        std::fs::rename(&unavailable, &sessions).unwrap();
-        std::fs::write(sessions.join("new.jsonl"), header(new)).unwrap();
-        assert_eq!(poll().as_deref(), Some(new));
+        let persisted = serde_json::to_string(&inst).unwrap();
+        let mut command = "prime-agent".to_string();
+        let agent = inst.resolved_agent();
+        assert!(!inst
+            .apply_session_flags(&mut command, "test", agent, None)
+            .unwrap());
+        assert_eq!(command, "prime-agent");
+        assert_eq!(inst.agent_session_id, None);
+
         let mut restarted: Instance = serde_json::from_str(&persisted).unwrap();
         let mut command = "prime-agent".to_string();
-        assert!(restarted.apply_session_flags(&mut command, "test").unwrap());
+        assert!(!restarted
+            .apply_session_flags(&mut command, "test", agent, None)
+            .unwrap());
+        assert_eq!(command, "prime-agent");
+
+        // Materialization makes the new root resumable, never the unrelated old transcript.
+        std::fs::write(sessions.join("new.jsonl"), header(new)).unwrap();
+        let mut restarted: Instance = serde_json::from_str(&persisted).unwrap();
+        let mut command = "prime-agent".to_string();
+        assert!(restarted
+            .apply_session_flags(&mut command, "test", agent, None)
+            .unwrap());
         assert_eq!(command, format!("prime-agent --resume {new}"));
     }
 
     #[test]
     #[serial_test::serial]
-    fn prime_extension_root_only_keeps_parent_publication() {
+    fn prime_root_publisher_rejects_child_and_resumes_parent() {
         if which::which("node").is_err() {
-            eprintln!("skipping: node not found on PATH");
+            eprintln!("skipping: node not found");
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
-        let project = tmp.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        let mut inst = tool_instance("prime-agent", project.to_str().unwrap());
-        inst.extra_args = "--session-dir /root/.prime/agent/custom-sessions".to_string();
-        inst.sandbox_info = Some(test_sandbox("prime-root-only", Some("/workspace/project")));
-
-        inst.build_launch_command().unwrap();
-        let store = inst.sandbox_capture_store_dir().unwrap();
+        let store = tmp.path().join("store");
+        std::fs::create_dir_all(store.join("custom-sessions")).unwrap();
+        let store = std::fs::canonicalize(store).unwrap();
         let sessions = store.join("custom-sessions");
-        std::fs::create_dir_all(sessions.join("children")).unwrap();
-        let parent_id = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
-        let child_id = "018f47a6-7b80-7cc3-98a2-37b5f486b2a2";
-        std::fs::write(
-            sessions.join("parent.jsonl"),
-            format!(
-                "{}\n",
-                serde_json::json!({
-                    "type": "session",
-                    "version": 3,
-                    "id": parent_id,
-                    "timestamp": "2026-09-05T00:00:00.000Z",
-                    "cwd": "/workspace/project",
-                    "rlmDepth": 0,
-                })
+        let mut inst = tool_instance("prime-agent", tmp.path().to_str().unwrap());
+        inst.extra_args = "--session-dir /root/.prime/agent/custom-sessions".into();
+        inst.sandbox_info = Some(test_sandbox("prime-root", Some("/workspace/project")));
+        let parent = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
+        let child = "018f47a6-7b80-7cc3-98a2-37b5f486b2a2";
+        for (name, id, depth) in [("parent", parent, 0), ("child", child, 1)] {
+            std::fs::write(sessions.join(format!("{name}.jsonl")), format!("{}\n",
+                serde_json::json!({"type":"session", "id":id, "rlmDepth":depth, "cwd":"/workspace/project"}))).unwrap();
+        }
+        let sidecar = store.join("aoe-session").join(&inst.id).join("session_id");
+        let normal = store.join("pi-default/session_id");
+        let extension = store.join("extensions/aoe-session-id.js");
+        std::fs::create_dir_all(extension.parent().unwrap()).unwrap();
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/assets/session/aoe-session-id.js"
             ),
+            &extension,
         )
         .unwrap();
-        let child_header = format!(
-            "{}\n",
-            serde_json::json!({
-                "type": "session",
-                "version": 3,
-                "id": child_id,
-                "timestamp": "2026-09-05T00:00:01.000Z",
-                "cwd": "/workspace/project",
-                "rlmDepth": 1,
-            })
-        );
-        std::fs::write(sessions.join("children/child.jsonl"), &child_header).unwrap();
-        std::fs::write(sessions.join("child.jsonl"), child_header).unwrap();
-        let sidecar = store.join("aoe-session").join(&inst.id).join("session_id");
-        let root_sidecar = sidecar.parent().unwrap().join("root_session");
-        let publish_root = |id: &str, file: &str| {
-            std::fs::write(
-                &root_sidecar,
-                serde_json::json!({
-                    "id": id, "path": format!("/root/.prime/agent/custom-sessions/{file}"),
-                    "cwd": "/workspace/project", "rlmDepth": 0,
-                })
-                .to_string(),
-            )
-            .unwrap();
-        };
-        let default_sidecar = tmp.path().join("pi-default/session_id");
-        let default_path_sidecar = default_sidecar.parent().unwrap().join("session_path");
         let script = r#"
-import { readFileSync } from "node:fs";
-import { pathToFileURL } from "node:url";
-import { dirname, join } from "node:path";
-
-const extension = (await import(pathToFileURL(process.argv[1]).href)).default;
-process.chdir(process.argv[4]);
-const context = (id, path, rlmDepth) => ({
-  sessionManager: {
+    import { readFileSync } from 'node:fs';
+    import { pathToFileURL } from 'node:url';
+    const extension = (await import(pathToFileURL(process.argv[1]).href)).default;
+    process.chdir(process.argv[4]);
+    async function emit(target, rootOnly, id, name, depth) {
+      process.env.AOE_SESSION_ID_FILE = target;
+      process.env.AOE_SESSION_ROOT_ONLY = rootOnly ? '1' : '0';
+      let onStart;
+      extension({ on(event, handler) { if (event === 'session_start') onStart = handler; } });
+      await onStart({}, { sessionManager: {
     getSessionId: () => id,
-    getSessionFile: () => path,
-    getHeader: () => ({ rlmDepth, cwd: "/workspace/project" }),
-  },
-});
-async function publish(target, rootOnly) {
-  process.env.AOE_SESSION_ID_FILE = target;
-  if (rootOnly) process.env.AOE_SESSION_ROOT_ONLY = "1";
-  else process.env.AOE_SESSION_ROOT_ONLY = "0";
-  let sessionStart;
-  extension({ on(name, handler) { if (name === "session_start") sessionStart = handler; } });
-  await sessionStart({}, context(
-    "018f47a6-7b80-7cc3-98a2-37b5f486b2a1",
-    "custom-sessions/parent.jsonl",
-    0,
-  ));
-  await sessionStart({}, context(
-    "018f47a6-7b80-7cc3-98a2-37b5f486b2a2",
-    "custom-sessions/children/child.jsonl",
-    undefined,
-  ));
-  await sessionStart({}, context(
-    "018f47a6-7b80-7cc3-98a2-37b5f486b2a2",
-    "custom-sessions/children/child.jsonl",
-    1,
-  ));
-  return rootOnly
-    ? JSON.parse(readFileSync(join(dirname(target), "root_session"), "utf8"))
-    : readFileSync(target, "utf8").trim();
-}
-const rootOnly = await publish(process.argv[2], true);
-const defaultMode = await publish(process.argv[3], false);
-process.stdout.write(JSON.stringify({ rootOnly, defaultMode }));
-"#;
+    getSessionFile: () => 'custom-sessions/' + name + '.jsonl',
+    getHeader: () => ({ rlmDepth: depth, cwd: '/workspace/project' }),
+      } });
+    }
+    const [root, normal] = [process.argv[2], process.argv[3]];
+    await emit(root, true, '018f47a6-7b80-7cc3-98a2-37b5f486b2a1', 'parent', 0);
+    await emit(root, true, '018f47a6-7b80-7cc3-98a2-37b5f486b2a2', 'child', undefined);
+    await emit(root, true, '018f47a6-7b80-7cc3-98a2-37b5f486b2a2', 'child', 1);
+    await emit(normal, false, '018f47a6-7b80-7cc3-98a2-37b5f486b2a2', 'child', 1);
+    process.stdout.write(readFileSync(normal, 'utf8'));
+    "#;
         let output = std::process::Command::new("node")
             .args(["--input-type=module", "--eval", script])
-            .arg(store.join("extensions/aoe-session-id.js"))
+            .arg(&extension)
             .arg(&sidecar)
-            .arg(&default_sidecar)
+            .arg(&normal)
             .arg(&store)
             .output()
             .unwrap();
-
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let published: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(published["rootOnly"]["id"], parent_id);
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), child);
         assert_eq!(
-            published["defaultMode"], child_id,
-            "Pi default behavior changed"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&default_path_sidecar)
+            std::fs::read_to_string(normal.parent().unwrap().join("session_path"))
                 .unwrap()
                 .trim(),
-            "custom-sessions/children/child.jsonl",
-            "Pi default path publication changed"
+            "custom-sessions/child.jsonl"
         );
+        let plan = PrimeAgentCapturePlan {
+            store: store.clone(),
+            session_dir: "custom-sessions".into(),
+            container_session_dir: sessions.clone(),
+            container_cwd: "/workspace/project".into(),
+        };
         assert_eq!(
-            published["rootOnly"]["path"],
-            store
-                .canonicalize()
-                .unwrap()
-                .join("custom-sessions/parent.jsonl")
-                .to_str()
-                .unwrap()
+            validated_prime_root_publication(&plan, &inst.id),
+            Some(PrimeRootPublication::Ready(parent.into()))
         );
-
-        publish_root(child_id, "child.jsonl");
-        assert_eq!(
-            inst.prime_root_publication(),
-            None,
-            "a direct child transcript must fail root validation"
-        );
-        publish_root(parent_id, "parent.jsonl");
-
-        let mut restarted: Instance =
-            serde_json::from_str(&serde_json::to_string(&inst).unwrap()).unwrap();
+        let record = sidecar.parent().unwrap().join("root_session");
+        std::fs::write(&record, serde_json::json!({
+            "id": child, "path": sessions.join("child.jsonl"), "cwd": "/workspace/project", "rlmDepth": 0
+        }).to_string()).unwrap();
+        assert_eq!(validated_prime_root_publication(&plan, &inst.id), None);
+        std::fs::write(&record, serde_json::json!({
+            "id": parent, "path": sessions.join("parent.jsonl"), "cwd": "/workspace/project", "rlmDepth": 0
+        }).to_string()).unwrap();
+        let binding = crate::session::ExecutionBinding {
+            agent: "prime-agent".into(),
+            stores: vec![store.clone()],
+            configuration: Vec::new(),
+            exported_default_store: false,
+            cwd: "/workspace/project".into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        };
+        inst.active_execution = Some(ActiveExecution {
+            launch_id: "root-launch".into(),
+            binding,
+            capture: Some(CaptureContext::Prime {
+                plan,
+                sidecar: Some(SessionSidecarSource::SandboxDir(store)),
+            }),
+            container: None,
+        });
         let mut command = "prime-agent".to_string();
-        assert!(restarted.apply_session_flags(&mut command, "test").unwrap());
-        assert_eq!(command, format!("prime-agent --resume {parent_id}"));
-
-        let profile = restarted.effective_profile();
-        let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
+        let agent = inst.resolved_agent();
+        assert!(inst
+            .apply_session_flags(&mut command, "test", agent, None)
+            .unwrap());
+        assert_eq!(command, format!("prime-agent --resume {parent}"));
+    }
+    #[test]
+    #[serial_test::serial]
+    fn prepared_prime_launch_refreshes_resident_root_without_overwriting_peer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = tool_instance("prime-agent", project.to_str().unwrap());
+        inst.source_profile = "prime-resident-root-refresh".into();
+        inst.sandbox_info = Some(test_sandbox("prime-resident", Some("/workspace/project")));
+        admit_sandbox_fixture(&inst);
+        let plan = inst
+            .prime_agent_capture_plan(inst.prime_agent_capture_options().unwrap())
+            .unwrap();
+        let sessions = plan.store.join(&plan.session_dir);
+        std::fs::create_dir_all(&sessions).unwrap();
+        let record = plan
+            .store
+            .join("aoe-session")
+            .join(&inst.id)
+            .join("root_session");
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        let parent = "018f47a6-7b80-7cc3-98a2-37b5f486b2a1";
+        let newer = "018f47a6-7b80-7cc3-98a2-37b5f486b2a3";
+        let publish = |id: &str, name: &str| {
+            std::fs::write(sessions.join(format!("{name}.jsonl")), format!("{}\n",
+                serde_json::json!({"type": "session", "id": id, "rlmDepth": 0, "cwd": plan.container_cwd}))).unwrap();
+            std::fs::write(
+                &record,
+                serde_json::json!({
+                    "id": id, "path": plan.container_session_dir.join(format!("{name}.jsonl")),
+                    "cwd": plan.container_cwd, "rlmDepth": 0
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        publish(parent, "parent");
+        let storage =
+            crate::session::storage::Storage::new_unwatched(&inst.source_profile).unwrap();
         storage
-            .update(|instances, _| {
-                instances.push(restarted.clone());
+            .update(|rows, _| {
+                rows.push(inst.clone());
                 Ok(())
             })
             .unwrap();
-        let prepared = restarted.prepare_launch_command().unwrap();
-        assert!(prepared.command.as_deref().unwrap().contains(parent_id));
-        let excluded_prepared = restarted.prepare_launch_command().unwrap();
-        let newer_id = "018f47a6-7b80-7cc3-98a2-37b5f486b2a3";
-        std::fs::write(
-            sessions.join("newer.jsonl"),
-            format!(
-                "{}\n",
-                serde_json::json!({
-                    "type": "session",
-                    "version": 3,
-                    "id": newer_id,
-                    "timestamp": "2026-09-05T00:00:02.000Z",
-                    "cwd": "/workspace/project",
-                    "rlmDepth": 0,
-                })
-            ),
-        )
-        .unwrap();
-        publish_root(newer_id, "newer.jsonl");
-        for stored in [None, Some(parent_id.to_string())] {
-            let mut excluded = restarted.clone();
-            excluded.agent_session_id = stored.clone();
-            excluded
-                .retroactive_capture_excludes
-                .insert(newer_id.to_string());
-            let mut command = "prime-agent".to_string();
-            excluded.apply_session_flags(&mut command, "test").unwrap();
-            assert_eq!(excluded.agent_session_id, stored);
-            assert!(!command.contains(newer_id), "{command}");
-        }
-        let mut excluded = restarted.clone();
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .unwrap();
+        assert!(prepared.command.as_deref().unwrap().contains(parent));
+
+        publish(newer, "newer");
+        let mut excluded = inst.clone();
         excluded
             .retroactive_capture_excludes
-            .insert(newer_id.to_string());
-        let excluded_launch = excluded
-            .refresh_prepared_prime_launch_after_pane_stop(excluded_prepared)
+            .insert(ConversationBinding::unknown(newer));
+        let prior = excluded.conversation_state();
+        let prepared_excluded = excluded.prepare_launch_command(prior).unwrap();
+        let excluded_prepared = excluded
+            .refresh_prepared_prime_launch_after_pane_stop(prepared_excluded)
             .unwrap();
-        assert_eq!(excluded.agent_session_id.as_deref(), Some(parent_id));
-        assert!(excluded_launch
+        assert!(!excluded_prepared
             .command
             .as_deref()
             .unwrap()
-            .contains(parent_id));
-        assert!(!excluded_launch
-            .command
-            .as_deref()
-            .unwrap()
-            .contains(newer_id));
+            .contains(newer));
 
-        let prepared = restarted
+        let refreshed = inst
             .refresh_prepared_prime_launch_after_pane_stop(prepared)
             .unwrap();
-        assert_eq!(restarted.agent_session_id.as_deref(), Some(newer_id));
-        assert!(prepared.command.as_deref().unwrap().contains(newer_id));
-        let _ = restarted.persist_session_id(
-            &profile,
-            prepared.expected_prior_sid.as_deref(),
-            prepared.expected_prior_intent.clone(),
+        assert!(refreshed.command.as_deref().unwrap().contains(newer));
+        assert_eq!(
+            inst.persist_session_id(
+                &inst.source_profile.clone(),
+                &refreshed.expected_conversation
+            ),
+            SidPersistOutcome::Published
         );
         assert_eq!(
             storage.load().unwrap()[0].agent_session_id.as_deref(),
-            Some(newer_id)
+            Some(newer)
         );
-        assert_eq!(restarted.agent_session_id.as_deref(), Some(newer_id));
+
+        let peer = "018f47a6-7b80-7cc3-98a2-37b5f486b2a2";
         storage
-            .update(|instances, _| {
-                instances[0].agent_session_id = Some(child_id.to_string());
+            .update(|rows, _| {
+                rows[0].agent_session_id = Some(peer.into());
                 Ok(())
             })
             .unwrap();
-        let _ = restarted.persist_session_id(
-            &profile,
-            prepared.expected_prior_sid.as_deref(),
-            prepared.expected_prior_intent,
+        assert_eq!(
+            inst.persist_session_id(
+                &inst.source_profile.clone(),
+                &refreshed.expected_conversation,
+            ),
+            SidPersistOutcome::Published
         );
         assert_eq!(
             storage.load().unwrap()[0].agent_session_id.as_deref(),
-            Some(child_id)
+            Some(peer)
         );
-        assert_eq!(restarted.agent_session_id.as_deref(), Some(child_id));
+        assert_eq!(inst.agent_session_id.as_deref(), Some(peer));
     }
 }

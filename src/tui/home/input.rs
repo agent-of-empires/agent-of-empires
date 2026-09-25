@@ -12,7 +12,7 @@ use super::{
 };
 use crate::session::config::repo_config;
 use crate::session::config::{
-    load_config, update_app_state, update_config, GroupByMode, SortOrder,
+    load_config, update_app_state, update_config, GroupByMode, SidebarPosition, SortOrder,
 };
 use crate::session::{list_profiles_for_display, Item, Status};
 use crate::tui::app::Action;
@@ -598,11 +598,25 @@ impl HomeView {
         hit
     }
 
-    /// True when `(col, row)` lands on the side-by-side list/preview divider, which is the
-    /// preview's left border column that `hit_list` and `hit_preview` both miss by design.
-    /// False in stacked mode, in the takeover views (which clear `divider_col`), and while
-    /// a modal is open, so a dialog over the divider swallows stray clicks instead of
-    /// starting a hidden drag.
+    /// Cancel gestures tied to old screen coordinates before moving the sidebar.
+    pub(super) fn set_sidebar_position(&mut self, position: SidebarPosition) {
+        if self.sidebar_position == position {
+            return;
+        }
+        match self.drag_state {
+            Some(DragKind::ListDivider) => {
+                self.handle_drag_end();
+            }
+            Some(DragKind::PreviewSelect) => {
+                self.clear_preview_selection();
+            }
+            _ => {}
+        }
+        self.sidebar_position = position;
+    }
+
+    /// Hit the preview border shared with the list, on either side.
+    /// Stacked and takeover views clear `divider_col`; modals block drags.
     pub fn hit_divider(&self, col: u16, row: u16) -> bool {
         if self.has_dialog() {
             return false;
@@ -628,10 +642,7 @@ impl HomeView {
     /// mobile clients where Shift-bypass does nothing.
     pub fn handle_drag_start(&mut self, col: u16, row: u16) -> bool {
         if self.hit_divider(col, row) {
-            self.drag_state = Some(DragKind::ListDivider {
-                start_col: col,
-                start_width: self.list_width,
-            });
+            self.drag_state = Some(DragKind::ListDivider);
             return true;
         }
         // Modals that aren't live-send sit over the preview, so a click inside
@@ -657,11 +668,8 @@ impl HomeView {
         false
     }
 
-    /// Apply a drag-in-progress event. The divider recomputes the width from
-    /// `start_width + delta`, clamped to `[10, main_area_width - PREVIEW_MIN_WIDTH]` so
-    /// the preview keeps its floor and the value never wraps `u16`. A preview-pane
-    /// selection clamps its extent to the preview area and stashes it on
-    /// `preview_selection` for the renderer.
+    /// Resize the list within the preview's minimum width, or update a
+    /// text selection within the preview's content bounds.
     ///
     /// True when state changed, so the caller redraws. Nothing persists per tick: the
     /// divider saves on release and the preview-select path emits OSC 52 on release.
@@ -704,17 +712,17 @@ impl HomeView {
             return false;
         }
         match self.drag_state {
-            Some(DragKind::ListDivider {
-                start_col,
-                start_width,
-            }) => {
-                // i32 arithmetic so a leftward drag past the start column doesn't
-                // underflow u16 before the clamp.
-                let delta = col as i32 - start_col as i32;
-                let proposed = start_width as i32 + delta;
+            Some(DragKind::ListDivider) => {
+                if self.divider_col.is_none() {
+                    self.handle_drag_end();
+                    return false;
+                }
+                let proposed = match self.sidebar_position {
+                    SidebarPosition::Left => col as i32 - self.list_area.x as i32,
+                    SidebarPosition::Right => self.list_area.right() as i32 - 1 - col as i32,
+                };
 
-                // The clamp ceiling tracks the live viewport width, so a terminal resize
-                // mid-drag is honored; the floor of 10 matches the keyboard `<` limit.
+                // Match the keyboard shrink limit and reserve preview space.
                 let ceiling = self
                     .main_area_width
                     .saturating_sub(responsive::PREVIEW_MIN_WIDTH);
@@ -873,7 +881,7 @@ impl HomeView {
         self.preview_drag_pos = None;
         self.preview_autoscroll_at = None;
         match state {
-            DragKind::ListDivider { .. } => {
+            DragKind::ListDivider => {
                 self.save_list_width();
             }
             DragKind::PreviewSelect => {
@@ -2845,7 +2853,11 @@ impl HomeView {
         if inst.is_structured() {
             crate::session::fork::structured_fork_capable(&inst.tool, inst.agent_name.as_deref())
         } else {
-            crate::session::fork::terminal_agent_can_fork(&inst.tool)
+            inst.fork_parent_binding()
+                .and_then(|parent| parent.execution.as_ref())
+                .is_some_and(|execution| {
+                    crate::session::fork::terminal_agent_can_fork(&execution.agent)
+                })
         }
     }
 
@@ -3000,8 +3012,12 @@ impl HomeView {
             return;
         };
         let tool = parent.tool.clone();
-        let parent_agent_session_id = parent.agent_session_id.clone();
-        let repo_path = parent.repo_path().to_string();
+        let parent_binding = parent.fork_parent_binding().cloned();
+        let repo_path = if parent.is_structured() {
+            parent.repo_path().to_string()
+        } else {
+            parent.project_path.clone()
+        };
         let group_path = parent.group_path.clone();
         let title = parent.title.clone();
         let parent_is_structured = parent.is_structured();
@@ -3038,11 +3054,7 @@ impl HomeView {
             }
         } else {
             let child_id = crate::session::capture::generate_session_uuid();
-            match crate::session::fork::terminal_fork_seed(
-                &tool,
-                parent_agent_session_id.as_deref(),
-                child_id,
-            ) {
+            match crate::session::fork::terminal_fork_seed(parent_binding.as_ref(), child_id) {
                 Ok(s) => s,
                 Err(crate::session::ForkDenied::AgentCannotFork) => {
                     self.info_dialog = Some(InfoDialog::new(

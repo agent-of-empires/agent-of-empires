@@ -1,6 +1,6 @@
 //! Session management module
 
-mod anchored_fs;
+pub(crate) mod anchored_fs;
 pub mod artifacts;
 pub mod attach_project;
 pub mod builder;
@@ -69,17 +69,20 @@ pub use groups::{
 };
 #[cfg(test)]
 pub(crate) use instance::install_aliases;
+#[cfg(test)]
+pub(crate) use instance::test_helpers::publish_host_pi_transcript;
 pub(crate) use instance::{
     duplicate_session_error, find_duplicate_session, is_duplicate_session,
-    persist_omp_session_to_storage, persist_session_to_storage, PassiveStatusPatch, ResumeIntent,
-    SidWrite, NEWER_GENERATION_BUSY_REASON,
+    persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite,
+    NEWER_GENERATION_BUSY_REASON,
 };
 pub(crate) use instance::{
     generic_host_config_path_for, resolved_agent_for, sidecar_host_config_path_for,
-    ResumeAttemptPolicy, TerminalContextResume,
+    ConversationState, ResumeAttemptPolicy, TerminalContextResume,
 };
 pub use instance::{
-    is_valid_session_color, DetectionState, EnsureReadyError, EnsureReadyOutcome, Instance,
+    is_valid_session_color, ConversationBinding, ConversationProvenance, DetectionState,
+    EnsureReadyError, EnsureReadyOutcome, ExecutionBinding, ExecutionLocation, Instance,
     LaunchSidOutcome, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
     PendingInitialTurn, PluginCreateIdempotency, PollerStart, SandboxInfo, SessionBucket,
     StartOutcome, Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
@@ -447,7 +450,7 @@ impl Drop for FailNextListProfilesGuard {
 }
 
 /// Enumerate profile directory names in `profiles_dir`, skipping symlinks.
-fn list_profile_names_in(profiles_dir: &std::path::Path) -> Result<Vec<String>> {
+pub(crate) fn list_profile_names_in(profiles_dir: &std::path::Path) -> Result<Vec<String>> {
     let mut profiles = Vec::new();
     for entry in fs::read_dir(profiles_dir)? {
         let entry = entry?;

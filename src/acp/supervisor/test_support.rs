@@ -67,6 +67,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             .expect("fixture installs its respawn");
         handle.client = Arc::new(client);
         handle.lease = respawn.clone();
+        handle.native_session_id = None;
         respawn.epoch()
     }
 
@@ -131,6 +132,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             session_id.to_string(),
             WorkerHandle {
                 client: Arc::new(client),
+                native_session_id: None,
                 drain_task: tokio::spawn(async {}),
                 restart_history: vec![],
                 kind,
@@ -232,12 +234,14 @@ pub(super) fn spawn_request(session_id: &str) -> SpawnRequest {
         effort_explicit: false,
         stored_acp_session_id: None,
         fork_from: None,
+        sandbox_continuation: super::SandboxContinuation::Persisted,
         seed_history_replay: false,
         sandbox_info: None,
         source_profile: None,
         yolo_mode: false,
         acp_mode_id: None,
         agent_command_override: None,
+        claude_store_pin: None,
     }
 }
 
@@ -269,6 +273,7 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
         source_profile: None,
         mcp_servers: Vec::new(),
         generation: 0,
+        claude_store_pin: None,
     }
 }
 

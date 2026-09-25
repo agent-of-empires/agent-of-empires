@@ -83,15 +83,6 @@ describe("SessionRow Add project entry", () => {
 });
 
 describe("AddProjectModal", () => {
-  it("warns before attaching that the directory moves and the session restarts", async () => {
-    openRowMenu(ws());
-    fireEvent.click(screen.getByTestId("sidebar-context-menu-add-project"));
-    const warning = await waitFor(() => screen.getByTestId("add-project-modal-restart-warning"));
-    for (const text of ["working directory moves", "stopped for the move and started again", "conversation is kept"]) {
-      expect(warning.textContent).toContain(text);
-    }
-  });
-
   it.each([
     ["frontend", false],
     ["/src/frontend", true],

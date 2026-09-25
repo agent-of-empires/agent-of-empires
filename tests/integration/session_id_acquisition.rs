@@ -1,5 +1,4 @@
-//! `start_with_size_opts` must return `LaunchSidOutcome::Skipped` when the
-//! tmux session already exists, short-circuiting before `apply_session_flags`.
+//! Native session ID acquisition and launch lifecycle regressions.
 
 use agent_of_empires::session::{GroupTree, Instance, LaunchSidOutcome, Status, Storage};
 use agent_of_empires::tmux;
@@ -223,6 +222,20 @@ fn restart_surfaces_a_pinned_fresh_launch_that_dies() {
     inst.tool = "claude".to_string();
     inst.command = "claude".to_string();
     inst.agent_session_id = Some(VALID_CLAUDE_UUID.to_string());
+    inst.agent_session_binding = Some(agent_of_empires::session::ConversationBinding {
+        session_id: VALID_CLAUDE_UUID.into(),
+        provenance: agent_of_empires::session::ConversationProvenance::Preallocated,
+        execution: Some(agent_of_empires::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![temp.path().join(".claude")],
+            configuration: Vec::new(),
+            exported_default_store: false,
+            cwd: workdir.clone(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        }),
+        transcript_path: None,
+    });
     let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
     let _cleanup = TmuxCleanup(&session_name);
 
@@ -252,6 +265,105 @@ fn restart_surfaces_a_pinned_fresh_launch_that_dies() {
         wait_until(|| !tmux::Session::from_name(&session_name).exists()),
         "the corpse pane must be torn down so a later start is not a no-op"
     );
+}
+
+#[test]
+#[serial]
+fn fork_child_publication_confirms_preallocated_identity() {
+    if !tmux_available() {
+        return;
+    }
+    let temp = setup_temp_home();
+    acknowledge_agent_hooks();
+    let project = temp.path().join("project");
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    let aoe = env!("CARGO_BIN_EXE_aoe");
+    let claude = bin.join("claude");
+    let publish = temp.path().join("publish");
+    let published = temp.path().join("published");
+    std::fs::write(
+        &claude,
+        format!(
+            r#"#!/bin/sh
+sid=
+while [ "$#" -gt 0 ]; do if [ "$1" = --session-id ]; then shift; sid=$1; fi; shift; done
+[ -n "$sid" ] || exit 1
+while [ ! -e {} ]; do sleep 0.05; done
+printf '{{"session_id":"%s"}}\n' "$sid" | {} __extract-session-id || exit 1
+: > {}
+sleep 60
+"#,
+            shell_words::quote(publish.to_str().unwrap()),
+            shell_words::quote(aoe),
+            shell_words::quote(published.to_str().unwrap()),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let cli = |args: &[&str]| {
+        let output = Command::new(aoe)
+            .args(["--profile", "default"])
+            .args(args)
+            .current_dir(&project)
+            .env("PATH", &path)
+            .env("SHELL", "/bin/bash")
+            .env("TMPDIR", temp.path())
+            .env("AOE_TMUX_SOCKET", tmux_socket())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    cli(&["profile", "create", "default"]);
+    cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--tool",
+        "claude",
+        "-t",
+        "parent",
+    ]);
+    cli(&["session", "set-session-id", "parent", VALID_CLAUDE_UUID]);
+    cli(&["add", "--fork-from", "parent", "-t", "child"]);
+    let storage = Storage::open_unwatched("default").unwrap();
+    let child = storage
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.title == "child")
+        .unwrap();
+    let session_name = tmux::Session::generate_name(&child.id, &child.title);
+    let _cleanup = TmuxCleanup(&session_name);
+    let child_sid = child.agent_session_id.clone();
+    cli(&["session", "start", "child"]);
+    std::fs::write(&publish, "").unwrap();
+    assert!(
+        wait_until(|| published.is_file()),
+        "native publication did not complete"
+    );
+    cli(&["session", "stop", "child"]);
+    assert!(
+        storage.load().unwrap().iter().any(|row| {
+            row.id == child.id
+                && row.agent_session_id == child_sid
+                && row.agent_session_binding.as_ref().is_some_and(|binding| {
+                    binding.provenance
+                        == agent_of_empires::session::ConversationProvenance::Observed
+                })
+        }),
+        "qualified same-SID publication must confirm the fork child"
+    );
+    cli(&["add", "--fork-from", "child", "-t", "grandchild"]);
 }
 
 fn launch_count(path: &std::path::Path) -> usize {

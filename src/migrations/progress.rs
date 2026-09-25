@@ -6,7 +6,7 @@
 //! call `step`, `progress` and `notice` from wherever the work happens; with
 //! no reporter installed every call is a no-op.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -64,6 +64,7 @@ thread_local! {
     /// once (the boot pass and a store move from a session launch); a
     /// process-wide slot would route one's events to the other's renderer.
     static REPORTERS: RefCell<Vec<(u64, Reporter)>> = const { RefCell::new(Vec::new()) };
+    static ANNOUNCED: Cell<bool> = const { Cell::new(false) };
 }
 
 static NEXT_REPORTER_ID: AtomicU64 = AtomicU64::new(1);
@@ -88,6 +89,22 @@ impl Drop for ReporterGuard {
         if let Some(id) = self.0.take() {
             REPORTERS.with(|reporters| reporters.borrow_mut().retain(|(other, _)| *other != id));
         }
+    }
+}
+
+pub(super) fn install_announced(announced: bool) -> AnnouncedGuard {
+    AnnouncedGuard(ANNOUNCED.replace(announced))
+}
+
+pub(super) fn announced() -> bool {
+    ANNOUNCED.get()
+}
+
+pub(super) struct AnnouncedGuard(bool);
+
+impl Drop for AnnouncedGuard {
+    fn drop(&mut self) {
+        ANNOUNCED.set(self.0);
     }
 }
 

@@ -26,7 +26,8 @@ pub enum QueueReason {
     Cancelling,
     /// A `/compact` is running.
     Compacting,
-    /// No live worker, and not the idle-dormant case this POST would wake.
+    /// No live worker, and not a case this POST would wake (idle dormancy or a
+    /// rate-limit park).
     WorkerDown,
 }
 
@@ -37,13 +38,16 @@ pub struct WorkerLiveness {
     pub running: bool,
     /// The session was auto-stopped for inactivity.
     pub idle_dormant: bool,
-    /// The session is parked on the rate-limit redelivery cap.
-    pub rate_limit_exhausted: bool,
+    /// Any live, unsuperseded rate-limit park, armed or capped. With
+    /// `rate_limit_auto_resume` off (the default) the reconciler holds its
+    /// respawn indefinitely, so a queued prompt would wait on a worker nothing
+    /// starts; sending is the user asking to try again now.
+    pub rate_limit_parked: bool,
 }
 
 /// Decide what to do with a prompt arriving for `state`.
 pub fn decide(state: &AcpState, worker: WorkerLiveness) -> PromptDispatch {
-    if !worker.running && !worker.idle_dormant && !worker.rate_limit_exhausted {
+    if !worker.running && !worker.idle_dormant && !worker.rate_limit_parked {
         return PromptDispatch::Queued {
             reason: QueueReason::WorkerDown,
         };
@@ -84,12 +88,12 @@ mod tests {
         s
     }
 
-    /// `(running, idle_dormant, rate_limit_exhausted)`.
+    /// `(running, idle_dormant, rate_limit_parked)`.
     fn worker(flags: (bool, bool, bool)) -> WorkerLiveness {
         WorkerLiveness {
             running: flags.0,
             idle_dormant: flags.1,
-            rate_limit_exhausted: flags.2,
+            rate_limit_parked: flags.2,
         }
     }
 
@@ -100,7 +104,8 @@ mod tests {
         const LIVE: (bool, bool, bool) = (true, false, false);
         const IDLE: (bool, bool, bool) = (false, false, false);
         const DORMANT: (bool, bool, bool) = (false, true, false);
-        const CAPPED: (bool, bool, bool) = (false, false, true);
+        // Armed or capped: `decide` does not tell them apart.
+        const PARKED: (bool, bool, bool) = (false, false, true);
         // (incident, turn flags, worker liveness, decision)
         let cases = [
             (
@@ -170,18 +175,17 @@ mod tests {
                 queued(QueueReason::TurnActive),
             ),
             (
-                "#3688 a session parked on the redelivery cap sends: nothing \
-                 un-parks it on a timer, so queueing strands the prompt the \
-                 banner asked for",
+                "a rate-limit park sends, armed or capped: by default its respawn \
+                 is held indefinitely, so queueing would strand the prompt",
                 (false, false, false, false),
-                CAPPED,
+                PARKED,
                 PromptDispatch::Sent,
             ),
             (
-                "#3688 the cap park does not override the turn gates either, \
+                "#3688 a park does not override the turn gates either, \
                  so a stale turn_active latch still parks",
                 (true, false, false, false),
-                CAPPED,
+                PARKED,
                 queued(QueueReason::TurnActive),
             ),
         ];
