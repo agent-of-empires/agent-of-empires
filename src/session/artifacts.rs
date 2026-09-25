@@ -94,41 +94,30 @@ mod tests {
 
     #[test]
     #[serial]
-    fn resolve_rejects_dotdot_traversal() {
-        let _tmp = isolate_app_dir();
-        let id = format!("art-{}", uuid::Uuid::new_v4());
-        session_artifact_dir(&id).unwrap();
-        assert!(resolve_artifact_path(&id, "../../../../etc/hosts").is_none());
-    }
-
-    #[test]
-    #[serial]
-    fn resolve_rejects_symlink_escape() {
+    fn resolve_returns_only_regular_files_inside_the_session_dir() {
         let _tmp = isolate_app_dir();
         let id = format!("art-{}", uuid::Uuid::new_v4());
         let dir = session_artifact_dir(&id).unwrap();
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink("/etc/hosts", dir.join("escape")).unwrap();
-            assert!(resolve_artifact_path(&id, "escape").is_none());
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn resolve_rejects_missing_and_non_file() {
-        let _tmp = isolate_app_dir();
-        let id = format!("art-{}", uuid::Uuid::new_v4());
-        let dir = session_artifact_dir(&id).unwrap();
-        assert!(resolve_artifact_path(&id, "nope.png").is_none());
+        fs::write(dir.join("shot.png"), b"png").unwrap();
         fs::create_dir_all(dir.join("adir")).unwrap();
-        assert!(resolve_artifact_path(&id, "adir").is_none());
-    }
-
-    #[test]
-    #[serial]
-    fn resolve_rejects_unsafe_instance_id() {
-        let _tmp = isolate_app_dir();
-        assert!(resolve_artifact_path("../etc", "hosts").is_none());
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc/hosts", dir.join("escape")).unwrap();
+        // Enough `..` to reach `/` from the session dir, so the traversal row names a real file.
+        let traversal = format!("{}etc/hosts", "../".repeat(dir.components().count()));
+        // An unsafe id whose base resolves (the app dir) must not reach a file under it.
+        let via_parent = format!("artifacts/{id}/shot.png");
+        for (instance, rel) in [
+            (id.as_str(), traversal.as_str()),
+            (id.as_str(), "escape"),
+            (id.as_str(), "nope.png"),
+            (id.as_str(), "adir"),
+            ("..", via_parent.as_str()),
+        ] {
+            assert_eq!(
+                resolve_artifact_path(instance, rel),
+                None,
+                "{instance} {rel}"
+            );
+        }
     }
 }

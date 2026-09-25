@@ -67,26 +67,18 @@ mod tests {
 
     #[test]
     #[serial]
-    fn is_scratch_path_rejects_outside_root() {
+    fn is_scratch_path_rejects_paths_outside_the_root() {
         let _tmp = isolate_app_dir();
-        assert!(!is_scratch_path(Path::new("/etc")));
-        assert!(!is_scratch_path(Path::new("/tmp/aoe-scratch-foo")));
-    }
-
-    #[test]
-    #[serial]
-    fn is_scratch_path_rejects_dotdot_traversal() {
-        let _tmp = isolate_app_dir();
-        let id = format!("traverse-{}", uuid::Uuid::new_v4());
-        let real = provision_scratch_dir(&id).unwrap();
-
-        let tampered = real.join("..").join("..").join("..").join("etc");
-        assert!(
-            !is_scratch_path(&tampered),
-            "`..` traversal must not escape the scratch root"
-        );
-
-        let _ = fs::remove_dir_all(&real);
+        let real = provision_scratch_dir(&format!("traverse-{}", uuid::Uuid::new_v4())).unwrap();
+        // `real/../..` is the existing app dir: lexically under the root, canonically outside it.
+        let traversal = real.join("..").join("..");
+        for path in [
+            Path::new("/etc"),
+            Path::new("/tmp/aoe-scratch-foo"),
+            traversal.as_path(),
+        ] {
+            assert!(!is_scratch_path(path), "{}", path.display());
+        }
     }
 
     #[test]

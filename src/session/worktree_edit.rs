@@ -456,23 +456,17 @@ mod tests {
     }
 
     #[test]
-    fn leaf_from_title_slugifies() {
-        assert_eq!(worktree_leaf_from_title("Auth refactor"), "auth-refactor");
-        assert_eq!(
-            worktree_leaf_from_title("Fix: the/thing (v2)"),
-            "fix-the-thing-v2"
-        );
-        let leaf = worktree_leaf_from_title("jacob/feature-1");
-        assert_eq!(leaf, "jacob-feature-1");
-        assert!(!leaf.contains('/'));
-    }
-
-    #[test]
-    fn leaf_from_title_never_empty_or_traversal() {
-        assert_eq!(worktree_leaf_from_title("..."), "session");
-        assert_eq!(worktree_leaf_from_title("   "), "session");
-        let leaf = worktree_leaf_from_title("../escape");
-        assert!(!leaf.contains('/') && leaf != ".." && !leaf.is_empty());
+    fn leaf_from_title_is_one_safe_non_empty_component() {
+        for (title, leaf) in [
+            ("Auth refactor", "auth-refactor"),
+            ("Fix: the/thing (v2)", "fix-the-thing-v2"),
+            ("jacob/feature-1", "jacob-feature-1"),
+            ("...", "session"),
+            ("   ", "session"),
+            ("../escape", "escape"),
+        ] {
+            assert_eq!(worktree_leaf_from_title(title), leaf, "{title:?}");
+        }
     }
 
     #[test]

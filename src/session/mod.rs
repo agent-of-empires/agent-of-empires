@@ -935,48 +935,6 @@ mod tests {
         assert_eq!(count_active_tuis(Duration::from_secs(30)), 1);
     }
 
-    #[test]
-    #[serial_test::serial]
-    fn test_collect_startup_config_warnings_clean() {
-        let temp = isolate_app_dir();
-        assert!(collect_startup_config_warnings("").is_none());
-
-        let dir = app_dir(&temp);
-        fs::write(
-            dir.join("config.toml"),
-            toml::to_string_pretty(&config::Config::default()).unwrap(),
-        )
-        .unwrap();
-        let profile_dir = dir.join("profiles").join("default");
-        fs::create_dir_all(&profile_dir).unwrap();
-        fs::write(
-            profile_dir.join("config.toml"),
-            "description = \"work\"\n[sandbox]\nenabled_by_default = true\n",
-        )
-        .unwrap();
-        let warning = collect_startup_config_warnings("default");
-        assert!(
-            warning.is_none(),
-            "round-tripped config must not warn, got: {warning:?}"
-        );
-
-        let _temp = seed_configs(
-            Some(
-                "[session]\n\
-                 custom_agents = { myagent = \"true\" }\n\
-                 [agents.claude.status_map]\n\
-                 SessionStart = \"running\"\n\
-                 [tools.lazygit]\n\
-                 command = \"lazygit\"\n\
-                 [plugins.\"aoe.web\"]\n\
-                 enabled = true\n",
-            ),
-            None,
-        );
-        let warning = collect_startup_config_warnings("");
-        assert!(warning.is_none(), "documented map keys: got {warning:?}");
-    }
-
     /// Write `global` and/or `profile` config into an isolated app dir and return the guard.
     fn seed_configs(global: Option<&str>, profile: Option<&str>) -> AppDirGuard {
         let temp = isolate_app_dir();
@@ -998,15 +956,41 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn startup_config_warnings_report_parse_failures_and_unknown_keys() {
-        // (case, global, profile, profile argument, fragments the warning must contain)
-        type Case = (
+        let default_config = toml::to_string_pretty(&config::Config::default()).unwrap();
+        // (case, global, profile, profile argument, fragments the warning must contain; none
+        // means no warning)
+        type Case<'a> = (
             &'static str,
-            Option<&'static str>,
+            Option<&'a str>,
             Option<&'static str>,
             &'static str,
             &'static [&'static str],
         );
         let cases: &[Case] = &[
+            ("no config", None, None, "", &[]),
+            (
+                "round-tripped defaults",
+                Some(&default_config),
+                Some("description = \"work\"\n[sandbox]\nenabled_by_default = true\n"),
+                "default",
+                &[],
+            ),
+            (
+                "documented map keys",
+                Some(
+                    "[session]\n\
+                     custom_agents = { myagent = \"true\" }\n\
+                     [agents.claude.status_map]\n\
+                     SessionStart = \"running\"\n\
+                     [tools.lazygit]\n\
+                     command = \"lazygit\"\n\
+                     [plugins.\"aoe.web\"]\n\
+                     enabled = true\n",
+                ),
+                None,
+                "",
+                &[],
+            ),
             (
                 "unparseable global",
                 Some(BAD_TYPE),
@@ -1048,10 +1032,13 @@ mod tests {
         ];
         for (case, global, profile, arg, fragments) in cases {
             let _temp = seed_configs(*global, *profile);
-            let warning = collect_startup_config_warnings(arg)
-                .unwrap_or_else(|| panic!("{case}: expected a warning"));
+            let warning = collect_startup_config_warnings(arg);
+            if fragments.is_empty() {
+                assert!(warning.is_none(), "{case}: got {warning:?}");
+            }
             for fragment in *fragments {
-                assert!(warning.contains(fragment), "{case}: got {warning}");
+                let warning = warning.as_deref().unwrap_or_default();
+                assert!(warning.contains(fragment), "{case}: got {warning:?}");
             }
         }
     }
