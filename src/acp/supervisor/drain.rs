@@ -502,6 +502,10 @@ impl<S: BroadcastSink> Drain<S> {
             ),
         }
 
+        let mut claude_config_dir = config
+            .claude_store_pin
+            .as_ref()
+            .map(|pin| pin.store.clone());
         if config.sandbox_info.is_none() {
             let minted = before_session_env(
                 session_id,
@@ -526,9 +530,9 @@ impl<S: BroadcastSink> Drain<S> {
                     "{what} on respawn; reusing the environment from the prior launch"
                 );
             }
-            apply_claude_store_pin(
+            claude_config_dir = apply_claude_store_pin(
                 &mut config.host_environment,
-                config.claude_store_pin.as_deref(),
+                config.claude_store_pin.as_ref(),
             );
         }
 
@@ -538,7 +542,7 @@ impl<S: BroadcastSink> Drain<S> {
             config.source_profile.clone(),
             config.cwd.clone(),
             config.host_environment.clone(),
-            config.claude_store_pin.clone(),
+            claude_config_dir,
             "MCP re-resolution on respawn failed",
         )
         .await;
@@ -1170,7 +1174,10 @@ mod tests {
         save_record("s-store", 4242, 0);
         let socket = worker_registry::socket_path_for("s-store").unwrap();
         let mut config = runner_config(socket);
-        config.claude_store_pin = Some(selected.clone());
+        config.claude_store_pin = Some(crate::session::capture::ClaudeStorePin {
+            store: selected.clone(),
+            explicit: false,
+        });
         config.host_environment = vec![("CLAUDE_CONFIG_DIR".into(), "stale".into())];
         let lease = sup
             .test_install_runner(

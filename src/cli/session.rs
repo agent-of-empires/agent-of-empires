@@ -877,6 +877,7 @@ fn apply_import_mode(
                 agent: "claude".into(),
                 stores: vec![s.config_dir.clone()],
                 configuration: Vec::new(),
+                exported_default_store: false,
                 cwd: crate::session::capture::canonicalize_or_raw(&s.cwd),
                 filesystem: "host".into(),
                 cwd_filesystem: "host".into(),

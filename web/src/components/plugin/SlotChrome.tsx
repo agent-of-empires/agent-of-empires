@@ -1,5 +1,5 @@
 import { lucideIcon, toneClasses, validTone } from "../../lib/pluginUi";
-import { renderIcon, safeHref, str, type Obj } from "./slotPayload";
+import { pluginLinkProps, renderIcon, safeHref, str, type Obj } from "./slotPayload";
 
 export function Spinner({ className }: { className: string }) {
   return (
@@ -32,8 +32,16 @@ export function BadgeChip({ item, slot, pluginId }: { item: Obj; slot: string; p
       {text && <span className="truncate">{text}</span>}
     </>
   );
-  return safe ? (
-    <a {...common} href={safe} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()}>
+  const linkProps = safe ? pluginLinkProps(safe) : null;
+  return linkProps ? (
+    <a
+      {...common}
+      {...linkProps}
+      onClick={(e) => {
+        e.stopPropagation();
+        linkProps.onClick(e);
+      }}
+    >
       {inner}
     </a>
   ) : (

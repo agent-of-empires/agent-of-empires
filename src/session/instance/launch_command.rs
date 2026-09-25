@@ -1457,6 +1457,175 @@ mod tests {
         }
     }
 
+    /// Claude reads `$CLAUDE_CONFIG_DIR/.claude.json` whenever the variable is
+    /// set, so a host launch into the default store must leave it unset (#4119).
+    #[test]
+    #[serial_test::serial]
+    fn host_claude_exports_its_store_only_when_it_is_not_the_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let default = temp.path().join(".claude");
+        let custom = temp.path().join("custom-claude");
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let canonical = |path: &std::path::Path| {
+            crate::session::capture::canonicalize_allowing_missing_leaf(path).unwrap()
+        };
+        for (exported, expected) in [
+            (None, None),
+            (Some(&default), Some(&default)),
+            (Some(&custom), Some(&custom)),
+        ] {
+            let _env = match exported {
+                Some(dir) => EnvGuard::set(&[("CLAUDE_CONFIG_DIR", dir)]),
+                None => EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]),
+            };
+            let expected = expected.map(|path| canonical(path));
+            let mut inst = Instance::new("claude-host-store", "/tmp");
+            let routed = |inst: &Instance| {
+                let execution = inst
+                    .resolve_native_execution(inst.conversation_target())
+                    .unwrap();
+                let routed = execution
+                    .routing
+                    .iter()
+                    .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                    .map(|(_, value)| value.as_deref().map(|value| canonical(value.as_ref())))
+                    .expect("Claude store is always routed");
+                (routed, execution)
+            };
+            let (fresh, execution) = routed(&inst);
+            assert_eq!(fresh, expected, "exported={exported:?}");
+            let (command, _, _, _) = inst.build_launch_command(Some(&execution)).unwrap();
+            let command = command.unwrap();
+            assert_eq!(
+                command.contains("unset CLAUDE_CONFIG_DIR"),
+                expected.is_none(),
+                "{command}"
+            );
+
+            // Resuming a conversation recorded in the default store keeps it unset, also from
+            // a binding recorded before the export was, and that binding still validates.
+            let mut asserted = inst.asserted_resume_binding(sid, None).unwrap();
+            inst.resume_binding = Some(asserted.clone());
+            inst.resume_intent = ResumeIntent::Use(sid.into());
+            assert_eq!(routed(&inst).0, expected, "exported={exported:?}");
+            asserted.execution.as_mut().unwrap().exported_default_store = false;
+            inst.resume_binding = Some(asserted);
+            let (legacy, execution) = routed(&inst);
+            assert_eq!(legacy, expected, "legacy exported={exported:?}");
+            inst.validate_conversation_target(&execution.binding, Some(sid))
+                .unwrap();
+        }
+    }
+
+    /// A store explicitly selected through a symlinked `~/.claude` is still exported, and the
+    /// selection survives capture; only the implicit default stays unset.
+    #[test]
+    #[serial_test::serial]
+    fn explicit_alias_of_the_default_claude_store_stays_exported() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let work = temp.path().join("profiles/work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::os::unix::fs::symlink(&work, temp.path().join(".claude")).unwrap();
+        let work = work.canonicalize().unwrap();
+        let declare = |profile: &str, dir: &str| {
+            let path =
+                crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                format!("[session.agent_config_dir]\nclaude = {dir:?}\n"),
+            )
+            .unwrap();
+        };
+        declare("alias", work.to_str().unwrap());
+        declare("literal", "~/.claude");
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let routed = |inst: &Instance| {
+            let execution = inst
+                .resolve_native_execution(inst.conversation_target())
+                .unwrap();
+            let routed = execution
+                .routing
+                .iter()
+                .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                .and_then(|(_, value)| value.clone())
+                .map(std::path::PathBuf::from);
+            (routed, execution.binding)
+        };
+        let capture = |inst: &mut Instance, binding| {
+            inst.resume_binding = None;
+            inst.resume_intent = ResumeIntent::Default;
+            inst.set_agent_conversation(
+                Some(sid.into()),
+                Some(crate::session::ConversationBinding {
+                    session_id: sid.into(),
+                    execution: Some(binding),
+                    provenance: crate::session::ConversationProvenance::Observed,
+                    transcript_path: None,
+                }),
+                None,
+            );
+        };
+
+        let literal = temp.path().join(".claude");
+        for (profile, store, expected) in [
+            ("undeclared", None, None),
+            ("literal", None, None),
+            ("alias", None, Some(&work)),
+            ("undeclared", Some(&work), Some(&work)),
+            ("undeclared", Some(&literal), None),
+        ] {
+            let mut inst = Instance::new("claude-alias-store", "/tmp");
+            inst.source_profile = profile.into();
+            if let Some(store) = store {
+                inst.resume_binding = Some(inst.asserted_resume_binding(sid, Some(store)).unwrap());
+                inst.resume_intent = ResumeIntent::Use(sid.into());
+            }
+            let (launched, binding) = routed(&inst);
+            assert_eq!(
+                launched.as_ref(),
+                expected,
+                "profile={profile} store={store:?}"
+            );
+            // The next launch resumes from the binding this launch's capture records.
+            capture(&mut inst, binding.clone());
+            inst.source_profile = "undeclared".into();
+            assert_eq!(
+                routed(&inst).0.as_ref(),
+                expected,
+                "profile={profile} store={store:?}"
+            );
+            // A binding recorded before the export was kept it only while a selector names it.
+            capture(
+                &mut inst,
+                crate::session::ExecutionBinding {
+                    exported_default_store: false,
+                    ..binding
+                },
+            );
+            inst.source_profile = profile.into();
+            let legacy = if store.is_some() { None } else { expected };
+            assert_eq!(
+                routed(&inst).0.as_ref(),
+                legacy,
+                "legacy profile={profile} store={store:?}"
+            );
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn sandboxed_assertion_keeps_the_native_container_store() {

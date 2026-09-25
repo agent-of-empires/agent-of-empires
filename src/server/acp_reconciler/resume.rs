@@ -340,7 +340,7 @@ async fn build_spawn_request(
             inst.acp_effort.clone(),
             inst.agent_model.clone(),
             inst.selected_claude_conversation()
-                .and_then(|(_, execution)| execution.stores.first().cloned()),
+                .and_then(|(_, execution)| crate::session::capture::ClaudeStorePin::of(execution)),
         )
     };
     let agent = supervisor

@@ -2,15 +2,16 @@
 
 import type { CommandAction } from "../components/command-palette/types";
 import { invokePluginCommand, type PluginCommand, type PluginUiEntry } from "./api";
+import { isAllowedHref, isInternalHref, navigateInternalHref } from "./pluginHref";
 import { reportError } from "./toastBus";
 
-/** Only `http`/`https`, so a plugin cannot smuggle `javascript:` or `file:` hrefs. */
-export function isExternalHttpUrl(u: unknown): u is string {
-  return typeof u === "string" && /^https?:\/\//i.test(u);
-}
-
-export function openExternal(url: string): void {
-  window.open(url, "_blank", "noopener,noreferrer");
+/** A same-origin href navigates via the router; anything else opens a new tab. */
+export function openPluginLink(href: string): void {
+  if (isInternalHref(href)) {
+    navigateInternalHref(href);
+  } else {
+    window.open(href, "_blank", "noopener,noreferrer");
+  }
 }
 
 /** Surfaces failures (read-only, no worker, network) as an error toast. */
@@ -48,7 +49,7 @@ export function resolveCommandLinks(
   const links: CommandLink[] = [];
   const seen = new Set<string>();
   const push = (href: unknown, label: unknown) => {
-    if (!isExternalHttpUrl(href) || seen.has(href)) return;
+    if (!isAllowedHref(href) || seen.has(href)) return;
     seen.add(href);
     links.push({ href, label: typeof label === "string" && label ? label : href });
   };
@@ -84,7 +85,7 @@ export function buildPluginCommandActions(
           group: "Actions",
           keywords: ["plugin", cmd.plugin_id, cmd.id],
           shortcut: !multiple ? cmd.keybinds[0] : undefined,
-          perform: () => openExternal(link.href),
+          perform: () => openPluginLink(link.href),
         });
       });
     } else if (!cmd.action && activeSessionId) {

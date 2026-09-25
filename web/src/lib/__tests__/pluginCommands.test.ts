@@ -4,7 +4,6 @@ import type { PluginCommand, PluginUiEntry } from "../api";
 import {
   buildPluginCommandActions,
   invokeActionlessCommand,
-  isExternalHttpUrl,
   matchPluginChord,
   parsePluginChord,
   pickKeybindEffect,
@@ -49,17 +48,6 @@ const prA = { href: "https://github.com/o/a/pull/1", tooltip: "a: PR #1" };
 const prB = { href: "https://github.com/o/b/pull/2", tooltip: "b: PR #2" };
 const key = (k: string, over: Partial<KeyboardEvent> = {}) =>
   ({ ctrlKey: true, shiftKey: true, altKey: false, metaKey: false, key: k, ...over }) as KeyboardEvent;
-
-it.each([
-  ["https://x.test", true],
-  ["http://x.test", true],
-  ["javascript:alert(1)", false],
-  ["file:///etc/passwd", false],
-  ["", false],
-  [undefined, false],
-])("isExternalHttpUrl(%j) is %s", (url, expected) => {
-  expect(isExternalHttpUrl(url)).toBe(expected);
-});
 
 describe("chords", () => {
   it.each([
