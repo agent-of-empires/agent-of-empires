@@ -479,6 +479,11 @@ impl Instance {
                 Err(error) if managed && !matches!(self.resume_intent, ResumeIntent::Default) => {
                     return Err(error);
                 }
+                // A stored id no context can attest is a deviation, not routine: warn.
+                Err(error) if managed => {
+                    tracing::warn!(target: "session.store", error = %error, "no attestable execution context for recorded conversation '{}'; launching with the agent's own resume flags, re-pin it with aoe session set-session-id or restore the execution context it was captured in", self.agent_session_id.as_deref().unwrap_or_default());
+                    None
+                }
                 Err(error) => {
                     tracing::debug!(target: "session.store", error = %error, "native execution unavailable; using native launch flags");
                     None
@@ -1418,8 +1423,8 @@ mod tests {
             let asserted = inst.asserted_resume_binding(sid, None);
             if agent == "codex" && crate::process::HAS_CODEX_MANAGED_PREFERENCES {
                 assert_eq!(
-                    asserted.unwrap_err().to_string(),
-                    "Codex managed preferences cannot be attested by the local file contract"
+                    format!("{:#}", asserted.unwrap_err()),
+                    "aoe session set-session-id cannot resolve the native execution identity for this context: Codex managed preferences cannot be attested by the local file contract"
                 );
                 continue;
             }
@@ -1540,5 +1545,57 @@ mod tests {
             inst.agent_session_binding,
             Some(crate::session::ConversationBinding::unknown(sid))
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn an_unattestable_recorded_conversation_warns_at_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let codex_home = root.path().join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", root.path().to_str().unwrap()),
+            ("CODEX_HOME", codex_home.to_str().unwrap()),
+        ]);
+        // No auth.json, so the native execution identity never resolves.
+        let _codex = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "codex",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let sid = "11111111-2222-4333-8444-555555555555";
+        let launch = |session_id: Option<&str>, intent: ResumeIntent| {
+            let mut inst = tool_instance("codex", project.to_str().unwrap());
+            inst.agent_session_id = session_id.map(str::to_owned);
+            inst.resume_intent = intent;
+            let capture = crate::session::test_support::LogCapture::start();
+            let _ = inst.prepare_launch_command(inst.conversation_state());
+            capture.contents()
+        };
+
+        let carried = launch(Some(sid), ResumeIntent::Default);
+        let warned = carried
+            .lines()
+            .find(|line| line.contains("WARN") && line.contains("set-session-id"))
+            .unwrap_or_else(|| panic!("no warning for the carried conversation:\n{carried}"));
+        assert!(warned.contains(sid), "the warning names the conversation");
+        assert!(!carried.contains("native execution unavailable"));
+
+        // A cleared launch still holds its stored id this early, so it must not warn.
+        for (session_id, label) in [(Some(sid), "cleared with a stored id"), (None, "fresh")] {
+            let quiet = launch(session_id, ResumeIntent::Cleared);
+            assert!(
+                !quiet.contains("set-session-id"),
+                "a {label} launch must stay quiet:\n{quiet}"
+            );
+            assert!(
+                quiet.lines().any(|line| line.contains("DEBUG")
+                    && line.contains("native execution unavailable; using native launch flags")),
+                "expected the debug line for a {label} launch:\n{quiet}"
+            );
+        }
     }
 }

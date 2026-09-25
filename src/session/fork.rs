@@ -2,6 +2,7 @@
 //! carries.
 
 use crate::agents::{get_agent, ForkStrategy};
+use crate::session::ConversationProvenance;
 
 /// The kind of one-shot fork a freshly-created session should perform on its first launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,10 @@ pub enum ForkDenied {
     /// No captured session id to fork from yet (the parent never started a
     /// conversation, or its id hasn't been observed).
     NoParentSession,
+    /// A conversation id is recorded, but the binding that would prove which
+    /// native conversation it names was never attested, so the id cannot be
+    /// shown to be a real conversation to fork.
+    UnqualifiedParent { provenance: ConversationProvenance },
 }
 
 /// Process-wide default ACP registry, used only to answer "does this built-in tool have an ACP
@@ -52,9 +57,15 @@ pub fn terminal_fork_seed(
     parent: Option<&crate::session::ConversationBinding>,
     child_session_id: String,
 ) -> Result<ForkSeed, ForkDenied> {
-    let parent = parent
-        .filter(|parent| parent.is_known())
-        .ok_or(ForkDenied::NoParentSession)?;
+    let parent = match parent {
+        Some(parent) if parent.is_known() => parent,
+        Some(parent) => {
+            return Err(ForkDenied::UnqualifiedParent {
+                provenance: parent.provenance.clone(),
+            })
+        }
+        None => return Err(ForkDenied::NoParentSession),
+    };
     let agent = parent
         .execution
         .as_ref()
@@ -72,11 +83,10 @@ pub fn terminal_fork_seed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{ConversationBinding, ConversationProvenance, ExecutionBinding};
+    use crate::session::{ConversationBinding, ExecutionBinding};
 
-    #[test]
-    fn fork_requires_a_proven_parent_and_matching_native_capability() {
-        let mut parent = ConversationBinding {
+    fn bound(provenance: ConversationProvenance) -> ConversationBinding {
+        ConversationBinding {
             session_id: "parent-uuid".into(),
             execution: Some(ExecutionBinding {
                 agent: "claude".into(),
@@ -86,32 +96,40 @@ mod tests {
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),
             }),
-            provenance: ConversationProvenance::Observed,
+            provenance,
             transcript_path: None,
-        };
-        assert!(matches!(
-            terminal_fork_seed(Some(&parent), "child-uuid".into()),
-            Ok(ForkSeed::Terminal { .. })
-        ));
+        }
+    }
+
+    #[test]
+    fn fork_reports_a_recorded_but_unattested_parent_separately() {
         for provenance in [
             ConversationProvenance::Unknown,
             ConversationProvenance::Preallocated,
         ] {
-            parent.provenance = provenance;
+            let parent = bound(provenance.clone());
             assert_eq!(
                 terminal_fork_seed(Some(&parent), "child-uuid".into()),
-                Err(ForkDenied::NoParentSession)
+                Err(ForkDenied::UnqualifiedParent { provenance })
             );
         }
-        parent.provenance = ConversationProvenance::Observed;
+        assert_eq!(
+            terminal_fork_seed(None, "child-uuid".into()),
+            Err(ForkDenied::NoParentSession)
+        );
+    }
+
+    #[test]
+    fn fork_requires_a_qualified_parent_and_matching_native_capability() {
+        let mut parent = bound(ConversationProvenance::Observed);
+        assert!(matches!(
+            terminal_fork_seed(Some(&parent), "child-uuid".into()),
+            Ok(ForkSeed::Terminal { .. })
+        ));
         parent.execution.as_mut().unwrap().agent = "gemini".into();
         assert_eq!(
             terminal_fork_seed(Some(&parent), "child-uuid".into()),
             Err(ForkDenied::AgentCannotFork)
-        );
-        assert_eq!(
-            terminal_fork_seed(None, "child-uuid".into()),
-            Err(ForkDenied::NoParentSession)
         );
     }
 }

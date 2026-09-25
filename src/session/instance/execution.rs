@@ -1,5 +1,6 @@
 //! Conversation identity is independent of status detection and command spelling.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -1051,7 +1052,10 @@ impl Instance {
 }
 
 impl Instance {
-    pub(crate) fn fork_parent_binding(&self) -> Option<&ConversationBinding> {
+    /// The conversation an explicit fork would carry. A recorded id with no
+    /// binding at all, which a degraded launch leaves behind, is an unqualified
+    /// recorded conversation, not nothing to fork.
+    pub(crate) fn fork_parent_binding(&self) -> Option<std::borrow::Cow<'_, ConversationBinding>> {
         let (sid, binding) = match &self.resume_intent {
             ResumeIntent::Fork { .. } => return None,
             ResumeIntent::Use(sid) => (Some(sid), self.resume_binding.as_ref()),
@@ -1060,7 +1064,14 @@ impl Instance {
                 self.agent_session_binding.as_ref(),
             ),
         };
-        binding.filter(|binding| Some(&binding.session_id) == sid && binding.is_known())
+        let sid = sid?;
+        match binding {
+            Some(binding) if binding.session_id == *sid => Some(Cow::Borrowed(binding)),
+            // A binding naming a different conversation is an inconsistency,
+            // not a recorded id awaiting proof.
+            Some(_) => None,
+            None => Some(Cow::Owned(ConversationBinding::unknown(sid))),
+        }
     }
 
     pub(super) fn execution_agent(&self) -> Result<&'static AgentDef> {
@@ -1262,11 +1273,13 @@ impl Instance {
                     configuration.push(file);
                 }
                 let auth_file = root.join("auth.json");
-                let bytes = inputs.read_native_file(&auth_file)?.context("Codex login may select cloud-managed requirements; a local API-key authentication contract is required")?;
+                let Some(bytes) = inputs.read_native_file(&auth_file)? else {
+                    bail!("Codex has no auth.json in CODEX_HOME (default ~/.codex); sign in with an OpenAI API key and re-run");
+                };
                 let auth: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&bytes)?;
                 anyhow::ensure!(["tokens", "agent_identity", "personal_access_token"].iter().all(|key| auth.get(*key).is_none_or(serde_json::Value::is_null))
                     && auth.get("auth_mode").is_none_or(|mode| mode.is_null() || mode.as_str() == Some("apikey"))
-                    && auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str).is_some_and(|key| !key.trim().is_empty()), "Codex authentication may select cloud-managed requirements; its namespace is unproven");
+                    && auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str).is_some_and(|key| !key.trim().is_empty()), "Codex is not authenticated with a local OpenAI API key; set OPENAI_API_KEY in CODEX_HOME/auth.json (default ~/.codex/auth.json) and re-run");
                 configuration.push(auth_file);
                 let sqlite = inputs.canonical_path(&sqlite)?;
                 routing.push(("CODEX_HOME".into(), Some(root.to_str().context("Codex home is not UTF-8")?.into())));
@@ -2159,6 +2172,7 @@ impl Instance {
         .unwrap_or_else(|| {
             self.resolve_native_execution(None)
                 .map(|execution| execution.binding)
+                .context("aoe session set-session-id cannot resolve the native execution identity for this context")
         })?;
         anyhow::ensure!(
             crate::agents::get_agent(&execution.agent)
@@ -2484,5 +2498,45 @@ mod tests {
                 "{name} must refuse a valued verbosity override"
             );
         }
+    }
+
+    /// A recorded id must reach `terminal_fork_seed` even unqualified, so the
+    /// fork can say which state it is in instead of claiming nothing to fork.
+    #[test]
+    fn fork_parent_binding_keeps_a_recorded_but_unqualified_conversation() {
+        let mut instance = Instance::new("parent", "/tmp");
+        instance.agent_session_id = Some("legacy-uuid".into());
+        instance.agent_session_binding = Some(ConversationBinding::unknown("legacy-uuid"));
+
+        assert_eq!(
+            crate::session::fork::terminal_fork_seed(
+                instance.fork_parent_binding().as_deref(),
+                "child-uuid".into()
+            ),
+            Err(crate::session::ForkDenied::UnqualifiedParent {
+                provenance: ConversationProvenance::Unknown
+            })
+        );
+    }
+
+    /// A degraded launch drops the binding and leaves the id, so the fork must
+    /// still name that conversation rather than report nothing to fork.
+    #[test]
+    fn fork_parent_binding_reports_a_dropped_binding_for_a_recorded_id() {
+        let mut instance = Instance::new("parent", "/tmp");
+        instance.agent_session_id = Some("legacy-uuid".into());
+        instance.agent_session_binding = None;
+
+        assert_eq!(
+            crate::session::fork::terminal_fork_seed(
+                instance.fork_parent_binding().as_deref(),
+                "child-uuid".into()
+            ),
+            Err(crate::session::ForkDenied::UnqualifiedParent {
+                provenance: ConversationProvenance::Unknown
+            })
+        );
+        instance.agent_session_id = None;
+        assert!(instance.fork_parent_binding().is_none());
     }
 }

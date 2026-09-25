@@ -583,12 +583,19 @@ impl Instance {
                         .is_some_and(|execution| execution.agent == "claude")
             })
             .cloned();
-        let binding = if asserted.is_some() {
-            asserted
-        } else {
-            worker.map_or(Ok(None), |worker| self.resolved_handoff_binding(&sid, worker))?
-        }
-        .context("ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal")?;
+        let unresolved = "ACP does not prove a native conversation store; bind its current ID with aoe session set-session-id SESSION ID --store /absolute/claude-store before switching to terminal";
+        let resolved = match asserted {
+            Some(asserted) => Ok(Some(asserted)),
+            None => worker
+                .map(|worker| self.resolved_handoff_binding(&sid, worker))
+                .transpose()
+                .map(Option::flatten),
+        };
+        let binding = match resolved {
+            Ok(Some(binding)) => binding,
+            Ok(None) => return Err(anyhow::anyhow!(unresolved)),
+            Err(error) => return Err(error.context(unresolved)),
+        };
         self.adopt_conversation_state(ConversationState {
             session_id: Some(sid.clone()),
             binding: Some(binding.clone()),
@@ -994,7 +1001,9 @@ mod tests {
         let error = inst
             .switch_to_terminal_keep_context(Some(&worker))
             .unwrap_err();
-        assert!(error.to_string().contains("--mcp-config"), "{error:#}");
+        let chain = format!("{error:#}");
+        assert!(chain.contains("set-session-id"), "{chain}");
+        assert!(chain.contains("--mcp-config"), "{chain}");
         assert_eq!(inst.view, View::Structured);
         assert_eq!(inst.acp_session_id.as_deref(), Some("sid-abc"));
     }

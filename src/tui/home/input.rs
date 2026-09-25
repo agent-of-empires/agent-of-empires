@@ -2853,11 +2853,11 @@ impl HomeView {
         if inst.is_structured() {
             crate::session::fork::structured_fork_capable(&inst.tool, inst.agent_name.as_deref())
         } else {
-            inst.fork_parent_binding()
-                .and_then(|parent| parent.execution.as_ref())
-                .is_some_and(|execution| {
+            inst.fork_parent_binding().is_some_and(|parent| {
+                parent.execution.as_ref().is_some_and(|execution| {
                     crate::session::fork::terminal_agent_can_fork(&execution.agent)
                 })
+            })
         }
     }
 
@@ -3012,7 +3012,9 @@ impl HomeView {
             return;
         };
         let tool = parent.tool.clone();
-        let parent_binding = parent.fork_parent_binding().cloned();
+        let parent_binding = parent
+            .fork_parent_binding()
+            .map(std::borrow::Cow::into_owned);
         let repo_path = if parent.is_structured() {
             parent.repo_path().to_string()
         } else {
@@ -3071,6 +3073,24 @@ impl HomeView {
                         "Nothing to fork yet",
                         "This session has no captured conversation to fork from. Send it at least one message first.",
                     ));
+                    return;
+                }
+                Err(crate::session::ForkDenied::UnqualifiedParent { provenance }) => {
+                    let preallocated = matches!(
+                        provenance,
+                        crate::session::ConversationProvenance::Preallocated
+                    );
+                    self.info_dialog = Some(if preallocated {
+                        InfoDialog::new(
+                            "Nothing to fork yet",
+                            "This session has no captured conversation to fork from. Send it at least one message first.",
+                        )
+                    } else {
+                        InfoDialog::new(
+                            "Conversation not verified",
+                            "This session records a conversation id, but it was never verified against a native agent. Run 'aoe session set-session-id <session> <id>' on it to qualify it.",
+                        )
+                    });
                     return;
                 }
             }

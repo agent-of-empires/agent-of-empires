@@ -289,13 +289,14 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         if !user_chose_tool {
             resolved_tool = source.tool.clone();
         }
-        let parent_agent = source
-            .fork_parent_binding()
+        let parent_binding = source.fork_parent_binding();
+        let parent_agent = parent_binding
+            .as_ref()
             .and_then(|binding| binding.execution.as_ref())
             .map(|execution| execution.agent.clone())
             .unwrap_or_else(|| source.tool.clone());
         let seed = crate::session::fork::terminal_fork_seed(
-            source.fork_parent_binding(),
+            parent_binding.as_deref(),
             crate::session::capture::generate_session_uuid(),
         )
         .map_err(|denied| match denied {
@@ -307,6 +308,22 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 "Nothing to fork: session '{}' has no captured agent session yet. Start a conversation in it first.",
                 source.title
             ),
+            crate::session::ForkDenied::UnqualifiedParent { provenance } => {
+                if matches!(provenance, crate::session::ConversationProvenance::Preallocated) {
+                    anyhow::anyhow!(
+                        "Nothing to fork: session '{}' has no captured agent session yet. Start a conversation in it first.",
+                        source.title
+                    )
+                } else {
+                    let recorded = parent_binding
+                        .as_ref()
+                        .map_or("", |binding| binding.session_id.as_str());
+                    anyhow::anyhow!(
+                        "Nothing to fork: session '{}' records conversation '{}' but it was never verified against a native agent; run `aoe session set-session-id {} {}` to qualify it.",
+                        source.title, recorded, source.title, recorded
+                    )
+                }
+            }
         })?;
         Some(seed)
     } else {

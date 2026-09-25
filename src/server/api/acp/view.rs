@@ -389,7 +389,7 @@ pub async fn acp_disable(
             )
             .await;
         if let Err(error) = instance.switch_to_terminal_keep_context(worker.as_ref()) {
-            return (StatusCode::CONFLICT, error.to_string()).into_response();
+            return (StatusCode::CONFLICT, format!("{error:#}")).into_response();
         }
     } else {
         instance.view = View::Terminal;

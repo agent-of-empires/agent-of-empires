@@ -239,8 +239,9 @@ fn fork_with_native_selector_is_refused_at_launch() {
 /// Every way a fork can be refused: a different agent (a captured id is
 /// agent-specific), an agent with no fork capability, flags that change the
 /// working directory or carry their own resume/fork flags, a parent with no
-/// captured conversation, and a parent whose own fork has not launched. Each
-/// refusal fires before provisioning, so nothing is persisted or left on disk.
+/// captured conversation, a parent whose recorded conversation was never
+/// attested, and a parent whose own fork has not launched. Each refusal fires
+/// before provisioning, so nothing is persisted or left on disk.
 #[test]
 #[parallel]
 fn fork_from_refusals_persist_nothing() {
@@ -251,6 +252,9 @@ fn fork_from_refusals_persist_nothing() {
         Bare,
         /// Forked but never launched: a synthetic id plus a live Fork intent.
         UnlaunchedFork,
+        /// A pre-v1.17 row: an id is stored, but its binding was never
+        /// attested, so the fork is refused as unqualified.
+        LegacyUnqualified,
     }
     struct Case {
         parent: Parent,
@@ -297,6 +301,11 @@ fn fork_from_refusals_persist_nothing() {
             args: &[],
             expect: "its own fork has not launched yet",
         },
+        Case {
+            parent: Parent::LegacyUnqualified,
+            args: &[],
+            expect: "set-session-id",
+        },
     ];
 
     for case in cases {
@@ -314,6 +323,24 @@ fn fork_from_refusals_persist_nothing() {
                     "-t",
                     "Parent",
                 ]);
+            }
+            Parent::LegacyUnqualified => {
+                h.run_cli_ok(&[
+                    "add",
+                    project.to_str().unwrap(),
+                    "--cmd",
+                    "claude",
+                    "-t",
+                    "Parent",
+                ]);
+                patch_session(&h, "Parent", |session| {
+                    session["agent_session_id"] = json!(PARENT_AGENT_ID);
+                    session["agent_session_binding"] = json!({
+                        "session_id": PARENT_AGENT_ID,
+                        "execution": null,
+                        "provenance": "unknown",
+                    });
+                });
             }
             Parent::UnlaunchedFork => {
                 h.run_cli_ok(&[

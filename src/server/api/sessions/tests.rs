@@ -879,6 +879,88 @@ fn fork_from_builds_structured_seed_when_view_is_structured() {
     );
 }
 
+#[test]
+fn fork_denial_message_distinguishes_every_refusal_state() {
+    assert_eq!(
+        fork_denial_message(&crate::session::ForkDenied::AgentCannotFork),
+        "This agent has no native fork capability. Forkable agents: claude, codex, opencode."
+    );
+    assert_eq!(
+        fork_denial_message(&crate::session::ForkDenied::NoParentSession),
+        "This session has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id."
+    );
+    assert_eq!(
+        fork_denial_message(&crate::session::ForkDenied::UnqualifiedParent {
+            provenance: crate::session::ConversationProvenance::Unknown,
+        }),
+        "This session records a conversation id, but it was never verified against a native agent. Run 'aoe session set-session-id <session> <id>' on it to qualify it."
+    );
+    // A pre-pinned id has no conversation to qualify, so the pin cannot be the remedy.
+    let preallocated = fork_denial_message(&crate::session::ForkDenied::UnqualifiedParent {
+        provenance: crate::session::ConversationProvenance::Preallocated,
+    });
+    assert!(!preallocated.contains("set-session-id"), "{preallocated}");
+    assert_eq!(
+        preallocated,
+        "This session has no captured conversation to fork from. Send it at least one message first."
+    );
+}
+
+#[test]
+fn fork_from_an_unqualified_parent_is_refused_as_unqualified() {
+    let mut parent = crate::session::Instance::new("parent", "/tmp");
+    parent.agent_session_id = Some("parent-uuid".into());
+    parent.agent_session_binding =
+        Some(crate::session::ConversationBinding::unknown("parent-uuid"));
+
+    assert_eq!(
+        resolve_create_fork_seed("parent-uuid", false, &[parent]),
+        Err(crate::session::ForkDenied::UnqualifiedParent {
+            provenance: crate::session::ConversationProvenance::Unknown
+        })
+    );
+}
+
+/// Two rows can record one conversation id. The qualified one decides the
+/// fork, whatever order `Storage::load()` returned the rows in.
+#[test]
+fn fork_from_prefers_the_qualified_row_over_an_unqualified_one() {
+    let qualified = crate::session::ConversationBinding {
+        session_id: "parent-uuid".into(),
+        execution: Some(crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec!["/tmp/claude-store".into()],
+            configuration: Vec::new(),
+            cwd: "/tmp".into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        }),
+        provenance: crate::session::ConversationProvenance::Observed,
+        transcript_path: None,
+    };
+    let mut attested = crate::session::Instance::new("attested", "/tmp");
+    attested.agent_session_id = Some("parent-uuid".into());
+    attested.agent_session_binding = Some(qualified.clone());
+    let mut legacy = crate::session::Instance::new("legacy", "/tmp");
+    legacy.agent_session_id = Some("parent-uuid".into());
+    legacy.agent_session_binding =
+        Some(crate::session::ConversationBinding::unknown("parent-uuid"));
+
+    for parents in [
+        vec![legacy.clone(), attested.clone()],
+        vec![attested, legacy],
+    ] {
+        match resolve_create_fork_seed("parent-uuid", false, &parents)
+            .expect("the qualified row decides the fork")
+        {
+            crate::session::ForkSeed::Terminal { parent, .. } => {
+                assert_eq!(parent, qualified)
+            }
+            crate::session::ForkSeed::Structured { .. } => panic!("expected Terminal seed"),
+        }
+    }
+}
+
 fn create_body_from_json(value: serde_json::Value) -> CreateSessionBody {
     serde_json::from_value(value).expect("valid CreateSessionBody")
 }
