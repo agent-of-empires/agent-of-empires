@@ -1,0 +1,979 @@
+use std::ffi::CString;
+use std::fs::File;
+use std::io::Read;
+use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+use tokio::net::UnixStream;
+use tokio::time::Instant;
+
+use super::dto::{valid_namespace, valid_uuid};
+use super::ReadFailure;
+
+const LOCK_FILE: &str = "lifetime.lock";
+const PREBIND_FILE: &str = "runtime.prebind.json";
+const POSTBIND_FILE: &str = "runtime.postbind.json";
+const SOCKET_FILE: &str = "runtime.sock";
+const MARKER_LIMIT: u64 = 64 * 1024;
+
+#[derive(Debug)]
+pub(crate) enum TrustedPathError {
+    Missing,
+    Invalid,
+}
+
+pub(crate) struct OwnedNamespace {
+    pub name: String,
+    pub home: PathBuf,
+    dir: OwnedFd,
+}
+
+impl OwnedNamespace {
+    fn anchored_socket_path(&self) -> Result<PathBuf, ReadFailure> {
+        anchored_child_path(self.dir.as_raw_fd(), SOCKET_FILE)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrebindMarker {
+    schema: u8,
+    pid: u32,
+    process_start_identity: String,
+    prebind_instance_id: String,
+    namespace: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PostbindMarker {
+    schema: u8,
+    pid: u32,
+    process_start_identity: String,
+    prebind_instance_id: String,
+    runtime_instance_id: String,
+    runtime_epoch: String,
+    namespace: String,
+    socket_path: String,
+    owner_uid: u32,
+    socket_device: u64,
+    socket_inode: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UdsIdentity {
+    pub namespace: String,
+    pub prebind_instance_id: String,
+    pub runtime_instance_id: String,
+    pub runtime_epoch: String,
+    pub owner_uid: u32,
+}
+
+pub(crate) struct UdsConnection {
+    stream: UnixStream,
+    identity: UdsIdentity,
+    home: PathBuf,
+    admission: Admission,
+    exchange_deadline: Instant,
+}
+
+pub(crate) struct UdsExchange {
+    pub stream: tokio_tungstenite::WebSocketStream<UnixStream>,
+    pub identity: UdsIdentity,
+    pub home: PathBuf,
+    pub deadline: Instant,
+    pub _admission: Admission,
+}
+
+impl UdsConnection {
+    pub(crate) async fn upgrade(
+        self,
+        request: tokio_tungstenite::tungstenite::handshake::client::Request,
+    ) -> Result<UdsExchange, ReadFailure> {
+        let config = super::websocket_config();
+        let (stream, _) = tokio::time::timeout_at(
+            self.exchange_deadline,
+            tokio_tungstenite::client_async_with_config(request, self.stream, Some(config)),
+        )
+        .await
+        .map_err(|_| ReadFailure::post("connection_closed"))?
+        .map_err(|_| ReadFailure::post("unavailable"))?;
+        Ok(UdsExchange {
+            stream,
+            identity: self.identity,
+            home: self.home,
+            deadline: self.exchange_deadline,
+            _admission: self.admission,
+        })
+    }
+}
+
+pub(crate) struct Admission {
+    _namespace: OwnedNamespace,
+    _lock: File,
+}
+
+pub(crate) async fn connect(establishment_deadline: Instant) -> Result<UdsConnection, ReadFailure> {
+    let namespace = tokio::time::timeout_at(
+        establishment_deadline,
+        tokio::task::spawn_blocking(existing_app_namespace),
+    )
+    .await
+    .map_err(|_| ReadFailure::post("unavailable"))?
+    .map_err(|_| ReadFailure::post("unavailable"))?
+    .map_err(trusted_path_failure)?;
+    tokio::time::timeout_at(establishment_deadline, connect_admission(namespace))
+        .await
+        .map_err(|_| ReadFailure::post("unavailable"))?
+}
+
+fn trusted_path_failure(error: TrustedPathError) -> ReadFailure {
+    match error {
+        TrustedPathError::Missing => ReadFailure::pre("marker_missing"),
+        TrustedPathError::Invalid => ReadFailure::pre("marker_invalid"),
+    }
+}
+
+fn app_path_and_home() -> Result<(PathBuf, PathBuf), TrustedPathError> {
+    let home = dirs::home_dir().ok_or(TrustedPathError::Invalid)?;
+    if !home.is_absolute() {
+        return Err(TrustedPathError::Invalid);
+    }
+    #[cfg(target_os = "linux")]
+    let path = {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| home.join(".config"));
+        (base.join(crate::session::APP_DIR_NAME_XDG), home)
+    };
+    #[cfg(target_os = "macos")]
+    let path = {
+        let xdg_base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute());
+        let xdg = xdg_base
+            .as_ref()
+            .map(|base| base.join(crate::session::APP_DIR_NAME_XDG));
+        let legacy = home.join(crate::session::APP_DIR_NAME_OTHER);
+        let xdg_absolute_set = xdg_base.is_some();
+        let selected = match (xdg.as_ref().filter(|path| path.exists()), legacy.exists()) {
+            (Some(path), _) => path.clone(),
+            (None, true) => legacy,
+            (None, false) if xdg_absolute_set => xdg.expect("absolute XDG base"),
+            (None, false) => legacy,
+        };
+        (selected, home)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let path = (home.join(crate::session::APP_DIR_NAME_OTHER), home);
+    Ok(path)
+}
+
+pub(crate) fn existing_app_namespace() -> Result<OwnedNamespace, TrustedPathError> {
+    let (path, home) = app_path_and_home()?;
+    let euid = unsafe { libc::geteuid() };
+    let dir = open_trusted_directory(&path, euid)?;
+    let name = if cfg!(debug_assertions) {
+        "debug:agent-of-empires-dev"
+    } else {
+        "release:agent-of-empires"
+    };
+    Ok(OwnedNamespace {
+        name: name.to_string(),
+        home,
+        dir,
+    })
+}
+
+fn open_trusted_directory(path: &Path, euid: u32) -> Result<OwnedFd, TrustedPathError> {
+    if !path.is_absolute() {
+        return Err(TrustedPathError::Invalid);
+    }
+    let root = open_dir(Path::new("/"), euid)?;
+    validate_directory_stat(&root, euid, false, true)?;
+    let components: Vec<CString> = path
+        .components()
+        .skip(1)
+        .map(|component| {
+            let component = component.as_os_str();
+            CString::new(component.as_bytes()).map_err(|_| TrustedPathError::Invalid)
+        })
+        .collect::<Result<_, _>>()?;
+    if components.is_empty() {
+        return Err(TrustedPathError::Invalid);
+    }
+
+    let mut current = root;
+    let count = components.len();
+    for (index, component) in components.into_iter().enumerate() {
+        let next = open_dir_at(current.as_raw_fd(), &component).map_err(|error| {
+            if error.raw_os_error() == Some(libc::ENOENT) && index + 1 == count {
+                TrustedPathError::Missing
+            } else {
+                TrustedPathError::Invalid
+            }
+        })?;
+        validate_directory_stat(&next, euid, index + 1 == count, true)?;
+        current = next;
+    }
+    Ok(current)
+}
+
+fn open_dir(path: &Path, _euid: u32) -> Result<OwnedFd, TrustedPathError> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| TrustedPathError::Invalid)?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    fd_to_owned(fd).map_err(|_| TrustedPathError::Invalid)
+}
+
+fn open_dir_at(parent: RawFd, component: &CString) -> std::io::Result<OwnedFd> {
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            component.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    fd_to_owned(fd)
+}
+
+fn fd_to_owned(fd: RawFd) -> std::io::Result<OwnedFd> {
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn validate_directory_stat(
+    file: &OwnedFd,
+    euid: u32,
+    final_component: bool,
+    root_check: bool,
+) -> Result<(), TrustedPathError> {
+    let stat = fstat(file.as_raw_fd())?;
+    if !directory_stat(&stat) || stat.st_mode & 0o022 != 0 {
+        return Err(TrustedPathError::Invalid);
+    }
+    if root_check {
+        let root = stat.st_mode & 0o111 != 0;
+        let owner = if final_component {
+            stat.st_uid == euid
+        } else {
+            stat.st_uid == 0 || stat.st_uid == euid
+        };
+        if !root || !owner {
+            return Err(TrustedPathError::Invalid);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    validate_posix_acl(file.as_raw_fd(), stat.st_uid, euid, stat.st_mode)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_posix_acl(fd: RawFd, owner: u32, euid: u32, mode: u32) -> Result<(), TrustedPathError> {
+    let names = xattr_names(fd)?;
+    let Some(name) = names
+        .into_iter()
+        .find(|name| name.as_slice() == b"system.posix_acl_access")
+    else {
+        return Ok(());
+    };
+    let value = xattr_value(fd, &name)?;
+    validate_acl_value(&value, owner, euid, mode)
+}
+
+#[cfg(target_os = "linux")]
+fn xattr_names(fd: RawFd) -> Result<Vec<Vec<u8>>, TrustedPathError> {
+    let needed = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0) };
+    if needed < 0 {
+        let error = std::io::Error::last_os_error();
+        return if matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::ENOENT)) {
+            Ok(Vec::new())
+        } else {
+            Err(TrustedPathError::Invalid)
+        };
+    }
+    if needed == 0 {
+        return Ok(Vec::new());
+    }
+    let mut bytes = vec![0u8; needed as usize];
+    let actual = unsafe { libc::flistxattr(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+    if actual < 0 {
+        return Err(TrustedPathError::Invalid);
+    }
+    bytes.truncate(actual as usize);
+    Ok(bytes
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_vec())
+        .collect())
+}
+
+#[cfg(target_os = "linux")]
+fn xattr_value(fd: RawFd, name: &[u8]) -> Result<Vec<u8>, TrustedPathError> {
+    let c_name = CString::new(name).map_err(|_| TrustedPathError::Invalid)?;
+    let needed = unsafe { libc::fgetxattr(fd, c_name.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed < 0 {
+        return Err(TrustedPathError::Invalid);
+    }
+    let mut value = vec![0u8; needed as usize];
+    let actual =
+        unsafe { libc::fgetxattr(fd, c_name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+    if actual < 0 {
+        return Err(TrustedPathError::Invalid);
+    }
+    value.truncate(actual as usize);
+    Ok(value)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_acl_value(
+    value: &[u8],
+    owner: u32,
+    euid: u32,
+    mode: u32,
+) -> Result<(), TrustedPathError> {
+    if value.len() < 8 || u32::from_le_bytes(value[0..4].try_into().unwrap()) != 2 {
+        return Err(TrustedPathError::Invalid);
+    }
+    if (value.len() - 8) % 8 != 0 {
+        return Err(TrustedPathError::Invalid);
+    }
+    let entry_count = (value.len() - 8) / 8;
+    let mut mask = ((mode & 0o070) >> 3) as u16;
+    for index in 0..entry_count {
+        let offset = 8 + index * 8;
+        let tag = u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
+        let permission = u16::from_le_bytes(value[offset + 2..offset + 4].try_into().unwrap());
+        let _id = u32::from_le_bytes(value[offset + 4..offset + 8].try_into().unwrap());
+        if tag == 0x10 {
+            mask = permission;
+        }
+    }
+    for index in 0..entry_count {
+        let offset = 8 + index * 8;
+        let tag = u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
+        let permission = u16::from_le_bytes(value[offset + 2..offset + 4].try_into().unwrap());
+        let id = u32::from_le_bytes(value[offset + 4..offset + 8].try_into().unwrap());
+        let applies = match tag {
+            0x02 => id == euid,
+            0x04 => owner == euid,
+            0x08 => supplementary_group_ids().contains(&id),
+            _ => false,
+        };
+        if applies && (permission & mask & 0x2 != 0 || (tag == 0x08 && permission & 0x2 != 0)) {
+            return Err(TrustedPathError::Invalid);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn supplementary_group_ids() -> Vec<u32> {
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    let mut groups = vec![0u32; count as usize];
+    let actual = unsafe { libc::getgroups(count as libc::c_int, groups.as_mut_ptr().cast()) };
+    if actual < 0 {
+        Vec::new()
+    } else {
+        groups.truncate(actual as usize);
+        groups
+    }
+}
+
+async fn connect_admission(namespace: OwnedNamespace) -> Result<UdsConnection, ReadFailure> {
+    let dir = namespace.dir.as_raw_fd();
+    let euid = unsafe { libc::geteuid() };
+    let (lock, lock_identity) =
+        open_entry(dir, LOCK_FILE, EntryKind::Regular).map_err(|error| match error {
+            EntryError::Missing => ReadFailure::pre("marker_missing"),
+            EntryError::Invalid => ReadFailure::pre("marker_invalid"),
+        })?;
+    validate_regular_file(&lock, euid, &lock_identity)
+        .map_err(|_| ReadFailure::pre("marker_invalid"))?;
+
+    let lock_fd = lock.as_raw_fd();
+    if unsafe { libc::flock(lock_fd, libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+        return Err(ReadFailure::pre("marker_identity"));
+    }
+    let after = fstatat(dir, LOCK_FILE).map_err(|_| ReadFailure::pre("marker_identity"))?;
+    if identity(&after) != lock_identity {
+        return Err(ReadFailure::pre("marker_identity"));
+    }
+    let admission = Admission {
+        _namespace: namespace,
+        _lock: lock,
+    };
+
+    inspect_temporary_markers(admission._namespace.dir.as_raw_fd())?;
+    let prebind: Option<PrebindMarker> = match read_marker::<PrebindMarker>(dir, PREBIND_FILE) {
+        Ok(value) => {
+            validate_prebind(&value, &admission._namespace.name)?;
+            Some(value)
+        }
+        Err(error) if error.code() == "marker_missing" => None,
+        Err(error) => return Err(error),
+    };
+    let postbind: Option<PostbindMarker> = match read_marker::<PostbindMarker>(dir, POSTBIND_FILE) {
+        Ok(value) => {
+            validate_postbind(&value, &admission._namespace.name)?;
+            Some(value)
+        }
+        Err(error) if error.code() == "marker_missing" => None,
+        Err(error) => return Err(error),
+    };
+
+    let Some(postbind) = postbind else {
+        if let Some(prebind) = &prebind {
+            if process_state(prebind.pid, &prebind.process_start_identity)? != ProcessState::Dead {
+                return Err(ReadFailure::pre("marker_identity"));
+            }
+        }
+        return Err(ReadFailure::pre("marker_missing"));
+    };
+    if let Some(prebind) = &prebind {
+        if prebind.prebind_instance_id != postbind.prebind_instance_id
+            || prebind.pid != postbind.pid
+            || prebind.process_start_identity != postbind.process_start_identity
+        {
+            return Err(ReadFailure::pre("marker_identity"));
+        }
+    }
+    if process_state(postbind.pid, &postbind.process_start_identity)? != ProcessState::Live {
+        return Err(ReadFailure::pre("marker_missing"));
+    }
+    validate_socket_entry(dir, &postbind, euid)?;
+
+    let path = admission._namespace.anchored_socket_path()?;
+    let std_stream = std::os::unix::net::UnixStream::connect(&path)
+        .map_err(|_| ReadFailure::post("unavailable"))?;
+    let stream = UnixStream::from_std(std_stream).map_err(|_| ReadFailure::post("unavailable"))?;
+    validate_connected_socket(stream.as_raw_fd(), dir, &postbind, euid)?;
+    Ok(UdsConnection {
+        stream,
+        identity: UdsIdentity {
+            namespace: admission._namespace.name.clone(),
+            prebind_instance_id: postbind.prebind_instance_id.clone(),
+            runtime_instance_id: postbind.runtime_instance_id.clone(),
+            runtime_epoch: postbind.runtime_epoch.clone(),
+            owner_uid: postbind.owner_uid,
+        },
+        home: admission._namespace.home.clone(),
+        admission,
+        exchange_deadline: Instant::now() + std::time::Duration::from_secs(15),
+    })
+}
+
+fn validate_prebind(marker: &PrebindMarker, namespace: &str) -> Result<(), ReadFailure> {
+    if marker.schema != 1 || !valid_uuid(&marker.prebind_instance_id) {
+        return Err(ReadFailure::pre("marker_invalid"));
+    }
+    if !valid_namespace(&marker.namespace) {
+        return Err(ReadFailure::pre("marker_invalid"));
+    }
+    if marker.namespace != namespace || !valid_process_identity(&marker.process_start_identity) {
+        return Err(ReadFailure::pre("marker_identity"));
+    }
+    Ok(())
+}
+
+fn validate_postbind(marker: &PostbindMarker, namespace: &str) -> Result<(), ReadFailure> {
+    if marker.schema != 1
+        || !valid_uuid(&marker.prebind_instance_id)
+        || !valid_uuid(&marker.runtime_instance_id)
+        || !valid_uuid(&marker.runtime_epoch)
+    {
+        return Err(ReadFailure::pre("marker_invalid"));
+    }
+    if !valid_namespace(&marker.namespace) {
+        return Err(ReadFailure::pre("marker_invalid"));
+    }
+    if marker.namespace != namespace
+        || marker.socket_path != SOCKET_FILE
+        || marker.owner_uid != unsafe { libc::geteuid() }
+        || !valid_process_identity(&marker.process_start_identity)
+    {
+        return Err(ReadFailure::pre("marker_identity"));
+    }
+    Ok(())
+}
+
+fn read_marker<T: for<'de> Deserialize<'de>>(dir: RawFd, name: &str) -> Result<T, ReadFailure> {
+    let (file, entry_identity) =
+        open_entry(dir, name, EntryKind::Regular).map_err(|error| match error {
+            EntryError::Missing => ReadFailure::pre("marker_missing"),
+            EntryError::Invalid => ReadFailure::pre("marker_invalid"),
+        })?;
+    validate_regular_file(&file, unsafe { libc::geteuid() }, &entry_identity)
+        .map_err(|_| ReadFailure::pre("marker_invalid"))?;
+    let mut bytes = Vec::new();
+    file.take(MARKER_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ReadFailure::pre("marker_invalid"))?;
+    if bytes.len() as u64 > MARKER_LIMIT {
+        return Err(ReadFailure::pre("marker_invalid"));
+    }
+    let after = fstatat(dir, name).map_err(|_| ReadFailure::pre("marker_identity"))?;
+    if identity(&after) != entry_identity {
+        return Err(ReadFailure::pre("marker_identity"));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| ReadFailure::pre("marker_invalid"))
+}
+
+fn inspect_temporary_markers(dir: RawFd) -> Result<(), ReadFailure> {
+    let duplicate = unsafe { libc::dup(dir) };
+    let scan = fd_to_owned(duplicate).map_err(|_| ReadFailure::pre("marker_identity"))?;
+    let entries = unsafe { libc::fdopendir(scan.into_raw_fd()) };
+    if entries.is_null() {
+        return Err(ReadFailure::pre("marker_identity"));
+    }
+    let result = scan_temporary_markers(entries);
+    unsafe { libc::closedir(entries) };
+    result
+}
+
+fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<(), ReadFailure> {
+    loop {
+        errno_reset();
+        let entry = unsafe { libc::readdir(entries) };
+        if entry.is_null() {
+            return if errno() == 0 {
+                Ok(())
+            } else {
+                Err(ReadFailure::pre("marker_identity"))
+            };
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let Some(kind) = temporary_kind(&name) else {
+            if name.starts_with("runtime.") && name != SOCKET_FILE {
+                return Err(ReadFailure::pre("marker_invalid"));
+            }
+            continue;
+        };
+        let suffix = name
+            .rsplit_once(".tmp.")
+            .map(|(_, value)| value)
+            .unwrap_or_default();
+        if !valid_uuid(suffix) {
+            return Err(ReadFailure::pre("marker_invalid"));
+        }
+        let bytes = read_named_file(unsafe { libc::dirfd(entries) }, &name)?;
+        let (content_uuid, pid, process_identity) = match kind {
+            TempKind::Prebind => match serde_json::from_slice::<PrebindMarker>(&bytes) {
+                Ok(value)
+                    if value.schema == 1
+                        && valid_namespace(&value.namespace)
+                        && valid_uuid(&value.prebind_instance_id) =>
+                {
+                    (
+                        value.prebind_instance_id,
+                        value.pid,
+                        value.process_start_identity,
+                    )
+                }
+                Ok(_) => return Err(ReadFailure::pre("marker_invalid")),
+                Err(_) => return Err(ReadFailure::pre("marker_identity")),
+            },
+            TempKind::Postbind => match serde_json::from_slice::<PostbindMarker>(&bytes) {
+                Ok(value)
+                    if value.schema == 1
+                        && valid_namespace(&value.namespace)
+                        && valid_uuid(&value.prebind_instance_id) =>
+                {
+                    (
+                        value.prebind_instance_id,
+                        value.pid,
+                        value.process_start_identity,
+                    )
+                }
+                Ok(_) => return Err(ReadFailure::pre("marker_invalid")),
+                Err(_) => return Err(ReadFailure::pre("marker_identity")),
+            },
+        };
+        if content_uuid != suffix {
+            return Err(ReadFailure::pre("marker_invalid"));
+        }
+        if process_state(pid, &process_identity)? != ProcessState::Dead {
+            return Err(ReadFailure::pre("marker_identity"));
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TempKind {
+    Prebind,
+    Postbind,
+}
+
+fn temporary_kind(name: &str) -> Option<TempKind> {
+    if name.starts_with("runtime.prebind.tmp.") {
+        Some(TempKind::Prebind)
+    } else if name.starts_with("runtime.postbind.tmp.") {
+        Some(TempKind::Postbind)
+    } else {
+        None
+    }
+}
+
+fn read_named_file(dir: RawFd, name: &str) -> Result<Vec<u8>, ReadFailure> {
+    let (file, entry) = open_entry(dir, name, EntryKind::Regular)
+        .map_err(|_| ReadFailure::pre("marker_invalid"))?;
+    validate_regular_file(&file, unsafe { libc::geteuid() }, &entry)
+        .map_err(|_| ReadFailure::pre("marker_invalid"))?;
+    let mut bytes = Vec::new();
+    file.take(MARKER_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ReadFailure::pre("marker_invalid"))?;
+    if bytes.len() as u64 > MARKER_LIMIT {
+        return Err(ReadFailure::pre("marker_invalid"));
+    }
+    let after = fstatat(dir, name).map_err(|_| ReadFailure::pre("marker_invalid"))?;
+    if identity(&after) != entry {
+        return Err(ReadFailure::pre("marker_identity"));
+    }
+    Ok(bytes)
+}
+
+fn validate_socket_entry(
+    dir: RawFd,
+    marker: &PostbindMarker,
+    euid: u32,
+) -> Result<(), ReadFailure> {
+    let stat = fstatat(dir, SOCKET_FILE).map_err(|_| ReadFailure::pre("marker_identity"))?;
+    if !socket_stat(&stat)
+        || stat.st_uid != euid
+        || stat.st_dev as u64 != marker.socket_device
+        || stat.st_ino as u64 != marker.socket_inode
+        || !socket_mode_allowed(&stat, euid)
+    {
+        return Err(ReadFailure::pre("marker_identity"));
+    }
+    Ok(())
+}
+
+fn validate_connected_socket(
+    stream: RawFd,
+    dir: RawFd,
+    marker: &PostbindMarker,
+    euid: u32,
+) -> Result<(), ReadFailure> {
+    let connected = fstat(stream).map_err(|_| ReadFailure::post("socket_identity"))?;
+    let current = fstatat(dir, SOCKET_FILE).map_err(|_| ReadFailure::post("socket_identity"))?;
+    if !socket_stat(&connected)
+        || !socket_stat(&current)
+        || connected.st_dev != current.st_dev
+        || connected.st_ino != current.st_ino
+        || connected.st_dev != marker.socket_device
+        || connected.st_ino != marker.socket_inode
+    {
+        return Err(ReadFailure::post("socket_identity"));
+    }
+    peer_credentials(stream, marker, euid)
+}
+
+#[cfg(target_os = "linux")]
+fn peer_credentials(stream: RawFd, marker: &PostbindMarker, euid: u32) -> Result<(), ReadFailure> {
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result != 0 || length != std::mem::size_of::<libc::ucred>() as libc::socklen_t {
+        return Err(ReadFailure::post("peer_identity"));
+    }
+    let credentials = unsafe { credentials.assume_init() };
+    if credentials.uid != marker.owner_uid
+        || credentials.uid != euid
+        || credentials.pid as u32 != marker.pid
+    {
+        return Err(ReadFailure::post("peer_identity"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_credentials(_: RawFd, _: &PostbindMarker, _: u32) -> Result<(), ReadFailure> {
+    Err(ReadFailure::post("peer_identity"))
+}
+
+fn anchored_child_path(dir: RawFd, child: &str) -> Result<PathBuf, ReadFailure> {
+    #[cfg(target_os = "linux")]
+    let base = PathBuf::from(format!("/proc/self/fd/{dir}"));
+    #[cfg(target_os = "macos")]
+    let base = PathBuf::from(format!("/dev/fd/{dir}"));
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let base = PathBuf::from(format!("/proc/self/fd/{dir}"));
+    if !base.exists() {
+        return Err(ReadFailure::post("peer_identity"));
+    }
+    Ok(base.join(child))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Regular,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Copy)]
+enum EntryError {
+    Missing,
+    Invalid,
+}
+
+fn open_entry(dir: RawFd, name: &str, kind: EntryKind) -> Result<(File, FileIdentity), EntryError> {
+    let before = fstatat(dir, name).map_err(|error| {
+        if error.raw_os_error() == Some(libc::ENOENT) {
+            EntryError::Missing
+        } else {
+            EntryError::Invalid
+        }
+    })?;
+    if before.st_nlink != 1 || (matches!(kind, EntryKind::Regular) && !regular_stat(&before)) {
+        return Err(EntryError::Invalid);
+    }
+    let c_name = CString::new(name).map_err(|_| EntryError::Invalid)?;
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(EntryError::Invalid);
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let opened = fstat(file.as_raw_fd()).map_err(|_| EntryError::Invalid)?;
+    let before_identity = identity(&before);
+    let opened_identity = identity(&opened);
+    if before_identity != opened_identity {
+        return Err(EntryError::Invalid);
+    }
+    Ok((file, before_identity))
+}
+
+fn validate_regular_file(
+    file: &File,
+    euid: u32,
+    expected: &FileIdentity,
+) -> Result<(), TrustedPathError> {
+    let stat = fstat(file.as_raw_fd())?;
+    if !regular_stat(&stat)
+        || stat.st_uid != euid
+        || stat.st_mode & 0o777 != 0o600
+        || stat.st_nlink != 1
+        || identity(&stat) != *expected
+    {
+        return Err(TrustedPathError::Invalid);
+    }
+    Ok(())
+}
+
+fn identity(stat: &libc::stat) -> FileIdentity {
+    FileIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    }
+}
+
+fn fstat(fd: RawFd) -> Result<libc::stat, TrustedPathError> {
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(TrustedPathError::Invalid);
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+fn fstatat(dir: RawFd, name: &str) -> std::io::Result<libc::stat> {
+    let name =
+        CString::new(name).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    if unsafe {
+        libc::fstatat(
+            dir,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { stat.assume_init() })
+}
+
+fn regular_stat(stat: &libc::stat) -> bool {
+    stat.st_mode & libc::S_IFMT == libc::S_IFREG
+}
+
+fn directory_stat(stat: &libc::stat) -> bool {
+    stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+}
+
+fn socket_stat(stat: &libc::stat) -> bool {
+    stat.st_mode & libc::S_IFMT == libc::S_IFSOCK
+}
+
+fn socket_mode_allowed(stat: &libc::stat, euid: u32) -> bool {
+    if stat.st_uid != euid {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        stat.st_mode & 0o777 == 0o600
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let primary_group = unsafe { libc::getegid() };
+        stat.st_mode & 0o777 == 0o600
+            || (stat.st_mode & 0o777 == 0o660 && stat.st_gid == primary_group)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+fn valid_process_identity(value: &str) -> bool {
+    let Some((platform, version, boot, start)) = parse_process_identity(value) else {
+        return false;
+    };
+    if version != "v1" || !valid_uuid(boot) {
+        return false;
+    }
+    match platform {
+        "linux" => !start.is_empty() && start.bytes().all(|byte| byte.is_ascii_digit()),
+        "macos" => {
+            let Some((seconds, micros)) = start.rsplit_once('.') else {
+                return false;
+            };
+            !seconds.is_empty()
+                && seconds.bytes().all(|byte| byte.is_ascii_digit())
+                && micros.len() == 6
+                && micros.bytes().all(|byte| byte.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
+fn parse_process_identity(value: &str) -> Option<(&str, &str, &str, &str)> {
+    let (platform, rest) = value.split_once(':')?;
+    let (version, rest) = rest.split_once(':')?;
+    let (boot, start) = rest.rsplit_once(':')?;
+    Some((platform, version, boot, start))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessState {
+    Live,
+    Dead,
+}
+
+fn process_state(pid: u32, recorded: &str) -> Result<ProcessState, ReadFailure> {
+    let Some((platform, _, boot, start)) = parse_process_identity(recorded) else {
+        return Err(ReadFailure::pre("marker_identity"));
+    };
+    if (cfg!(target_os = "linux") && platform != "linux")
+        || (cfg!(target_os = "macos") && platform != "macos")
+    {
+        return Err(ReadFailure::pre("marker_identity"));
+    }
+    let current_boot = current_boot_id().ok_or_else(|| ReadFailure::pre("marker_identity"))?;
+    if boot != current_boot {
+        return Ok(ProcessState::Dead);
+    }
+    match process_start(pid)? {
+        Some(current) if current == start => Ok(ProcessState::Live),
+        Some(_) => Ok(ProcessState::Dead),
+        None => Ok(ProcessState::Dead),
+    }
+}
+
+fn current_boot_id() -> Option<String> {
+    let value = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let value = value.trim().to_string();
+    valid_uuid(&value).then_some(value)
+}
+
+fn process_start(pid: u32) -> Result<Option<String>, ReadFailure> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = match std::fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(ReadFailure::pre("marker_identity")),
+    };
+    let close = stat
+        .rfind(')')
+        .ok_or_else(|| ReadFailure::pre("marker_identity"))?;
+    let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+    fields
+        .get(19)
+        .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
+        .map(|value| (*value).to_string())
+        .map(Some)
+        .ok_or_else(|| ReadFailure::pre("marker_identity"))
+}
+
+fn errno_reset() {
+    unsafe { *libc::__errno_location() = 0 }
+}
+
+fn errno() -> i32 {
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_identity_grammar_is_ascii_and_structured() {
+        let boot = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        assert!(valid_process_identity(&format!("linux:v1:{boot}:123")));
+        assert!(!valid_process_identity(&format!("linux:v1:{boot}:123 ")));
+        assert!(!valid_process_identity(&format!("linux:v2:{boot}:123")));
+    }
+
+    #[test]
+    fn temporary_name_requires_canonical_uuid() {
+        let name = "runtime.prebind.tmp.aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        assert!(temporary_kind(name).is_some());
+        assert!(valid_uuid(name.rsplit_once(".tmp.").unwrap().1));
+        assert!(!valid_uuid("AAAAAAAA-bbbb-cccc-dddd-eeeeeeeeeeee"));
+    }
+
+    #[test]
+    fn os_path_helpers_do_not_create_directories() {
+        let base = std::env::temp_dir().join(format!("aoe-read-{}", uuid::Uuid::new_v4()));
+        let path = base.join("missing");
+        assert!(!path.exists());
+        assert!(app_path_and_home().is_ok());
+        assert!(!path.exists());
+    }
+}

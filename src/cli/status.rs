@@ -9,16 +9,27 @@ use crate::session::{Status, Storage};
 #[derive(Args)]
 pub struct StatusArgs {
     /// Show detailed session list
-    #[arg(short = 'v', long)]
-    verbose: bool,
+    #[arg(short = 'v', long, conflicts_with_all = ["quiet", "json"])]
+    pub(crate) verbose: bool,
 
     /// Only output waiting count (for scripts)
-    #[arg(short = 'q', long)]
-    quiet: bool,
+    #[arg(short = 'q', long, conflicts_with_all = ["json", "verbose"])]
+    pub(crate) quiet: bool,
 
     /// Output as JSON
-    #[arg(long)]
-    json: bool,
+    #[arg(long, conflicts_with_all = ["quiet", "verbose"])]
+    pub(crate) json: bool,
+}
+
+impl StatusArgs {
+    #[cfg(test)]
+    pub(crate) fn test_json() -> Self {
+        Self {
+            verbose: false,
+            quiet: false,
+            json: true,
+        }
+    }
 }
 
 #[derive(Default)]

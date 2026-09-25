@@ -231,11 +231,17 @@ pub struct SetWorktreeNameArgs {
 #[derive(Args)]
 pub struct ShowArgs {
     /// Session ID or title (optional, auto-detects in tmux)
-    identifier: Option<String>,
+    pub(crate) identifier: Option<String>,
 
     /// Output as JSON
     #[arg(long)]
-    json: bool,
+    pub(crate) json: bool,
+}
+
+impl ShowArgs {
+    pub(crate) fn identifier(&self) -> Option<&str> {
+        self.identifier.as_deref()
+    }
 }
 
 #[derive(Args)]

@@ -369,6 +369,23 @@ pub fn list_profiles() -> Result<Vec<String>> {
     list_profile_names_in(&profiles_dir)
 }
 
+/// The app dir path, resolved but never created. Read-only callers (the runtime
+/// read endpoint) must not materialize the directory as a side effect of a read.
+pub fn app_dir_path() -> Result<PathBuf> {
+    get_app_dir_path()
+}
+
+/// [`list_profiles`] without the `get_app_dir` auto-create, for callers that must
+/// stay side-effect free. Enumeration failures surface as `Err` rather than an
+/// empty list, so the caller can degrade health instead of reporting "no profiles".
+pub fn list_profiles_readonly() -> Result<Vec<String>> {
+    let profiles_dir = get_app_dir_path()?.join("profiles");
+    if !profiles_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    list_profile_names_in(&profiles_dir)
+}
+
 /// Picker order: alphabetical, with a profile named `default` last.
 pub fn sort_profiles_for_display(profiles: &mut [String]) {
     profiles.sort_by(|a, b| {

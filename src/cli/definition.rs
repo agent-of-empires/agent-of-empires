@@ -52,7 +52,7 @@ pub struct Cli {
     /// name is refused, not created (make one with `aoe profile create`).
     /// Profile-independent commands such as `list --all` and `serve --stop`
     /// ignore it
-    #[arg(short = 'p', long, global = true, env = "AGENT_OF_EMPIRES_PROFILE")]
+    #[arg(short = 'p', long, global = true)]
     pub profile: Option<String>,
 
     /// Attach to a remote agent daemon instead of using the local
@@ -60,7 +60,7 @@ pub struct Cli {
     /// `AOE_DAEMON_TOKEN` for the bearer token. Only meaningful at the
     /// no-subcommand `aoe` invocation (the TUI dashboard); ignored
     /// otherwise.
-    #[arg(long, global = true, env = "AOE_DAEMON_URL")]
+    #[arg(long, global = true)]
     pub daemon_url: Option<String>,
 
     #[command(subcommand)]

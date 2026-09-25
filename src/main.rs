@@ -7,6 +7,7 @@ use agent_of_empires::tui;
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser};
 use clap_complete::generate;
+use std::io::Write;
 
 fn is_serve_command(cli: &Cli) -> bool {
     matches!(cli.command, Some(Commands::Serve(_)))
@@ -76,7 +77,7 @@ async fn main() -> Result<()> {
     }
 
     // Only a parse failure loads the plugin registry to graft plugin commands.
-    let cli = match Cli::try_parse() {
+    let mut cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(_) => {
             let matches = cli::graft::augmented_command().get_matches();
@@ -86,6 +87,26 @@ async fn main() -> Result<()> {
             }
         }
     };
+
+    let read_source = cli::runtime_read::read_request_source(&cli);
+    if let Some(command) = cli::runtime_read::classify(cli.command.as_ref()) {
+        let outcome = cli::runtime_read::execute(command, &read_source).await;
+        emit_read_outcome(outcome);
+    }
+
+    if cli.profile.is_none() {
+        if let Some(profile) = read_source.env_profile.as_deref() {
+            match profile.to_str() {
+                Some(profile) => cli.profile = Some(profile.to_string()),
+                None => Cli::command()
+                    .error(
+                        clap::error::ErrorKind::InvalidValue,
+                        "AGENT_OF_EMPIRES_PROFILE must be valid UTF-8",
+                    )
+                    .exit(),
+            }
+        }
+    }
 
     if let Some(err) = serve_unavailable_error(&cli) {
         err.exit();
@@ -232,6 +253,22 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn emit_read_outcome(outcome: cli::runtime_read::ReadOutcome) -> ! {
+    if let Some(stdout) = outcome.stdout {
+        if std::io::stdout()
+            .lock()
+            .write_all(stdout.as_bytes())
+            .is_err()
+        {
+            eprintln!("daemon read: renderer_internal");
+            std::process::exit(1);
+        }
+    }
+    if let Some(stderr) = outcome.stderr {
+        let _ = std::io::stderr().lock().write_all(stderr.as_bytes());
+    }
+    std::process::exit(outcome.exit);
+}
 async fn run(
     cli: Cli,
     is_daemon_child: bool,

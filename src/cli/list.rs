@@ -12,15 +12,10 @@ const TABLE_COL_PATH: usize = 40;
 const TABLE_COL_ID_DISPLAY: usize = 12;
 const TABLE_COL_STATE: usize = 9;
 
-/// The `aoe list --state=` vocabulary. Mirrors the REST API's
-/// `SessionScope` (`GET /api/sessions?state=`) so the two vocabularies
-/// share one source of truth (#3350). Kept as a clap-facing enum here
-/// rather than deriving `ValueEnum` on the wire type: the API rejects
-/// unrecognized values via serde with a JSON 400, while clap wants its
-/// own `PossibleValue` list for `--help` and `--state=?` errors.
+/// The `aoe list --state=` vocabulary shared with the REST API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lowercase")]
-enum StateFilter {
+pub(crate) enum StateFilter {
     /// Only sessions that are neither archived nor trashed.
     Live,
     /// Only sessions currently in the trash.
@@ -43,18 +38,35 @@ impl From<StateFilter> for SessionScope {
 pub struct ListArgs {
     /// Output as JSON
     #[arg(long)]
-    json: bool,
+    pub(crate) json: bool,
 
     /// List sessions from all profiles
     #[arg(long)]
-    all: bool,
+    pub(crate) all: bool,
 
-    /// Filter by session state. Defaults to `all`, every persisted session,
-    /// which is what `aoe list` has always shown. Pass `--state=live` to skip
-    /// trashed and archived rows; the vocabulary matches the REST API's
-    /// `GET /api/sessions?state=`.
-    #[arg(long, value_enum, default_value_t = StateFilter::All)]
-    state: StateFilter,
+    /// Filter by session state
+    #[arg(long, value_enum, default_value = "all")]
+    pub(crate) state: StateFilter,
+}
+
+impl ListArgs {
+    #[cfg(test)]
+    pub(crate) fn test_json() -> Self {
+        Self {
+            json: true,
+            all: false,
+            state: StateFilter::All,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_all() -> Self {
+        Self {
+            json: false,
+            all: true,
+            state: StateFilter::All,
+        }
+    }
 }
 
 pub(super) fn state_tag(inst: &Instance) -> &'static str {
