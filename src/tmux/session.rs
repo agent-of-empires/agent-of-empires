@@ -2985,82 +2985,83 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn send_key_tokens_appends_no_implicit_enter() {
-        require_tmux!();
+    fn send_key_tokens_sends_exactly_the_given_keys() {
+        // send key tokens sends exact sequence in order
+        {
+            require_tmux!();
 
-        let guard = TmuxTestSession::new("aoe_test_tokens_no_enter");
-        let name = guard.name().to_string();
-        let status = start_test_session(
-            &name,
-            ("40", "10"),
-            &[r#"sh -c 'read -r line; printf "got:<%s>" "$line"; sleep 60'"#],
-            &[";", "set-option", "-t", &name, "pane-base-index", "0"],
-        )
-        .status;
-        assert!(status.success());
-        crate::tmux::test_inject_session_into_cache(&name);
+            let guard = TmuxTestSession::new("aoe_test_tokens_sequence");
+            let name = guard.name().to_string();
+            let status = start_test_session(
+                &name,
+                ("40", "10"),
+                &["sh -c 'read -r line; printf \"got:%s\" \"$line\"; sleep 60'"],
+                &[";", "set-option", "-t", &name, "pane-base-index", "0"],
+            )
+            .status;
+            assert!(status.success());
+            crate::tmux::test_inject_session_into_cache(&name);
 
-        let session = Session::from_name(&name);
-        session
-            .send_key_tokens(&[crate::agents::KeyToken::Literal("hi")])
-            .expect("send_key_tokens");
+            let session = Session::from_name(&name);
+            session
+                .send_key_tokens(&[
+                    crate::agents::KeyToken::Literal("hi"),
+                    crate::agents::KeyToken::Named("Enter"),
+                ])
+                .expect("send_key_tokens");
 
-        let pane = only_pane_id(&name);
-        for args in [
-            vec!["send-keys", "-t", &pane, "-l", "--", "-tail"],
-            vec!["send-keys", "-t", &pane, "Enter"],
-        ] {
-            assert!(crate::tmux::tmux_command()
-                .args(args)
-                .status()
-                .expect("complete input line")
-                .success());
-        }
-        wait_for_text(
-            &session,
-            "got:<hi-tail>",
-            "one complete input line",
-            |session| session.capture_pane(20),
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn send_key_tokens_sends_exact_sequence_in_order() {
-        require_tmux!();
-
-        let guard = TmuxTestSession::new("aoe_test_tokens_sequence");
-        let name = guard.name().to_string();
-        let status = start_test_session(
-            &name,
-            ("40", "10"),
-            &["sh -c 'read -r line; printf \"got:%s\" \"$line\"; sleep 60'"],
-            &[";", "set-option", "-t", &name, "pane-base-index", "0"],
-        )
-        .status;
-        assert!(status.success());
-        crate::tmux::test_inject_session_into_cache(&name);
-
-        let session = Session::from_name(&name);
-        session
-            .send_key_tokens(&[
-                crate::agents::KeyToken::Literal("hi"),
-                crate::agents::KeyToken::Named("Enter"),
-            ])
-            .expect("send_key_tokens");
-
-        let mut content = String::new();
-        for _ in 0..50 {
-            content = session.capture_pane(20).expect("capture_pane");
-            if content.contains("got:hi") {
-                break;
+            let mut content = String::new();
+            for _ in 0..50 {
+                content = session.capture_pane(20).expect("capture_pane");
+                if content.contains("got:hi") {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                content.contains("got:hi"),
+                "literal text followed by a named Enter token should submit the line, got: {content:?}"
+            );
         }
-        assert!(
-            content.contains("got:hi"),
-            "literal text followed by a named Enter token should submit the line, got: {content:?}"
-        );
+        // send key tokens appends no implicit enter
+        {
+            require_tmux!();
+
+            let guard = TmuxTestSession::new("aoe_test_tokens_no_enter");
+            let name = guard.name().to_string();
+            let status = start_test_session(
+                &name,
+                ("40", "10"),
+                &[r#"sh -c 'read -r line; printf "got:<%s>" "$line"; sleep 60'"#],
+                &[";", "set-option", "-t", &name, "pane-base-index", "0"],
+            )
+            .status;
+            assert!(status.success());
+            crate::tmux::test_inject_session_into_cache(&name);
+
+            let session = Session::from_name(&name);
+            session
+                .send_key_tokens(&[crate::agents::KeyToken::Literal("hi")])
+                .expect("send_key_tokens");
+
+            let pane = only_pane_id(&name);
+            for args in [
+                vec!["send-keys", "-t", &pane, "-l", "--", "-tail"],
+                vec!["send-keys", "-t", &pane, "Enter"],
+            ] {
+                assert!(crate::tmux::tmux_command()
+                    .args(args)
+                    .status()
+                    .expect("complete input line")
+                    .success());
+            }
+            wait_for_text(
+                &session,
+                "got:<hi-tail>",
+                "one complete input line",
+                |session| session.capture_pane(20),
+            );
+        }
     }
 
     #[test]
@@ -3176,56 +3177,57 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_is_attached_false_for_detached_session() {
-        require_tmux!();
+    fn test_is_attached_tracks_live_clients() {
+        // is attached false for detached session
+        {
+            require_tmux!();
 
-        let guard = TmuxTestSession::new("aoe_test_attached");
-        let output = start_test_session(guard.name(), ("80", "24"), &["sleep 30"], &[]);
-        assert!(output.status.success());
+            let guard = TmuxTestSession::new("aoe_test_attached");
+            let output = start_test_session(guard.name(), ("80", "24"), &["sleep 30"], &[]);
+            assert!(output.status.success());
 
-        let session = Session::from_name(guard.name());
-        assert_eq!(
-            session.is_attached(),
-            Some(false),
-            "Detached session should report is_attached() == false",
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_is_attached_true_with_live_client() {
-        require_tmux!();
-
-        let target = TmuxTestSession::new("aoe_test_attached_target");
-        let created = start_test_session(target.name(), ("80", "24"), &["sleep 30"], &[]);
-        assert!(created.status.success());
-
-        let probe = crate::tmux::tmux_command();
-        let mut argv = vec![probe.get_program().to_string_lossy().into_owned()];
-        argv.extend(probe.get_args().map(|a| a.to_string_lossy().into_owned()));
-        let attach_cmd = format!(
-            "unset TMUX; TERM=xterm-256color exec {} attach-session -t {}",
-            argv.join(" "),
-            target.name()
-        );
-
-        let client = TmuxTestSession::new("aoe_test_attached_client");
-        let spawned = start_test_session(client.name(), ("100", "40"), &[&attach_cmd], &[]);
-        assert!(spawned.status.success());
-
-        let session = Session::from_name(target.name());
-        let mut attached = false;
-        for _ in 0..40 {
-            if session.is_attached() == Some(true) {
-                attached = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
+            let session = Session::from_name(guard.name());
+            assert_eq!(
+                session.is_attached(),
+                Some(false),
+                "Detached session should report is_attached() == false",
+            );
         }
-        assert!(
-            attached,
-            "a session with a live tmux client must report is_attached() == true"
-        );
+        // is attached true with live client
+        {
+            require_tmux!();
+
+            let target = TmuxTestSession::new("aoe_test_attached_target");
+            let created = start_test_session(target.name(), ("80", "24"), &["sleep 30"], &[]);
+            assert!(created.status.success());
+
+            let probe = crate::tmux::tmux_command();
+            let mut argv = vec![probe.get_program().to_string_lossy().into_owned()];
+            argv.extend(probe.get_args().map(|a| a.to_string_lossy().into_owned()));
+            let attach_cmd = format!(
+                "unset TMUX; TERM=xterm-256color exec {} attach-session -t {}",
+                argv.join(" "),
+                target.name()
+            );
+
+            let client = TmuxTestSession::new("aoe_test_attached_client");
+            let spawned = start_test_session(client.name(), ("100", "40"), &[&attach_cmd], &[]);
+            assert!(spawned.status.success());
+
+            let session = Session::from_name(target.name());
+            let mut attached = false;
+            for _ in 0..40 {
+                if session.is_attached() == Some(true) {
+                    attached = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                attached,
+                "a session with a live tmux client must report is_attached() == true"
+            );
+        }
     }
 
     #[test]
@@ -3383,60 +3385,165 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn composited_capture_matches_capture_pane_when_unsplit() {
-        require_tmux!();
+    fn composited_capture_layouts() {
+        // composited capture matches capture pane when unsplit
+        {
+            require_tmux!();
 
-        let guard = TmuxTestSession::new("aoe_test_composite_single");
-        let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
-        wait_for_pane_text(&session, "ALPHA");
+            let guard = TmuxTestSession::new("aoe_test_composite_single");
+            let session =
+                start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
+            wait_for_pane_text(&session, "ALPHA");
 
-        let plain = session
-            .capture_pane_with_cursor(10)
-            .expect("capture_pane_with_cursor")
-            .0;
-        let composited = session
-            .capture_window_composited(10)
-            .expect("capture_window_composited");
-        assert!(plain.contains("ALPHA"), "control capture empty: {plain:?}");
-        assert_eq!(
-            composited, plain,
-            "an unsplit window must pass the pane bytes through untouched"
-        );
-    }
+            let plain = session
+                .capture_pane_with_cursor(10)
+                .expect("capture_pane_with_cursor")
+                .0;
+            let composited = session
+                .capture_window_composited(10)
+                .expect("capture_window_composited");
+            assert!(plain.contains("ALPHA"), "control capture empty: {plain:?}");
+            assert_eq!(
+                composited, plain,
+                "an unsplit window must pass the pane bytes through untouched"
+            );
+        }
+        // composited capture includes a split off pane
+        {
+            require_tmux!();
 
-    #[test]
-    #[serial_test::serial]
-    fn composited_capture_includes_a_split_off_pane() {
-        require_tmux!();
+            let guard = TmuxTestSession::new("aoe_test_composite_split");
+            let session =
+                start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
+            wait_for_pane_text(&session, "ALPHA");
+            split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
+            wait_for_composite_text(&session, "BRAVO");
 
-        let guard = TmuxTestSession::new("aoe_test_composite_split");
-        let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
-        wait_for_pane_text(&session, "ALPHA");
-        split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
-        wait_for_composite_text(&session, "BRAVO");
+            let plain = session.capture_pane(10).expect("capture_pane");
+            let composited = session
+                .capture_window_composited(10)
+                .expect("capture_window_composited");
 
-        let plain = session.capture_pane(10).expect("capture_pane");
-        let composited = session
-            .capture_window_composited(10)
-            .expect("capture_window_composited");
+            assert!(plain.contains("ALPHA"));
+            assert!(
+                !plain.contains("BRAVO"),
+                "control: capture_pane should not see the split pane"
+            );
+            assert!(
+                composited.contains("ALPHA") && composited.contains("BRAVO"),
+                "composite missed a pane:\n{composited}"
+            );
+            let seam_row = composited
+                .lines()
+                .find(|l| l.contains("ALPHA"))
+                .expect("row with ALPHA");
+            assert!(
+                seam_row.contains("BRAVO"),
+                "panes should share a row, not stack:\n{seam_row:?}"
+            );
+        }
+        // a stacked split composites one line per window row
+        {
+            require_tmux!();
 
-        assert!(plain.contains("ALPHA"));
-        assert!(
-            !plain.contains("BRAVO"),
-            "control: capture_pane should not see the split pane"
-        );
-        assert!(
-            composited.contains("ALPHA") && composited.contains("BRAVO"),
-            "composite missed a pane:\n{composited}"
-        );
-        let seam_row = composited
-            .lines()
-            .find(|l| l.contains("ALPHA"))
-            .expect("row with ALPHA");
-        assert!(
-            seam_row.contains("BRAVO"),
-            "panes should share a row, not stack:\n{seam_row:?}"
-        );
+            let guard = TmuxTestSession::new("aoe_test_composite_rows");
+            let session =
+                start_composite_session(guard.name(), 30, 10, "sh -c 'echo ALPHA; sleep 30'");
+            wait_for_pane_text(&session, "ALPHA");
+            let split = crate::tmux::tmux_command()
+                .args([
+                    "split-window",
+                    "-v",
+                    "-t",
+                    &session.name,
+                    "sh -c 'sleep 30'",
+                ])
+                .status()
+                .expect("tmux split-window -v");
+            assert!(split.success(), "failed to split {}", session.name);
+            refresh_session_cache();
+            wait_for_composite_text(&session, "ALPHA");
+
+            let composited = session.capture_window_composited(10).expect("composite");
+            assert_eq!(
+                composited.lines().count(),
+                10,
+                "composite must be window_height lines:\n{composited}"
+            );
+        }
+        // a zoomed pane falls back to the plain capture
+        {
+            require_tmux!();
+
+            let guard = TmuxTestSession::new("aoe_test_composite_zoom");
+            let session =
+                start_composite_session(guard.name(), 40, 8, "sh -c 'echo ALPHA; sleep 30'");
+            wait_for_pane_text(&session, "ALPHA");
+            split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
+            wait_for_composite_text(&session, "BRAVO");
+
+            let unzoomed = session
+                .capture_window_composited(10)
+                .expect("composite unzoomed");
+            assert!(
+                unzoomed.contains("ALPHA") && unzoomed.contains("BRAVO"),
+                "control: split should composite both panes:\n{unzoomed}"
+            );
+
+            let zoom = crate::tmux::tmux_command()
+                .args(["resize-pane", "-Z", "-t", &format!("{}:^.1", session.name)])
+                .status()
+                .expect("tmux resize-pane -Z");
+            assert!(zoom.success(), "zoom must land or this tests nothing");
+            assert_eq!(
+                String::from_utf8_lossy(
+                    &crate::tmux::tmux_command()
+                        .args([
+                            "display-message",
+                            "-p",
+                            "-t",
+                            &format!("{}:^", session.name),
+                            "-F",
+                            "#{window_zoomed_flag}",
+                        ])
+                        .output()
+                        .expect("zoom probe")
+                        .stdout
+                )
+                .trim(),
+                "1",
+                "tmux did not report the window as zoomed"
+            );
+
+            let zoomed = session
+                .capture_window_composited(10)
+                .expect("composite zoomed");
+            assert!(
+                !zoomed.contains('─') && !zoomed.contains('│'),
+                "zoomed frame painted border fill over the window:\n{zoomed}"
+            );
+            assert_eq!(
+                zoomed,
+                session
+                    .capture_pane_with_cursor(10)
+                    .expect("capture_pane_with_cursor")
+                    .0,
+                "zoomed must be byte-identical to the pane-0 capture"
+            );
+
+            assert!(crate::tmux::tmux_command()
+                .args(["resize-pane", "-Z", "-t", &format!("{}:^.1", session.name)])
+                .status()
+                .expect("tmux unzoom")
+                .success());
+            let restored = session
+                .capture_window_composited(10)
+                .expect("composite after unzoom");
+            assert!(
+                restored.contains("ALPHA") && restored.contains("BRAVO"),
+                "unzoom did not restore the composite:\n{restored}"
+            );
+        }
     }
 
     fn pane0_tmux_geometry(session: &Session) -> (u16, u16, u16, u16) {
@@ -3573,250 +3680,148 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn a_zoomed_pane_falls_back_to_the_plain_capture() {
-        require_tmux!();
+    fn composited_capture_layout_and_cursor() {
+        // captured layout puts pane zero first at the origin
+        {
+            require_tmux!();
 
-        let guard = TmuxTestSession::new("aoe_test_composite_zoom");
-        let session = start_composite_session(guard.name(), 40, 8, "sh -c 'echo ALPHA; sleep 30'");
-        wait_for_pane_text(&session, "ALPHA");
-        split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
-        wait_for_composite_text(&session, "BRAVO");
-
-        let unzoomed = session
-            .capture_window_composited(10)
-            .expect("composite unzoomed");
-        assert!(
-            unzoomed.contains("ALPHA") && unzoomed.contains("BRAVO"),
-            "control: split should composite both panes:\n{unzoomed}"
-        );
-
-        let zoom = crate::tmux::tmux_command()
-            .args(["resize-pane", "-Z", "-t", &format!("{}:^.1", session.name)])
-            .status()
-            .expect("tmux resize-pane -Z");
-        assert!(zoom.success(), "zoom must land or this tests nothing");
-        assert_eq!(
-            String::from_utf8_lossy(
-                &crate::tmux::tmux_command()
-                    .args([
-                        "display-message",
-                        "-p",
-                        "-t",
-                        &format!("{}:^", session.name),
-                        "-F",
-                        "#{window_zoomed_flag}",
-                    ])
-                    .output()
-                    .expect("zoom probe")
-                    .stdout
-            )
-            .trim(),
-            "1",
-            "tmux did not report the window as zoomed"
-        );
-
-        let zoomed = session
-            .capture_window_composited(10)
-            .expect("composite zoomed");
-        assert!(
-            !zoomed.contains('─') && !zoomed.contains('│'),
-            "zoomed frame painted border fill over the window:\n{zoomed}"
-        );
-        assert_eq!(
-            zoomed,
-            session
-                .capture_pane_with_cursor(10)
-                .expect("capture_pane_with_cursor")
-                .0,
-            "zoomed must be byte-identical to the pane-0 capture"
-        );
-
-        assert!(crate::tmux::tmux_command()
-            .args(["resize-pane", "-Z", "-t", &format!("{}:^.1", session.name)])
-            .status()
-            .expect("tmux unzoom")
-            .success());
-        let restored = session
-            .capture_window_composited(10)
-            .expect("composite after unzoom");
-        assert!(
-            restored.contains("ALPHA") && restored.contains("BRAVO"),
-            "unzoom did not restore the composite:\n{restored}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn a_stacked_split_composites_one_line_per_window_row() {
-        require_tmux!();
-
-        let guard = TmuxTestSession::new("aoe_test_composite_rows");
-        let session = start_composite_session(guard.name(), 30, 10, "sh -c 'echo ALPHA; sleep 30'");
-        wait_for_pane_text(&session, "ALPHA");
-        let split = crate::tmux::tmux_command()
-            .args([
-                "split-window",
-                "-v",
-                "-t",
-                &session.name,
-                "sh -c 'sleep 30'",
-            ])
-            .status()
-            .expect("tmux split-window -v");
-        assert!(split.success(), "failed to split {}", session.name);
-        refresh_session_cache();
-        wait_for_composite_text(&session, "ALPHA");
-
-        let composited = session.capture_window_composited(10).expect("composite");
-        assert_eq!(
-            composited.lines().count(),
-            10,
-            "composite must be window_height lines:\n{composited}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn captured_layout_puts_pane_zero_first_at_the_origin() {
-        require_tmux!();
-
-        let guard = TmuxTestSession::new("aoe_test_layout_order");
-        let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
-        wait_for_pane_text(&session, "ALPHA");
-        split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
-        wait_for_composite_text(&session, "BRAVO");
-        let selected = crate::tmux::tmux_command()
-            .args(["select-pane", "-t", &format!("{}:^.1", session.name)])
-            .output()
-            .expect("tmux select-pane");
-        assert!(
-            selected.status.success(),
-            "select-pane must land, or this degrades to the pane-0-already-active case"
-        );
-        let active = crate::tmux::tmux_command()
-            .args([
-                "display-message",
-                "-p",
-                "-t",
-                &format!("{}:^", session.name),
-                "-F",
-                "#{pane_index}",
-            ])
-            .output()
-            .expect("tmux display-message");
-        assert_eq!(
-            String::from_utf8_lossy(&active.stdout).trim(),
-            "1",
-            "pane 1 should be the active pane before the layout is captured"
-        );
-        let layout = session
-            .capture_window_layout(2)
-            .expect("layout for a split window");
-        assert_eq!(layout.panes.len(), 2);
-        assert_eq!(layout.window_width, 80);
-        let first = layout.first_pane().expect("first pane");
-        assert_eq!(
-            (first.left, first.top),
-            (0, 0),
-            "pane 0 must sit at the origin in this split; a border-status row would shift it"
-        );
-        assert!(
-            layout.panes[0].rows.iter().any(|r| r.contains("ALPHA")),
-            "pane 0 rows: {:?}",
-            layout.panes[0].rows
-        );
-        assert!(layout.panes[1].rows.iter().any(|r| r.contains("BRAVO")));
-        for (i, pane) in layout.panes.iter().enumerate() {
-            for row in &pane.rows {
-                assert_eq!(
-                    crate::tmux::utils::strip_ansi(row).chars().count(),
-                    pane.geom.width as usize,
-                    "pane {i} row not padded to {}: {row:?}",
-                    pane.geom.width
-                );
+            let guard = TmuxTestSession::new("aoe_test_layout_order");
+            let session =
+                start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
+            wait_for_pane_text(&session, "ALPHA");
+            split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
+            wait_for_composite_text(&session, "BRAVO");
+            let selected = crate::tmux::tmux_command()
+                .args(["select-pane", "-t", &format!("{}:^.1", session.name)])
+                .output()
+                .expect("tmux select-pane");
+            assert!(
+                selected.status.success(),
+                "select-pane must land, or this degrades to the pane-0-already-active case"
+            );
+            let active = crate::tmux::tmux_command()
+                .args([
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &format!("{}:^", session.name),
+                    "-F",
+                    "#{pane_index}",
+                ])
+                .output()
+                .expect("tmux display-message");
+            assert_eq!(
+                String::from_utf8_lossy(&active.stdout).trim(),
+                "1",
+                "pane 1 should be the active pane before the layout is captured"
+            );
+            let layout = session
+                .capture_window_layout(2)
+                .expect("layout for a split window");
+            assert_eq!(layout.panes.len(), 2);
+            assert_eq!(layout.window_width, 80);
+            let first = layout.first_pane().expect("first pane");
+            assert_eq!(
+                (first.left, first.top),
+                (0, 0),
+                "pane 0 must sit at the origin in this split; a border-status row would shift it"
+            );
+            assert!(
+                layout.panes[0].rows.iter().any(|r| r.contains("ALPHA")),
+                "pane 0 rows: {:?}",
+                layout.panes[0].rows
+            );
+            assert!(layout.panes[1].rows.iter().any(|r| r.contains("BRAVO")));
+            for (i, pane) in layout.panes.iter().enumerate() {
+                for row in &pane.rows {
+                    assert_eq!(
+                        crate::tmux::utils::strip_ansi(row).chars().count(),
+                        pane.geom.width as usize,
+                        "pane {i} row not padded to {}: {row:?}",
+                        pane.geom.width
+                    );
+                }
             }
         }
-    }
+        // composited capture carries the pane cursor
+        {
+            require_tmux!();
 
-    #[test]
-    #[serial_test::serial]
-    fn composited_capture_carries_the_pane_cursor() {
-        require_tmux!();
+            let guard = TmuxTestSession::new("aoe_test_composite_cursor");
+            let session =
+                start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
+            wait_for_pane_text(&session, "ALPHA");
 
-        let guard = TmuxTestSession::new("aoe_test_composite_cursor");
-        let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
-        wait_for_pane_text(&session, "ALPHA");
+            let (content, cursor) = session
+                .capture_window_composited_with_cursor(20)
+                .expect("composited capture");
+            let plain = session
+                .capture_pane_with_cursor(20)
+                .expect("capture_pane_with_cursor")
+                .0;
+            assert_eq!(
+                content, plain,
+                "unsplit window must still pass pane bytes through untouched"
+            );
+            assert!(
+                content.contains("ALPHA"),
+                "first captured row went missing: {content:?}"
+            );
+            let cursor = cursor.expect("a cursor for a live pane");
+            assert_eq!(cursor.pane_width, 80, "cursor carries the pane geometry");
+            assert!(
+                cursor.position_reliable,
+                "an unchanged single-pane capture must keep its cursor"
+            );
 
-        let (content, cursor) = session
-            .capture_window_composited_with_cursor(20)
-            .expect("composited capture");
-        let plain = session
-            .capture_pane_with_cursor(20)
-            .expect("capture_pane_with_cursor")
-            .0;
-        assert_eq!(
-            content, plain,
-            "unsplit window must still pass pane bytes through untouched"
-        );
-        assert!(
-            content.contains("ALPHA"),
-            "first captured row went missing: {content:?}"
-        );
-        let cursor = cursor.expect("a cursor for a live pane");
-        assert_eq!(cursor.pane_width, 80, "cursor carries the pane geometry");
-        assert!(
-            cursor.position_reliable,
-            "an unchanged single-pane capture must keep its cursor"
-        );
+            split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
+            wait_for_composite_text(&session, "BRAVO");
 
-        split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
-        wait_for_composite_text(&session, "BRAVO");
+            let (content, cursor) = session
+                .capture_window_composited_with_cursor(20)
+                .expect("composited capture");
+            assert!(content.contains("ALPHA") && content.contains("BRAVO"));
+            let cursor = cursor.expect("a cursor for the split window");
+            assert_eq!(
+                cursor.pane_width, 80,
+                "rebased onto the window, not pane 0 (which is now ~39 wide)"
+            );
+            assert_eq!(
+                cursor.history_size, 0,
+                "a composite has no scrollback to advertise"
+            );
+            assert!(
+                cursor.position_reliable,
+                "visible-only composite cannot have drifted"
+            );
+        }
+        // both composite transports agree on a static window
+        {
+            require_tmux!();
 
-        let (content, cursor) = session
-            .capture_window_composited_with_cursor(20)
-            .expect("composited capture");
-        assert!(content.contains("ALPHA") && content.contains("BRAVO"));
-        let cursor = cursor.expect("a cursor for the split window");
-        assert_eq!(
-            cursor.pane_width, 80,
-            "rebased onto the window, not pane 0 (which is now ~39 wide)"
-        );
-        assert_eq!(
-            cursor.history_size, 0,
-            "a composite has no scrollback to advertise"
-        );
-        assert!(
-            cursor.position_reliable,
-            "visible-only composite cannot have drifted"
-        );
-    }
+            let guard = TmuxTestSession::new("aoe_test_composite_agree");
+            let session =
+                start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
+            wait_for_pane_text(&session, "ALPHA");
+            split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
+            wait_for_composite_text(&session, "BRAVO");
 
-    #[test]
-    #[serial_test::serial]
-    fn both_composite_transports_agree_on_a_static_window() {
-        require_tmux!();
+            let fallback = session
+                .capture_window_composited(24)
+                .expect("capture_window_composited");
+            let layout = session.capture_window_layout(2).expect("layout");
+            let swapped = layout.composite_with_first_pane_rows(&layout.panes[0].rows.clone());
 
-        let guard = TmuxTestSession::new("aoe_test_composite_agree");
-        let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
-        wait_for_pane_text(&session, "ALPHA");
-        split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
-        wait_for_composite_text(&session, "BRAVO");
-
-        let fallback = session
-            .capture_window_composited(24)
-            .expect("capture_window_composited");
-        let layout = session.capture_window_layout(2).expect("layout");
-        let swapped = layout.composite_with_first_pane_rows(&layout.panes[0].rows.clone());
-
-        assert_eq!(
-            fallback,
-            layout.composite(),
-            "fork-per-frame and cached-layout renderings diverged"
-        );
-        assert_eq!(
-            fallback, swapped,
-            "swapping pane 0's rows for identical rows changed the frame"
-        );
+            assert_eq!(
+                fallback,
+                layout.composite(),
+                "fork-per-frame and cached-layout renderings diverged"
+            );
+            assert_eq!(
+                fallback, swapped,
+                "swapping pane 0's rows for identical rows changed the frame"
+            );
+        }
     }
 
     #[test]

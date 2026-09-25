@@ -702,24 +702,48 @@ mod tests {
 
     #[test]
     #[serial]
-    fn delete_if_owned_preserves_replacement_record_and_socket() {
-        with_temp_home(|| {
-            let session_id = "replacement";
-            let socket = socket_path_for(session_id).unwrap();
-            touch_live_socket(&socket);
-            let replacement_control = crate::process::worker::control_socket_sibling(&socket);
-            let mut record = new_record(session_id, 111, socket);
-            save(&record).unwrap();
-            record.pid = 222;
-            save(&record).unwrap();
+    fn delete_if_owned_leaves_a_replacement_record() {
+        // delete if owned preserves replacement record and socket
+        {
+            with_temp_home(|| {
+                let session_id = "replacement";
+                let socket = socket_path_for(session_id).unwrap();
+                touch_live_socket(&socket);
+                let replacement_control = crate::process::worker::control_socket_sibling(&socket);
+                let mut record = new_record(session_id, 111, socket);
+                save(&record).unwrap();
+                record.pid = 222;
+                save(&record).unwrap();
 
-            assert!(!delete_if_owned(session_id, 111).unwrap());
-            assert_eq!(load(session_id).unwrap().unwrap().pid, 222);
-            assert!(replacement_control.exists());
-            assert!(delete_if_owned(session_id, 222).unwrap());
-            assert!(load(session_id).unwrap().is_none());
-            assert!(!replacement_control.exists());
-        });
+                assert!(!delete_if_owned(session_id, 111).unwrap());
+                assert_eq!(load(session_id).unwrap().unwrap().pid, 222);
+                assert!(replacement_control.exists());
+                assert!(delete_if_owned(session_id, 222).unwrap());
+                assert!(load(session_id).unwrap().is_none());
+                assert!(!replacement_control.exists());
+            });
+        }
+        // delete if owned by leaves a replacement record
+        {
+            with_temp_home(|| {
+                let socket = workers_dir().unwrap().join("g.sock");
+                let rec = new_record("g", 41, socket).with_generation(3);
+                save(&rec).unwrap();
+                assert!(
+                    delete_if_owned_by("g", 40, 3),
+                    "other pid: settled without touching"
+                );
+                assert!(load("g").unwrap().is_some());
+                assert!(
+                    delete_if_owned_by("g", 41, 4),
+                    "other generation: settled, kept"
+                );
+                assert!(load("g").unwrap().is_some());
+                assert!(delete_if_owned_by("g", 41, 3));
+                assert!(load("g").unwrap().is_none());
+                assert!(delete_if_owned_by("g", 41, 3), "missing record is settled");
+            });
+        }
     }
 
     #[test]
@@ -923,29 +947,6 @@ mod tests {
             );
             clear_restart_marker("m");
             assert!(!path.exists());
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn delete_if_owned_by_leaves_a_replacement_record() {
-        with_temp_home(|| {
-            let socket = workers_dir().unwrap().join("g.sock");
-            let rec = new_record("g", 41, socket).with_generation(3);
-            save(&rec).unwrap();
-            assert!(
-                delete_if_owned_by("g", 40, 3),
-                "other pid: settled without touching"
-            );
-            assert!(load("g").unwrap().is_some());
-            assert!(
-                delete_if_owned_by("g", 41, 4),
-                "other generation: settled, kept"
-            );
-            assert!(load("g").unwrap().is_some());
-            assert!(delete_if_owned_by("g", 41, 3));
-            assert!(load("g").unwrap().is_none());
-            assert!(delete_if_owned_by("g", 41, 3), "missing record is settled");
         });
     }
 }

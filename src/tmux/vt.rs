@@ -3143,18 +3143,72 @@ mod tests {
     }
 
     #[test]
-    fn grid_content_preserves_interior_padding() {
-        let mut p = vt100::Parser::new(2, 20, 0);
-        p.process(b"A\x1b[12GB");
-        let (content, _) = grid_content(&mut p, 2, 20, 2);
-        assert!(
-            content.contains("A          B"),
-            "interior padding collapsed:\n{content:?}"
-        );
-        assert!(
-            !content.contains("\x1b[10C") && !content.contains("\x1b[C"),
-            "cursor-forward escape leaked:\n{content:?}"
-        );
+    fn grid_content_keeps_padding_color_and_scrollback() {
+        // grid content preserves interior padding
+        {
+            let mut p = vt100::Parser::new(2, 20, 0);
+            p.process(b"A\x1b[12GB");
+            let (content, _) = grid_content(&mut p, 2, 20, 2);
+            assert!(
+                content.contains("A          B"),
+                "interior padding collapsed:\n{content:?}"
+            );
+            assert!(
+                !content.contains("\x1b[10C") && !content.contains("\x1b[C"),
+                "cursor-forward escape leaked:\n{content:?}"
+            );
+        }
+        // grid content preserves color
+        {
+            let mut p = vt100::Parser::new(2, 20, 0);
+            p.process(b"\x1b[31mX\x1b[0m");
+            let (content, _) = grid_content(&mut p, 2, 20, 2);
+            assert!(content.contains('X'), "glyph missing:\n{content:?}");
+            assert!(
+                content.contains("\x1b[31m") || content.contains("31m"),
+                "red foreground lost:\n{content:?}"
+            );
+        }
+        // grid content keeps trailing styled fill
+        {
+            let mut p = vt100::Parser::new(2, 10, 0);
+            p.process(b"Hi\x1b[44m\x1b[K");
+            let (content, _) = grid_content(&mut p, 2, 10, 2);
+            let first = content.split('\n').next().unwrap_or("");
+            assert!(
+                first.contains("44m"),
+                "trailing background fill dropped:\n{content:?}"
+            );
+            assert!(
+                first.matches(' ').count() >= 8,
+                "trailing fill should keep its eight cells as spaces:\n{content:?}"
+            );
+        }
+        // grid content assembles scrollback and screen
+        {
+            let mut p = vt100::Parser::new(4, 20, 100);
+            for i in 1..=12 {
+                p.process(format!("LINE{i:02}\r\n").as_bytes());
+            }
+
+            let (content, history) = grid_content(&mut p, 100, 20, 4);
+            assert!(history > 0, "expected scrollback depth, got {history}");
+            assert!(
+                content.contains("LINE01"),
+                "missing oldest line:\n{content}"
+            );
+            assert!(
+                content.contains("LINE12"),
+                "missing newest line:\n{content}"
+            );
+
+            let (screen_only, _) = grid_content(&mut p, 4, 20, 4);
+            assert!(
+                !screen_only.contains("LINE01"),
+                "screen-only window should not include scrollback:\n{screen_only}"
+            );
+            assert_eq!(p.screen().scrollback(), 0, "live-edge offset not restored");
+        }
     }
 
     fn visible_width(row: &str) -> usize {
@@ -3163,74 +3217,72 @@ mod tests {
     }
 
     #[test]
-    fn capture_rows_padded_fills_every_row_to_the_pane_width() {
-        let rows = capture_rows_padded(b"ab\nlonger\n", 8, 3);
-        assert_eq!(rows.len(), 3, "one entry per pane row, blanks included");
-        for (i, row) in rows.iter().enumerate() {
-            assert_eq!(visible_width(row), 8, "row {i} not padded: {row:?}");
+    fn capture_rows_padded_fits_rows_to_the_pane() {
+        // capture rows padded fills every row to the pane width
+        {
+            let rows = capture_rows_padded(b"ab\nlonger\n", 8, 3);
+            assert_eq!(rows.len(), 3, "one entry per pane row, blanks included");
+            for (i, row) in rows.iter().enumerate() {
+                assert_eq!(visible_width(row), 8, "row {i} not padded: {row:?}");
+            }
+            assert!(rows[0].contains("ab"));
+            assert!(rows[1].contains("longer"));
         }
-        assert!(rows[0].contains("ab"));
-        assert!(rows[1].contains("longer"));
-    }
-
-    #[test]
-    fn capture_rows_padded_unstaircases_bare_lf_input() {
-        let rows = capture_rows_padded(b"line-1\nline-2\n", 10, 2);
-        let plain: Vec<String> = rows
-            .iter()
-            .map(|r| crate::tmux::utils::strip_ansi(r))
-            .collect();
-        assert_eq!(plain[0].trim_end(), "line-1");
-        assert_eq!(plain[1].trim_end(), "line-2", "row 1 staircased");
-    }
-
-    #[test]
-    fn capture_rows_padded_resets_style_before_padding() {
-        let rows = capture_rows_padded(b"\x1b[41mred", 8, 1);
-        assert_eq!(visible_width(&rows[0]), 8);
-        assert!(
-            rows[0].ends_with("\x1b[0m     "),
-            "padding not reset: {:?}",
-            rows[0]
-        );
-    }
-
-    #[test]
-    fn capture_rows_padded_counts_a_trailing_wide_glyph_as_two_columns() {
-        let rows = capture_rows_padded("ab漢".as_bytes(), 4, 1);
-        assert_eq!(
-            visible_width(&rows[0]),
-            4,
-            "row should exactly fill the pane: {:?}",
-            rows[0]
-        );
-        assert!(
-            !rows[0].ends_with(' '),
-            "no padding belongs on a row that already fills its width: {:?}",
-            rows[0]
-        );
-
-        let rows = capture_rows_padded("ab漢".as_bytes(), 7, 1);
-        assert_eq!(visible_width(&rows[0]), 7, "{:?}", rows[0]);
-
-        let rows = capture_rows_padded("abc漢".as_bytes(), 4, 2);
-        for (i, r) in rows.iter().enumerate() {
-            assert_eq!(visible_width(r), 4, "row {i}: {r:?}");
+        // capture rows padded unstaircases bare lf input
+        {
+            let rows = capture_rows_padded(b"line-1\nline-2\n", 10, 2);
+            let plain: Vec<String> = rows
+                .iter()
+                .map(|r| crate::tmux::utils::strip_ansi(r))
+                .collect();
+            assert_eq!(plain[0].trim_end(), "line-1");
+            assert_eq!(plain[1].trim_end(), "line-2", "row 1 staircased");
         }
-    }
+        // capture rows padded resets style before padding
+        {
+            let rows = capture_rows_padded(b"\x1b[41mred", 8, 1);
+            assert_eq!(visible_width(&rows[0]), 8);
+            assert!(
+                rows[0].ends_with("\x1b[0m     "),
+                "padding not reset: {:?}",
+                rows[0]
+            );
+        }
+        // capture rows padded counts a trailing wide glyph as two columns
+        {
+            let rows = capture_rows_padded("ab漢".as_bytes(), 4, 1);
+            assert_eq!(
+                visible_width(&rows[0]),
+                4,
+                "row should exactly fill the pane: {:?}",
+                rows[0]
+            );
+            assert!(
+                !rows[0].ends_with(' '),
+                "no padding belongs on a row that already fills its width: {:?}",
+                rows[0]
+            );
 
-    #[test]
-    fn capture_rows_padded_survives_a_one_row_pane_that_wraps() {
-        let rows = capture_rows_padded(b"keep", 3, 1);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(visible_width(&rows[0]), 3);
-    }
+            let rows = capture_rows_padded("ab漢".as_bytes(), 7, 1);
+            assert_eq!(visible_width(&rows[0]), 7, "{:?}", rows[0]);
 
-    #[test]
-    fn capture_rows_padded_truncates_content_wider_than_the_pane() {
-        let rows = capture_rows_padded(b"abcdefgh", 4, 2);
-        assert_eq!(visible_width(&rows[0]), 4);
-        assert_eq!(visible_width(&rows[1]), 4);
+            let rows = capture_rows_padded("abc漢".as_bytes(), 4, 2);
+            for (i, r) in rows.iter().enumerate() {
+                assert_eq!(visible_width(r), 4, "row {i}: {r:?}");
+            }
+        }
+        // capture rows padded survives a one row pane that wraps
+        {
+            let rows = capture_rows_padded(b"keep", 3, 1);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(visible_width(&rows[0]), 3);
+        }
+        // capture rows padded truncates content wider than the pane
+        {
+            let rows = capture_rows_padded(b"abcdefgh", 4, 2);
+            assert_eq!(visible_width(&rows[0]), 4);
+            assert_eq!(visible_width(&rows[1]), 4);
+        }
     }
 
     #[test]
@@ -3308,39 +3360,41 @@ mod tests {
         );
     }
     #[test]
-    fn lf_to_crlf_unstaircases_seed_rows() {
-        let raw = b"line-1\nline-2\nREADY> ";
-        let mut staircased = vt100::Parser::new(6, 40, 0);
-        staircased.process(raw);
-        assert_eq!(
-            staircased.screen().cell(1, 0).map(|c| c.contents()),
-            Some(""),
-            "control: bare LF should staircase (row 1 col 0 empty)"
-        );
+    fn lf_to_crlf_unstaircases_only_bare_lf() {
+        // lf to crlf unstaircases seed rows
+        {
+            let raw = b"line-1\nline-2\nREADY> ";
+            let mut staircased = vt100::Parser::new(6, 40, 0);
+            staircased.process(raw);
+            assert_eq!(
+                staircased.screen().cell(1, 0).map(|c| c.contents()),
+                Some(""),
+                "control: bare LF should staircase (row 1 col 0 empty)"
+            );
 
-        let mut fixed = vt100::Parser::new(6, 40, 0);
-        fixed.process(&lf_to_crlf(raw));
-        assert_eq!(
-            fixed.screen().cell(0, 0).map(|c| c.contents()),
-            Some("l"),
-            "row 0 starts at col 0"
-        );
-        assert_eq!(
-            fixed.screen().cell(1, 0).map(|c| c.contents()),
-            Some("l"),
-            "row 1 must start at col 0, not staircase"
-        );
-        assert_eq!(
-            fixed.screen().cell(2, 0).map(|c| c.contents()),
-            Some("R"),
-            "prompt row starts at col 0"
-        );
-    }
-
-    #[test]
-    fn lf_to_crlf_leaves_existing_crlf_alone() {
-        assert_eq!(lf_to_crlf(b"a\r\nb"), b"a\r\nb");
-        assert_eq!(lf_to_crlf(b"a\nb"), b"a\r\nb");
+            let mut fixed = vt100::Parser::new(6, 40, 0);
+            fixed.process(&lf_to_crlf(raw));
+            assert_eq!(
+                fixed.screen().cell(0, 0).map(|c| c.contents()),
+                Some("l"),
+                "row 0 starts at col 0"
+            );
+            assert_eq!(
+                fixed.screen().cell(1, 0).map(|c| c.contents()),
+                Some("l"),
+                "row 1 must start at col 0, not staircase"
+            );
+            assert_eq!(
+                fixed.screen().cell(2, 0).map(|c| c.contents()),
+                Some("R"),
+                "prompt row starts at col 0"
+            );
+        }
+        // lf to crlf leaves existing crlf alone
+        {
+            assert_eq!(lf_to_crlf(b"a\r\nb"), b"a\r\nb");
+            assert_eq!(lf_to_crlf(b"a\nb"), b"a\r\nb");
+        }
     }
 
     #[test]
@@ -3355,203 +3409,202 @@ mod tests {
     }
 
     #[test]
-    fn seed_places_cursor_at_queried_position_not_end_of_content() {
-        let rows: u16 = 6;
-        let cols: u16 = 20;
-        let body = b"row0-full-content\nrow1-full-content\nrow2-full-content\nrow3-full-content\nrow4-full-content\nrow5-full-content\n";
-        let state = PaneSeedState {
-            cursor_x: 3,
-            cursor_y: 1,
-            cursor_visible: true,
-            pane_height: rows,
-            ..Default::default()
-        };
-        let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-        p.process(&assemble_seed_stream(body, &state, rows));
-
-        assert_eq!(
-            p.screen().cursor_position(),
-            (1, 3),
-            "cursor must sit at the queried (row 1, col 3), not end-of-content"
-        );
-        assert!(
-            !p.screen().hide_cursor(),
-            "cursor_flag=1 must show the cursor"
-        );
-        assert!(
-            p.screen().contents().contains("row0-full-content"),
-            "top row must survive (no over-scroll):\n{}",
-            p.screen().contents()
-        );
-    }
-
-    #[test]
-    fn seed_hides_cursor_when_pane_hid_it() {
-        let state = PaneSeedState {
-            cursor_x: 0,
-            cursor_y: 0,
-            cursor_visible: false,
-            ..Default::default()
-        };
-        let mut p = vt100::Parser::new(4, 10, 0);
-        p.process(&assemble_seed_stream(b"hi\n", &state, 4));
-        assert!(
-            p.screen().hide_cursor(),
-            "cursor_flag=0 must hide the seeded cursor"
-        );
-    }
-
-    #[test]
-    fn seed_cursor_row_is_visible_screen_relative_with_scrollback() {
-        let rows: u16 = 4;
-        let cols: u16 = 12;
-        let mut body = Vec::new();
-        for i in 0..10 {
-            body.extend_from_slice(format!("HL{i:02}\n").as_bytes());
-        }
-        let state = PaneSeedState {
-            cursor_x: 2,
-            cursor_y: 1,
-            cursor_visible: true,
-            pane_height: rows,
-            ..Default::default()
-        };
-        let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-        p.process(&assemble_seed_stream(&body, &state, rows));
-        assert_eq!(
-            p.screen().cursor_position(),
-            (1, 2),
-            "cursor row is visible-screen-relative, not counted from the top of history"
-        );
-        assert!(
-            p.screen().contents().contains("HL09"),
-            "newest row must be on the visible screen:\n{}",
-            p.screen().contents()
-        );
-    }
-
-    #[test]
-    fn seed_keeps_cursor_on_the_prompt_when_the_pane_outgrows_the_grid() {
-        let rows: u16 = 6;
-        let cols: u16 = 20;
-        let pane_height: u16 = 8;
-        let mut body = Vec::new();
-        for i in 0..3 {
-            body.extend_from_slice(format!("line-{i}\n").as_bytes());
-        }
-        body.extend_from_slice(b"READY> \n");
-        for _ in 4..pane_height {
-            body.extend_from_slice(b"\n");
-        }
-        let state = PaneSeedState {
-            cursor_x: 7,
-            cursor_y: 3,
-            cursor_visible: true,
-            pane_height,
-            ..Default::default()
-        };
-        let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-        p.process(&assemble_seed_stream(&body, &state, rows));
-
-        assert_eq!(
-            p.screen().cursor_position(),
-            (1, 7),
-            "cursor must follow the prompt row the taller body pushed up:\n{}",
-            p.screen().contents()
-        );
-        assert!(
-            p.screen().contents().contains("READY>"),
-            "prompt must be on the visible screen:\n{}",
-            p.screen().contents()
-        );
-    }
-
-    #[test]
-    fn seeded_cursor_row_reduces_to_cursor_y_when_heights_agree() {
-        let body = |rows: usize| -> Vec<u8> {
-            let mut out = Vec::new();
-            for i in 0..rows {
-                out.extend_from_slice(format!("r{i}\n").as_bytes());
-            }
-            out
-        };
-        let cases: [(usize, u16, u16, u16, u16); 4] = [
-            (4, 4, 2, 4, 2),
-            (10, 4, 2, 4, 2),
-            (4, 0, 2, 4, 2),
-            (4, 2, 1, 6, 3),
-        ];
-        for (body_rows, pane_height, cursor_y, rows, want) in cases {
+    fn seed_places_the_cursor_where_the_pane_reports_it() {
+        // seed places cursor at queried position not end of content
+        {
+            let rows: u16 = 6;
+            let cols: u16 = 20;
+            let body = b"row0-full-content\nrow1-full-content\nrow2-full-content\nrow3-full-content\nrow4-full-content\nrow5-full-content\n";
             let state = PaneSeedState {
-                cursor_y,
+                cursor_x: 3,
+                cursor_y: 1,
+                cursor_visible: true,
+                pane_height: rows,
+                ..Default::default()
+            };
+            let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+            p.process(&assemble_seed_stream(body, &state, rows));
+
+            assert_eq!(
+                p.screen().cursor_position(),
+                (1, 3),
+                "cursor must sit at the queried (row 1, col 3), not end-of-content"
+            );
+            assert!(
+                !p.screen().hide_cursor(),
+                "cursor_flag=1 must show the cursor"
+            );
+            assert!(
+                p.screen().contents().contains("row0-full-content"),
+                "top row must survive (no over-scroll):\n{}",
+                p.screen().contents()
+            );
+        }
+        // seed hides cursor when pane hid it
+        {
+            let state = PaneSeedState {
+                cursor_x: 0,
+                cursor_y: 0,
+                cursor_visible: false,
+                ..Default::default()
+            };
+            let mut p = vt100::Parser::new(4, 10, 0);
+            p.process(&assemble_seed_stream(b"hi\n", &state, 4));
+            assert!(
+                p.screen().hide_cursor(),
+                "cursor_flag=0 must hide the seeded cursor"
+            );
+        }
+        // seed cursor row is visible screen relative with scrollback
+        {
+            let rows: u16 = 4;
+            let cols: u16 = 12;
+            let mut body = Vec::new();
+            for i in 0..10 {
+                body.extend_from_slice(format!("HL{i:02}\n").as_bytes());
+            }
+            let state = PaneSeedState {
+                cursor_x: 2,
+                cursor_y: 1,
+                cursor_visible: true,
+                pane_height: rows,
+                ..Default::default()
+            };
+            let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+            p.process(&assemble_seed_stream(&body, &state, rows));
+            assert_eq!(
+                p.screen().cursor_position(),
+                (1, 2),
+                "cursor row is visible-screen-relative, not counted from the top of history"
+            );
+            assert!(
+                p.screen().contents().contains("HL09"),
+                "newest row must be on the visible screen:\n{}",
+                p.screen().contents()
+            );
+        }
+        // seed keeps cursor on the prompt when the pane outgrows the grid
+        {
+            let rows: u16 = 6;
+            let cols: u16 = 20;
+            let pane_height: u16 = 8;
+            let mut body = Vec::new();
+            for i in 0..3 {
+                body.extend_from_slice(format!("line-{i}\n").as_bytes());
+            }
+            body.extend_from_slice(b"READY> \n");
+            for _ in 4..pane_height {
+                body.extend_from_slice(b"\n");
+            }
+            let state = PaneSeedState {
+                cursor_x: 7,
+                cursor_y: 3,
+                cursor_visible: true,
                 pane_height,
                 ..Default::default()
             };
+            let mut p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+            p.process(&assemble_seed_stream(&body, &state, rows));
+
             assert_eq!(
-                seeded_cursor_row(&body(body_rows), &state, rows),
-                want,
-                "body_rows={body_rows} pane_height={pane_height} cursor_y={cursor_y} rows={rows}"
+                p.screen().cursor_position(),
+                (1, 7),
+                "cursor must follow the prompt row the taller body pushed up:\n{}",
+                p.screen().contents()
             );
+            assert!(
+                p.screen().contents().contains("READY>"),
+                "prompt must be on the visible screen:\n{}",
+                p.screen().contents()
+            );
+        }
+        // seeded cursor row reduces to cursor y when heights agree
+        {
+            let body = |rows: usize| -> Vec<u8> {
+                let mut out = Vec::new();
+                for i in 0..rows {
+                    out.extend_from_slice(format!("r{i}\n").as_bytes());
+                }
+                out
+            };
+            let cases: [(usize, u16, u16, u16, u16); 4] = [
+                (4, 4, 2, 4, 2),
+                (10, 4, 2, 4, 2),
+                (4, 0, 2, 4, 2),
+                (4, 2, 1, 6, 3),
+            ];
+            for (body_rows, pane_height, cursor_y, rows, want) in cases {
+                let state = PaneSeedState {
+                    cursor_y,
+                    pane_height,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    seeded_cursor_row(&body(body_rows), &state, rows),
+                    want,
+                    "body_rows={body_rows} pane_height={pane_height} cursor_y={cursor_y} rows={rows}"
+                );
+            }
         }
     }
 
     #[test]
-    fn parse_seed_state_reads_extended_probe_fields() {
-        let s = parse_seed_state("1 0 1 0 7 12 0 1 345 48 120");
-        assert!(s.alt && !s.mouse && s.mouse_sgr && !s.mouse_all);
-        assert_eq!((s.cursor_x, s.cursor_y), (7, 12));
-        assert!(!s.cursor_visible && s.app_cursor);
-        assert_eq!(
-            (s.history_size, s.pane_height, s.pane_width),
-            (345, 48, 120)
-        );
-        let short = parse_seed_state("0 0 0 0 3 4");
-        assert_eq!((short.cursor_x, short.cursor_y), (3, 4));
-        assert!(short.cursor_visible);
-        assert_eq!(
-            (short.history_size, short.pane_height, short.pane_width),
-            (0, 0, 0)
-        );
-    }
+    fn seed_probe_parsing_rejects_drift_and_swallowed_rows() {
+        // parse seed state reads extended probe fields
+        {
+            let s = parse_seed_state("1 0 1 0 7 12 0 1 345 48 120");
+            assert!(s.alt && !s.mouse && s.mouse_sgr && !s.mouse_all);
+            assert_eq!((s.cursor_x, s.cursor_y), (7, 12));
+            assert!(!s.cursor_visible && s.app_cursor);
+            assert_eq!(
+                (s.history_size, s.pane_height, s.pane_width),
+                (345, 48, 120)
+            );
+            let short = parse_seed_state("0 0 0 0 3 4");
+            assert_eq!((short.cursor_x, short.cursor_y), (3, 4));
+            assert!(short.cursor_visible);
+            assert_eq!(
+                (short.history_size, short.pane_height, short.pane_width),
+                (0, 0, 0)
+            );
+        }
+        // split seed capture separates body and probe
+        {
+            let raw = b"row-a\n\n\nrow-d\n0 0 0 0 5 3 1 0 12 24\n";
+            let (body, probe) = split_seed_capture(raw);
+            assert_eq!(body, b"row-a\n\n\nrow-d\n");
+            let post = parse_seed_state(probe);
+            assert_eq!((post.cursor_x, post.cursor_y), (5, 3));
+            assert_eq!((post.history_size, post.pane_height), (12, 24));
 
-    #[test]
-    fn split_seed_capture_separates_body_and_probe() {
-        let raw = b"row-a\n\n\nrow-d\n0 0 0 0 5 3 1 0 12 24\n";
-        let (body, probe) = split_seed_capture(raw);
-        assert_eq!(body, b"row-a\n\n\nrow-d\n");
-        let post = parse_seed_state(probe);
-        assert_eq!((post.cursor_x, post.cursor_y), (5, 3));
-        assert_eq!((post.history_size, post.pane_height), (12, 24));
+            let (body, probe) = split_seed_capture(b"0 0 0 0 1 2 1 0 0 5\n");
+            assert!(body.is_empty());
+            assert_eq!(parse_seed_state(probe).cursor_y, 2);
 
-        let (body, probe) = split_seed_capture(b"0 0 0 0 1 2 1 0 0 5\n");
-        assert!(body.is_empty());
-        assert_eq!(parse_seed_state(probe).cursor_y, 2);
-
-        assert_eq!(split_seed_capture(b""), (&b""[..], ""));
-    }
-
-    #[test]
-    fn is_probe_line_rejects_swallowed_capture_rows() {
-        let fields = SEED_STATE_FMT.split_whitespace().count();
-        let probe = vec!["7"; fields].join(" ");
-        assert!(is_probe_line(&probe));
-        assert!(!is_probe_line("$ cargo build --release"));
-        assert!(!is_probe_line("zsh: command not found: python"));
-        assert!(!is_probe_line(&vec!["1"; fields - 1].join(" ")));
-        assert!(!is_probe_line(&vec!["1"; fields + 1].join(" ")));
-        assert!(!is_probe_line(""));
-    }
-
-    #[test]
-    fn seed_probe_agreement_detects_drift() {
-        let base = parse_seed_state("0 0 0 0 10 20 1 0 100 40 80");
-        assert_eq!(base, parse_seed_state("0 0 0 0 10 20 1 0 100 40 80"));
-        assert_ne!(base, parse_seed_state("0 0 0 0 11 20 1 0 100 40 80"));
-        assert_ne!(base, parse_seed_state("0 0 0 0 10 20 1 0 101 40 80"));
-        assert_ne!(base, parse_seed_state("1 0 0 0 10 20 1 0 100 40 80"));
-        assert_ne!(base, parse_seed_state("0 0 0 0 10 20 1 0 100 41 80"));
-        assert_ne!(base, parse_seed_state("0 0 0 0 10 20 1 0 100 40 79"));
-        assert_ne!(base, parse_seed_state("0 0 0 0 10 20 0 0 100 40 80"));
+            assert_eq!(split_seed_capture(b""), (&b""[..], ""));
+        }
+        // is probe line rejects swallowed capture rows
+        {
+            let fields = SEED_STATE_FMT.split_whitespace().count();
+            let probe = vec!["7"; fields].join(" ");
+            assert!(is_probe_line(&probe));
+            assert!(!is_probe_line("$ cargo build --release"));
+            assert!(!is_probe_line("zsh: command not found: python"));
+            assert!(!is_probe_line(&vec!["1"; fields - 1].join(" ")));
+            assert!(!is_probe_line(&vec!["1"; fields + 1].join(" ")));
+            assert!(!is_probe_line(""));
+        }
+        // seed probe agreement detects drift
+        {
+            let base = parse_seed_state("0 0 0 0 10 20 1 0 100 40 80");
+            assert_eq!(base, parse_seed_state("0 0 0 0 10 20 1 0 100 40 80"));
+            assert_ne!(base, parse_seed_state("0 0 0 0 11 20 1 0 100 40 80"));
+            assert_ne!(base, parse_seed_state("0 0 0 0 10 20 1 0 101 40 80"));
+            assert_ne!(base, parse_seed_state("1 0 0 0 10 20 1 0 100 40 80"));
+            assert_ne!(base, parse_seed_state("0 0 0 0 10 20 1 0 100 41 80"));
+            assert_ne!(base, parse_seed_state("0 0 0 0 10 20 1 0 100 40 79"));
+            assert_ne!(base, parse_seed_state("0 0 0 0 10 20 0 0 100 40 80"));
+        }
     }
 
     fn dummy_channel(name: &str, dir: &std::path::Path) -> (Arc<VtChannel>, Arc<AtomicU8>) {
@@ -3559,48 +3612,50 @@ mod tests {
     }
 
     #[test]
-    fn output_only_channel_never_writes_to_the_pane() {
-        for (input, delivered) in [(false, false), (true, true)] {
-            let name = format!("aoe_test_vt_input_{input}_{}", std::process::id());
-            let dir = tempfile::tempdir().expect("tempdir");
-            let listener = UnixListener::bind(dir.path().join("s.sock")).expect("bind");
-            let writer = UnixStream::connect(dir.path().join("s.sock")).expect("connect");
-            let (mut pane_side, _) = listener.accept().expect("accept");
-            pane_side
-                .set_read_timeout(Some(Duration::from_millis(100)))
-                .expect("read timeout");
-            let (channel, lifecycle) = dummy_channel_with_input(&name, dir.path(), input);
-            *channel.stream.lock().unwrap() = Some(writer);
-            VtLifecycle::Live.store(&lifecycle);
-            REGISTRY
-                .lock()
-                .unwrap()
-                .insert(name.clone(), Arc::downgrade(&channel));
+    fn output_only_channel_reads_without_writing() {
+        // output only channel never writes to the pane
+        {
+            for (input, delivered) in [(false, false), (true, true)] {
+                let name = format!("aoe_test_vt_input_{input}_{}", std::process::id());
+                let dir = tempfile::tempdir().expect("tempdir");
+                let listener = UnixListener::bind(dir.path().join("s.sock")).expect("bind");
+                let writer = UnixStream::connect(dir.path().join("s.sock")).expect("connect");
+                let (mut pane_side, _) = listener.accept().expect("accept");
+                pane_side
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .expect("read timeout");
+                let (channel, lifecycle) = dummy_channel_with_input(&name, dir.path(), input);
+                *channel.stream.lock().unwrap() = Some(writer);
+                VtLifecycle::Live.store(&lifecycle);
+                REGISTRY
+                    .lock()
+                    .unwrap()
+                    .insert(name.clone(), Arc::downgrade(&channel));
 
-            assert_eq!(input_mode(&name).is_some(), delivered, "input={input}");
-            assert_eq!(try_send_input(&name, b"x"), delivered, "input={input}");
-            let mut buf = [0u8; 8];
-            let got = pane_side.read(&mut buf).unwrap_or(0);
-            let want: &[u8] = if delivered { b"x" } else { b"" };
-            assert_eq!(&buf[..got], want, "input={input}");
+                assert_eq!(input_mode(&name).is_some(), delivered, "input={input}");
+                assert_eq!(try_send_input(&name, b"x"), delivered, "input={input}");
+                let mut buf = [0u8; 8];
+                let got = pane_side.read(&mut buf).unwrap_or(0);
+                let want: &[u8] = if delivered { b"x" } else { b"" };
+                assert_eq!(&buf[..got], want, "input={input}");
 
-            REGISTRY.lock().unwrap().remove(&name);
+                REGISTRY.lock().unwrap().remove(&name);
+            }
         }
-    }
+        // output only channel still reports the pane cursor mode
+        {
+            let name = format!("aoe_test_vt_cursor_mode_{}", std::process::id());
+            let dir = tempfile::tempdir().expect("tempdir");
+            let channel = register_live_for_test(&name, dir.path(), false, true);
 
-    #[test]
-    fn output_only_channel_still_reports_the_pane_cursor_mode() {
-        let name = format!("aoe_test_vt_cursor_mode_{}", std::process::id());
-        let dir = tempfile::tempdir().expect("tempdir");
-        let channel = register_live_for_test(&name, dir.path(), false, true);
+            assert_eq!(cursor_mode(&name), Some(true));
+            assert_eq!(input_mode(&name), None);
 
-        assert_eq!(cursor_mode(&name), Some(true));
-        assert_eq!(input_mode(&name), None);
+            VtLifecycle::fail(&channel.lifecycle);
+            assert_eq!(cursor_mode(&name), None, "a dead grid's mode is stale");
 
-        VtLifecycle::fail(&channel.lifecycle);
-        assert_eq!(cursor_mode(&name), None, "a dead grid's mode is stale");
-
-        unregister_for_test(&name);
+            unregister_for_test(&name);
+        }
     }
 
     #[test]
@@ -4627,34 +4682,6 @@ mod tests {
     }
 
     #[test]
-    fn grid_content_preserves_color() {
-        let mut p = vt100::Parser::new(2, 20, 0);
-        p.process(b"\x1b[31mX\x1b[0m");
-        let (content, _) = grid_content(&mut p, 2, 20, 2);
-        assert!(content.contains('X'), "glyph missing:\n{content:?}");
-        assert!(
-            content.contains("\x1b[31m") || content.contains("31m"),
-            "red foreground lost:\n{content:?}"
-        );
-    }
-
-    #[test]
-    fn grid_content_keeps_trailing_styled_fill() {
-        let mut p = vt100::Parser::new(2, 10, 0);
-        p.process(b"Hi\x1b[44m\x1b[K");
-        let (content, _) = grid_content(&mut p, 2, 10, 2);
-        let first = content.split('\n').next().unwrap_or("");
-        assert!(
-            first.contains("44m"),
-            "trailing background fill dropped:\n{content:?}"
-        );
-        assert!(
-            first.matches(' ').count() >= 8,
-            "trailing fill should keep its eight cells as spaces:\n{content:?}"
-        );
-    }
-
-    #[test]
     fn reader_pokes_registered_wakeup_on_grid_change() {
         use std::io::Write;
 
@@ -4706,74 +4733,73 @@ mod tests {
     }
 
     #[test]
-    fn osc52_scanner_extracts_bel_and_st_terminated_writes() {
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"before\x1b]52;c;aGVsbG8=\x07after"),
-            Some("hello".to_string())
-        );
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"\x1b]52;c;aGVsbG8=\x1b\\"),
-            Some("hello".to_string())
-        );
-        let mut s = Osc52Scanner::new();
-        assert_eq!(s.feed(b"\x1b]52;c;aGk\x07"), Some("hi".to_string()));
-        let mut s = Osc52Scanner::new();
-        assert_eq!(s.feed(b"\x1b]52;;aGVsbG8=\x07"), Some("hello".to_string()));
-    }
-
-    #[test]
-    fn osc52_scanner_survives_arbitrary_chunk_splits() {
-        let seq = b"noise\x1b]52;c;aGVsbG8=\x07more";
-        for split in 1..seq.len() {
+    fn osc52_scanner_extracts_clipboard_writes() {
+        // osc52 scanner extracts bel and st terminated writes
+        {
             let mut s = Osc52Scanner::new();
-            let first = s.feed(&seq[..split]);
-            let second = s.feed(&seq[split..]);
             assert_eq!(
-                first.or(second),
-                Some("hello".to_string()),
-                "split at byte {split} lost the copy"
+                s.feed(b"before\x1b]52;c;aGVsbG8=\x07after"),
+                Some("hello".to_string())
+            );
+            let mut s = Osc52Scanner::new();
+            assert_eq!(
+                s.feed(b"\x1b]52;c;aGVsbG8=\x1b\\"),
+                Some("hello".to_string())
+            );
+            let mut s = Osc52Scanner::new();
+            assert_eq!(s.feed(b"\x1b]52;c;aGk\x07"), Some("hi".to_string()));
+            let mut s = Osc52Scanner::new();
+            assert_eq!(s.feed(b"\x1b]52;;aGVsbG8=\x07"), Some("hello".to_string()));
+        }
+        // osc52 scanner survives arbitrary chunk splits
+        {
+            let seq = b"noise\x1b]52;c;aGVsbG8=\x07more";
+            for split in 1..seq.len() {
+                let mut s = Osc52Scanner::new();
+                let first = s.feed(&seq[..split]);
+                let second = s.feed(&seq[split..]);
+                assert_eq!(
+                    first.or(second),
+                    Some("hello".to_string()),
+                    "split at byte {split} lost the copy"
+                );
+            }
+        }
+        // osc52 scanner skips queries and empty writes
+        {
+            let mut s = Osc52Scanner::new();
+            assert_eq!(s.feed(b"\x1b]52;c;?\x07"), None);
+            let mut s = Osc52Scanner::new();
+            assert_eq!(s.feed(b"\x1b]52;c;\x07"), None);
+            let mut s = Osc52Scanner::new();
+            assert_eq!(s.feed(b"\x1b]52;c;=====\x07"), None);
+        }
+        // osc52 scanner ignores other sequences and recovers
+        {
+            let mut s = Osc52Scanner::new();
+            assert_eq!(
+                s.feed(b"\x1b]0;title\x07\x1b[31m\x1b]521;x\x07\x1b]52;c;aGVsbG8=\x07"),
+                Some("hello".to_string())
+            );
+            let mut s = Osc52Scanner::new();
+            assert_eq!(
+                s.feed(b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;aGk=\x07"),
+                Some("hi".to_string())
             );
         }
-    }
-
-    #[test]
-    fn osc52_scanner_skips_queries_and_empty_writes() {
-        let mut s = Osc52Scanner::new();
-        assert_eq!(s.feed(b"\x1b]52;c;?\x07"), None);
-        let mut s = Osc52Scanner::new();
-        assert_eq!(s.feed(b"\x1b]52;c;\x07"), None);
-        let mut s = Osc52Scanner::new();
-        assert_eq!(s.feed(b"\x1b]52;c;=====\x07"), None);
-    }
-
-    #[test]
-    fn osc52_scanner_ignores_other_sequences_and_recovers() {
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"\x1b]0;title\x07\x1b[31m\x1b]521;x\x07\x1b]52;c;aGVsbG8=\x07"),
-            Some("hello".to_string())
-        );
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;aGk=\x07"),
-            Some("hi".to_string())
-        );
-    }
-
-    #[test]
-    fn osc52_scanner_unwraps_tmux_passthrough_wrapped_writes() {
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x07\x1b\\"),
-            Some("hello".to_string())
-        );
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x1b\x1b\\\x1b\\"),
-            Some("hello".to_string())
-        );
+        // osc52 scanner unwraps tmux passthrough wrapped writes
+        {
+            let mut s = Osc52Scanner::new();
+            assert_eq!(
+                s.feed(b"\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x07\x1b\\"),
+                Some("hello".to_string())
+            );
+            let mut s = Osc52Scanner::new();
+            assert_eq!(
+                s.feed(b"\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x1b\x1b\\\x1b\\"),
+                Some("hello".to_string())
+            );
+        }
     }
 
     #[test]
@@ -5041,93 +5067,127 @@ mod tests {
     }
 
     #[test]
-    fn seed_records_links_already_on_screen() {
-        let slot = LinkTable::default();
-        record_seed_links(
-            &slot,
-            b"\x1b[32msee \x1b]8;;https://example.com/repo\x1b\\the repo\x1b]8;;\x1b\\ now\x1b[0m",
-        );
-        assert_eq!(
-            slot.table
-                .lock()
-                .unwrap()
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>(),
-            vec![PaneLink {
-                text: "the repo".to_string(),
-                uri: "https://example.com/repo".to_string(),
-            }]
-        );
-        record_seed_links(
-            &slot,
-            b"\x1b]8;;https://example.com/repo\x1b\\the repo\x1b]8;;\x1b\\",
-        );
-        assert_eq!(slot.table.lock().unwrap().len(), 1);
-    }
+    fn link_table_follows_the_accepted_snapshot() {
+        // seed records links already on screen
+        {
+            let slot = LinkTable::default();
+            record_seed_links(
+                &slot,
+                b"\x1b[32msee \x1b]8;;https://example.com/repo\x1b\\the repo\x1b]8;;\x1b\\ now\x1b[0m",
+            );
+            assert_eq!(
+                slot.table
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                vec![PaneLink {
+                    text: "the repo".to_string(),
+                    uri: "https://example.com/repo".to_string(),
+                }]
+            );
+            record_seed_links(
+                &slot,
+                b"\x1b]8;;https://example.com/repo\x1b\\the repo\x1b]8;;\x1b\\",
+            );
+            assert_eq!(slot.table.lock().unwrap().len(), 1);
+        }
+        // an accepted snapshot replaces rather than merges links
+        {
+            let slot = LinkTable::default();
+            record_links(
+                &slot,
+                vec![PaneLink {
+                    text: "docs".to_string(),
+                    uri: "https://example.com/old".to_string(),
+                }],
+            );
+            let after_record = slot.generation.load(Ordering::Acquire);
 
-    #[test]
-    fn an_accepted_snapshot_replaces_rather_than_merges_links() {
-        let slot = LinkTable::default();
-        record_links(
-            &slot,
-            vec![PaneLink {
-                text: "docs".to_string(),
-                uri: "https://example.com/old".to_string(),
-            }],
-        );
-        let after_record = slot.generation.load(Ordering::Acquire);
+            record_seed_links(
+                &slot,
+                b"see \x1b]8;;https://example.com/new\x1b\\docs\x1b]8;;\x1b\\ now",
+            );
+            let held: Vec<PaneLink> = slot.table.lock().unwrap().iter().cloned().collect();
+            assert_eq!(held.len(), 1, "the obsolete target is gone: {held:?}");
+            assert_eq!(held[0].uri, "https://example.com/new");
+            assert!(slot.generation.load(Ordering::Acquire) > after_record);
 
-        record_seed_links(
-            &slot,
-            b"see \x1b]8;;https://example.com/new\x1b\\docs\x1b]8;;\x1b\\ now",
-        );
-        let held: Vec<PaneLink> = slot.table.lock().unwrap().iter().cloned().collect();
-        assert_eq!(held.len(), 1, "the obsolete target is gone: {held:?}");
-        assert_eq!(held[0].uri, "https://example.com/new");
-        assert!(slot.generation.load(Ordering::Acquire) > after_record);
-
-        record_seed_links(&slot, b"see docs now");
-        assert!(
-            slot.table.lock().unwrap().is_empty(),
-            "a snapshot with no sequences must leave no targets"
-        );
-    }
-
-    #[test]
-    fn a_rejected_swap_leaves_the_links_alone() {
-        let slot = LinkTable::default();
-        record_links(
-            &slot,
-            vec![PaneLink {
-                text: "docs".to_string(),
-                uri: "https://example.com/live".to_string(),
-            }],
-        );
-        let parser = Mutex::new(vt100::Parser::new(24, 80, 0));
-        let app_cursor = AtomicBool::new(false);
-        let grid_gen = AtomicU64::new(7);
-        assert_eq!(
-            swap_seeded_parser(
-                SeedSink {
-                    parser: &parser,
-                    app_cursor: &app_cursor,
-                    grid_gen: &grid_gen,
-                    links: &slot,
-                },
-                Some(1),
-                b"\x1b]8;;https://example.com/stale\x1b\\docs\x1b]8;;\x1b\\",
-                (80, 24),
-                SeedGuard {
-                    chunk: None,
-                    pipe: None,
-                },
-            ),
-            VtRefreshResult::Busy
-        );
-        let held: Vec<PaneLink> = slot.table.lock().unwrap().iter().cloned().collect();
-        assert_eq!(held.len(), 1);
-        assert_eq!(held[0].uri, "https://example.com/live");
+            record_seed_links(&slot, b"see docs now");
+            assert!(
+                slot.table.lock().unwrap().is_empty(),
+                "a snapshot with no sequences must leave no targets"
+            );
+        }
+        // a rejected swap leaves the links alone
+        {
+            let slot = LinkTable::default();
+            record_links(
+                &slot,
+                vec![PaneLink {
+                    text: "docs".to_string(),
+                    uri: "https://example.com/live".to_string(),
+                }],
+            );
+            let parser = Mutex::new(vt100::Parser::new(24, 80, 0));
+            let app_cursor = AtomicBool::new(false);
+            let grid_gen = AtomicU64::new(7);
+            assert_eq!(
+                swap_seeded_parser(
+                    SeedSink {
+                        parser: &parser,
+                        app_cursor: &app_cursor,
+                        grid_gen: &grid_gen,
+                        links: &slot,
+                    },
+                    Some(1),
+                    b"\x1b]8;;https://example.com/stale\x1b\\docs\x1b]8;;\x1b\\",
+                    (80, 24),
+                    SeedGuard {
+                        chunk: None,
+                        pipe: None,
+                    },
+                ),
+                VtRefreshResult::Busy
+            );
+            let held: Vec<PaneLink> = slot.table.lock().unwrap().iter().cloned().collect();
+            assert_eq!(held.len(), 1);
+            assert_eq!(held[0].uri, "https://example.com/live");
+        }
+        // record links dedupes and caps
+        {
+            let slot = LinkTable::default();
+            let link = |n: usize| PaneLink {
+                text: format!("link {n}"),
+                uri: format!("https://example.com/{n}"),
+            };
+            record_links(&slot, vec![link(0), link(1), link(0)]);
+            assert_eq!(
+                slot.table
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|l| l.uri.clone())
+                    .collect::<Vec<_>>(),
+                vec!["https://example.com/1", "https://example.com/0"]
+            );
+            record_links(
+                &slot,
+                (2..crate::tmux::osc8::MAX_PANE_LINKS + 8)
+                    .map(link)
+                    .collect(),
+            );
+            let held = slot.table.lock().unwrap();
+            assert_eq!(held.len(), crate::tmux::osc8::MAX_PANE_LINKS);
+            assert_eq!(
+                held.back().unwrap().uri,
+                format!(
+                    "https://example.com/{}",
+                    crate::tmux::osc8::MAX_PANE_LINKS + 7
+                )
+            );
+        }
     }
 
     #[test]
@@ -5394,40 +5454,6 @@ mod tests {
     }
 
     #[test]
-    fn record_links_dedupes_and_caps() {
-        let slot = LinkTable::default();
-        let link = |n: usize| PaneLink {
-            text: format!("link {n}"),
-            uri: format!("https://example.com/{n}"),
-        };
-        record_links(&slot, vec![link(0), link(1), link(0)]);
-        assert_eq!(
-            slot.table
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|l| l.uri.clone())
-                .collect::<Vec<_>>(),
-            vec!["https://example.com/1", "https://example.com/0"]
-        );
-        record_links(
-            &slot,
-            (2..crate::tmux::osc8::MAX_PANE_LINKS + 8)
-                .map(link)
-                .collect(),
-        );
-        let held = slot.table.lock().unwrap();
-        assert_eq!(held.len(), crate::tmux::osc8::MAX_PANE_LINKS);
-        assert_eq!(
-            held.back().unwrap().uri,
-            format!(
-                "https://example.com/{}",
-                crate::tmux::osc8::MAX_PANE_LINKS + 7
-            )
-        );
-    }
-
-    #[test]
     fn osc52_observer_publishes_copy_without_a_vt_grid() {
         use std::io::Write;
 
@@ -5556,32 +5582,6 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         drop(conn);
         let _ = reader.join();
-    }
-
-    #[test]
-    fn grid_content_assembles_scrollback_and_screen() {
-        let mut p = vt100::Parser::new(4, 20, 100);
-        for i in 1..=12 {
-            p.process(format!("LINE{i:02}\r\n").as_bytes());
-        }
-
-        let (content, history) = grid_content(&mut p, 100, 20, 4);
-        assert!(history > 0, "expected scrollback depth, got {history}");
-        assert!(
-            content.contains("LINE01"),
-            "missing oldest line:\n{content}"
-        );
-        assert!(
-            content.contains("LINE12"),
-            "missing newest line:\n{content}"
-        );
-
-        let (screen_only, _) = grid_content(&mut p, 4, 20, 4);
-        assert!(
-            !screen_only.contains("LINE01"),
-            "screen-only window should not include scrollback:\n{screen_only}"
-        );
-        assert_eq!(p.screen().scrollback(), 0, "live-edge offset not restored");
     }
 
     #[test]

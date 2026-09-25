@@ -1377,71 +1377,71 @@ mod tests {
     }
 
     #[test]
-    fn daemon_probe_only_marks_missing_process_as_stale() {
-        let cases = [
-            (Ok(()), DaemonProbeDisposition::VerifyIdentity),
-            (Err(nix::errno::Errno::ESRCH), DaemonProbeDisposition::Stale),
-            (
-                Err(nix::errno::Errno::EPERM),
-                DaemonProbeDisposition::Indeterminate,
-            ),
-            (
-                Err(nix::errno::Errno::EIO),
-                DaemonProbeDisposition::Indeterminate,
-            ),
-        ];
-        for (result, expected) in cases {
-            assert_eq!(classify_daemon_probe(result), expected);
+    fn daemon_verification_is_exact() {
+        // daemon probe only marks missing process as stale
+        {
+            let cases = [
+                (Ok(()), DaemonProbeDisposition::VerifyIdentity),
+                (Err(nix::errno::Errno::ESRCH), DaemonProbeDisposition::Stale),
+                (
+                    Err(nix::errno::Errno::EPERM),
+                    DaemonProbeDisposition::Indeterminate,
+                ),
+                (
+                    Err(nix::errno::Errno::EIO),
+                    DaemonProbeDisposition::Indeterminate,
+                ),
+            ];
+            for (result, expected) in cases {
+                assert_eq!(classify_daemon_probe(result), expected);
+            }
         }
-    }
-
-    #[test]
-    fn daemon_command_requires_exact_executable_and_serve_subcommand() {
-        let cases: &[(&[u8], bool)] = &[
-            (b"/usr/local/bin/aoe\0serve\0--daemon\0", true),
-            (b"agent-of-empires serve --daemon", true),
-            (b"aoe --profile work serve --daemon", true),
-            (b"aoe --profile=work serve --daemon", true),
-            (b"aoe update", false),
-            (b"aoe --profile serve update", false),
-            (b"aoe --some-option serve update", false),
-            (b"/tmp/aoe-helper serve", false),
-            (b"runner --label aoe serve", false),
-        ];
-        for (command, expected) in cases {
-            assert_eq!(command_is_aoe_serve(command), *expected, "{command:?}");
+        // daemon command requires exact executable and serve subcommand
+        {
+            let cases: &[(&[u8], bool)] = &[
+                (b"/usr/local/bin/aoe\0serve\0--daemon\0", true),
+                (b"agent-of-empires serve --daemon", true),
+                (b"aoe --profile work serve --daemon", true),
+                (b"aoe --profile=work serve --daemon", true),
+                (b"aoe update", false),
+                (b"aoe --profile serve update", false),
+                (b"aoe --some-option serve update", false),
+                (b"/tmp/aoe-helper serve", false),
+                (b"runner --label aoe serve", false),
+            ];
+            for (command, expected) in cases {
+                assert_eq!(command_is_aoe_serve(command), *expected, "{command:?}");
+            }
         }
-    }
-
-    #[test]
-    fn daemon_pid_must_be_positive() {
-        let cases = [
-            ("42", Some(42)),
-            (" 7\n", Some(7)),
-            ("0", None),
-            ("-1", None),
-            ("x", None),
-        ];
-        for (raw, expected) in cases {
-            assert_eq!(parse_positive_pid(raw), expected, "{raw:?}");
+        // daemon pid must be positive
+        {
+            let cases = [
+                ("42", Some(42)),
+                (" 7\n", Some(7)),
+                ("0", None),
+                ("-1", None),
+                ("x", None),
+            ];
+            for (raw, expected) in cases {
+                assert_eq!(parse_positive_pid(raw), expected, "{raw:?}");
+            }
         }
-    }
-
-    #[test]
-    fn daemon_instance_requires_an_exact_environment_entry() {
-        let cases: &[(&[u8], &str, bool)] = &[
-            (b"HOME=/tmp\0AOE_SERVE_INSTANCE_ID=abc\0", "abc", true),
-            (b"aoe serve AOE_SERVE_INSTANCE_ID=abc", "abc", true),
-            (b"AOE_SERVE_INSTANCE_ID=other\0", "abc", false),
-            (b"PREFIX_AOE_SERVE_INSTANCE_ID=abc\0", "abc", false),
-            (b"AOE_SERVE_INSTANCE_ID=abc-suffix", "abc", false),
-        ];
-        for (environment, instance_id, expected) in cases {
-            assert_eq!(
-                environment_has_daemon_instance(environment, instance_id),
-                *expected,
-                "{environment:?}"
-            );
+        // daemon instance requires an exact environment entry
+        {
+            let cases: &[(&[u8], &str, bool)] = &[
+                (b"HOME=/tmp\0AOE_SERVE_INSTANCE_ID=abc\0", "abc", true),
+                (b"aoe serve AOE_SERVE_INSTANCE_ID=abc", "abc", true),
+                (b"AOE_SERVE_INSTANCE_ID=other\0", "abc", false),
+                (b"PREFIX_AOE_SERVE_INSTANCE_ID=abc\0", "abc", false),
+                (b"AOE_SERVE_INSTANCE_ID=abc-suffix", "abc", false),
+            ];
+            for (environment, instance_id, expected) in cases {
+                assert_eq!(
+                    environment_has_daemon_instance(environment, instance_id),
+                    *expected,
+                    "{environment:?}"
+                );
+            }
         }
     }
 
