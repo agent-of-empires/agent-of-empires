@@ -808,6 +808,7 @@ mod tests {
             cwd: "/tmp/x".into(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         };
         let binding = crate::session::ConversationBinding {
             session_id: sid.into(),
@@ -1485,6 +1486,7 @@ mod tests {
                 cwd: "/tmp/pi-stale-path".into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),
+                exported_default_store: None,
             },
             capture: None,
             container: None,

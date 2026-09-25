@@ -215,6 +215,7 @@ fn shared_account_roots_carry_the_selected_external_store() {
             cwd: project,
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         }),
     });
     let swap = classify(&instance, &profile, "b");
@@ -305,6 +306,7 @@ fn carry_preserves_known_conversation_already_in_destination() {
             cwd: project,
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         }),
     });
     let ToolSwap::KeepConversation(Some(carry)) = classify(&instance, &profile, "b") else {
@@ -364,6 +366,7 @@ fn carry_refuses_unproven_destination_before_writing() {
             cwd: project,
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         }),
     });
     let mut violations = Vec::new();

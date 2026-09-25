@@ -274,6 +274,7 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
         mcp_servers: Vec::new(),
         generation: 0,
         claude_store_pin: None,
+        base_host_environment: vec![],
     }
 }
 

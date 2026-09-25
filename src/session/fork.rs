@@ -5,6 +5,7 @@ use crate::agents::{get_agent, ForkStrategy};
 
 /// The kind of one-shot fork a freshly-created session should perform on its first launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ForkSeed {
     /// Terminal fork: resume `parent_agent_session_id` with the agent's fork
     /// flag, writing to the pre-generated `child_session_id`.
@@ -85,6 +86,7 @@ mod tests {
                 cwd: "/work".into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),
+                exported_default_store: None,
             }),
             provenance: ConversationProvenance::Observed,
             transcript_path: None,

@@ -561,6 +561,7 @@ mod tests {
                 cwd: "/tmp/x".into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),
+                exported_default_store: None,
             };
             claimant.active_execution = Some(ActiveExecution {
                 launch_id: "qualified".into(),
@@ -655,6 +656,7 @@ mod tests {
                 cwd: "/tmp/x".into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),
+                exported_default_store: None,
             }),
             provenance: ConversationProvenance::Asserted,
             transcript_path: None,

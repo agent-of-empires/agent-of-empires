@@ -60,7 +60,9 @@ pub struct SpawnConfig {
     pub wrapper_substitution: Option<(String, String)>,
     /// Lifecycle epoch stamped on the runner's registry record.
     pub generation: u64,
-    pub claude_store_pin: Option<PathBuf>,
+    pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
+    /// Trusted environment before the current hook overlay or Claude routing.
+    pub base_host_environment: Vec<(String, String)>,
 }
 
 /// Request-sourced keys may not redirect infrastructure the operator env
@@ -78,6 +80,13 @@ pub(super) fn provider_env_denyreason(key: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Request-sourced environment cannot redirect a conversation's Claude store.
+pub(super) fn request_env_denyreason(key: &str) -> Option<&'static str> {
+    provider_env_denyreason(key).or_else(|| {
+        (key == "CLAUDE_CONFIG_DIR").then_some("Claude store routing, pinned by the session")
+    })
 }
 
 /// Trusted operator config may set infrastructure keys (as a terminal pane
@@ -157,7 +166,7 @@ pub(super) fn allowlisted_env_pairs(config: &SpawnConfig) -> Vec<(String, String
     };
     let mut pairs = Vec::new();
     for name in allowlist {
-        if let Some(reason) = provider_env_denyreason(name) {
+        if let Some(reason) = request_env_denyreason(name) {
             warn!(target: "acp", key = %name, reason, "ignoring env allowlist entry");
             continue;
         }
@@ -208,14 +217,38 @@ pub(super) fn apply_env_filter(
         keys.forwarded.push(key);
     }
     for (key, value) in &config.provider_env {
-        if let Some(reason) = provider_env_denyreason(key) {
+        if let Some(reason) = request_env_denyreason(key) {
             warn!(target: "acp", key = %key, reason, "rejecting provider_env override of protected key");
             continue;
         }
         cmd.env(key, value);
         keys.provider.push(key.clone());
     }
+    apply_claude_store_route(cmd, config);
     keys
+}
+
+/// Applies the pin after ambient, inherited, allowlist, and provider layers.
+fn apply_claude_store_route(cmd: &mut std::process::Command, config: &SpawnConfig) {
+    let Some(pin) = config.claude_store_pin.as_ref() else {
+        return;
+    };
+    let home = config
+        .host_environment
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "HOME")
+        .map(|(_, value)| PathBuf::from(value))
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    let should_export = !home.is_some_and(|home| {
+        crate::session::capture::is_default_claude_store(&pin.store, &home)
+            && pin.exported_default_store == Some(false)
+    });
+    if should_export {
+        cmd.env("CLAUDE_CONFIG_DIR", &pin.store);
+    } else {
+        cmd.env_remove("CLAUDE_CONFIG_DIR");
+    }
 }
 
 /// `dirs` first, then `path`, dropping any already present.
@@ -248,6 +281,7 @@ fn apply_stdio_env(
         cmd.env(key, value);
         keys.host.push(key.clone());
     }
+    apply_claude_store_route(cmd.as_std_mut(), config);
     if let Some(socket_path) = &config.socket_path {
         cmd.env("AOE_ACP_SOCKET", socket_path);
     }
@@ -279,23 +313,26 @@ pub(super) fn native_store_snapshot(
             .filter(|value| !value.is_empty())
     };
     let cwd = crate::session::capture::canonicalize_allowing_missing_leaf(&config.cwd)?;
-    let root = value("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| value("HOME").map(|home| PathBuf::from(home).join(".claude")))?;
+    let exported = value("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+    let home = value("HOME").map(PathBuf::from);
+    let root = exported
+        .clone()
+        .or_else(|| home.as_ref().map(|home| home.join(".claude")))?;
     let root = if root.is_absolute() {
         root
     } else {
         cwd.join(root)
     };
+    let store = crate::session::capture::canonicalize_allowing_missing_leaf(&root)?;
+    let exported_default_store = Some(exported.is_some());
     Some(crate::session::ExecutionBinding {
         agent: "claude".into(),
-        stores: vec![crate::session::capture::canonicalize_allowing_missing_leaf(
-            &root,
-        )?],
+        stores: vec![store],
         configuration: Vec::new(),
         cwd,
-        filesystem: "host".into(),
         cwd_filesystem: "host".into(),
+        filesystem: "host".into(),
+        exported_default_store,
     })
 }
 
@@ -466,11 +503,12 @@ mod tests {
             ("MY_CUSTOM_VAR", false, false),
             ("XDG_CONFIG_HOME", false, false),
             ("CODEX_HOME", false, false),
+            ("CLAUDE_CONFIG_DIR", true, false),
             ("1BAD", false, true),
             ("HAS-DASH", false, true),
         ] {
             assert_eq!(
-                provider_env_denyreason(key).is_some(),
+                request_env_denyreason(key).is_some(),
                 provider_denied,
                 "{key}"
             );
@@ -586,6 +624,90 @@ mod tests {
                 assert!(!applied.contains_key(*key), "{key} leaked: {applied:#?}");
             }
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn final_claude_route_removes_ambient_allowlist_and_provider_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let default = home.join(".claude");
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&default).unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", home.to_str().unwrap()),
+            ("CLAUDE_CONFIG_DIR", other.to_str().unwrap()),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "witness"),
+        ]);
+        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        config.spec.env_allowlist = Some(vec![
+            "CLAUDE_CONFIG_DIR".into(),
+            "CLAUDE_CODE_OAUTH_TOKEN".into(),
+        ]);
+        config.provider_env = vec![
+            ("CLAUDE_CONFIG_DIR".into(), other.display().to_string()),
+            ("ANTHROPIC_API_KEY".into(), "request-auth".into()),
+        ];
+        config.claude_store_pin = Some(crate::session::capture::ClaudeStorePin {
+            store: default,
+            exported_default_store: Some(false),
+        });
+
+        let applied = applied_env(&config);
+        assert!(!applied.contains_key("CLAUDE_CONFIG_DIR"));
+        assert_eq!(
+            applied.get("CLAUDE_CODE_OAUTH_TOKEN").map(String::as_str),
+            Some("witness")
+        );
+        assert_eq!(
+            applied.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("request-auth")
+        );
+    }
+
+    #[test]
+    fn native_snapshot_records_the_effective_default_route_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let mut config = env_test_spawn_config(home.clone());
+        config.claude_store_pin = Some(crate::session::capture::ClaudeStorePin {
+            store: home.join(".claude"),
+            exported_default_store: Some(false),
+        });
+        let command = std::process::Command::new("/bin/true");
+        let snapshot = native_store_snapshot(
+            &config,
+            &command,
+            &[("HOME".into(), home.display().to_string())],
+        )
+        .unwrap();
+        assert_eq!(snapshot.exported_default_store, Some(false));
+
+        let snapshot = native_store_snapshot(
+            &config,
+            &command,
+            &[
+                ("HOME".into(), home.display().to_string()),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    home.join(".claude").display().to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(snapshot.exported_default_store, Some(true));
+
+        let custom = home.join("custom");
+        let snapshot = native_store_snapshot(
+            &config,
+            &command,
+            &[
+                ("HOME".into(), home.display().to_string()),
+                ("CLAUDE_CONFIG_DIR".into(), custom.display().to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(snapshot.exported_default_store, Some(false));
     }
 
     #[test]

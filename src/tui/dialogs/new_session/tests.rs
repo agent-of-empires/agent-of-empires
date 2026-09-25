@@ -1225,6 +1225,7 @@ fn terminal_fork_hides_structured_despite_structured_default() {
                 cwd: TEST_PATH.into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),
+                exported_default_store: None,
             }),
             provenance: crate::session::ConversationProvenance::Observed,
             transcript_path: None,

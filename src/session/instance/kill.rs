@@ -579,6 +579,7 @@ mod tests {
             cwd: home.path().into(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         };
         inst.resume_intent = ResumeIntent::Use(sid.into());
         inst.resume_binding = Some(crate::session::ConversationBinding {

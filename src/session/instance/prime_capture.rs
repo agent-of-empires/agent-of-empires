@@ -873,6 +873,7 @@ mod tests {
             cwd: "/workspace/project".into(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         };
         inst.active_execution = Some(ActiveExecution {
             launch_id: "root-launch".into(),

@@ -880,6 +880,7 @@ fn apply_import_mode(
                 cwd: crate::session::capture::canonicalize_or_raw(&s.cwd),
                 filesystem: "host".into(),
                 cwd_filesystem: "host".into(),
+                exported_default_store: None,
             }),
             provenance: crate::session::ConversationProvenance::Imported,
             transcript_path: None,

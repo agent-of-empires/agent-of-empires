@@ -30,6 +30,7 @@ fn observed_fork_parent(agent: &str) -> Instance {
                 cwd: "/tmp/repo".into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),
+                exported_default_store: None,
             }),
             provenance: crate::session::ConversationProvenance::Observed,
             transcript_path: None,

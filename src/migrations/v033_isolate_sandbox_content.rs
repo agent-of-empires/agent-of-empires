@@ -2876,6 +2876,7 @@ mod tests {
                 cwd: temporary.path().to_path_buf(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),
+                exported_default_store: None,
             }),
             provenance: crate::session::ConversationProvenance::Observed,
             transcript_path: None,

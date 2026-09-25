@@ -681,6 +681,7 @@ mod tests {
                 cwd: "/tmp".into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),
+                exported_default_store: None,
             }),
             provenance: ConversationProvenance::Asserted,
             transcript_path: None,

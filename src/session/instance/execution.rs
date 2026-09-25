@@ -21,7 +21,7 @@ pub struct ExecutionLocation {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionBinding {
     pub agent: String,
     pub stores: Vec<PathBuf>,
@@ -30,6 +30,30 @@ pub struct ExecutionBinding {
     pub cwd: PathBuf,
     pub cwd_filesystem: String,
     pub filesystem: String,
+    /// Whether the launch explicitly exported Claude's implicit default store.
+    /// `None` identifies bindings written before routing provenance existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exported_default_store: Option<bool>,
+}
+
+impl PartialEq for ExecutionBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.key("") == other.key("")
+            && self.configuration == other.configuration
+            && self.cwd == other.cwd
+            && self.cwd_filesystem == other.cwd_filesystem
+    }
+}
+
+impl Eq for ExecutionBinding {}
+
+impl std::hash::Hash for ExecutionBinding {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key("").hash(state);
+        self.configuration.hash(state);
+        self.cwd.hash(state);
+        self.cwd_filesystem.hash(state);
+    }
 }
 
 impl ExecutionBinding {
@@ -1193,30 +1217,44 @@ impl Instance {
         let mut routing = Vec::new();
         let mut case_insensitive_routing: &'static [&'static str] = &[];
         let mut configuration = Vec::new();
+        let mut exported_default_store = None;
         let mut pi_root = None;
         let mut pi_transcript_path = None;
         let mut namespace_arguments = Vec::new();
         let mut roots = match agent.name {
             "claude" => {
-                // The recorded binding names the store this conversation
-                // actually lives in, whether it was asserted with `--store`
-                // or captured by a validated launch; assertions must survive
-                // the qualified publication that relabels them Observed.
-                let recorded = (inputs.container.is_none())
+                let recorded_execution = (inputs.container.is_none())
                     .then(|| {
                         target
                             .and_then(|(_, binding, _)| binding)
                             .filter(|binding| binding.is_known())
                             .and_then(|binding| binding.execution.as_ref())
-                            .and_then(|execution| execution.stores.first())
-                            .cloned()
+                            .filter(|execution| !execution.stores.is_empty())
                     })
                     .flatten();
+                let recorded = recorded_execution.and_then(|execution| execution.stores.first().cloned());
                 let root = absolute(recorded
                     .or_else(|| declared.clone())
                     .or_else(|| value("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()).map(PathBuf::from))
                     .unwrap_or_else(|| home.join(".claude")));
-                routing.push(("CLAUDE_CONFIG_DIR".into(), Some(root.to_str().context("native store is not UTF-8")?.to_owned())));
+                let default = crate::session::capture::is_default_claude_store(&root, &home);
+                let explicit = recorded_execution
+                    .and_then(|execution| execution.exported_default_store)
+                    .unwrap_or_else(|| {
+                        let selected_alias = declared.as_ref().is_some_and(|selected| {
+                            crate::session::capture::is_default_claude_store(selected, &home)
+                                && crate::git::template::lexical_normalize(selected)
+                                    != crate::git::template::lexical_normalize(&home.join(".claude"))
+                        });
+                        let exported_this_store = value("CLAUDE_CONFIG_DIR")
+                            .filter(|value| !value.is_empty())
+                            .is_some_and(|value| absolute(PathBuf::from(value)) == root);
+                        selected_alias || exported_this_store
+                    });
+                let export = inputs.container.is_some() || explicit || !default;
+                exported_default_store = Some(export && default);
+                let pinned = root.to_str().context("native store is not UTF-8")?.to_owned();
+                routing.push(("CLAUDE_CONFIG_DIR".into(), export.then_some(pinned)));
                 vec![root]
             }
             "codex" => {
@@ -1704,6 +1742,7 @@ impl Instance {
                 agent: agent.name.into(),
                 stores,
                 configuration,
+                exported_default_store,
                 cwd: cwd.path,
                 cwd_filesystem: cwd.filesystem,
                 filesystem: filesystem.context("native conversation store is unavailable")?,
@@ -2212,6 +2251,11 @@ impl Instance {
             *primary = crate::session::capture::canonicalize_or_raw(
                 store.to_str().context("store path must be UTF-8")?,
             );
+            let selected_home = super::hooks::host_home(&self.resolved_host_environment())
+                .context("native HOME is unavailable")?;
+            execution.exported_default_store = Some(
+                crate::session::capture::is_default_claude_store(primary, &selected_home),
+            );
         }
         Ok(ConversationBinding {
             session_id: sid.into(),
@@ -2275,6 +2319,7 @@ mod tests {
             cwd: root.join("cwd"),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         };
         let host = binding(&real);
         let host_alias = binding(&alias);
@@ -2306,6 +2351,31 @@ mod tests {
             &container_store,
             &container_store_alias
         ));
+    }
+
+    #[test]
+    fn legacy_binding_routing_marker_is_optional_and_not_identity() {
+        use std::hash::{Hash, Hasher};
+
+        let legacy: ExecutionBinding = serde_json::from_value(serde_json::json!({
+            "agent": "claude",
+            "stores": ["/tmp/claude"],
+            "cwd": "/tmp",
+            "cwd_filesystem": "host",
+            "filesystem": "host"
+        }))
+        .unwrap();
+        assert_eq!(legacy.exported_default_store, None);
+        let mut exported = legacy.clone();
+        exported.exported_default_store = Some(true);
+        assert_eq!(legacy, exported);
+
+        let digest = |binding: &ExecutionBinding| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            binding.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(digest(&legacy), digest(&exported));
     }
 
     fn hermes_fixture() -> (tempfile::TempDir, NativeLaunchInputs, rusqlite::Connection) {

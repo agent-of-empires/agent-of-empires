@@ -702,6 +702,7 @@ fn restart_tool_swap_refuses_a_foreign_pending_fork() {
             cwd: temp.path().canonicalize().unwrap(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         }),
         transcript_path: None,
     });

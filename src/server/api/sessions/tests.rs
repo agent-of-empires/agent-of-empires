@@ -843,6 +843,7 @@ fn fork_from_builds_terminal_seed_for_claude() {
             cwd: "/tmp".into(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         }),
         provenance: crate::session::ConversationProvenance::Observed,
         transcript_path: None,

@@ -1157,6 +1157,7 @@ mod tests {
                     cwd: "/workspace".into(),
                     cwd_filesystem: "host".into(),
                     filesystem: "host".into(),
+                    exported_default_store: None,
                 },
                 capture: Some(super::CaptureContext::Store {
                     root: store.to_path_buf(),

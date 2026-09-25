@@ -90,6 +90,7 @@ mod tests {
             cwd: temp.path().into(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         };
         assert!(exclusions
             .iter()
