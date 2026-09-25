@@ -1216,7 +1216,7 @@ fn terminal_fork_hides_structured_despite_structured_default() {
     dialog.apply_structured_default();
     assert!(dialog.structured_enabled);
     dialog.set_fork_from(crate::session::ForkSeed::Terminal {
-        parent: crate::session::ConversationBinding {
+        parent: Box::new(crate::session::ConversationBinding {
             session_id: "parent".into(),
             execution: Some(crate::session::ExecutionBinding {
                 agent: "claude".into(),
@@ -1229,7 +1229,7 @@ fn terminal_fork_hides_structured_despite_structured_default() {
             }),
             provenance: crate::session::ConversationProvenance::Observed,
             transcript_path: None,
-        },
+        }),
         child_session_id: "child".into(),
     });
     assert!(!dialog.structured_capable);

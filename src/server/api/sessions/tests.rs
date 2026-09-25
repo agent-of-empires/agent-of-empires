@@ -859,7 +859,7 @@ fn fork_from_builds_terminal_seed_for_claude() {
             parent,
             child_session_id,
         } => {
-            assert_eq!(parent, parent_binding);
+            assert_eq!(*parent, parent_binding);
             assert!(crate::session::capture::is_valid_session_id(
                 &child_session_id
             ));

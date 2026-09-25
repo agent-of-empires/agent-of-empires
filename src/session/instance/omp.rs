@@ -821,8 +821,67 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn omp_launch_wrapper_preserves_known_breadcrumb_extras_and_rejects_invalid_ones() {
-        use std::os::unix::fs::PermissionsExt;
+        run_omp_launch_wrapper_test_in_child();
+    }
 
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn omp_launch_wrapper_preserves_known_breadcrumb_extras_and_rejects_invalid_ones_child() {
+        println!("OMP_WRAPPER_TEST_CHILD_ENTERED");
+        exercise_omp_launch_wrapper();
+    }
+
+    #[cfg(unix)]
+    fn run_omp_launch_wrapper_test_in_child() {
+        let current_thread = std::thread::current();
+        let test = current_thread.name().expect("test thread name");
+        let child_test = format!("{test}_child");
+        let home = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                child_test.as_str(),
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("breadcrumb_tmp", "preexisting")
+            .env("marker_tmp", "preexisting")
+            .env("write_count", "1")
+            .stdin(std::process::Stdio::null());
+        let output = crate::process::run_with_timeout_process_group(
+            &mut command,
+            std::time::Duration::from_secs(60),
+        )
+        .expect("spawn isolated OMP wrapper test")
+        .expect("isolated OMP wrapper test watchdog expired");
+        assert!(
+            output.status.success(),
+            "isolated OMP wrapper test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout
+                .lines()
+                .chain(stderr.lines())
+                .any(|line| line.contains("OMP_WRAPPER_TEST_CHILD_ENTERED")),
+            "isolated OMP wrapper child did not acknowledge entry:\n{}\n{}",
+            stdout,
+            stderr
+        );
+    }
+
+    #[cfg(unix)]
+    fn exercise_omp_launch_wrapper() {
+        use std::os::unix::fs::PermissionsExt;
         let _env = crate::session::test_support::EnvGuard::unset(
             &crate::session::capture::OMP_STORE_ENV_KEYS,
         );
@@ -843,6 +902,7 @@ mod tests {
   if [ -n "${AOE_TEST_FAIL_WRITE-}" ] && [ -n "${breadcrumb_tmp-}" ] \
     && [ -z "${marker_tmp-}" ]; then
     write_count=$(( ${write_count:-0} + 1 ))
+    command printf '%s\n%s\n' "$breadcrumb_tmp" "$write_count" >> "$AOE_TEST_WRITE_TRACE"
     if [ "$write_count" -eq "$AOE_TEST_FAIL_WRITE" ]; then
       command printf partial
       command printf injected > "$AOE_TEST_WRITE_FAILURE"
@@ -889,6 +949,7 @@ mod tests {
             "printf launched > {}",
             shell_escape(&launched.to_string_lossy())
         );
+        let write_trace = root.join("write-trace");
         let cases = [
             ("/work\n/session.jsonl\n", true),
             ("/work\n/session.jsonl\nfresh\n", true),
@@ -934,17 +995,23 @@ mod tests {
             let _ = std::fs::remove_file(&launched);
             let _ = std::fs::remove_file(&write_failure);
             std::fs::write(&breadcrumb, content).unwrap();
+            let _ = std::fs::remove_file(&write_trace);
             let wrapped = wrap_omp_launch(&raw, &plan);
             let mut command = std::process::Command::new("sh");
             command
                 .arg("-c")
                 .arg(wrapped)
-                .env("PATH", test_path_with_shim(&bin));
-            command.env_remove("AOE_TEST_FAIL_WRITE");
+                .env("PATH", test_path_with_shim(&bin))
+                .env_remove("breadcrumb_tmp")
+                .env_remove("marker_tmp")
+                .env_remove("write_count")
+                .env_remove("AOE_TEST_FAIL_WRITE")
+                .stdin(std::process::Stdio::null());
             if let Some(index) = failed_write {
                 command
                     .env("AOE_TEST_FAIL_WRITE", index.to_string())
-                    .env("AOE_TEST_WRITE_FAILURE", &write_failure);
+                    .env("AOE_TEST_WRITE_FAILURE", &write_failure)
+                    .env("AOE_TEST_WRITE_TRACE", &write_trace);
             }
             for mutation in omp_host_routing_environment(&routing) {
                 match mutation {
@@ -956,11 +1023,93 @@ mod tests {
                     }
                 }
             }
-            let status = command.status().unwrap();
-            assert!(status.success(), "{content:?}");
+            let output = crate::process::run_with_timeout_process_group(
+                &mut command,
+                std::time::Duration::from_secs(10),
+            )
+            .expect("run OMP wrapper shell")
+            .expect("OMP wrapper shell watchdog expired");
+            assert!(
+                output.status.success(),
+                "{content:?}\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             assert_eq!(std::fs::read_to_string(&launched).unwrap(), "launched");
-            if failed_write.is_some() {
+            if let Some(index) = failed_write {
+                let expected_temp_prefix = format!(".aoe-omp-breadcrumb-{}.tmp.", plan.launch_id);
+                let trace = std::fs::read_to_string(&write_trace).unwrap();
+                let mut injected_breadcrumb = None;
+                let mut trace_fields = trace.lines();
+                for expected_count in 1..=index {
+                    let breadcrumb_tmp = trace_fields.next().unwrap();
+                    let count = trace_fields.next().unwrap();
+                    let breadcrumb_path = std::path::Path::new(breadcrumb_tmp);
+                    let mut components = breadcrumb_path
+                        .strip_prefix(plan.layout.terminal_sessions.as_path())
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "injected breadcrumb escaped terminal sessions: {breadcrumb_tmp:?}"
+                            )
+                        })
+                        .components();
+                    let temp_dir = components
+                        .next()
+                        .and_then(|component| match component {
+                            std::path::Component::Normal(name) => name.to_str(),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("injected breadcrumb has no normal temp directory: {breadcrumb_tmp:?}")
+                        });
+                    let pid = temp_dir
+                        .strip_prefix(&expected_temp_prefix)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "injected breadcrumb has unexpected temp directory: {temp_dir:?}"
+                            )
+                        });
+                    assert!(
+                        !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()),
+                        "injected breadcrumb has invalid temp PID: {pid:?}"
+                    );
+                    let file = components.next().and_then(|component| match component {
+                        std::path::Component::Normal(name) => name.to_str(),
+                        _ => None,
+                    });
+                    assert_eq!(
+                        file,
+                        Some("breadcrumb"),
+                        "unexpected injected breadcrumb file"
+                    );
+                    assert!(
+                        components.next().is_none(),
+                        "injected breadcrumb escaped its temp child"
+                    );
+                    assert_eq!(count, expected_count.to_string());
+                    if expected_count == index {
+                        injected_breadcrumb = Some(breadcrumb_tmp);
+                    }
+                }
+                assert_eq!(trace_fields.next(), None);
+                let injected_breadcrumb = injected_breadcrumb.expect("injected breadcrumb path");
+                let partial =
+                    std::fs::read_to_string(injected_breadcrumb).unwrap_or_else(|error| {
+                        panic!(
+                            "injected breadcrumb was not opened: {injected_breadcrumb:?}: {error}"
+                        )
+                    });
+                assert!(
+                    partial.ends_with("partial"),
+                    "injected write did not produce partial breadcrumb output: {partial:?}"
+                );
                 assert_eq!(std::fs::read_to_string(&write_failure).unwrap(), "injected");
+            } else {
+                assert!(
+                    !write_failure.exists(),
+                    "unexpected injected write for {content:?}"
+                );
+                assert!(!write_trace.exists());
             }
 
             if accepted {
