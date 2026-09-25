@@ -358,63 +358,66 @@ mod tests {
     }
 
     #[test]
-    fn test_container_exec_command() {
-        let mut container = DockerContainer::new("test1234567890ab", "ubuntu:latest");
-        container.runtime = ContainerRuntime::docker();
+    fn test_container_exec_and_create_args() {
+        // container exec command
+        {
+            let mut container = DockerContainer::new("test1234567890ab", "ubuntu:latest");
+            container.runtime = ContainerRuntime::docker();
 
-        let cmd = container.exec_command(None, "my-agent");
-        assert_eq!(cmd, "docker exec -it aoe-sandbox-test1234 my-agent");
-    }
-    #[test]
-    fn test_anonymous_volumes_in_create_args() {
-        let container = DockerContainer::new("test1234567890ab", "alpine:latest");
-        let config = ContainerConfig {
-            working_dir: "/workspace/myproject".to_string(),
-            volumes: vec![],
-            anonymous_volumes: vec![
-                "/workspace/myproject/target".to_string(),
-                "/workspace/myproject/node_modules".to_string(),
-            ],
-            named_ignore_volumes: vec![],
-            environment: vec![],
-            cpu_limit: None,
-            memory_limit: None,
-            port_mappings: vec![],
-            ..Default::default()
-        };
+            let cmd = container.exec_command(None, "my-agent");
+            assert_eq!(cmd, "docker exec -it aoe-sandbox-test1234 my-agent");
+        }
+        // anonymous volumes in create args
+        {
+            let container = DockerContainer::new("test1234567890ab", "alpine:latest");
+            let config = ContainerConfig {
+                working_dir: "/workspace/myproject".to_string(),
+                volumes: vec![],
+                anonymous_volumes: vec![
+                    "/workspace/myproject/target".to_string(),
+                    "/workspace/myproject/node_modules".to_string(),
+                ],
+                named_ignore_volumes: vec![],
+                environment: vec![],
+                cpu_limit: None,
+                memory_limit: None,
+                port_mappings: vec![],
+                ..Default::default()
+            };
 
-        let args = container.build_create_args(&config);
+            let args = container.build_create_args(&config);
 
-        let v_positions: Vec<usize> = args
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| *a == "-v")
-            .map(|(i, _)| i)
-            .collect();
+            let v_positions: Vec<usize> = args
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| *a == "-v")
+                .map(|(i, _)| i)
+                .collect();
 
-        let volume_values: Vec<&str> = v_positions.iter().map(|&i| args[i + 1].as_str()).collect();
+            let volume_values: Vec<&str> =
+                v_positions.iter().map(|&i| args[i + 1].as_str()).collect();
 
-        assert!(volume_values.contains(&"/workspace/myproject/target"));
-        assert!(volume_values.contains(&"/workspace/myproject/node_modules"));
-    }
+            assert!(volume_values.contains(&"/workspace/myproject/target"));
+            assert!(volume_values.contains(&"/workspace/myproject/node_modules"));
+        }
+        // no anonymous volumes when empty
+        {
+            let container = DockerContainer::new("test1234567890ab", "alpine:latest");
+            let config = ContainerConfig {
+                working_dir: "/workspace".to_string(),
+                volumes: vec![],
+                anonymous_volumes: vec![],
+                named_ignore_volumes: vec![],
+                environment: vec![],
+                cpu_limit: None,
+                memory_limit: None,
+                port_mappings: vec![],
+                ..Default::default()
+            };
 
-    #[test]
-    fn test_no_anonymous_volumes_when_empty() {
-        let container = DockerContainer::new("test1234567890ab", "alpine:latest");
-        let config = ContainerConfig {
-            working_dir: "/workspace".to_string(),
-            volumes: vec![],
-            anonymous_volumes: vec![],
-            named_ignore_volumes: vec![],
-            environment: vec![],
-            cpu_limit: None,
-            memory_limit: None,
-            port_mappings: vec![],
-            ..Default::default()
-        };
+            let args = container.build_create_args(&config);
 
-        let args = container.build_create_args(&config);
-
-        assert!(!args.contains(&"-v".to_string()));
+            assert!(!args.contains(&"-v".to_string()));
+        }
     }
 }

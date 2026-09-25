@@ -267,36 +267,36 @@ mod tests {
     }
 
     #[test]
-    fn new_name_includes_prefix_tool_title_and_truncated_id() {
-        let s = ToolSession::new("0123456789abcdef", "my-session", "lazygit");
-        let name = s.session_name();
-        assert!(name.starts_with(TOOL_PREFIX), "name was {}", name);
-        assert!(name.contains("lazygit"));
-        assert!(name.contains("my-session"));
-        assert!(name.ends_with("_01234567"), "name was {}", name);
-    }
-
-    #[test]
-    fn new_name_sanitizes_unsafe_characters() {
-        let s = ToolSession::new("abc12345", "feature/foo:bar", "my tool.v2");
-        let name = s.session_name();
-        assert!(!name.contains(':'), "name was {}", name);
-        assert!(!name.contains('.'), "name was {}", name);
-        assert!(!name.contains(' '), "name was {}", name);
-    }
-
-    #[test]
-    fn distinct_tools_on_same_session_have_distinct_names() {
-        let id = "0123456789abcdef";
-        let lazygit = ToolSession::new(id, "x", "lazygit");
-        let yazi = ToolSession::new(id, "x", "yazi");
-        assert_ne!(lazygit.session_name(), yazi.session_name());
-    }
-
-    #[test]
-    fn distinct_sessions_for_same_tool_have_distinct_names() {
-        let a = ToolSession::new("aaaaaaaa1111", "x", "lazygit");
-        let b = ToolSession::new("bbbbbbbb2222", "x", "lazygit");
-        assert_ne!(a.session_name(), b.session_name());
+    fn new_names_are_sanitized_and_distinct() {
+        // new name includes prefix tool title and truncated id
+        {
+            let s = ToolSession::new("0123456789abcdef", "my-session", "lazygit");
+            let name = s.session_name();
+            assert!(name.starts_with(TOOL_PREFIX), "name was {}", name);
+            assert!(name.contains("lazygit"));
+            assert!(name.contains("my-session"));
+            assert!(name.ends_with("_01234567"), "name was {}", name);
+        }
+        // new name sanitizes unsafe characters
+        {
+            let s = ToolSession::new("abc12345", "feature/foo:bar", "my tool.v2");
+            let name = s.session_name();
+            assert!(!name.contains(':'), "name was {}", name);
+            assert!(!name.contains('.'), "name was {}", name);
+            assert!(!name.contains(' '), "name was {}", name);
+        }
+        // distinct tools on same session have distinct names
+        {
+            let id = "0123456789abcdef";
+            let lazygit = ToolSession::new(id, "x", "lazygit");
+            let yazi = ToolSession::new(id, "x", "yazi");
+            assert_ne!(lazygit.session_name(), yazi.session_name());
+        }
+        // distinct sessions for same tool have distinct names
+        {
+            let a = ToolSession::new("aaaaaaaa1111", "x", "lazygit");
+            let b = ToolSession::new("bbbbbbbb2222", "x", "lazygit");
+            assert_ne!(a.session_name(), b.session_name());
+        }
     }
 }

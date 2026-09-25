@@ -90,30 +90,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_resolve_template_with_repo_name() {
-        let vars = TemplateVars {
-            repo_name: "my-repo".to_string(),
-            branch: "feat/test".to_string(),
-            session_id: "abc123".to_string(),
-            base_path: PathBuf::from("/home/user/repos/my-repo"),
-        };
+    fn test_resolve_template_and_sanitize_branch_name() {
+        // resolve template with repo name
+        {
+            let vars = TemplateVars {
+                repo_name: "my-repo".to_string(),
+                branch: "feat/test".to_string(),
+                session_id: "abc123".to_string(),
+                base_path: PathBuf::from("/home/user/repos/my-repo"),
+            };
 
-        let result = resolve_template("../{repo-name}-wt/{branch}", &vars).unwrap();
-        assert!(result.to_string_lossy().contains("my-repo-wt"));
-        assert!(result.to_string_lossy().contains("feat-test"));
-    }
+            let result = resolve_template("../{repo-name}-wt/{branch}", &vars).unwrap();
+            assert!(result.to_string_lossy().contains("my-repo-wt"));
+            assert!(result.to_string_lossy().contains("feat-test"));
+        }
+        // resolve template with all variables
+        {
+            let vars = TemplateVars {
+                repo_name: "test".to_string(),
+                branch: "main".to_string(),
+                session_id: "xyz789".to_string(),
+                base_path: PathBuf::from("/repos/test"),
+            };
 
-    #[test]
-    fn test_sanitize_branch_name_replaces_slashes() {
-        let sanitized = sanitize_branch_name("feat/my-feature");
-        assert_eq!(sanitized, "feat-my-feature");
-    }
+            let result =
+                resolve_template("../wt/{repo-name}/{branch}/{session-id}", &vars).unwrap();
 
-    #[test]
-    fn test_sanitize_branch_name_handles_special_chars() {
-        let sanitized = sanitize_branch_name("feat@bug#123");
-        assert!(!sanitized.contains("@"));
-        assert!(!sanitized.contains("#"));
+            assert!(result.to_string_lossy().contains("test"));
+            assert!(result.to_string_lossy().contains("main"));
+            assert!(result.to_string_lossy().contains("xyz789"));
+        }
+        // sanitize branch name replaces slashes
+        {
+            let sanitized = sanitize_branch_name("feat/my-feature");
+            assert_eq!(sanitized, "feat-my-feature");
+        }
+        // sanitize branch name handles special chars
+        {
+            let sanitized = sanitize_branch_name("feat@bug#123");
+            assert!(!sanitized.contains("@"));
+            assert!(!sanitized.contains("#"));
+        }
     }
 
     #[test]
@@ -149,21 +166,5 @@ mod tests {
             lexical_normalize(Path::new("/a/b/./../c")),
             PathBuf::from("/a/c")
         );
-    }
-
-    #[test]
-    fn test_resolve_template_with_all_variables() {
-        let vars = TemplateVars {
-            repo_name: "test".to_string(),
-            branch: "main".to_string(),
-            session_id: "xyz789".to_string(),
-            base_path: PathBuf::from("/repos/test"),
-        };
-
-        let result = resolve_template("../wt/{repo-name}/{branch}/{session-id}", &vars).unwrap();
-
-        assert!(result.to_string_lossy().contains("test"));
-        assert!(result.to_string_lossy().contains("main"));
-        assert!(result.to_string_lossy().contains("xyz789"));
     }
 }

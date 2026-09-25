@@ -248,15 +248,58 @@ mod tests {
     use crate::tmux::{Session, SESSION_PREFIX};
 
     #[test]
-    fn test_terminal_session_generate_name() {
-        assert_eq!(
-            TerminalSession::generate_name("abc123def456", "My Project"),
-            format!("{TERMINAL_PREFIX}My_Project_abc123de")
-        );
-        assert_eq!(
-            ContainerTerminalSession::generate_name("abc123def456", "My Project"),
-            format!("{CONTAINER_TERMINAL_PREFIX}My_Project_abc123de")
-        );
+    fn terminal_session_names_are_distinct_per_kind_and_index() {
+        // terminal session generate name
+        {
+            assert_eq!(
+                TerminalSession::generate_name("abc123def456", "My Project"),
+                format!("{TERMINAL_PREFIX}My_Project_abc123de")
+            );
+            assert_eq!(
+                ContainerTerminalSession::generate_name("abc123def456", "My Project"),
+                format!("{CONTAINER_TERMINAL_PREFIX}My_Project_abc123de")
+            );
+        }
+        // terminal session name differs from agent session
+        {
+            let agent_name = Session::generate_name("abc123def456", "My Project");
+            let terminal_name = TerminalSession::generate_name("abc123def456", "My Project");
+            assert_ne!(agent_name, terminal_name);
+            assert!(agent_name.starts_with(SESSION_PREFIX));
+            assert!(terminal_name.starts_with(TERMINAL_PREFIX));
+        }
+        // terminal index zero matches legacy name
+        {
+            let legacy = TerminalSession::generate_name("abc123def456", "My Project");
+            let indexed_zero =
+                TerminalSession::generate_name_indexed("abc123def456", "My Project", 0);
+            assert_eq!(legacy, indexed_zero);
+
+            let legacy_c = ContainerTerminalSession::generate_name("abc123def456", "My Project");
+            let indexed_zero_c =
+                ContainerTerminalSession::generate_name_indexed("abc123def456", "My Project", 0);
+            assert_eq!(legacy_c, indexed_zero_c);
+        }
+        // terminal index nonzero suffixed and distinct
+        {
+            let zero = TerminalSession::generate_name_indexed("abc123def456", "My Project", 0);
+            let one = TerminalSession::generate_name_indexed("abc123def456", "My Project", 1);
+            let two = TerminalSession::generate_name_indexed("abc123def456", "My Project", 2);
+            assert_ne!(zero, one);
+            assert_ne!(one, two);
+            assert!(one.ends_with("_t1"));
+            assert!(two.ends_with("_t2"));
+            assert!(one.starts_with(&zero));
+        }
+        // container terminal name differs from host terminal
+        {
+            let host_name = TerminalSession::generate_name("abc123def456", "My Project");
+            let container_name =
+                ContainerTerminalSession::generate_name("abc123def456", "My Project");
+            assert_ne!(host_name, container_name);
+            assert!(host_name.starts_with(TERMINAL_PREFIX));
+            assert!(container_name.starts_with(CONTAINER_TERMINAL_PREFIX));
+        }
     }
 
     const ID: &str = "abc12345deadbeef";
@@ -330,48 +373,6 @@ mod tests {
     }
 
     #[test]
-    fn test_terminal_session_name_differs_from_agent_session() {
-        let agent_name = Session::generate_name("abc123def456", "My Project");
-        let terminal_name = TerminalSession::generate_name("abc123def456", "My Project");
-        assert_ne!(agent_name, terminal_name);
-        assert!(agent_name.starts_with(SESSION_PREFIX));
-        assert!(terminal_name.starts_with(TERMINAL_PREFIX));
-    }
-
-    #[test]
-    fn test_terminal_index_zero_matches_legacy_name() {
-        let legacy = TerminalSession::generate_name("abc123def456", "My Project");
-        let indexed_zero = TerminalSession::generate_name_indexed("abc123def456", "My Project", 0);
-        assert_eq!(legacy, indexed_zero);
-
-        let legacy_c = ContainerTerminalSession::generate_name("abc123def456", "My Project");
-        let indexed_zero_c =
-            ContainerTerminalSession::generate_name_indexed("abc123def456", "My Project", 0);
-        assert_eq!(legacy_c, indexed_zero_c);
-    }
-
-    #[test]
-    fn test_terminal_index_nonzero_suffixed_and_distinct() {
-        let zero = TerminalSession::generate_name_indexed("abc123def456", "My Project", 0);
-        let one = TerminalSession::generate_name_indexed("abc123def456", "My Project", 1);
-        let two = TerminalSession::generate_name_indexed("abc123def456", "My Project", 2);
-        assert_ne!(zero, one);
-        assert_ne!(one, two);
-        assert!(one.ends_with("_t1"));
-        assert!(two.ends_with("_t2"));
-        assert!(one.starts_with(&zero));
-    }
-
-    #[test]
-    fn test_container_terminal_name_differs_from_host_terminal() {
-        let host_name = TerminalSession::generate_name("abc123def456", "My Project");
-        let container_name = ContainerTerminalSession::generate_name("abc123def456", "My Project");
-        assert_ne!(host_name, container_name);
-        assert!(host_name.starts_with(TERMINAL_PREFIX));
-        assert!(container_name.starts_with(CONTAINER_TERMINAL_PREFIX));
-    }
-
-    #[test]
     fn test_host_pane_inputs_injects_env_and_login_shell() {
         let (env, cmd) = host_pane_inputs(Some("/bin/zsh"), None, "/Users/me", "/usr/bin:/bin");
         assert_eq!(
@@ -426,96 +427,97 @@ mod tests {
     }
     #[test]
     #[serial_test::serial]
-    fn test_terminal_session_is_pane_dead_after_command_exits() {
-        use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead};
+    fn test_terminal_session_is_pane_dead() {
+        // terminal session is pane dead on running session
+        {
+            let _env = crate::session::test_support::EnvGuard::read_lock();
+            require_tmux!();
 
-        let _env = crate::session::test_support::EnvGuard::read_lock();
-        require_tmux!();
+            let guard = TmuxTestSession::new("aoe_test_terminal_alive");
+            let session_name = guard.name().to_string();
+            let session = TerminalSession {
+                name: session_name.clone(),
+            };
 
-        let guard = TmuxTestSession::new("aoe_test_terminal_dead");
-        let session_name = guard.name().to_string();
-        let session = TerminalSession {
-            name: session_name.clone(),
-        };
+            let output = crate::tmux::tmux_command()
+                .args([
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &session_name,
+                    "-x",
+                    "80",
+                    "-y",
+                    "24",
+                    "sleep",
+                    "30",
+                    ";",
+                    "set-option",
+                    "-p",
+                    "-t",
+                    &session_name,
+                    "remain-on-exit",
+                    "on",
+                ])
+                .output()
+                .expect("tmux new-session");
+            assert!(output.status.success());
 
-        let output = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep 1",
-                ";",
-                "set-option",
-                "-p",
-                "-t",
-                &session_name,
-                "remain-on-exit",
-                "on",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(output.status.success());
+            let pane_id = crate::tmux::test_helpers::only_pane_id(&session_name);
+            crate::tmux::test_helpers::wait_for_pane_command(&pane_id, "sleep");
+            assert_eq!(
+                crate::tmux::test_helpers::pane_field(&pane_id, "#{pane_dead}"),
+                "0"
+            );
 
-        wait_for_pane_dead(&only_pane_id(&session_name));
+            assert!(
+                !session.is_pane_dead(),
+                "Terminal session pane should be alive while command running"
+            );
+        }
+        // terminal session is pane dead after command exits
+        {
+            use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead};
 
-        assert!(
-            session.is_pane_dead(),
-            "Terminal session pane should be dead after command exits"
-        );
-    }
+            let _env = crate::session::test_support::EnvGuard::read_lock();
+            require_tmux!();
 
-    #[test]
-    #[serial_test::serial]
-    fn test_terminal_session_is_pane_dead_on_running_session() {
-        let _env = crate::session::test_support::EnvGuard::read_lock();
-        require_tmux!();
+            let guard = TmuxTestSession::new("aoe_test_terminal_dead");
+            let session_name = guard.name().to_string();
+            let session = TerminalSession {
+                name: session_name.clone(),
+            };
 
-        let guard = TmuxTestSession::new("aoe_test_terminal_alive");
-        let session_name = guard.name().to_string();
-        let session = TerminalSession {
-            name: session_name.clone(),
-        };
+            let output = crate::tmux::tmux_command()
+                .args([
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &session_name,
+                    "-x",
+                    "80",
+                    "-y",
+                    "24",
+                    "sleep 1",
+                    ";",
+                    "set-option",
+                    "-p",
+                    "-t",
+                    &session_name,
+                    "remain-on-exit",
+                    "on",
+                ])
+                .output()
+                .expect("tmux new-session");
+            assert!(output.status.success());
 
-        let output = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep",
-                "30",
-                ";",
-                "set-option",
-                "-p",
-                "-t",
-                &session_name,
-                "remain-on-exit",
-                "on",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(output.status.success());
+            wait_for_pane_dead(&only_pane_id(&session_name));
 
-        let pane_id = crate::tmux::test_helpers::only_pane_id(&session_name);
-        crate::tmux::test_helpers::wait_for_pane_command(&pane_id, "sleep");
-        assert_eq!(
-            crate::tmux::test_helpers::pane_field(&pane_id, "#{pane_dead}"),
-            "0"
-        );
-
-        assert!(
-            !session.is_pane_dead(),
-            "Terminal session pane should be alive while command running"
-        );
+            assert!(
+                session.is_pane_dead(),
+                "Terminal session pane should be dead after command exits"
+            );
+        }
     }
 
     #[test]
