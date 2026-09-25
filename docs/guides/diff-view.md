@@ -28,7 +28,7 @@ The diff refreshes automatically after you save and exit the editor.
 
 ## In the web dashboard
 
-The changed-files list has two layouts, toggled in its header: **flat** lists every path, **tree** nests them under collapsible directories with per-directory file counts and `+`/`-` stats. Arrow keys move the selection, left and right expand or collapse a directory, and Enter or Space opens a file. Per-repo collapse state persists to your web settings. Right-click a file or folder for **Copy relative path**.
+The changed-files list has two layouts, toggled in its header: **flat** lists every path, **tree** nests them under collapsible directories with per-directory file counts and `+`/`-` stats. Arrow keys move the selection, left and right expand or collapse a directory, and Enter or Space opens a file. Per-repo collapse state persists to your web settings. Right-click a file or folder for **Copy relative path**. On a file, **Open file** opens its current working-tree copy in a new browser tab. It is disabled for deleted files.
 
 The **Files** pane (folder icon in the activity bar) browses the session's whole working directory, not just its git changes, so it lists files even in a non-git scratch session. Markdown renders as HTML with a **Rendered** / **Raw** toggle, in this pane and from the diff list. Files an agent cites that live outside the session's repo open only when that agent actually read or wrote them during this session: the dashboard cannot open an arbitrary host path.
 
