@@ -175,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_codex_cwd_validates_declared_ids() {
+    fn parse_codex_cwd_and_filename_uuid_validate_ids() {
         let root = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
         let child = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
         let cwd = Some("/p".to_string());
@@ -213,10 +213,7 @@ mod tests {
                 "{name}"
             );
         }
-    }
 
-    #[test]
-    fn extract_codex_uuid_from_filename_requires_trailing_uuid() {
         let uuid = "abcdef01-2345-6789-abcd-ef0123456789";
         let path = PathBuf::from(format!("rollout-2025-03-06T12-00-00-{uuid}.jsonl"));
         assert_eq!(

@@ -51,39 +51,18 @@ mod tests {
 
     #[test]
     #[serial]
-    fn provisions_and_returns_app_dir_path() {
+    fn provisions_a_fresh_dir_under_the_root_and_refuses_reuse() {
         let _tmp = isolate_app_dir();
         let id = format!("test-{}", uuid::Uuid::new_v4());
         let path = provision_scratch_dir(&id).expect("provision must succeed");
-        assert!(path.exists());
         assert!(path.is_dir());
         assert!(path.starts_with(scratch_root().unwrap()));
         assert_eq!(path.file_name().and_then(|n| n.to_str()), Some(id.as_str()));
-        let _ = fs::remove_dir_all(&path);
-    }
-
-    #[test]
-    #[serial]
-    fn provision_collision_errors() {
-        let _tmp = isolate_app_dir();
-        let id = format!("collision-{}", uuid::Uuid::new_v4());
-        let first = provision_scratch_dir(&id).expect("first provision must succeed");
-        let second = provision_scratch_dir(&id);
+        assert!(is_scratch_path(&path));
         assert!(
-            second.is_err(),
+            provision_scratch_dir(&id).is_err(),
             "provision_scratch_dir must error on collision rather than reuse contents",
         );
-        let _ = fs::remove_dir_all(&first);
-    }
-
-    #[test]
-    #[serial]
-    fn is_scratch_path_accepts_under_root() {
-        let _tmp = isolate_app_dir();
-        let id = format!("guard-accept-{}", uuid::Uuid::new_v4());
-        let path = provision_scratch_dir(&id).unwrap();
-        assert!(is_scratch_path(&path));
-        let _ = fs::remove_dir_all(&path);
     }
 
     #[test]

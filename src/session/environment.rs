@@ -712,18 +712,6 @@ mod tests {
     }
 
     #[test]
-    fn login_shell_command_flags_known_shells_only() {
-        for (shell, want) in [
-            ("/bin/zsh", "'/bin/zsh' -l"),
-            ("/opt/homebrew/bin/fish", "'/opt/homebrew/bin/fish' -l"),
-            ("/usr/bin/nu", "'/usr/bin/nu'"),
-            ("/usr/bin/pwsh", "'/usr/bin/pwsh'"),
-        ] {
-            assert_eq!(login_shell_command(shell), want);
-        }
-    }
-
-    #[test]
     #[serial(shell_env)]
     fn user_shell_resolution() {
         for (shell, user, posix) in [
@@ -739,6 +727,14 @@ mod tests {
             };
             assert_eq!(user_shell(), user);
             assert_eq!(user_posix_shell(), posix);
+        }
+        for (shell, want) in [
+            ("/bin/zsh", "'/bin/zsh' -l"),
+            ("/opt/homebrew/bin/fish", "'/opt/homebrew/bin/fish' -l"),
+            ("/usr/bin/nu", "'/usr/bin/nu'"),
+            ("/usr/bin/pwsh", "'/usr/bin/pwsh'"),
+        ] {
+            assert_eq!(login_shell_command(shell), want);
         }
     }
 

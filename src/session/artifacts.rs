@@ -79,35 +79,16 @@ mod tests {
 
     #[test]
     #[serial]
-    fn session_artifact_dir_is_idempotent() {
-        let _tmp = isolate_app_dir();
-        let id = format!("art-{}", uuid::Uuid::new_v4());
-        let first = session_artifact_dir(&id).expect("first must succeed");
-        let second = session_artifact_dir(&id).expect("second must succeed");
-        assert_eq!(first, second);
-        assert!(first.is_dir());
-    }
-
-    #[test]
-    #[serial]
-    fn resolve_accepts_regular_file_under_root() {
+    fn artifact_dir_is_idempotent_and_resolves_files_under_it() {
         let _tmp = isolate_app_dir();
         let id = format!("art-{}", uuid::Uuid::new_v4());
         let dir = session_artifact_dir(&id).unwrap();
+        assert_eq!(session_artifact_dir(&id).unwrap(), dir);
         fs::write(dir.join("shot.png"), b"png").unwrap();
-        let resolved = resolve_artifact_path(&id, "shot.png").expect("must resolve");
-        assert!(resolved.ends_with("shot.png"));
-        assert!(resolved.is_file());
-    }
-
-    #[test]
-    #[serial]
-    fn resolve_accepts_nested_file() {
-        let _tmp = isolate_app_dir();
-        let id = format!("art-{}", uuid::Uuid::new_v4());
-        let dir = session_artifact_dir(&id).unwrap();
         fs::create_dir_all(dir.join("sub")).unwrap();
         fs::write(dir.join("sub/a.txt"), b"a").unwrap();
+        let resolved = resolve_artifact_path(&id, "shot.png").expect("must resolve");
+        assert!(resolved.ends_with("shot.png") && resolved.is_file());
         assert!(resolve_artifact_path(&id, "sub/a.txt").is_some());
     }
 
