@@ -60,7 +60,15 @@ pub struct SpawnConfig {
     pub wrapper_substitution: Option<(String, String)>,
     /// Lifecycle epoch stamped on the runner's registry record.
     pub generation: u64,
-    pub claude_store_pin: Option<PathBuf>,
+    pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
+}
+
+/// Request-sourced `provider_env` keys: the shared deny policy, plus Claude's
+/// store routing, which the session's conversation pins.
+pub(super) fn request_env_denyreason(key: &str) -> Option<&'static str> {
+    provider_env_denyreason(key).or_else(|| {
+        (key == "CLAUDE_CONFIG_DIR").then_some("Claude store routing, pinned by the session")
+    })
 }
 
 /// Request-sourced keys may not redirect infrastructure the operator env
@@ -208,7 +216,7 @@ pub(super) fn apply_env_filter(
         keys.forwarded.push(key);
     }
     for (key, value) in &config.provider_env {
-        if let Some(reason) = provider_env_denyreason(key) {
+        if let Some(reason) = request_env_denyreason(key) {
             warn!(target: "acp", key = %key, reason, "rejecting provider_env override of protected key");
             continue;
         }
@@ -279,20 +287,27 @@ pub(super) fn native_store_snapshot(
             .filter(|value| !value.is_empty())
     };
     let cwd = crate::session::capture::canonicalize_allowing_missing_leaf(&config.cwd)?;
-    let root = value("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| value("HOME").map(|home| PathBuf::from(home).join(".claude")))?;
+    let exported = value("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+    let home = value("HOME").map(PathBuf::from);
+    let root = exported
+        .clone()
+        .or_else(|| home.as_ref().map(|home| home.join(".claude")))?;
     let root = if root.is_absolute() {
         root
     } else {
         cwd.join(root)
     };
+    let exported_default_store = exported.is_some()
+        && home
+            .as_ref()
+            .is_some_and(|home| crate::session::capture::is_default_claude_store(&root, home));
     Some(crate::session::ExecutionBinding {
         agent: "claude".into(),
         stores: vec![crate::session::capture::canonicalize_allowing_missing_leaf(
             &root,
         )?],
         configuration: Vec::new(),
+        exported_default_store,
         cwd,
         filesystem: "host".into(),
         cwd_filesystem: "host".into(),
@@ -450,6 +465,33 @@ mod tests {
         }
     }
 
+    /// The worker's handoff binding records an exported default store the way the
+    /// terminal launch does, so an explicit selection keeps matching across surfaces.
+    #[test]
+    fn claude_snapshot_records_only_an_exported_default_store() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let config = env_test_spawn_config(home.clone());
+        let command = std::process::Command::new("true");
+        let default = home.join(".claude");
+        let custom = home.join("custom");
+        for (exported, expected) in [
+            (None, false),
+            (Some(&default), true),
+            (Some(&custom), false),
+        ] {
+            let mut overrides = vec![("HOME".to_string(), home.display().to_string())];
+            overrides.extend(
+                exported.map(|dir| ("CLAUDE_CONFIG_DIR".to_string(), dir.display().to_string())),
+            );
+            let snapshot = native_store_snapshot(&config, &command, &overrides).unwrap();
+            assert_eq!(
+                snapshot.exported_default_store, expected,
+                "exported={exported:?}"
+            );
+        }
+    }
+
     #[test]
     fn env_deny_policies() {
         for (key, provider_denied, host_denied) in [
@@ -536,6 +578,7 @@ mod tests {
             ("AOE_TEST_UNLISTED_SENTINEL", "leak"),
             ("AOE_TOKEN", "daemon-secret"),
             ("LD_PRELOAD", "/tmp/evil.so"),
+            ("CLAUDE_CONFIG_DIR", "/operator/claude"),
         ]);
         let reg = crate::acp::agent_registry::AgentRegistry::with_defaults();
         let mut config = env_test_spawn_config(tmp.path().to_path_buf());
@@ -548,7 +591,12 @@ mod tests {
             ..config.spec.clone()
         };
         let custom = crate::acp::AgentSpec::from_acp_cmd("custom", "/bin/true").unwrap();
-        let cases: [(AgentSpec, &[(&str, &str)], &[&str]); 5] = [
+        let cases: [(AgentSpec, &[(&str, &str)], &[&str]); 6] = [
+            (
+                reg.get("claude-code").unwrap().clone(),
+                &[("CLAUDE_CONFIG_DIR", "/operator/claude")],
+                &["OPENAI_API_KEY"],
+            ),
             (
                 reg.get("aoe-agent").unwrap().clone(),
                 &[
@@ -586,6 +634,19 @@ mod tests {
                 assert!(!applied.contains_key(*key), "{key} leaked: {applied:#?}");
             }
         }
+
+        // A request cannot move a worker off the store its conversation pins.
+        config.spec = crate::acp::AgentSpec::from_acp_cmd("custom", "/bin/true").unwrap();
+        config.provider_env = vec![
+            ("CLAUDE_CONFIG_DIR".into(), "/request".into()),
+            ("ANTHROPIC_API_KEY".into(), "sk-request".into()),
+        ];
+        let applied = applied_env(&config);
+        assert_eq!(
+            applied.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-request")
+        );
+        assert!(!applied.contains_key("CLAUDE_CONFIG_DIR"), "{applied:#?}");
     }
 
     #[test]

@@ -870,6 +870,7 @@ mod tests {
             agent: "prime-agent".into(),
             stores: vec![store.clone()],
             configuration: Vec::new(),
+            exported_default_store: false,
             cwd: "/workspace/project".into(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),

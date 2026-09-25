@@ -766,7 +766,7 @@ pub fn build_instance(
                 instance.resume_intent = crate::session::ResumeIntent::Fork {
                     from: parent.session_id.clone(),
                 };
-                instance.resume_binding = Some(parent);
+                instance.resume_binding = Some(*parent);
             }
             crate::session::ForkSeed::Structured {
                 parent_acp_session_id,
@@ -2142,6 +2142,7 @@ mod tests {
                 agent: "claude".into(),
                 stores: vec![std::path::PathBuf::from("/tmp/store")],
                 configuration: Vec::new(),
+                exported_default_store: false,
                 cwd: "/tmp".into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),
@@ -2168,7 +2169,7 @@ mod tests {
             repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: Some(ForkSeed::Terminal {
-                parent: parent.clone(),
+                parent: Box::new(parent.clone()),
                 child_session_id: "child-conversation".into(),
             }),
         };

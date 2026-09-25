@@ -678,6 +678,7 @@ mod tests {
                 agent: "claude".into(),
                 stores: vec!["/tmp/claude-store".into()],
                 configuration: Vec::new(),
+                exported_default_store: false,
                 cwd: "/tmp".into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),

@@ -1216,19 +1216,20 @@ fn terminal_fork_hides_structured_despite_structured_default() {
     dialog.apply_structured_default();
     assert!(dialog.structured_enabled);
     dialog.set_fork_from(crate::session::ForkSeed::Terminal {
-        parent: crate::session::ConversationBinding {
+        parent: Box::new(crate::session::ConversationBinding {
             session_id: "parent".into(),
             execution: Some(crate::session::ExecutionBinding {
                 agent: "claude".into(),
                 stores: vec!["/store".into()],
                 configuration: Vec::new(),
+                exported_default_store: false,
                 cwd: TEST_PATH.into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),
             }),
             provenance: crate::session::ConversationProvenance::Observed,
             transcript_path: None,
-        },
+        }),
         child_session_id: "child".into(),
     });
     assert!(!dialog.structured_capable);
