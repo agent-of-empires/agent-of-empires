@@ -76,90 +76,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_items_fit() {
-        let s = calculate_scroll(3, 0, 10);
-        assert_eq!(s.scroll_offset, 0);
-        assert_eq!(s.list_visible, 3);
-        assert!(!s.has_more_above);
-        assert!(!s.has_more_below);
-    }
-
-    #[test]
-    fn cursor_at_top_with_overflow() {
-        let s = calculate_scroll(10, 0, 5);
-        assert_eq!(s.scroll_offset, 0);
-        assert!(!s.has_more_above);
-        assert!(s.has_more_below);
-        // 5 lines - 1 for below indicator = 4 visible items
-        assert_eq!(s.list_visible, 4);
-    }
-
-    #[test]
-    fn cursor_in_middle() {
-        let s = calculate_scroll(10, 5, 5);
-        assert!(s.scroll_offset > 0);
-        assert!(s.has_more_above);
-        assert!(s.has_more_below);
-        // 5 lines - 1 above - 1 below = 3 visible items
-        assert_eq!(s.list_visible, 3);
-    }
-
-    #[test]
-    fn cursor_at_bottom() {
-        let s = calculate_scroll(10, 9, 5);
-        assert!(s.scroll_offset > 0);
-        assert!(s.has_more_above);
-        assert!(!s.has_more_below);
-        // 5 lines - 1 above = 4 visible items
-        assert_eq!(s.list_visible, 4);
-    }
-
-    #[test]
-    fn visible_height_one_suppresses_indicators() {
-        let s = calculate_scroll(5, 3, 1);
-        assert_eq!(s.list_visible, 1);
-        assert!(!s.has_more_above);
-        assert!(!s.has_more_below);
-    }
-
-    #[test]
-    fn visible_height_zero() {
-        let s = calculate_scroll(5, 0, 0);
-        assert_eq!(s.scroll_offset, 0);
-        assert_eq!(s.list_visible, 0);
-        assert!(!s.has_more_above);
-        assert!(!s.has_more_below);
-    }
-
-    #[test]
-    fn empty_list() {
-        let s = calculate_scroll(0, 0, 10);
-        assert_eq!(s.scroll_offset, 0);
-        assert_eq!(s.list_visible, 0);
-        assert!(!s.has_more_above);
-        assert!(!s.has_more_below);
-    }
-
-    #[test]
-    fn off_by_one_regression() {
-        // total=7, visible_height=5, cursor=4: item[6] must be accounted for
-        let s = calculate_scroll(7, 4, 5);
-        let shown = s.scroll_offset + s.list_visible;
-        let hidden_below = 7_usize.saturating_sub(shown);
-        if hidden_below > 0 {
-            assert!(s.has_more_below, "hidden items must show below indicator");
+    fn calculate_scroll_cases() {
+        // (total, cursor, height) -> (offset, visible, more above, more below).
+        // Each indicator costs a line; height <= 1 suppresses both, and at
+        // height 2 an indicator yields so at least one item shows.
+        let cases = [
+            ((3, 0, 10), (0, 3, false, false)),
+            ((10, 0, 5), (0, 4, false, true)),
+            ((10, 5, 5), (3, 3, true, true)),
+            ((10, 9, 5), (6, 4, true, false)),
+            ((5, 3, 1), (3, 1, false, false)),
+            ((5, 0, 0), (0, 0, false, false)),
+            ((0, 0, 10), (0, 0, false, false)),
+            // Off-by-one regression: item[6] is hidden, so "more below" shows.
+            ((7, 4, 5), (2, 3, true, true)),
+            ((10, 5, 2), (5, 1, true, false)),
+        ];
+        for ((total, cursor, height), want) in cases {
+            let s = calculate_scroll(total, cursor, height);
+            assert_eq!(
+                (
+                    s.scroll_offset,
+                    s.list_visible,
+                    s.has_more_above,
+                    s.has_more_below
+                ),
+                want,
+                "total={total} cursor={cursor} height={height}"
+            );
         }
-    }
-
-    #[test]
-    fn visible_height_two_shows_at_least_one_item() {
-        // With height=2, both indicators would consume all space.
-        // Must suppress indicators to show at least 1 item.
-        let s = calculate_scroll(10, 5, 2);
-        assert!(
-            s.list_visible >= 1,
-            "must show at least 1 item, got list_visible={}",
-            s.list_visible
-        );
     }
 }

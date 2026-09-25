@@ -212,140 +212,65 @@ mod tests {
     }
 
     #[test]
-    fn test_new_with_some_text_prepopulates() {
-        let dialog = CustomInstructionDialog::new(Some("hello world".to_string()));
-        assert_eq!(dialog.get_text(), "hello world");
-        assert_eq!(dialog.focused_zone, 0);
-        assert_eq!(dialog.focused_button, 0);
-    }
-
-    #[test]
-    fn test_new_with_none_starts_empty() {
-        let dialog = CustomInstructionDialog::new(None);
-        assert_eq!(dialog.get_text(), "");
-    }
-
-    #[test]
-    fn test_new_with_multiline_text() {
-        let dialog = CustomInstructionDialog::new(Some("line1\nline2\nline3".to_string()));
-        assert_eq!(dialog.get_text(), "line1\nline2\nline3");
-    }
-
-    #[test]
-    fn test_tab_toggles_focused_zone() {
-        let mut dialog = CustomInstructionDialog::new(None);
-        assert_eq!(dialog.focused_zone, 0);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_zone, 1);
-
-        dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_zone, 0);
-    }
-
-    #[test]
-    fn test_shift_tab_toggles_in_reverse() {
-        let mut dialog = CustomInstructionDialog::new(None);
-        assert_eq!(dialog.focused_zone, 0);
-
-        dialog.handle_key(shift_key(KeyCode::Tab));
-        assert_eq!(dialog.focused_zone, 1);
-
-        dialog.handle_key(shift_key(KeyCode::Tab));
-        assert_eq!(dialog.focused_zone, 0);
-    }
-
-    #[test]
-    fn test_escape_returns_cancel_from_zone_0() {
-        let mut dialog = CustomInstructionDialog::new(None);
-        dialog.focused_zone = 0;
-        let result = dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_escape_returns_cancel_from_zone_1() {
-        let mut dialog = CustomInstructionDialog::new(None);
-        dialog.focused_zone = 1;
-        let result = dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_enter_in_zone_0_does_not_submit() {
-        let mut dialog = CustomInstructionDialog::new(None);
-        dialog.focused_zone = 0;
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Continue));
-    }
-
-    #[test]
-    fn test_enter_on_save_button_returns_submit() {
-        let mut dialog = CustomInstructionDialog::new(Some("test text".to_string()));
-        dialog.focused_zone = 1;
-        dialog.focused_button = 0;
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(Some(text)) => assert_eq!(text, "test text"),
-            _ => panic!("Expected Submit(Some(...))"),
+    fn new_prepopulates_and_tab_toggles_zones() {
+        for (initial, text) in [
+            (Some("hello world"), "hello world"),
+            (None, ""),
+            (Some("line1\nline2\nline3"), "line1\nline2\nline3"),
+        ] {
+            let dialog = CustomInstructionDialog::new(initial.map(str::to_string));
+            assert_eq!(dialog.get_text(), text);
+            assert_eq!((dialog.focused_zone, dialog.focused_button), (0, 0));
         }
-    }
-
-    #[test]
-    fn test_enter_on_cancel_button_returns_cancel() {
-        let mut dialog = CustomInstructionDialog::new(Some("test text".to_string()));
-        dialog.focused_zone = 1;
-        dialog.focused_button = 1;
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Cancel));
-    }
-
-    #[test]
-    fn test_left_right_in_button_row_toggles_focused_button() {
+        for tab in [key(KeyCode::Tab), shift_key(KeyCode::Tab)] {
+            let mut dialog = CustomInstructionDialog::new(None);
+            dialog.handle_key(tab);
+            assert_eq!(dialog.focused_zone, 1);
+            dialog.handle_key(tab);
+            assert_eq!(dialog.focused_zone, 0);
+        }
         let mut dialog = CustomInstructionDialog::new(None);
         dialog.focused_zone = 1;
-        assert_eq!(dialog.focused_button, 0);
-
         dialog.handle_key(key(KeyCode::Right));
         assert_eq!(dialog.focused_button, 1);
-
         dialog.handle_key(key(KeyCode::Left));
         assert_eq!(dialog.focused_button, 0);
     }
 
     #[test]
-    fn test_submit_with_empty_text_returns_none() {
-        let mut dialog = CustomInstructionDialog::new(None);
-        dialog.focused_zone = 1;
-        dialog.focused_button = 0;
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(None) => {}
-            _ => panic!("Expected Submit(None)"),
-        }
-    }
-
-    #[test]
-    fn test_submit_with_whitespace_only_returns_none() {
-        let mut dialog = CustomInstructionDialog::new(Some("   \n  ".to_string()));
-        dialog.focused_zone = 1;
-        dialog.focused_button = 0;
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(None) => {}
-            _ => panic!("Expected Submit(None) for whitespace-only text"),
-        }
-    }
-
-    #[test]
-    fn test_submit_with_nonempty_text_returns_some() {
-        let mut dialog = CustomInstructionDialog::new(Some("custom instruction".to_string()));
-        dialog.focused_zone = 1;
-        dialog.focused_button = 0;
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        match result {
-            DialogResult::Submit(Some(text)) => assert_eq!(text, "custom instruction"),
-            _ => panic!("Expected Submit(Some(...))"),
+    fn key_outcomes() {
+        let submit = |t: &str| DialogResult::Submit(Some(t.to_string()));
+        // (initial text, zone, button, key, outcome). Blank text submits None.
+        let cases = [
+            (None, 0, 0, KeyCode::Esc, DialogResult::Cancel),
+            (None, 1, 0, KeyCode::Esc, DialogResult::Cancel),
+            (None, 0, 0, KeyCode::Enter, DialogResult::Continue),
+            (Some("test text"), 1, 0, KeyCode::Enter, submit("test text")),
+            (
+                Some("test text"),
+                1,
+                1,
+                KeyCode::Enter,
+                DialogResult::Cancel,
+            ),
+            (None, 1, 0, KeyCode::Enter, DialogResult::Submit(None)),
+            (
+                Some("   \n  "),
+                1,
+                0,
+                KeyCode::Enter,
+                DialogResult::Submit(None),
+            ),
+        ];
+        for (initial, zone, button, code, want) in cases {
+            let mut dialog = CustomInstructionDialog::new(initial.map(str::to_string));
+            dialog.focused_zone = zone;
+            dialog.focused_button = button;
+            assert_eq!(
+                dialog.handle_key(key(code)),
+                want,
+                "{initial:?} zone {zone} button {button} {code:?}"
+            );
         }
     }
 }
