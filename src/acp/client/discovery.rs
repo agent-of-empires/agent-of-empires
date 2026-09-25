@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn url_parsing_helpers() {
+    fn url_helpers_and_loopback_detection() {
         for (url, token) in [
             ("http://localhost:8080/?token=abc123", Some("abc123")),
             ("http://localhost:8080/?foo=bar&token=zzz", Some("zzz")),
@@ -319,97 +319,91 @@ mod tests {
         assert_eq!(http_to_ws("http://127.0.0.1:8080"), "ws://127.0.0.1:8080");
         assert_eq!(http_to_ws("https://remote.test"), "wss://remote.test");
         assert_eq!(http_to_ws("ws://already"), "ws://already");
+
+        {
+            assert!(is_loopback("http://127.0.0.1:8080"));
+            assert!(is_loopback("http://localhost:8081/"));
+            assert!(is_loopback("http://[::1]:8080"));
+            assert!(is_loopback("http://127.2.3.4:8080"));
+            assert!(!is_loopback("https://example.com"));
+            assert!(!is_loopback("http://192.168.1.50:8080"));
+            assert!(!is_loopback("https://localhost.attacker.example"));
+            assert!(!is_loopback("http://127.0.0.1.evil.example"));
+
+            // The loopback alternate wins, but a lone public URL is still selected.
+            let public = ServeUrl {
+                label: None,
+                url: "https://aoe.example.test/?token=secret".into(),
+            };
+            let loopback = ServeUrl {
+                label: Some("localhost".into()),
+                url: "http://127.0.0.1:8080/?token=secret".into(),
+            };
+            for (urls, want) in [
+                (vec![public.clone(), loopback.clone()], &loopback),
+                (vec![public.clone()], &public),
+            ] {
+                let selected = preferred_daemon_url(&urls).expect("a daemon URL is selected");
+                assert_eq!(selected.url, want.url);
+            }
+        }
     }
 
     /// A loopback local daemon adopts a rotated token, keeps the last valid one
     /// across a torn or non-hex write, and caches it for the next read.
     #[test]
-    fn loopback_endpoint_tracks_rotated_token() {
+    fn only_a_loopback_local_daemon_reads_the_rotated_token() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("serve.token");
         let (old, new) = ("a".repeat(64), "b".repeat(64));
-        let endpoint = endpoint(Some(&old), Source::LocalDaemon);
+        let local = endpoint(Some(&old), Source::LocalDaemon);
 
         std::fs::write(&path, &new).unwrap();
-        assert_eq!(endpoint.resolved_token_from_path(&path), Some(new.clone()));
+        assert_eq!(local.resolved_token_from_path(&path), Some(new.clone()));
         for invalid in ["partial".to_string(), "A".repeat(64), "g".repeat(64)] {
             std::fs::write(&path, invalid).unwrap();
-            assert_eq!(endpoint.resolved_token_from_path(&path), Some(new.clone()));
+            assert_eq!(local.resolved_token_from_path(&path), Some(new.clone()));
         }
-    }
 
-    /// Only a loopback local daemon may be handed the app directory's token: a
-    /// legacy public endpoint, an env override, and a `--no-auth` endpoint all
-    /// keep what discovery gave them.
-    #[test]
-    fn non_loopback_endpoints_never_read_the_local_token_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("serve.token");
-        std::fs::write(&path, "b".repeat(64)).unwrap();
-        let captured = "a".repeat(64);
+        // Only a loopback local daemon may be handed the app directory's token: a
+        // legacy public endpoint, an env override, and a `--no-auth` endpoint all
+        // keep what discovery gave them.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("serve.token");
+            std::fs::write(&path, "b".repeat(64)).unwrap();
+            let captured = "a".repeat(64);
 
-        let public = DaemonEndpoint::new(
-            "https://old-tunnel.example.com".into(),
-            Some(captured.clone()),
-            Source::LocalDaemon,
-        );
-        assert_eq!(
-            public.resolved_token_from_path(&path),
-            Some(captured.clone())
-        );
-        assert_eq!(
-            endpoint(Some(&captured), Source::Env).resolved_token_from_path(&path),
-            Some(captured)
-        );
-        assert_eq!(
-            endpoint(None, Source::LocalDaemon).resolved_token_from_path(&path),
-            None
-        );
-    }
-
-    #[test]
-    fn is_loopback_matches_localhost_variants() {
-        assert!(is_loopback("http://127.0.0.1:8080"));
-        assert!(is_loopback("http://localhost:8081/"));
-        assert!(is_loopback("http://[::1]:8080"));
-        assert!(is_loopback("http://127.2.3.4:8080"));
-        assert!(!is_loopback("https://example.com"));
-        assert!(!is_loopback("http://192.168.1.50:8080"));
-        assert!(!is_loopback("https://localhost.attacker.example"));
-        assert!(!is_loopback("http://127.0.0.1.evil.example"));
-    }
-
-    /// The loopback alternate wins, but a lone public URL is still selected.
-    #[test]
-    fn preferred_daemon_url_prefers_loopback() {
-        let public = ServeUrl {
-            label: None,
-            url: "https://aoe.example.test/?token=secret".into(),
-        };
-        let loopback = ServeUrl {
-            label: Some("localhost".into()),
-            url: "http://127.0.0.1:8080/?token=secret".into(),
-        };
-        for (urls, want) in [
-            (vec![public.clone(), loopback.clone()], &loopback),
-            (vec![public.clone()], &public),
-        ] {
-            let selected = preferred_daemon_url(&urls).expect("a daemon URL is selected");
-            assert_eq!(selected.url, want.url);
+            let public = DaemonEndpoint::new(
+                "https://old-tunnel.example.com".into(),
+                Some(captured.clone()),
+                Source::LocalDaemon,
+            );
+            assert_eq!(
+                public.resolved_token_from_path(&path),
+                Some(captured.clone())
+            );
+            assert_eq!(
+                endpoint(Some(&captured), Source::Env).resolved_token_from_path(&path),
+                Some(captured)
+            );
+            assert_eq!(
+                endpoint(None, Source::LocalDaemon).resolved_token_from_path(&path),
+                None
+            );
         }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn discover_env_returns_none_when_unset() {
-        let _env =
-            crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_URL", "AOE_DAEMON_TOKEN"]);
-        assert!(discover_env().is_none());
     }
 
     #[test]
     #[serial_test::serial]
     fn discover_env_parses_url_and_token() {
+        {
+            let _env = crate::session::test_support::EnvGuard::unset(&[
+                "AOE_DAEMON_URL",
+                "AOE_DAEMON_TOKEN",
+            ]);
+            assert!(discover_env().is_none());
+        }
         let _env = crate::session::test_support::EnvGuard::set(&[
             (
                 "AOE_DAEMON_URL",
