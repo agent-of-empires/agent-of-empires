@@ -2051,10 +2051,16 @@ pub(crate) fn is_binary_on_path(binary: &str) -> bool {
 const AGENT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const LOGIN_SHELL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Divides both probe timeouts; set only inside an isolated probe-test subprocess.
+#[cfg(test)]
+static PROBE_TIMEOUT_DIVISOR: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
 fn agent_probe_output(
     command: &mut Command,
     timeout: std::time::Duration,
 ) -> Option<std::process::Output> {
+    #[cfg(test)]
+    let timeout = timeout / PROBE_TIMEOUT_DIVISOR.get().copied().unwrap_or(1);
     match crate::process::run_with_timeout_process_group(
         command.stdin(std::process::Stdio::null()),
         timeout,
@@ -2503,6 +2509,7 @@ mod tests {
             return;
         }
         use std::time::{Duration, Instant};
+        PROBE_TIMEOUT_DIVISOR.set(5).unwrap();
         let diagnostics = tempfile::tempdir().unwrap();
         let diagnostics_path = diagnostics.path().join("timeouts.log");
         tracing_subscriber::fmt()
@@ -2518,8 +2525,8 @@ mod tests {
             }
         }
         for (executable, timeout) in [
-            ("vibe", AGENT_PROBE_TIMEOUT),
-            ("login-shell", LOGIN_SHELL_PROBE_TIMEOUT),
+            ("vibe", AGENT_PROBE_TIMEOUT / 5),
+            ("login-shell", LOGIN_SHELL_PROBE_TIMEOUT / 5),
         ] {
             let home = tempfile::tempdir().unwrap();
             let _env = probe_environment(home.path());
@@ -2602,7 +2609,7 @@ mod tests {
                 diagnostics.lines().any(|line| {
                     line.contains("WARN")
                         && line.contains("program=")
-                        && line.contains(&format!("timeout_s={}", timeout.as_secs()))
+                        && line.contains(&format!("timeout_s={}", (timeout / 5).as_secs()))
                 }),
                 "missing timeout diagnostic: {diagnostics}"
             );
@@ -4055,12 +4062,16 @@ mod tests {
         if run_probe_test_in_subprocess() {
             return;
         }
+        // Scaled timeouts: the login shell outlives the per-agent timeout but not its own.
+        PROBE_TIMEOUT_DIVISOR.set(5).unwrap();
         let home = tempfile::tempdir().unwrap();
         let _env = probe_environment(home.path());
         let log = shell_words::quote(home.path().join("probes").to_str().unwrap()).into_owned();
         std::fs::write(
             home.path().join("bin/login-shell"),
-            format!("#!/bin/sh\nprintf 'login\n' >> {log}\n/bin/sleep 6\nexec /bin/sh -c \"$2\"\n"),
+            format!(
+                "#!/bin/sh\nprintf 'login\n' >> {log}\n/bin/sleep 1.2\nexec /bin/sh -c \"$2\"\n"
+            ),
         )
         .unwrap();
         let found = login_shell_probe(&[
