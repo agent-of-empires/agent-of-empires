@@ -62,16 +62,18 @@ test.describe("Sidebar context-menu viewport clamp (#1601)", () => {
     await expect(target).toHaveClass(/overflow-y-auto/);
   }
 
-  for (const [what, anchor, selector] of [
-    ["session row", ROW, MENU],
-    ["repo group header", "[data-testid='sidebar-group-header']", GROUP_MENU],
-  ] as const) {
-    test(`right-click on the bottom ${what} keeps the menu inside the viewport`, async ({ page }) => {
-      await installSidebarMocks(page, { sessions: THREE });
-      await page.setViewportSize({ width: 900, height: 360 });
-      await page.goto("/");
-      await expect(page.locator("header")).toBeVisible();
+  test("right-click on the bottom session row and repo group header keeps each menu inside the viewport", async ({
+    page,
+  }) => {
+    await installSidebarMocks(page, { sessions: THREE });
+    await page.setViewportSize({ width: 900, height: 360 });
+    await page.goto("/");
+    await expect(page.locator("header")).toBeVisible();
 
+    for (const [anchor, selector] of [
+      [ROW, MENU],
+      ["[data-testid='sidebar-group-header']", GROUP_MENU],
+    ] as const) {
       const anchors = page.locator(anchor);
       await expect(anchors).toHaveCount(3);
       await anchors.last().scrollIntoViewIfNeeded();
@@ -81,8 +83,10 @@ test.describe("Sidebar context-menu viewport clamp (#1601)", () => {
       await expect(target).toBeVisible();
       await expectClamped(page, selector);
       await expectDvhCap(target);
-    });
-  }
+      await page.mouse.click(5, 5);
+      await expect(target).toBeHidden();
+    }
+  });
 });
 
 // #1724, #2312: Cmd/Ctrl+click toggles a row into the selection without
@@ -124,7 +128,9 @@ test.describe("Sidebar multi-select (#1724, #2312)", () => {
     await expect(selectedRows(page)).toHaveCount(0);
   });
 
-  test("right-click an unselected row resets the selection to that row (#2312)", async ({ page }) => {
+  test("right-click on an unselected row resets the selection; Shift+click ranges from a navigated row (#2312)", async ({
+    page,
+  }) => {
     await openSidebar(page, THREE);
     await rows(page)
       .nth(0)
@@ -135,20 +141,18 @@ test.describe("Sidebar multi-select (#1724, #2312)", () => {
     await expect(selectedRows(page)).toHaveCount(2);
 
     await rows(page).nth(2).click({ button: "right" });
-
     await expect(selectedRows(page)).toHaveCount(1);
     await expect(menu(page)).toBeVisible();
     await expect(menu(page)).not.toContainText("selected");
     await expect(menu(page).locator("[data-testid='sidebar-context-menu-bulk-archive']")).toHaveCount(0);
-  });
+    await page.keyboard.press("Escape");
+    await page.mouse.click(5, 5);
+    await expect(menu(page)).toBeHidden();
 
-  test("plain click then Shift+click selects the range from the navigated row (#2312)", async ({ page }) => {
-    await openSidebar(page, THREE);
     // A plain click navigates and leaves the row as the anchor; no intervening
     // Cmd+click is needed before the range works.
     await rows(page).nth(0).click();
     await expect.poll(() => page.url()).toContain("/session/s-1");
-
     await rows(page)
       .nth(2)
       .click({ modifiers: ["Shift"] });
