@@ -67,7 +67,7 @@ pub(super) async fn build_disk_watch_entry(
         },
     );
     // Test-only barrier.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, debug_assertions))]
     {
         let armed = disk_watch_build_barrier().lock().unwrap().clone();
         if let Some(barrier) = armed {
@@ -83,7 +83,7 @@ pub(super) async fn build_disk_watch_entry(
 
 /// Test-only barrier installed inside `build_disk_watch_entry` to deterministically pin a
 /// building task at a known point so a concurrent same-profile remove can run against it.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, debug_assertions))]
 pub(crate) struct DiskWatchBuildBarrier {
     pub(crate) entered: tokio::sync::Notify,
     pub(crate) release: tokio::sync::Notify,
@@ -91,7 +91,7 @@ pub(crate) struct DiskWatchBuildBarrier {
     pub(crate) armed: tokio::sync::Notify,
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn disk_watch_build_barrier(
 ) -> &'static std::sync::Mutex<Option<Arc<DiskWatchBuildBarrier>>> {
     static BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<DiskWatchBuildBarrier>>>> =

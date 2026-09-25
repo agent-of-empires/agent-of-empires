@@ -52,7 +52,7 @@ pub(crate) fn pane_links(session: &str) -> Vec<osc8::PaneLink> {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub mod test_support {
     pub use super::env::{

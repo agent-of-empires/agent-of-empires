@@ -453,7 +453,7 @@ fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<StorageFloc
         if e.kind() != std::io::ErrorKind::WouldBlock {
             return Err(e.into());
         }
-        #[cfg(feature = "test-support")]
+        #[cfg(debug_assertions)]
         if let Some(marker) = std::env::var_os("AOE_E2E_STORAGE_LOCK_CONTENDED") {
             fs::write(marker, path.as_os_str().as_encoded_bytes())?;
         }

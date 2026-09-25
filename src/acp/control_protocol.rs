@@ -203,7 +203,7 @@ pub(crate) async fn read_frame_with_size<R: AsyncRead + Unpin>(
     r: &mut R,
 ) -> Result<Option<(ControlBody, usize)>> {
     let mut len_buf = [0u8; 4];
-    #[cfg(feature = "test-support")]
+    #[cfg(debug_assertions)]
     let length_read = async {
         let mut consumed = 0;
         while consumed < len_buf.len() {
@@ -221,7 +221,7 @@ pub(crate) async fn read_frame_with_size<R: AsyncRead + Unpin>(
         Ok(consumed)
     }
     .await;
-    #[cfg(not(feature = "test-support"))]
+    #[cfg(not(debug_assertions))]
     let length_read = r.read_exact(&mut len_buf).await;
     match length_read {
         Ok(_) => {}

@@ -140,13 +140,13 @@ struct Inner {
 enum DispatchMsg {
     Kernel(notify::Result<notify::Event>),
     Local(PathBuf),
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, debug_assertions))]
     Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
 pub struct FileWatchService {
     inner: Mutex<Inner>,
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, debug_assertions))]
     kernel_observers: Mutex<HashMap<PathBuf, Vec<tokio::sync::oneshot::Sender<()>>>>,
     dispatcher_dead: AtomicBool,
     tokio_tx: mpsc::UnboundedSender<DispatchMsg>,
@@ -185,7 +185,7 @@ impl FileWatchService {
                 pending: HashMap::new(),
                 slots: BTreeMap::new(),
             }),
-            #[cfg(any(test, feature = "test-support"))]
+            #[cfg(any(test, debug_assertions))]
             kernel_observers: Mutex::new(HashMap::new()),
             tokio_tx,
             last_kernel_warn_unix_ms: AtomicI64::new(0),
@@ -363,7 +363,7 @@ impl FileWatchService {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub mod test_support {
     use super::{Arc, DispatchMsg, FileWatchService, Path, WatchError};
@@ -532,7 +532,7 @@ async fn run_dispatcher(
                     DispatchMsg::Local(path) => {
                         dispatch_path(&arc, &path, FileEventKind::Upserted, EventSource::Local);
                     }
-                    #[cfg(any(test, feature = "test-support"))]
+                    #[cfg(any(test, debug_assertions))]
                     DispatchMsg::Barrier(tx) => {
                         let _ = tx.send(());
                     }
@@ -580,7 +580,7 @@ fn handle_kernel(svc: &Arc<FileWatchService>, res: notify::Result<notify::Event>
     };
     for path in &ev.paths {
         dispatch_path(svc, path, kind, EventSource::Kernel);
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(any(test, debug_assertions))]
         if let Some(observers) = svc.kernel_observers.lock().unwrap().remove(path) {
             for observer in observers {
                 let _ = observer.send(());

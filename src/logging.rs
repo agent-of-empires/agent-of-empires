@@ -859,7 +859,7 @@ fn apply_filter_file(path: &std::path::Path) {
             "runner filter swap failed"
         ),
     }
-    #[cfg(feature = "test-support")]
+    #[cfg(debug_assertions)]
     if path.with_extension("observe").exists() {
         std::fs::write(path.with_extension("applied"), directive)
             .expect("publish e2e filter application");
