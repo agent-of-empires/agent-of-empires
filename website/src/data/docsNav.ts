@@ -25,6 +25,7 @@ export const docsNav: NavSection[] = [
       { title: "Container Sandbox", href: "/guides/sandbox/", description: "Run AI coding agents in isolated Docker, Podman, or Apple containers." },
       { title: "Claude Code Telemetry to Otari", href: "/guides/otari-telemetry/", description: "Export Claude Code usage from host and sandbox sessions to Otari." },
       { title: "Live Mode", href: "/guides/live-mode/", description: "Watch a session stream live and type into it from the TUI." },
+      { title: "Remote Machines", href: "/guides/remotes/", description: "List and drive sessions on other machines' daemons from the TUI." },
       { title: "Repo Config & Hooks", href: "/guides/repo-config/", description: "Per-repo configuration and lifecycle hooks for sessions." },
       { title: "Git Worktrees", href: "/guides/worktrees/", description: "How AoE creates and cleans up a git worktree per session." },
       { title: "Multi-Repo Workspaces", href: "/guides/multi-repo-workspaces/", description: "Drive one session across several git repositories at once." },
@@ -82,6 +83,7 @@ export const docsNav: NavSection[] = [
     items: [
       { title: "Structured View Internals", href: "/docs/development/internals/structured-view/" },
       { title: "Plugin System Internals", href: "/docs/development/internals/plugin-system/" },
+      { title: "Daemon-to-Client Transports", href: "/docs/development/internals/client-transports/" },
     ],
   },
 ];

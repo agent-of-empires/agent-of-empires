@@ -19,6 +19,7 @@ export function liveFrame(over: Partial<LiveFrame> = {}): LiveFrame {
     altScreen: false,
     mouse: false,
     mouseSgr: false,
+    mouseAll: false,
     pane0: null,
     ...over,
   };

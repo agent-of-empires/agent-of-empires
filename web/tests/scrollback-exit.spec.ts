@@ -171,8 +171,11 @@ test.describe("Mobile live-view scrollback", () => {
       .poll(() => textMessages(handle).filter((m) => m.includes('"type":"window"')).length, { timeout: 3_000 })
       .toBeGreaterThan(before);
 
-    // No SGR wheel bytes or pause/resume control messages on mobile.
+    // The copy-mode machinery must stay retired on mobile: a normal-screen
+    // pane scrolls its own capture window, so nothing forwards a wheel in
+    // any form, and no pause/resume control messages, ever.
     const all = textMessages(handle).join("");
+    expect(all).not.toContain('"type":"wheel"');
     expect(all).not.toContain("\x1b[<64;");
     expect(all).not.toContain("\x1b[<65;");
     expect(all).not.toContain("pause_output");

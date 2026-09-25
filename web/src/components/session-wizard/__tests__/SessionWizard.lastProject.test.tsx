@@ -112,7 +112,7 @@ describe("SessionWizard last-project memory", () => {
     localStorage.setItem(PROJECT_KEY, "not a path");
     const { getByText } = renderWizard();
 
-    await waitFor(() => expect(fetchRecentProjects).toHaveBeenCalled());
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
     expect(fetchIsGitRepo).not.toHaveBeenCalled();
     expect(launchButton(getByText).disabled).toBe(true);
   });

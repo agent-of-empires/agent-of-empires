@@ -95,12 +95,29 @@ impl Instance {
             session_id_poller_retry_after: None,
             retroactive_capture_excludes: HashSet::new(),
             pane_dead_observed: false,
+            agent_pane: PaneObservation::default(),
+            auxiliary: Vec::new(),
             file_watch: None,
         }
     }
 
-    /// Inject the live FileWatchService Arc into this Instance for in-process Local fast-path
-    /// notifications during subsequent storage mutations.
+    pub fn auxiliary_presence(&self, target: &AuxiliaryTarget) -> PanePresence {
+        self.auxiliary
+            .iter()
+            .find(|observation| &observation.target == target)
+            .map_or(PanePresence::Unknown, |observation| observation.pane.state)
+    }
+
+    pub fn tool_presence(&self, name: &str) -> PanePresence {
+        self.auxiliary.iter().find(|observation| matches!(&observation.target, AuxiliaryTarget::Tool { tool_name } if tool_name == name))
+            .map_or(PanePresence::Unknown, |observation| observation.pane.state)
+    }
+
+    /// Inject the live FileWatchService Arc into this Instance for
+    /// in-process Local fast-path notifications during subsequent storage
+    /// mutations. Called by `Storage::load*` automatically; manual call
+    /// sites are daemon-side recovery and TUI session-creation paths that
+    /// build Instances without going through Storage::load.
     pub(crate) fn set_file_watch(
         &mut self,
         fw: std::sync::Arc<crate::file_watch::FileWatchService>,
@@ -108,16 +125,20 @@ impl Instance {
         self.file_watch = Some(fw);
     }
 
-    /// Resolve the live `Arc<FileWatchService>` for this Instance, falling back to a noop service
-    /// when none was injected (ad-hoc construction or pre-injection state).
+    /// Resolve the live `Arc<FileWatchService>` for this Instance, falling
+    /// back to a noop service when none was injected (ad-hoc construction
+    /// or pre-injection state). Use sites pair this with `Storage::new`
+    /// directly because `new_unwatched` would shadow a live injection.
     pub(super) fn resolve_file_watch(&self) -> std::sync::Arc<crate::file_watch::FileWatchService> {
         self.file_watch
             .clone()
             .unwrap_or_else(crate::file_watch::FileWatchService::noop)
     }
 
-    /// Whether a title rename should also move the worktree directory leaf, given the resolved
-    /// `session.tie_workdir_to_name` setting.
+    /// Whether a title rename should also move the worktree directory leaf,
+    /// given the resolved `session.tie_workdir_to_name` setting. True only for
+    /// aoe-managed worktree sessions: non-worktree (scratch, plain tmux) and
+    /// externally-attached worktrees are always a no-op. See #1927.
     pub fn tie_workdir_applies(&self, tie_setting: bool) -> bool {
         tie_setting
             && self
@@ -126,8 +147,14 @@ impl Instance {
                 .is_some_and(|w| w.managed_by_aoe)
     }
 
-    /// Whether deleting this session has aoe-managed worktree state to clean up, covering BOTH
-    /// single-repo and multi-repo (workspace) sessions.
+    /// Whether deleting this session has aoe-managed worktree state to clean
+    /// up, covering BOTH single-repo and multi-repo (workspace) sessions.
+    /// Single-repo sessions carry an aoe-managed `worktree_info`; workspace
+    /// sessions carry `workspace_info` instead (with `worktree_info = None`),
+    /// and opt into cleanup via `cleanup_on_delete`. Entry points use this to
+    /// decide whether to set `delete_worktree`; gating on `worktree_info`
+    /// alone silently leaks the workspace directory (#2363). Mirrors the TUI
+    /// group-delete predicate so every surface agrees.
     pub fn has_managed_worktree_or_workspace(&self) -> bool {
         self.worktree_info
             .as_ref()
@@ -139,6 +166,12 @@ impl Instance {
     }
 
     /// Every repo this session works in, empty for a single-repo session.
+    ///
+    /// The one accessor consumers read, so nothing has to know that a session
+    /// gains repos two ways: created multi-repo, or converted by
+    /// `attach_project` (#3103). Both end up in `workspace_info.repos`, which is
+    /// the point of converting rather than keeping a second list: a repo added
+    /// later is indistinguishable from one present at creation.
     pub fn all_repos(&self) -> &[WorkspaceRepo] {
         self.workspace_info
             .as_ref()
@@ -146,9 +179,9 @@ impl Instance {
             .unwrap_or(&[])
     }
 
-    /// Return the profile that should drive config resolution for this instance, falling back to
-    /// the user's globally configured default when `source_profile` was never populated (e.g.
-    /// legacy callers).
+    /// Return the profile that should drive config resolution for this
+    /// instance, falling back to the user's globally configured default
+    /// when `source_profile` was never populated (e.g. legacy callers).
     pub fn effective_profile(&self) -> String {
         crate::session::config::effective_profile(&self.source_profile)
     }
@@ -169,7 +202,33 @@ impl Instance {
             .or_else(|| crate::agents::get_agent(&self.effective_detect_as()))
     }
 
+    pub(super) fn effective_detect_as_in<'a>(
+        &'a self,
+        config: &'a crate::session::config::SessionConfig,
+    ) -> &'a str {
+        if self.detect_as.is_empty() {
+            config
+                .agent_detect_as
+                .get(&self.tool)
+                .map_or("", String::as_str)
+        } else {
+            &self.detect_as
+        }
+    }
+
+    pub(super) fn resolved_agent_in(
+        &self,
+        config: &crate::session::config::SessionConfig,
+    ) -> Option<&'static crate::agents::AgentDef> {
+        crate::agents::get_agent(&self.tool)
+            .or_else(|| crate::agents::get_agent(self.effective_detect_as_in(config)))
+    }
+
     /// The built-in identity used to compare capture stores and aliases.
+    ///
+    /// This is classification only. Capture and resume authorization still
+    /// goes through `resolved_session_support` or `supports_native_resume`,
+    /// which also prove the launch command and capture context.
     pub(crate) fn capture_agent_name(&self) -> Option<&'static str> {
         self.resolved_agent().map(|a| a.name)
     }
@@ -242,8 +301,14 @@ impl Instance {
             && !words.iter().any(|word| word == "--")
     }
 
-    /// The basename of the program this launch actually runs, which is the token a live process
-    /// carries in argv.
+    /// The basename of the program this launch actually runs, which is the
+    /// token a live process carries in argv.
+    ///
+    /// A command override names it; otherwise it is the resolved agent's own
+    /// binary. Matching on this rather than on `agent.binary` is what lets the
+    /// orphan scan see a renamed wrapper, which carries the pane's
+    /// `AOE_INSTANCE_ID` because [`status_hook_env_prefix`] injects the marker
+    /// on hook presence alone.
     pub(crate) fn launch_executable_token(&self) -> Option<String> {
         let words = parse_launch_command(self.get_tool_command())?.words;
         Path::new(words.first()?)
@@ -268,6 +333,9 @@ impl Instance {
     }
 
     /// Whether this launch shape leaves Claude user hooks enabled.
+    ///
+    /// This is evidence for the identity publisher only. It does not change
+    /// native resume support.
     pub(crate) fn hook_session_publisher_allowed_by_argv(&self) -> bool {
         if !self
             .default_selector_agent()
@@ -486,7 +554,7 @@ impl Instance {
     /// resolve the directory of the tool it is moving to as well as the one it
     /// is moving from.
     pub(crate) fn declared_agent_config_dir_for(&self, tool: &str) -> Option<std::path::PathBuf> {
-        let home = super::hooks::host_home(&self.resolved_host_environment())?;
+        let home = self.resolved_host_home()?;
         crate::session::config::profile_config::resolve_config_or_warn(&self.effective_profile())
             .session
             .agent_config_dir_for(tool, &home)
@@ -497,18 +565,26 @@ impl Instance {
         if !self.is_sandboxed() {
             return None;
         }
-        let home = dirs::home_dir()?;
+        let home = self.resolved_host_home()?;
         let config = crate::session::config::profile_config::resolve_config_or_warn(
             &self.effective_profile(),
         );
-        let declared = config.session.agent_config_dir_for(&self.tool, &home);
-        let agent = self.resolved_agent()?;
+        self.sandbox_capture_store_dir_for(self.resolved_agent()?, &config, &home)
+    }
+
+    pub(super) fn sandbox_capture_store_dir_for(
+        &self,
+        agent: &crate::agents::AgentDef,
+        config: &crate::session::config::Config,
+        home: &Path,
+    ) -> Option<std::path::PathBuf> {
+        let declared = config.session.agent_config_dir_for(&self.tool, home);
         if self.sandbox_store_generation
             >= crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
         {
             crate::session::config::container_config::sandbox_store_dir(
                 agent.name,
-                &home,
+                home,
                 declared.as_deref(),
                 &self.id,
             )
@@ -517,7 +593,7 @@ impl Instance {
         } else {
             crate::session::config::container_config::sandbox_store_migration_paths(
                 agent.name,
-                &home,
+                home,
                 declared.as_deref(),
                 &self.id,
             )
@@ -526,6 +602,45 @@ impl Instance {
             .next()
             .map(|(shared, _)| shared)
         }
+    }
+
+    pub(crate) fn is_managed_capture_peer(
+        &self,
+        current_id: &str,
+        is_current_profile: bool,
+    ) -> bool {
+        !(is_current_profile && self.id == current_id)
+            && self.is_sandboxed()
+            && self.archived_at.is_none()
+            && self.trashed_at.is_none()
+            && !matches!(self.status, Status::Stopped | Status::Deleting)
+    }
+
+    pub(crate) fn managed_capture_store_conflicts(
+        &self,
+        backend: crate::agents::SessionCaptureBackend,
+        current_store: &Path,
+        config: &crate::session::config::Config,
+        home: &Path,
+    ) -> bool {
+        let agent = crate::agents::get_agent(&self.tool).or_else(|| {
+            let detect_as = if self.detect_as.is_empty() {
+                config.session.agent_detect_as.get(&self.tool)?.as_str()
+            } else {
+                &self.detect_as
+            };
+            crate::agents::get_agent(detect_as)
+        });
+        let Some(agent) = agent else { return false };
+        if !self
+            .source_session_support()
+            .is_some_and(|(capture, _)| capture.backend == backend)
+        {
+            return false;
+        }
+        self.sandbox_capture_store_dir_for(agent, config, home)
+            .and_then(|path| std::fs::canonicalize(path).ok())
+            .is_none_or(|path| path == current_store)
     }
 
     pub(super) fn sandbox_capture_store_dir(&self) -> Option<std::path::PathBuf> {
@@ -542,8 +657,11 @@ impl Instance {
         self.sandbox_info.as_ref().is_some_and(|s| s.enabled)
     }
 
-    /// The repo this session groups under: the worktree's main repo when present (so all branches
-    /// of a repo group together), else the project path.
+    /// The repo this session groups under: the worktree's main repo when
+    /// present (so all branches of a repo group together), else the project
+    /// path. Shared by sidebar project grouping and new-session prefill so
+    /// the "which directory does this session belong to" rule lives in one
+    /// place.
     pub fn repo_path(&self) -> &str {
         self.worktree_info
             .as_ref()
@@ -555,8 +673,9 @@ impl Instance {
         self.yolo_mode
     }
 
-    /// True when this session renders in the structured (ACP) view. Rows damaged by pre-fix writers
-    /// are healed on reload by the server's structured row repair path.
+    /// True when this session renders in the structured (ACP) view. Rows
+    /// damaged by pre-fix writers are healed on reload by the server's
+    /// structured row repair path.
     pub fn is_structured(&self) -> bool {
         self.view == View::Structured
     }

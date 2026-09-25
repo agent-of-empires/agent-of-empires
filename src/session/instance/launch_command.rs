@@ -44,6 +44,8 @@ fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxe
 }
 
 /// Write the Pi session-id extension into the app dir and return its path.
+///
+/// Rewritten when the content differs so an upgrade ships its own version.
 pub(super) fn session_identity_extension_path() -> Result<PathBuf> {
     const SOURCE: &str = crate::session::instance::SESSION_IDENTITY_EXTENSION;
     let root = crate::session::get_app_dir()?;
@@ -55,7 +57,9 @@ pub(super) fn session_identity_extension_path() -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Whether a host `environment` list assigns `PATH`.
+/// Whether a host `environment` list assigns `PATH`. Entries are either `KEY`
+/// (pass AoE's own value through, which cannot redirect a binary lookup) or
+/// `KEY=VALUE`, so only the assigning form counts.
 pub(super) fn environment_defines_path(environment: &[String]) -> bool {
     environment.iter().any(|entry| {
         entry
@@ -106,8 +110,10 @@ pub(super) fn build_resume_flags(
     }
 }
 
-/// Build the launch flags for a one-shot terminal fork. Returns the empty string for an unforkable
-/// agent or an invalid id (mirroring `build_resume_flags`'s fail-closed contract).
+/// Build the launch flags for a one-shot terminal fork. Returns the empty
+/// string for an unforkable agent or an invalid id (mirroring
+/// `build_resume_flags`'s fail-closed contract). The child id is pre-pinned so
+/// the forked session is durable on disk before launch.
 pub(super) fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> String {
     use crate::agents::{get_agent, ForkStrategy, ResumeStrategy};
 
@@ -243,12 +249,22 @@ pub(super) fn append_resume_flags(
 }
 
 /// Format an environment variable assignment as a shell-safe command prefix.
+///
+/// Uses `shell_escape` (single-quote escaping) so the value is preserved
+/// verbatim when parsed by the inner `bash -c '...'` shell created by
+/// `wrap_command_ignore_suspend`.
 fn format_env_var_prefix(key: &str, value: &str, cmd: &str) -> String {
     let escaped = shell_escape(value);
     format!("{}={} {}", key, escaped, cmd)
 }
 
 /// Prepend agent-specific environment overrides to a launch command.
+///
+/// Some terminal agents inherit the parent tmux env, which can carry
+/// `NO_COLOR=1` and silently disable their terminal palettes even though the
+/// web renderer handles ANSI fine. Unsetting `NO_COLOR` and advertising
+/// `TERM=xterm-256color` plus `COLORTERM=truecolor` at launch keeps color on
+/// without pinning tools to a specific `FORCE_COLOR` depth.
 fn apply_agent_launch_env(cmd: &mut String, agent: Option<&'static crate::agents::AgentDef>) {
     if !matches!(agent.map(|a| a.name), Some("antigravity" | "codex")) {
         return;
@@ -260,8 +276,10 @@ fn apply_agent_launch_env(cmd: &mut String, agent: Option<&'static crate::agents
     );
 }
 
-/// Run a script through a dedicated descriptor so its size is not constrained by the per-argument
-/// exec limit and the launched agent retains the pane TTY on standard input.
+/// Run a script through a dedicated descriptor so its size is not constrained
+/// by the per-argument exec limit and the launched agent retains the pane TTY
+/// on standard input. The delimiter grows until it cannot close a here-document
+/// present in user-controlled command text.
 pub(super) fn shell_stdin_command(shell: &str, login: bool, script: &str, stem: &str) -> String {
     let mut delimiter = stem.to_string();
     while script.lines().any(|line| line == delimiter) {
@@ -383,8 +401,9 @@ impl Instance {
         self.has_command_override()
     }
 
-    /// True only when the launch command differs from the agent's default binary (ignores
-    /// extra_args).
+    /// True only when the launch command differs from the agent's default
+    /// binary (ignores extra_args). Use this for status-detection and
+    /// restart guards where only a wrapper script matters.
     pub fn has_command_override(&self) -> bool {
         if self.command.is_empty() {
             return false;
@@ -408,7 +427,10 @@ impl Instance {
         }
     }
 
-    /// The text searched for a user-selected `--agent NAME` flag.
+    /// The text searched for a user-selected `--agent NAME` flag: both the
+    /// command override (where a custom command like `kiro-cli chat --agent x`
+    /// may live) and the extra-args field (the usual place). Joined so a flag
+    /// in either is found.
     pub(super) fn selected_agent_args(&self) -> String {
         if self.command.is_empty() {
             self.extra_args.clone()
@@ -419,7 +441,10 @@ impl Instance {
         }
     }
 
-    /// Launch command including any agent `launch_subcommand` (e.g. `kiro-cli chat`).
+    /// Launch command including any agent `launch_subcommand` (e.g.
+    /// `kiro-cli chat`). A user command override takes precedence verbatim and
+    /// the subcommand is not applied to it. Used when assembling the launch
+    /// command so subcommand-scoped flags (yolo, resume) parse correctly.
     fn get_launch_command(&self) -> String {
         if self.command.is_empty() {
             crate::agents::get_agent(&self.tool)
@@ -430,8 +455,18 @@ impl Instance {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn prepare_launch_command(
         &mut self,
+        expected_conversation: ConversationState,
+    ) -> Result<PreparedLaunch> {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.prepare_launch_command_in(CaptureStorage::Profiles(&file_watch), expected_conversation)
+    }
+
+    pub(super) fn prepare_launch_command_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
         expected_conversation: ConversationState,
     ) -> Result<PreparedLaunch> {
         let sandbox_context_reset = match self.resolved_agent() {
@@ -451,7 +486,7 @@ impl Instance {
         let prior_probe_failed_sid = self.resume_probe_failed_sid.clone();
         let preparation = (|| -> Result<_> {
             if matches!(self.resume_intent, ResumeIntent::Default) {
-                if let Some(observation) = self.capture_freshest_conversation() {
+                if let Some(observation) = self.capture_freshest_conversation_in(stores) {
                     self.apply_conversation_observation(&observation);
                 }
             }
@@ -508,7 +543,7 @@ impl Instance {
             } else {
                 None
             };
-            let parts = self.build_launch_command(execution.as_ref())?;
+            let parts = self.build_launch_command_in(stores, execution.as_ref())?;
             if (managed || parts.1) && validate_target {
                 if let Some(execution) = execution.as_ref() {
                     self.validate_conversation_target(
@@ -569,8 +604,21 @@ impl Instance {
     }
 
     /// Refresh after pane teardown; Prime resident workers may still be running.
+    #[cfg(test)]
     pub(super) fn refresh_prepared_prime_launch_after_pane_stop(
         &mut self,
+        prepared: PreparedLaunch,
+    ) -> Result<PreparedLaunch> {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.refresh_prepared_prime_launch_after_pane_stop_in(
+            CaptureStorage::Profiles(&file_watch),
+            prepared,
+        )
+    }
+
+    pub(super) fn refresh_prepared_prime_launch_after_pane_stop_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
         prepared: PreparedLaunch,
     ) -> Result<PreparedLaunch> {
         if !prepared.is_existing {
@@ -580,16 +628,27 @@ impl Instance {
                 prepared.expected_conversation.pi_session_path.clone(),
             );
         }
-        self.absorb_published_prime_session();
-        let mut refreshed = self.prepare_launch_command(prepared.expected_conversation)?;
+        self.absorb_published_prime_session_in(stores);
+        let mut refreshed =
+            self.prepare_launch_command_in(stores, prepared.expected_conversation)?;
         refreshed.expected_prior_omp_generation = prepared.expected_prior_omp_generation;
         Ok(refreshed)
     }
 
     /// Construct the command only after hook execution has completed. Keeping this phase hook-free
     /// prevents a revalidation retry from replaying user code while the lifecycle lock is held.
+    #[cfg(test)]
     pub(super) fn build_launch_command(
         &mut self,
+        execution: Option<&super::execution::NativeExecution>,
+    ) -> Result<LaunchCommandParts> {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.build_launch_command_in(CaptureStorage::Profiles(&file_watch), execution)
+    }
+
+    pub(super) fn build_launch_command_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
         execution: Option<&super::execution::NativeExecution>,
     ) -> Result<LaunchCommandParts> {
         if self.tool == "omp" && !self.has_command_override() {
@@ -602,15 +661,15 @@ impl Instance {
             .or_else(|| self.default_selector_agent());
 
         let (cmd, is_existing, omp_capture_plan, launch_env) = if self.is_sandboxed() {
-            let image = self
+            let image = &self
                 .sandbox_info
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed instance"))?
                 .image
                 .clone();
-            let fallback_container = execution
-                .is_none()
-                .then(|| DockerContainer::new(&self.id, &image));
+            let fallback_container = execution.is_none().then(|| {
+                DockerContainer::new(&self.id, image, crate::containers::get_container_runtime())
+            });
             let snapshot = execution.and_then(|execution| execution.inputs.container.as_ref());
             anyhow::ensure!(
                 execution.is_none() || snapshot.is_some(),
@@ -688,7 +747,7 @@ impl Instance {
                 tool_cmd.push_str(flag);
             }
             let is_existing =
-                self.apply_session_flags(&mut tool_cmd, "sandboxed", agent, execution)?;
+                self.apply_session_flags_in(stores, &mut tool_cmd, "sandboxed", agent, execution)?;
             apply_agent_launch_env(&mut tool_cmd, agent);
 
             let fallback_environment = if execution.is_none() {
@@ -755,7 +814,7 @@ impl Instance {
                 },
             )
         } else {
-            let result = self.build_host_command(agent, execution)?;
+            let result = self.build_host_command_in(stores, agent, execution)?;
             let env = if execution.is_none() {
                 crate::session::environment::resolve_host_environment_pairs(
                     &self.resolved_host_environment(),
@@ -781,8 +840,19 @@ impl Instance {
 
     /// Build the tmux command for a host session after all launch hooks have
     /// completed.
+    #[cfg(test)]
     fn build_host_command(
         &mut self,
+        agent: Option<&'static crate::agents::AgentDef>,
+        execution: Option<&super::execution::NativeExecution>,
+    ) -> Result<(Option<String>, bool, Option<OmpCapturePlan>)> {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.build_host_command_in(CaptureStorage::Profiles(&file_watch), agent, execution)
+    }
+
+    fn build_host_command_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
         agent: Option<&'static crate::agents::AgentDef>,
         execution: Option<&super::execution::NativeExecution>,
     ) -> Result<(Option<String>, bool, Option<OmpCapturePlan>)> {
@@ -793,11 +863,33 @@ impl Instance {
         let identity_extension = execution
             .and_then(|execution| execution.inputs.identity_extension.as_ref())
             .or(fallback_identity.as_ref());
-        self.build_host_command_with_identity_extension(agent, identity_extension, execution)
+        self.build_host_command_with_identity_extension_in(
+            stores,
+            agent,
+            identity_extension,
+            execution,
+        )
     }
 
+    #[cfg(test)]
     fn build_host_command_with_identity_extension(
         &mut self,
+        agent: Option<&'static crate::agents::AgentDef>,
+        identity_extension: Option<&(String, String)>,
+        execution: Option<&super::execution::NativeExecution>,
+    ) -> Result<(Option<String>, bool, Option<OmpCapturePlan>)> {
+        let file_watch = crate::file_watch::FileWatchService::noop();
+        self.build_host_command_with_identity_extension_in(
+            CaptureStorage::Profiles(&file_watch),
+            agent,
+            identity_extension,
+            execution,
+        )
+    }
+
+    fn build_host_command_with_identity_extension_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
         agent: Option<&'static crate::agents::AgentDef>,
         identity_extension: Option<&(String, String)>,
         execution: Option<&super::execution::NativeExecution>,
@@ -846,8 +938,13 @@ impl Instance {
                             apply_yolo_mode(&mut cmd, yolo, false);
                         }
                     }
-                    let is_existing =
-                        self.apply_session_flags(&mut cmd, "host agent", agent, execution)?;
+                    let is_existing = self.apply_session_flags_in(
+                        stores,
+                        &mut cmd,
+                        "host agent",
+                        agent,
+                        execution,
+                    )?;
                     apply_agent_launch_env(&mut cmd, agent);
                     let raw_command = format!("{}{}", env_prefix, cmd);
                     let command = if let Some(plan) = omp_capture_plan.as_ref() {
@@ -883,7 +980,7 @@ impl Instance {
                 }
             }
             let is_existing =
-                self.apply_session_flags(&mut cmd, "host custom", agent, execution)?;
+                self.apply_session_flags_in(stores, &mut cmd, "host custom", agent, execution)?;
             apply_agent_launch_env(&mut cmd, agent);
             let raw_command = format!("{}{}", env_prefix, cmd);
             let command = if let Some(plan) = omp_capture_plan.as_ref() {
@@ -945,7 +1042,7 @@ mod tests {
         ]);
         inst.sandbox_info = Some(sandbox);
         admit_fixture_content(&inst);
-        let config = inst.build_container_config().unwrap();
+        let config = inst.build_container_config_for_test().unwrap();
         let _transport =
             install_container_transport(temp_home.path(), "aoe-pi-argv", &config.volumes);
         std::fs::copy(
@@ -1653,7 +1750,7 @@ mod tests {
             container_workdir: Some("/workspace/project".into()),
             before_start_env: Vec::new(),
         });
-        let config = inst.build_container_config().unwrap();
+        let config = inst.build_container_config_for_test().unwrap();
         let _transport = super::super::test_helpers::install_container_transport(
             temp.path(),
             "claude-sandbox",

@@ -12,6 +12,11 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe ps`↴](#aoe-ps)
 * [`aoe logs`↴](#aoe-logs)
 * [`aoe log-level`↴](#aoe-log-level)
+* [`aoe remote`↴](#aoe-remote)
+* [`aoe remote add`↴](#aoe-remote-add)
+* [`aoe remote list`↴](#aoe-remote-list)
+* [`aoe remote remove`↴](#aoe-remote-remove)
+* [`aoe remote toggle`↴](#aoe-remote-toggle)
 * [`aoe remove`↴](#aoe-remove)
 * [`aoe send`↴](#aoe-send)
 * [`aoe status`↴](#aoe-status)
@@ -142,6 +147,7 @@ Run without arguments to launch the TUI dashboard.
 * `ps` — Show a substrate-agnostic runtime view of in-flight sessions (tmux agent panes and ACP structured-view workers), one row each
 * `logs` — View the configured AoE log file with a pretty viewer
 * `log-level` — Get or set the running daemon's log filter at runtime. Pass a bare level (debug/info/...) for the safe expansion, or `--filter <expr>` for raw EnvFilter syntax. `--get` prints the current filter. Changes are ephemeral and lost on daemon restart
+* `remote` — Manage remote daemon endpoints the TUI can connect to
 * `remove` — Remove a session
 * `send` — Send a message to a running agent session
 * `status` — Show session status summary
@@ -172,7 +178,7 @@ Run without arguments to launch the TUI dashboard.
 ###### **Options:**
 
 * `-p`, `--profile <PROFILE>` — Profile to use (separate workspace with its own sessions). Commands that consume or create profile state require an existing profile: an unknown name is refused, not created (make one with `aoe profile create`). Profile-independent commands such as `list --all` and `serve --stop` ignore it
-* `--daemon-url <DAEMON_URL>` — Attach to a remote agent daemon instead of using the local session list. Equivalent to setting `AOE_DAEMON_URL`; pair with `AOE_DAEMON_TOKEN` for the bearer token. Only meaningful at the no-subcommand `aoe` invocation (the TUI dashboard); ignored otherwise
+* `--daemon-url <DAEMON_URL>` — Connect to a remote agent daemon. The TUI lists its sessions inline beside local ones as a temporary remote that is never saved; `aoe acp` verbs and `aoe serve --status` target it instead of the local daemon. Equivalent to setting `AOE_DAEMON_URL`; pair with `AOE_DAEMON_TOKEN` for the bearer token
 
 
 
@@ -307,6 +313,77 @@ Get or set the running daemon's log filter at runtime. Pass a bare level (debug/
 
 * `--filter <FILTER>` — Raw EnvFilter directive. Use this for per-target tuning, e.g. `--filter acp.protocol=trace,info`. Bare `--filter debug` is rejected; use the positional `level` form instead
 * `--get` — Print the current filter without changing it
+
+
+
+## `aoe remote`
+
+Manage remote daemon endpoints the TUI can connect to
+
+**Usage:** `aoe remote <COMMAND>`
+
+###### **Subcommands:**
+
+* `add` — Add or update a remote daemon endpoint
+* `list` — List configured remotes
+* `remove` — Remove a configured remote
+* `toggle` — Enable or disable a remote without removing it
+
+
+
+## `aoe remote add`
+
+Add or update a remote daemon endpoint
+
+**Usage:** `aoe remote add [OPTIONS] <ADDRESS>`
+
+###### **Arguments:**
+
+* `<ADDRESS>` — Where the remote daemon listens: `host:port` for a LAN or tailnet address (plain HTTP), a hostname (HTTPS), or a full URL. A `?token=` query, as `aoe serve --status` prints it, supplies the token
+
+###### **Options:**
+
+* `--name <NAME>` — Short name used to select this remote. Defaults to the remote's hostname
+* `--token <TOKEN>` — Bearer token the daemon prints at startup
+* `--passphrase <PASSPHRASE>` — Passphrase for a daemon started with `--remote`. Exchanged once for a device-bound session; never stored
+* `--code <CODE>` — One-time pairing code shown in the remote's Remote Access view (R in its `aoe`). Used when no token or passphrase is given; prompted for on a terminal
+* `--insecure` — Send credentials over plain HTTP to a non-loopback URL, for a daemon on a network you trust. Anyone on that network can read the token and session. Asked on a terminal when not given
+
+
+
+## `aoe remote list`
+
+List configured remotes
+
+**Usage:** `aoe remote list`
+
+
+
+## `aoe remote remove`
+
+Remove a configured remote
+
+**Usage:** `aoe remote remove <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>`
+
+
+
+## `aoe remote toggle`
+
+Enable or disable a remote without removing it
+
+**Usage:** `aoe remote toggle [OPTIONS] <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>`
+
+###### **Options:**
+
+* `--off` — Disable instead of enable
 
 
 
@@ -1092,7 +1169,7 @@ Add a project to the registry
 
   Possible values: `global`, `profile`
 
-* `--allow-override` — Allow registering this path even if it already exists in the other scope. Without this flag the command errors when the same canonical path is already registered globally (when adding to profile) or in any profile (when adding globally). When override is allowed and both scopes hold the same path, the profile entry shadows the global one
+* `--allow-override` — Allow the same canonical path in the global and selected profile scopes. The profile entry shadows the global entry in merged views
 * `--base-branch <BASE_BRANCH>` — Default base branch for new worktree branches created against this project, whether it is the launch repo or an extra repo in a multi-repo workspace. An explicit session base wins; when omitted, falls back to the global/profile `worktree.default_base_branch`, then the repo's detected default branch
 
 
@@ -1568,6 +1645,7 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
 
 ###### **Options:**
 
+* `--core-only` — Serve the private local API without opening TCP or a dashboard
 * `--port <PORT>` — Port to listen on (default: 8080; debug builds default to 8081 so a `cargo run` instance does not collide with an installed release `aoe`)
 * `--host <HOST>` — Host/IP to bind to (use 0.0.0.0 for LAN/VPN access)
 
@@ -1593,7 +1671,8 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
    `--status` is read-only and incompatible with every flag that would change daemon state (`--stop`, `--daemon`, `--remote`) or the bind config of a fresh daemon (`--no-auth`, `--auth`, `--behind-proxy`, `--read-only`, `--passphrase`, `--port`, `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`, `--allowed-host`, `--allowed-origin`). Clap reports the misuse instead of silently ignoring the extras.
 * `--passphrase <PASSPHRASE>` — Require a passphrase for login (second-factor auth). Can also be set via AOE_SERVE_PASSPHRASE environment variable
 * `--open` — Open the dashboard URL in the default browser once the server is ready. Ignored in a build with no dashboard bundle, under --daemon or --remote, and whenever no browser the user could see is reachable (see `tui::open_url`): over SSH without a forwarded display, or on Linux/BSD with no display server. `BROWSER` overrides the check on platforms whose launcher reads it, which excludes macOS
-* `--restart` — Restart a running `aoe serve` daemon, replaying the host, port, mode, and auth it was launched with (read from `serve.launch`). The passphrase is recalled from `serve.passphrase` or `AOE_SERVE_PASSPHRASE` before the old daemon is stopped, so a passphrase-protected daemon is never left down. Incompatible with the flags that would change the daemon's bind config: that config comes from the persisted launch state
+* `--restart` — Restart the running managed daemon with its recorded policy. Missing credentials are rejected before stopping it
+* `--rollback` — Restore the retained daemon policy after a failed replacement
 
 
 

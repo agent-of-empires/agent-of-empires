@@ -29,11 +29,11 @@ use self::state::{
 };
 use crate::acp::client::{
     require_daemon, ws_connect_with, DaemonEndpoint, HttpClient, HttpError, ManagerError,
-    PluginCommandView, WsError, WsMessage, REPLAY_PAGE_SIZE,
+    PluginCommandView, WsMessage, REPLAY_PAGE_SIZE,
 };
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::ApprovalDecisionWire;
-use crate::daemon::QueuedPromptEntry;
+use crate::daemon::{QueuedPromptEntry, WsError};
 use crate::plugin::ui_state::{Tone, UiSnapshot};
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
@@ -365,13 +365,19 @@ fn should_retry_plugin_ui_poll(error: &HttpError) -> bool {
     !matches!(error, HttpError::Unauthorized)
 }
 
-pub async fn run_for_endpoint(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+/// Run the full-screen view against `endpoint` until the user exits. Generic
+/// over the backend so the home view can open a remote session with its own
+/// terminal.
+pub async fn run_for_endpoint<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
     event_stream: &mut EventStream,
     theme: &Theme,
     endpoint: DaemonEndpoint,
     session_id: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let ViewSetup {
         mut state,
         startup_toast,
@@ -603,7 +609,7 @@ fn drain_plugin_toast(state: &mut StructuredViewState, toast_deadline: &mut Opti
     // A notification carrying an href is a worker `ui.open_url`; the seq dedupe
     // in `next_plugin_toast` guarantees one open per notification.
     if let Some(href) = &n.href {
-        let url = crate::tui::open_url::resolve_href(&state.endpoint.base_url, href);
+        let url = crate::tui::open_url::resolve_href(&state.endpoint.browser_base_url(), href);
         let _ = crate::tui::open_url::open_url(&url);
     }
     let text = match &n.body {
@@ -964,7 +970,8 @@ async fn handle_terminal_event(
         Intent::OpenInBrowser => {
             let url = format!(
                 "{}/sessions/{}/acp",
-                state.endpoint.base_url, state.session_id
+                state.endpoint.browser_base_url(),
+                state.session_id
             );
             if let Err(e) = crate::tui::open_url::open_url(&url) {
                 set_toast(
@@ -1362,7 +1369,7 @@ async fn handle_plugin_command(
 /// Open one resolved plugin link in the browser (through the test seam) and
 /// toast the outcome.
 fn open_link(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>, href: &str) {
-    let url = crate::tui::open_url::resolve_href(&state.endpoint.base_url, href);
+    let url = crate::tui::open_url::resolve_href(&state.endpoint.browser_base_url(), href);
     if let Err(e) = crate::tui::open_url::open_url(&url) {
         set_toast(
             state,
@@ -1769,11 +1776,14 @@ async fn refresh_queue(state: &mut StructuredViewState) {
     }
 }
 
-fn redraw(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+fn redraw<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
     theme: &Theme,
     state: &mut StructuredViewState,
-) -> Result<()> {
+) -> Result<()>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     terminal.draw(|f| {
         // Stash the pane geometry this frame draws with so mouse events
         // hit-test against what is actually on screen. The full-screen

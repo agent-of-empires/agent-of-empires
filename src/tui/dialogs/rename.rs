@@ -60,6 +60,10 @@ pub struct RenameDialog {
     worktree_branch: Option<WorktreeBranch>,
     /// State of the branch toggle. Meaningless unless `worktree_branch` is set.
     rename_branch: bool,
+    /// A remote row's dialog: the title is the only field, since the group
+    /// tree, the profiles and the worktree all belong to the other machine.
+    /// Set by [`Self::for_remote_session`], which also supplies the heading.
+    remote: Option<String>,
 }
 
 /// Branch context for a tied worktree session's rename toggle.
@@ -110,6 +114,7 @@ impl RenameDialog {
             focusable_rects: Vec::new(),
             worktree_branch: None,
             rename_branch: false,
+            remote: None,
         }
     }
 
@@ -124,6 +129,16 @@ impl RenameDialog {
             upstream,
         });
         self
+    }
+
+    /// A remote row's rename dialog. Only the title is editable: the group
+    /// tree, the profile list and the worktree all live on `remote`, and the
+    /// daemon there owns whether a rename moves a directory with it.
+    pub fn for_remote_session(current_title: &str, remote: &str) -> Self {
+        Self {
+            remote: Some(remote.to_string()),
+            ..Self::new(current_title, "", "", Vec::new(), Vec::new())
+        }
     }
 
     pub fn new_for_group(
@@ -154,6 +169,7 @@ impl RenameDialog {
             focusable_rects: Vec::new(),
             worktree_branch: None,
             rename_branch: false,
+            remote: None,
         }
     }
 
@@ -169,6 +185,7 @@ impl RenameDialog {
 
     fn field_count(&self) -> usize {
         match self.mode {
+            RenameMode::Session if self.remote.is_some() => 1,
             // title, group, profile, and the branch toggle when present.
             RenameMode::Session => {
                 if self.shows_branch_toggle() {
@@ -286,7 +303,9 @@ impl RenameDialog {
     }
 
     fn selected_profile(&self) -> &str {
-        &self.available_profiles[self.profile_index]
+        self.available_profiles
+            .get(self.profile_index)
+            .map_or("", String::as_str)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<RenameData> {
@@ -326,6 +345,20 @@ impl RenameDialog {
         match key.code {
             KeyCode::Esc => DialogResult::Cancel,
             KeyCode::Enter => {
+                // A remote row carries only a title, and an unchanged one is
+                // a cancel the same way an empty one is.
+                if self.remote.is_some() {
+                    let title = self.new_title.value().trim().to_string();
+                    if title.is_empty() || title == self.current_title {
+                        return DialogResult::Cancel;
+                    }
+                    return DialogResult::Submit(RenameData {
+                        title,
+                        group: None,
+                        profile: None,
+                        rename_branch: false,
+                    });
+                }
                 let title_value = self.new_title.value().trim().to_string();
                 let group_value = self.new_group.value().trim();
                 let selected_profile = self.selected_profile();
@@ -451,9 +484,12 @@ impl RenameDialog {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        match self.mode {
-            RenameMode::Session => self.render_session(frame, area, theme),
-            RenameMode::Group => self.render_group(frame, area, theme),
+        match (self.mode, self.remote.clone()) {
+            (RenameMode::Session, Some(remote)) => {
+                self.render_remote_session(frame, area, theme, &remote)
+            }
+            (RenameMode::Session, None) => self.render_session(frame, area, theme),
+            (RenameMode::Group, _) => self.render_group(frame, area, theme),
         }
     }
 
@@ -553,6 +589,60 @@ impl RenameDialog {
         if self.group_picker.is_active() {
             self.group_picker.render(frame, area, theme);
         }
+    }
+
+    /// The remote shape: current title, new title, hint. Every other field
+    /// the session dialog carries belongs to the machine that owns the row.
+    fn render_remote_session(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: &Theme,
+        remote: &str,
+    ) {
+        self.focusable_rects.clear();
+        let dialog_area = super::centered_rect(area, 50, 9);
+        frame.render_widget(Clear, dialog_area);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.accent))
+            .title(format!(" Rename on {remote} "))
+            .title_style(Style::default().fg(theme.title).bold());
+        let inner = block.inner(dialog_area);
+        frame.render_widget(block, dialog_area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(1), // Current title
+                Constraint::Length(1), // Spacer
+                Constraint::Length(1), // New title field
+                Constraint::Length(1), // Spacer
+                Constraint::Min(1),    // Hint
+            ])
+            .split(inner);
+
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Current title: ", Style::default().fg(theme.dimmed)),
+                Span::styled(&self.current_title, Style::default().fg(theme.text)),
+            ])),
+            chunks[0],
+        );
+        render_text_field(
+            frame,
+            chunks[2],
+            "New title:",
+            &self.new_title,
+            true,
+            None,
+            theme,
+        );
+        self.focusable_rects.push((0, chunks[2]));
+        self.render_hints(frame, chunks[4], theme);
     }
 
     fn render_branch_toggle(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -737,10 +827,15 @@ impl RenameDialog {
     }
 
     fn render_hints(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let mut hint_spans = vec![
-            Span::styled("Tab", Style::default().fg(theme.hint)),
-            Span::raw(" switch  "),
-        ];
+        // A one-field dialog has nothing to switch between.
+        let mut hint_spans = if self.field_count() > 1 {
+            vec![
+                Span::styled("Tab", Style::default().fg(theme.hint)),
+                Span::raw(" switch  "),
+            ]
+        } else {
+            Vec::new()
+        };
         if self.is_branch_toggle_field() {
             hint_spans.push(Span::styled("Space", Style::default().fg(theme.hint)));
             hint_spans.push(Span::raw(" toggle  "));
@@ -1038,6 +1133,39 @@ mod tests {
         assert_eq!(d.new_group.value(), "work");
         let data = submitted(d.handle_key(key(KeyCode::Enter)));
         assert_eq!(data.group.as_deref(), Some("work"));
+    }
+
+    /// A remote row's group tree, profiles and worktree all live on the other
+    /// machine, so the dialog carries the title and nothing else.
+    #[test]
+    fn a_remote_rename_submits_the_title_alone() {
+        let mut dialog = RenameDialog::for_remote_session("refactor", "mini");
+        assert_eq!(dialog.field_count(), 1);
+
+        // Tab has nowhere to go, so the one field keeps focus.
+        dialog.handle_key(key(KeyCode::Tab));
+        assert_eq!(dialog.focused_field, 0);
+
+        // The current title retyped is not an edit.
+        for ch in "refactor".chars() {
+            dialog.handle_key(key(KeyCode::Char(ch)));
+        }
+        assert!(matches!(
+            dialog.handle_key(key(KeyCode::Enter)),
+            DialogResult::Cancel
+        ));
+
+        for ch in "-two".chars() {
+            dialog.handle_key(key(KeyCode::Char(ch)));
+        }
+        match dialog.handle_key(key(KeyCode::Enter)) {
+            DialogResult::Submit(data) => {
+                assert_eq!(data.title, "refactor-two");
+                assert!(data.group.is_none() && data.profile.is_none());
+                assert!(!data.rename_branch, "the owning machine decides that");
+            }
+            _ => panic!("a changed title should submit"),
+        }
     }
 
     #[test]

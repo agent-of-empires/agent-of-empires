@@ -182,6 +182,30 @@ async fn sensitive_routes_are_blocked() {
     }
 }
 
+#[tokio::test]
+async fn creation_cancellation_is_limited_to_structured_targets() {
+    let state =
+        build_test_app_state_cityhall(vec![structured_session("own"), plain_session("foreign")]);
+    let app = build_router_for_test(state);
+    for (id, status, code) in [
+        ("own", StatusCode::CONFLICT, "creation_not_pending"),
+        ("foreign", StatusCode::FORBIDDEN, "cityhall_mode"),
+        ("missing", StatusCode::FORBIDDEN, "cityhall_mode"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                &format!("/api/sessions/{id}/creation/cancel"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{id}");
+        assert_eq!(response.headers()["aoe-error-code"], code, "{id}");
+    }
+}
+
 // F1: delete_workspace tears down EVERY id, so a workspace whose owner is a
 // legit structured session but whose sibling is a foreign plain session must be
 // refused. Seeding a real structured owner + plain sibling locks the

@@ -10,6 +10,9 @@
 //! - A store is an orphan only when its id resolves in no profile of either
 //!   build namespace. A registry that cannot be read is never "a profile with
 //!   no sessions"; the pass fails and deletes nothing.
+//!   Live sessions and retained purge owners across every profile and build
+//!   namespace also keep their stores; an incomplete registry or purge journal
+//!   aborts the pass instead of shortening the ownership inventory.
 //! - A store is removed only when *no* container for its id exists, under any
 //!   installed runtime. Not merely "not running": a stopped container can be
 //!   started between the check and the removal, and no lock a reclaim can hold
@@ -273,12 +276,8 @@ fn guard(app_dir: &Path) -> Result<(crate::session::StorageFlock, crate::session
 /// Serialises reclaim passes so two do not race to remove the same store.
 const RECLAIM_LOCK: &str = ".sandbox-reclaim.lock";
 
-/// The store ids every profile's registry claims.
-///
-/// Fails rather than answering short. A missing registry file is a profile
-/// with no sessions; a registry that exists but cannot be read, parsed, or
-/// understood is a profile whose sessions we cannot see, and treating its
-/// stores as unowned would delete them.
+/// Live and retained purge owners across every profile and namespace.
+/// Incomplete registries or journals cannot establish that a store is unowned.
 fn owned_ids(app_dir: &Path, also: &[PathBuf]) -> Result<BTreeSet<String>> {
     let mut paths = registry_paths(app_dir)?;
     if paths.is_empty() {
@@ -287,8 +286,18 @@ fn owned_ids(app_dir: &Path, also: &[PathBuf]) -> Result<BTreeSet<String>> {
             app_dir.display()
         );
     }
+    let mut roots = vec![app_dir];
     for dir in also {
-        paths.extend(registry_paths(dir)?);
+        match fs::symlink_metadata(dir) {
+            Ok(_) => {
+                paths.extend(registry_paths(dir)?);
+                roots.push(dir.as_path());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspecting {}", dir.display()));
+            }
+        }
     }
     let mut ids = BTreeSet::new();
     for path in paths {
@@ -306,13 +315,17 @@ fn owned_ids(app_dir: &Path, also: &[PathBuf]) -> Result<BTreeSet<String>> {
             ids.insert(id.to_string());
         }
     }
+    // Purge persists its owner before removing the row: read journals last.
+    for root in roots {
+        ids.extend(super::purge_owners::session_ids(root)?);
+    }
     Ok(ids)
 }
 
 /// Every profile's registry, plus the default one. A `sessions.json` that is
 /// present but not a regular file is a registry we cannot read, so it fails
 /// the pass rather than being skipped.
-fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
+pub(super) fn registry_paths(app_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = vec![app_dir.to_path_buf()];
     let profiles = app_dir.join("profiles");
     match fs::read_dir(&profiles) {
@@ -641,6 +654,7 @@ fn directory_bytes(root: &Path) -> u64 {
 /// pass.
 pub(crate) fn remove_stores_for(
     instance: &crate::session::Instance,
+    _config: &crate::session::Config,
 ) -> Result<(Vec<PathBuf>, u64)> {
     if instance.sandbox_store_generation
         < crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION
@@ -704,6 +718,7 @@ mod tests {
             .map(|id| format!(r#"{{"id":"{id}"}}"#))
             .collect();
         fs::write(app.join("sessions.json"), format!("[{}]", ids.join(","))).unwrap();
+        super::super::purge_owners::initialize(app).unwrap();
     }
 
     fn unproven_store(home: &Path, id: &str, bytes: usize) -> PathBuf {
@@ -711,6 +726,10 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join(".credentials.json"), vec![b'x'; bytes]).unwrap();
         path
+    }
+
+    fn store(home: &Path, id: &str, bytes: usize) -> PathBuf {
+        unproven_store(home, id, bytes)
     }
 
     fn owned_store(app: &Path, home: &Path, id: &str, bytes: usize) -> PathBuf {
@@ -731,6 +750,65 @@ mod tests {
     /// A container still exists for it.
     fn retained(_: &str) -> Result<bool> {
         Ok(true)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn retained_purge_owners_protect_stores_across_namespaces() {
+        for sibling in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let app = dir.path().join("app");
+            let other = dir.path().join("other");
+            let home = dir.path().join("home");
+            fs::create_dir_all(&app).unwrap();
+            fs::create_dir_all(&other).unwrap();
+            let _isolation = crate::session::test_support::isolate_app_dir_at(&app);
+            app_with_rows(&app, &[]);
+            app_with_rows(&other, &[]);
+            let owner_app = if sibling { &other } else { &app };
+            let storage = crate::session::Storage::new_for_test_path(
+                "default",
+                owner_app.join("sessions.json"),
+            );
+            let row = crate::session::Instance::new("retained", home.to_str().unwrap());
+            let protected = store(&home, &row.id, 40);
+            let unclaimed = store(&home, "2222222222222222", 10);
+            let owner = super::super::purge_owners::PurgeOwner::record(
+                &storage,
+                &row,
+                super::super::purge_owners::PurgeCapture::new(&row).unwrap(),
+            )
+            .unwrap();
+            let namespaces = [other.clone()];
+
+            reclaim_in(&app, &namespaces, &home, NO_GRACE, &gone).unwrap();
+            assert!(
+                protected.join(".credentials.json").exists(),
+                "a retained purge owner lost its store (sibling={sibling})"
+            );
+            assert!(unclaimed.exists(), "unproven stores must be retained");
+
+            let journal = owner_app.join(super::super::purge_owners::FILE_NAME);
+            let saved = fs::read(&journal).unwrap();
+            for malformed in [true, false] {
+                if malformed {
+                    fs::write(&journal, b"{").unwrap();
+                } else {
+                    fs::remove_file(&journal).unwrap();
+                }
+                let unclaimed = store(&home, "2222222222222222", 10);
+                assert!(reclaim_in(&app, &namespaces, &home, NO_GRACE, &gone).is_err());
+                assert!(protected.join(".credentials.json").exists());
+                assert!(unclaimed.join(".credentials.json").exists());
+                fs::write(&journal, &saved).unwrap();
+            }
+            owner.release().unwrap();
+            reclaim_in(&app, &namespaces, &home, NO_GRACE, &gone).unwrap();
+            assert!(
+                protected.exists(),
+                "unproven store must remain after owner release"
+            );
+        }
     }
 
     #[test]
@@ -908,11 +986,7 @@ mod tests {
         fs::create_dir_all(&app).unwrap();
         fs::create_dir_all(&sibling).unwrap();
         app_with_rows(&app, &[]);
-        fs::write(
-            sibling.join("sessions.json"),
-            r#"[{"id":"2222222222222222"}]"#,
-        )
-        .unwrap();
+        app_with_rows(&sibling, &["2222222222222222"]);
         let store = owned_store(&app, &home, "2222222222222222", 40);
 
         let outcome = reclaim_in(&app, &[sibling], &home, NO_GRACE, &gone).unwrap();
@@ -1090,7 +1164,8 @@ mod tests {
         instance.sandbox_store_generation =
             crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION;
 
-        let (removed, freed) = remove_stores_for(&instance).unwrap();
+        let (removed, freed) =
+            remove_stores_for(&instance, &crate::session::Config::default()).unwrap();
 
         assert!(removed.is_empty(), "{removed:?}");
         assert_eq!(freed, 0);
@@ -1108,7 +1183,8 @@ mod tests {
             &link,
         )
         .unwrap();
-        let (removed, _) = remove_stores_for(&instance).unwrap();
+        let (removed, _) =
+            remove_stores_for(&instance, &crate::session::config::Config::default()).unwrap();
         assert_eq!(removed, vec![link.clone()]);
         assert!(!link.exists());
         assert_eq!(fs::read(target.join("keep")).unwrap(), b"keep");
@@ -1231,7 +1307,7 @@ mod tests {
             b"UNCERTIFIED_ORIGINAL_CONTEXT",
         )
         .unwrap();
-        remove_stores_for(&instance).unwrap();
+        remove_stores_for(&instance, &crate::session::Config::default()).unwrap();
         assert_eq!(
             fs::read(root.join("projects/original.jsonl")).unwrap(),
             b"UNCERTIFIED_ORIGINAL_CONTEXT"

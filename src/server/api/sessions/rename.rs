@@ -4,16 +4,6 @@ use super::*;
 
 // --- Rename session ---
 
-#[derive(Deserialize)]
-pub struct RenameSessionBody {
-    pub title: String,
-    /// When the session is tied (`session.tie_workdir_to_name`) and an
-    /// aoe-managed worktree, also rename the git branch to match the new title.
-    /// Ignored for untied / non-worktree sessions (#1927).
-    #[serde(default)]
-    pub rename_branch: bool,
-}
-
 pub(super) fn apply_session_title_rename(inst: &mut Instance, title: String) {
     inst.title = title;
 }

@@ -42,6 +42,10 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
         description: "Ctrl+T from any field: run in a fresh scratch dir (no project path needed)",
     },
     FieldHelp {
+        name: "Remote",
+        description: "Machine to create the session on (Left/Right to cycle)",
+    },
+    FieldHelp {
         name: "Profile",
         description: "Settings profile for session defaults (Left/Right to cycle)",
     },
@@ -89,8 +93,57 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
     },
 ];
 
+/// A remote daemon the dialog can create a session on.
+#[derive(Clone)]
+pub struct RemoteTarget {
+    pub name: String,
+    pub machine: Result<RemoteMachine, RemoteUnavailable>,
+}
+
+/// What creating a session on a remote needs.
+#[derive(Clone)]
+pub struct RemoteMachine {
+    pub home: Option<String>,
+    /// Profile names, the remote's default first.
+    pub profiles: Vec<String>,
+    /// Agents installed on the remote.
+    pub tools: Vec<String>,
+    /// Whether the remote reported a running container runtime.
+    pub docker_available: bool,
+    pub client: crate::daemon::DaemonClient,
+}
+
+/// Why a listed remote cannot take a session yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteUnavailable {
+    Connecting,
+    Unreachable,
+}
+
+impl RemoteUnavailable {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Connecting => "connecting…",
+            Self::Unreachable => "unreachable",
+        }
+    }
+}
+
+/// What the dialog offers on one machine.
+#[derive(Clone, Default)]
+pub(super) struct MachineShape {
+    profiles: Vec<String>,
+    profile_descriptions: Vec<Option<String>>,
+    default_profile: String,
+    tools: Vec<String>,
+    docker_available: bool,
+    path: String,
+}
+
 #[derive(Clone)]
 pub struct NewSessionData {
+    /// The remote daemon to create on, or `None` for this machine.
+    pub remote: Option<String>,
     pub profile: String,
     pub title: String,
     pub path: String,
@@ -195,6 +248,12 @@ pub struct NewSessionDialog {
     pub(super) workspace_repo_adding_new: bool,
     pub(super) workspace_repo_ghost: Option<path_input::PathGhostCompletion>,
     pub(super) workspace_repo_dir_picker_active: bool,
+    pub(super) remote_targets: Vec<RemoteTarget>,
+    /// 0 is this machine; `n` is `remote_targets[n - 1]`.
+    pub(super) remote_index: usize,
+    /// This machine's shape, restored when Remote returns to Local.
+    pub(super) local: MachineShape,
+    /// Worktree configuration overlay mode (Ctrl+P on worktree field)
     pub(super) worktree_config_mode: bool,
     /// Focused field within the worktree config overlay (0=name, 1=new_branch, 2=extra_repos)
     pub(super) worktree_config_focused_field: usize,
@@ -382,6 +441,9 @@ fn build_inherited_settings(sandbox: &SandboxConfig) -> Vec<(String, String)> {
 /// Row index per main-form field, resolved by
 /// [`NewSessionDialog::field_indices`].
 pub(super) struct FieldIndices {
+    /// Which machine the session is created on. Present only when a remote is
+    /// configured, and first, because it decides what the rows below mean.
+    pub remote: usize,
     pub profile: usize,
     pub path: usize,
     pub title: usize,
@@ -495,6 +557,9 @@ impl NewSessionDialog {
             projects_picker: ListPicker::new("Add registered project"),
             available_projects: Vec::new(),
             dir_picker: DirPicker::new(),
+            remote_targets: Vec::new(),
+            remote_index: 0,
+            local: MachineShape::default(),
             worktree_enabled,
             worktree_dirty: false,
             worktree_branch: Input::default(),
@@ -688,11 +753,147 @@ impl NewSessionDialog {
             }
         }
 
+        if self.dir_picker.poll() {
+            changed = true;
+        }
+
         changed
     }
 
+    /// The selected profile's name on the selected machine; empty when that
+    /// machine lists none, which a remote create reads as its default.
     pub(super) fn selected_profile(&self) -> &str {
-        &self.available_profiles[self.profile_index]
+        self.available_profiles
+            .get(self.profile_index)
+            .map_or("", String::as_str)
+    }
+
+    /// The remote the dialog targets, or `None` for this machine.
+    pub(super) fn selected_remote(&self) -> Option<&RemoteTarget> {
+        self.remote_targets.get(self.remote_index.checked_sub(1)?)
+    }
+
+    fn selected_machine(&self) -> Option<&RemoteMachine> {
+        self.selected_remote()?.machine.as_ref().ok()
+    }
+
+    /// Offer a Remote picker over this machine and `targets`. Choosing a
+    /// remote targets that machine: its profiles, its agents, its filesystem,
+    /// and its daemon on submit.
+    pub fn with_remotes(mut self, targets: Vec<RemoteTarget>) -> Self {
+        self.local = MachineShape {
+            profiles: self.available_profiles.clone(),
+            profile_descriptions: self.profile_descriptions.clone(),
+            default_profile: self.profile.clone(),
+            tools: self.available_tools.clone(),
+            docker_available: self.docker_available,
+            path: self.path.value().to_string(),
+        };
+        self.remote_targets = targets;
+        self
+    }
+
+    /// Open already aimed at `name`, for a New Session action taken on that
+    /// remote's rows. Call after [`Self::with_remotes`]; a name that is not
+    /// among the targets leaves the dialog on this machine.
+    pub fn targeting_remote(mut self, name: &str) -> Self {
+        if let Some(index) = self.remote_targets.iter().position(|t| t.name == name) {
+            self.select_remote(index + 1);
+        }
+        self
+    }
+
+    pub(super) fn has_remote_selection(&self) -> bool {
+        !self.remote_targets.is_empty()
+    }
+
+    /// Move the Remote picker and reshape the dialog for that machine: its
+    /// profiles, tools, sandbox availability and starting path. Workspace
+    /// repos are paths on the machine left behind, so they are dropped.
+    fn select_remote(&mut self, index: usize) {
+        if index == self.remote_index {
+            return;
+        }
+        if self.remote_index == 0 {
+            self.local.path = self.path.value().to_string();
+        }
+        self.remote_index = index;
+        let shape = match self.selected_remote().map(|t| &t.machine) {
+            None => self.local.clone(),
+            Some(Ok(machine)) => MachineShape {
+                profiles: machine.profiles.clone(),
+                profile_descriptions: vec![None; machine.profiles.len()],
+                default_profile: machine.profiles.first().cloned().unwrap_or_default(),
+                tools: machine.tools.clone(),
+                docker_available: machine.docker_available,
+                path: machine.home.clone().unwrap_or_default(),
+            },
+            Some(Err(_)) => MachineShape::default(),
+        };
+        self.profile_index = shape
+            .profiles
+            .iter()
+            .position(|p| *p == shape.default_profile)
+            .unwrap_or(0);
+        self.available_profiles = shape.profiles;
+        self.profile_descriptions = shape.profile_descriptions;
+        // The tool fields index into this list, so it is never left empty.
+        self.available_tools = if shape.tools.is_empty() {
+            self.local.tools.clone()
+        } else {
+            shape.tools
+        };
+        self.tool_index = 0;
+        self.docker_available = shape.docker_available;
+        self.path = Input::new(shape.path);
+        self.path_ghost = None;
+        self.workspace_repos.clear();
+        self.workspace_repos_expanded = false;
+        self.reload_config_defaults();
+    }
+
+    /// `~` means the target machine's home, not this one's.
+    fn resolve_remote_path(&self, path: &str) -> String {
+        let home = self.selected_machine().and_then(|m| m.home.as_deref());
+        match (path, home) {
+            ("~", Some(home)) => home.to_string(),
+            (p, Some(home)) if p.starts_with("~/") => {
+                format!("{}/{}", home.trim_end_matches('/'), &p[2..])
+            }
+            (p, _) => p.to_string(),
+        }
+    }
+
+    /// Open the directory picker on whichever machine the dialog targets.
+    fn activate_dir_picker(&mut self, initial: &str) {
+        match self.selected_remote().map(|t| t.machine.clone()) {
+            None => self.dir_picker.activate(initial),
+            Some(Ok(machine)) => {
+                let initial = if initial.trim().is_empty() {
+                    machine.home.clone().unwrap_or_else(|| "/".to_string())
+                } else {
+                    self.resolve_remote_path(initial.trim())
+                };
+                self.dir_picker.activate_remote(machine.client, &initial);
+            }
+            Some(Err(_)) => self.error_message = self.remote_unavailable_message(),
+        }
+    }
+
+    /// Why the selected remote cannot take this submit, if it cannot.
+    fn remote_unavailable_message(&self) -> Option<String> {
+        let target = self.selected_remote()?;
+        match target.machine {
+            Ok(_) => None,
+            Err(RemoteUnavailable::Connecting) => Some(format!(
+                "{} is still connecting. Reopen this dialog once it connects.",
+                target.name
+            )),
+            Err(RemoteUnavailable::Unreachable) => Some(format!(
+                "{} is unreachable. Choose another remote.",
+                target.name
+            )),
+        }
     }
 
     /// Description of the selected profile, `None` when unset or the index is
@@ -720,6 +921,11 @@ impl NewSessionDialog {
     }
 
     fn resolve_config_for_path(&self, profile: &str) -> crate::session::Config {
+        // Local profile and repo config say nothing about a remote machine; its
+        // daemon applies its own on create.
+        if self.remote_index > 0 {
+            return crate::session::Config::default();
+        }
         let path = self.path.value().trim();
         if path.is_empty() {
             resolve_config_or_warn(profile)
@@ -752,13 +958,12 @@ impl NewSessionDialog {
         crate::agents::get_agent(tool_name).is_some_and(|a| a.host_only)
     }
 
-    /// Index of the path field, which precedes title. Shifts by one when the
-    /// profile picker occupies field 0.
-    /// Which main-form row each field occupies. The layout is dynamic: a lone
-    /// profile or tool hides its cycler, a host-only agent drops the sandbox
-    /// and worktree rows, and a non-ACP tool drops the structured toggle.
-    /// Hidden fields get [`FieldIndices::ABSENT`], which no focus index can
-    /// equal, so callers compare without special-casing.
+    /// Which main-form row each field occupies. The layout is dynamic: a
+    /// configured remote adds a machine picker at the top, a lone profile or
+    /// tool hides its cycler, a host-only agent drops the sandbox and worktree
+    /// rows, and a non-ACP tool drops the structured toggle. Hidden fields get
+    /// [`FieldIndices::ABSENT`], which no focus index can equal, so callers
+    /// compare without special-casing.
     pub(super) fn field_indices(&self) -> FieldIndices {
         let is_host_only = self.selected_tool_host_only();
         let mut next = 0;
@@ -771,6 +976,7 @@ impl NewSessionDialog {
             index
         };
         FieldIndices {
+            remote: take(self.has_remote_selection()),
             profile: take(self.has_profile_selection()),
             path: take(true),
             title: take(true),
@@ -886,6 +1092,9 @@ impl NewSessionDialog {
             projects_picker: ListPicker::new("Add registered project"),
             available_projects: Vec::new(),
             dir_picker: DirPicker::new(),
+            remote_targets: Vec::new(),
+            remote_index: 0,
+            local: MachineShape::default(),
             worktree_enabled: config.worktree.enabled,
             worktree_dirty: false,
             worktree_branch: Input::default(),
@@ -960,6 +1169,9 @@ impl NewSessionDialog {
             projects_picker: ListPicker::new("Add registered project"),
             available_projects: Vec::new(),
             dir_picker: DirPicker::new(),
+            remote_targets: Vec::new(),
+            remote_index: 0,
+            local: MachineShape::default(),
             worktree_enabled: false,
             worktree_dirty: false,
             worktree_branch: Input::default(),
@@ -1157,7 +1369,9 @@ impl NewSessionDialog {
     fn activate_focused_field(&mut self) {
         let fields = self.field_indices();
 
-        if self.focused_field == fields.profile {
+        if self.focused_field == fields.remote {
+            self.select_remote((self.remote_index + 1) % (self.remote_targets.len() + 1));
+        } else if self.focused_field == fields.profile {
             if self.available_profiles.len() > 1 {
                 self.profile_index = (self.profile_index + 1) % self.available_profiles.len();
                 self.reload_config_defaults();
@@ -1265,7 +1479,9 @@ impl NewSessionDialog {
         if self.dir_picker.is_active() {
             match self.dir_picker.handle_key(key) {
                 DirPickerResult::Selected(path) => {
-                    persist_last_browse_dir(&path);
+                    if self.remote_index == 0 {
+                        persist_last_browse_dir(&path);
+                    }
                     if self.workspace_repo_dir_picker_active {
                         self.workspace_repo_editing_input = Some(Input::new(path));
                         self.workspace_repo_ghost = self
@@ -1305,12 +1521,12 @@ impl NewSessionDialog {
         if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
             if self.focused_field == self.path_field() {
                 let path_value = self.path.value().trim().to_string();
-                let initial = if path_value.is_empty() {
+                let initial = if path_value.is_empty() && self.remote_index == 0 {
                     last_browse_dir().unwrap_or_default()
                 } else {
                     path_value
                 };
-                self.dir_picker.activate(&initial);
+                self.activate_dir_picker(&initial);
                 return DialogResult::Continue;
             }
             if self.focused_field == fields.tool {
@@ -1354,12 +1570,16 @@ impl NewSessionDialog {
                 DialogResult::Cancel
             }
             KeyCode::Enter => {
-                self.error_message = None;
+                self.error_message = self.remote_unavailable_message();
+                if self.error_message.is_some() {
+                    return DialogResult::Continue;
+                }
                 if self.focused_field == self.path_field() {
                     self.seed_worktree_for_path();
                 }
-                // The server provisions the scratch dir, so no path check.
-                if !self.scratch {
+                // The server provisions the scratch dir, so no path check, and
+                // a remote path is validated by the daemon that owns it.
+                if !self.scratch && self.remote_index == 0 {
                     let path_str = self.path.value().trim().to_string();
                     let resolved = path_input::expand_tilde(&path_str);
                     if !std::path::Path::new(&resolved).exists() {
@@ -1408,6 +1628,18 @@ impl NewSessionDialog {
                 if self.focused_field == fields.group {
                     self.recompute_group_ghost();
                 }
+                DialogResult::Continue
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                if self.focused_field == fields.remote =>
+            {
+                let count = self.remote_targets.len() + 1;
+                let index = if key.code == KeyCode::Left {
+                    (self.remote_index + count - 1) % count
+                } else {
+                    (self.remote_index + 1) % count
+                };
+                self.select_remote(index);
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
@@ -1504,7 +1736,8 @@ impl NewSessionDialog {
                 DialogResult::Continue
             }
             _ => {
-                if self.focused_field != fields.profile
+                if self.focused_field != fields.remote
+                    && self.focused_field != fields.profile
                     && self.focused_field != fields.tool
                     && self.focused_field != fields.worktree
                     && self.focused_field != fields.sandbox
@@ -1799,7 +2032,7 @@ impl NewSessionDialog {
                     .as_ref()
                     .map(|i| i.value().trim().to_string())
                     .unwrap_or_default();
-                let initial = if initial.is_empty() {
+                let initial = if initial.is_empty() && self.remote_index == 0 {
                     last_browse_dir().unwrap_or_else(|| {
                         std::env::current_dir()
                             .map(|p| p.to_string_lossy().to_string())
@@ -1809,7 +2042,7 @@ impl NewSessionDialog {
                     initial
                 };
                 self.workspace_repo_dir_picker_active = true;
-                self.dir_picker.activate(&initial);
+                self.activate_dir_picker(&initial);
                 return DialogResult::Continue;
             }
 
@@ -1905,8 +2138,11 @@ impl NewSessionDialog {
     }
 
     fn reload_tool_config(&mut self) {
-        let profile = self.selected_profile().to_string();
-        let config = resolve_config_or_warn(&profile);
+        let config = if self.remote_index > 0 {
+            crate::session::Config::default()
+        } else {
+            resolve_config_or_warn(self.selected_profile())
+        };
         let tool = self
             .available_tools
             .get(self.tool_index)
@@ -1962,7 +2198,7 @@ impl NewSessionDialog {
     /// capable), surfacing a refusal inline. Runs before any worktree, scratch
     /// or container work, so a refusal cannot orphan resources.
     fn validate_structured(&mut self) -> bool {
-        if !(self.structured_enabled && self.structured_capable) {
+        if self.remote_index > 0 || !(self.structured_enabled && self.structured_capable) {
             return true;
         }
         let profile = self.selected_profile().to_string();
@@ -1995,11 +2231,14 @@ impl NewSessionDialog {
                 None
             };
         DialogResult::Submit(NewSessionData {
+            remote: self.selected_remote().map(|t| t.name.clone()),
             profile: self.selected_profile().to_string(),
             title: final_title,
             // Scratch sends an empty path; the server provisions the dir.
             path: if self.scratch {
                 String::new()
+            } else if self.remote_index > 0 {
+                self.resolve_remote_path(self.path.value().trim())
             } else {
                 self.path.value().trim().to_string()
             },

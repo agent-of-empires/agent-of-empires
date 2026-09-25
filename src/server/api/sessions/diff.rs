@@ -4,25 +4,64 @@ use super::*;
 
 // --- Rich Diff (per-file, merge-base aware) ---
 
+/// [`crate::git::diff::FileStatus`] plus `unchanged`, which the full-file fallback
+/// reports for an in-repo path with no diff against the base.
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
+pub enum RichDiffStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    Untracked,
+    Conflicted,
+    Unchanged,
+}
+
+impl From<crate::git::diff::FileStatus> for RichDiffStatus {
+    fn from(status: crate::git::diff::FileStatus) -> Self {
+        use crate::git::diff::FileStatus as F;
+        match status {
+            F::Added => Self::Added,
+            F::Modified => Self::Modified,
+            F::Deleted => Self::Deleted,
+            F::Renamed => Self::Renamed,
+            F::Copied => Self::Copied,
+            F::Untracked => Self::Untracked,
+            F::Conflicted => Self::Conflicted,
+        }
+    }
+}
+
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct RichDiffFileInfo {
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub old_path: Option<String>,
-    pub status: String,
+    pub status: RichDiffStatus,
     pub additions: usize,
     pub deletions: usize,
     /// Workspace repo this file belongs to, `None` for single-repo sessions.
     /// The frontend groups the sidebar list by it and uses it to disambiguate
     /// path collisions across repos (#1047).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub repo_name: Option<String>,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct RepoBase {
     /// None for single-repo sessions; Some for each workspace member.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub repo_name: Option<String>,
     pub base_branch: String,
     /// Worktree path this entry's diff was computed in. The web base picker
@@ -33,10 +72,13 @@ pub struct RepoBase {
     /// came from the creation base, the profile default, or auto-detection, so
     /// the client hides its reset affordance (#3329).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub base_override: Option<String>,
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct RichDiffFilesResponse {
     pub files: Vec<RichDiffFileInfo>,
     /// One entry per repo whose diff was computed: one element with
@@ -44,12 +86,15 @@ pub struct RichDiffFilesResponse {
     /// sessions, since each member can have a different default (#1047).
     pub per_repo_bases: Vec<RepoBase>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub warning: Option<String>,
 }
 
 /// Contents-based diff response: raw old/new text that the web client parses
 /// and renders itself via `@pierre/diffs`. See [`MAX_CONTENTS_BYTES`].
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct RichFileContentsResponse {
     pub file: RichDiffFileInfo,
     pub old_content: String,
@@ -264,7 +309,7 @@ pub async fn session_diff_files(
                 all_files.push(RichDiffFileInfo {
                     path: f.path.to_string_lossy().to_string(),
                     old_path: f.old_path.map(|p| p.to_string_lossy().to_string()),
-                    status: f.status.label().to_string(),
+                    status: f.status.into(),
                     additions: f.additions,
                     deletions: f.deletions,
                     repo_name: repo.name.clone(),
@@ -422,7 +467,7 @@ pub async fn session_diff_file(
                 let file = RichDiffFileInfo {
                     path: query.path.clone(),
                     old_path: None,
-                    status: "unchanged".to_string(),
+                    status: RichDiffStatus::Unchanged,
                     additions: 0,
                     deletions: 0,
                     repo_name: selected_repo_name.clone(),
@@ -468,7 +513,7 @@ pub async fn session_diff_file(
             let file = RichDiffFileInfo {
                 path: contents.path.to_string_lossy().to_string(),
                 old_path: contents.old_path.map(|p| p.to_string_lossy().to_string()),
-                status: contents.status.label().to_string(),
+                status: contents.status.into(),
                 additions,
                 deletions,
                 repo_name: selected_repo_name.clone(),

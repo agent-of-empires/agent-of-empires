@@ -56,7 +56,7 @@ export interface MobileLiveTerminalProps {
   typedWordRef: React.RefObject<string>;
   /** Uploads a pasted image and resolves to a path the pane can read, or null. */
   uploadPastedImage: (file: File) => Promise<string | null>;
-  forwardWheel: (up: boolean, sgr: boolean, col: number, row: number) => void;
+  forwardWheel: (up: boolean, col: number, row: number, count?: number) => void;
   forwardButton: (
     baseButton: number,
     release: boolean,
@@ -199,12 +199,18 @@ export function MobileLiveTerminal({
   const spacerLines = Math.max(0, (frame?.history ?? 0) - Math.max(0, lines.length - screenRows));
   // A full-screen mouse app's scrollback is not capturable: no spacer, no native scroll, wheels go to the app.
   const altScreen = frame?.altScreen ?? false;
-  const forwardMode = altScreen && (frame?.mouse ?? false);
+  // Mouse tracking is deliberately not part of this gate, mirroring the TUI's
+  // `wheel_forward_cell`: the daemon reports a wheel to an app that asked for
+  // one and PageUp/PageDown to one that did not. Button reports are what need
+  // tracking, and they gate on `mouseTrackingRef` at the press.
+  const forwardMode = altScreen;
+  const mouseTracking = frame?.mouse ?? false;
   const effectiveSpacerLines = forwardMode ? 0 : spacerLines;
   // Gestures yield to a selection so WebKit can drag its handles; the layout keeps `forwardMode` so row keys hold.
-  const { forwardModeRef, mouseSgrRef } = useTerminalGestureBoundary({
+  const { forwardModeRef, mouseTrackingRef, mouseSgrRef } = useTerminalGestureBoundary({
     scrollerRef,
     forwardMode: forwardMode && !selectionHeld,
+    mouseTracking,
     mouseSgr: frame?.mouseSgr ?? false,
   });
   const forwardGestures = forwardMode && !selectionHeld;
@@ -352,6 +358,7 @@ export function MobileLiveTerminal({
     lineH,
     rowsRef,
     forwardModeRef,
+    mouseTrackingRef,
     mouseSgrRef,
     pointerCell,
     inputPaneMiddleRow,

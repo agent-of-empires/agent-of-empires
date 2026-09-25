@@ -17,6 +17,11 @@ npx tsc -b
 without `--features web` needs no JavaScript tooling. Use `npm run format` to fix oxfmt output;
 Prettier is not used.
 
+`src/lib/liveWire.ts` and `src/lib/apiWire.ts` are generated from the Rust
+wire types (`src/daemon/live.rs` and `src/daemon/wire.rs`) by `cargo test
+--lib export_bindings`. Change the Rust types and regenerate; edits to the
+TypeScript are overwritten and CI fails on a stale copy.
+
 ## Tests
 
 - Vitest with RTL and MSW: component logic and request payloads.

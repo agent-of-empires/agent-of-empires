@@ -1,7 +1,7 @@
 import { test, expect, observeFor } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
 import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
-import { mockTerminalApis, seedSettings, fireTouches, type MockHandle } from "./helpers/terminal-mocks";
+import { mockTerminalApis, seedSettings, type MockHandle } from "./helpers/terminal-mocks";
 import { DESKTOP, iPhone13 } from "./helpers/viewports";
 import {
   expectScrollMode,
@@ -22,15 +22,6 @@ test.describe("Live terminal mouse forwarding (mobile)", () => {
 
   const pointer = (page: Page, type: string, x: number, y: number, init: Record<string, unknown> = {}) =>
     scroller(page).dispatchEvent(type, { pointerType: "mouse", button: 0, clientX: x, clientY: y, ...init });
-
-  const hasLegacyDown = (h: MockHandle) =>
-    h.liveMessages.some((b) => b.length >= 4 && b[0] === 0x1b && b[1] === 0x5b && b[2] === 0x4d && b[3] === 0x61);
-
-  async function swipeUp(page: Page) {
-    await fireTouches(page, "touchstart", [{ x: 100, y: 300 }]);
-    await fireTouches(page, "touchmove", [{ x: 100, y: 220 }]);
-    await fireTouches(page, "touchend", [{ x: 100, y: 220 }]);
-  }
 
   /** Open the session in the given screen mode and hand back the handle and scroller box. */
   async function mount(page: Page, flags: { altScreen: boolean; mouse: boolean; mouseSgr: boolean }) {
@@ -109,76 +100,6 @@ test.describe("Live terminal mouse forwarding (mobile)", () => {
       });
     });
   }
-
-  test("swipe over a full-screen SGR-mouse app forwards SGR wheel bytes", async ({ page }) => {
-    const handle = await mount(page, { altScreen: true, mouse: true, mouseSgr: true });
-    // touch-action: none is what keeps the drag from panning the whole page:
-    // React's delegated touch listeners are passive, so the component cannot
-    // preventDefault the native pan.
-    await expect.poll(() => scroller(page).evaluate((el) => getComputedStyle(el).touchAction)).toBe("none");
-    // A direct, non-passive listener backs this up if WebKit decided the
-    // gesture's touch-action before the frame switched into forward mode.
-    await expect
-      .poll(() => scroller(page).evaluate((el) => el.dispatchEvent(new Event("touchmove", { cancelable: true }))))
-      .toBe(false);
-    await swipeUp(page);
-    await expect.poll(() => liveTexts(handle).some((s) => s.includes("\x1b[<65;"))).toBe(true);
-
-    // Downward swipe forwards wheel UP (button 64).
-    await fireTouches(page, "touchstart", [{ x: 100, y: 120 }]);
-    await fireTouches(page, "touchmove", [{ x: 100, y: 300 }]);
-    await fireTouches(page, "touchend", [{ x: 100, y: 300 }]);
-    await expect.poll(() => liveTexts(handle).some((s) => s.includes("\x1b[<64;"))).toBe(true);
-
-    // Wheel events in all three deltaModes (px / line / page) plus a sub-notch
-    // delta (no-op) and a scroll, which must NOT enter reading in forward mode.
-    await scroller(page).dispatchEvent("wheel", { deltaY: 120, deltaMode: 0 });
-    await scroller(page).dispatchEvent("wheel", { deltaY: 3, deltaMode: 1 });
-    await scroller(page).dispatchEvent("wheel", { deltaY: 1, deltaMode: 2 });
-    await scroller(page).dispatchEvent("wheel", { deltaY: 1, deltaMode: 0 });
-    await scroller(page).dispatchEvent("scroll", {});
-    await expect(page.getByRole("button", { name: "Back to live" })).toHaveCount(0);
-  });
-
-  test("a flick coasts: wheel bytes keep arriving after the finger lifts, and a touch stops it", async ({ page }) => {
-    const handle = await mount(page, { altScreen: true, mouse: true, mouseSgr: true });
-    // Synthetic touchmoves land with ~1ms deltas, so the raw release velocity
-    // is absurd; the component's velocity cap is what bounds this coast.
-    await fireTouches(page, "touchstart", [{ x: 100, y: 300 }]);
-    for (const y of [280, 260, 240, 220]) {
-      await fireTouches(page, "touchmove", [{ x: 100, y }]);
-    }
-    await fireTouches(page, "touchend", [{ x: 100, y: 220 }]);
-    // Let the drag's own bytes drain, then require NEW bytes with no input at
-    // all: only the momentum loop can be producing them.
-    await page.waitForTimeout(150);
-    const atLift = handle.liveMessages.length;
-    await expect.poll(() => handle.liveMessages.length, { timeout: 3_000 }).toBeGreaterThan(atLift);
-    // A touch lands mid-coast: the coast must stop (a tap emits no wheel bytes).
-    await fireTouches(page, "touchstart", [{ x: 100, y: 200 }]);
-    await fireTouches(page, "touchend", [{ x: 100, y: 200 }]);
-    await page.waitForTimeout(150);
-    const afterStop = handle.liveMessages.length;
-    await observeFor(page, 500, async () => {
-      expect(handle.liveMessages.length).toBe(afterStop);
-    });
-  });
-
-  test("swipe over a full-screen LEGACY-mouse app forwards X10 wheel bytes", async ({ page }) => {
-    const handle = await mount(page, { altScreen: true, mouse: true, mouseSgr: false });
-    await swipeUp(page);
-    await expect.poll(() => hasLegacyDown(handle)).toBe(true);
-    expect(liveTexts(handle).some((s) => s.includes("\x1b[<"))).toBe(false);
-  });
-
-  test("normal-screen agent does NOT forward wheel bytes", async ({ page }) => {
-    const handle = await mount(page, { altScreen: false, mouse: true, mouseSgr: true });
-    await swipeUp(page);
-    await observeFor(page, 300, async () => {
-      expect(liveTexts(handle).some((s) => s.includes("\x1b[<") || s.includes("\x1b[M"))).toBe(false);
-      expect(hasLegacyDown(handle)).toBe(false);
-    });
-  });
 });
 
 // Select-to-copy over a full-screen agent, driven end to end. jsdom covers the

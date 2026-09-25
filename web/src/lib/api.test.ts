@@ -243,8 +243,8 @@ const requestCases: RequestCase[] = [
     () => api.browseFilesystem("/repo", 50, "src", true),
   ],
   ["GET /api/groups", () => api.fetchGroups()],
-  ["GET /api/projects", () => api.fetchProjects()],
-  ["GET /api/projects?scope=profile", () => api.fetchProjects("profile")],
+  ["GET /api/projects?profile=default", () => api.fetchProjects({ profile: "default" })],
+  ["GET /api/projects?scope=global", () => api.fetchProjects({ scope: "global" })],
   ["GET /api/claude-sessions", () => api.listClaudeSessions()],
   [
     "GET /api/docker/status",
@@ -253,21 +253,21 @@ const requestCases: RequestCase[] = [
   ],
   [
     "POST /api/projects",
-    () => api.createProject({ path: "/p", name: "p", scope: "global" }),
+    () => api.createProject({ path: "/p", name: "p", scope: "global", profile: "default" }),
     {
-      body: { path: "/p", name: "p", scope: "global" },
+      body: { path: "/p", name: "p", scope: "global", profile: "default" },
       respond: json({ name: "p" }),
       result: { ok: true, project: { name: "p" } },
     },
   ],
   [
-    "DELETE /api/projects/my%20proj?scope=profile",
-    () => api.deleteProject("my proj", "profile"),
+    "DELETE /api/projects/my%20proj?scope=profile&profile=default",
+    () => api.deleteProject("my proj", { scope: "profile", profile: "default" }),
     { result: { ok: true } },
   ],
   [
     "PATCH /api/projects/p?scope=global",
-    () => api.updateProject("p", "global", "develop"),
+    () => api.updateProject("p", { scope: "global" }, { default_base_branch: "develop" }),
     {
       body: { default_base_branch: "develop" },
       respond: json({ name: "p" }),
@@ -276,12 +276,20 @@ const requestCases: RequestCase[] = [
   ],
   [
     "PATCH /api/projects/p?scope=global",
-    () => api.updateProject("p", "global", null),
+    () => api.updateProject("p", { scope: "global" }, { default_base_branch: null }),
     { body: { default_base_branch: null }, respond: json({}) },
   ],
   [
     "PATCH /api/projects/p?scope=global",
-    () => api.updateProject("p", "global", "develop", { worktree_enabled: true, smart_rename: null }),
+    () =>
+      api.updateProject(
+        "p",
+        { scope: "global" },
+        {
+          default_base_branch: "develop",
+          overrides: { worktree_enabled: true, smart_rename: null },
+        },
+      ),
     {
       body: { default_base_branch: "develop", overrides: { worktree_enabled: true, smart_rename: null } },
       respond: json({}),
@@ -289,12 +297,15 @@ const requestCases: RequestCase[] = [
   ],
   [
     "POST /api/projects",
-    () => api.createProject({ path: "/p", overrides: { worktree_enabled: true } }),
-    { body: { path: "/p", overrides: { worktree_enabled: true } }, respond: json({}) },
+    () => api.createProject({ path: "/p", scope: "global", profile: "default", overrides: { worktree_enabled: true } }),
+    {
+      body: { path: "/p", scope: "global", profile: "default", overrides: { worktree_enabled: true } },
+      respond: json({}),
+    },
   ],
   [
-    "PATCH /api/projects/a%20b?scope=profile",
-    () => api.setProjectPinned("a b", "profile", true),
+    "PATCH /api/projects/a%20b?scope=profile&profile=default",
+    () => api.updateProject("a b", { scope: "profile", profile: "default" }, { pinned: true }),
     { body: { pinned: true }, respond: json({ pinned: true }), result: { ok: true, project: { pinned: true } } },
   ],
   [
@@ -741,10 +752,9 @@ describe("installAcpAgent", () => {
 
 describe("project mutations", () => {
   const calls: [string, () => Promise<{ ok: boolean; error?: string }>][] = [
-    ["createProject", () => api.createProject({ path: "/p" })],
-    ["deleteProject", () => api.deleteProject("p", "global")],
-    ["updateProject", () => api.updateProject("p", "global", "x")],
-    ["setProjectPinned", () => api.setProjectPinned("p", "global", true)],
+    ["createProject", () => api.createProject({ path: "/p", scope: "global", profile: "default" })],
+    ["deleteProject", () => api.deleteProject("p", { scope: "global" })],
+    ["updateProject", () => api.updateProject("p", { scope: "global" }, { default_base_branch: "x" })],
   ];
 
   it.each(calls)("%s maps JSON, text, and network errors", async (_name, call) => {

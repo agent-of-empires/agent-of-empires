@@ -79,7 +79,9 @@ fn resolved_repo_config_path(project_path: &Path) -> Option<PathBuf> {
     [REPO_CONFIG_PATH, LEGACY_REPO_CONFIG_PATH]
         .into_iter()
         .map(|rel| project_path.join(rel))
-        .find(|path| path.exists())
+        // Not `exists`: a dangling symlink is a config the user meant to have,
+        // so the read must report it rather than fall through to defaults.
+        .find(|path| fs::symlink_metadata(path).is_ok())
 }
 
 /// Loads `.agent-of-empires/config.toml`, falling back to the legacy
@@ -179,6 +181,27 @@ pub fn save_repo_config(project_path: &Path, config: &RepoConfig) -> Result<()> 
 
 pub fn merge_repo_config(config: Config, repo: &RepoConfig) -> Config {
     profile_config::merge_configs_generic(&config, &repo.allowed_overrides())
+}
+
+pub(crate) fn resolve_sandbox_config_with_repo(
+    base: &super::SandboxConfig,
+    project: &Path,
+) -> Result<Option<super::SandboxConfig>> {
+    let Some(repo) = load_repo_config(&repo_config_source_path(project))? else {
+        return Ok(None);
+    };
+    let overrides = repo.allowed_overrides();
+    let Some(sandbox) = overrides
+        .get("sandbox")
+        .filter(|value| value.as_object().is_some_and(|object| !object.is_empty()))
+    else {
+        return Ok(None);
+    };
+    let mut merged = serde_json::to_value(base)?;
+    super::settings_schema::merge_json(&mut merged, sandbox);
+    serde_json::from_value(merged)
+        .map(Some)
+        .context("Invalid repository sandbox configuration")
 }
 
 /// Keeps only what a repo may set and returns the dropped dotted paths, sorted.

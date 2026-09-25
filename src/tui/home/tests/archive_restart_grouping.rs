@@ -2,9 +2,11 @@
 
 use super::*;
 
-/// Archiving under the default sort advances the cursor to the next active session below
-/// instead of following the row into the Archived section, which is not auto-revealed; its
-/// header count is the feedback.
+/// Archiving in the default (non-Attention) sort advances the cursor to the
+/// next active session below instead of following the archived row into the
+/// Archived section. The section is NOT auto-revealed; its header count is
+/// the feedback. The preview follows the new selection through the normal
+/// per-frame retarget (cache gates on session id, worker drops stale frames).
 #[test]
 #[serial]
 fn archive_advances_cursor_to_next_session() {
@@ -19,7 +21,9 @@ fn archive_advances_cursor_to_next_session() {
         other => panic!("expected a session row below the cursor, got {other:?}"),
     };
 
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
 
     assert!(
         env.view.get_instance(&id).unwrap().is_archived(),
@@ -58,7 +62,9 @@ fn archive_bottom_row_falls_back_to_session_above() {
         other => panic!("expected a session row above the cursor, got {other:?}"),
     };
 
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
 
     assert!(env.view.get_instance(&id).unwrap().is_archived());
     assert_eq!(
@@ -68,8 +74,36 @@ fn archive_bottom_row_falls_back_to_session_above() {
     );
 }
 
-/// The successor scan must skip rows parked under an expanded Archived section: archiving
-/// the last active row with an archived one visible below clears the selection.
+/// Archiving the only active session leaves nothing to advance to: the
+/// cursor clamps into the remaining list (the Archived section header) and
+/// the selection clears instead of pointing at a vanished row.
+#[test]
+#[serial]
+fn archive_last_active_session_clears_selection() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view.archived_section_collapsed = true;
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
+
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert_eq!(
+        env.view.selected_session, None,
+        "no active session remains, so nothing should be selected"
+    );
+    assert!(
+        env.view.cursor < env.view.flat_items.len(),
+        "cursor must stay clamped inside the rebuilt list"
+    );
+}
+
+/// The successor scan must skip rows already parked under an EXPANDED
+/// Archived section: archiving the last active row with an archived row
+/// visible below clears the selection instead of advancing into the section.
 #[test]
 #[serial]
 fn archive_successor_skips_archived_rows() {
@@ -82,7 +116,9 @@ fn archive_successor_skips_archived_rows() {
         other => panic!("expected a second session row, got {other:?}"),
     };
     env.view.select_session_by_id(&parked_id);
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
     assert!(env.view.get_instance(&parked_id).unwrap().is_archived());
 
     // Archive the remaining active session. The only session row left below
@@ -92,7 +128,9 @@ fn archive_successor_skips_archived_rows() {
         id, parked_id,
         "selection must have fallen back to the active row"
     );
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
 
     assert!(env.view.get_instance(&id).unwrap().is_archived());
     assert_eq!(
@@ -101,39 +139,39 @@ fn archive_successor_skips_archived_rows() {
     );
 }
 
-/// Archiving the only active session leaves nothing to advance to, in any sort: the cursor
-/// clamps into the remaining list and the selection clears rather than pointing at the row
-/// now hidden in the collapsed Archived section.
+/// Attention sort: archiving the only active session with the Archived
+/// section collapsed leaves no session row for `select_top_attention` to
+/// land on. Selection must clear (not stay pinned to the invisible archived
+/// row) and the cursor must clamp into the shrunken list.
 #[test]
 #[serial]
-fn archive_last_active_session_clears_selection() {
-    for sort in [None, Some(crate::session::config::SortOrder::Attention)] {
-        let mut env = create_test_env_with_sessions(1);
-        if let Some(sort) = sort {
-            env.view.sort_order = sort;
-            env.view.flat_items = env.view.build_flat_items();
-        }
-        env.view.archived_section_collapsed = true;
-        env.view.cursor = 0;
-        env.view.update_selected();
-        let id = env.view.selected_session.clone().unwrap();
+fn archive_last_active_session_attention_sort_clears_selection() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view.sort_order = crate::session::config::SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.archived_section_collapsed = true;
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
 
+    with_canonical_archive(&mut env, |env| {
         env.view.toggle_archive_at_cursor().unwrap();
+    });
 
-        assert!(env.view.get_instance(&id).unwrap().is_archived());
-        assert_eq!(
-            env.view.selected_session, None,
-            "{sort:?}: nothing active remains, so the archived row must not stay selected"
-        );
-        assert!(
-            env.view.cursor < env.view.flat_items.len(),
-            "{sort:?}: cursor must stay clamped inside the rebuilt list"
-        );
-    }
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert_eq!(
+        env.view.selected_session, None,
+        "selection must not point at the archived row hidden in the collapsed section"
+    );
+    assert!(
+        env.view.cursor < env.view.flat_items.len(),
+        "cursor must stay clamped inside the rebuilt list"
+    );
 }
 
-/// `z` unarchives the row and keeps it selected, following it back to its real tier.
-/// Unarchive does not restart the agent: the row stays Stopped until `e`.
+/// Restoring with `z` unarchives the row and keeps it selected, following it
+/// back to its real tier. Unarchive does not restart the agent: the row stays
+/// Stopped (archive killed its pane) and the user restarts with `e`.
 #[test]
 #[serial]
 fn unarchive_keeps_selection() {
@@ -143,13 +181,17 @@ fn unarchive_keeps_selection() {
     env.view.update_selected();
     let id = env.view.selected_session.clone().unwrap();
 
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
     assert!(env.view.get_instance(&id).unwrap().is_archived());
 
     // The archive advanced the cursor to the neighbor; navigate back onto
     // the archived row (visible because the section is expanded) to restore.
     env.view.select_session_by_id(&id);
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
     assert!(
         !env.view.get_instance(&id).unwrap().is_archived(),
         "second toggle unarchives"
@@ -167,8 +209,7 @@ fn unarchive_keeps_selection() {
     }
 }
 
-/// `restart_selected_session` must drop the press silently when nothing is
-/// selected. No restart_with_size call, no save, no cooldown insertion.
+/// A restart with no selection neither submits nor reserves a row.
 #[test]
 #[serial]
 fn restart_selected_session_noop_with_no_selection() {
@@ -179,73 +220,57 @@ fn restart_selected_session_noop_with_no_selection() {
     assert!(env.view.restart_cooldown_at.is_empty());
 }
 
-/// Sunk rows and transient lifecycle states skip the restart path, leaving their own state
-/// intact and the cooldown unset: archive's contract is "don't auto-revive", and a snooze is
-/// only visible in Attention sort
-/// (`restart_selected_session_wakes_snooze_outside_attention_sort` covers the rest).
+/// Sunk rows (`archived` / `snoozed` / `pane_dead_observed`) and transient
+/// lifecycle states (`Creating` / `Deleting`) must skip the restart path.
+/// Archive's contract is "don't auto-revive"; restart should respect that.
 #[test]
 #[serial]
-fn restart_selected_session_skips_sunk_and_transient_rows() {
-    use crate::session::config::SortOrder;
-    // (label, sort order, put the row in that state, check it is still in it)
-    type Case = (
-        &'static str,
-        Option<SortOrder>,
-        fn(&mut Instance),
-        fn(&Instance) -> bool,
+fn restart_selected_session_skips_archived_row() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.mutate_instance(&id, |inst| inst.archive());
+
+    let result = env.view.restart_selected_session(None, None, None, None);
+    assert!(result.is_ok());
+    assert!(
+        env.view.instance_at(0).is_archived(),
+        "archive bit should still be set: restart must not unarchive"
     );
-
-    let cases: [Case; 3] = [
-        (
-            "archived",
-            None,
-            |inst| inst.archive(),
-            Instance::is_archived,
-        ),
-        (
-            "snoozed",
-            Some(SortOrder::Attention),
-            |inst| inst.snooze(30),
-            Instance::is_snoozed,
-        ),
-        (
-            "creating",
-            None,
-            |inst| inst.status = Status::Creating,
-            |inst| inst.status == Status::Creating,
-        ),
-    ];
-
-    for (label, sort, sink, still_sunk) in cases {
-        let mut env = create_test_env_with_sessions(1);
-        let id = env.view.instance_at(0).id.clone();
-        env.view.selected_session = Some(id.clone());
-        if let Some(sort) = sort {
-            env.view.sort_order = sort;
-        }
-        env.view.mutate_instance(&id, sink);
-
-        assert!(env
-            .view
-            .restart_selected_session(None, None, None, None)
-            .is_ok());
-        assert!(
-            still_sunk(env.view.instance_at(0)),
-            "{label}: restart must leave the row's own state alone"
-        );
-        assert!(
-            env.view.restart_cooldown_at.is_empty(),
-            "{label}: a skipped restart must not set the cooldown"
-        );
-    }
+    assert!(
+        env.view.restart_cooldown_at.is_empty(),
+        "cooldown should not be set on a skipped restart"
+    );
 }
 
-/// Outside Attention sort the snooze badge, dim styling and `z ` prefix are invisible, so
-/// swallowing a restart press would leave the user staring at an apparently restartable
-/// row. Wake the snooze and let the restart proceed.
 #[test]
 #[serial]
-fn restart_selected_session_wakes_snooze_outside_attention_sort() {
+fn restart_selected_session_skips_snoozed_row_in_attention_sort() {
+    use crate::session::config::SortOrder;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.sort_order = SortOrder::Attention;
+    env.view.mutate_instance(&id, |inst| inst.snooze(30));
+
+    let result = env.view.restart_selected_session(None, None, None, None);
+    assert!(result.is_ok());
+    assert!(
+        env.view.instance_at(0).is_snoozed(),
+        "Attention sort: snooze is the user's explicit `don't revive`; restart must not clear it"
+    );
+    assert!(
+        env.view.restart_cooldown_at.is_empty(),
+        "Attention sort: skipped restart should not set the cooldown"
+    );
+}
+
+/// Outside Attention sort, restarting requests an authoritative unsnooze;
+/// the TUI must not clear the snooze before the daemon commits it.
+#[test]
+#[serial]
+fn restart_selected_session_requests_unsnooze_without_a_local_write() {
     use crate::session::config::SortOrder;
 
     let mut env = create_test_env_with_sessions(1);
@@ -255,24 +280,45 @@ fn restart_selected_session_wakes_snooze_outside_attention_sort() {
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
     assert!(env.view.instance_at(0).is_snoozed(), "pre-condition");
 
+    let mut respond = env.view.session_feed.command_driver_for_test();
     let result = env.view.restart_selected_session(None, None, None, None);
     assert!(result.is_ok());
     assert!(
-        !env.view.instance_at(0).is_snoozed(),
-        "Newest sort: restart on a snoozed row must clear the snooze so persisted state matches what's on screen"
+        env.view.instance_at(0).is_snoozed(),
+        "admission must not mutate the authoritative snooze"
     );
-    // The cooldown is set because the press wasn't dropped; the restart itself is
-    // scheduled on a worker, so only the synchronous bookkeeping is asserted.
+    // An admitted daemon submit records the cooldown; the assertion drains
+    // the submission so it does not leak into the next test's feed.
+    assert!(
+        respond(Ok(crate::daemon::RuntimeCursor {
+            epoch: "test".into(),
+            revision: 2,
+        }))
+        .is_some_and(|(target, mutation)| target == id
+            && matches!(mutation, crate::daemon::SessionMutation::Restart(body) if body.unsnooze)),
+        "a proceeding restart requests an unsnooze from the daemon"
+    );
     assert!(
         env.view.restart_cooldown_at.contains_key(&id),
         "Newest sort: restart that proceeded must record the cooldown"
     );
 }
 
-/// The cooldown map debounces rapid presses, so a second press within the window is
-/// dropped before it could tear down a still-booting pane. The full restart path needs
-/// tmux, so this asserts the bookkeeping: the second call returns without overwriting the
-/// timestamp.
+#[test]
+#[serial]
+fn restart_selected_session_skips_creating_row() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view
+        .mutate_instance(&id, |inst| inst.status = crate::session::Status::Creating);
+
+    let result = env.view.restart_selected_session(None, None, None, None);
+    assert!(result.is_ok());
+    assert!(env.view.restart_cooldown_at.is_empty());
+}
+
+/// Rapid keyboard repeats must not enqueue a second daemon restart.
 #[test]
 #[serial]
 fn restart_selected_session_debounces_via_cooldown_map() {
@@ -280,9 +326,7 @@ fn restart_selected_session_debounces_via_cooldown_map() {
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
 
-    // Seed the cooldown so the next press is debounced, standing in for "the first
-    // restart already ran": the debounce check happens before restart_with_size, which a
-    // unit test cannot run.
+    // Stand in for a recently admitted restart.
     let now = std::time::Instant::now();
     env.view.restart_cooldown_at.insert(id.clone(), now);
 
@@ -292,376 +336,6 @@ fn restart_selected_session_debounces_via_cooldown_map() {
     assert_eq!(
         stored, now,
         "cooldown timestamp must not be overwritten on a debounced press"
-    );
-}
-
-/// An engine swap must not carry the old agent's session state to the new one, in memory
-/// or on disk: session ids are per-agent namespaces, so a carried-over sid makes the next
-/// launch emit `--resume <foreign-sid>`, and an in-memory-only reset is reverted by
-/// `reconcile_from_disk`. Follow-on to #3077.
-#[test]
-#[serial]
-fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.selected_session = Some(id.clone());
-    let seed = |inst: &mut Instance| {
-        inst.tool = "claude".to_string();
-        inst.agent_session_id = Some("11111111-2222-3333-4444-555555555555".to_string());
-        inst.acp_session_id = Some("acp-sess-1".to_string());
-        inst.agent_name = Some("claude-code".to_string());
-        inst.acp_effort = Some("high".to_string());
-        inst.agent_model = Some("claude-opus-4-7".to_string());
-        // The approval posture is deliberately NOT reset; see the comment in
-        // `Instance::swap_tool`.
-        inst.acp_mode_id = Some("plan".to_string());
-    };
-    env.view.mutate_instance(&id, seed);
-    // Seed the disk row directly rather than through `save()`, which syncs only status and
-    // launch config, so the disk assertions below would pass vacuously.
-    env.view
-        .storages
-        .get("test")
-        .unwrap()
-        .update(|instances, _groups| {
-            seed(instances.iter_mut().find(|i| i.id == id).unwrap());
-            Ok(())
-        })
-        .unwrap();
-
-    env.view
-        .restart_selected_session(None, Some("codex"), None, None)
-        .unwrap();
-
-    let inst = env.view.instance_at(0);
-    assert_eq!(inst.tool, "codex");
-    assert_eq!(inst.agent_session_id, None, "in-memory sid must be dropped");
-    assert_eq!(inst.acp_session_id, None);
-    assert_eq!(inst.agent_name, None);
-    assert_eq!(inst.acp_effort, None);
-    assert_eq!(
-        inst.agent_model, None,
-        "the old agent's model must be dropped"
-    );
-    assert_eq!(
-        inst.acp_mode_id.as_deref(),
-        Some("plan"),
-        "the approval posture must survive: clearing it resolves the adapter's \
-         bypass mode on a yolo_mode row"
-    );
-
-    let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
-    let row = disk.iter().find(|i| i.id == id).unwrap();
-    assert_eq!(
-        row.agent_session_id, None,
-        "the old engine's sid must be gone from disk too, else reconcile_from_disk \
-         restores it and the new engine launches with --resume <foreign-sid>"
-    );
-    assert_eq!(row.acp_session_id, None);
-    assert_eq!(row.agent_name, None);
-    assert_eq!(row.agent_model, None);
-    assert_eq!(row.acp_mode_id.as_deref(), Some("plan"));
-    // Parked, not discarded: the disk row is what a swap back reads, which is what makes
-    // claude -> codex -> claude resumable. Round-trip mechanics are covered by
-    // `swap_tool_parks_and_restores_per_tool_session_ids`.
-    let parked = row.prior_tool_session_ids.get("claude").unwrap();
-    assert_eq!(
-        parked.agent_session_id.as_deref(),
-        Some("11111111-2222-3333-4444-555555555555")
-    );
-    assert_eq!(parked.acp_session_id.as_deref(), Some("acp-sess-1"));
-}
-
-/// Only a tool swap removes the sandbox container, and a failed removal fails the restart (#3959).
-#[cfg(unix)]
-#[test]
-#[serial]
-fn restart_selected_session_tool_swap_discards_sandbox_container() {
-    use crate::session::SandboxInfo;
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.selected_session = Some(id.clone());
-
-    let bin = env._temp.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    let calls = env._temp.path().join("runtime-calls");
-    let fail_removal = env._temp.path().join("fail-removal");
-    // Record every runtime call and fail all but removal (unless the `fail_removal` file
-    // exists), so the relaunch stops at the container probe instead of reaching tmux.
-    for binary in ["docker", "podman", "container"] {
-        let script = bin.join(binary);
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n\
-                 if [ \"$1\" = rm ] && [ ! -e '{}' ]; then exit 0; fi\n\
-                 echo 'permission denied' >&2\nexit 1\n",
-                calls.display(),
-                fail_removal.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let _path = crate::session::test_support::path_prepended(&bin);
-
-    let seed = |inst: &mut Instance| {
-        inst.tool = "claude".to_string();
-        inst.sandbox_info = Some(SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "ubuntu:latest".to_string(),
-            container_name: "test-container".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        });
-    };
-    env.view.mutate_instance(&id, seed);
-    env.view
-        .storages
-        .get("test")
-        .unwrap()
-        .update(|instances, _groups| {
-            seed(instances.iter_mut().find(|i| i.id == id).unwrap());
-            Ok(())
-        })
-        .unwrap();
-
-    let container = crate::containers::DockerContainer::from_session_id(&id).name;
-    let runtime_calls = || {
-        std::fs::read_to_string(&calls)
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    };
-    let removals = || {
-        runtime_calls()
-            .iter()
-            .filter(|line| line.starts_with("rm ") && line.ends_with(&container))
-            .count()
-    };
-    let restart = |env: &mut TestEnv, tool: Option<&str>| {
-        env.view.restart_cooldown_at.clear();
-        env.view
-            .restart_selected_session(None, tool, None, None)
-            .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !env.view.apply_restart_results() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "restart did not finish"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    };
-
-    for (tool, removal_fails, expected_removals, case) in [
-        (None, false, 0, "a plain restart must reuse the container"),
-        (
-            Some("claude"),
-            false,
-            0,
-            "restarting on the same tool is not a swap",
-        ),
-        (
-            Some("codex"),
-            false,
-            1,
-            "a tool swap must remove the container",
-        ),
-        (
-            Some("claude"),
-            true,
-            2,
-            "a failed removal must fail the restart",
-        ),
-    ] {
-        if removal_fails {
-            std::fs::write(&fail_removal, "").unwrap();
-        }
-        let calls_before = runtime_calls().len();
-        restart(&mut env, tool);
-        assert!(
-            runtime_calls().len() > calls_before,
-            "{case}: the relaunch never reached the container runtime"
-        );
-        assert_eq!(removals(), expected_removals, "{case}");
-        let error = env
-            .view
-            .instance_at(0)
-            .last_error
-            .clone()
-            .unwrap_or_default();
-        assert_eq!(
-            error.contains(&format!("{container} built for the previous tool")),
-            removal_fails,
-            "{case}: {error}"
-        );
-    }
-}
-
-/// Swapping between two tool names that run the same agent on different
-/// accounts keeps the conversation instead of parking it, so the session
-/// resumes where it left off on the new account (#4030). A swap to a different
-/// agent still parks it.
-#[test]
-#[serial]
-fn restart_selected_session_account_swap_keeps_the_conversation() {
-    const SID: &str = "11111111-2222-3333-4444-555555555555";
-    // (tool swapped to, sid still on the row, sid parked under the old tool)
-    let cases = [("claude-2", Some(SID), None), ("codex", None, Some(SID))];
-    for (new_tool, expected_live, expected_parked) in cases {
-        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("test");
-        let mut env = create_test_env_with_sessions(1);
-        let id = env.view.instance_at(0).id.clone();
-        env.view.selected_session = Some(id.clone());
-
-        // A real profile config, not a bare registry install: the restart path
-        // resolves the profile several times, and each resolve reinstalls that
-        // profile's whole alias registry from what it read.
-        let profile_dir = crate::session::get_profile_dir_path("test").expect("profile dir");
-        std::fs::create_dir_all(&profile_dir).expect("profile dir");
-        std::fs::write(
-            profile_dir.join("config.toml"),
-            "[session.agent_detect_as]\n\
-             claude-1 = \"claude\"\n\
-             claude-2 = \"claude\"\n",
-        )
-        .expect("profile config");
-        crate::session::config::profile_config::resolve_config_or_warn("test");
-
-        let seed = |inst: &mut Instance| {
-            inst.tool = "claude-1".to_string();
-            inst.detect_as = "claude".to_string();
-            inst.agent_session_id = Some(SID.to_string());
-        };
-        env.view.mutate_instance(&id, seed);
-        env.view
-            .storages
-            .get("test")
-            .unwrap()
-            .update(|instances, _groups| {
-                seed(instances.iter_mut().find(|i| i.id == id).unwrap());
-                Ok(())
-            })
-            .unwrap();
-
-        env.view
-            .restart_selected_session(None, Some(new_tool), None, None)
-            .unwrap();
-
-        let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
-        let row = disk.iter().find(|i| i.id == id).unwrap();
-        assert_eq!(row.tool, new_tool);
-        assert_eq!(
-            row.agent_session_id.as_deref(),
-            expected_live,
-            "{new_tool}: the disk row is what the next launch resumes from"
-        );
-        assert_eq!(
-            row.prior_tool_session_ids
-                .get("claude-1")
-                .and_then(|parked| parked.agent_session_id.as_deref()),
-            expected_parked,
-            "{new_tool}"
-        );
-        assert_eq!(
-            env.view.instance_at(0).agent_session_id.as_deref(),
-            expected_live
-        );
-    }
-}
-
-/// The disk row a tool swap writes must resolve `agent_detect_as` against the session's own
-/// profile: `source_profile` is `skip_serializing`, so a storage-loaded row comes back
-/// blank and would key the default profile's aliases, and `detect_as` is not in
-/// `reconcile_from_disk`'s carry set, so that wrong value is what the next launch reads.
-#[test]
-#[serial]
-fn restart_selected_session_tool_swap_resolves_detect_as_for_the_row_profile() {
-    // The registries are process-globals and every config resolve here rewrites the
-    // touched profiles' entries, so snapshot before anything runs and restore on the way
-    // out.
-    let _registry_test = crate::tmux::status_rules::ProfileRegistryGuard::take("test");
-    let _registry_other = crate::tmux::status_rules::ProfileRegistryGuard::take("other");
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.selected_session = Some(id.clone());
-
-    // Pin the resolved default profile to something other than the row's own
-    // profile, so a blank `source_profile` is observably the wrong key.
-    let app_dir = crate::session::get_app_dir().expect("app dir");
-    std::fs::create_dir_all(app_dir.join("profiles").join("other")).expect("other profile");
-    std::fs::write(app_dir.join("config.toml"), "default_profile = \"other\"\n")
-        .expect("global config");
-
-    let mut config = crate::session::Config::default();
-    config
-        .session
-        .agent_detect_as
-        .insert("gjc".to_string(), "claude".to_string());
-    crate::tmux::status_rules::install_from_config("test", &config);
-    crate::tmux::status_rules::install_from_config("other", &crate::session::Config::default());
-
-    env.view
-        .restart_selected_session(None, Some("gjc"), None, None)
-        .unwrap();
-
-    let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
-    let row = disk.iter().find(|i| i.id == id).unwrap();
-    assert_eq!(row.tool, "gjc");
-    assert_eq!(
-        row.detect_as, "claude",
-        "the swap must read profile 'test' aliases, not the default profile's"
-    );
-}
-
-/// The tool-swap test above mutates the process-global `agent_detect_as` registry through
-/// `install_from_config`, and the registry outlives the test, so any later reader of those
-/// profiles would observe state its config never contained. Sentinel aliases stand in for
-/// entries an earlier test installed; both must survive unchanged.
-#[test]
-#[serial]
-fn tool_swap_test_restores_the_detect_as_registry() {
-    // (profile, sentinel agent, target)
-    let sentinels = [
-        ("test", "zz-sentinel-test", "codex"),
-        ("other", "zz-sentinel-other", "claude"),
-    ];
-    // The probe's own seeds must not leak either: restore the pre-probe
-    // entries once the assertion below has run.
-    let _registry_test = crate::tmux::status_rules::ProfileRegistryGuard::take("test");
-    let _registry_other = crate::tmux::status_rules::ProfileRegistryGuard::take("other");
-    for (profile, agent, target) in sentinels {
-        let mut seeded = crate::session::Config::default();
-        seeded
-            .session
-            .agent_detect_as
-            .insert(agent.to_string(), target.to_string());
-        crate::tmux::status_rules::install_from_config(profile, &seeded);
-    }
-
-    // serial_test 4's default-key lock is reentrant, so this serialized test
-    // can be called directly and observed after its nested guards have dropped.
-    restart_selected_session_tool_swap_resolves_detect_as_for_the_row_profile();
-
-    for (profile, agent, target) in sentinels {
-        assert_eq!(
-            crate::tmux::status_rules::effective_detect_as(profile, agent, ""),
-            target,
-            "the tool-swap test clobbered pre-existing alias {agent} in profile '{profile}'"
-        );
-    }
-    assert_eq!(
-        crate::tmux::status_rules::effective_detect_as("test", "gjc", ""),
-        "",
-        "the tool-swap test leaked `gjc -> claude` into profile 'test'"
     );
 }
 
@@ -720,12 +394,14 @@ fn restart_tool_swap_refuses_a_foreign_pending_fork() {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
+    let mut respond = view.session_feed.command_driver_for_test();
     view.update_selected();
     view.selected_session = Some(id.clone());
     view.restart_selected_session(None, Some("codex"), None, None)
         .unwrap();
     let mut applied = false;
     for _ in 0..120 {
+        let _ = respond(Err("restart refused before launch".to_string()));
         if view.apply_restart_results() {
             applied = true;
             break;
@@ -745,315 +421,29 @@ fn restart_tool_swap_refuses_a_foreign_pending_fork() {
     assert!(
         matches!(&row.resume_intent, crate::session::ResumeIntent::Fork { from } if from == sid)
     );
-    assert_eq!(row.status, crate::session::Status::Error);
+    assert_eq!(row.status, crate::session::Status::Idle);
 }
 
 #[test]
 #[serial]
-fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
-    if crate::tmux::tmux_command().arg("-V").output().is_err() {
-        eprintln!("Skipping: tmux not available");
-        return;
-    }
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    // The transcript-existence gate resolves the Claude home via CLAUDE_CONFIG_DIR before
-    // falling back to $HOME/.claude, so a var set in the invoking environment points
-    // outside this test's temp home: the seeded transcript reads as absent and the restart
-    // launches fresh-pinned instead of driving the --resume cascade under test. Pin the var
-    // to the temp home.
-    let claude_home = temp.path().join(".claude");
-    let _claude_config_guard =
-        crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", claude_home.clone())]);
-    crate::session::config::update_app_state(|state| {
-        state.has_acknowledged_agent_hooks = true;
-    })
-    .unwrap();
-    let profile = "restart-resume-failed";
-    let storage = Storage::new_unwatched(profile).unwrap();
-    let stale_sid = "11111111-2222-3333-4444-555555555555";
-    // Use an exact built-in binary so the production resume gate passes while
-    // the login-shell-safe fake rejects the stale id.
-    let _path_guard = crate::session::test_support::install_login_shell_path_command(
-        temp.path(),
-        "claude",
-        "#!/bin/sh\nexit 1\n",
-    );
-    // The instance workdir is a created tempdir path, not a shared global like /tmp/x:
-    // `tmux new-session -c` on a nonexistent dir fails outright, and a pre-existing /tmp/x
-    // would change the launch behavior.
-    let workdir = temp.path().join("workdir");
-    std::fs::create_dir_all(&workdir).unwrap();
-    let workdir_str = workdir.to_str().unwrap().to_string();
-
-    let mut inst = Instance::new("restart-resume-failed", &workdir_str);
-    inst.source_profile = profile.to_string();
-    inst.tool = "claude".to_string();
-    inst.command = "claude".to_string();
-    let binding = inst.asserted_resume_binding(stale_sid, None).unwrap();
-    inst.set_agent_conversation(Some(stale_sid.to_string()), Some(binding), None);
-    let id = inst.id.clone();
-    let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-    let _ = crate::tmux::tmux_command()
-        .args(["kill-session", "-t", &tmux_name])
-        .output();
-
-    storage
-        .update(|instances, groups| {
-            *instances = vec![inst.clone()];
-            *groups = GroupTree::new_with_groups(std::slice::from_ref(&inst), &[]).get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    // A real prior conversation on disk so the restart drives the --resume cascade and its
-    // ResumeFailed path; a stored sid with no transcript launches fresh-pinned instead. The
-    // lookup canonicalizes the project path, so encode the canonical form (the tempdir may
-    // sit behind a symlink).
-    let canonical_workdir = std::fs::canonicalize(&workdir).unwrap();
-    let claude_dir =
-        claude_home
-            .join("projects")
-            .join(crate::session::capture::encode_claude_project_path(
-                &canonical_workdir.to_string_lossy(),
-            ));
-    std::fs::create_dir_all(&claude_dir).unwrap();
-    std::fs::write(claude_dir.join(format!("{stale_sid}.jsonl")), "seed\n").unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some(profile.to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.update_selected();
-    view.selected_session = Some(id.clone());
-
-    let result = view.restart_selected_session(None, None, None, None);
-    assert!(result.is_ok());
-
-    let mut applied = false;
-    for _ in 0..120 {
-        if view.apply_restart_results() {
-            applied = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-
-    let _ = crate::tmux::tmux_command()
-        .args(["kill-session", "-t", &tmux_name])
-        .output();
-
-    assert!(applied, "timed out waiting for async restart result");
-    let row_dbg = view.get_instance(&id).cloned();
-    let dialog =
-        view.info_dialog.as_ref().unwrap_or_else(|| {
-            panic!(
-            "resume failure dialog missing; row status={:?} last_error={:?} sid={:?} marker={:?}",
-            row_dbg.as_ref().map(|r| r.status),
-            row_dbg.as_ref().and_then(|r| r.last_error.clone()),
-            row_dbg.as_ref().and_then(|r| r.agent_session_id.clone()),
-            row_dbg.as_ref().and_then(|r| r.resume_probe_failed_sid.clone()),
-        )
-        });
-    assert_eq!(dialog.title(), "Restart Failed");
-    assert!(
-        dialog.message().contains(stale_sid),
-        "dialog message was: {}",
-        dialog.message()
-    );
-    let row = view.get_instance(&id).expect("instance remains visible");
-    assert_eq!(row.agent_session_id.as_deref(), Some(stale_sid));
-    assert_eq!(row.resume_probe_failed_sid.as_deref(), Some(stale_sid));
-    assert_eq!(row.status, crate::session::Status::Error);
-    assert!(row.last_accessed_at.is_some());
-}
-
-#[test]
-#[serial]
-fn apply_restart_results_preserves_peer_sid_and_marker() {
-    use crate::session::StartOutcome;
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.restart_in_flight.insert(id.clone());
-    env.view.instance_at_mut(0).agent_session_id = Some("peer-fresh-sid".to_string());
-    env.view.instance_at_mut(0).resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
-
-    let mut worker = env.view.instance_at(0).clone();
-    worker.status = crate::session::Status::Error;
-    worker.agent_session_id = Some("phase1-stale-sid".to_string());
-    worker.resume_probe_failed_sid = Some("phase1-stale-sid".to_string());
-    worker.last_error =
-        Some("resume failed for sid phase1-stale-sid; preserved for explicit retry".to_string());
-
-    env.view.restart_poller = crate::tui::restart_poller::RestartPoller::with_result_for_test(
-        crate::session::restart::RestartResult {
-            session_id: id.clone(),
-            before: Box::new(worker.clone()),
-            instance: Box::new(worker),
-            outcome: Ok(StartOutcome::ResumeFailed {
-                sid: "phase1-stale-sid".to_string(),
-            }),
-        },
-    );
-
-    assert!(env.view.apply_restart_results());
-
-    let row = env
-        .view
-        .get_instance(&id)
-        .expect("instance remains visible");
-    assert_eq!(row.status, crate::session::Status::Error);
-    assert_eq!(row.agent_session_id.as_deref(), Some("peer-fresh-sid"));
-    assert_eq!(
-        row.resume_probe_failed_sid.as_deref(),
-        Some("peer-fresh-sid")
-    );
-    assert!(env.view.restart_in_flight.is_empty());
-    let dialog = env
-        .view
-        .info_dialog
-        .as_ref()
-        .expect("resume failure dialog");
-    assert!(dialog.message().contains("phase1-stale-sid"));
-}
-
-#[test]
-#[serial]
-fn apply_restart_results_propagates_worker_sid_without_peer_write() {
-    use crate::session::StartOutcome;
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.restart_in_flight.insert(id.clone());
-    env.view.instance_at_mut(0).agent_session_id = Some("sid-before".to_string());
-
-    let before = env.view.instance_at(0).clone();
-    let mut worker = before.clone();
-    worker.agent_session_id = Some("sid-after".to_string());
-    worker.status = crate::session::Status::Running;
-
-    env.view.restart_poller = crate::tui::restart_poller::RestartPoller::with_result_for_test(
-        crate::session::restart::RestartResult {
-            session_id: id.clone(),
-            before: Box::new(before),
-            instance: Box::new(worker),
-            outcome: Ok(StartOutcome::Resumed),
-        },
-    );
-
-    assert!(env.view.apply_restart_results());
-
-    let row = env
-        .view
-        .get_instance(&id)
-        .expect("instance remains visible");
-    assert_eq!(row.status, crate::session::Status::Running);
-    assert_eq!(row.agent_session_id.as_deref(), Some("sid-after"));
-    assert_eq!(row.resume_probe_failed_sid, None);
-    assert!(env.view.restart_in_flight.is_empty());
-}
-
-/// Enter on a stopped session queues the start cascade, which can pull an image for
-/// minutes, on the restart worker rather than the event loop, and attaches only once the
-/// agent launched (#3630).
-#[test]
-#[serial]
-fn restart_then_attach_queues_the_cascade_and_attaches_after_launch() {
-    use crate::session::{StartOutcome, Status};
-
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    let before = env.view.instance_at(0).clone();
-    let disk_generation = |view: &HomeView| {
-        view.storages["test"]
-            .load()
-            .unwrap()
-            .into_iter()
-            .find(|row| row.id == id)
-            .unwrap()
-            .lifecycle_generation
-    };
-    let generation = disk_generation(&env.view);
-
-    for (case, outcome, attaches, dialog) in [
-        ("fresh", Ok(StartOutcome::Fresh), true, None),
-        (
-            "fresh after failed resume",
-            Ok(StartOutcome::FreshAfterFailedResume { sid: "s".into() }),
-            true,
-            Some("Restarted"),
-        ),
-        (
-            "resume failed",
-            Ok(StartOutcome::ResumeFailed { sid: "s".into() }),
-            false,
-            Some("Restart Failed"),
-        ),
-        (
-            "cascade error",
-            Err("pull failed".to_string()),
-            false,
-            Some("Restart Failed"),
-        ),
-    ] {
-        // A seeded worker ignores requests, so a cascade could only run inline.
-        env.view.restart_poller = crate::tui::restart_poller::RestartPoller::with_result_for_test(
-            crate::session::restart::RestartResult {
-                session_id: id.clone(),
-                before: Box::new(before.clone()),
-                instance: Box::new(before.clone()),
-                outcome,
-            },
-        );
-
-        env.view.restart_then_attach(&id, None, false);
-        assert!(env.view.restart_in_flight.contains(&id), "{case}");
-        assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Starting);
-        assert_eq!(
-            disk_generation(&env.view),
-            generation,
-            "{case}: the launch cascade ran on the caller"
-        );
-
-        assert!(env.view.apply_restart_results(), "{case}");
-        let expected = if attaches { vec![id.clone()] } else { vec![] };
-        assert_eq!(env.view.take_restarted_attaches(), expected, "{case}");
-        assert!(env.view.attach_after_restart.is_empty(), "{case}");
-        // The attach no longer waits on the cascade, so a failure must still
-        // reach the user.
-        assert_eq!(
-            env.view.info_dialog.take().map(|d| d.title().to_string()),
-            dialog.map(str::to_string),
-            "{case}"
-        );
-    }
-}
-
-#[test]
-#[serial]
-fn execute_send_message_missing_session_shows_send_failed() {
+fn sending_to_a_session_that_is_gone_is_refused_before_any_pane_work() {
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
     env.view.instances.shift_remove(&id);
 
-    env.view.execute_send_message(&id, "hello");
-
-    let dialog = env.view.info_dialog.as_ref().expect("send failure dialog");
-    assert_eq!(dialog.title(), "Send Failed");
-    assert_eq!(
-        dialog.message(),
-        "Session disappeared before the message could be sent."
+    // The pane preparation is the guard now: a session the daemon does not
+    // publish cannot be prepared, and the caller renders that as "Send Failed".
+    let refusal = env.view.prepare_send_target(
+        &id,
+        crate::tui::home::live_send::LiveSendTarget::Agent,
+        "hello".to_string(),
+        None,
     );
+    assert!(refusal.is_err(), "a missing session cannot be prepared");
 }
 
-/// A second restart press while the first cascade is still on the worker must be dropped:
-/// the 1.5s keyboard-repeat debounce does not cover a deliberate press during a
-/// multi-second pull, so without the in-flight guard the row would restart twice.
+/// A second restart is refused while the daemon request remains in flight,
+/// even after the keyboard-repeat cooldown has elapsed.
 #[test]
 #[serial]
 fn restart_selected_session_skips_when_already_in_flight() {
@@ -1075,8 +465,9 @@ fn restart_selected_session_skips_when_already_in_flight() {
     );
 }
 
-/// Deleting a row whose restart cascade is still running would fire docker commands
-/// against the container the worker is creating, so the delete must be refused visibly.
+/// Deleting a row whose restart cascade is still running would fire docker
+/// commands against the container the worker is mid-creating. The delete must
+/// be refused (and surfaced) rather than racing the restart worker.
 #[test]
 #[serial]
 fn delete_selected_refused_during_restart() {
@@ -1178,9 +569,10 @@ fn delete_selected_refused_during_restart() {
     assert!(groups.iter().any(|group| group.path == "work"));
 }
 
-/// `build_flat_items_by_org` groups sessions by each repo's resolved remote owner (any
-/// hosted git remote, not just GitHub), and falls a session with no resolvable owner into
-/// the synthetic "No organization" bucket.
+/// `build_flat_items_by_org` must group sessions by each repo's resolved
+/// remote owner (any hosted git remote, not just GitHub), and fall a
+/// session with no resolvable owner into the synthetic "No organization"
+/// bucket.
 #[test]
 #[serial]
 fn build_flat_items_by_org_groups_by_resolved_owner() {
@@ -1201,6 +593,7 @@ fn build_flat_items_by_org_groups_by_resolved_owner() {
                     membership.insert(inst.title.clone(), current_group.clone().unwrap());
                 }
             }
+            _ => {}
         }
     }
 
@@ -1212,9 +605,10 @@ fn build_flat_items_by_org_groups_by_resolved_owner() {
     );
 }
 
-/// Two repos owned by the same login on different hosts must render as two separate org
-/// headers, both displayed "acme", and a bulk operation scoped to one must never pull in
-/// the other's session (#3284 review).
+/// Required-fix regression (#3284 review): two repos owned by the same
+/// login on different hosts (GitHub "acme" vs GitLab "acme") must render as
+/// two separate org headers, both displayed "acme", and a bulk operation
+/// scoped to one must never pull in the other's session.
 #[test]
 #[serial]
 fn build_flat_items_by_org_scopes_same_named_owners_by_host() {
@@ -1270,9 +664,11 @@ fn build_flat_items_by_org_scopes_same_named_owners_by_host() {
     );
 }
 
-/// Project grouping must survive Attention sort: `build_flat_items` short-circuited on
-/// `SortOrder::Attention` before checking `GroupByMode`, flattening the list and dropping
-/// the headers users triage within.
+/// Project grouping must survive Attention sort. Previously `build_flat_items`
+/// short-circuited on `SortOrder::Attention` before checking `GroupByMode`,
+/// flattening the list and dropping project headers. The headers are the
+/// whole point of project mode; users want attention triage WITHIN their
+/// project boundaries, not a flat firehose across projects.
 #[test]
 #[serial]
 fn project_grouping_survives_attention_sort() {
@@ -1311,8 +707,11 @@ fn project_grouping_survives_attention_sort() {
     );
 }
 
-/// Within a project group under Attention sort, sessions order by attention tier: Waiting
-/// above Running, so `sort_sessions` is reached through the project flatten path.
+/// Within a project group under Attention sort, sessions must order by
+/// attention tier: Waiting (tier 0) above Running (tier 4). Confirms that
+/// the existing `sort_sessions` helper, already reached by the project
+/// flatten path via `flatten_tree`, is doing its job once we stopped
+/// short-circuiting it.
 #[test]
 #[serial]
 fn project_grouping_sorts_sessions_by_attention_within_group() {
@@ -1328,13 +727,12 @@ fn project_grouping_sorts_sessions_by_attention_within_group() {
     for item in &env.view.flat_items {
         match item {
             Item::Group { name, .. } => current_group = Some(name.clone()),
-            Item::Session { id, .. } => {
-                if current_group.as_deref() == Some("alpha") {
-                    if let Some(inst) = env.view.instances.get(id) {
-                        alpha_session_order.push(inst.title.clone());
-                    }
+            Item::Session { id, .. } if current_group.as_deref() == Some("alpha") => {
+                if let Some(inst) = env.view.instances.get(id) {
+                    alpha_session_order.push(inst.title.clone());
                 }
             }
+            _ => {}
         }
     }
     assert_eq!(
@@ -1344,8 +742,11 @@ fn project_grouping_sorts_sessions_by_attention_within_group() {
     );
 }
 
-/// The most attention-urgent project floats to the top: `attention_group_key` scores groups
-/// by their best member's tier, so alpha's Waiting sorts above beta's Error.
+/// The most-attention-urgent project floats to the top. `attention_group_key`
+/// scores groups by their best member's tier; beta has an Error (tier 1)
+/// while alpha's best is Waiting (tier 0), so alpha sorts first. This
+/// confirms that the existing group-sort path is reached for project mode
+/// under Attention sort.
 #[test]
 #[serial]
 fn project_groups_sort_by_top_attention_member() {
@@ -1372,9 +773,9 @@ fn project_groups_sort_by_top_attention_member() {
     );
 }
 
-/// Archiving a project header under Attention sort removes the project from the main flow
-/// once all its live sessions are archived; the rows stay under the Archived section's
-/// project sub-header.
+/// Archiving a project header while in Attention sort must remove the project
+/// from the main flow once all of its live sessions are archived. The archived
+/// rows still appear under the synthetic Archived section's project sub-header.
 #[test]
 #[serial]
 fn project_attention_archive_selected_group_removes_empty_main_header() {
@@ -1406,7 +807,15 @@ fn project_attention_archive_selected_group_removes_empty_main_header() {
     env.view.update_selected();
     assert_eq!(env.view.selected_group.as_deref(), Some("beta"));
 
-    env.view.archive_selected_group().unwrap();
+    with_canonical_group_archive(&mut env, |env| {
+        env.view.archive_selected_group().unwrap();
+        assert!(env
+            .view
+            .instances
+            .values()
+            .filter(|row| crate::tui::home::project_group_key(row) == "beta")
+            .all(|row| !row.is_archived()));
+    });
 
     assert!(
         env.view
@@ -1415,6 +824,16 @@ fn project_attention_archive_selected_group_removes_empty_main_header() {
             .filter(|i| crate::tui::home::project_group_key(i) == "beta")
             .all(|i| i.is_archived()),
         "all beta sessions must be archived"
+    );
+    let alpha: Vec<_> = env
+        .view
+        .instances
+        .values()
+        .filter(|row| crate::tui::home::project_group_key(row) == "alpha")
+        .collect();
+    assert!(
+        !alpha.is_empty() && alpha.iter().all(|row| !row.is_archived()),
+        "unselected project stays active"
     );
     assert!(
         !env.view.flat_items.iter().any(|item| matches!(
@@ -1437,9 +856,9 @@ fn project_attention_archive_selected_group_removes_empty_main_header() {
     );
 }
 
-/// A registered (pinned) project with no sessions surfaces as an empty header in project
-/// view, mirroring the WebUI where an empty project is a registry entry decoupled from
-/// sessions (#2047).
+/// A registered (pinned) project with no sessions surfaces as an empty
+/// header in project view, mirroring the WebUI where an empty project is just
+/// a registry entry decoupled from sessions. This is the core of #2047.
 #[test]
 #[serial]
 fn pinned_project_without_sessions_shows_empty_header() {
@@ -1477,8 +896,9 @@ fn pinned_project_without_sessions_shows_empty_header() {
     assert!(env.view.is_project_label_pinned("gamma"));
 }
 
-/// `p` on a project header pins it rather than opening the projects dialog: the pin toggle
-/// wins the shared chord while a project header is selected.
+/// Pressing `p` on a project header pins it (registers the repo) instead of
+/// opening the projects dialog; the pin toggle binding wins the shared chord
+/// because a project header is selected.
 #[test]
 #[serial]
 fn p_key_pins_project_on_header() {
@@ -1512,8 +932,9 @@ fn p_key_pins_project_on_header() {
         "a successful pin must not raise an info dialog"
     );
 
-    // A second toggle unpins but keeps the saved project, so the entry stays in the
-    // registry; only an explicit remove deletes it. See #2208.
+    // Unpinning (a second toggle) clears the pin but KEEPS the saved project,
+    // so the entry stays in the registry (only an explicit remove deletes it).
+    // See #2208.
     env.view.toggle_project_pin_at_cursor();
     assert!(!env.view.is_project_label_pinned("alpha"));
     // A successful unpin is likewise quiet.
@@ -1529,8 +950,9 @@ fn p_key_pins_project_on_header() {
     assert!(!after[0].pinned, "unpin must clear the pin flag");
 }
 
-/// Off a project header, `p` keeps its original meaning and opens the projects dialog, so
-/// the overload doesn't shadow the global binding.
+/// Off a project header (here: in Manual grouping), `p` keeps its original
+/// meaning and opens the projects dialog, so the overload doesn't shadow the
+/// global binding.
 #[test]
 #[serial]
 fn p_key_opens_projects_dialog_off_project_header() {
@@ -1549,10 +971,13 @@ fn p_key_opens_projects_dialog_off_project_header() {
     );
 }
 
-/// A user's own repo whose basename is `scratch` must be pinnable while the synthetic
-/// scratch bucket stays excluded. The gate used to reject the header by display label,
-/// collapsing both cases (#3133); #3237 gave the bucket its own sentinel identity, so the
-/// two render as separate headers, keyed here by path.
+/// A user's own repo whose basename is `scratch` must be pinnable, while the
+/// synthetic scratch bucket (sessions with no repo, living under
+/// `<app_dir>/scratch/<id>`) stays excluded. The gate used to reject the header
+/// by its display LABEL, which collapsed both cases together and left `p` on a
+/// real `~/scratch` repo falling through to the Projects dialog. See #3133; #3237
+/// then gave the synthetic bucket its own sentinel identity, so the real repo
+/// and the bucket render as two separate headers, keyed here by path.
 #[test]
 #[serial]
 fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
@@ -1560,9 +985,10 @@ fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
     use crate::session::projects::canonical_key;
     use crate::session::SCRATCH_GROUP_PATH;
 
-    // (case, has a real repo named `scratch`, has a synthetic scratch session, a
-    //  pre-existing registry entry for `/repos/scratch` and its pin flag, the path of the
-    //  header this case targets, whether the pin gate opens, and whether `p` pins it)
+    // (case, has a real repo named `scratch`, has a synthetic scratch session,
+    //  a pre-existing registry entry for `/repos/scratch` and its pin flag,
+    //  the path of the header this case targets, the pin gate opens on it, and
+    //  whether it is pinned after `p`)
     let cases = [
         // The reporter's setup: a plain repo at `~/scratch`, no scratch sessions.
         ("real repo only", true, false, None, "scratch", true, true),
@@ -1576,8 +1002,9 @@ fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
             false,
             false,
         ),
-        // The real repo and the synthetic bucket render as separate headers (#3237). This
-        // case targets the real repo header; the bucket's own is covered by
+        // The real repo and the synthetic bucket now render as two separate
+        // headers (#3237). This case targets the real repo header, which backs a
+        // pinnable project; the bucket's own header is covered by
         // `synthetic_scratch_bucket_is_distinct_from_real_repo`.
         (
             "real repo plus scratch session",
@@ -1588,8 +1015,9 @@ fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
             true,
             true,
         ),
-        // A saved-but-unpinned repo named `scratch` surfaces no header of its own, so the
-        // synthetic bucket is the only `scratch` header and `p` keeps its global meaning.
+        // A saved-but-unpinned repo named `scratch` surfaces no header of its
+        // own (only pinned empties do), so the synthetic bucket is the only
+        // `scratch` header and `p` must keep its global meaning.
         (
             "saved unpinned repo plus scratch session",
             false,
@@ -1709,9 +1137,10 @@ fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
     }
 }
 
-/// #3237: a real repo named `scratch` and the synthetic bucket must render as two project
-/// headers with distinct identity paths, one session each rather than a pooled count, and
-/// independent pin state. Mirrors the org same-owner-two-hosts separation above.
+/// #3237: a real repo named `scratch` and the synthetic scratch bucket must
+/// render as two separate project headers with distinct identity paths, one
+/// session each (not a pooled count), and independent pin/scope state. Mirrors
+/// the org same-owner-two-hosts separation test above.
 #[test]
 #[serial]
 fn synthetic_scratch_bucket_is_distinct_from_real_repo() {
@@ -1744,8 +1173,9 @@ fn synthetic_scratch_bucket_is_distinct_from_real_repo() {
     view.group_by = GroupByMode::Project;
     view.flat_items = view.build_flat_items();
 
-    // Two headers on distinct identity paths, one session each rather than a pooled count.
-    // The repo header keeps its basename; the bucket renders the system label.
+    // Two headers on distinct identity paths, one session each rather than a
+    // pooled count of two. The repo header keeps its basename; the bucket
+    // renders the capitalized system label.
     let scratch_headers: Vec<(&str, &str, usize)> = view
         .flat_items
         .iter()
@@ -1791,10 +1221,11 @@ fn synthetic_scratch_bucket_is_distinct_from_real_repo() {
     assert_eq!(view.active_sessions_in_selected_group(), vec![scratch_id]);
 }
 
-/// #3237: New Session from the synthetic bucket must not prefill another scratch session's
-/// throwaway `<app_dir>/scratch/<id>` as the cwd, tying the new session's lifetime to an
-/// unrelated dir; it falls through to the default cwd. Same invariant
-/// `project_header_repo_path` enforces for pinning.
+/// #3237: New Session from the synthetic scratch bucket must not prefill
+/// another scratch session's throwaway `<app_dir>/scratch/<id>` directory as
+/// the working cwd; the dialog should fall through to the default cwd instead
+/// of tying the new session's lifetime to an unrelated scratch dir. Mirrors
+/// the same invariant `project_header_repo_path` enforces for the pin action.
 #[test]
 #[serial]
 fn scratch_bucket_lends_no_repo_path_for_new_session_prefill() {
@@ -1822,13 +1253,16 @@ fn scratch_bucket_lends_no_repo_path_for_new_session_prefill() {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
-    assert_eq!(view.group_by, GroupByMode::Project);
+    // "Group by remote" is the stored default; with no remote configured a new
+    // user still sees Project grouping.
+    assert_eq!(view.effective_group_by(), GroupByMode::Project);
     assert_eq!(view.group_repo_path(SCRATCH_GROUP_PATH), None);
 }
 
-/// #3237: when the only scratch session is archived, the seed must not create a phantom
-/// empty `scratch` header in the main flow, which would be undeletable in project mode. The
-/// bucket appears only under the Archived section.
+/// #3237 pitfall guard: when the only scratch session is archived, the seed
+/// must not create a phantom empty `scratch` header in the main flow (an
+/// archived-only project header is undeletable in project mode). The bucket
+/// appears only nested under the Archived section.
 #[test]
 #[serial]
 fn scratch_bucket_absent_from_main_flow_when_only_scratch_is_archived() {
@@ -1952,12 +1386,15 @@ fn unpin_archived_only_project_leaves_main_flow() {
     );
 }
 
-/// A registry entry whose path differs from an archived session's repo path sharing the
-/// same basename must still read as pinned and be unpinnable. The empty header is surfaced
-/// by label match, so pin state must resolve by the same rule: letting the archived row
-/// lend its path made the comparison fail (repo gone, so `canonical_key` compares raw
-/// strings), the header read as unpinned, and `p` died on the name conflict, leaving a
-/// phantom header the user could not clear.
+/// A registry entry whose path differs from an archived session's repo path
+/// sharing the same basename must still read as pinned and be unpinnable.
+/// The empty header is surfaced by LABEL match (`unpopulated_projects`), so
+/// pin state and the unpin toggle must resolve by the same rule. Previously
+/// `project_header_repo_path` let the archived row lend the header its path:
+/// the path comparison failed (repo gone from disk, `canonical_key` compares
+/// raw strings), the header read as unpinned, and `p` routed to the pin
+/// branch and died on the name conflict, leaving a phantom header the user
+/// could not clear.
 #[test]
 #[serial]
 fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnable() {
@@ -1970,8 +1407,9 @@ fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnabl
     let _guard = setup_test_home(&temp);
     let storage = Storage::new_unwatched("test").unwrap();
 
-    // A live session in another project, plus an archived one whose repo basename is
-    // "otari" but whose recorded path differs from the registry entry below.
+    // A live session in another project, plus an ARCHIVED session whose repo
+    // basename is "otari" but whose recorded path differs from the registry
+    // entry below (repo deleted/moved, so neither canonicalizes).
     let mut alpha = Instance::new("alpha-running", "/repos/alpha");
     alpha.status = Status::Running;
     let mut orphan = Instance::new("otari-old", "/old/home/otari");
@@ -2056,8 +1494,9 @@ fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnabl
     );
 }
 
-/// The pin persists a project across its last session leaving the view, which is the
-/// user-visible promise of #2047.
+/// The pin must persist a project across its last session leaving the view:
+/// once pinned, the header remains even when no sessions reference it. This
+/// is the user-visible promise of #2047.
 #[test]
 #[serial]
 fn pinned_project_survives_losing_last_session() {
@@ -2100,9 +1539,10 @@ fn pinned_project_survives_losing_last_session() {
     );
 }
 
-/// Two repos sharing a basename are judged independently: a header whose own repo is not
-/// registered reads as unpinned even when a different same-basename repo is in the
-/// registry. Guards the path-keyed pin identity (CodeRabbit #2055).
+/// Two repos that share a basename are judged independently for pinning: a
+/// header whose own repo is not registered must read as unpinned even when a
+/// different same-basename repo is in the registry. Guards the path-keyed pin
+/// identity (CodeRabbit #2055).
 #[test]
 #[serial]
 fn same_basename_repos_pin_independently() {
@@ -2132,13 +1572,14 @@ fn same_basename_repos_pin_independently() {
         .iter()
         .position(|i| matches!(i, Item::Group { name, .. } if name == "api"))
         .expect("api header present");
-    // The header's repo (/other/api) is not registered, so it is not pinned even though
-    // /work/api is; the old basename match reported pinned here.
+    // The header's repo (/other/api) is not registered, so it is NOT pinned,
+    // even though a same-basename repo (/work/api) is. The old basename match
+    // would have reported pinned here.
     assert!(!env.view.is_project_label_pinned("api"));
 
-    // Pinning this header would register under the basename "api", which the registry
-    // already holds for /work/api, so name-uniqueness surfaces a conflict rather than
-    // silently toggling the unrelated entry.
+    // Pinning this header would register under the basename "api", which the
+    // registry already holds for /work/api, so the registry's name-uniqueness
+    // surfaces a conflict rather than silently toggling the unrelated entry.
     env.view.cursor = api_idx;
     env.view.update_selected();
     env.view.toggle_project_pin_at_cursor();
@@ -2155,9 +1596,9 @@ fn same_basename_repos_pin_independently() {
     assert_eq!(paths, vec!["/work/api".to_string()]);
 }
 
-/// "New Session" on an empty pinned project must prefill the registered repo path, so the
-/// pin-then-launch loop works: the path can only come from `group_repo_path`'s registry
-/// fallback.
+/// "New Session" on an empty pinned project (no member sessions) must prefill
+/// the registered repo path, so the pin->launch loop works: the path can only
+/// come from the registry fallback in `group_repo_path`.
 #[test]
 #[serial]
 fn empty_pinned_project_new_session_uses_registered_path() {
@@ -2183,8 +1624,9 @@ fn empty_pinned_project_new_session_uses_registered_path() {
     );
 }
 
-/// In all-profiles mode the pin registry must include every loaded profile's projects, so
-/// a profile-scoped pin keeps its empty header (CodeRabbit #2055).
+/// In all-profiles mode the pin registry must include every loaded profile's
+/// projects, not just the default profile's, so a profile-scoped pin keeps its
+/// empty header (CodeRabbit #2055).
 #[test]
 #[serial]
 fn all_profiles_view_includes_profile_scoped_pins() {
@@ -2239,9 +1681,11 @@ fn all_profiles_view_includes_profile_scoped_pins() {
     assert!(view.is_project_label_pinned("lonely"));
 }
 
-/// Unpinning a profile-scoped pin from all-profiles mode must actually clear it. #2055: the
-/// header surfaced from a non-default profile's registry while the unpin removed against
-/// `config_profile()`, so the header never disappeared.
+/// Unpinning a PROFILE-scoped pin from all-profiles mode must actually clear
+/// it. Regression for #2055: the empty header surfaced from a non-default
+/// profile's registry, but the unpin removed against `config_profile()` (the
+/// default profile) rather than the profile that owned the entry, so the
+/// header never disappeared.
 #[test]
 #[serial]
 fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
@@ -2317,11 +1761,12 @@ fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
     );
 }
 
-/// A repo pinned in both scopes (a profile entry shadowing a global one via
-/// `--allow-override`) must fully unpin in one press: `load_merged` surfaces only the
-/// shadowing entry, so clearing just that one would re-surface the global pin after a
-/// "success" dialog. Unpin sweeps every scope, clearing the flag and keeping the entries.
-/// See #2208.
+/// A repo pinned in BOTH scopes (a profile entry shadowing a global one via
+/// `--allow-override`) must fully unpin in a single press. `load_merged` only
+/// surfaces the shadowing profile entry, so clearing just that one would
+/// re-surface the global pin and leave the header pinned after a "success"
+/// dialog. Unpin sweeps every scope for the path, clearing the flag while
+/// keeping each entry. See #2208.
 #[test]
 #[serial]
 fn unpin_clears_both_global_and_profile_entries_for_a_path() {
@@ -2388,9 +1833,12 @@ fn unpin_clears_both_global_and_profile_entries_for_a_path() {
     );
 }
 
-/// Flipping `group_by` with `g` keeps the cursor on the selected session even as the list
-/// reshapes: `apply_group_by` clamped by index, landing on whatever row slid into the old
-/// slot once project headers were inserted, so the fix seeks by id after the rebuild.
+/// Pressing `g` to flip `group_by` keeps the cursor on the previously
+/// selected session, even when the list reshapes (Manual flat list →
+/// Project grouped list). Previously `apply_group_by` clamped by index,
+/// which landed the cursor on whatever row slid into the old slot once
+/// project headers got inserted. The fix seeks `selected_session` by id
+/// after the rebuild.
 #[test]
 #[serial]
 fn group_by_toggle_preserves_selected_session() {
@@ -2401,8 +1849,9 @@ fn group_by_toggle_preserves_selected_session() {
     env.view.sort_order = crate::session::config::SortOrder::Newest;
     env.view.flat_items = env.view.build_flat_items();
 
-    // The last session in the Manual flat list is the row whose index is most likely to be
-    // invalidated once project headers are inserted in front of it.
+    // Pick the last session in the Manual flat list; that's the row whose
+    // index is most likely to be invalidated when project headers get
+    // inserted in front of it.
     let target_id = env
         .view
         .flat_items
@@ -2436,13 +1885,15 @@ fn group_by_toggle_preserves_selected_session() {
         .expect("cursor must point into flat_items");
     match cursor_item {
         Item::Session { id, .. } => assert_eq!(id, &target_id),
-        Item::Group { .. } => panic!("cursor landed on a group header, not the session"),
+        _ => panic!("cursor landed on a header row, not the session"),
     }
 }
 
-/// Flipping `sort_order` with `o` keeps the cursor on the selected session. Most visible
-/// going Newest to Attention with Project grouping on, where both groups and their members
-/// reorder, so the target is unlikely to keep its index.
+/// Pressing `o` to flip `sort_order` keeps the cursor on the previously
+/// selected session. Most visible when going Newest → Attention with
+/// Project grouping on, since Attention reorders both groups (by top
+/// member) and sessions within each group, so the target session is very
+/// unlikely to keep its index across the rebuild.
 #[test]
 #[serial]
 fn sort_order_toggle_preserves_selected_session() {
@@ -2480,8 +1931,10 @@ fn sort_order_toggle_preserves_selected_session() {
     );
 }
 
-/// `reseat_cursor_after_rebuild` falls back to index clamping with no prior selection,
-/// guarding the empty-or-group-only path where the original clamp was correct.
+/// `reseat_cursor_after_rebuild` falls back to index clamping when there
+/// is no prior session selection. Guards against the helper accidentally
+/// regressing the empty-or-group-only path, where the original clamp
+/// logic was correct.
 #[test]
 #[serial]
 fn reseat_cursor_clamps_when_no_session_selected() {
@@ -2500,8 +1953,10 @@ fn reseat_cursor_clamps_when_no_session_selected() {
     );
 }
 
-/// Manual grouping plus Attention sort must still flatten: the cross-cutting flat priority
-/// view is the right behavior when the user has not opted into project grouping.
+/// Manual grouping + Attention sort must still flatten. The cross-cutting
+/// flat priority view is the original Attention design and is the right
+/// behavior when the user has not opted into project grouping. Guards
+/// against an over-eager refactor flipping both modes to grouped.
 #[test]
 #[serial]
 fn manual_grouping_attention_sort_stays_flat() {
@@ -2564,7 +2019,7 @@ fn profile_move_group_metadata_survives_reload() {
             .entry("beta".to_string())
             .or_insert_with(|| GroupTree::new_with_groups(&[], &[]));
         let requested = view.instances["moved"].clone();
-        view.move_to_profile("moved", "beta", requested, None, false)
+        view.move_to_profile_with_effect("moved", "beta", requested, None, false, |_| Ok(()))
             .unwrap();
     }
 
@@ -2594,10 +2049,13 @@ fn profile_move_group_metadata_survives_reload() {
     assert!(target_groups.iter().any(|group| group.path == "work"));
 }
 
-/// Favorite, snooze and urgent decorations render only in Attention sort. With
-/// `session.favorites_first` off the star is Attention-only, so other sorts paint the plain
-/// title even when the flag is set. The flag-on case is
-/// `favorite_decoration_shows_outside_attention_when_favorites_first`.
+/// Favorite, snooze, and urgent decorations only render in Attention sort.
+/// With `session.favorites_first` off, the star is Attention-only: in Newest
+/// (or any other sort) the row paints with its plain title and status-driven
+/// color even when the flag is set, so users who don't triage in Attention
+/// don't see decoration for state they didn't opt into managing.
+///
+/// The flag-on case is `favorite_decoration_shows_outside_attention_when_favorites_first`.
 #[test]
 #[serial]
 fn favorite_decoration_gated_to_attention_sort() {
@@ -2657,8 +2115,9 @@ fn favorite_decoration_gated_to_attention_sort() {
     crate::session::set_favorites_first(original);
 }
 
-/// With favorites-first on (the default) the star follows the pin, so a favorited row shows
-/// it in Newest too. A snoozed favorite is not pinned, so it is not decorated.
+/// With favorites-first on (the default), the star follows the pin: a
+/// favorited row shows it in Newest too, because it is pinned there.
+/// A snoozed favorite is not pinned, so it must not be decorated either.
 #[test]
 #[serial]
 fn favorite_decoration_shows_outside_attention_when_favorites_first() {
@@ -2713,8 +2172,9 @@ fn favorite_decoration_shows_outside_attention_when_favorites_first() {
     crate::session::set_favorites_first(original);
 }
 
-/// Snoozed rows show their prefix and remaining-time column only in Attention sort;
-/// elsewhere the flag persists silently and the row paints its underlying status.
+/// Snoozed rows: prefix and remaining-time column only appear in Attention
+/// sort. Outside Attention, the snooze flag persists silently and the row
+/// paints with its underlying status.
 #[test]
 #[serial]
 fn snooze_decoration_gated_to_attention_sort() {
@@ -2757,9 +2217,10 @@ fn snooze_decoration_gated_to_attention_sort() {
     );
 }
 
-/// Archived sessions live under the synthetic "Archived" section pinned to the bottom in
-/// every sort mode, not inline. The header carries the count and stays visible when
-/// collapsed.
+/// Archived sessions live under the synthetic "Archived" section pinned to
+/// the bottom of the sidebar in every sort mode, not inline at their
+/// natural position. The section header carries the count; when collapsed
+/// the archived rows themselves are hidden but the header still appears.
 #[test]
 #[serial]
 fn archived_section_pinned_to_bottom_in_every_sort() {
@@ -2824,9 +2285,10 @@ fn archived_section_pinned_to_bottom_in_every_sort() {
     }
 }
 
-/// In Project grouping, archived sessions nest under per-project sub-headers inside the
-/// Archived section rather than one flat list: Archived (depth 0) > project (depth 1) >
-/// sessions (depth 2), most recently archived first.
+/// In Project grouping mode, archived sessions must nest under per-project
+/// sub-headers inside the Archived section instead of forming one flat list.
+/// Layout: Archived (depth 0) > <project> (depth 1) > sessions (depth 2).
+/// Sessions inside a sub-folder still sort most-recently-archived first.
 #[test]
 #[serial]
 fn archived_section_nests_by_project_in_project_mode() {
@@ -2838,8 +2300,9 @@ fn archived_section_nests_by_project_in_project_mode() {
 
     let mut env = create_test_env_two_projects_mixed_attention();
     env.view.group_by = GroupByMode::Project;
-    // Pin to AZ so this asserts only the depth-0/1/2 layout; sort-order coverage lives in
-    // `archived_sub_folders_honor_sort_order`.
+    // Pin to AZ so this test asserts only the depth-0/1/2 layout shape,
+    // not the sort-order behavior. Sort_order coverage lives in
+    // `archived_sub_folders_honor_sort_order` below.
     env.view.sort_order = SortOrder::AZ;
     // Archive one session from each project so we expect two sub-folders.
     let alpha_id = env
@@ -2888,8 +2351,9 @@ fn archived_section_nests_by_project_in_project_mode() {
         _ => unreachable!(),
     }
 
-    // The next two non-session items are sub-folder headers at depth 1, "alpha" then
-    // "beta", with each folder's sessions at depth 2 following it.
+    // The next two non-session items should be sub-folder headers at depth 1,
+    // one for "alpha" and one for "beta", in alphabetical order. Between them
+    // and after the second, the sessions at depth 2 belong to that sub-folder.
     let tail = &env.view.flat_items[arch_idx + 1..];
 
     let sub_alpha_path = archived_project_sub_path("alpha");
@@ -2948,9 +2412,10 @@ fn archived_section_nests_by_project_in_project_mode() {
     }
 }
 
-/// A project whose only remaining member is archived must leave no empty phantom header in
-/// the main flow: the session shows under the Archived section, and an empty project header
-/// would be undeletable in project mode.
+/// A project whose only remaining member is archived must NOT leave an empty
+/// phantom header in the main (non-archived) flow. The archived session shows
+/// under the Archived section instead; an empty project header would be
+/// undeletable in project mode ("Project groups are automatic").
 #[test]
 #[serial]
 fn archived_only_project_leaves_no_phantom_header() {
@@ -3028,7 +2493,7 @@ fn archived_section_collapsed_hides_project_sub_folders() {
         .iter()
         .filter(|it| match it {
             Item::Group { path, .. } => is_within_archived_section(path),
-            Item::Session { .. } => false,
+            _ => false,
         })
         .collect();
     assert_eq!(
@@ -3039,9 +2504,10 @@ fn archived_section_collapsed_hides_project_sub_folders() {
     );
 }
 
-/// Collapsing one project sub-folder under Archived hides its sessions but leaves the
-/// sub-header and its siblings intact, through the same `project_group_collapsed` map as
-/// regular project mode, keyed by `archived_project_sub_path`.
+/// Collapsing a single project sub-folder under Archived hides its session
+/// rows but leaves the sub-header (and any other sub-folders) intact. Uses
+/// the same `project_group_collapsed` map that drives regular project mode
+/// collapse, keyed by the synthetic `archived_project_sub_path`.
 #[test]
 #[serial]
 fn archived_project_sub_folder_collapse_hides_only_its_sessions() {
@@ -3105,9 +2571,12 @@ fn archived_project_sub_folder_collapse_hides_only_its_sessions() {
     );
 }
 
-/// Archived project sub-folders honor `sort_order` like active project headers: AZ/ZA by
-/// name, recency sorts bringing the most recently archived to the top, Oldest inverse.
-/// Probes AZ, ZA and Newest; the other branches share `sort_archived_project_buckets`.
+/// Archived project sub-folders honor `sort_order`, mirroring how active
+/// project headers order in `flatten_tree`. AZ/ZA sort by project name;
+/// recency sorts (Newest, LastActivity, Attention) bring the most-
+/// recently-archived project to the top; Oldest does the inverse. Probes
+/// AZ, ZA, and Newest as representatives; the Oldest/LastActivity/Attention
+/// branches share the same `sort_archived_project_buckets` machinery.
 #[test]
 #[serial]
 fn archived_sub_folders_honor_sort_order() {
@@ -3187,16 +2656,7 @@ fn archived_sub_folders_honor_sort_order() {
 #[test]
 #[serial]
 fn every_view_mode_paints_the_same_sunk_row_decoration() {
-    // `render_item_line`'s three view arms each carried their own copy of the archive /
-    // snooze / favorite block, and the Tool arm had none, so an archived session in Tool
-    // view kept painting its live glyph. `decorate_row` owns the overlay for every mode
-    // now, so the three must agree.
-    //
-    // The pane views are seeded live on purpose: `ICON_IDLE` and `ICON_STOPPED` are the same
-    // glyph and an unseeded pane row is already dim, so a row whose terminal is not running
-    // renders identically with and without the sink override and every assertion would pass
-    // on a renderer that dropped `decorate_row`. Injecting the pane names into the shared
-    // tmux snapshot makes the seed a bright spinner for the override to act on.
+    // Live seeds make a missing sink overlay observable in every view.
     use crate::session::Status;
     use crate::tui::home::{ViewMode, ICON_STOPPED};
     use ratatui::style::Modifier;
@@ -3220,14 +2680,27 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
         depth: 0,
     };
 
-    let seed_panes_live = || {
-        crate::tmux::test_inject_session_into_cache(&crate::tmux::TerminalSession::generate_name(
-            &id, &title,
-        ));
-        crate::tmux::test_inject_session_into_cache(&crate::tmux::ToolSession::generate_name(
-            &id, &title, "lazygit",
-        ));
-    };
+    env.view.mutate_instance(&id, |instance| {
+        use crate::session::{AuxiliaryObservation, AuxiliaryTarget, PanePresence};
+        instance.auxiliary = vec![
+            AuxiliaryObservation {
+                target: AuxiliaryTarget::Host { index: 0 },
+                pane: crate::session::PaneObservation {
+                    state: PanePresence::Alive,
+                    tmux_session: Some("host".into()),
+                },
+            },
+            AuxiliaryObservation {
+                target: AuxiliaryTarget::Tool {
+                    tool_name: "lazygit".to_owned(),
+                },
+                pane: crate::session::PaneObservation {
+                    state: PanePresence::Alive,
+                    tmux_session: Some("tool".into()),
+                },
+            },
+        ];
+    });
 
     // (label, archived, snoozed, expected title prefix, extra modifiers)
     let cases = [
@@ -3250,7 +2723,6 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
 
         // Anti-vacuity: a live, unsunk row must NOT already look sunk, or the
         // sink assertions below prove nothing about this mode.
-        seed_panes_live();
         env.view.mutate_instance(&id, |inst| {
             inst.status = Status::Running;
             inst.archived_at = None;
@@ -3265,7 +2737,6 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
         );
 
         for (label, archived, snoozed, prefix, extra) in cases {
-            seed_panes_live();
             // Status stays Running so the live-glyph branch would fire in
             // every mode if the sink override were missing.
             env.view.mutate_instance(&id, |inst| {
@@ -3300,13 +2771,13 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
             );
         }
 
-        // Error and Deleting punch through the sink mask in Structured only, where the
-        // seed carries ICON_ERROR + theme.error so a failed Empty Trash stays
-        // distinguishable. The pane views seed from terminal liveness and have no error
-        // affordance, so punching through would paint a bright "still alive" row in the
-        // shelf while signalling nothing.
+        // Error and Deleting punch through the sink mask in Structured only.
+        // There the seed carries ICON_ERROR + theme.error, so a failed Empty
+        // Trash stays distinguishable from a healthy trash row. The pane views
+        // seed from terminal liveness and have no error affordance, so
+        // punching through would paint a bright animated "still alive" row
+        // inside the Archived shelf while signalling nothing about the failure.
         for status in [Status::Error, Status::Deleting] {
-            seed_panes_live();
             env.view.mutate_instance(&id, |inst| {
                 inst.status = status;
                 inst.archived_at = Some(chrono::Utc::now());
@@ -3323,12 +2794,15 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
     }
 }
 
-/// The paint path must never fork tmux, however cold the shared snapshots are: every tmux
-/// question a frame needs is answered from `SESSION_CACHE` / `PANE_META_CACHE` and
-/// `LiveCaptureWorker` frames. Walks the three view modes across an empty cache, a
-/// fresh-but-absent snapshot and an expired one, counting forks on the paint thread through
-/// the `tmux_command()` probe. Worker threads are not armed, so their captures don't
-/// count.
+/// Regression: the TUI paint path must never fork tmux, no matter how cold
+/// the shared snapshots are. Every tmux question a frame needs is answered
+/// from `SESSION_CACHE` / `PANE_META_CACHE` by a background poller and from
+/// `LiveCaptureWorker` frames; this walks Structured / Terminal / Tool view
+/// modes across an empty cache, a fresh-but-absent snapshot, and an expired
+/// one (the states that used to trigger synchronous refreshes from render)
+/// and counts forks on the paint thread via the probe at
+/// `tmux_command()`. Worker threads are NOT armed, so their legitimate
+/// captures don't count.
 #[test]
 #[serial]
 fn paint_never_forks_tmux_even_with_empty_absent_or_expired_caches() {
@@ -3351,9 +2825,10 @@ fn paint_never_forks_tmux_even_with_empty_absent_or_expired_caches() {
     ];
     for mode in modes {
         env.view.view_mode = mode.clone();
-        // Cache states: (session snapshot, pane snapshot). "Cold boot" is never refreshed,
-        // "absent" is fresh without our session, "expired" is populated past CACHE_TTL. All
-        // three used to make paint refresh synchronously.
+        // Cache states: (session snapshot, pane snapshot). "Cold boot" is the
+        // never-refreshed state; "absent" is fresh but without our session;
+        // "expired" is populated but past CACHE_TTL. All three used to make
+        // paint refresh synchronously.
         let states = [("cold-boot", 0), ("fresh-absent", 1), ("expired", 2)];
         for (label, state) in states {
             match state {
@@ -3396,11 +2871,13 @@ fn paint_never_forks_tmux_even_with_empty_absent_or_expired_caches() {
     }
 }
 
-/// A frozen (scrolled-back) preview must still be able to grow its capture: only worker
-/// frames write the cache, so the reading-depth budget has to reach the worker while frozen
-/// and an adequate frame has to be applied, or scrollback reads hit a wall at the live-edge
-/// window. An inadequate frame is skipped rather than applied, since it would clamp the
-/// held offset against too few lines and snap toward the live edge.
+/// Regression: a frozen (scrolled-back) preview must still be able to GROW
+/// its capture. Only worker frames write the cache now, so the reading-depth
+/// budget has to reach the worker while frozen and an adequate frame has to
+/// be applied; otherwise scrollback reads hit a hard wall at the live-edge
+/// window (~CAPTURE_BUFFER rows past the viewport). An inadequate frame is
+/// skipped rather than applied: it would clamp the held offset against too
+/// few lines and snap the view toward the live edge.
 #[test]
 #[serial]
 fn frozen_preview_grows_only_on_coverage_extending_frames() {
@@ -3444,9 +2921,12 @@ fn frozen_preview_grows_only_on_coverage_extending_frames() {
     );
 }
 
-/// A frame captured before the last retarget must never land under the new view. The
-/// consumer-side `frame_is_current` guard is the last defense against the worker publishing
-/// an old-generation frame after `set_target` cleared the mailbox.
+/// Regression: a frame captured before the last retarget must never land
+/// under the new view. The consumer-side `frame_is_current` guard is the
+/// last line of defense against the race where the worker publishes an
+/// old-generation frame after `set_target` cleared the mailbox; without
+/// this test, deleting the guard reintroduces the previous pane's bytes
+/// under the new header.
 #[test]
 #[serial]
 fn preview_rejects_frames_from_previous_generation() {
@@ -3456,8 +2936,9 @@ fn preview_rejects_frames_from_previous_generation() {
     env.view
         .sync_preview_capture_worker(Some("aoe_test_new_target".to_string()));
     if let Some(worker) = env.view.preview_capture_worker.as_ref() {
-        // Idle the real capture thread before injection, so it cannot overwrite the
-        // synthetic stale frame and pass the test by accident.
+        // Idle the real capture thread before injection, so it cannot
+        // overwrite the synthetic stale frame and make the test pass by
+        // accident even if the consumer guard is deleted.
         worker.set_target(String::new());
         worker.inject_stale_generation_frame_for_test(40, "previous pane bytes");
     }
@@ -3470,10 +2951,11 @@ fn preview_rejects_frames_from_previous_generation() {
     );
 }
 
-/// Entering live-send while a blocking capture is in flight must revalidate the empty-frame
-/// policy on the consumer: an empty frame captured just before the transition cannot blank
-/// the agent pane (#1501), and the same restored frame must clear stale content after
-/// live-send exits.
+/// Regression: entering live-send while a blocking capture is in flight must
+/// revalidate the empty-frame policy on the consumer. An empty frame captured
+/// just before the transition cannot blank the agent/tool pane under the
+/// user's cursor (#1501); the same restored frame must clear stale content
+/// after live-send exits.
 #[test]
 #[serial]
 fn preview_revalidates_empty_policy_across_live_transition() {
@@ -3555,9 +3037,9 @@ fn passive_completion_invalidates_only_matching_agent_live_geometry() {
     }
 }
 
-/// A worker that stops advancing is replaced after the tmux deadline, while a normal
-/// retarget clears heartbeat history. Removing either reset leaves the old worker or the old
-/// target's liveness attached to the displayed pane.
+/// A worker that stops advancing is replaced after the tmux deadline, while a
+/// normal retarget clears heartbeat history. Removing either reset leaves the
+/// old worker or old target's liveness attached to the displayed pane.
 #[test]
 fn stalled_preview_worker_restarts_and_retarget_resets_heartbeat() {
     let mut env = create_test_env_empty();
@@ -3607,9 +3089,10 @@ fn stalled_preview_worker_restarts_and_retarget_resets_heartbeat() {
     );
 }
 
-/// #3611: trashed-row healing must not run before the first frame. `HomeView::new` hands it
-/// to `ReconcilePoller`, so the repair lands through `apply_reconcile_results`. This row
-/// needs only a pointer repair, so the sweep reaches durable state without git.
+/// #3611: trashed-row healing must not run before the first frame. `HomeView::new`
+/// hands it to `ReconcilePoller`, so the repair lands through
+/// `apply_reconcile_results` instead. This row needs only a pointer repair, so
+/// the sweep reaches durable state without git.
 #[test]
 #[serial]
 fn trashed_row_healing_lands_through_the_reconcile_poller() {
@@ -3661,9 +3144,9 @@ fn trashed_row_healing_lands_through_the_reconcile_poller() {
     );
 }
 
-/// The reconcile sweep's reload must respect the same live-send gate every other storage
-/// reload uses, and the worker's verdict must survive being skipped rather than being
-/// drained and dropped.
+/// the reconcile sweep's reload must respect the same live-send
+/// gate every other storage reload uses, and the worker's verdict must survive
+/// being skipped rather than being drained and dropped.
 #[test]
 #[serial]
 fn reconcile_reload_waits_for_live_send_to_finish() {
@@ -3679,6 +3162,7 @@ fn reconcile_reload_waits_for_live_send_to_finish() {
         target: LiveSendTarget::Agent,
         exit_chords: Vec::new(),
         leader: None,
+        remote: None,
     });
 
     assert!(
@@ -3693,10 +3177,12 @@ fn reconcile_reload_waits_for_live_send_to_finish() {
     );
 }
 
-/// Startup auto-recovery launches from `project_path` and records each attempt in a
-/// boot-scoped ledger that is not retried, so it must not run until the reconcile sweep can
-/// repoint a row whose worktree moved outside aoe (#2002). `HomeView::new` arms the gate
-/// instead of starting recovery, and `apply_reconcile_results` releases it exactly once.
+/// startup auto-recovery launches from `project_path` and records
+/// each attempt in a boot-scoped ledger that is not retried, so it must not run
+/// until the reconcile sweep has had its chance to repoint a row whose worktree
+/// moved outside aoe (#2002). `HomeView::new` therefore arms the gate instead of
+/// starting recovery, and `apply_reconcile_results` releases it exactly once,
+/// whether or not the sweep changed anything.
 #[test]
 #[serial]
 fn startup_recovery_waits_for_the_first_reconcile_sweep() {
@@ -3748,10 +3234,11 @@ fn startup_recovery_waits_for_the_first_reconcile_sweep() {
     assert!(view.startup_recovery_gate.is_none());
 }
 
-/// The gate cannot outlive its deadline: `Storage::update` blocks on a contended profile
-/// flock with no timeout, so a peer holding it leaves the sweep worker neither delivering a
-/// result nor disconnecting, and gating recovery forever would trade "recovery used a stale
-/// path" for "recovery never ran".
+/// the gate cannot outlive its deadline.
+/// `Storage::update` blocks on a contended profile flock with no timeout, so a
+/// peer holding that lock leaves the sweep worker neither delivering a result
+/// nor disconnecting. Gating recovery on that forever would trade "recovery
+/// used a stale path" for "recovery never ran", which is the worse failure.
 #[test]
 #[serial]
 fn startup_recovery_gate_expires_when_the_sweep_never_lands() {
@@ -3783,9 +3270,9 @@ fn startup_recovery_gate_expires_when_the_sweep_never_lands() {
     );
 }
 
-/// A failed reload must not be retried every tick: `apply_reconcile_results` runs ~30 times
-/// a second, so an unreadable store would spin on storage and flood the log where every
-/// other reload in that loop is throttled.
+/// A failed reload must not be retried on every tick. `apply_reconcile_results`
+/// runs ~30 times a second, so an unreadable store would spin on storage and
+/// flood the log where every other reload in that loop is throttled.
 #[test]
 #[serial]
 fn a_failed_reload_backs_off_instead_of_retrying_every_tick() {
@@ -3864,6 +3351,7 @@ fn startup_recovery_gate_expires_during_live_send() {
         target: LiveSendTarget::Agent,
         exit_chords: Vec::new(),
         leader: None,
+        remote: None,
     });
     view.startup_recovery_gate =
         Some(std::time::Instant::now() - HomeView::STARTUP_RECOVERY_GATE_TIMEOUT);
@@ -3875,9 +3363,10 @@ fn startup_recovery_gate_expires_during_live_send() {
     );
 }
 
-/// A repair queued in the channel must be applied to `instances` before the gate opens,
-/// deadline or not: releasing first let startup recovery clone a `project_path` the sweep
-/// had already fixed and spend that row's one boot attempt on it.
+/// a repair queued in the channel must be applied to `instances`
+/// before the gate opens, deadline or not. Releasing first let startup recovery
+/// clone a `project_path` the sweep had already fixed on disk and spend that
+/// row's one boot-scoped attempt on it, which is what the gate exists to stop.
 #[test]
 #[serial]
 fn a_queued_repair_is_applied_before_the_gate_opens_at_the_deadline() {
@@ -3972,6 +3461,7 @@ fn a_queued_repair_keeps_the_gate_armed_while_live_send_holds_the_reload() {
         target: LiveSendTarget::Agent,
         exit_chords: Vec::new(),
         leader: None,
+        remote: None,
     });
 
     assert!(
@@ -3993,8 +3483,9 @@ fn a_queued_repair_keeps_the_gate_armed_while_live_send_holds_the_reload() {
     assert!(view.startup_recovery_gate.is_none());
 }
 
-/// A failed reload must keep the repair pending and the gate shut. Clearing the flag before
-/// the fallible call dropped the repair and released recovery against stale rows.
+/// a failed reload must keep the repair pending and the gate shut.
+/// Clearing the flag before the fallible call dropped the repair and released
+/// recovery against stale rows, which is the failure the gate exists to prevent.
 #[test]
 #[serial]
 fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
@@ -4051,9 +3542,10 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
         "the in-memory row is still the stale one"
     );
 
-    // The repair is retried, not lost, once storage is readable. The retry is throttled, so
-    // let the backoff elapse as a later tick would;
-    // `a_failed_reload_backs_off_instead_of_retrying_every_tick` covers the throttle.
+    // The repair is retried, not lost, once storage is readable again. The
+    // retry is throttled, so let the backoff elapse as a later tick would;
+    // `a_failed_reload_backs_off_instead_of_retrying_every_tick` covers the
+    // throttle itself.
     std::fs::remove_dir(&groups).unwrap();
     std::fs::write(&groups, "[]").unwrap();
     view.reconcile_reload_retry_at = Some(std::time::Instant::now());

@@ -132,28 +132,29 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
     fetchGroups().then((g) => dispatch({ type: "SET_GROUPS", groups: g }));
     fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
-    // A remembered or prefilled path is never selected in ProjectStep, so seed its override here.
+    // Seed resolved profile defaults and the remembered project override together.
     const initialPath = state.data.path;
-    const projectSeed = initialPath
-      ? fetchProjects()
-          .then((projects) => {
-            const key = normalizeProjectPathKey(initialPath);
-            const override = projects.find((p) => normalizeProjectPathKey(p.path) === key)?.overrides?.worktree_enabled;
-            if (override !== undefined) {
-              dispatch({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override, path: initialPath });
-            }
-          })
-          .catch(() => {})
-      : Promise.resolve();
-    // Seed resolved profile defaults: the profile picker is hidden for single-profile users.
-    const settingsSeed = fetchProfiles()
+    const defaultsSeed = fetchProfiles()
       // A failed profiles fetch must not skip settings: an explicit prefill
       // profile, or the unresolved global config, still applies.
       .catch(() => [] as Awaited<ReturnType<typeof fetchProfiles>>)
-      .then((p) => {
-        dispatch({ type: "SET_PROFILES", profiles: p });
-        const effectiveProfile = prefill?.profile || p.find((x) => x.is_default)?.name || "";
-        return fetchSettings(effectiveProfile || undefined);
+      .then((profiles) => {
+        dispatch({ type: "SET_PROFILES", profiles });
+        const effectiveProfile = prefill?.profile || profiles.find((profile) => profile.is_default)?.name || "";
+        const projectSeed =
+          initialPath && effectiveProfile
+            ? fetchProjects({ profile: effectiveProfile })
+                .then((projects) => {
+                  const key = normalizeProjectPathKey(initialPath);
+                  const override = projects?.find((project) => normalizeProjectPathKey(project.path) === key)?.overrides
+                    ?.worktree_enabled;
+                  if (override !== undefined) {
+                    dispatch({ type: "SEED_PROJECT_WORKTREE_OVERRIDE", override, path: initialPath });
+                  }
+                })
+                .catch(() => {})
+            : Promise.resolve();
+        return Promise.all([fetchSettings(effectiveProfile || undefined), projectSeed]).then(([settings]) => settings);
       })
       .then((s) => {
         if (!s) return;
@@ -171,7 +172,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
         });
       })
       .catch(() => {});
-    void Promise.all([settingsSeed, projectSeed]).then(() => setDefaultsReady(true));
+    void defaultsSeed.then(() => setDefaultsReady(true));
     // Seed once; a re-render with a new prefill object must not stomp user edits.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -281,6 +282,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
           {!nameOnly && (
             <ProjectStep
               data={state.data}
+              profile={state.data.profile || state.profiles.find((profile) => profile.is_default)?.name}
               onChange={handleChange}
               initialTab={prefill?.initialTab}
               agents={state.agents}

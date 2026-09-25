@@ -30,18 +30,6 @@ impl FileStatus {
             FileStatus::Conflicted => 'U',
         }
     }
-
-    pub fn label(&self) -> &'static str {
-        match self {
-            FileStatus::Added => "added",
-            FileStatus::Modified => "modified",
-            FileStatus::Deleted => "deleted",
-            FileStatus::Renamed => "renamed",
-            FileStatus::Copied => "copied",
-            FileStatus::Untracked => "untracked",
-            FileStatus::Conflicted => "conflicted",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

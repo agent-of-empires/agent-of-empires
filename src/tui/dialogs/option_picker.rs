@@ -34,7 +34,7 @@ impl GroupPickerDialog {
         use GroupByMode::*;
         Self::with_options(
             " Group By ",
-            &[Manual, Project, Org],
+            &[Manual, Project, Org, Remote],
             GroupByMode::label,
             current,
         )
@@ -166,7 +166,7 @@ mod tests {
         }
         assert!(matches!(
             dialog.handle_key(key(KeyCode::Enter)),
-            DialogResult::Submit(GroupByMode::Org)
+            DialogResult::Submit(GroupByMode::Remote)
         ));
     }
 }

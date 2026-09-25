@@ -104,7 +104,7 @@ percent-encoding = "2"
 tokio-util = { version = "0.7", features = ["codec", "compat"] }
 
 # Process handling
-nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource", "dir", "user", "poll"] }
+nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource", "dir", "user", "poll", "hostname"] }
 
 # Unicode width + normalization (NFKD used to fold accents in title-derived branch names)
 unicode-normalization = "0.1"
@@ -147,6 +147,8 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # Daemon HTTP/WS server. Core: the daemon is the product, the dashboard is one
 # surface on it (see the `web` feature).
 axum = { version = "0.8", features = ["ws"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 # Cross-platform browser launcher: `aoe serve --open`, the plugin host's
 # `ui.open_url`, and structured-view link activation.
 webbrowser = "1"
@@ -243,6 +245,10 @@ serde_json = "1.0"
 # dependency; the build-cache guard test parses .cargo/config.toml.
 toml = "1.1"
 cargo-husky = { version = "1", default-features = false, features = ["precommit-hook", "run-cargo-fmt"] }
+# Writes the dashboard's copy of the live-stream wire types from the Rust
+# ones (`src/daemon/live.rs`) when the lib tests run. Test-only: the derive is
+# behind `cfg(test)`, so no released binary links it.
+ts-rs = { version = "12", features = ["chrono-impl"] }
 # Test-only tower dep for `ServiceExt::oneshot`, so the DNS-rebinding gate
 # (#2735) can be driven through the real router without binding a socket.
 tower = { version = "0.5", features = ["util"] }

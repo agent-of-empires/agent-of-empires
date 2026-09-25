@@ -61,7 +61,13 @@ struct LoginSession {
     /// User-agent string captured at login, for a friendly device
     /// label in the devices view. Display-only.
     user_agent: String,
+    /// Set for a session enrolled with a pairing code rather than the
+    /// passphrase. A paired session authenticates without the token and
+    /// survives passphrase changes.
+    device_name: Option<String>,
     /// Deadline value at the last time this session was persisted to disk.
+    /// Drives `REFRESH_PERSIST_THRESHOLD` coalescing, so a sliding refresh
+    /// writes only once it has moved far enough. Never serialized. See #1235.
     last_persisted_expires_at: Instant,
 }
 
@@ -158,6 +164,35 @@ impl LoginManager {
         created_ip: &str,
         user_agent: &str,
     ) -> String {
+        self.insert_session(binding_secret_bytes, created_ip, user_agent, None)
+            .await
+    }
+
+    /// Create a device-bound session for a client that redeemed a pairing
+    /// code. Same lifetime and binding rules as a passphrase session.
+    pub async fn create_paired_session(
+        &self,
+        binding_secret_bytes: &[u8],
+        created_ip: &str,
+        user_agent: &str,
+        device_name: &str,
+    ) -> String {
+        self.insert_session(
+            binding_secret_bytes,
+            created_ip,
+            user_agent,
+            Some(device_name.to_string()),
+        )
+        .await
+    }
+
+    async fn insert_session(
+        &self,
+        binding_secret_bytes: &[u8],
+        created_ip: &str,
+        user_agent: &str,
+        device_name: Option<String>,
+    ) -> String {
         let session_id = super::generate_token();
         let now = Instant::now();
         let session = LoginSession {
@@ -169,6 +204,7 @@ impl LoginManager {
             created_at: SystemTime::now(),
             created_ip: created_ip.to_string(),
             user_agent: user_agent.to_string(),
+            device_name,
             last_persisted_expires_at: now + SESSION_LIFETIME,
         };
 
@@ -195,8 +231,19 @@ impl LoginManager {
 
     /// Validate a session.
     pub async fn validate_session(&self, session_id: &str, presented_binding: &[u8]) -> bool {
+        self.validate_session_kind(session_id, presented_binding)
+            .await
+            .is_some()
+    }
+
+    /// [`Self::validate_session`], reporting how the session was enrolled.
+    pub async fn validate_session_kind(
+        &self,
+        session_id: &str,
+        presented_binding: &[u8],
+    ) -> Option<SessionKind> {
         if session_id.is_empty() || presented_binding.len() != BINDING_SECRET_BYTES {
-            return false;
+            return None;
         }
 
         let presented_hash = hash_binding_secret(presented_binding);
@@ -208,17 +255,14 @@ impl LoginManager {
         let mut refreshed_deadline: Option<Instant> = None;
         let valid = {
             let mut sessions = self.sessions.write().await;
-            let Some(session) = sessions.get_mut(session_id) else {
-                return false;
-            };
+            let session = sessions.get_mut(session_id)?;
 
             if Instant::now() > session.expires_at {
                 sessions.remove(session_id);
                 needs_persist = true;
-                false
+                None
             } else if session.binding_hash.ct_eq(&presented_hash).unwrap_u8() == 0 {
-                // Constant-time compare.
-                false
+                None
             } else {
                 // Sliding window: extend expiry on each valid access.
                 let new_expiry = Instant::now() + SESSION_LIFETIME;
@@ -229,7 +273,11 @@ impl LoginManager {
                     needs_persist = true;
                     refreshed_deadline = Some(new_expiry);
                 }
-                true
+                Some(if session.device_name.is_some() {
+                    SessionKind::Paired
+                } else {
+                    SessionKind::Passphrase
+                })
             }
         };
 
@@ -399,6 +447,7 @@ impl LoginManager {
                     created_at: chrono::DateTime::<chrono::Utc>::from(s.created_at),
                     last_seen: chrono::DateTime::<chrono::Utc>::from(last_seen),
                     current: current_session_id == Some(id.as_str()),
+                    device_name: s.device_name.clone(),
                 }
             })
             .collect();
@@ -455,7 +504,16 @@ impl LoginManager {
     }
 }
 
-/// Hash a device binding secret with SHA-256.
+/// How a login session was enrolled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionKind {
+    Passphrase,
+    Paired,
+}
+
+/// Hash a device binding secret with SHA-256. The input carries 256 bits of
+/// entropy from the client's `crypto.getRandomValues`, so plain SHA-256 needs
+/// no process-scoped secret.
 fn hash_binding_secret(secret: &[u8]) -> [u8; 32] {
     Sha256::digest(secret).into()
 }
@@ -473,6 +531,9 @@ pub struct DeviceSession {
     /// True for the session making the request, so the UI can label
     /// "this device" and guard self-revocation.
     pub current: bool,
+    /// Name a paired client gave itself; absent for passphrase logins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
 }
 
 /// On-disk shape of `login_sessions.toml`. `passphrase_hash` is the argon2 PHC string of
@@ -505,6 +566,8 @@ struct PersistedSession {
     /// Lockout deadline as Unix epoch milliseconds; 0 means no lockout.
     #[serde(default)]
     elevation_locked_until_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_name: Option<String>,
 }
 
 /// Convert an in-memory `Instant` deadline to a wall-clock epoch-ms value for persistence.
@@ -541,6 +604,7 @@ fn build_persisted(
                 .elevation_locked_until
                 .map(|d| instant_deadline_to_ms(d, now_inst, now))
                 .unwrap_or(0),
+            device_name: s.device_name.clone(),
         })
         .collect();
 
@@ -553,8 +617,11 @@ fn build_persisted(
 
 /// Atomically write the session store, owner-only (0600).
 fn write_sessions(path: &Path, file: &PersistedFile) -> bool {
-    // The no-symlink, owner-only invariant belongs on the write path too, not just at load.
-    if let Err(e) = check_path_security(path) {
+    // The no-symlink, owner-only invariant belongs on the write path too,
+    // not just at load. `atomic_write` resolves symlinks and writes through
+    // to the target, so an unguarded persist would hand the session secret
+    // to whatever a planted link points at. See #1235, #3186.
+    if let Err(e) = crate::util::check_owner_only_file(path, "login sessions") {
         tracing::warn!(
             target: "auth.passphrase",
             error = %e,
@@ -584,44 +651,11 @@ fn write_sessions(path: &Path, file: &PersistedFile) -> bool {
     true
 }
 
-/// Fail-closed check that the sessions store is safe to read from or write to.
-fn check_path_security(path: &Path) -> anyhow::Result<()> {
-    use anyhow::{bail, Context};
-
-    if let Some(parent) = path.parent() {
-        let pmeta = std::fs::symlink_metadata(parent).context("stat login sessions parent dir")?;
-        if pmeta.file_type().is_symlink() {
-            bail!("login sessions parent dir is a symlink; refusing");
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if pmeta.permissions().mode() & 0o022 != 0 {
-                bail!("login sessions parent dir is group/world writable; refusing");
-            }
-        }
-    }
-
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                bail!("login sessions path is a symlink; refusing");
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if meta.permissions().mode() & 0o077 != 0 {
-                    bail!("login sessions file is group/world accessible; refusing");
-                }
-            }
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).context("stat login sessions file"),
-    }
-}
-
-/// Load and rehydrate persisted sessions.
+/// Load and rehydrate persisted sessions. Returns an empty map (not an
+/// error) for the benign cases: file missing, schema mismatch, or
+/// passphrase changed. Returns `Err` only for states that warrant a
+/// visible warning (symlink, loose perms, unreadable, unparseable), in
+/// which case the caller also starts empty. See #1235.
 fn load_sessions(
     path: &Path,
     passphrase: Option<&str>,
@@ -630,7 +664,7 @@ fn load_sessions(
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
 
-    check_path_security(path)?;
+    crate::util::check_owner_only_file(path, "login sessions")?;
 
     let raw = match std::fs::read_to_string(path) {
         Ok(r) => r,
@@ -649,26 +683,23 @@ fn load_sessions(
         return Ok(HashMap::new());
     }
 
-    // Without a configured passphrase there is no login gate, so any
-    // persisted sessions are meaningless; start clean.
-    let Some(passphrase) = passphrase else {
-        return Ok(HashMap::new());
+    // Passphrase sessions survive only while the same passphrase is
+    // configured. Paired sessions never depended on it, so they stay.
+    let passphrase_unchanged = match (passphrase, file.passphrase_hash.as_deref()) {
+        (Some(passphrase), Some(hash)) => argon2_verify(passphrase, hash),
+        _ => false,
     };
-    // Drop everything if the passphrase changed since the file was
-    // written (or the file carries no hash to verify against).
-    match file.passphrase_hash.as_deref() {
-        Some(hash) if argon2_verify(passphrase, hash) => {}
-        _ => {
-            let n = file.sessions.len();
-            if n > 0 {
-                tracing::info!(
-                    target: "auth.passphrase",
-                    dropped = n,
-                    "passphrase changed since last run; persisted sessions invalidated"
-                );
-            }
-            return Ok(HashMap::new());
-        }
+    let dropped = file
+        .sessions
+        .iter()
+        .filter(|s| s.device_name.is_none() && !passphrase_unchanged)
+        .count();
+    if dropped > 0 && passphrase.is_some() {
+        tracing::info!(
+            target: "auth.passphrase",
+            dropped,
+            "passphrase changed since last run; persisted sessions invalidated"
+        );
     }
 
     let now_inst = Instant::now();
@@ -677,6 +708,9 @@ fn load_sessions(
 
     let mut out = HashMap::new();
     for ps in file.sessions {
+        if ps.device_name.is_none() && !passphrase_unchanged {
+            continue;
+        }
         // Drop already-expired entries; clamp future deadlines back to
         // the lifetime ceiling (clock skew or tampering).
         if ps.expires_at_ms <= now {
@@ -716,6 +750,7 @@ fn load_sessions(
                 created_at,
                 created_ip: ps.created_ip,
                 user_agent: ps.user_agent,
+                device_name: ps.device_name,
                 last_persisted_expires_at: expires_at,
             },
         );
@@ -768,11 +803,18 @@ pub struct LoginRequest {
 /// POST /api/login
 pub async fn login_handler(
     State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    peer: super::peer::ConnectionPeer,
     headers: axum::http::HeaderMap,
     login_body: Result<Json<LoginRequest>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
-    let client_ip = resolve_client_ip(addr, &headers);
+    let super::peer::ConnectionPeer::Tcp(addr) = peer else {
+        return (
+            StatusCode::CONFLICT,
+            "Local owner authentication does not use browser login",
+        )
+            .into_response();
+    };
+    let client_ip = resolve_client_ip(addr, &headers, state.behind_tunnel);
 
     if !state.login_manager.is_enabled() {
         return (
@@ -899,10 +941,17 @@ pub struct ElevateRequest {
 /// POST /api/login/elevate
 pub async fn elevate_handler(
     State(state): State<Arc<AppState>>,
-    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    peer: super::peer::ConnectionPeer,
     request: axum::extract::Request,
 ) -> axum::response::Response {
-    let client_ip = resolve_client_ip(addr, request.headers());
+    let super::peer::ConnectionPeer::Tcp(addr) = peer else {
+        return (
+            StatusCode::CONFLICT,
+            "Local owner authentication does not use browser elevation",
+        )
+            .into_response();
+    };
+    let client_ip = resolve_client_ip(addr, request.headers(), state.behind_tunnel);
 
     if !state.login_manager.is_enabled() {
         return (
@@ -1109,6 +1158,17 @@ pub async fn login_status_handler(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
 ) -> Json<serde_json::Value> {
+    if matches!(
+        request
+            .extensions()
+            .get::<super::auth::LocalAuthorization>(),
+        Some(super::auth::LocalAuthorization::UnixOwner(_))
+    ) {
+        return Json(serde_json::json!({
+            "required": false, "authenticated": true, "elevated": true,
+            "elevated_until_secs": null, "principal": "local_owner"
+        }));
+    }
     let required = state.login_manager.is_enabled();
 
     if !required {
@@ -1503,6 +1563,40 @@ mod tests {
         );
     }
 
+    /// A pairing-code session is bound to its device, not to the passphrase,
+    /// so it has to survive a passphrase change and its removal. Only an
+    /// explicit logout ends it.
+    #[tokio::test]
+    async fn paired_sessions_outlive_passphrase_changes_and_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (login, paired) = (binding(0xB3), binding(0xB4));
+        let (login_id, paired_id) = {
+            let mgr = LoginManager::with_persistence(Some("first-pass"), dir.path());
+            (
+                mgr.create_session(&login, "127.0.0.1", "browser").await,
+                mgr.create_paired_session(&paired, "10.0.0.9", "aoe-remote", "laptop")
+                    .await,
+            )
+        };
+
+        for passphrase in [Some("second-pass"), None] {
+            let mgr = LoginManager::with_persistence(passphrase, dir.path());
+            assert!(!mgr.validate_session(&login_id, &login).await);
+            assert_eq!(
+                mgr.validate_session_kind(&paired_id, &paired).await,
+                Some(SessionKind::Paired),
+                "{passphrase:?}"
+            );
+            let devices = mgr.device_snapshot(None).await;
+            assert_eq!(devices.len(), 1);
+            assert_eq!(devices[0].device_name.as_deref(), Some("laptop"));
+        }
+
+        let mgr = LoginManager::with_persistence(None, dir.path());
+        assert_eq!(mgr.logout_all().await, 1);
+        assert!(!mgr.validate_session(&paired_id, &paired).await);
+    }
+
     #[tokio::test]
     async fn logout_all_clears_and_persists() {
         let dir = tempfile::tempdir().unwrap();
@@ -1539,6 +1633,7 @@ mod tests {
                 user_agent: "old".to_string(),
                 elevation_failures: 0,
                 elevation_locked_until_ms: 0,
+                device_name: None,
             }],
         };
         write_sessions(&path, &file);
@@ -1574,7 +1669,7 @@ mod tests {
             sessions: vec![],
         };
         assert!(!write_sessions(&store, &file));
-        assert!(check_path_security(&store).is_err());
+        assert!(crate::util::check_owner_only_file(&store, "login sessions").is_err());
 
         let _mgr = LoginManager::with_persistence(Some("pass"), dir.path());
         assert_eq!(
@@ -1589,8 +1684,16 @@ mod tests {
             let path = dir.path().join(format!("perm{mode:o}.toml"));
             std::fs::write(&path, "x").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-            assert_eq!(check_path_security(&path).is_ok(), ok, "mode {mode:o}");
+            assert_eq!(
+                crate::util::check_owner_only_file(&path, "login sessions").is_ok(),
+                ok,
+                "mode {mode:o}"
+            );
         }
-        assert!(check_path_security(&dir.path().join("missing.toml")).is_ok());
+        assert!(crate::util::check_owner_only_file(
+            &dir.path().join("missing.toml"),
+            "login sessions"
+        )
+        .is_ok());
     }
 }

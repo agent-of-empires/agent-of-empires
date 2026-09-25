@@ -1,20 +1,21 @@
 //! Session operations for HomeView (create, delete, rename)
 
-use crate::session::builder::{self, InstanceParams};
-use crate::session::conversation_carry;
 use crate::session::{
     acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, list_profiles,
     GroupMovePlan, Instance, Item, LifecycleOperation, Status, Storage,
 };
 use crate::tui::deletion_poller::DeletionRequest;
-use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
-use crate::tui::restart_poller::RestartRequest;
+use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog};
+use crate::tui::remote_delete;
 
-use super::HomeView;
+use super::{HomeView, PendingArchiveCursor};
 
-/// Matches instances whose `group_path` is `group_path` or nests beneath it,
-/// optionally scoped to one profile. `prefix` must be `"{group_path}/"`; callers
-/// already have it computed.
+/// Membership predicate for a manual group: matches instances whose
+/// `group_path` equals `group_path` or nests beneath it, optionally scoped to
+/// a single owning profile (`None` matches every profile). `prefix` must be
+/// `"{group_path}/"`; it is taken as an argument rather than computed here
+/// because `group_has_managed_worktrees` / `group_has_containers` already
+/// receive it precomputed from their call sites.
 fn group_membership<'a>(
     group_path: &'a str,
     prefix: &'a str,
@@ -47,21 +48,14 @@ fn rekey_tmux_after_persist(id: &str, old_title: &str, new_title: &str) -> Optio
     }
 }
 
-/// Compact snooze label (`"30 min"`, `"1 hr"`, `"2 hr 30 min"`), general for any
-/// value even though the picker only submits 30 / 60 / 1440.
-fn humanize_minutes(m: u32) -> String {
-    let hours = m / 60;
-    let mins = m % 60;
-    match (hours, mins) {
-        (0, _) => format!("{} min", mins),
-        (_, 0) => format!("{} hr", hours),
-        _ => format!("{} hr {} min", hours, mins),
-    }
-}
-
-/// Why a tied-worktree rename must refuse to move the worktree directory: the
-/// `rename(2)` behind `git worktree move` fails while an agent or a sandbox
-/// container (alive even when Idle) holds the dir. Stopping the session clears both.
+/// Why a tied-worktree rename must refuse to move the worktree directory.
+///
+/// `git worktree move` does a `rename(2)` on the worktree dir, which the
+/// kernel refuses while anything holds it. Two distinct holders matter and
+/// they need different wording: an active agent (the session's `status`),
+/// and a sandbox session's container, which bind-mounts the worktree dir and
+/// stays alive on `sleep infinity` even while the agent is Idle. Both are
+/// cleared by stopping the session.
 #[derive(Debug, PartialEq, Eq)]
 enum WorktreeRenameBlock {
     /// The session's agent is busy (running, starting, etc.).
@@ -70,8 +64,9 @@ enum WorktreeRenameBlock {
     SandboxContainer,
 }
 
-/// Whether the move must be blocked, and why; `None` when it is safe. Status takes
-/// precedence over the container reason.
+/// Decide whether a tied-worktree rename must be blocked, and why. Status
+/// takes precedence so a busy agent reports as `ActiveAgent` rather than
+/// reaching for the container reason. Returns `None` when the move is safe.
 fn worktree_rename_block(
     status: Status,
     is_sandboxed: bool,
@@ -96,10 +91,18 @@ fn worktree_rename_block_message(reason: &WorktreeRenameBlock) -> &'static str {
 impl HomeView {
     /// Pin or unpin the project header under the cursor (project view only).
     ///
-    /// Pinning registers the repo if needed and sets `pinned`. Unpinning clears the flag
-    /// but keeps the registry entry, so the project stays saved and only loses its header
-    /// once it has no sessions; only the projects dialog removes an entry. Goes through
-    /// `projects::add` / `projects::set_pinned`, the same path the web API uses. See #2208.
+    /// Pinning keeps the repo's header in project view even after its last
+    /// session is gone: it registers the repo if needed (the same global
+    /// registry the WebUI writes) and sets its `pinned` flag. Unpinning clears
+    /// the flag but KEEPS the registry entry, so the project stays a saved
+    /// project (still in the Projects view and the new-session wizard); its
+    /// header just drops once it has no sessions. Only an explicit remove (the
+    /// projects dialog) deletes the entry. See #2208.
+    ///
+    /// The registry is the shared persistence layer, so this goes through the
+    /// same `projects::add` / `projects::set_pinned` the web API and the
+    /// projects dialog use; canonicalization and conflict rules stay in one
+    /// place.
     pub(super) fn toggle_project_pin_at_cursor(&mut self) {
         use crate::session::{projects, Project, ProjectScope};
         use crate::tui::dialogs::InfoDialog;
@@ -108,13 +111,17 @@ impl HomeView {
             return;
         };
         let profile = self.config_profile();
-        // The header's own canonical repo path, or None for an empty pinned header.
-        // Keying on it keeps two repos that share a basename independent.
+        // The header's own repo path (canonical), or None for an empty pinned
+        // header. Keying on the path keeps two repos that share a basename
+        // independent, so the toggle acts on the repo the user is looking at.
         let header_path = self.project_header_repo_path(&label);
 
         if self.is_project_label_pinned(&label) {
-            // Unpin the entry whose canonical path matches the header's repo. An empty
-            // header has no session path, so fall back to the basename match.
+            // Unpin. Prefer the registry entry whose canonical path matches the
+            // header's own repo. An empty header has no session path, so fall
+            // back to the basename match (it exists only because a pinned
+            // project carries that basename; two such empties share one header
+            // and clear one per press).
             let existing = match &header_path {
                 Some(path) => self
                     .registered_projects
@@ -139,8 +146,11 @@ impl HomeView {
                 ));
             }
         } else {
-            // Pin the repo backing this header; an unpinned header always has a live
-            // session, so its path is known. Flip an already-saved entry, else register.
+            // Pin the repo backing this header. An unpinned header always has at
+            // least one live session (an empty header is pinned by
+            // construction), so its repo path is known. If the repo is already
+            // saved (registered but not pinned), flip its flag; otherwise
+            // register it pinned.
             let Some(repo_path) = header_path else {
                 return;
             };
@@ -174,10 +184,15 @@ impl HomeView {
         self.update_selected();
     }
 
-    /// Set `pinned` on every registry entry for `target_path` across the global file and
-    /// every profile: a path can be registered in several scopes at once and the visible
-    /// entry does not say which. Per-scope `NotFound` is ignored, a real I/O failure is
-    /// surfaced, and no match anywhere is `NotFound`. See #2208.
+    /// Set the `pinned` flag on every registry entry for `target_path`'s
+    /// canonical path, across the global file and every loaded profile (plus
+    /// the default profile). A path can be registered in more than one scope at
+    /// once (`--allow-override` lets a profile entry shadow a global one), and
+    /// `registered_projects` drops which profile each entry came from in
+    /// all-profiles mode, so a single visible entry is not enough. `NotFound`
+    /// per scope is ignored; a real I/O/parse failure is surfaced even if
+    /// another scope updated, since a partial toggle the user can't see is
+    /// worse than a visible error; no match anywhere is `NotFound`. See #2208.
     fn set_project_pinned_all_scopes(
         &self,
         target_path: &str,
@@ -190,19 +205,29 @@ impl HomeView {
             profiles.push(profile.to_string());
         }
         // Global lives in one shared file, so the profile arg is irrelevant.
-        let mut updates = vec![projects::set_pinned(
+        let mut updates = vec![projects::update(
             profile,
             ProjectScope::Global,
             target_path,
-            pinned,
-        )];
+            projects::ProjectPatch {
+                pinned: Some(pinned),
+                ..Default::default()
+            },
+        )
+        .map(|_| ())];
         for p in &profiles {
-            updates.push(projects::set_pinned(
-                p,
-                ProjectScope::Profile,
-                target_path,
-                pinned,
-            ));
+            updates.push(
+                projects::update(
+                    p,
+                    ProjectScope::Profile,
+                    target_path,
+                    projects::ProjectPatch {
+                        pinned: Some(pinned),
+                        ..Default::default()
+                    },
+                )
+                .map(|_| ()),
+            );
         }
         let mut updated_any = false;
         let mut hard_err: Option<projects::RegistryError> = None;
@@ -222,83 +247,38 @@ impl HomeView {
             ))),
         }
     }
-
-    pub(super) fn create_session(&mut self, data: NewSessionData) -> anyhow::Result<String> {
-        let target_profile = data.profile.clone();
-
-        // In unified mode, all instances are loaded, so use them for title dedup.
-        // For the target profile, filter to that profile's instances.
-        let existing_titles: Vec<&str> = self
-            .instances()
-            .filter(|i| i.source_profile == target_profile)
-            .map(|i| i.title.as_str())
-            .collect();
-        let existing_branches: Vec<&str> = self
-            .instances()
-            .filter(|i| i.source_profile == target_profile)
-            .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
-            .collect();
-
-        // `structured` is applied post-build (mirrors the web create
-        // handler); read it off before the params conversion consumes data.
-        let structured = data.structured;
-        let params = InstanceParams::from(data);
-
-        let build_result = builder::build_instance(
-            params,
-            &existing_titles,
-            &existing_branches,
-            &target_profile,
-        )?;
-        let mut instance = build_result.instance;
-        instance.source_profile = target_profile.clone();
-        if structured {
-            builder::structured::apply_structured_choice(&mut instance);
-        }
-        let session_id = instance.id.clone();
-
-        // Ensure target profile storage exists
-        if !self.storages.contains_key(&target_profile) {
-            self.storages.insert(
-                target_profile.clone(),
-                Storage::new(&target_profile, self.file_watch.clone())?,
-            );
-        }
-
-        self.add_instance(instance.clone());
-        self.rebuild_group_trees();
-        if !instance.group_path.is_empty() {
-            if let Some(tree) = self.group_trees.get_mut(&target_profile) {
-                tree.create_group(&instance.group_path);
-            }
-        }
-        self.save()?;
-
-        self.reload()?;
-        // reload()'s selection fallback lands on the nearest index, often the new
-        // session's group folder, so pin the selection the caller attaches to. Same as
-        // the async branch in apply_creation_results.
-        self.select_and_reveal_session(&session_id);
-        Ok(session_id)
-    }
-
-    /// Restart the cursor's session, optionally migrating to a new profile and/or
-    /// swapping the AI engine first.
+    /// Restart the cursor's session, optionally migrating to a new profile
+    /// and/or swapping the AI engine first.
     ///
-    /// Guards: no selection and transient lifecycle (`Creating` / `Deleting`) drop;
-    /// archived and trashed rows refuse with an info dialog pointing at the restore key;
-    /// pane-dead rows drop silently; snoozed rows drop only under `Attention` sort, since
-    /// elsewhere the snooze surface is hidden, so the flag is cleared and the restart
-    /// runs. A repeat within 1.5s is debounced: overlapping cascades would each spawn a
-    /// wake-up worker and tear down the still-booting pane.
+    /// Guards (apply to bare `e` / `E` / `F5` and dialog-submitted restarts):
+    /// - No selection: no-op.
+    /// - Transient lifecycle (`Creating` / `Deleting`): drop.
+    /// - Sunk rows: archived and trashed rows refuse with an info dialog
+    ///   pointing at the restore key (archive's contract is "do not
+    ///   auto-revive", but a silent drop read as a swallowed failure);
+    ///   pane-dead rows still drop silently (they have a dedicated revive
+    ///   path). Snoozed rows drop only when `sort_order == Attention`; in other
+    ///   sort modes the snooze surface is hidden, so silently swallowing
+    ///   the press would leave the user staring at a row that looks
+    ///   restartable but isn't. Outside Attention we clear the snooze flag
+    ///   and let the restart proceed so behavior matches what the user
+    ///   sees on screen.
+    /// - Spam-debounce: if the same session was restarted within the last
+    ///   1.5s, the press is dropped. Without this guard rapid `e` presses
+    ///   would each submit a daemon start and churn the still-booting agent
+    ///   via overlapping starts.
     ///
-    /// `new_profile` moves the session between profile storages and `new_tool` updates
-    /// the field before respawn. A swap between two tool names running the same agent on
-    /// different accounts carries the conversation across instead of parking it; see
-    /// [`crate::session::conversation_carry::classify`]. The cascade runs on the
-    /// `RestartPoller` (docker and the before_start hook block for seconds) and its
-    /// `Instance` comes back through `apply_restart_results`. The wake-up message is
-    /// `session.restart_wake_message`; empty disables it.
+    /// - `new_profile`: when `Some(p)` and `p` differs from the current
+    ///   `source_profile`, the session moves between profile storages.
+    ///   Mirrors the profile-move path in `rename_selected` so a restart-
+    ///   with-different-profile behaves the same as rename + restart.
+    /// - `new_tool`: when `Some(t)` and `t` differs from the current `tool`,
+    ///   the field is updated before respawn so the new agent binary starts
+    ///   on the next launch.
+    ///
+    /// Launch edits travel with the restart command. Only the daemon may commit
+    /// them after lifecycle admission; a disconnected or refused request leaves
+    /// both this view and the stored session untouched.
     pub(super) fn restart_selected_session(
         &mut self,
         new_profile: Option<&str>,
@@ -311,18 +291,23 @@ impl HomeView {
             None => return Ok(()),
         };
 
-        // A cascade for this row is already on the worker. The 1.5s debounce below does
-        // not cover a deliberate second press during a multi-second pull, and a duplicate
-        // request would restart the row into the container the first one is building.
+        // A daemon start for this row is already in flight. The start runs
+        // off the event loop now, so the 1.5s keyboard-repeat debounce below
+        // does not cover a deliberate second press during a multi-second
+        // start. Without this guard a duplicate submit would churn the
+        // still-booting agent a second time.
         if self.restart_in_flight.contains(&id) {
             return Ok(());
         }
 
-        // A trashed/archived row's agent was stopped deliberately, so refuse visibly and
-        // point at the restore key instead of swallowing the press.
+        // A trashed/archived row's refusal must be visible: its agent was
+        // deliberately stopped, so a silent no-op here read as a swallowed
+        // failure (the row just sits there). Point at the restore key instead.
         let shelved = self.get_instance(&id).and_then(|inst| {
-            // A row mid-purge gets no restore hint: it would race the in-flight delete.
-            // Falls through to the transient skip below, which drops Deleting silently.
+            // A row mid-purge gets no restore/unarchive hint: same rationale
+            // as `render_shelf_deleting_preview`, which drops those hints so
+            // they don't race the in-flight delete. Falls through to the
+            // transient skip below, which drops Deleting silently.
             if inst.status == Status::Deleting {
                 None
             } else if inst.is_trashed() {
@@ -349,8 +334,7 @@ impl HomeView {
             Some(inst) => {
                 let snoozed = inst.is_snoozed();
                 let skip = matches!(inst.status, Status::Creating | Status::Deleting)
-                    || (snoozed && in_attention)
-                    || inst.pane_dead_observed;
+                    || (snoozed && in_attention);
                 let wake_snooze = snoozed && !in_attention;
                 (skip, wake_snooze)
             }
@@ -368,261 +352,49 @@ impl HomeView {
                 return Ok(());
             }
         }
-        let restart_edit_baseline = self
-            .get_instance(&id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-        let current_profile = restart_edit_baseline.source_profile.clone();
-        let profile_move_target = new_profile
-            .filter(|target| *target != current_profile.as_str())
-            .map(str::to_string);
-        if let Some(target_profile) = profile_move_target.as_ref() {
-            let profiles = list_profiles()?;
-            if !profiles.contains(target_profile) {
-                anyhow::bail!("Profile '{}' does not exist", target_profile);
-            }
-        }
-
-        // Identity-changing edits follow the global lock order: app-wide identity, then
-        // session title and source lifecycle. Hold both through the profile transaction.
-        let profile_move_identity = if profile_move_target.is_some() {
-            Some(acquire_session_identity_lock()?)
-        } else {
-            None
+        let body = crate::daemon::RestartSessionBody {
+            size: crate::terminal::get_size().and_then(|(cols, rows)| {
+                Some(crate::daemon::TerminalSize {
+                    cols: std::num::NonZeroU16::new(cols)?,
+                    rows: std::num::NonZeroU16::new(rows)?,
+                })
+            }),
+            profile: new_profile.map(str::to_owned),
+            tool: new_tool.map(str::to_owned),
+            extra_args: new_extra_args.map(str::to_owned),
+            command_override: new_command_override.map(str::to_owned),
+            unsnooze: wake_snooze,
+            ..Default::default()
         };
-        let profile_move_guards = if profile_move_target.is_some() {
-            Some(self.lock_session_mutation_and_reload(&id)?)
-        } else {
-            None
-        };
-        let restart_edit_authoritative = self
-            .get_instance(&id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
-        if let Some(target_profile) = profile_move_target.as_deref() {
-            let target_rows = Storage::open(target_profile, self.file_watch.clone())?.load()?;
-            if is_duplicate_session(
-                target_rows.iter(),
-                &restart_edit_authoritative.title,
-                &restart_edit_authoritative.project_path,
-                None,
-            ) {
-                return Err(duplicate_session_error(&restart_edit_authoritative.title));
-            }
-        }
-
-        let tool_swapped = new_tool.is_some_and(|tool| tool != restart_edit_authoritative.tool);
-        // Decided against the pre-swap row: once the swap has run, the outgoing
-        // account's config root is no longer reachable from the instance.
-        let swap_kind = match new_tool.filter(|_| tool_swapped) {
-            Some(tool) => conversation_carry::classify(
-                &restart_edit_authoritative,
-                profile_move_target.as_deref().unwrap_or(&current_profile),
-                tool,
-            ),
-            None => conversation_carry::ToolSwap::Park,
-        };
-        let (account_swap, mut carry_plan) = match swap_kind {
-            conversation_carry::ToolSwap::Park => (false, None),
-            conversation_carry::ToolSwap::KeepConversation(carry) => (true, carry),
-        };
-
-        // A cross-profile restart stages on a detached candidate: do not persist a tool
-        // swap into the source row before the target transaction accepts it.
-        if let Some(target_profile) = profile_move_target.as_deref() {
-            if !self.storages.contains_key(target_profile) {
-                self.storages.insert(
-                    target_profile.to_string(),
-                    Storage::open(target_profile, self.file_watch.clone())?,
-                );
-            }
-
-            let mut requested = restart_edit_authoritative.clone();
-            if wake_snooze {
-                requested.unsnooze();
-            }
-            if let Some(target_tool) = new_tool {
-                if target_tool != restart_edit_authoritative.tool.as_str() {
-                    if account_swap {
-                        requested.swap_account(target_tool);
-                    } else {
-                        requested.swap_tool(target_tool);
-                    }
-                }
-            }
-            if let Some(command) = new_command_override {
-                requested.command = command.to_string();
-            }
-            if let Some(extra) = new_extra_args {
-                requested.extra_args = extra.to_string();
-            }
-            self.move_to_profile(
-                &id,
-                target_profile,
-                requested,
-                Some(&restart_edit_authoritative),
-                account_swap,
-            )?;
-            // The committed row is the authority the launch resumes from, and
-            // the capture pollers can have refreshed its conversation since the
-            // snapshot the plan froze; see `ConversationCarry::retarget`.
-            if let Some(carry) = carry_plan.as_mut() {
-                if let Some(moved) = self.get_instance(&id) {
-                    carry.retarget(conversation_carry::conversation_ids(moved));
-                }
-            }
-            self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
-        } else {
-            // Outside Attention sort, restart on a snoozed row clears the
-            // snooze flag so persisted state matches the visible restart.
-            if wake_snooze {
-                self.mutate_instance(&id, |inst| inst.unsnooze());
-            }
-
-            if let Some(target_tool) = new_tool {
-                let current_tool = self
-                    .get_instance(&id)
-                    .map(|i| i.tool.clone())
-                    .unwrap_or_default();
-                if target_tool != current_tool {
-                    if account_swap {
-                        self.mutate_instance(&id, |inst| inst.swap_account(target_tool));
-                    } else {
-                        self.mutate_instance(&id, |inst| inst.swap_tool(target_tool));
-                    }
-                    let disk_ids = self.persist_tool_swap(&id, target_tool, account_swap);
-                    if let Some(carry) = carry_plan.as_mut() {
-                        carry.retarget(disk_ids);
-                    }
-                }
-            }
-            if let Some(command) = new_command_override {
-                self.mutate_instance(&id, |inst| {
-                    inst.command = command.to_string();
-                });
-            }
-            if let Some(extra) = new_extra_args {
-                self.mutate_instance(&id, |inst| {
-                    inst.extra_args = extra.to_string();
-                });
-            }
+        if let Err(error) = self
+            .session_feed
+            .submit(id.clone(), crate::daemon::SessionMutation::Restart(body))
+        {
+            self.info_dialog = Some(InfoDialog::new(
+                "Restart failed",
+                &format!("{error}\nReconnect the runtime and try again."),
+            ));
+            return Ok(());
         }
         self.restart_cooldown_at.insert(id.clone(), now);
-        self.mutate_instance(&id, |inst| inst.touch_last_accessed());
-
-        // Persist profile/tool/command and the access timestamp while the durable row
-        // still carries its prior lifecycle. The worker owns the Starting reservation;
-        // publishing that status here would make it reject its own request.
-        self.save()?;
-        // The canonical profile locks are already released; publish the final launch
-        // edit while identity, title and lifecycle are still guarded.
-        drop(profile_move_identity);
-        drop(profile_move_guards);
-
-        // The cascade shells out to docker and runs the before_start hook, so it stays
-        // off the event loop: show Starting locally, let the worker reserve and persist
-        // it, and reconcile through `apply_restart_results`.
-        let size = crate::terminal::get_size();
-
-        // Starting plus a fresh last_start_time keeps the StatusPoller from flipping the
-        // row to Error before the worker finishes.
-        self.mutate_instance(&id, |inst| {
-            inst.status = Status::Starting;
-            inst.last_error = None;
-            inst.last_start_time = Some(std::time::Instant::now());
-        });
-
-        let Some(instance) = self.get_instance(&id).cloned() else {
-            return Ok(());
-        };
-
-        // Resolve the wake message on the main thread (config access). Empty is
-        // the documented opt-out; the worker skips the wake-up then.
-        let wake_message = crate::session::resolve_config(&instance.source_profile)
-            .map(|c| c.session.restart_wake_message.clone())
-            .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string());
-
-        self.restart_in_flight.insert(id.clone());
-        self.restart_poller.request_restart(RestartRequest {
-            session_id: id,
-            instance,
-            size,
-            wake_message,
-            skip_on_launch: false,
-            bound_hooks: true,
-            discard_sandbox_container: tool_swapped,
-            conversation_carry: carry_plan,
-        });
+        self.restart_in_flight.insert(id);
         Ok(())
     }
 
-    /// Land an engine swap's session bookkeeping on the disk row.
-    ///
-    /// `account_swap` picks which swap the disk row takes: the parking one, or the one
-    /// that keeps the conversation because only the account changed. Returns the
-    /// conversation ids the disk row held before the swap, which a carry uses in place
-    /// of the ones its plan froze; see
-    /// [`crate::session::conversation_carry::ConversationCarry::retarget`].
-    ///
-    /// `save()` leaves `agent_session_id` and friends to their CAS writers, so without
-    /// this write `reconcile_from_disk` restores the old engine's sid and the new engine
-    /// resumes a foreign one. It runs against the disk row because the capture pollers
-    /// may hold a fresher sid than this snapshot; parking whatever disk holds is what
-    /// makes a swap-back restore the real conversation. Best-effort: a failed write
-    /// leaves the stale sid and the restart's resume probe recovers by starting fresh.
-    fn persist_tool_swap(&self, id: &str, new_tool: &str, account_swap: bool) -> Vec<String> {
-        let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
-            return Vec::new();
-        };
-        let Some(storage) = self.storages.get(&profile) else {
-            tracing::warn!(
-                target: "tui.home",
-                profile = %profile,
-                id = %id,
-                "persist_tool_swap: no storage registered for profile; \
-                 the old engine's session id stays on disk"
-            );
-            return Vec::new();
-        };
-        let id_owned = id.to_string();
-        let new_tool = new_tool.to_string();
-        let row_profile = profile.clone();
-        let observed = storage.update(|instances, _groups| {
-            let mut observed = Vec::new();
-            if let Some(disk) = instances.iter_mut().find(|i| i.id == id_owned) {
-                observed = crate::session::conversation_carry::conversation_ids(disk);
-                // `source_profile` is `skip_serializing`, so a storage-loaded row
-                // resolves `agent_detect_as` against the default profile and would pin
-                // the wrong built-in; `detect_as` is not in `reconcile_from_disk`'s carry
-                // set, so the next launch reads that value. Restore it before the swap.
-                disk.source_profile = row_profile.clone();
-                if account_swap {
-                    disk.swap_account(&new_tool);
-                } else {
-                    disk.swap_tool(&new_tool);
-                }
-            }
-            Ok(observed)
-        });
-        match observed {
-            Ok(ids) => ids,
-            Err(e) => {
-                tracing::error!(
-                    target: "tui.home",
-                    id = %id,
-                    "persist_tool_swap: failed to move the old engine's session state aside: {e}"
-                );
-                Vec::new()
-            }
-        }
-    }
-
     pub(super) fn delete_selected(&mut self, options: &DeleteOptions) -> anyhow::Result<()> {
+        // A remote row is never in `selected_session`, so the dialog's submit
+        // has to reach that daemon's delete route instead of the local poller.
+        if let Some((remote, id)) = self.selected_remote.clone() {
+            let kind = remote_delete::DeleteKind::Purge(remote_delete::purge_body(options));
+            self.start_remote_delete(remote, id, kind);
+            return Ok(());
+        }
         if let Some(id) = &self.selected_session {
             let id = id.clone();
 
-            // Deleting a row mid-restart would fire docker commands against the
-            // container the restart worker is creating and orphan resources.
+            // Refuse to delete a row whose daemon start is still in flight:
+            // deletion would race the start the daemon is mid-running,
+            // orphaning resources non-deterministically.
             if self.restart_in_flight.contains(&id) {
                 self.info_dialog = Some(InfoDialog::new(
                     "Restart in progress",
@@ -681,11 +453,12 @@ impl HomeView {
         Ok(())
     }
 
-    /// Commit one profile's group deletion before any purge is queued, so a watcher
-    /// reload or a restart cannot rebuild the group from an unchanged `groups.json`.
-    /// Blockers are re-checked against durable rows because a Creating member may exist
-    /// only on disk. `Status::Deleting` stays an in-memory overlay owned by
-    /// `PurgeTransaction`.
+    /// Commit one profile's group deletion before any purge is queued, so a
+    /// watcher reload or restart cannot rebuild the group from an unchanged
+    /// `groups.json`. Blockers are re-checked against the durable rows because
+    /// a Creating member may exist only on disk. `Status::Deleting` is
+    /// deliberately not persisted: it stays an in-memory overlay owned by the
+    /// `PurgeTransaction` lifecycle.
     fn persist_group_delete_with_sessions(
         &mut self,
         profile: &str,
@@ -846,9 +619,7 @@ impl HomeView {
         Ok(())
     }
 
-    /// Force-remove a session from storage, for rows stuck in Deleting. Worktree and
-    /// branch cleanup are skipped because the original deletion already attempted them;
-    /// tmux and sandbox teardown run off-thread so a hung call cannot block input.
+    /// Forget a stuck deletion record; finish runtime cleanup off the input thread.
     pub(super) fn force_remove_session(&mut self, session_id: &str) -> anyhow::Result<()> {
         let instance = self.instances.get(session_id).cloned();
         self.remove_instance(session_id);
@@ -856,29 +627,9 @@ impl HomeView {
         self.save()?;
         self.reload()?;
 
-        if let Some(inst) = instance {
+        if let Some(instance) = instance {
             std::thread::spawn(move || {
-                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    inst.kill_all_tmux_sessions_without_lifecycle_row()
-                })) {
-                    tracing::error!(
-                        target: "session.delete",
-                        session_id = %inst.id,
-                        "force_remove tmux teardown panicked: {:?}",
-                        panic
-                    );
-                }
-                if inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) {
-                    let container = crate::containers::DockerContainer::from_session_id(&inst.id);
-                    if let crate::containers::Teardown::Failed(e) = container.teardown(&inst.id) {
-                        tracing::warn!(
-                            target: "session.delete",
-                            session_id = %inst.id,
-                            "force_remove container teardown failed: {}",
-                            e
-                        );
-                    }
-                }
+                crate::session::deletion::cleanup_abandoned_session(instance);
             });
         }
         Ok(())
@@ -1043,8 +794,10 @@ impl HomeView {
                     Storage::open(target_profile, self.file_watch.clone())?,
                 );
             }
-            // Run the transaction for its durable effect only: the reload below
-            // republishes the moved rows and re-merges runtime-only state onto them.
+            // Run the batch transaction for its durable effect only. The moved
+            // rows are republished from disk by the reload below, which also
+            // re-merges runtime-only state onto them, so inserting the returned
+            // rows in memory here would just be overwritten by that reload.
             {
                 let source = self
                     .storages
@@ -1112,8 +865,10 @@ impl HomeView {
 
         let path_changed = new_path != ctx.old_path;
 
-        // Capture old_path and its descendants before the rebuild, which derives groups
-        // from `instance.group_path`, already migrated by the loop above.
+        // Capture old_path and its descendants from the pre-rebuild tree:
+        // rebuild_group_trees below derives groups from instance.group_path,
+        // which the loop above already migrated, so the old paths are about
+        // to disappear from the in-memory tree.
         let stale_paths: Vec<String> = if path_changed || profile_changed {
             let prefix = format!("{}/", ctx.old_path);
             self.group_trees
@@ -1157,8 +912,9 @@ impl HomeView {
         Ok(())
     }
 
-    /// Edit the selected session's worktree workdir name: move the worktree directory
-    /// and, optionally, rename its git branch, persisting both. See #1723.
+    /// Edit the selected session's worktree workdir name: move the worktree
+    /// directory and, optionally, rename its git branch. Persists the new
+    /// `project_path` (and branch) through `apply_user_action`. See #1723.
     pub(super) fn set_worktree_name_for_selected(
         &mut self,
         new_name: &str,
@@ -1215,10 +971,16 @@ impl HomeView {
         if status.blocks_worktree_edit() {
             anyhow::bail!("Stop the session before editing its workdir name");
         }
-        // A sandbox container stays up while Idle and bind-mounts the worktree, so the
-        // move would hit EBUSY and a reused container would keep the old path; `status`
-        // alone does not see this. Gated on the directory actually moving, since the
-        // helper discards a stopped container. See #2117, #2414.
+        // A sandbox session keeps its container alive (running `sleep infinity`)
+        // even while Idle, and that container bind-mounts the worktree dir, so
+        // the `git worktree move` below would hit EBUSY, and a reused container
+        // would keep mounting (and `cd`-ing into) the old path. Refuse until the
+        // session is stopped, mirroring the tied-rename path. `status` alone is
+        // insufficient: `blocks_worktree_edit` is false for an Idle session
+        // whose container is still up. See #2117, #2414.
+        // Gated on the directory actually moving: the helper discards a
+        // stopped container, which is only worth doing for a real relocation.
+        // A no-op or branch-only edit leaves the mount valid.
         if crate::session::worktree_edit::worktree_move_required(
             std::path::Path::new(&project_path),
             new_name,
@@ -1241,9 +1003,12 @@ impl HomeView {
         let new_path = outcome.new_path.to_string_lossy().to_string();
         let new_branch = outcome.new_branch.clone();
 
-        // A container's mounts and working dir are baked in at create time and do not
-        // follow a host-side `git worktree move`, so drop it and force a fresh create on
-        // the next start. Only when the dir moved. Mirrors `rename_selected` (#2117).
+        // A container created against the old path is now stale: its mounts and
+        // working dir are baked in at create time and do NOT follow a host-side
+        // `git worktree move`, so a reused container would `docker exec -w` into
+        // a path that no longer exists. Drop it to force a fresh create on next
+        // start. Only when the dir actually moved; a branch-only rename leaves
+        // the path valid. Mirrors `rename_selected` (#2117).
         let dir_moved = outcome.new_path != std::path::Path::new(&project_path);
         if dir_moved {
             crate::session::worktree_edit::discard_sandbox_container_after_move(&id, is_sandboxed);
@@ -1265,16 +1030,19 @@ impl HomeView {
         Ok(())
     }
 
-    /// Attach a repo to `id` and, when a worker is live, restart it so the agent can see
-    /// the new root (#3103). The worktree is created before anything is persisted, so a
-    /// save failure rolls it back rather than leaving an orphan. The restart goes through
-    /// the marker `aoe acp restart` writes, so the daemon respawns with the stored ACP
-    /// session id and the transcript survives.
+    /// Attach a repo to `id` and, when a worker is live, restart it so the agent
+    /// can see the new root (#3103).
+    ///
+    /// The worktree is created before anything is persisted, so a save failure
+    /// rolls it back rather than leaving an orphan on disk. The restart goes
+    /// through the same restart marker `aoe acp restart` writes, so the daemon
+    /// respawns with the stored ACP session id and the transcript survives.
+    /// Dispatch an attach onto the background poller.
     ///
     /// Returns as soon as the request is queued; the outcome arrives through
-    /// [`super::HomeView::apply_attach_project_results`]. Every check that can be made
-    /// from the in-memory instance is made here rather than on the worker, so an `Err` is
-    /// a refusal the caller can show immediately.
+    /// [`super::HomeView::apply_attach_project_results`]. An `Err` here is a
+    /// refusal the caller can show immediately, so every check that can be made
+    /// from the in-memory instance is made here rather than on the worker.
     pub(super) fn add_project_to_session(
         &mut self,
         id: &str,
@@ -1283,8 +1051,10 @@ impl HomeView {
         let Some(instance) = self.get_instance(id).cloned() else {
             anyhow::bail!("Session no longer exists");
         };
-        // Defence in depth behind the picker's own gate: this is the choke point both
-        // TUI entry points share, and what SIGTERMs the worker below.
+        // Defence in depth behind the picker's own gate: this is the choke point
+        // both TUI entry points share, and it is what SIGTERMs the worker below.
+        // See `open_add_project_for_selected` for why the check is the observed
+        // status rather than the daemon's event-log probe.
         if matches!(
             instance.status,
             crate::session::Status::Creating | crate::session::Status::Deleting
@@ -1293,15 +1063,17 @@ impl HomeView {
                 "Wait for the session to finish starting or deleting before attaching a project"
             );
         }
-        // The same set the picker refuses: `Waiting` and `Starting` are turns in flight
-        // too, and killing the worker in `Waiting` discards a pending approval.
+        // The same set the picker refuses, via the shared helper: `Waiting` and
+        // `Starting` are turns in flight just as much as `Running`, and killing
+        // the worker in `Waiting` discards a pending approval.
         if instance.status.blocks_worktree_edit() {
             anyhow::bail!(
                 "The agent is mid-turn and attaching restarts it; wait for the turn to finish or stop the session first"
             );
         }
-        // Trashed and archived too, so a status flip while the picker is open cannot
-        // slip an attach onto a deliberately stopped agent.
+        // Trashed and archived too, so the set matches the picker's gate: a
+        // status flip while the picker is open must not slip an attach onto a
+        // session whose agent is deliberately stopped.
         if instance.is_trashed() {
             anyhow::bail!("This session is in the trash; restore it before attaching a project");
         }
@@ -1316,9 +1088,10 @@ impl HomeView {
             anyhow::bail!("An attach is already running for this session; wait for it to finish");
         }
 
-        // Everything blocking runs on the poller thread: `git worktree add` alone takes
-        // seconds, and the fetch, submodule init, worker bounce and container removal
-        // behind it take longer. `apply_attach_project_results` reloads and reports.
+        // Everything blocking runs on the poller thread. `git worktree add` alone
+        // takes seconds, and the fetch, submodule init, worker bounce and
+        // container removal behind it take longer; inline, that froze the UI for
+        // the whole attach. `apply_attach_project_results` reloads and reports.
         self.attach_project_in_flight.insert(id.to_string());
         self.attach_project_poller.request_attach(
             crate::session::attach_project::AttachProjectRequest {
@@ -1346,8 +1119,9 @@ impl HomeView {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
             let title_changed_by_user = !new_title.is_empty() && new_title != live.title;
-            // The app-wide identity guard covers profile-changing renames too; the
-            // existing-session guards nest beneath it, title -> lifecycle -> Storage.
+            // The app-wide identity guard covers profile-changing renames too.
+            // Existing-session guards nest beneath it in the order session
+            // title -> source lifecycle -> profile Storage.
             let _identity_lock = acquire_session_identity_lock()?;
             let _mutation_guards = self.lock_session_mutation_and_reload(&id)?;
             let previous = self
@@ -1416,9 +1190,11 @@ impl HomeView {
                 }
             }
 
-            // Tied mode (#1927): a worktree session's directory leaf follows its title,
-            // so move the directory in lockstep before persisting the new title. Gated on
-            // a stopped session; a running one warns and renames nothing.
+            // Tied mode (#1927): a worktree session's directory leaf follows
+            // its title, so move the directory in lockstep before persisting
+            // the new title. The move is gated on a stopped session; a running
+            // session surfaces a warning and nothing is renamed. Applied below
+            // in both the profile-move and the standard persist paths.
             let mut new_path: Option<String> = None;
             let mut new_branch: Option<String> = None;
             // Fire when the title changed (dir follows it) OR the user opted to
@@ -1470,8 +1246,9 @@ impl HomeView {
                     return Err(duplicate_session_error(&projected_move.title));
                 }
             }
-            // Fire when the title changed (the dir follows it) or the user asked to
-            // rename the branch, which is allowed even with the title unchanged.
+            // Fire when the title changed (dir follows it) OR the user opted to
+            // rename the branch (which may be requested even with the title
+            // unchanged, to bring a drifted branch back in line with the dir).
             if tied_edit && cross_profile_target.is_none() {
                 let snapshot = self.get_instance(&id).map(|i| {
                     (
@@ -1534,8 +1311,10 @@ impl HomeView {
                 }
             }
 
-            // Cross-profile worktree and container effects run inside the dual-profile
-            // transaction; tmux rekeying waits until persistence and publication succeed.
+            // Cross-profile worktree/container effects run inside the
+            // dual-profile transaction after authoritative target validation.
+            // Tmux rekeying is deliberately deferred until persistence and
+            // in-memory publication have both succeeded.
             if let Some(target_profile) = cross_profile_target.as_deref() {
                 if !self.storages.contains_key(target_profile) {
                     self.storages.insert(
@@ -1590,11 +1369,20 @@ impl HomeView {
                                     },
                                 ) {
                                     Ok(outcome) => {
-                                        // Both sides derive the leaf from the same
-                                        // title through `target_worktree_path`, so the
-                                        // published row and the directory that moved must
-                                        // agree; assert it so a drift in either sanitizer
-                                        // fails loudly instead of stranding the row.
+                                        // The row published to the target profile
+                                        // carries `candidate.project_path`, which
+                                        // was precomputed by `target_worktree_path`
+                                        // in `projected_move` above. `edit_worktree_workdir`
+                                        // relocates the directory to its own
+                                        // `outcome.new_path`, also derived by
+                                        // `target_worktree_path` from the same
+                                        // current path and the same title-derived
+                                        // leaf, so the two are guaranteed identical
+                                        // and the published row always points at the
+                                        // directory that actually moved. Assert it so
+                                        // any future drift in either sanitizer chain
+                                        // fails loudly in debug rather than silently
+                                        // stranding the row on a wrong path.
                                         debug_assert_eq!(
                                             outcome.new_path,
                                             std::path::Path::new(&candidate.project_path),
@@ -1663,64 +1451,66 @@ impl HomeView {
         Ok(())
     }
 
-    /// Snooze keybind: an already-snoozed row wakes immediately, otherwise the duration
-    /// picker opens and `snooze_session_for` runs on submit.
-    ///
-    /// A snooze is a temporary archive: `snoozed_until = now + minutes` sinks the row to
-    /// tier 99, renders it italic+dim with a `z ` prefix and the remaining time, and it
-    /// wakes lazily when the timer elapses. The duration is resolved at snooze time, so
-    /// changing the config default does not extend one in flight.
-    pub(super) fn toggle_snooze_at_cursor(&mut self) -> anyhow::Result<Option<String>> {
+    /// Open the duration picker, or queue an unsnooze for an already snoozed row.
+    pub(super) fn toggle_snooze_at_cursor(&mut self) -> anyhow::Result<()> {
+        if self.selected_remote.is_some() {
+            self.toggle_remote_snooze_at_cursor();
+            return Ok(());
+        }
         let Some(id) = self.selected_session.clone() else {
-            return Ok(None);
+            return Ok(());
         };
-        let (is_snoozed, title) = {
-            let inst = self.instances.get(&id);
-            match inst {
-                Some(i) => (i.is_snoozed(), i.title.clone()),
-                None => return Ok(None),
-            }
+        let Some(instance) = self.instances.get(&id) else {
+            return Ok(());
         };
-        if is_snoozed {
-            self.apply_user_action(&id, |inst| inst.unsnooze())?;
-            self.rebuild_flat_items();
-            return Ok(Some(format!("Woke: {}", title)));
+        if instance.is_snoozed() {
+            return self.session_feed.submit(
+                id,
+                crate::daemon::SessionMutation::Snooze(crate::daemon::UpdateSnoozeBody {
+                    minutes: None,
+                }),
+            );
         }
-
+        self.snooze_duration_dialog = Some(crate::tui::dialogs::SnoozeDurationDialog::new(
+            &instance.title,
+        ));
         self.pending_snooze_session = Some(id);
-        self.snooze_duration_dialog = Some(crate::tui::dialogs::SnoozeDurationDialog::new(&title));
-        Ok(None)
+        Ok(())
     }
 
-    /// Apply a snooze with an explicit duration, on the picker's submit. The only place
-    /// the TUI mutates `snoozed_until`. Jumps to the next needs-attention row once this
-    /// one sinks, so triage can continue.
-    pub(super) fn snooze_session_for(
-        &mut self,
-        id: &str,
-        minutes: u32,
-    ) -> anyhow::Result<Option<String>> {
-        let title = self
-            .instances
-            .get(id)
-            .map(|i| i.title.clone())
-            .unwrap_or_default();
-        self.apply_user_action(id, |inst| inst.snooze(minutes))?;
-        self.rebuild_flat_items();
-        if self.sort_order == crate::session::config::SortOrder::Attention {
-            self.select_top_attention(None);
+    /// Apply a duration the snooze dialog returned, to whichever row opened
+    /// it. The remote pending slot is checked first because a remote row sets
+    /// both `selected_remote` and no `selected_session`.
+    pub(super) fn resolve_snooze_duration(&mut self, minutes: u32) {
+        if self.pending_remote_snooze.take().is_some() {
+            self.snooze_remote_for(minutes);
+            return;
         }
-        Ok(Some(format!(
-            "Snoozed for {}: {}",
-            humanize_minutes(minutes),
-            title
-        )))
+        let Some(id) = self.pending_snooze_session.take() else {
+            return;
+        };
+        if let Err(e) = self.snooze_session_for(&id, minutes) {
+            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                "Snooze not changed",
+                &e.to_string(),
+            ));
+        }
     }
 
-    /// Toggle the favorite flag on the cursor's session. Favorites pin above peers in
-    /// the same status tier under the Attention sort and render bold + underline with a
-    /// leading `* ` (see `render.rs`). Favorite survives an unsnooze but not an archive;
-    /// that mutual exclusion lives in `Instance::archive()`.
+    pub(super) fn snooze_session_for(&mut self, id: &str, minutes: u32) -> anyhow::Result<()> {
+        self.session_feed.submit(
+            id.to_owned(),
+            crate::daemon::SessionMutation::Snooze(crate::daemon::UpdateSnoozeBody {
+                minutes: Some(minutes),
+            }),
+        )?;
+        if self.sort_order == crate::session::config::SortOrder::Attention {
+            self.select_top_attention(Some(id));
+        }
+        Ok(())
+    }
+
+    /// Queue a favorite change; only canonical snapshots update the row.
     pub(super) fn toggle_favorite_at_cursor(&mut self) -> anyhow::Result<()> {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
@@ -1729,19 +1519,24 @@ impl HomeView {
             Some(i) => i.is_favorited(),
             None => return Ok(()),
         };
-        if is_fav {
-            self.apply_user_action(&id, |inst| inst.unfavorite())?;
-        } else {
-            self.apply_user_action(&id, |inst| inst.favorite())?;
-        }
-        self.rebuild_flat_items();
+        self.session_feed.submit(
+            id,
+            crate::daemon::SessionMutation::Favorite(crate::daemon::UpdateFavoriteBody {
+                favorited: !is_fav,
+            }),
+        )?;
         Ok(())
     }
 
-    /// The session the cursor should land on once the cursor's row is archived: the
-    /// nearest visible non-archived session below, else above. Rows inside collapsed
-    /// groups and rows already under the Archived section are not candidates, so the
-    /// cursor never jumps into either. `None` leaves the caller to clamp the index.
+    /// The session the cursor should land on after the cursor's row is
+    /// archived away: the nearest non-archived session below the cursor,
+    /// else the nearest one above. `None` when no other active session is
+    /// VISIBLE (the caller falls back to an index clamp); active sessions
+    /// hidden inside collapsed groups are deliberately not candidates, so
+    /// archiving never yanks the cursor into a group the user folded away.
+    /// Scans the pre-archive flat list, so it walks the rows the
+    /// user sees; archived rows already parked under the Archived section
+    /// are skipped so the cursor never advances into it.
     fn archive_successor_session(&self, archiving_id: &str) -> Option<String> {
         let candidate = |item: &Item| -> Option<String> {
             let Item::Session { id, .. } = item else {
@@ -1766,42 +1561,49 @@ impl HomeView {
         None
     }
 
-    /// Manual unread toggle (`U`), symmetric in both directions. The row's
-    /// `theme.unread` color is the feedback, so there is no toast. No-op when disabled.
+    /// Queue a manual unread change and hold its mark for this visit.
     pub(super) fn toggle_unread_at_cursor(&mut self) -> anyhow::Result<()> {
         if !crate::session::unread_enabled() {
             return Ok(());
         }
+        if self.selected_remote.is_some() {
+            self.toggle_remote_unread_at_cursor();
+            return Ok(());
+        }
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
-        if !self.instances.contains_key(&id) {
+        let Some(instance) = self.instances.get(&id) else {
             return Ok(());
-        }
-        self.apply_user_action(&id, |inst| inst.toggle_unread())?;
-        // Hold the row for the current visit so the dwell cannot undo a fresh `u`; the
-        // hold is released once the cursor leaves (see `tick_unread_dwell`).
-        if self.get_instance(&id).is_some_and(|i| i.is_unread()) {
-            self.manual_unread_hold = Some(id.clone());
+        };
+        let unread = !instance.is_unread();
+        self.session_feed.submit(
+            id.clone(),
+            crate::daemon::SessionMutation::Unread(crate::daemon::UpdateUnreadBody { unread }),
+        )?;
+        if unread {
+            self.manual_unread_hold = Some(id);
         } else if self.manual_unread_hold.as_deref() == Some(id.as_str()) {
             self.manual_unread_hold = None;
         }
-        self.rebuild_flat_items();
-        // Under Attention sort the toggle changes the row's rank, so reseat the cursor
-        // by id to keep the next action on this session.
-        self.select_session_by_id(&id);
         Ok(())
     }
 
-    /// Toggle archive on the cursor's session. Archive tears down every tmux session
-    /// (agent plus ancillary) but keeps worktree, branch and container. Unarchive does
-    /// not respawn: press `e`, or send a message to auto-unarchive. See #1868.
+    /// Toggle the cursor's session: archive or unarchive. Archive tears down
+    /// all tmux sessions (agent + ancillary); worktree, branch, container
+    /// preserved. Unarchive does NOT respawn; press `e` to restart, or send
+    /// a message to auto-unarchive. See #1868.
     pub(super) fn toggle_archive_at_cursor(&mut self) -> anyhow::Result<()> {
+        if self.selected_remote.is_some() {
+            self.toggle_remote_archive_at_cursor();
+            return Ok(());
+        }
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
-        // A trashed row cannot be meaningfully archived, so `z` on it restores the
-        // session from the trash instead. See #2489.
+        // The shelve/unshelve key doubles as restore for the Trash section: a
+        // trashed row can't be meaningfully archived, so `z` on it pulls the
+        // session back out of the trash instead. See #2489.
         if matches!(self.instances.get(&id), Some(i) if i.is_trashed()) {
             self.restore_selected_from_trash();
             return Ok(());
@@ -1811,70 +1613,59 @@ impl HomeView {
             None => return Ok(()),
         };
         if is_archived {
-            self.apply_user_action(&id, |inst| inst.unarchive())?;
-            self.rebuild_flat_items();
-            // Re-seat the cursor on the unarchived row: the rebuild moves it from tier
-            // 99 to its real tier. It stays Stopped until the user restarts it with `e`.
-            self.select_session_by_id(&id);
+            self.session_feed.submit(
+                id.clone(),
+                crate::daemon::SessionMutation::Archive(crate::daemon::UpdateArchiveBody {
+                    archived: false,
+                    kill_pane: true,
+                }),
+            )?;
+            // The row rises when the snapshot proves it; the cursor follows
+            // then, because after the rebuild the row jumps from tier 99 to its
+            // real tier and would otherwise strand the cursor at the old index.
+            self.pending_archive_cursor = Some(PendingArchiveCursor {
+                id,
+                archived: false,
+                successor: None,
+            });
             return Ok(());
         }
 
-        // Tear down all tmux before flipping archived. #1868.
-        if let Some(inst) = self.instances.get(&id) {
-            inst.kill_all_tmux_sessions();
-        }
-
-        // Decide where the cursor lands before the row sinks, against the pre-archive
-        // list. Only the non-Attention branch uses it; Attention re-picks from the top.
+        // Decide where the cursor lands BEFORE the row sinks, against the
+        // pre-archive list the user is actually looking at. Only the
+        // non-Attention branch consumes it; Attention re-picks from the top.
         let successor = (self.sort_order != crate::session::config::SortOrder::Attention)
             .then(|| self.archive_successor_session(&id))
             .flatten();
 
-        self.apply_user_action(&id, |inst| inst.archive())?;
-        if self.sort_order == crate::session::config::SortOrder::Attention {
-            // Attention sort is a triage flow: the cursor advances to the next item
-            // that needs attention, which is always a live row.
-            self.rebuild_flat_items();
-            self.select_top_attention(None);
-            // select_top_attention is a no-op when no session row is visible, which
-            // would strand the selection on the now-invisible archived row and leave the
-            // cursor past the list; clamp and re-resolve like the fallback below.
-            if self.selected_session.as_deref() == Some(id.as_str()) {
-                self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
-                self.update_selected();
-            }
-        } else {
-            // Advance to the next session rather than following the archived row into
-            // the section: archiving reads as "done with this one". The preview retargets
-            // itself each frame and the worker drops stale frames, so there is no
-            // dead-pane flash (#2025). The section is not revealed; its count is the
-            // feedback.
-            self.rebuild_flat_items();
-            match successor {
-                Some(next) => self.select_session_by_id(&next),
-                None => {
-                    // No other active session: clamp and let `update_selected` resolve
-                    // whatever sits at the cursor now (usually the Archived header).
-                    self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
-                    self.update_selected();
-                }
-            }
-        }
+        // The daemon tears the panes down (#1868) and stamps `archived_at`; the
+        // row, the section counts and the cursor placement follow from the
+        // canonical snapshot, which is why the decision above is remembered.
+        self.session_feed.submit(
+            id.clone(),
+            crate::daemon::SessionMutation::Archive(crate::daemon::UpdateArchiveBody {
+                archived: true,
+                kill_pane: true,
+            }),
+        )?;
+        self.pending_archive_cursor = Some(PendingArchiveCursor {
+            id,
+            archived: true,
+            successor,
+        });
         Ok(())
     }
-
-    /// Move a session to the trash and set `trashed_at`, keeping durable artifacts so it
-    /// can be restored. The Trash section's collapse state is left untouched; its header
-    /// count is the feedback (#2489).
+    /// Move a session to the trash and set `trashed_at`. Durable artifacts are
+    /// kept so it can be restored. The Trash section's collapse state is left
+    /// untouched: like single-row archive, the section header's count is the
+    /// feedback, so a user who collapsed it stays collapsed (#2489).
     ///
-    /// The durable trash marker is written inline so the row flips immediately.
-    /// Everything that can block, tmux teardown, the container stop and the worktree
-    /// relocation, runs on the `TrashPoller` and is reconciled by
-    /// [`apply_trash_results`](crate::tui::home::HomeView::apply_trash_results): a live
-    /// bind mount makes the worktree move fail EBUSY, but `docker stop` blocks for the
-    /// container's grace period, which froze the input thread inline (#1496). A
-    /// structured-view worker is reaped by the daemon reconciler once the row reads
-    /// trashed.
+    /// The durable trash marker is written inline (a fast local write) so the
+    /// row flips to Trashed immediately. Everything that can block, tmux
+    /// teardown, the sandbox container stop, and the worktree relocation out of
+    /// the active dir, runs off-thread on the `TrashPoller` and is reconciled
+    /// by [`apply_trash_results`](crate::tui::home::HomeView::apply_trash_results).
+    /// Stop the container before relocating its live bind-mounted worktree.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
         let Some((profile, mut request_instance)) = self
             .instances
@@ -1936,9 +1727,10 @@ impl HomeView {
         self.update_selected();
     }
 
-    /// Restore the selected trashed session, clearing `trashed_at` so it returns to its
-    /// prior bucket. No-op when the selection is not trashed; the session stays stopped
-    /// until the user restarts it with `e`. See #2489.
+    /// Restore the selected trashed session, clearing `trashed_at` so it
+    /// returns to its prior bucket. No-op when the selection is not trashed.
+    /// The session stays stopped (trash killed its panes); the user restarts
+    /// it with `e` like any stopped session. See #2489.
     pub(super) fn restore_selected_from_trash(&mut self) {
         let Some(id) = self.selected_session.clone() else {
             return;
@@ -1955,9 +1747,9 @@ impl HomeView {
         else {
             return;
         };
-        // Restore bypasses the generic user-action diff because lifecycle ownership,
-        // worktree movement and the durable untrash must stay under the per-instance
-        // flock.
+        // Restore bypasses the generic user-action diff because lifecycle
+        // ownership, worktree movement, and durable untrash must stay under the
+        // per-instance flock.
         let outcome = {
             let Some(storage) = self.storages.get(&profile) else {
                 tracing::warn!(
@@ -1979,6 +1771,7 @@ impl HomeView {
                     inst.project_path = project_path;
                     inst.pre_trash_project_path = pre_trash_project_path;
                     inst.untrash();
+                    inst.status = Status::Stopped;
                     inst.lifecycle_reservation = None;
                 }
                 self.rebuild_flat_items();
@@ -2009,9 +1802,11 @@ impl HomeView {
         }
     }
 
-    /// Restore every trashed session, driving each row through the same
-    /// `restore_selected_from_trash` as a single restore so the claim/commit races
-    /// (#2541) are handled identically. Each failure surfaces its own info dialog; the
+    /// Restore every trashed session back into its group. The synthetic Trash
+    /// section's "Restore All" bulk action: drives each row through the same
+    /// per-row `restore_selected_from_trash` (claim, off-lock worktree move,
+    /// untrash) so the claim/commit races (#2541) are handled identically to a
+    /// single restore. Each row's failure surfaces its own info dialog; the
     /// last one wins, which is acceptable for a rare bulk recovery.
     pub(super) fn restore_all_from_trash(&mut self) {
         let ids: Vec<String> = self
@@ -2024,40 +1819,43 @@ impl HomeView {
             return;
         }
         for id in ids {
-            // `restore_selected_from_trash` acts on the selection, so point it at each
-            // row in turn; it re-selects the restored session, which the next iteration
-            // overwrites.
+            // `restore_selected_from_trash` acts on the selection, so point it
+            // at each row in turn; it re-selects the restored session on
+            // success, and the next iteration overwrites that.
             self.selected_session = Some(id);
             self.restore_selected_from_trash();
         }
     }
 
-    /// Unarchive every archived session. Rows stay Stopped, same as a single unarchive.
-    /// Reversible, so no confirmation upstream.
+    /// Restore every archived row through the daemon. The section updates from
+    /// receipts and canonical snapshots, not from local storage writes.
     pub(super) fn unarchive_all(&mut self) {
-        let ids: Vec<String> = self
+        let requests = self
             .instances
             .values()
-            .filter(|i| i.is_archived() && !i.is_trashed())
-            .map(|i| i.id.clone())
-            .collect();
-        if ids.is_empty() {
-            return;
+            .filter(|row| row.is_archived() && !row.is_trashed())
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    crate::daemon::SessionMutation::Archive(crate::daemon::UpdateArchiveBody {
+                        archived: false,
+                        kill_pane: true,
+                    }),
+                )
+            });
+        if let Err(error) = self.session_feed.submit_batch(requests) {
+            self.info_dialog = Some(InfoDialog::new("Restore Failed", &error.to_string()));
         }
-        if let Err(e) = self.bulk_apply_user_action(&ids, |inst| inst.unarchive()) {
-            tracing::error!(target: "tui.home", "unarchive_all failed: {e}");
-        }
-        self.rebuild_flat_items();
-        if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
-            self.cursor = self.flat_items.len() - 1;
-        }
-        self.update_selected();
     }
 
-    /// Permanently purge every trashed session, reached only after the confirm dialog.
-    /// Each row runs the same off-thread deletion path as a single permanent delete, with
-    /// cleanup options resolved per row from its repo config (mirroring the CLI
-    /// `empty-trash`) and force removal so a dirty worktree cannot pin a row.
+    /// Permanently purge every trashed session. The Trash section's "Empty
+    /// Trash" bulk action, reached only after the confirm dialog. Each row runs
+    /// the same off-thread deletion path as a single permanent delete:
+    /// reservation, hooks, teardown, and durable completion all run inside
+    /// `deletion_poller`; the event loop only queues requests.
+    /// Cleanup options are resolved per row from its repo config, mirroring the
+    /// CLI `empty-trash`, with force removal so a dirty worktree can't keep a
+    /// row pinned.
     pub(super) fn empty_trash_all(&mut self) {
         let mut trashed: Vec<Instance> = self
             .instances
@@ -2071,8 +1869,10 @@ impl HomeView {
         }
         for inst in trashed {
             let id = inst.id.clone();
-            // A restart cascade still on the worker would race the teardown against the
-            // container it is creating; skip the row, as `delete_selected` does.
+            // A daemon start still in flight would race the teardown against
+            // the container it is mid-creating; skip that row rather than
+            // orphan resources, the same guard `delete_selected` applies to
+            // a single delete.
             if self.restart_in_flight.contains(&id) {
                 continue;
             }
@@ -2108,17 +1908,21 @@ impl HomeView {
         self.update_selected();
     }
 
-    /// The active (non-archived) session ids under the selected group header, honoring
-    /// the group-by mode. Archived rows already live under the Archived section, so they
-    /// are excluded. Empty when no group is selected.
+    /// Collect the active (non-archived) session ids under the currently
+    /// selected group header, honoring the active group-by mode. Archived
+    /// sessions are excluded: they already live under the synthetic Archived
+    /// section, and re-archiving them is a no-op. Returns empty when no group
+    /// is selected.
     pub(super) fn active_sessions_in_selected_group(&self) -> Vec<String> {
         let Some(group_path) = self.selected_group.as_deref() else {
             return Vec::new();
         };
-        match self.group_by {
-            // Project headers are derived from each session's repo name and unified
-            // across profiles, narrowed only by the active profile filter, exactly as
-            // `build_flat_items_by_project` builds them.
+        match self.effective_group_by() {
+            // Machine headers are not groups, so nothing selects one here.
+            crate::session::config::GroupByMode::Remote => Vec::new(),
+            // Project headers are derived from each session's repo name and
+            // unified across profiles, narrowed only by the active profile
+            // filter, exactly as `build_flat_items_by_project` builds them.
             crate::session::config::GroupByMode::Project => self
                 .instances
                 .values()
@@ -2131,8 +1935,10 @@ impl HomeView {
                 .filter(|i| super::project_group_key(i) == group_path)
                 .map(|i| i.id.clone())
                 .collect(),
-            // Org headers key on the host-scoped owner so same-named owners on
-            // different hosts stay separate; same cross-profile unification as Project.
+            // Org headers are derived from each session's resolved remote
+            // owner key (host-scoped, not just the bare owner, so same-named
+            // owners on different hosts stay separate), same
+            // unification-across-profiles rationale as Project.
             crate::session::config::GroupByMode::Org => self
                 .instances
                 .values()
@@ -2145,9 +1951,9 @@ impl HomeView {
                 .filter(|i| self.org_group_key(i) == group_path)
                 .map(|i| i.id.clone())
                 .collect(),
-            // Manual groups nest, so a session belongs when its path matches exactly or
-            // sits beneath the group; scoped to the owning profile the same way
-            // `delete_selected_group` does.
+            // Manual groups can nest, so a session belongs when its path
+            // matches exactly or sits beneath the group. Scope to the group's
+            // owning profile the same way `delete_selected_group` does.
             crate::session::config::GroupByMode::Manual => {
                 let prefix = format!("{}/", group_path);
                 let is_member =
@@ -2162,42 +1968,23 @@ impl HomeView {
         }
     }
 
-    /// Archive every active session under the selected group: tmux teardown
-    /// runs off-thread, persist runs inline. Confirmation upstream. See #1868.
+    /// Queue the whole group's archive before submitting any row. The daemon
+    /// tears down each pane and publishes its committed state.
     pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
         let ids = self.active_sessions_in_selected_group();
         if ids.is_empty() {
             return Ok(());
         }
-        // Off-thread tmux teardown so N x 4 shellouts don't block the input
-        // thread. Mirrors `force_remove_session`.
-        let kill_targets: Vec<_> = ids
-            .iter()
-            .filter_map(|id| self.instances.get(id).cloned())
-            .collect();
-        std::thread::spawn(move || {
-            for inst in kill_targets {
-                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    inst.kill_all_tmux_sessions()
-                })) {
-                    tracing::error!(
-                        target: "session.tmux_cleanup",
-                        session_id = %inst.id,
-                        "archive_selected_group tmux teardown panicked: {:?}",
-                        panic
-                    );
-                }
-            }
-        });
-        self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
+        self.session_feed.submit_batch(ids.into_iter().map(|id| {
+            (
+                id,
+                crate::daemon::SessionMutation::Archive(crate::daemon::UpdateArchiveBody {
+                    archived: true,
+                    kill_pane: true,
+                }),
+            )
+        }))?;
         self.reveal_archived_section();
-        self.rebuild_flat_items();
-        // The project header vanishes once its last active member is archived, so the
-        // cursor's old index may point past the list end; clamp and re-resolve.
-        if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
-            self.cursor = self.flat_items.len() - 1;
-        }
-        self.update_selected();
         Ok(())
     }
 }
@@ -2216,13 +2003,19 @@ enum RestoreFromTrash {
     PersistFailed,
 }
 
-/// Restore under one per-instance lifecycle flock. Acquisition, worktree move,
-/// and durable commit therefore form one serialized transition.
+/// Restore under identity and lifecycle exclusion through durable commit.
 fn restore_from_trash_with_storage(
     storage: &Storage,
     id: &str,
     owned_trash_generation: Option<u64>,
 ) -> RestoreFromTrash {
+    let _identity = match crate::session::acquire_session_identity_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore identity lock failed: {error}");
+            return RestoreFromTrash::PersistFailed;
+        }
+    };
     let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(id) {
         Ok(lock) => lock,
         Err(error) => {
@@ -2323,9 +2116,11 @@ fn restore_from_trash_with_storage(
 mod tests {
     use super::*;
 
-    // An Idle sandbox session whose container is still running is the #1927 follow-up:
-    // the worktree dir is an active bind-mount source, so `git worktree move` fails with
-    // EBUSY and the rename must block with the sandbox-specific reason.
+    // An Idle sandbox session whose container is still running is the #1927
+    // follow-up bug: the worktree dir is an active bind-mount source, so
+    // `git worktree move` fails with EBUSY. Before the fix this returned
+    // `None` (the rename proceeded and the move blew up with "fatal: failed
+    // to move"); it must now block with the sandbox-specific reason.
     #[test]
     fn idle_sandbox_with_running_container_blocks() {
         assert_eq!(

@@ -1,11 +1,11 @@
-//! macOS-specific process utilities.
+//! macOS-specific process utilities
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 use std::collections::HashMap;
 use std::process::Command;
 
 pub(super) use super::unix::{
-    configure_process_group, kill_process_group, terminate_process_group,
+    configure_process_group, kill_process_group, terminate_process_group, try_wait_status_hook,
 };
 pub(super) fn rename_exclusive(
     source_dir: &std::os::fd::OwnedFd,
@@ -35,6 +35,11 @@ pub(super) fn rename_exclusive(
     result.map_err(std::io::Error::from)
 }
 
+pub(crate) fn unix_peer_uid(stream: &tokio::net::UnixStream) -> std::io::Result<u32> {
+    Ok(stream.peer_cred()?.uid())
+}
+
+/// Collect `pid` and every descendant by parsing `ps -A` once and walking the map.
 pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
     let children_map = build_children_map();
     let mut pids = vec![pid];
@@ -42,6 +47,7 @@ pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
     pids
 }
 
+/// Build a map of parent PID -> list of child PIDs by parsing `ps` output once
 pub(super) fn build_children_map() -> HashMap<u32, Vec<u32>> {
     let mut children_map: HashMap<u32, Vec<u32>> = HashMap::new();
 
@@ -65,7 +71,16 @@ pub(super) fn build_children_map() -> HashMap<u32, Vec<u32>> {
     children_map
 }
 
-/// `-E` appends each owned process's environment; if `ps` rejects it, every candidate is `false`.
+/// One `ps -A -ww -E -o command=` fork deciding, for each candidate `i`,
+/// whether a live process belongs to it: a whitespace-delimited token exactly
+/// equals `env_needles[i]` (anchored, matching the `KEY=VAL` env tokens `-E`
+/// appends), and the line contains `cmdline_needles[i]` when both are supplied.
+/// An executable needle matches an exact argv-token basename. A candidate with
+/// one signal uses that one; otherwise every supplied signal must match.
+/// `-ww` disables column
+/// truncation; `-E` appends each owner-owned process's environment. If a `ps`
+/// build rejects `-E`, the call fails closed to all `false` and recovery falls
+/// back to the ledger. Best-effort: a failed `ps` yields all `false`.
 pub(super) fn processes_matching(
     env_needles: &[String],
     cmdline_needles: &[Option<String>],
@@ -125,8 +140,13 @@ pub(super) fn processes_matching(
     found
 }
 
+/// Sample system memory via `sysctl` and `vm_stat`, matching this module's
+/// existing shell-out convention. Populates total/available RAM and the native
+/// memory-pressure level; PSI has no macOS analogue and stays `None`.
 pub(super) fn sample_memory() -> super::metrics::MemorySample {
-    // A vm_stat failure alone would otherwise read as a false 100% used.
+    // Require both figures: total comes from a reliable sysctl but available is
+    // parsed from vm_stat, so a vm_stat failure alone would otherwise read as a
+    // false 100%. Report "unknown" (0/0) unless both are present.
     let (total_bytes, available_bytes) = match (
         sysctl_u64("hw.memsize"),
         read_vm_stat().and_then(|s| parse_vm_stat_available(&s)),
@@ -269,7 +289,10 @@ fn read_vm_stat() -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// (free + inactive) pages; an approximation, so the band uses the native pressure level.
+/// Derive "available" bytes from `vm_stat`: (free + inactive) pages times the
+/// reported page size. Inactive pages are reclaimable, so this mirrors the
+/// spirit of Linux `MemAvailable`. It is an approximation, which is why macOS
+/// leans on the native pressure level for its band rather than this number.
 fn parse_vm_stat_available(vm_stat: &str) -> Option<u64> {
     let page_size = parse_vm_stat_page_size(vm_stat)?;
     let free = parse_vm_stat_pages(vm_stat, "Pages free")?;
@@ -277,12 +300,15 @@ fn parse_vm_stat_available(vm_stat: &str) -> Option<u64> {
     Some((free + inactive).saturating_mul(page_size))
 }
 
+/// The page size from the `vm_stat` header: `Mach Virtual Memory Statistics:
+/// (page size of 16384 bytes)`.
 fn parse_vm_stat_page_size(vm_stat: &str) -> Option<u64> {
     let line = vm_stat.lines().next()?;
     let after = line.split("page size of").nth(1)?;
     after.split_whitespace().next()?.parse().ok()
 }
 
+/// A `vm_stat` page-count line like `Pages free:    123456.` (trailing period).
 fn parse_vm_stat_pages(vm_stat: &str, key: &str) -> Option<u64> {
     for line in vm_stat.lines() {
         let Some((name, rest)) = line.split_once(':') else {
@@ -314,6 +340,7 @@ Pages wired down:                        300000.
         assert_eq!(parse_vm_stat_page_size(VM_STAT), Some(16384));
         assert_eq!(parse_vm_stat_pages(VM_STAT, "Pages free"), Some(123456));
         assert_eq!(parse_vm_stat_pages(VM_STAT, "Pages inactive"), Some(200000));
+        // available = (free + inactive) * page_size
         assert_eq!(
             parse_vm_stat_available(VM_STAT),
             Some((123456 + 200000) * 16384)
@@ -345,7 +372,10 @@ Pages wired down:                        300000.
     }
 }
 
-/// `kern.boottime` shifts on clock steps; the session UUID does not.
+/// Per-boot identity from `kern.bootsessionuuid`: a UUID fixed for the boot's
+/// lifetime. Preferred over `kern.boottime`, which is recomputed as
+/// `now - uptime` and shifts on clock steps (NTP, sleep/wake), which would
+/// silently rotate the ledger mid-boot.
 pub(super) fn boot_id() -> Option<String> {
     let out = Command::new("sysctl")
         .args(["-n", "kern.bootsessionuuid"])
@@ -376,7 +406,10 @@ pub(super) fn parent_and_argv0(pid: u32) -> Option<(u32, String)> {
     Some((ppid, fields.next().unwrap_or_default().to_string()))
 }
 
+/// Get the foreground process group leader for a shell PID
 pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
+    // Use ps to get the foreground process group
+    // ps -o tpgid= -p <pid> gives us the terminal foreground process group ID
     let output = Command::new("ps")
         .args(["-o", "tpgid=", "-p", &shell_pid.to_string()])
         .output()
@@ -395,10 +428,14 @@ pub fn get_foreground_pid(shell_pid: u32) -> Option<u32> {
         return Some(shell_pid);
     }
 
+    // Find a process in the foreground group
     find_process_in_group(tpgid as u32).or(Some(shell_pid))
 }
 
+/// Find a process belonging to the given process group
 fn find_process_in_group(pgrp: u32) -> Option<u32> {
+    // Use ps to find processes in this group
+    // ps -o pid=,pgid= -A lists all processes with their PIDs and PGIDs
     let output = Command::new("ps")
         .args(["-o", "pid=,pgid=", "-A"])
         .output()
@@ -422,6 +459,8 @@ fn find_process_in_group(pgrp: u32) -> Option<u32> {
     None
 }
 
+/// Prevents user-idle system sleep by holding a `caffeinate` child. `-i`
+/// inhibits system idle sleep only, so the display still sleeps normally.
 pub(super) struct CaffeinateInhibitor {
     child: Option<std::process::Child>,
 }
@@ -437,7 +476,9 @@ impl super::SleepInhibit for CaffeinateInhibitor {
         if super::sleep_inhibit_unavailable() {
             return Ok(());
         }
-        // `-w <daemon_pid>` releases the assertion even when the daemon dies without `Drop`.
+        // `-w <daemon_pid>` makes caffeinate exit when the daemon exits, so
+        // the assertion is released even on `std::process::exit`, a panic,
+        // OOM, or `kill -9`, none of which run a `Drop`.
         let child = match Command::new("caffeinate")
             .args(["-i", "-w", &std::process::id().to_string()])
             .stdin(std::process::Stdio::null())

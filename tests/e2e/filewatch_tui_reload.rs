@@ -21,7 +21,10 @@ fn peer_storage_update_reflects_within_sub_tick_budget() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("filewatch_reload");
+    h.enable_e2e_debug_signals();
     h.spawn_tui();
+    // Native pane preparation refuses an unready runtime.
+    h.wait_for_runtime_ready();
     h.wait_for(" aoe ");
 
     // Set HOME/XDG_CONFIG_HOME for THIS process so `Storage::new`
@@ -69,7 +72,10 @@ fn peer_cli_add_reflects_during_live_send_without_changing_target() {
         String::from_utf8_lossy(&active.stderr)
     );
 
+    h.enable_e2e_debug_signals();
     h.spawn_tui();
+    // Native pane preparation refuses an unready runtime.
+    h.wait_for_runtime_ready();
     h.wait_for("active-live");
     h.send_keys("Tab");
     h.wait_for_timeout("LIVE →  active-live", Duration::from_secs(10));

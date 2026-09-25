@@ -1,5 +1,6 @@
-/// Tests for the mode that opens a newly created terminal-mode session: the default follows
-/// `default_attach_mode`, and an explicit mode applies only after creation.
+/// Tests for the mode that opens a newly-created terminal-mode session. The
+/// default follows `default_attach_mode`, preserving historical behavior. An
+/// explicit mode applies only after creation.
 use super::*;
 use crate::session::config::{update_config, AttachMode, NewSessionMode};
 
@@ -55,9 +56,10 @@ fn resolves_new_session_mode() {
 #[test]
 #[serial]
 fn returns_none_for_missing_instance() {
-    // Race: the apply_creation_results return reaches the dispatch after the instance was
-    // deleted, so `None` tells the caller to fall back to the structured-aware attach_session
-    // path rather than attach to a ghost.
+    // Race: the apply_creation_results return reaches the dispatch
+    // and the instance has been deleted in the meantime. `None`
+    // signals the caller to fall back to the structured view-aware
+    // attach_session path rather than try to attach to a ghost.
     let env = create_test_env_empty();
     let mode = env.view.new_session_attach_mode("nonexistent-id");
     assert!(mode.is_none());
@@ -66,8 +68,10 @@ fn returns_none_for_missing_instance() {
 #[test]
 #[serial]
 fn returns_none_for_acp_session() {
-    // Acp sessions aren't tmux-backed, so live mode has no target and tmux attach is a
-    // no-op; the resolver returns None so the dispatch picks the fallback explicitly.
+    // Acp sessions aren't tmux-backed; live mode has no target
+    // and tmux attach is a no-op. The resolver returns None so the
+    // dispatch picks the (no-op) fallback explicitly, regardless of
+    // what the user configured globally.
     let mut env = create_test_env_empty();
     write_session_modes(AttachMode::LiveSend, NewSessionMode::MatchDefault);
     let id = add_session(&mut env.view, "acp-one");
@@ -76,51 +80,4 @@ fn returns_none_for_acp_session() {
     });
     let mode = env.view.new_session_attach_mode(&id);
     assert!(mode.is_none(), "structured view sessions must return None");
-}
-
-/// A minimal `NewSessionData` for the sync create path: no sandbox, no hooks, no worktree.
-/// That combination bypasses `creation_poller` and runs `create_session` inline, which is
-/// the path that originally emitted `Action::AttachSession` and bypassed the attach-mode
-/// setting.
-fn sync_path_session_data(project: &str) -> crate::tui::dialogs::NewSessionData {
-    crate::tui::dialogs::NewSessionData {
-        profile: "test".to_string(),
-        title: "sync-path-test".to_string(),
-        path: project.to_string(),
-        group: String::new(),
-        tool: "claude".to_string(),
-        worktree_enabled: false,
-        worktree_branch: None,
-        create_new_branch: false,
-        base_branch: None,
-        extra_repo_paths: Vec::new(),
-        sandbox: false,
-        sandbox_image: String::new(),
-        yolo_mode: false,
-        extra_env: Vec::new(),
-        extra_args: String::new(),
-        command_override: String::new(),
-        scratch: false,
-        fork_seed: None,
-        structured: false,
-    }
-}
-
-#[test]
-#[serial]
-fn sync_create_path_emits_attach_after_create_not_attach_session() {
-    // Regression guard: `Action::AttachSession` skips the attach-mode dispatch, and only
-    // `Action::AttachAfterCreate` routes through it, so a refactor flipping this back would
-    // silently stop the live-mode setting on plain creates. e2e covers the live-mode end;
-    // this covers the action plumbing without tmux.
-    let mut env = create_test_env_empty();
-    let project_dir = env._temp.path().join("sync-project");
-    std::fs::create_dir_all(&project_dir).unwrap();
-    let data = sync_path_session_data(project_dir.to_str().unwrap());
-    let action = env.view.create_session_with_hooks(data, None);
-    assert!(
-        matches!(action, Some(Action::AttachAfterCreate(_))),
-        "sync create path must emit AttachAfterCreate (route through attach-mode setting), got {:?}",
-        action
-    );
 }

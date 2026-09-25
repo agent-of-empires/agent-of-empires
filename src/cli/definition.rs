@@ -55,11 +55,11 @@ pub struct Cli {
     #[arg(short = 'p', long, global = true, env = "AGENT_OF_EMPIRES_PROFILE")]
     pub profile: Option<String>,
 
-    /// Attach to a remote agent daemon instead of using the local
-    /// session list. Equivalent to setting `AOE_DAEMON_URL`; pair with
-    /// `AOE_DAEMON_TOKEN` for the bearer token. Only meaningful at the
-    /// no-subcommand `aoe` invocation (the TUI dashboard); ignored
-    /// otherwise.
+    /// Connect to a remote agent daemon. The TUI lists its sessions
+    /// inline beside local ones as a temporary remote that is never saved;
+    /// `aoe acp` verbs and `aoe serve --status` target it instead of the
+    /// local daemon. Equivalent to setting `AOE_DAEMON_URL`; pair with
+    /// `AOE_DAEMON_TOKEN` for the bearer token.
     #[arg(long, global = true, env = "AOE_DAEMON_URL")]
     pub daemon_url: Option<String>,
 
@@ -94,6 +94,12 @@ pub enum Commands {
     /// `--filter <expr>` for raw EnvFilter syntax. `--get` prints the
     /// current filter. Changes are ephemeral and lost on daemon restart.
     LogLevel(LogLevelArgs),
+
+    /// Manage remote daemon endpoints the TUI can connect to
+    Remote {
+        #[command(subcommand)]
+        command: crate::cli::remote::RemoteCommands,
+    },
 
     /// Remove a session
     #[command(alias = "rm")]
@@ -264,6 +270,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "ps",
     "logs",
     "log_level",
+    "remote",
     "remove",
     "send",
     "status",
@@ -301,6 +308,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Ps(_) => "ps",
         Commands::Logs(_) => "logs",
         Commands::LogLevel(_) => "log_level",
+        Commands::Remote { .. } => "remote",
         Commands::Remove(_) => "remove",
         Commands::Send(_) => "send",
         Commands::Status(_) => "status",

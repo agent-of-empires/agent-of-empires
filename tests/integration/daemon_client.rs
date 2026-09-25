@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use agent_of_empires::daemon::{
-    AcpWorkerState, ContextResumeAvailability, ContextResumeIndeterminateReason, DaemonClient,
-    DaemonClientError, PromptAttachmentKind,
+    AcpWorkerState, ApiErrorCode, ContextResumeAvailability, ContextResumeIndeterminateReason,
+    DaemonClient, DaemonClientError, SessionCredential,
 };
 use agent_of_empires::session::SessionScope;
 use reqwest::StatusCode;
@@ -12,6 +12,7 @@ use tokio::net::TcpListener;
 
 #[derive(Debug)]
 struct RecordedRequest {
+    method: String,
     target: String,
     headers: HashMap<String, String>,
 }
@@ -66,19 +67,6 @@ fn structured_success() -> String {
             },
             "acp_worker_state": "running",
             "acp_capable": true,
-            "queued_prompts": [{
-                "id": "prompt-a",
-                "seq": 7,
-                "text": "continue",
-                "attachments": [{
-                    "id": "attachment-a",
-                    "kind": "image",
-                    "mime_type": "image/png",
-                    "size": 42
-                }],
-                "created_at": "2026-01-01T00:01:00Z",
-                "origin_device": "laptop"
-            }],
             "acp_session_id": "acp-session-a",
             "acp_agent": "claude",
             "acp_can_fork": true,
@@ -118,14 +106,18 @@ async fn serve_once(wire_response: Vec<u8>) -> (String, tokio::task::JoinHandle<
         let request = String::from_utf8(request).unwrap();
         let mut lines = request.split("\r\n");
         let mut request_line = lines.next().unwrap().split_ascii_whitespace();
-        assert_eq!(request_line.next(), Some("GET"));
+        let method = request_line.next().unwrap().to_string();
         let target = request_line.next().unwrap().to_string();
         let headers = lines
             .take_while(|line| !line.is_empty())
             .filter_map(|line| line.split_once(':'))
             .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
             .collect();
-        RecordedRequest { target, headers }
+        RecordedRequest {
+            method,
+            target,
+            headers,
+        }
     });
     (format!("http://{address}"), task)
 }
@@ -180,6 +172,7 @@ async fn daemon_client_http_contract() {
         assert!(envelope.sessions.is_empty());
         assert_eq!(envelope.workspace_ordering, ["workspace-a"]);
         let request = request.await.unwrap();
+        assert_eq!(request.method, "GET");
         assert_eq!(request.target, expected_target);
         let expected_authorization = token.map(|token| format!("Bearer {token}"));
         assert_eq!(
@@ -209,6 +202,10 @@ async fn daemon_client_http_contract() {
         Err(DaemonClientError::InsecureBearerTransport)
     ));
     assert!(DaemonClient::new("http://example.test", None).is_ok());
+    assert!(
+        DaemonClient::with_login("http://192.168.1.20:8081", Some("secret-token"), None, true)
+            .is_ok()
+    );
     assert!(DaemonClient::new("https://example.test", Some("secret-token")).is_ok());
     for invalid_token in ["bad value", "tøken"] {
         assert!(matches!(
@@ -258,18 +255,12 @@ async fn daemon_client_http_contract() {
     assert!(session.acp_can_fork);
     assert!(session.keeps_context);
     assert_eq!(session.clear_aliases, ["/clear"]);
-    assert_eq!(session.queued_prompts[0].seq, 7);
-    assert_eq!(
-        session.queued_prompts[0].attachments[0].kind,
-        PromptAttachmentKind::Image
-    );
     let round_trip = serde_json::to_value(&envelope).unwrap();
     for key in [
         "view",
         "context_resume",
         "acp_worker_state",
         "acp_capable",
-        "queued_prompts",
         "acp_session_id",
         "acp_agent",
         "acp_can_fork",
@@ -340,6 +331,7 @@ async fn daemon_client_http_contract() {
         error,
         DaemonClientError::Status {
             status: StatusCode::UNAUTHORIZED,
+            code: None,
             ref body,
             truncated: false,
         } if body.is_empty()
@@ -362,6 +354,7 @@ async fn daemon_client_http_contract() {
         status,
         body,
         truncated,
+        code: None,
     } = error
     else {
         panic!("expected status error");
@@ -455,4 +448,105 @@ async fn daemon_client_http_contract() {
             .is_err()
     );
     redirected_request.abort();
+}
+
+/// A response whose headers arrive but whose body never finishes, so a client
+/// that awaits the body on an error stalls past the test's deadline.
+async fn serve_stalled_body(head: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(stream.read(&mut request).await.unwrap() > 0);
+        stream.write_all(head.as_bytes()).await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    (format!("http://{address}"), task)
+}
+
+#[tokio::test]
+#[serial_test::parallel]
+async fn daemon_client_api_errors_classify_from_status_and_header_only() {
+    let (origin, stalled) = serve_stalled_body(
+        "HTTP/1.1 403 Forbidden\r\nAoE-Error-Code: read_only\r\nContent-Length: 64\r\n\r\n",
+    )
+    .await;
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        DaemonClient::new(&origin, Some("secret-token"))
+            .unwrap()
+            .post_api::<_, serde_json::Value>(&["pair", "codes"], &serde_json::json!({})),
+    )
+    .await
+    .expect("an authenticated error must not wait for its body")
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        DaemonClientError::Status {
+            status: StatusCode::FORBIDDEN,
+            code: Some(ApiErrorCode::ReadOnly),
+            ref body,
+            ..
+        } if body.is_empty()
+    ));
+    stalled.abort();
+
+    let login = SessionCredential {
+        session: "session-id".into(),
+        binding: "binding-secret".into(),
+    };
+    let reflected = "reflected session-id";
+    let (origin, request) = serve_once(response(
+        "400 Bad Request",
+        &[("AoE-Error-Code", "read_only")],
+        reflected,
+    ))
+    .await;
+    let error = DaemonClient::with_login(&origin, None, Some(&login), false)
+        .unwrap()
+        .get_api::<serde_json::Value>(&["profiles"], &[])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            DaemonClientError::Status {
+                status: StatusCode::BAD_REQUEST,
+                code: None,
+                body,
+                ..
+            } if body.is_empty()
+        ),
+        "a login session authenticates too, and a code on the wrong status means nothing: {error:?}"
+    );
+    let request = request.await.unwrap();
+    assert_eq!(request.target, "/api/profiles");
+    assert_eq!(
+        request.headers.get("cookie").map(String::as_str),
+        Some("aoe_session=session-id")
+    );
+    assert_eq!(
+        request
+            .headers
+            .get(agent_of_empires::daemon::DEVICE_BINDING_HEADER)
+            .map(String::as_str),
+        Some("binding-secret")
+    );
+
+    let (origin, request) = serve_once(response("200 OK", &[], &"x".repeat(16_777_217))).await;
+    assert!(matches!(
+        DaemonClient::new(&origin, Some("secret-token"))
+            .unwrap()
+            .get_api::<serde_json::Value>(&["agents"], &[])
+            .await,
+        Err(DaemonClientError::ResponseTooLarge { limit: 16_777_216 })
+    ));
+    request.await.unwrap();
+
+    assert!(matches!(
+        DaemonClient::with_login("http://example.test", None, Some(&login), false),
+        Err(DaemonClientError::InsecureBearerTransport)
+    ));
+    assert!(DaemonClient::with_login("http://example.test", None, Some(&login), true).is_ok());
 }

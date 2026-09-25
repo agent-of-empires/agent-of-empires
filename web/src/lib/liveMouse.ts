@@ -1,23 +1,12 @@
-// Mouse forwarding for full-screen apps in the mobile live view, mirroring the TUI's encodings in src/tui/home/input.rs.
-
-/** Wheel bytes: `up` picks button 64 vs 65, `sgr` picks SGR (1006) vs X10; `col`/`row` are 1-based. */
-export function wheelMouseBytes(up: boolean, sgr: boolean, col: number, row: number): Uint8Array<ArrayBuffer> {
-  const button = up ? 64 : 65;
-  const cx = Math.max(1, Math.floor(col));
-  const cy = Math.max(1, Math.floor(row));
-  // A fresh non-shared ArrayBuffer, which is what WebSocket.send accepts.
-  if (sgr) {
-    const s = `\x1b[<${button};${cx};${cy}M`;
-    const out = new Uint8Array(s.length);
-    for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
-    return out;
-  }
-  // Legacy X10 encodes value + 32 in one byte, so coordinates clamp at 223.
-  const enc = (v: number) => Math.min(223, v) + 32;
-  const out = new Uint8Array(6);
-  out.set([0x1b, 0x5b, 0x4d, enc(button), enc(cx), enc(cy)]);
-  return out;
-}
+// Mouse forwarding for the mobile live view. When the live-send target is a
+// full-screen (alternate-screen) app with mouse tracking on, its scrollback is
+// not capturable, so pointer gestures go to the app instead of widening the
+// capture window. Button reports are encoded here, mirroring the TUI's
+// `mouse_event_bytes` (src/tui/home/input.rs) so both surfaces speak the same
+// encodings. Wheel notches are not: they go as a `wheel` control message the
+// daemon encodes, which is the only form a non-owner viewer may send. See
+// src/server/live_ws.rs for the frame flags (altScreen / mouse / mouseSgr)
+// that drive this.
 
 /** Button report mirroring the TUI's `mouse_event_bytes`. `baseButton` is 0/1/2; `motion` sets the drag bit. */
 export function buttonMouseBytes(

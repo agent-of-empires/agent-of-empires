@@ -3,12 +3,23 @@
 
 use super::*;
 
-/// Governs whether `start_with_resume_fallback` may pass `--resume <sid>` at all, independent of
-/// the per-sid loop-breaker (`resume_probe_failed_sid`), which always applies regardless of policy.
+/// Governs whether `start_with_resume_fallback` may pass `--resume <sid>` at
+/// all, independent of the per-sid loop-breaker (`resume_probe_failed_sid`),
+/// which always applies regardless of policy. `HonorAutoResumeSetting` is
+/// used by explicit user restart/reattach (`e`, `Enter`); `Allow` is used by
+/// Send Message and Live Send, which must keep trying to preserve agent
+/// context even when the user has disabled auto-resume for manual restarts.
+/// See #2609.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResumeAttemptPolicy {
     HonorAutoResumeSetting,
     Allow,
+}
+
+pub(crate) struct LaunchReservation {
+    pub(crate) generation: u64,
+    pub(crate) title_lock: crate::session::storage::StorageFlock,
+    pub(crate) lifecycle_lock: crate::session::storage::StorageFlock,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,12 +28,25 @@ enum ProbeResult {
     Dead,
 }
 
+pub(crate) struct ResumeLaunchOptions {
+    pub(crate) resume_policy: ResumeAttemptPolicy,
+    pub(crate) restart: bool,
+    pub(crate) conversation_carry: Option<ConversationCarry>,
+}
+
 const RESUME_PROBE_MAX: std::time::Duration = std::time::Duration::from_millis(3000);
 
 const RESUME_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Grace window we keep observing after the pane stops running its boot shell, before declaring
-/// `Alive`.
+/// Grace window we keep observing after the pane stops running its boot
+/// shell, before declaring `Alive`. Sized to cover the longest in-pane
+/// boot a real agent takes before it would have crashed on a bad sid:
+/// opencode (bun-compiled native binary that loads JS, parses argv, and
+/// hits the session-not-found path) reaches `pane_dead = true` between
+/// ~900ms and ~1100ms after spawn on a warm cache, longer on cold or
+/// heavy projects. Healthy resumes pay this entire window once; the pane is
+/// fully attachable for the duration so the cost is purely in the synchronous
+/// restart path's latency, not in agent responsiveness afterward.
 const RESUME_PROBE_POST_SHELL_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
 
 impl Instance {
@@ -53,10 +77,11 @@ impl Instance {
         self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, true, false, None)
     }
 
-    /// Restart, first removing the sandbox container when `discard_sandbox_container` is set so the
-    /// launch recreates it with the current tool's mounts, and carrying the conversation into the
-    /// incoming account's config root when the swap changed only the account (#4030). Removal
-    /// happens only once this restart owns the Launch reservation.
+    /// Restart, first removing the sandbox container when `discard_sandbox_container`
+    /// is set so the launch recreates it with the current tool's mounts (#3959),
+    /// and carrying the conversation into the incoming account's config root
+    /// when the swap changed only the account (#4030).
+    /// Removal happens only once this restart owns the Launch reservation.
     pub fn restart_discarding_sandbox_container(
         &mut self,
         size: Option<(u16, u16)>,
@@ -75,6 +100,26 @@ impl Instance {
     }
 
     /// Settle-based pane probe used by the resume-fallback cascade.
+    ///
+    /// Returns `Dead` immediately if the pane dies or the session evaporates
+    /// during the probe window. Returns `Alive` only after the pane has been
+    /// off the boot shell for `RESUME_PROBE_POST_SHELL_GRACE` consecutive
+    /// time (handles agents whose boot wrapper sits before the agent
+    /// crashes on a bad sid), or charitably on full timeout for slow-start
+    /// agents. `pane_dead` is the unambiguous signal we trust to fire the
+    /// cascade.
+    ///
+    /// For instances using a shell-wrapper command (`/bin/sh -c '...'`,
+    /// agent-override scripts), `is_pane_running_shell` stays true for the
+    /// entire probe and the post-shell grace shortcut never fires. Such
+    /// instances rely exclusively on `pane_dead`: if the wrapper exits
+    /// when the agent crashes, the cascade fires correctly; if the wrapper
+    /// holds the pane open past the agent crash (e.g., trailing `sleep`),
+    /// the cascade misses it. Pathological shape; not worth special-casing.
+    ///
+    /// Latency consequence: shell-wrapper instances therefore burn the full
+    /// `RESUME_PROBE_MAX` on every healthy resume. Real agents settle in
+    /// ~`RESUME_PROBE_POST_SHELL_GRACE`.
     fn probe_settle(
         &self,
         max: std::time::Duration,
@@ -113,6 +158,43 @@ impl Instance {
     }
 
     /// Start the session with a one-shot resume fallback.
+    ///
+    /// Cascade:
+    ///   1. If a valid `agent_session_id` is set and the agent supports
+    ///      resume, attempt the start (which appends `--resume <sid>` or
+    ///      equivalent). Probe the pane via `probe_settle`.
+    ///   2. If the pane went dead within the probe window, stop the poller,
+    ///      tear down the dead tmux session, preserve the sid, persist a
+    ///      `resume_probe_failed_sid` loop-breaker, and return
+    ///      `StartOutcome::ResumeFailed`. A dead pane is not proof that the
+    ///      sid is invalid, so this path must not clear it or launch fresh.
+    ///   3. A launch that pins an already-stored id without resuming it
+    ///      (`--session-id <sid>`, or a fork's pre-generated child id) is
+    ///      probed the same way, but a death there fails the call outright
+    ///      rather than arming the resume loop-breaker: nothing was resumed,
+    ///      so there is no resume to break. See `probe_pinned_fresh_launch`.
+    ///
+    /// `resume_policy` gates step 1: `HonorAutoResumeSetting` additionally
+    /// requires `SessionConfig::auto_resume_on_restart`; `Allow` always
+    /// permits an attempt when the resolved agent supports native resume. Independent
+    /// of policy, a sid that already equals `resume_probe_failed_sid` from a
+    /// prior call never re-attempts resume: it returns
+    /// `StartOutcome::FreshAfterFailedResume` instead of repeating the same
+    /// doomed probe. See #2609.
+    ///
+    /// Latency: only fires the probe when a freshly-created tmux session is
+    /// being handed an id AoE already had stored (step 1 or step 3). Healthy
+    /// launches on real agents pay `RESUME_PROBE_POST_SHELL_GRACE` (~2s) once
+    /// on cold start; warm sessions and brand-new ones pay nothing.
+    /// Shell-wrapper command overrides pay the full `RESUME_PROBE_MAX` (~3s) on
+    /// every healthy resume because `is_pane_running_shell` never clears for
+    /// them; see `probe_settle`. When the failure path fires, add
+    /// `kill_clean` (~100ms macOS grace) before returning.
+    ///
+    /// Acp-mode sessions short-circuit (no tmux pane to probe).
+    /// `StartOutcome::Fresh` is honest there: structured view's resume concept lives
+    /// in `acp_session_id` and is handled by the ACP supervisor, not
+    /// by this cascade.
     pub(crate) fn start_with_resume_fallback(
         &mut self,
         size: Option<(u16, u16)>,
@@ -145,7 +227,7 @@ impl Instance {
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance start lock")?;
-        self.reconcile_from_disk();
+        self.reconcile_from_store(&storage)?;
         if self.is_structured() {
             return Ok(StartOutcome::Fresh);
         }
@@ -157,43 +239,121 @@ impl Instance {
             self.last_error = None;
             self.last_error_check = None;
         }
-        self.acquire_lifecycle_reservation(
+        let generation = self.acquire_lifecycle_reservation(
             &storage,
             LifecycleOperation::Launch,
             Some(Status::Starting),
         )?;
-        if restart {
-            self.stop_and_flush_poller_lifecycle_locked();
-            self.capture_omp_before_restart(&profile);
-        }
         if discard_sandbox_container {
             if let Err(error) = self.discard_stale_sandbox_container() {
-                self.fail_reserved_launch(&storage, &error, false);
+                self.fail_reserved_launch(&storage, generation, &error, false);
+                return Err(error);
+            }
+        }
+        self.resume_reserved_launch(
+            &storage,
+            size,
+            skip_on_launch,
+            LaunchReservation {
+                generation,
+                title_lock,
+                lifecycle_lock,
+            },
+            ResumeLaunchOptions {
+                resume_policy,
+                restart,
+                conversation_carry,
+            },
+        )
+    }
+
+    pub(crate) fn resume_reserved_launch(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        size: Option<(u16, u16)>,
+        skip_on_launch: bool,
+        reservation: LaunchReservation,
+        options: ResumeLaunchOptions,
+    ) -> Result<StartOutcome> {
+        let generation =
+            self.prepare_reserved_launch_hooks(storage, options.restart, reservation)?;
+        let hook_result = self.run_pre_launch_hooks(skip_on_launch, storage, None);
+        self.finish_reserved_launch(storage, size, options, generation, hook_result)
+    }
+    pub(crate) fn capture_before_restart_in(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+    ) -> Result<()> {
+        self.stop_and_flush_poller_lifecycle_locked(storage)?;
+        self.capture_omp_before_restart(storage)
+    }
+
+    pub(crate) fn discard_reserved_restart_container(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+    ) -> Result<()> {
+        if let Err(error) = self.discard_stale_sandbox_container() {
+            self.fail_reserved_launch(storage, generation, &error, false);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_reserved_launch_hooks(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        restart: bool,
+        reservation: LaunchReservation,
+    ) -> Result<u64> {
+        let LaunchReservation {
+            generation,
+            title_lock,
+            lifecycle_lock,
+        } = reservation;
+        if restart {
+            let capture = self
+                .stop_and_flush_poller_lifecycle_locked(storage)
+                .and_then(|()| self.capture_omp_before_restart(storage));
+            if let Err(error) = capture {
+                self.fail_reserved_launch(storage, generation, &error, false);
                 return Err(error);
             }
         }
 
-        // Keep the generation reservation durable, but allow hooks to invoke aoe against this
-        // session without waiting on either flock.
         drop(lifecycle_lock);
         drop(title_lock);
-        let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
-        let (_title_lock, _lifecycle_lock) =
-            self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
-        self.reconcile_sidecar_into_disk();
-        let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
-        let expected = self.apply_fresh_launch_intent();
+        Ok(generation)
+    }
 
+    pub(crate) fn finish_reserved_launch(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        size: Option<(u16, u16)>,
+        options: ResumeLaunchOptions,
+        generation: u64,
+        hook_result: Result<()>,
+    ) -> Result<StartOutcome> {
+        let (_title_lock, _lifecycle_lock) =
+            self.reacquire_launch_locks_after_hooks(storage, generation, hook_result)?;
+        let ResumeLaunchOptions {
+            resume_policy,
+            restart,
+            conversation_carry,
+        } = options;
+        let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
+        let expected = self.apply_fresh_launch_intent_in(storage);
         let result = (|| {
-            let prepared = self.stop_carry_and_prepare(restart, conversation_carry, expected)?;
-            let launch_outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
+            let prepared =
+                self.stop_carry_and_prepare_in(storage, restart, conversation_carry, expected)?;
+            let launch_outcome = self.spawn_prepared_launch(size, storage, prepared)?;
             let outcome =
-                self.finish_resume_launch(launch_outcome, skipped_failed_resume_sid, &profile)?;
-            self.commit_lifecycle_launch(&storage, restart)?;
+                self.finish_resume_launch(launch_outcome, skipped_failed_resume_sid, storage)?;
+            self.commit_lifecycle_launch(storage, generation, restart)?;
             Ok(outcome)
         })();
         if let Err(error) = result {
-            self.fail_reserved_launch(&storage, &error, true);
+            self.fail_reserved_launch(storage, generation, &error, true);
             return Err(error);
         }
         result
@@ -211,8 +371,9 @@ impl Instance {
     /// from whether the incoming account's transcript exists, so a carry after
     /// it pins an id the agent then rejects as already in use, killing the pane
     /// (#3399).
-    fn stop_carry_and_prepare(
+    fn stop_carry_and_prepare_in(
         &mut self,
+        storage: &dyn crate::session::SessionStore,
         restart: bool,
         conversation_carry: Option<ConversationCarry>,
         expected: ConversationState,
@@ -226,7 +387,9 @@ impl Instance {
             // conversation, and an outgoing sidecar must not rebind it
             // (launch_command's preparation applies the same gate).
             if matches!(self.resume_intent, ResumeIntent::Default) {
-                if let Some(observation) = self.capture_freshest_conversation() {
+                if let Some(observation) =
+                    self.capture_freshest_conversation_in(CaptureStorage::Scoped(storage))
+                {
                     self.apply_conversation_observation(&observation);
                 }
             }
@@ -240,18 +403,32 @@ impl Instance {
             };
             let excluded = original
                 .filter(|binding| self.retroactive_capture_excludes.insert(binding.clone()));
-            let mut prepared = self.prepare_launch_command(expected)?;
+            let mut prepared =
+                self.prepare_launch_command_in(CaptureStorage::Scoped(storage), expected)?;
             if let Some(binding) = excluded {
                 self.retroactive_capture_excludes.remove(&binding);
             }
             prepared.carry_relocated = relocated;
             return Ok(prepared);
         }
-        let prepared = self.prepare_launch_command(expected)?;
+        let stores = CaptureStorage::Scoped(storage);
+        let prepared = self.prepare_launch_command_in(stores, expected)?;
         if restart {
-            return self.refresh_prepared_prime_launch_after_pane_stop(prepared);
+            return self.refresh_prepared_prime_launch_after_pane_stop_in(stores, prepared);
         }
         Ok(prepared)
+    }
+
+    #[cfg(test)]
+    fn stop_carry_and_prepare(
+        &mut self,
+        restart: bool,
+        conversation_carry: Option<ConversationCarry>,
+        expected: ConversationState,
+    ) -> Result<PreparedLaunch> {
+        let storage =
+            crate::session::storage::Storage::new_unwatched(&self.effective_profile()).unwrap();
+        self.stop_carry_and_prepare_in(&storage, restart, conversation_carry, expected)
     }
 
     /// A failure fails the restart: relaunching into the old container would run the new tool
@@ -307,8 +484,19 @@ impl Instance {
         None
     }
 
-    /// Fail the launch when a fresh-but-pinned start (`--session-id <sid>` on an id the session
-    /// already had stored) died inside the probe window.
+    /// Fail the launch when a fresh-but-pinned start (`--session-id <sid>` on
+    /// an id the session already had stored) died inside the probe window.
+    ///
+    /// The agent rejects a `--session-id` it considers live ("Session ID ... is
+    /// already in use") and exits at once. `remain-on-exit` then holds the dead
+    /// pane, so the tmux name stays claimed and every later start sees an
+    /// existing session and no-ops without saying why. Returning `Err` routes
+    /// through `fail_reserved_launch`, which tears the corpse down and records
+    /// the pane's own message on the session. See #3399.
+    ///
+    /// Latency: the same window a resume attempt pays (~2s to settle, 3s max),
+    /// on the two launch shapes that can carry a doomed id. A brand-new
+    /// session never reaches here.
     fn probe_pinned_fresh_launch(&mut self, sid: &str) -> Result<()> {
         let probe = self.probe_settle(RESUME_PROBE_MAX, RESUME_PROBE_POLL);
         if matches!(probe, Ok(ProbeResult::Alive)) {
@@ -321,8 +509,18 @@ impl Instance {
         anyhow::bail!("agent exited immediately when pinned to session id {sid}{detail}")
     }
 
-    /// Last line of the agent's own output in the dead pane, as a ": <line>" suffix for an error
-    /// message.
+    /// Last line of the agent's own output in the dead pane, as a ": <line>"
+    /// suffix for an error message. `remain-on-exit` keeps the content
+    /// readable, so this surfaces the agent's diagnosis ("Session ID ... is
+    /// already in use") rather than a generic failure. tmux appends its own
+    /// `Pane is dead (status N)` banner below that output; skip it, since the
+    /// caller already knows the pane died.
+    ///
+    /// `capture_pane` captures with `-e`, so the agent's line still carries the
+    /// SGR sequences it was printed with (an agent error line is routinely red).
+    /// Strip them before this lands in `last_error`, which is persisted and
+    /// rendered as plain text by the TUI and the dashboard; stripping first also
+    /// keeps the banner filter working when `remain-on-exit-format` is styled.
     fn dead_pane_detail(&self) -> String {
         self.tmux_session()
             .ok()
@@ -346,7 +544,7 @@ impl Instance {
         &mut self,
         launch_outcome: LaunchSidOutcome,
         skipped_failed_resume_sid: Option<String>,
-        profile: &str,
+        storage: &dyn crate::session::SessionStore,
     ) -> Result<StartOutcome> {
         let (attempted_sid, pinned_prior_sid) = match launch_outcome {
             LaunchSidOutcome::Existing { sid }
@@ -393,13 +591,7 @@ impl Instance {
         self.stop_poller();
         self.session_id_poller = None;
         self.resume_probe_failed_sid = Some(stale_sid.clone());
-        if self.mark_resume_probe_failed(profile, &stale_sid) == SidWrite::Failed {
-            anyhow::bail!(
-                "resume probe failed for sid {} for {}, but marker could not be persisted",
-                stale_sid,
-                self.id,
-            );
-        }
+        self.mark_resume_probe_failed(storage, &stale_sid)?;
         self.kill_clean_locked()
             .with_context(|| format!("kill_clean before resume fallback for {}", self.id))?;
         self.status = Status::Error;
@@ -811,7 +1003,8 @@ mod tests {
                             pinned_prior_sid: Some(sid.to_string()),
                         },
                         None,
-                        "test",
+                        &crate::session::storage::Storage::new_unwatched("resume-contract")
+                            .unwrap(),
                     )
                     .unwrap(),
                     StartOutcome::Fresh,
@@ -955,7 +1148,7 @@ mod tests {
                 sid: launched_sid.to_string(),
             },
             None,
-            "marker-before-cleanup",
+            &storage,
         );
         assert!(
             result.is_err(),

@@ -38,8 +38,10 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     const { scroller, wheel } = term();
     expect(scroller.className).toContain("overflow-hidden");
     fireEvent.wheel(scroller, { deltaY: 120 });
-    // Down with SGR encoding.
-    expect(wheel.mock.calls[0]!.slice(0, 2)).toEqual([false, true]);
+    expect(wheel).toHaveBeenCalled();
+    // deltaY > 0 = scroll down = wheel down (up === false). The daemon picks
+    // the encoding from the pane's own modes, so none is passed here.
+    expect(wheel.mock.calls[0][0]).toBe(false);
     fireEvent.wheel(scroller, { deltaY: -120 });
     expect(wheel.mock.calls.at(-1)![0]).toBe(true);
     // A line-mode delta still forwards a notch.
@@ -48,15 +50,17 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     expect(wheel).toHaveBeenCalled();
   });
 
-  it.each([
-    ["an app with no mouse mode", { altScreen: true, mouse: false }],
-    ["a normal-screen agent", { altScreen: false, mouse: true, mouseSgr: true }],
-  ])("keeps capture scrolling for %s", (_n, over) => {
-    const { scroller, wheel, button } = term(over);
-    expect(scroller.className).toContain("overflow-y-auto");
+  // A full-screen app without mouse tracking still owns its own scrollback,
+  // and the daemon sends it PageUp/PageDown. Scrolling the browser's spacer
+  // of unrelated normal-buffer history would show the user nothing.
+  it("forwards the wheel to a full-screen app that never enabled mouse tracking", () => {
+    const { scroller, wheel, button } = term(frame({ altScreen: true, mouse: false }));
+    expect(scroller.className).toContain("overflow-hidden");
     fireEvent.wheel(scroller, { deltaY: 120 });
-    fireEvent.pointerDown(scroller, mouse());
-    expect(wheel).not.toHaveBeenCalled();
+    expect(wheel).toHaveBeenCalled();
+    // A button report is the part that needs tracking: an app that never
+    // asked for one reads it as typed escape bytes.
+    fireEvent.pointerDown(scroller, { pointerType: "mouse", button: 0, clientX: 10, clientY: 20 });
     expect(button).not.toHaveBeenCalled();
   });
 
@@ -103,18 +107,93 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     expect(wheel).toHaveBeenCalledTimes(1);
   });
 
-  it("reports touch wheels at pane 0's middle row and desktop wheels at the pointer row", () => {
-    // Position-aware apps ignore wheels over their input box, so touch uses the middle row.
-    const { scroller, wheel } = term();
-    drag(scroller, 300, 266);
-    expect(wheel.mock.calls[0]![3]).toBe(2);
+  it("maps split-window mouse input into pane 0", () => {
+    const clamped = term(frame({ altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 1, rows: 1 } }));
+    fireEvent.pointerDown(clamped.scroller, { pointerType: "mouse", button: 0, clientX: 500, clientY: 500 });
+    expect(clamped.button.mock.calls[0]!.slice(4)).toEqual([1, 1]);
+    clamped.unmount();
+
+    const base = term(
+      frame({ altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 80, rows: 24, left: 0, top: 0 } }),
+    );
+    fireEvent.pointerDown(base.scroller, { pointerType: "mouse", button: 0, clientX: 100, clientY: 100 });
+    const baseRow = base.button.mock.calls[0]![5] as number;
+    base.unmount();
+
+    const offset = term(
+      frame({ altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 80, rows: 24, left: 0, top: 1 } }),
+    );
+    fireEvent.pointerDown(offset.scroller, { pointerType: "mouse", button: 0, clientX: 100, clientY: 100 });
+    const offsetRow = offset.button.mock.calls[0]![5] as number;
+    expect(offsetRow).toBe(baseRow - 1);
+  });
+
+  it("does NOT forward a click for a normal-screen agent", () => {
+    const { scroller, button } = term(frame({ altScreen: false, mouse: true, mouseSgr: true }));
+    fireEvent.pointerDown(scroller, { pointerType: "mouse", button: 0, clientX: 10, clientY: 10 });
+    expect(button).not.toHaveBeenCalled();
+  });
+
+  it("does NOT forward a Shift+click (keeps local text selection)", () => {
+    const { scroller, button } = term(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    fireEvent.pointerDown(scroller, { pointerType: "mouse", button: 0, shiftKey: true, clientX: 10, clientY: 10 });
+    expect(button).not.toHaveBeenCalled();
+  });
+
+  it("does NOT forward a touch pointer (touch keeps its own scroll path)", () => {
+    const { scroller, button } = term(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    fireEvent.pointerDown(scroller, { pointerType: "touch", button: 0, clientX: 10, clientY: 10 });
+    expect(button).not.toHaveBeenCalled();
+  });
+
+  it("forwards a drag motion report and finalizes on release", () => {
+    // Exact per-cell dedupe counts depend on measured char metrics, which are
+    // unstable in jsdom; that is asserted in the real browser by
+    // tests/live-click-forward.spec.ts. Here we just lock the gesture shape:
+    // press (no motion) -> drag (motion bit) -> release. The drag moves in Y
+    // (row space): columns clamp to 1 in jsdom because renderCols never
+    // settles, so a horizontal move would dedupe to the same cell.
+    const { scroller, button } = term(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    fireEvent.pointerDown(scroller, { pointerType: "mouse", button: 0, clientX: 10, clientY: 10 });
+    fireEvent.pointerMove(scroller, { pointerType: "mouse", clientX: 10, clientY: 40 });
+    fireEvent.pointerUp(scroller, { pointerType: "mouse", button: 0, clientX: 10, clientY: 40 });
+    const calls = button.mock.calls;
+    expect(calls[0]!.slice(1, 3)).toEqual([false, false]); // press: not release, not motion
+    expect(calls.some((c) => c[1] === false && c[2] === true)).toBe(true); // a drag (motion) report
+    expect(calls.at(-1)![1]).toBe(true); // release last
+  });
+
+  it("gears a touch drag up by the forward touch gain", () => {
+    const { scroller, wheel } = term(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    // lineH = 14 * 1.2 = 16.8px, so 14px of finger travel is short of a line
+    // and reaches one notch only because of the assist; ungeared it would
+    // round to nothing. A drag this small fits in one burst and leaves at
+    // once (pacing across bursts is covered in the alt-screen spec).
+    fireEvent.touchStart(scroller, { touches: [{ clientX: 100, clientY: 300 } as Touch] });
+    fireEvent.touchMove(scroller, { touches: [{ clientX: 100, clientY: 286 } as Touch] });
+    expect(wheel).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports touch wheels at the input pane's middle row; desktop wheels keep the pointer cell", () => {
+    // Position-aware apps (Claude Code) hit-test the wheel's row and ignore
+    // notches over their pinned input box, which shrank the usable touch area
+    // to the transcript sliver above it. The touch path therefore clamps to
+    // the pane's vertical middle (rows=3 -> row 2) no matter where the finger
+    // is; the desktop pointer keeps real hover semantics (y=266 -> row 3).
+    const { scroller, wheel } = term(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    fireEvent.touchStart(scroller, { touches: [{ clientX: 100, clientY: 300 } as Touch] });
+    fireEvent.touchMove(scroller, { touches: [{ clientX: 100, clientY: 266 } as Touch] });
+    expect(wheel.mock.calls[0]![2]).toBe(2);
     wheel.mockClear();
     fireEvent.wheel(scroller, { deltaY: 120, clientX: 100, clientY: 266 });
-    expect(wheel.mock.calls[0]![3]).toBe(3);
+    expect(wheel.mock.calls[0]![2]).toBe(3);
 
-    const split = term({ ...alt, rows: 8, pane0: { cols: 80, rows: 2 } });
-    drag(split.scroller, 300, 266);
-    expect(split.wheel.mock.calls[0]![3]).toBe(1);
+    // A top/bottom split retains the composite's full row count in `rows`,
+    // but touch input stays in pane 0 and must use that pane's smaller extent.
+    const split = term(frame({ rows: 8, altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 80, rows: 2 } }));
+    fireEvent.touchStart(split.scroller, { touches: [{ clientX: 100, clientY: 300 } as Touch] });
+    fireEvent.touchMove(split.scroller, { touches: [{ clientX: 100, clientY: 266 } as Touch] });
+    expect(split.wheel.mock.calls[0]![2]).toBe(1);
   });
 
   it("does not enter reading mode on scroll while forwarding", () => {

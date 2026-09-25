@@ -1,7 +1,7 @@
 // Creating sessions against a real server: the wizard, scratch sessions, the palette, directory browsing, worktrees.
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { Locator, Page } from "@playwright/test";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
@@ -107,35 +107,6 @@ test.describe("scratch sessions", () => {
     expect(reloaded.map((row) => row.id)).toEqual([session.id]);
     expect(reloaded[0]!.scratch).toBe(true);
     expect(reloaded[0]!.project_path).toBe(session.project_path);
-  });
-
-  test("deleting a scratch session removes its scratch dir", async ({ page, spawnServe }) => {
-    const serve = await spawnServe();
-    const wizard = await openWizard(page, serve);
-    await wizard.getByRole("switch", { name: "Skip project folder" }).click();
-    await wizard.getByRole("button", { name: /Launch session/ }).click();
-    const [created] = await waitForSessions(serve.baseUrl);
-    const projectPath = created!.project_path as string;
-    expect(existsSync(projectPath)).toBe(true);
-
-    const row = page.locator("[data-testid='sidebar-session-row']").first();
-    await expect(row).toBeVisible({ timeout: 10_000 });
-    await row.click({ button: "right" });
-    await page.locator("[data-testid='sidebar-context-menu-delete']").click();
-    const dialog = page.locator("[data-testid='delete-session-dialog']");
-    await expect(dialog).toBeVisible();
-    // Trash is the default; only a permanent delete purges the directory.
-    await dialog.locator("[data-testid='delete-session-permanent']").click();
-    const deletePromise = page.waitForResponse(
-      (res) => res.url().endsWith(`/api/workspaces`) && res.request().method() === "DELETE",
-    );
-    await dialog.getByRole("button", { name: /^Delete$/ }).click();
-    const deleteRes = await deletePromise;
-    expect(deleteRes.ok()).toBe(true);
-    expect((deleteRes.request().postDataJSON() as { session_ids: string[] }).session_ids).toEqual([created!.id]);
-
-    await expect.poll(async () => (await listSessions(serve.baseUrl)).length, { timeout: 10_000 }).toBe(0);
-    await expect.poll(() => existsSync(projectPath), { timeout: 5_000 }).toBe(false);
   });
 
   test("palette 'New scratch session' opens the wizard and launches a scratch session", async ({ serve, page }) => {

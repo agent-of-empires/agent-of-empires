@@ -7,23 +7,29 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{api_error, AppState};
-use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
+use super::AppState;
+use crate::server::auth::{handler_elevated, AuthenticatedSession, LocalAuthorization};
 use crate::session::skills_model::{self, SkillError, SkillProvenance};
+
+fn error_response(status: StatusCode, code: &str, message: String) -> Response {
+    (status, Json(json!({ "error": code, "message": message }))).into_response()
+}
 
 fn skill_error(error: SkillError) -> Response {
     match error {
         SkillError::InvalidInput(message) => {
-            api_error(StatusCode::BAD_REQUEST, "invalid_skill", message)
+            error_response(StatusCode::BAD_REQUEST, "invalid_skill", message)
         }
         SkillError::NotFound(message) => {
-            api_error(StatusCode::NOT_FOUND, "skill_not_found", message)
+            error_response(StatusCode::NOT_FOUND, "skill_not_found", message)
         }
-        SkillError::Collision(message) => api_error(StatusCode::CONFLICT, "skill_exists", message),
+        SkillError::Collision(message) => {
+            error_response(StatusCode::CONFLICT, "skill_exists", message)
+        }
         SkillError::ReadOnly(message) => {
-            api_error(StatusCode::FORBIDDEN, "skill_read_only", message)
+            error_response(StatusCode::FORBIDDEN, "skill_read_only", message)
         }
-        SkillError::Io(error) => api_error(
+        SkillError::Io(error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
             format!("{error:#}"),
@@ -32,7 +38,7 @@ fn skill_error(error: SkillError) -> Response {
 }
 
 fn task_error(error: tokio::task::JoinError) -> Response {
-    api_error(
+    error_response(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal",
         error.to_string(),
@@ -42,7 +48,7 @@ fn task_error(error: tokio::task::JoinError) -> Response {
 async fn mutation_gate(
     state: &AppState,
     session: Option<&AuthenticatedSession>,
-    loopback_trusted: bool,
+    local: Option<&LocalAuthorization>,
 ) -> Result<(), Response> {
     if state.read_only {
         return Err(super::read_only_response());
@@ -50,11 +56,11 @@ async fn mutation_gate(
     if let Some(response) = super::cityhall_block(state) {
         return Err(response);
     }
-    if !handler_elevated(state, session, loopback_trusted).await {
-        return Err(api_error(
+    if !handler_elevated(state, session, local).await {
+        return Err(error_response(
             StatusCode::FORBIDDEN,
             "elevation_required",
-            "Re-enter the passphrase to continue",
+            "Re-enter the passphrase to continue".to_string(),
         ));
     }
     Ok(())
@@ -72,8 +78,8 @@ impl FromRequestParts<std::sync::Arc<AppState>> for SkillMutationGuard {
         state: &std::sync::Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
         let session = parts.extensions.get::<AuthenticatedSession>();
-        let loopback_trusted = parts.extensions.get::<LoopbackTrusted>().is_some();
-        mutation_gate(state, session, loopback_trusted).await?;
+        let local = parts.extensions.get::<LocalAuthorization>();
+        mutation_gate(state, session, local).await?;
         Ok(Self)
     }
 }
@@ -108,7 +114,7 @@ pub async fn list_skills() -> Response {
             "roots": skills_model::skill_roots(),
         }))
         .into_response(),
-        Ok(Err(error)) => api_error(
+        Ok(Err(error)) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
             format!("{error:#}"),
@@ -121,7 +127,9 @@ pub async fn list_skills() -> Response {
 pub async fn read_skill(Path((source, directory)): Path<(String, String)>) -> Response {
     let provenance = match source_provenance(&source) {
         Ok(value) => value,
-        Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_skill_source", message),
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_skill_source", message)
+        }
     };
     let result = tokio::task::spawn_blocking(move || {
         let home = dirs::home_dir().ok_or_else(|| {
@@ -208,7 +216,9 @@ pub async fn adopt_skill(
 ) -> Response {
     let provenance = match source_provenance(&source) {
         Ok(value) => value,
-        Err(message) => return api_error(StatusCode::BAD_REQUEST, "invalid_skill_source", message),
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_skill_source", message)
+        }
     };
     let result = tokio::task::spawn_blocking(move || {
         let home = dirs::home_dir().ok_or_else(|| {
@@ -243,23 +253,26 @@ pub struct SyncSkillsBody {
     roots: Vec<String>,
     /// Skills the caller has explicitly asked AoE to take over, overwriting a
     /// skill AoE does not manage or a propagated copy edited in place. Empty
-    /// (the default, and what every automatic sync uses) overwrites nothing.
+    /// means overwrite nothing, which is the default and what every automatic
+    /// sync uses.
     #[serde(default)]
     replace: Vec<String>,
-    /// When non-empty, reconcile only these skills, so sharing a single skill
-    /// is a single-skill operation rather than a filtered full sync.
+    /// When non-empty, reconcile only these skills. This is what makes sharing
+    /// a single skill a single-skill operation rather than a full sync whose
+    /// report is filtered afterwards.
     #[serde(default)]
     directories: Vec<String>,
 }
 
 /// `POST /api/skills/sync`: reconcile the managed store into agent skills dirs.
+///
 /// Returns one outcome per skill per root rather than failing on the first
 /// conflict: a destination AoE does not own is a normal result the user needs to
 /// see, not an error that should abandon the remaining roots.
 pub async fn sync_skills(_guard: SkillMutationGuard, Json(body): Json<SyncSkillsBody>) -> Response {
     for root in &body.roots {
         if skills_model::skill_root(root).is_none() {
-            return api_error(
+            return error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_skill_source",
                 format!("Unknown skill root {root:?}"),

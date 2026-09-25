@@ -13,10 +13,40 @@ fn user_settings_path() -> Option<PathBuf> {
 /// True when the user has set Claude Code's `tui` setting to `"fullscreen"`
 /// in `~/.claude/settings.json`. Any other value, missing file, or parse
 /// error returns false.
+///
+/// The answer is cached against the file's modification time and size. Every
+/// session-row projection asks, and the daemon reprojects on a timer, so
+/// without this the file is read and JSON-parsed every couple of seconds on an
+/// async worker to produce the answer it already had.
 pub fn read_tui_fullscreen() -> bool {
-    user_settings_path()
-        .map(|p| read_tui_fullscreen_at(&p))
-        .unwrap_or(false)
+    let Some(path) = user_settings_path() else {
+        return false;
+    };
+    let stamp = file_stamp(&path);
+    let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cached_stamp, fullscreen)) = *cache {
+        if cached_stamp == stamp {
+            return fullscreen;
+        }
+    }
+    let fullscreen = read_tui_fullscreen_at(&path);
+    *cache = Some((stamp, fullscreen));
+    fullscreen
+}
+
+/// What the cache compares. `None` for a file that is absent or unreadable,
+/// which is itself an answer worth keeping.
+type Stamp = Option<(std::time::SystemTime, u64)>;
+
+fn file_stamp(path: &Path) -> Stamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+fn cache() -> &'static std::sync::Mutex<Option<(Stamp, bool)>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(Stamp, bool)>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
 }
 
 fn read_tui_fullscreen_at(path: &Path) -> bool {

@@ -43,6 +43,13 @@ fn serve_unavailable_error(cli: &Cli) -> Option<clap::Error> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Experimental branch: its migrations are one-way, so only a debug build,
+    // which keeps its own app dir and tmux socket, may run.
+    anyhow::ensure!(
+        cfg!(debug_assertions),
+        "This experimental build runs only as a debug build (`cargo build`, then ./target/debug/aoe)"
+    );
+
     // Hidden helper for the VT live preview, handled before clap so it stays off the CLI surface.
     {
         let mut a = std::env::args();
@@ -91,6 +98,8 @@ async fn main() -> Result<()> {
         err.exit();
     }
 
+    // Mirrored into the env var so `acp::client::discovery` resolves a flag and
+    // an env-only run through one path.
     if let Some(url) = &cli.daemon_url {
         // SAFETY: single-threaded at this point — we haven't entered
         // the tokio runtime's worker pool yet (the runtime is owned by
@@ -339,6 +348,7 @@ async fn run(
         Some(Commands::Killall(args)) => cli::killall::run(args).await,
         Some(Commands::Session { command }) => cli::session::run(&profile, command).await,
         Some(Commands::Group { command }) => cli::group::run(&profile, command).await,
+        Some(Commands::Remote { command }) => cli::remote::run(command).await,
         Some(Commands::Plugin { command }) => cli::plugin::run(command).await,
         Some(Commands::Profile { command }) => cli::profile::run(&profile, command).await,
         Some(Commands::Project { command }) => {

@@ -2,34 +2,19 @@
 
 use super::*;
 
-// --- Update session group ---
-
-#[derive(Deserialize)]
-pub struct UpdateGroupBody {
-    /// Destination group path; the empty string means ungrouped. A non-empty
-    /// path auto-creates the group, since `/api/groups` and the `GroupTree`
-    /// render model both derive groups from instance `group_path` values.
-    pub group: String,
-}
-
 pub(super) fn apply_session_group(inst: &mut Instance, group: String) {
     inst.group_path = group;
 }
 
-/// `PATCH /api/sessions/:id/group`. Moves a session to another group, creates
-/// one by assigning its path, or clears it with the empty string. Web parity
-/// with the TUI rename dialog and `aoe session rename --group`.
-///
-/// Persist-first like the other per-field PATCH sub-routes, so a failed write
-/// returns 500 without leaving memory and disk diverged (#1589).
+/// `PATCH /api/sessions/:id/group`. Moves an existing session to another
+/// group, creates a new group by assigning its path, or clears the group
+/// (empty string). Web parity with the TUI rename dialog and `aoe session
+/// rename --group`, which already support post-create group edits.
 pub async fn update_session_group(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     body: Result<Json<UpdateGroupBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
-    }
     if state.read_only {
         return crate::server::api::read_only_response();
     }
@@ -38,9 +23,9 @@ pub async fn update_session_group(
         Err(rej) => return rej.into_response(),
     };
     let group = body.group;
-    // Match `create_session`'s group handling exactly: display-label check on a
-    // non-empty path, no trimming or slash normalization. The empty string is
-    // the ungroup sentinel and skips validation.
+    // Match `create_session`'s group handling exactly: display-label
+    // check on a non-empty path, no trimming or slash normalization. The
+    // empty string is the ungroup sentinel and skips validation.
     if !group.is_empty() {
         if let Err(msg) = validate_display_label(&group, "group") {
             return (
@@ -51,110 +36,55 @@ pub async fn update_session_group(
         }
     }
 
+    let namespace = state.profile_namespace.read().await;
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
 
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return session_not_found();
+            return crate::server::api::session_not_found();
         };
         inst.source_profile.clone()
     };
 
-    // Persist first; only mutate memory once disk is durable. See #1589.
     let persist_id = id.clone();
-    let persist_group = group.clone();
-    if persist_session_update(
+    let committed = commit_profile_update(
+        &state,
         profile,
         "group update",
-        state.file_watch.clone(),
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                apply_session_group(inst, persist_group);
+                apply_session_group(inst, group);
             }
         },
+        None,
     )
-    .await
-    .is_err()
-    {
-        return persist_failed_response();
+    .await;
+    if let Err(response) = committed {
+        return response;
     }
-
-    let mut instances = state.instances.write().await;
-    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        tracing::warn!(
-            target: "http.api.sessions",
-            session = %id,
-            "group update: instance vanished after persist"
-        );
-        return crate::server::api::session_gone_after_persist();
-    };
-    apply_session_group(inst, group);
-
-    let response =
-        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+    drop(_guard);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
 
-// --- Update session notification preferences ---
-
-/// Body for `PATCH /api/sessions/:id/notifications`. Each field is an outer
-/// Option so absence means "leave alone", with an inner Option where
-/// `Some(null)` means "clear this override".
-#[derive(Deserialize, Default)]
-pub struct UpdateNotificationsBody {
-    #[serde(default, deserialize_with = "deserialize_tristate")]
-    pub notify_on_waiting: Tristate,
-    #[serde(default, deserialize_with = "deserialize_tristate")]
-    pub notify_on_idle: Tristate,
-    #[serde(default, deserialize_with = "deserialize_tristate")]
-    pub notify_on_error: Tristate,
-}
-
-/// Three-state field representing JSON `undefined | null | true | false`:
-/// - Unset: leave the current session value untouched.
-/// - Clear: set to None (inherit the server default).
-/// - Set(v): explicit user override.
-#[derive(Default, Copy, Clone)]
-pub enum Tristate {
-    #[default]
-    Unset,
-    Clear,
-    Set(bool),
-}
-
-fn deserialize_tristate<'de, D>(d: D) -> Result<Tristate, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    // Option<Option<bool>>: absent -> None, null -> Some(None), bool -> Some(Some(bool))
-    let v: Option<Option<bool>> = Option::deserialize(d)?;
-    Ok(match v {
-        None => Tristate::Unset,
-        Some(None) => Tristate::Clear,
-        Some(Some(b)) => Tristate::Set(b),
-    })
-}
-
-/// Persist a session mutation to its profile store before touching memory.
-///
-/// Runs `mutate` inside the storage `update` transaction on a blocking thread,
-/// collapsing store-open, write and join failures into `Err(())` after logging
-/// with `label`. Callers MUST treat `Err` as HTTP 500 and leave the in-memory
-/// instance untouched: persisting first is what keeps disk and memory in
-/// agreement, and stops archive/snooze side effects firing on a write that
-/// never landed (#1589).
-pub(crate) async fn persist_session_update<F>(
+/// Return the mutation result and its complete committed profile bundle.
+/// Callers must leave the mirror and side effects untouched on failure.
+pub(crate) async fn persist_session_update<F, R>(
     profile: String,
     label: &'static str,
     file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
     mutate: F,
-) -> Result<(), ()>
+) -> Result<(R, Vec<Instance>, Vec<crate::session::Group>), ()>
 where
-    F: FnOnce(&mut Vec<Instance>) + Send + 'static,
+    F: FnOnce(&mut Vec<Instance>) -> R + Send + 'static,
+    R: Send + 'static,
 {
-    let storage = match Storage::new(&profile, file_watch) {
+    let storage = match Storage::open(&profile, file_watch) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(
@@ -165,14 +95,11 @@ where
         }
     };
     match tokio::task::spawn_blocking(move || {
-        storage.update(|instances, _groups| {
-            mutate(instances);
-            Ok(())
-        })
+        storage.update_with_snapshot(|instances, _groups| Ok(mutate(instances)))
     })
     .await
     {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(result)) => Ok(result),
         Ok(Err(e)) => {
             tracing::error!(
                 target: "http.api.sessions",
@@ -190,15 +117,97 @@ where
     }
 }
 
-/// 500 response for a `persist_session_update` failure. The body shape matches
-/// the other JSON errors in this module, so the dashboard's `!res.ok` handling
-/// reads the same keys.
+pub(super) async fn commit_profile_update<F, R>(
+    state: &Arc<AppState>,
+    profile: String,
+    label: &'static str,
+    mutate: F,
+    status_id: Option<String>,
+) -> Result<R, axum::response::Response>
+where
+    F: FnOnce(&mut Vec<Instance>) -> R + Send + 'static,
+    R: Send + 'static,
+{
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    }
+    let commit_state = state.clone();
+    let commit_profile = profile.clone();
+    let persisted = tokio::task::spawn_blocking(move || {
+        let store = crate::server::session_store::NativeSessionStore::open(
+            commit_state,
+            &commit_profile,
+            status_id,
+        )?;
+        (&store as &dyn crate::session::SessionStore).update(|rows, _| Ok(mutate(rows)))
+    })
+    .await;
+    match persisted {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) if error.is::<crate::session::NativeStoreUnavailable>() => {
+            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
+        }
+        Ok(Err(error)) => {
+            tracing::error!(target: "http.api.sessions", %error, %label, "session commit failed");
+            Err(persist_failed_response())
+        }
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", %error, %label, "session commit task failed");
+            state
+                .mark_reload_failure(crate::daemon::RuntimeHealth::Degraded {
+                    code: crate::daemon::ReloadFailureCode::ProfileData,
+                    profiles: vec![profile],
+                })
+                .await;
+            Err(persist_failed_response())
+        }
+    }
+}
+
+pub(super) async fn adopt_profile_update<R>(
+    state: &Arc<AppState>,
+    profile: String,
+    result: Result<(R, Vec<Instance>, Vec<crate::session::Group>), ()>,
+    committed_status: impl Fn(&str) -> bool,
+    publication: &tokio::sync::RwLockWriteGuard<'_, ()>,
+) -> Result<R, axum::response::Response> {
+    let committed = match result {
+        Ok((result, rows, groups)) => crate::server::reload::adopt_committed_profiles(
+            state,
+            [(&profile, rows, groups)],
+            committed_status,
+            publication,
+        )
+        .await
+        .map(|()| result),
+        Err(()) => Err(crate::server::reload::ReloadFailure {
+            health: crate::daemon::RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::ProfileData,
+                profiles: vec![profile],
+            },
+            source: anyhow::anyhow!("session commit failed"),
+        }),
+    };
+    match committed {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            *state.canonical_health.write().await = error.health;
+            state.runtime.request_publish();
+            Err(persist_failed_response())
+        }
+    }
+}
+
+/// Report a storage failure without exposing host diagnostics.
 pub(super) fn persist_failed_response() -> axum::response::Response {
-    api_error(
+    (
         StatusCode::INTERNAL_SERVER_ERROR,
-        "persist_failed",
-        "Failed to persist session update",
+        Json(serde_json::json!({
+            "error": "persist_failed",
+            "message": "Failed to persist session update"
+        })),
     )
+        .into_response()
 }
 
 pub async fn update_session_notifications(
@@ -206,9 +215,6 @@ pub async fn update_session_notifications(
     Path(id): Path<String>,
     body: Result<Json<UpdateNotificationsBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
-    }
     if state.read_only {
         return crate::server::api::read_only_response();
     }
@@ -216,8 +222,9 @@ pub async fn update_session_notifications(
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
-    // `Unset` leaves the stored value alone, `Clear` sets it to None (inherit
-    // default), `Set(v)` writes an explicit override.
+    // Apply each field independently. `Unset` leaves the stored value
+    // alone; `Clear` sets it to None (inherit default); `Set(v)` writes
+    // an explicit override.
     fn apply(target: &mut Option<bool>, tri: Tristate) {
         match tri {
             Tristate::Unset => {}
@@ -226,13 +233,17 @@ pub async fn update_session_notifications(
         }
     }
 
+    let namespace = state.profile_namespace.read().await;
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
 
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return session_not_found();
+            return crate::server::api::session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -241,12 +252,11 @@ pub async fn update_session_notifications(
     let idle = body.notify_on_idle;
     let error = body.notify_on_error;
 
-    // Persist first; only mutate memory once disk is durable (#1589).
     let persist_id = id.clone();
-    if persist_session_update(
+    let committed = commit_profile_update(
+        &state,
         profile,
         "notification update",
-        state.file_watch.clone(),
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                 apply(&mut inst.notify_on_waiting, waiting);
@@ -254,54 +264,18 @@ pub async fn update_session_notifications(
                 apply(&mut inst.notify_on_error, error);
             }
         },
+        None,
     )
-    .await
-    .is_err()
-    {
-        return persist_failed_response();
+    .await;
+    if let Err(response) = committed {
+        return response;
     }
-
-    let mut instances = state.instances.write().await;
-    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        tracing::warn!(
-            target: "http.api.sessions",
-            session = %id,
-            "notification update: instance vanished after persist"
-        );
-        return crate::server::api::session_gone_after_persist();
-    };
-    apply(&mut inst.notify_on_waiting, waiting);
-    apply(&mut inst.notify_on_idle, idle);
-    apply(&mut inst.notify_on_error, error);
-
-    let response =
-        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+    drop(_guard);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
 
-// `PATCH /api/sessions/{id}/diff-base` sets or clears the diff base override,
-// scoped to one repo. The web `vs <ref>` chip, the TUI diff view's `b` keybind,
-// and `aoe session set-base` all funnel through this endpoint or its storage
-// equivalent, so the override survives restart. A workspace session must name
-// the repo; a single-repo session omits it (#970, #3329).
-
-#[derive(Deserialize)]
-pub struct UpdateDiffBaseBody {
-    /// New override. `Some(non-empty)` sets it; `Some("")` or `None` clears it,
-    /// falling back to the recorded creation base, the profile default, then
-    /// auto-detection.
-    #[serde(default)]
-    pub base_branch: Option<String>,
-    /// Workspace repo this override applies to. Omitting it targets the
-    /// session's own checkout, which only a single-repo session has; omitting it
-    /// on a workspace is rejected rather than writing state nothing reads.
-    #[serde(default)]
-    pub repo: Option<String>,
-}
-
-/// Write a diff-base override onto the entry `repo` names, or onto the
-/// session's own checkout when it is `None`. Split out so the persist closure
-/// and the in-memory update cannot drift.
+/// Apply an override to the selected repo or the single-repo checkout.
 pub(super) fn apply_diff_base_override(
     inst: &mut crate::session::Instance,
     repo: Option<&str>,
@@ -324,9 +298,6 @@ pub async fn update_session_diff_base(
     Path(id): Path<String>,
     body: Result<Json<UpdateDiffBaseBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
-    }
     if state.read_only {
         return crate::server::api::read_only_response();
     }
@@ -335,34 +306,48 @@ pub async fn update_session_diff_base(
         Err(rej) => return rej.into_response(),
     };
 
+    let namespace = state.profile_namespace.read().await;
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
 
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return session_not_found();
+            return crate::server::api::session_not_found();
         };
-        // Reject a target that names no entry, so a stale client cannot write
-        // an override the diff never reads.
+        // Reject a target that names no entry, so a stale client cannot
+        // silently write an override the diff never reads.
         match body.repo.as_deref() {
             Some(name) => {
                 if !inst.all_repos().iter().any(|r| r.name == name) {
-                    return api_error(
+                    return (
                         StatusCode::BAD_REQUEST,
-                        "bad_request",
-                        "unknown workspace repo",
-                    );
+                        Json(serde_json::json!({
+                            "error": "bad_request",
+                            "message": "unknown workspace repo"
+                        })),
+                    )
+                        .into_response();
                 }
             }
             None => {
                 if inst.workspace_info.is_some() {
                     let names: Vec<&str> =
                         inst.all_repos().iter().map(|r| r.name.as_str()).collect();
-                    return api_error(StatusCode::BAD_REQUEST, "bad_request", format!(
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "bad_request",
+                            "message": format!(
                                 "this session is a multi-repo workspace; name the repo to set a diff base for ({})",
                                 names.join(", ")
-                            ));
+                            )
+                        })),
+                    )
+                        .into_response();
                 }
             }
         }
@@ -376,44 +361,24 @@ pub async fn update_session_diff_base(
         .filter(|v| !v.is_empty())
         .map(str::to_string);
 
-    // Persist first; only mutate memory once disk is durable. See #1589.
     let persist_id = id.clone();
-    let persist_override = new_override.clone();
-    let persist_repo = body.repo.clone();
-    if persist_session_update(
+    let persist_repo = body.repo;
+    let committed = commit_profile_update(
+        &state,
         profile,
         "diff-base update",
-        state.file_watch.clone(),
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                apply_diff_base_override(inst, persist_repo.as_deref(), persist_override);
+                apply_diff_base_override(inst, persist_repo.as_deref(), new_override);
             }
         },
+        None,
     )
-    .await
-    .is_err()
-    {
-        return persist_failed_response();
+    .await;
+    if let Err(response) = committed {
+        return response;
     }
-
-    let mut instances = state.instances.write().await;
-    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        tracing::warn!(
-            target: "http.api.sessions",
-            session = %id,
-            "diff-base update: instance vanished after persist"
-        );
-        return crate::server::api::session_gone_after_persist();
-    };
-    apply_diff_base_override(inst, body.repo.as_deref(), new_override);
-
-    let response =
-        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+    drop(_guard);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
-
-// Three sibling endpoints surface `Instance::pin`, `archive` and `snooze` to
-// the dashboard, all read-only-403 then persist-then-mutate. Archive also tears
-// down the tmux pane and, for structured sessions, the worker. Mutual-exclusion
-// invariants live in the `Instance` methods, so the handlers never set fields
-// directly (#1581).

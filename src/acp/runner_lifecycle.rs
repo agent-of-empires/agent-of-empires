@@ -72,7 +72,7 @@ enum Phase {
         since: Instant,
     },
     TeardownRetry {
-        identity: RunnerIdentity,
+        identity: Option<RunnerIdentity>,
         attempts: u32,
     },
 }
@@ -117,8 +117,7 @@ pub enum StopDecision {
     AlreadyStopping,
 }
 
-/// Process signalling and liveness, so teardown can be driven against a
-/// fake in tests without spawning anything.
+/// Runtime process-group signalling and exit proof.
 pub trait ProcessControl: Send + Sync + 'static {
     fn is_alive(&self, pid: u32) -> bool;
     fn terminate_group(&self, pid: u32);
@@ -128,21 +127,16 @@ pub trait ProcessControl: Send + Sync + 'static {
 pub struct SystemProcessControl;
 
 impl ProcessControl for SystemProcessControl {
-    /// pid 0 addresses the caller's own group and is never a runner.
     fn is_alive(&self, pid: u32) -> bool {
-        pid != 0 && crate::process::worker::is_pid_alive_and_ours(pid)
+        crate::process::worker::is_process_group_alive(pid)
     }
 
     fn terminate_group(&self, pid: u32) {
-        if pid != 0 {
-            crate::process::worker::terminate_process_group(pid);
-        }
+        crate::process::worker::terminate_process_group(pid);
     }
 
     fn kill_group(&self, pid: u32) {
-        if pid != 0 {
-            crate::process::worker::kill_process_group(pid);
-        }
+        crate::process::worker::kill_process_group(pid);
     }
 }
 
@@ -150,16 +144,15 @@ impl ProcessControl for SystemProcessControl {
 pub enum Settlement {
     /// Process-group exit and registry cleanup were proven.
     Proven,
-    /// The process survived escalation; keep ownership and retry.
-    Unproven(RunnerIdentity),
+    /// Exit or registry ownership is unproven; retain the lease and retry.
+    Unproven(Option<RunnerIdentity>),
 }
 
 /// Pending teardown a retry pass should drive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryClaim {
     pub lease: Lease,
-    /// `None` for a reclaimed teardown whose driver never settled; the
-    /// registry record then names the runner.
+    /// `None` when the runner identity could not be read or recovered.
     pub identity: Option<RunnerIdentity>,
     pub attempts: u32,
 }
@@ -443,7 +436,7 @@ impl LifecycleTable {
     ) -> Option<RetryClaim> {
         let entry = self.entries.get_mut(session_id)?;
         let (identity, attempts) = match entry.phase {
-            Phase::TeardownRetry { identity, attempts } => (Some(identity), attempts),
+            Phase::TeardownRetry { identity, attempts } => (identity, attempts),
             Phase::Stopping { attempts, since } if since.elapsed() >= orphaned_after => {
                 (None, attempts)
             }
@@ -626,6 +619,51 @@ mod tests {
         RunnerIdentity { pid, generation }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn system_control_keeps_a_leaderless_group_alive() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let mut leader = Command::new("sleep")
+            .arg("120")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = leader.id();
+        let mut member = None;
+        let observed = (|| -> std::io::Result<bool> {
+            member = Some(
+                Command::new("sleep")
+                    .arg("120")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .process_group(pid as i32)
+                    .spawn()?,
+            );
+            leader.kill()?;
+            leader.wait()?;
+            Ok(SystemProcessControl.is_alive(pid))
+        })();
+        if let Some(mut member) = member {
+            let _ = member.kill();
+            member.wait().unwrap();
+        }
+        let _ = leader.kill();
+        leader.wait().unwrap();
+        assert!(
+            observed.unwrap(),
+            "a surviving group member must prevent teardown settlement"
+        );
+        assert!(
+            !SystemProcessControl.is_alive(pid),
+            "a reaped group must permit settlement"
+        );
+    }
+
     #[test]
     fn identity_matches_record_with_legacy_generation() {
         let cases = [
@@ -707,7 +745,7 @@ mod tests {
             })
         );
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
-        table.settle(&lease, Settlement::Unproven(identity(9, 1)));
+        table.settle(&lease, Settlement::Unproven(Some(identity(9, 1))));
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
 
         let grace = Duration::from_secs(15);
@@ -724,7 +762,7 @@ mod tests {
             orphan.identity, None,
             "a stale claim is reclaimed without an identity"
         );
-        table.settle(&orphan.lease, Settlement::Unproven(identity(9, 1)));
+        table.settle(&orphan.lease, Settlement::Unproven(Some(identity(9, 1))));
         let again = table.claim_retry(ID, grace).unwrap();
         assert_eq!(again.attempts, 3, "attempts accumulate per settled retry");
         table.settle(&again.lease, Settlement::Proven);
@@ -801,7 +839,7 @@ mod tests {
         let lease = table.adopt_for_stop(ID).unwrap();
         assert_eq!(table.phase(ID), WorkerPhase::Stopping);
         assert!(table.adopt_for_stop(ID).is_none());
-        table.settle(&lease, Settlement::Unproven(identity(3, 0)));
+        table.settle(&lease, Settlement::Unproven(Some(identity(3, 0))));
         assert_eq!(
             table.retry_ids_after(Duration::from_secs(15)),
             vec![ID.to_string()]

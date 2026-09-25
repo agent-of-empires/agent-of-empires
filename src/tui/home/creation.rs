@@ -3,33 +3,10 @@
 
 use super::*;
 
-pub(super) fn cleanup_creation_resources(
-    instance: &Instance,
-    created_worktree: Option<&CreatedWorktreeInfo>,
-    created_workspace_worktrees: &[CreatedWorktreeInfo],
-    protected_owner: Option<&Instance>,
-) {
-    let worktree = created_worktree.map(crate::session::builder::CreatedWorktree::from);
-    let workspace_worktrees: Vec<_> = created_workspace_worktrees
-        .iter()
-        .map(crate::session::builder::CreatedWorktree::from)
-        .collect();
-    crate::session::builder::cleanup_instance(
-        instance,
-        worktree.as_ref(),
-        &workspace_worktrees,
-        protected_owner,
-    );
-}
-
-pub(super) enum CreationCommit {
-    Inserted,
-    Duplicate(Box<Instance>),
-}
-
-/// Cross-process guards for a single-session title mutation or profile move. The source
-/// profile's lifecycle flock nests inside the per-session title flock; callers retain this
-/// through durable persistence and any tmux rekey, so a terminal launch cannot observe the
+/// Cross-process guards for a single-session title mutation or profile move.
+/// The source profile's lifecycle flock is intentionally nested inside the
+/// per-session title flock; callers retain this value through durable
+/// persistence and any tmux rekey so a terminal launch cannot observe the
 /// transition halfway through.
 pub(in crate::tui) struct SessionMutationGuards {
     pub(super) _session_title: crate::session::StorageFlock,
@@ -37,17 +14,27 @@ pub(in crate::tui) struct SessionMutationGuards {
 }
 
 impl HomeView {
-    /// Request background session creation, used for sandbox sessions so the UI does not
-    /// block. A `Status::Creating` stub appears in the list, so progress shows in the
-    /// preview pane while the TUI stays usable.
-    pub fn request_creation(
-        &mut self,
-        mut data: NewSessionData,
-        hooks: Option<crate::session::config::repo_config::ResolvedHooks>,
-    ) {
-        // Pre-resolve the title with the logic the builder will run, so the stub, the
-        // background creation and the final instance agree; otherwise an empty title shows
-        // as the path basename in the stub and a civilization name in the instance.
+    /// Request session creation from the daemon. The stub is a display-only
+    /// placeholder: the daemon provisions, runs the hooks, and commits the row,
+    /// which then lands through the canonical feed.
+    pub fn request_creation(&mut self, mut data: NewSessionData, trust_hooks: Option<bool>) {
+        if self.pending_creation.is_some() {
+            self.flash_status("A session is already being created");
+            return;
+        }
+        // The daemon owns the creation, so a disconnected runtime must refuse
+        // before a placeholder claims a row that nothing will ever commit.
+        if !self.session_feed.mutations_available() {
+            self.new_dialog = None;
+            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                "Cannot Create Session",
+                "The local daemon is unavailable, so the session was not created.",
+            ));
+            return;
+        }
+        // Pre-resolve the title with the same logic the daemon's builder runs,
+        // so the placeholder and the committed row agree (otherwise an empty
+        // title shows as the path basename here and a civilization name there).
         if data.title.is_empty() {
             let existing_titles: Vec<&str> = self
                 .instances()
@@ -88,9 +75,8 @@ impl HomeView {
         stub.status = crate::session::Status::Creating;
         stub.yolo_mode = data.yolo_mode;
         stub.source_profile = data.profile.clone();
-
-        // Set stub worktree_info so project-mode grouping works during creation; the real
-        // one, with a resolved main_repo_path, replaces it once build_instance completes.
+        // Set stub worktree_info so project-mode grouping works during creation.
+        // The committed row replaces it once the daemon publishes the session.
         let stub_branch = data
             .worktree_branch
             .as_deref()
@@ -111,39 +97,9 @@ impl HomeView {
         }
 
         let stub_id = stub.id.clone();
-        let target_profile = data.profile.clone();
-        let existing_group_paths: HashSet<String> = self
-            .group_trees
-            .get(&target_profile)
-            .map(|tree| {
-                tree.get_all_groups()
-                    .into_iter()
-                    .map(|group| group.path)
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Add stub to instance list
-        self.add_instance(stub);
+        self.creating_stub_id = Some(stub_id.clone());
+        self.instances.insert(stub_id.clone(), stub);
         self.rebuild_group_trees();
-        if !data.group.is_empty() {
-            if let Some(tree) = self.group_trees.get_mut(&target_profile) {
-                tree.create_group(&data.group);
-            }
-        }
-        self.creating_provisional_group_paths = self
-            .group_trees
-            .get(&target_profile)
-            .map(|tree| {
-                tree.get_all_groups()
-                    .into_iter()
-                    .map(|group| group.path)
-                    .filter(|path| !existing_group_paths.contains(path))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Initialize progress tracking and select the stub
         self.creating_hook_progress.insert(
             stub_id.clone(),
             CreatingHookProgress {
@@ -151,10 +107,7 @@ impl HomeView {
                 current_hook: None,
             },
         );
-        self.creating_stub_id = Some(stub_id.clone());
         self.rebuild_flat_items();
-
-        // Move cursor to the new stub
         if let Some(pos) = self
             .flat_items
             .iter()
@@ -163,318 +116,329 @@ impl HomeView {
             self.cursor = pos;
             self.update_selected();
         }
-
-        // Close the dialog
         self.new_dialog = None;
 
-        self.creation_cancelled = false;
-        // Filter out the stub from existing instances so the builder doesn't
-        // treat its placeholder title as a duplicate to auto-increment.
-        let existing_instances: Vec<Instance> = self
-            .instances
-            .values()
-            .filter(|i| i.id != stub_id)
-            .cloned()
-            .collect();
-        let request = CreationRequest {
-            data,
-            existing_instances,
-            hooks,
-        };
-        self.creation_poller.request_creation(request);
+        let mut body = wizard_create_body(&data, trust_hooks);
+        body.idempotency_key = Some(stub_id.clone());
+        if let Err(error) = self.session_feed.create_session(stub_id.clone(), body) {
+            self.pending_creation = None;
+            self.discard_creating_stub();
+            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                "Creation Failed",
+                &error.to_string(),
+            ));
+            return;
+        }
+        self.pending_creation = Some(PendingCreation {
+            daemon_id: None,
+            request_key: stub_id,
+            cancel_requested: false,
+            cancel_sent: false,
+            outcome_unknown: false,
+        });
     }
 
-    /// Mark the current creation operation as cancelled
-    pub fn cancel_creation(&mut self) {
-        if self.creation_poller.is_pending() {
-            self.creation_cancelled = true;
-        }
-        // Remove the stub instance
-        if let Some(stub_id) = self.creating_stub_id.take() {
-            self.creating_provisional_group_paths.clear();
-            self.remove_instance(&stub_id);
-            self.creating_hook_progress.remove(&stub_id);
-            self.rebuild_group_trees();
-            self.rebuild_flat_items();
-            self.update_selected();
-        }
-        self.new_dialog = None;
-    }
-
-    /// Apply any pending creation results from the background poller.
-    /// Returns Some(session_id) if creation succeeded and we should attach.
-    pub fn apply_creation_results(&mut self) -> Option<String> {
-        use crate::tui::creation_poller::CreationResult;
-
-        let result = self.creation_poller.try_recv_result()?;
-
-        // Clean up the stub and progress tracking
-        let stub_id = self.creating_stub_id.take();
-        // Taken, not borrowed, so every early return leaves the field empty: the
-        // provisional group paths belong to this stub alone and must not carry into the
-        // next creation.
-        let provisional_group_paths = std::mem::take(&mut self.creating_provisional_group_paths);
-        if let Some(ref id) = stub_id {
-            self.creating_hook_progress.remove(id);
-        }
-
-        // Check if the user cancelled while waiting
-        if self.creation_cancelled {
-            self.creation_cancelled = false;
-            if let Some(id) = &stub_id {
-                self.remove_instance(id);
-            }
-            if let CreationResult::Success {
-                ref instance,
-                ref created_worktree,
-                ref created_workspace_worktrees,
-                ..
-            } = result
-            {
-                cleanup_creation_resources(
-                    instance,
-                    created_worktree.as_ref(),
-                    created_workspace_worktrees,
-                    None,
-                );
-            }
-            self.rebuild_group_trees();
-            self.rebuild_flat_items();
-            self.update_selected();
-            return None;
-        }
-
-        match result {
-            CreationResult::Success {
-                session_id,
-                instance,
-                created_worktree,
-                created_workspace_worktrees,
-                on_launch_hooks_ran,
-                mut warnings,
-            } => {
-                // Remove the stub instance
-                if let Some(id) = &stub_id {
-                    self.remove_instance(id);
-                }
-
-                let mut instance = *instance;
-                let target_profile = self.creation_poller.last_profile().unwrap_or_else(|| {
-                    self.active_profile
-                        .clone()
-                        .unwrap_or_else(crate::session::config::resolve_default_profile)
-                });
-                instance.source_profile = target_profile.clone();
-
-                if !self.storages.contains_key(&target_profile) {
-                    match Storage::new(&target_profile, self.file_watch.clone()) {
-                        Ok(storage) => {
-                            self.storages.insert(target_profile.clone(), storage);
-                        }
-                        Err(error) => {
-                            cleanup_creation_resources(
-                                &instance,
-                                created_worktree.as_ref(),
-                                &created_workspace_worktrees,
-                                None,
-                            );
-                            self.info_dialog = Some(InfoDialog::sized_to_fit(
-                                "Creation Failed",
-                                &format!("Failed to open profile storage: {error}"),
-                            ));
-                            self.new_dialog = None;
-                            self.rebuild_group_trees();
-                            self.rebuild_flat_items();
-                            self.update_selected();
-                            return None;
-                        }
-                    }
-                }
-
-                let Some(storage) = self.storages.get(&target_profile) else {
-                    // The block above found or inserted this profile's storage, so this is
-                    // unreachable; bail without attaching rather than panicking.
-                    return None;
+    /// Bind a pending creation to the daemon's own row and keep that row out of
+    /// the sidebar. Runs on every applied snapshot: the reservation is published
+    /// before provisioning, so this binds the id without waiting for a progress
+    /// frame, and re-hides the row if a reload brought it back in. Returns
+    /// whether anything changed.
+    pub(super) fn reconcile_in_flight_creation(
+        &mut self,
+        rows: &[crate::daemon::SessionResponse],
+    ) -> bool {
+        let id = {
+            let Some(pending) = self.pending_creation.as_mut() else {
+                return false;
+            };
+            if let Some(id) = pending.daemon_id.clone() {
+                id
+            } else {
+                let Some(row) = rows.iter().find(|row| {
+                    row.idempotency_key.as_deref() == Some(pending.request_key.as_str())
+                }) else {
+                    return false;
                 };
-                let persist_result = storage.update(|instances, groups| {
-                    // `save()` can run while the builder works and persist the
-                    // placeholder, so remove that exact row under the same storage lock used
-                    // for collision detection and insertion, or it collides with its own
-                    // result.
-                    let removed_persisted_stub = stub_id.as_deref().is_some_and(|stub_id| {
-                        let before = instances.len();
-                        instances.retain(|row| row.id != stub_id);
-                        instances.len() != before
-                    });
-                    if removed_persisted_stub && !provisional_group_paths.is_empty() {
-                        groups.retain(|group| !provisional_group_paths.contains(&group.path));
-                        // A peer may have committed another row into one of these paths,
-                        // so rebuild from the remaining rows and let its group survive the
-                        // provisional stub metadata.
-                        *groups = GroupTree::new_with_groups(instances, groups).get_all_groups();
-                    }
-                    if let Some(owner) = crate::session::find_duplicate_session(
-                        instances.iter(),
-                        &instance.title,
-                        &instance.project_path,
-                        None,
-                    ) {
-                        return Ok(CreationCommit::Duplicate(Box::new(owner.clone())));
-                    }
-                    instances.push(instance.clone());
-                    if !instance.group_path.is_empty() {
-                        let mut tree = GroupTree::new_with_groups(instances, groups);
-                        tree.create_group(&instance.group_path);
-                        *groups = tree.get_all_groups();
-                    }
-                    Ok(CreationCommit::Inserted)
-                });
-                match persist_result {
-                    Ok(CreationCommit::Inserted) => {}
-                    Ok(CreationCommit::Duplicate(owner)) => {
-                        cleanup_creation_resources(
-                            &instance,
-                            created_worktree.as_ref(),
-                            &created_workspace_worktrees,
-                            Some(&owner),
-                        );
-                        self.info_dialog = Some(InfoDialog::sized_to_fit(
-                            "Creation Failed",
-                            &crate::session::duplicate_session_error(&instance.title).to_string(),
-                        ));
-                        self.new_dialog = None;
-                        if let Err(error) = self.reload() {
-                            tracing::warn!(
-                                target: "tui.home",
-                                "Failed to reload authoritative state after creation collision: {error}"
-                            );
-                        }
-                        return None;
-                    }
-                    Err(error) => match storage.load() {
-                        Ok(instances) if instances.iter().any(|row| row.id == instance.id) => {
-                            warnings.push(format!(
-                                "Session metadata was written, but finalizing profile storage reported an error: {error}"
-                            ));
-                        }
-                        Ok(instances) => {
-                            let owner = crate::session::find_duplicate_session(
-                                &instances,
-                                &instance.title,
-                                &instance.project_path,
-                                None,
-                            )
-                            .cloned();
-                            cleanup_creation_resources(
-                                &instance,
-                                created_worktree.as_ref(),
-                                &created_workspace_worktrees,
-                                owner.as_ref(),
-                            );
-                            self.info_dialog = Some(InfoDialog::sized_to_fit(
-                                "Creation Failed",
-                                &format!("Failed to save session: {error}"),
-                            ));
-                            self.new_dialog = None;
-                            if let Err(reload_error) = self.reload() {
-                                tracing::warn!(
-                                    target: "tui.home",
-                                    "Failed to reload authoritative state after creation rollback: {reload_error}"
-                                );
-                            }
-                            return None;
-                        }
-                        Err(verify_error) => {
-                            self.info_dialog = Some(InfoDialog::sized_to_fit(
-                                "Creation Failed",
-                                &format!(
-                                    "Failed to save session and could not verify the result: {error}\n\
-                                     Created resources were retained to avoid deleting a persisted session: {verify_error}"
-                                ),
-                            ));
-                            self.new_dialog = None;
-                            self.rebuild_group_trees();
-                            self.rebuild_flat_items();
-                            self.update_selected();
-                            return None;
-                        }
-                    },
-                }
-
-                // `publish_persisted_instance` records the create-count and clears the id
-                // from `pending_added`, since the row is authoritative now. Its in-memory
-                // insert is superseded by the `reload()` below on success and is the
-                // fallback that keeps the row visible if that reload fails.
-                self.publish_persisted_instance(instance.clone());
-                self.rebuild_group_trees();
-
-                if on_launch_hooks_ran {
-                    self.on_launch_hooks_ran.insert(session_id.clone());
-                }
-
-                if let Err(e) = self.reload() {
-                    tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
-                }
-                // The creation poller may have minted `before_start_env` while bringing the
-                // container up. It is `#[serde(skip)]`, so the reload dropped it; carry it
-                // back onto the live instance (as the CLI's `merge_post_start` does) so the
-                // agent launch reuses it instead of re-minting.
-                let minted = instance
-                    .sandbox_info
-                    .as_mut()
-                    .map(|sb| std::mem::take(&mut sb.before_start_env))
-                    .unwrap_or_default();
-                if !minted.is_empty() {
-                    self.mutate_instance(&session_id, |inst| {
-                        if let Some(sb) = inst.sandbox_info.as_mut() {
-                            sb.before_start_env = minted.clone();
-                        }
-                    });
-                }
-                // reload()'s restore-previous-selection fallback lands the cursor on
-                // whichever index is closest to the removed stub, often the new session's
-                // group folder, so pin the selection onto the new session directly.
-                self.select_and_reveal_session(&session_id);
-                self.new_dialog = None;
-
-                if !warnings.is_empty() {
-                    let body = warnings.join("\n\n");
-                    let message = format!(
-                        "Session was created, but the following warnings were emitted during setup:\n\n{}",
-                        body
-                    );
-                    self.info_dialog = Some(InfoDialog::sized_to_fit("Session warnings", &message));
-                }
-
-                Some(session_id)
+                pending.daemon_id = Some(row.id.clone());
+                row.id.clone()
             }
-            CreationResult::Error(error) => {
-                // Remove the stub and show the error in an info dialog
-                if let Some(id) = &stub_id {
-                    self.remove_instance(id);
+        };
+        if self.instances.contains_key(&id) {
+            self.hide_in_flight_reservation(&id);
+            return true;
+        }
+        false
+    }
+
+    /// The daemon's session id for the creation this view is displaying.
+    pub(super) fn in_flight_creation_id(&self) -> Option<&str> {
+        self.pending_creation.as_ref()?.daemon_id.as_deref()
+    }
+
+    /// Drop the in-flight creation's own row from the sidebar. Deliberately not
+    /// `remove_instance`: that records a deletion to persist, and this row is the
+    /// daemon's, not one this view owns.
+    fn hide_in_flight_reservation(&mut self, id: &str) {
+        if self.instances.shift_remove(id).is_some() {
+            self.rebuild_flat_items();
+            match self.creating_stub_id.clone() {
+                Some(stub) => self.select_session_by_id(&stub),
+                None => self.update_selected(),
+            }
+        }
+    }
+
+    /// The command lane always keys the response by the original request key.
+    fn creating_token(&self) -> Option<&str> {
+        self.pending_creation
+            .as_ref()
+            .map(|pending| pending.request_key.as_str())
+    }
+
+    /// Remove the creating placeholder and its buffered progress. A creation
+    /// whose id the daemon has not named yet stays pending, so its
+    /// cancellation is still delivered once the id is known.
+    fn discard_creating_stub(&mut self) {
+        if let Some(stub_id) = self.creating_stub_id.take() {
+            self.instances.shift_remove(&stub_id);
+            self.creating_hook_progress.remove(&stub_id);
+        }
+        self.rebuild_group_trees();
+        self.rebuild_flat_items();
+        self.update_selected();
+    }
+
+    /// Ask the daemon to cancel the in-flight creation. The daemon finishes the
+    /// phase in flight before rolling back, so the placeholder goes away now and
+    /// no row appears unless the cancel arrived too late.
+    pub fn cancel_creation(&mut self) {
+        let Some(pending) = self.pending_creation.as_mut() else {
+            self.new_dialog = None;
+            return;
+        };
+        pending.cancel_requested = true;
+        if let Some(id) = pending.daemon_id.clone().filter(|_| !pending.cancel_sent) {
+            match self.session_feed.cancel_creation(id) {
+                Ok(()) => pending.cancel_sent = true,
+                Err(error) => {
+                    tracing::warn!(target: "tui.home", %error, "creation cancellation was refused")
+                }
+            }
+        }
+        self.discard_creating_stub();
+        self.new_dialog = None;
+    }
+
+    /// Bind the placeholder to the daemon's id and mirror the daemon's progress
+    /// into its preview buffer. Idempotent: progress repeats until it settles.
+    pub(super) fn apply_creation_progress(&mut self) -> bool {
+        let Some(progress) = self.session_feed.drain_progress() else {
+            return false;
+        };
+        let stub_id = self.creating_stub_id.clone();
+        let mut changed = false;
+        let mut deferred_cancel = None;
+        let mut bound = None;
+        {
+            let Some(pending) = self.pending_creation.as_mut() else {
+                return false;
+            };
+            let Some(entry) = progress.iter().find(|entry| match &pending.daemon_id {
+                Some(id) => entry.session_id == *id,
+                None => entry.request_key.as_deref() == Some(pending.request_key.as_str()),
+            }) else {
+                return false;
+            };
+            if pending.daemon_id.as_deref() != Some(entry.session_id.as_str()) {
+                pending.daemon_id = Some(entry.session_id.clone());
+                changed = true;
+                bound = Some(entry.session_id.clone());
+            }
+            if pending.cancel_requested && !pending.cancel_sent {
+                deferred_cancel = Some(entry.session_id.clone());
+            }
+            if let Some(buffer) = stub_id
+                .as_ref()
+                .and_then(|id| self.creating_hook_progress.get_mut(id))
+            {
+                let current = match &entry.command {
+                    Some(command) => format!("{}: {}", phase_label(entry.phase), command),
+                    None => phase_label(entry.phase).to_string(),
+                };
+                if buffer.current_hook.as_deref() != Some(current.as_str()) {
+                    buffer.current_hook = Some(current);
+                    changed = true;
+                }
+                if buffer.hook_output != entry.output {
+                    buffer.hook_output.clone_from(&entry.output);
+                    changed = true;
+                }
+            }
+        }
+        // The daemon's own reservation for this creation is now addressable, so
+        // keep it out of the sidebar: the placeholder already represents it, and
+        // two rows for one creation would double-render it.
+        if let Some(id) = bound {
+            self.hide_in_flight_reservation(&id);
+        }
+        // A cancellation asked for before the daemon named the creation lands
+        // here, once it can be addressed.
+        if let Some(id) = deferred_cancel {
+            match self.session_feed.cancel_creation(id) {
+                Ok(()) => self.pending_creation.as_mut().unwrap().cancel_sent = true,
+                Err(error) => {
+                    tracing::warn!(target: "tui.home", %error, "creation cancellation was refused")
+                }
+            }
+        }
+        changed
+    }
+
+    /// Attach only after a confirmed receipt or a matching canonical row.
+    pub fn apply_creation_results(&mut self) -> Option<String> {
+        use crate::tui::session_feed::CommandFailure;
+        let settled = self.session_feed.drain_creation_results();
+        if let Some((stub_id, result)) = settled
+            .into_iter()
+            .find(|(token, _)| self.creating_token() == Some(token.as_str()))
+        {
+            if let Err(CommandFailure::Unknown(message)) = &result {
+                if let Some(pending) = self.pending_creation.as_mut() {
+                    pending.outcome_unknown = true;
+                }
+                self.info_dialog = Some(InfoDialog::sized_to_fit(
+                    "Creation outcome unknown",
+                    &format!("{message}\nThe daemon may still be creating this session. Wait for its canonical row or cancel; do not submit a second creation yet."),
+                ));
+                return self.resolve_unknown_creation();
+            }
+            let cancelled = self
+                .pending_creation
+                .as_ref()
+                .is_some_and(|pending| pending.cancel_requested);
+            self.clear_creation_tracking(&stub_id);
+            if cancelled {
+                return match result {
+                    Err(CommandFailure::Rejected(_)) => {
+                        self.flash_status("Creation was refused before commit");
+                        None
+                    }
+                    Ok(_) => {
+                        self.flash_status(
+                            "Creation had already committed; cancellation was too late",
+                        );
+                        self.reload().ok();
+                        None
+                    }
+                    Err(CommandFailure::Unknown(_)) => unreachable!(),
+                };
+            }
+            return match result {
+                Ok(receipt) => self.commit_created_session(
+                    receipt.outcome.id,
+                    &receipt.outcome.profile,
+                    &receipt.outcome.warnings,
+                ),
+                Err(CommandFailure::Rejected(message)) => {
                     self.rebuild_group_trees();
                     self.rebuild_flat_items();
                     self.update_selected();
-                    // Hook failures carry multi-line output; size to fit so
-                    // the actual error isn't clipped at the default 50x9.
-                    self.info_dialog = Some(InfoDialog::sized_to_fit("Creation Failed", &error));
-                } else if let Some(dialog) = &mut self.new_dialog {
-                    dialog.set_loading(false);
-                    dialog.set_error(error);
+                    self.info_dialog = Some(InfoDialog::sized_to_fit("Creation Failed", &message));
+                    None
                 }
-                None
-            }
+                Err(CommandFailure::Unknown(_)) => unreachable!(),
+            };
         }
+        self.resolve_unknown_creation()
     }
 
-    /// Check if on_launch hooks already ran for this session (and consume the flag).
-    pub fn take_on_launch_hooks_ran(&mut self, session_id: &str) -> bool {
-        self.on_launch_hooks_ran.remove(session_id)
+    fn resolve_unknown_creation(&mut self) -> Option<String> {
+        let pending = self
+            .pending_creation
+            .as_ref()
+            .filter(|pending| pending.outcome_unknown)?;
+        let id = pending.daemon_id.as_deref()?;
+        let row = self.session_feed.applied_session(id)?.clone();
+        if row.idempotency_key.as_deref() != Some(pending.request_key.as_str())
+            || matches!(row.status.as_str(), "Creating" | "Starting")
+        {
+            return None;
+        }
+        let cancelled = pending.cancel_requested;
+        let stub_id = pending.request_key.clone();
+        self.clear_creation_tracking(&stub_id);
+        if cancelled {
+            self.flash_status("Creation committed before cancellation; session is retained");
+            self.reload().ok();
+            return None;
+        }
+        self.commit_created_session(row.id, &row.profile, &row.warnings)
+    }
+
+    fn clear_creation_tracking(&mut self, stub_id: &str) {
+        self.creating_stub_id = None;
+        self.pending_creation = None;
+        self.instances.shift_remove(stub_id);
+        self.creating_hook_progress.remove(stub_id);
+    }
+
+    fn commit_created_session(
+        &mut self,
+        session_id: String,
+        profile: &str,
+        warnings: &[String],
+    ) -> Option<String> {
+        crate::tui::app::record_session_create();
+        let loaded = if self
+            .active_profile
+            .as_deref()
+            .is_some_and(|active| active != profile)
+        {
+            self.switch_profile(Some(profile.to_owned()))
+        } else {
+            self.reload()
+        };
+        if let Err(error) = loaded {
+            self.info_dialog = Some(InfoDialog::sized_to_fit("Session created", &format!(
+                "The daemon created the session in profile {profile}, but its local view could not load: {error}"
+            )));
+            return None;
+        }
+        if self.get_instance(&session_id).is_none() {
+            self.info_dialog = Some(InfoDialog::new("Session created", "The session is committed but not visible yet; refresh its profile before attaching."));
+            return None;
+        }
+        self.select_and_reveal_session(&session_id);
+        self.new_dialog = None;
+        if !warnings.is_empty() {
+            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                "Session warnings",
+                &format!(
+                    "Session was created, but setup emitted warnings:\n\n{}",
+                    warnings.join("\n\n")
+                ),
+            ));
+        }
+        Some(session_id)
+    }
+
+    /// Clear the placeholder on quit. The daemon keeps admitted work, so this
+    /// only asks for cancellation when the creation already has an id.
+    pub(in crate::tui) fn cleanup_pending_creation(&mut self) {
+        let Some(pending) = self.pending_creation.as_ref() else {
+            return;
+        };
+        if let Some(id) = pending.daemon_id.clone().filter(|_| !pending.cancel_sent) {
+            if let Err(error) = self.session_feed.cancel_creation(id) {
+                tracing::warn!(target: "tui.home", %error, "creation cancellation at quit was refused");
+            }
+        }
+        self.discard_creating_stub();
     }
 
     /// Check if there's a pending creation operation
     pub fn is_creation_pending(&self) -> bool {
-        self.creation_poller.is_pending()
+        self.pending_creation.is_some()
     }
 
     /// Check if the currently selected session is the in-flight creating stub
@@ -513,8 +477,9 @@ impl HomeView {
         );
     }
 
-    /// Persist `confirm_before_quit = false` and update the cached flag, when the user
-    /// ticks "don't warn me again" in the quit dialog.
+    /// Persist `confirm_before_quit = false` and update the cached flag so
+    /// the quit confirmation stops appearing. Called when the user ticks
+    /// "don't warn me again" in the quit dialog.
     pub(in crate::tui) fn disable_confirm_before_quit(&mut self) {
         self.confirm_before_quit = false;
         if let Err(e) = update_config(|config| {
@@ -524,15 +489,16 @@ impl HomeView {
         }
     }
 
-    /// Persist the "don't warn me again" opt-out for whichever confirm offered the
-    /// checkbox. Both call sites route through this, so keyboard and click cannot disagree
-    /// about which confirms are opt-out-able; actions without a checkbox never reach it.
+    /// Persist the "don't warn me again" opt-out for whichever confirm
+    /// offered the checkbox. Both call sites (keyboard and click) route
+    /// through this so the two paths can't disagree about which confirms
+    /// are opt-out-able. Actions without a checkbox never reach it.
     pub(in crate::tui) fn apply_confirm_dont_ask_again(&mut self, action: &str) {
         match action {
             "quit" => self.disable_confirm_before_quit(),
-            // Written globally, matching the quit opt-out. A profile that overrides
-            // confirm_delete = true keeps prompting; that override is cleared from the
-            // settings pane.
+            // Written globally, matching the quit opt-out. A profile that
+            // overrides confirm_delete = true keeps prompting; that override
+            // is cleared from the settings pane, not from here.
             "trash_session" => {
                 if let Err(e) = update_config(|config| {
                     config.session.confirm_delete = false;
@@ -543,40 +509,143 @@ impl HomeView {
             _ => {}
         }
     }
+}
 
-    /// Clean up a pending creation on shutdown, waiting briefly for the background thread
-    /// so worktrees and instances can be cleaned up. If it does not finish in time the hook
-    /// subprocess completes on its own and orphaned Creating stubs are cleaned up on the
-    /// next launch.
-    pub fn cleanup_pending_creation(&mut self) {
-        if !self.creation_poller.is_pending() {
-            return;
+/// Wizard output as the daemon's create request. `trust_hooks` carries the
+/// wizard's own decision: `Some(true)` once the user approved the repository's
+/// hooks (the daemon then persists that approval before provisioning),
+/// `Some(false)` for a deliberate skip, `None` when there is nothing to approve.
+pub(crate) fn wizard_create_body(
+    data: &NewSessionData,
+    trust_hooks: Option<bool>,
+) -> crate::daemon::CreateSessionBody {
+    crate::daemon::CreateSessionBody {
+        title: Some(data.title.clone()),
+        size: None,
+        path: data.path.clone(),
+        tool: data.tool.clone(),
+        group: data.group.clone(),
+        yolo_mode: data.yolo_mode,
+        worktree_enabled: data.worktree_enabled,
+        worktree_branch: data.worktree_branch.clone(),
+        create_new_branch: data.create_new_branch,
+        base_branch: data.base_branch.clone(),
+        sandbox: data.sandbox,
+        extra_args: data.extra_args.clone(),
+        sandbox_image: (!data.sandbox_image.is_empty()).then(|| data.sandbox_image.clone()),
+        extra_env: data.extra_env.clone(),
+        extra_repo_paths: data.extra_repo_paths.clone(),
+        // The dialog collects one base for the whole session; per-repo bases
+        // are a CLI and web-wizard input for now (#3329).
+        repo_bases: Vec::new(),
+        command_override: data.command_override.clone(),
+        custom_instruction: None,
+        profile: Some(data.profile.clone()),
+        view: if data.structured {
+            crate::session::View::Structured
+        } else {
+            crate::session::View::Terminal
+        },
+        agent_name: None,
+        agent_model: None,
+        agent_effort: None,
+        scratch: data.scratch,
+        trust_hooks,
+        trust_review: None,
+        import_acp_session_id: None,
+        // The wizard resolved the parent's provider conversation id; the daemon
+        // rebuilds the seed from it and re-checks fork capability, choosing the
+        // structured or terminal shape from the requested view.
+        fork_from: match &data.fork_seed {
+            Some(crate::session::ForkSeed::Structured {
+                parent_acp_session_id,
+            }) => Some(parent_acp_session_id.clone()),
+            Some(crate::session::ForkSeed::Terminal { parent, .. }) => {
+                Some(parent.session_id.clone())
+            }
+            None => None,
+        },
+        fork_session_id: None,
+        callback_url: None,
+        idempotency_key: None,
+    }
+}
+
+/// Human label for a creation phase, shown beside the running hook command.
+fn phase_label(phase: crate::daemon::CreationPhase) -> &'static str {
+    use crate::daemon::CreationPhase;
+    match phase {
+        CreationPhase::Reserving => "Reserving",
+        CreationPhase::Provisioning => "Preparing",
+        CreationPhase::CreateHooks => "Running setup hooks",
+        CreationPhase::LaunchHooks => "Running launch hooks",
+    }
+}
+
+impl HomeView {
+    /// Place the cursor for an archive toggle once the snapshot shows the row
+    /// actually sank or rose. Returns whether the placement ran.
+    pub(super) fn apply_pending_archive_cursor(&mut self) -> bool {
+        let Some(pending) = self.pending_archive_cursor.take() else {
+            return false;
+        };
+        let settled = self
+            .instances
+            .get(&pending.id)
+            .is_some_and(|inst| inst.is_archived() == pending.archived);
+        if !settled {
+            // The snapshot predates the change; the next one carries it.
+            self.pending_archive_cursor = Some(pending);
+            return false;
         }
-        self.creation_cancelled = true;
-        if let Some(stub_id) = self.creating_stub_id.take() {
-            self.remove_instance(&stub_id);
-            self.creating_hook_progress.remove(&stub_id);
+        self.rebuild_flat_items();
+        if !pending.archived {
+            self.select_session_by_id(&pending.id);
+            if self.selected_session.as_deref() != Some(pending.id.as_str()) {
+                // A reload frame can move the cursor off the row before it is
+                // visible again; keep the intent and settle on the next
+                // snapshot so the preview follows the row back.
+                self.pending_archive_cursor = Some(pending);
+                return false;
+            }
+            return true;
         }
+        if self.sort_order == crate::session::config::SortOrder::Attention {
+            // Attention sort is a triage flow: the cursor advances to the next
+            // item that needs attention.
+            self.select_top_attention(None);
+            if self.selected_session.as_deref() == Some(pending.id.as_str()) {
+                self.clear_selection_off_archived_row();
+            }
+            return true;
+        }
+        // Advance to the next session rather than following the archived row into
+        // the Archived section: archiving reads as "I'm done with this one".
+        match pending.successor {
+            Some(next) => {
+                self.select_session_by_id(&next);
+            }
+            None => self.clear_selection_off_archived_row(),
+        }
+        true
+    }
 
-        // Wait briefly for the background thread to finish
-        let result = self
-            .creation_poller
-            .recv_result_timeout(std::time::Duration::from_secs(2));
-
-        if let Some(crate::tui::creation_poller::CreationResult::Success {
-            ref instance,
-            ref created_worktree,
-            ref created_workspace_worktrees,
-            ..
-        }) = result
-        {
-            cleanup_creation_resources(
-                instance,
-                created_worktree.as_ref(),
-                created_workspace_worktrees,
-                None,
-            );
-            tracing::info!(target: "tui.home", "Cleaned up cancelled session on exit");
+    /// Leave no selection on a row that just sank into the Archived section: a
+    /// session row already parked there must not become the selection, and the
+    /// heading itself resolves to nothing.
+    fn clear_selection_off_archived_row(&mut self) {
+        self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
+        let live = match self.flat_items.get(self.cursor) {
+            Some(Item::Session { id, .. }) => self
+                .instances
+                .get(id)
+                .is_some_and(|inst| !inst.is_archived()),
+            _ => false,
+        };
+        if live {
+            self.update_selected();
+        } else {
+            self.selected_session = None;
         }
     }
 }

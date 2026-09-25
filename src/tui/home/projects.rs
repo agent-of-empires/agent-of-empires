@@ -72,7 +72,7 @@ impl HomeView {
     /// project grouping is active, the cursor is on a group header, and that header is not
     /// synthetic (the shelves and the scratch bucket have no backing repo).
     pub(in crate::tui) fn project_group_at_cursor(&self) -> Option<String> {
-        if self.group_by != GroupByMode::Project {
+        if self.effective_group_by() != GroupByMode::Project {
             return None;
         }
         match self.flat_items.get(self.cursor) {

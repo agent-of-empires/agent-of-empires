@@ -23,6 +23,8 @@ pub use resolved::{resolve, resolve_all, Candidate, ResolvedSetting, SettingSour
 pub use validate::{validate_value, ValidationError};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WidgetKind {
     Toggle,
@@ -40,13 +42,18 @@ pub enum WidgetKind {
     /// Bounds are advisory; [`ValidationKind`] is the server gate.
     Number {
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional, type = "number"))]
         min: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional, type = "number"))]
         max: Option<i64>,
     },
     Slider {
+        #[cfg_attr(test, ts(type = "number"))]
         min: i64,
+        #[cfg_attr(test, ts(type = "number"))]
         max: i64,
+        #[cfg_attr(test, ts(type = "number"))]
         step: i64,
     },
     Select {
@@ -57,6 +64,7 @@ pub enum WidgetKind {
     DynamicSelect {
         source: OptionSource,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(test, ts(as = "Option<Vec<String>>", optional))]
         depends_on: Vec<String>,
     },
     /// Items are objects with a stable id under `id_field`; one level deep.
@@ -64,8 +72,10 @@ pub enum WidgetKind {
         id_field: String,
         fields: Vec<ObjectFieldDescriptor>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         min_items: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         max_items: Option<u32>,
     },
     Cron,
@@ -77,6 +87,8 @@ pub enum WidgetKind {
 
 /// Mirrors `aoe_plugin_api::OptionSource`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[serde(rename_all = "snake_case")]
 pub enum OptionSource {
     AcpAgents,
@@ -101,21 +113,27 @@ impl From<aoe_plugin_api::OptionSource> for OptionSource {
 
 /// A field of a [`WidgetKind::ObjectList`] item.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct ObjectFieldDescriptor {
     pub field: String,
     pub label: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[cfg_attr(test, ts(as = "Option<String>", optional))]
     pub description: String,
     #[serde(default)]
     pub required: bool,
     pub widget: ObjectFieldWidget,
     pub validation: ValidationKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "unknown"))]
     pub default: Option<serde_json::Value>,
 }
 
 /// A subset of [`WidgetKind`] without object lists, keeping the schema non-recursive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ObjectFieldWidget {
     Toggle,
@@ -127,8 +145,10 @@ pub enum ObjectFieldWidget {
     },
     Number {
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional, type = "number"))]
         min: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional, type = "number"))]
         max: Option<i64>,
     },
     Select {
@@ -137,18 +157,22 @@ pub enum ObjectFieldWidget {
     DynamicSelect {
         source: OptionSource,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(test, ts(as = "Option<Vec<String>>", optional))]
         depends_on: Vec<String>,
     },
     /// Stores an array of chosen option values.
     DynamicMultiSelect {
         source: OptionSource,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(test, ts(as = "Option<Vec<String>>", optional))]
         depends_on: Vec<String>,
     },
     Cron,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct SelectOption {
     pub value: String,
     pub label: String,
@@ -164,6 +188,8 @@ impl SelectOption {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[serde(tag = "policy", rename_all = "snake_case")]
 pub enum WebWritePolicy {
     Allow,
@@ -187,12 +213,16 @@ pub enum RepoPolicy {
 
 /// Server-authoritative validation applied before a value is merged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[serde(tag = "rule", rename_all = "snake_case")]
 pub enum ValidationKind {
     None,
     /// Inclusive bounds.
     RangeU64 {
+        #[cfg_attr(test, ts(type = "number"))]
         min: u64,
+        #[cfg_attr(test, ts(type = "number | null"))]
         max: Option<u64>,
     },
     /// Non-empty after trimming.
@@ -207,7 +237,9 @@ pub enum ValidationKind {
     BoolValue,
     /// Signed inclusive range with optional bounds.
     RangeI64 {
+        #[cfg_attr(test, ts(type = "number | null"))]
         min: Option<i64>,
+        #[cfg_attr(test, ts(type = "number | null"))]
         max: Option<i64>,
     },
     /// Docker memory-limit grammar (`512m`, `2g`); empty allowed.
@@ -239,6 +271,8 @@ pub enum ValidationKind {
 
 /// One configurable field, emitted by the `SettingsSection` derive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 pub struct FieldDescriptor {
     /// The `[section]` table in `config.toml` and the profile override key.
     pub section: String,
@@ -250,6 +284,7 @@ pub struct FieldDescriptor {
     pub widget: WidgetKind,
     pub web_write: WebWritePolicy,
     #[serde(skip)]
+    #[cfg_attr(test, ts(skip))]
     pub repo_policy: RepoPolicy,
     /// `false` for global-only fields.
     pub profile_overridable: bool,
@@ -259,6 +294,7 @@ pub struct FieldDescriptor {
     pub advanced: bool,
     /// Manifest default for plugin fields; core fields always have a value in `Config`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "unknown"))]
     pub default: Option<serde_json::Value>,
 }
 

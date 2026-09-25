@@ -1,6 +1,9 @@
 //! Test-only constructors that integration tests in `tests/` need to drive
-//! `reload_state_instances_from_disk` and the dynamic-profile-rewire helpers without going
-//! through the full daemon.
+//! `reload_state_instances_from_disk` and the dynamic-profile-rewire helpers
+//! without going through the full daemon. Mirrors the pattern at
+//! `src/tmux/mod.rs`'s `test_support` module: gated on
+//! `#[cfg(any(test, feature = "test-support"))]` so the surface stays out of
+//! production builds, and `#[doc(hidden)]` so it's invisible in rustdoc.
 
 use super::*;
 use crate::file_watch::FileWatchService;
@@ -12,9 +15,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
-use tokio_util::sync::CancellationToken;
 
-/// Build a minimal `Arc<AppState>` for helper-equivalence tests.
+/// Build a minimal `Arc<AppState>` for helper-equivalence tests. Most
+/// fields are seeded with empty / default values; only `instances`,
+/// `recently_restarted`, and the file-watch trio are real. Acp
+/// fields are stubbed because the helper's acp overlay reads them.
 pub fn build_test_app_state(prior: Vec<Instance>) -> Arc<AppState> {
     build_test_app_state_with_policy(prior, Vec::new(), Vec::new(), None)
 }
@@ -28,6 +33,7 @@ pub fn build_test_app_state_cityhall(prior: Vec<Instance>) -> Arc<AppState> {
         Vec::new(),
         None,
         true,
+        |_| {},
         std::convert::identity,
     )
 }
@@ -47,6 +53,40 @@ pub fn build_test_app_state_with_policy(
         allowed_origins,
         token,
         false,
+        |_| {},
+        std::convert::identity,
+    )
+}
+
+pub fn build_test_app_state_with_policy_configured(
+    prior: Vec<Instance>,
+    allowed_hosts: Vec<String>,
+    allowed_origins: Vec<String>,
+    token: Option<String>,
+    configure: impl FnOnce(&mut AppState),
+) -> Arc<AppState> {
+    build_test_app_state_impl(
+        prior,
+        allowed_hosts,
+        allowed_origins,
+        token,
+        false,
+        configure,
+        std::convert::identity,
+    )
+}
+
+pub fn build_test_app_state_configured(
+    prior: Vec<Instance>,
+    configure: impl FnOnce(&mut AppState),
+) -> Arc<AppState> {
+    build_test_app_state_impl(
+        prior,
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        configure,
         std::convert::identity,
     )
 }
@@ -58,9 +98,15 @@ pub(crate) fn build_test_app_state_with_launcher(
     prior: Vec<Instance>,
     launcher: crate::acp::supervisor::Launcher,
 ) -> Arc<AppState> {
-    build_test_app_state_impl(prior, Vec::new(), Vec::new(), None, false, |s| {
-        s.with_launcher(launcher)
-    })
+    build_test_app_state_impl(
+        prior,
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |s| s.with_launcher(launcher),
+    )
 }
 
 fn build_test_app_state_impl(
@@ -69,6 +115,7 @@ fn build_test_app_state_impl(
     allowed_origins: Vec<String>,
     token: Option<String>,
     cityhall_mode: bool,
+    configure: impl FnOnce(&mut AppState),
     customize: impl FnOnce(
         crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
     )
@@ -106,15 +153,31 @@ fn build_test_app_state_impl(
             control_cache: acp_control_cache.clone(),
         },
     ));
-    Arc::new(AppState {
-        profile: "test".to_string(),
+    let shutdown = session_service.work.shutdown.clone();
+    let mut state = AppState {
+        core_only: false,
         read_only: false,
         cityhall_mode,
         instances,
+        profile_namespace: Arc::new(RwLock::new(())),
+        publication: Arc::new(RwLock::new(())),
+        reload_lane: tokio::sync::Mutex::new(()),
+        canonical_metadata: RwLock::new(super::reload::CanonicalMetadata {
+            default_profile: "test".into(),
+            ..Default::default()
+        }),
+        canonical_health: RwLock::new(crate::daemon::RuntimeHealth::Healthy),
+        runtime: super::runtime::NativeRuntime::new(
+            "test".into(),
+            None,
+            session_service.work.clone(),
+        ),
         session_service,
         token_manager: Arc::new(TokenManager::new(token, Duration::from_secs(3600))),
         login_manager: Arc::new(login::LoginManager::new(None)),
         rate_limiter: Arc::new(RateLimiter::new()),
+        pairing_limiter: Arc::new(RateLimiter::new()),
+        pairing: Default::default(),
         behind_tunnel: false,
         auth_mode: "none",
         serve_mode: "local",
@@ -160,11 +223,20 @@ fn build_test_app_state_impl(
         telemetry_session_creates,
         telemetry_structured: StructuredTelemetryCounters::default(),
         telemetry_last_reported: std::sync::Mutex::new(None),
-        shutdown: CancellationToken::new(),
+        shutdown,
         file_watch,
         disk_changed: Arc::new(tokio::sync::Notify::new()),
         disk_watch_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-    })
+    };
+    configure(&mut state);
+    let state = Arc::new(state);
+    state.session_service.bind_native_state(&state);
+    state
+}
+
+pub async fn refresh_canonical_metadata_for_test(state: &Arc<AppState>) {
+    let loaded = super::reload::load_all_profiles(&state.file_watch).expect("load profiles");
+    *state.canonical_metadata.write().await = loaded.metadata;
 }
 
 pub async fn drain_session_id_updates_for_test(state: &Arc<AppState>) {
@@ -206,9 +278,7 @@ pub async fn disk_watch_handle_count(state: &Arc<AppState>) -> usize {
     state.disk_watch_handles.lock().await.len()
 }
 
-pub use super::api::system::{
-    create_profile, delete_profile, rename_profile, CreateProfileBody, RenameProfileBody,
-};
+pub use super::api::system::{create_profile, delete_profile, rename_profile};
 
 pub async fn add_profile_disk_watch(state: &Arc<AppState>, profile: &str) {
     super::add_profile_disk_watch(state, profile).await
@@ -222,12 +292,16 @@ pub async fn rename_profile_disk_watch(state: &Arc<AppState>, old: &str, new: &s
     super::rename_profile_disk_watch(state, old, new).await
 }
 
-/// Replace the `Arc<FileWatchService>` on a unique-Arc'd `AppState`.
+/// Configure both collaborators before binding the native runtime.
 pub fn replace_file_watch(state: &mut AppState, fw: Arc<crate::file_watch::FileWatchService>) {
+    Arc::get_mut(&mut state.session_service)
+        .expect("configure session service before sharing it")
+        .file_watch = fw.clone();
     state.file_watch = fw;
 }
 
-/// Read the current `Arc<FileWatchService>` for tests asserting on `subscriber_count`.
+/// Read the current `Arc<FileWatchService>` for tests asserting on
+/// `subscriber_count`. The Arc clone is cheap.
 pub fn file_watch(state: &AppState) -> Arc<crate::file_watch::FileWatchService> {
     state.file_watch.clone()
 }
@@ -246,8 +320,13 @@ pub async fn reload_disk_only_for_test(
         live_worker_records,
         super::state::StatusSource::DiskOnly,
         read_epoch,
+        {
+            let metadata = (state).canonical_metadata.read().await.clone();
+            metadata
+        },
+        Default::default(),
     )
-    .await
+    .await;
 }
 
 pub async fn reload_tmux_applied_for_test(
@@ -264,6 +343,11 @@ pub async fn reload_tmux_applied_for_test(
         live_worker_records,
         super::state::StatusSource::TmuxApplied,
         read_epoch,
+        {
+            let metadata = (state).canonical_metadata.read().await.clone();
+            metadata
+        },
+        Default::default(),
     )
-    .await
+    .await;
 }

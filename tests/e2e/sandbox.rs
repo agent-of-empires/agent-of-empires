@@ -185,3 +185,212 @@ fn sandbox_reclaim_reports_before_it_removes() {
     assert!(owned.exists(), "a claimed store must survive the pass");
     assert!(fresh.exists(), "a store being seeded right now was swept");
 }
+
+#[tokio::test]
+#[parallel]
+async fn native_purge_never_starts_the_managed_container() {
+    use agent_of_empires::{daemon::DaemonClient, session::Instance};
+    use std::{fs, path::PathBuf, process::Command, time::Duration};
+    crate::harness::require_tmux!();
+    const IMAGE: &str = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
+    const HOST: &str = "unix:///var/run/docker.sock";
+    fn docker(args: &[&str]) -> std::io::Result<Option<std::process::Output>> {
+        let mut command = Command::new("docker");
+        command
+            .args(args)
+            .env("DOCKER_HOST", HOST)
+            .env_remove("DOCKER_CONTEXT")
+            .env_remove("DOCKER_TLS")
+            .env_remove("DOCKER_TLS_VERIFY");
+        agent_of_empires::process::run_with_timeout(&mut command, Duration::from_secs(30))
+    }
+    if !docker(&["image", "inspect", IMAGE])
+        .ok()
+        .flatten()
+        .is_some_and(|out| out.status.success())
+    {
+        eprintln!(
+            "Skipping container purge: local Docker or the cached sandbox image is unavailable"
+        );
+        return;
+    }
+    let mut h = TuiTestHarness::new_in_tmp("native_purge_entrypoint");
+    for (key, value) in [
+        ("DOCKER_HOST", HOST),
+        ("DOCKER_CONTEXT", ""),
+        ("DOCKER_TLS", ""),
+        ("DOCKER_TLS_VERIFY", ""),
+        ("AGENT_OF_EMPIRES_PROFILE", "default"),
+    ] {
+        h.set_env(key, value);
+    }
+    h.stop_daemon_on_drop();
+    let app = crate::harness::app_dir_in(h.home_path());
+    let config_path = app.join("config.toml");
+    let mut config = fs::read_to_string(&config_path).unwrap();
+    config.push_str("\n[sandbox]\ncontainer_runtime = \"docker\"\n");
+    fs::write(config_path, config).unwrap();
+    let project = h.project_path();
+    {
+        let repository = git2::Repository::init(&project).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.invalid").unwrap();
+        let tree_id = repository.index().unwrap().write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        repository
+            .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .unwrap();
+    }
+    let added = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--worktree",
+        "purge-entrypoint",
+        "--new-branch",
+        "--tool",
+        "claude",
+        "--sandbox-image",
+        IMAGE,
+    ]);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let rows_path = app.join("profiles/default/sessions.json");
+    let mut rows: Vec<Instance> = serde_json::from_slice(&fs::read(&rows_path).unwrap()).unwrap();
+    let row = &mut rows[0];
+    assert!(row.worktree_info.as_ref().unwrap().managed_by_aoe);
+    let worktree = PathBuf::from(&row.project_path);
+    let control = h.home_path().join("container-control");
+    fs::create_dir(&control).unwrap();
+    fs::write(worktree.join("owned-data"), "keep until runtime teardown").unwrap();
+    struct OwnedContainer {
+        name: String,
+        worktree: PathBuf,
+        control: PathBuf,
+    }
+    impl Drop for OwnedContainer {
+        fn drop(&mut self) {
+            let Some(output) = docker(&["container", "inspect", &self.name])
+                .ok()
+                .flatten()
+                .filter(|output| output.status.success())
+            else {
+                return;
+            };
+            let Ok(values) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+            else {
+                return;
+            };
+            let Some(value) = values.first() else {
+                return;
+            };
+            let Some(mounts) = value["Mounts"].as_array() else {
+                return;
+            };
+            if [&self.worktree, &self.control].iter().all(|path| {
+                mounts
+                    .iter()
+                    .any(|mount| mount["Source"].as_str() == path.to_str())
+            }) {
+                if let Some(id) = value["Id"].as_str() {
+                    let _ = docker(&["rm", "-fv", id]);
+                }
+            }
+        }
+    }
+    let sandbox = row.sandbox_info.as_mut().unwrap();
+    let owned = OwnedContainer {
+        name: sandbox.container_name.clone(),
+        worktree: worktree.clone(),
+        control: control.clone(),
+    };
+    let work_mount = format!("type=bind,source={},target=/work", worktree.display());
+    let control_mount = format!("type=bind,source={},target=/control", control.display());
+    let created = docker(&[
+        "create",
+        "--name",
+        &owned.name,
+        "--entrypoint",
+        "/bin/sh",
+        "--mount",
+        &work_mount,
+        "--mount",
+        &control_mount,
+        "--workdir",
+        "/work",
+        IMAGE,
+        "-c",
+        "printf 'started\\n' >> /control/starts; exec sleep infinity",
+    ])
+    .unwrap()
+    .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let id = String::from_utf8(created.stdout).unwrap().trim().to_owned();
+    sandbox.container_id = Some(id.clone());
+    sandbox.container_workdir = Some("/work".into());
+    let session_id = row.id.clone();
+    fs::write(&rows_path, serde_json::to_vec(&rows).unwrap()).unwrap();
+    let started = h.run_cli(&["serve", "--core-only", "--daemon"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let sdk = DaemonClient::new_unix(app.join("daemon/api.sock")).unwrap();
+    let epoch = sdk.runtime_info().await.unwrap().epoch;
+    let http = reqwest::Client::builder()
+        .unix_socket(app.join("daemon/api.sock"))
+        .no_proxy()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let response = http
+        .delete(format!("http://localhost/api/sessions/{session_id}"))
+        .header(agent_of_empires::daemon::RUNTIME_EPOCH_HEADER, epoch)
+        .json(
+            &serde_json::json!({"delete_worktree":true,"delete_branch":true,
+                                 "delete_sandbox":true,"force_delete":true}),
+        )
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let outcome: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{outcome}");
+    assert_eq!(
+        outcome["cleanup_errors"],
+        serde_json::json!([]),
+        "{outcome}"
+    );
+    assert!(
+        !control.join("starts").exists(),
+        "purge executed the managed container entrypoint"
+    );
+    assert!(!worktree.exists(), "purge left the managed worktree behind");
+    let filter = format!("id={id}");
+    let remaining = docker(&[
+        "container",
+        "ls",
+        "--all",
+        "--quiet",
+        "--no-trunc",
+        "--filter",
+        &filter,
+    ])
+    .unwrap()
+    .unwrap();
+    assert!(
+        remaining.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remaining.stderr)
+    );
+    assert!(
+        remaining.stdout.is_empty(),
+        "purge retained its managed container"
+    );
+}

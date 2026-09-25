@@ -42,7 +42,9 @@ pub enum ContextMenuAction {
     EmptyTrash,
     /// Restore all from Trash, or unarchive all. Reversible, so no confirm.
     RestoreAll,
-    /// Collapse or expand the section the menu was opened on.
+    /// Collapse or expand the header the menu was opened on: a synthetic Trash
+    /// or Archived section, or a machine header. The label flips to "Expand"
+    /// when it is already collapsed.
     ToggleSectionCollapse,
 }
 
@@ -177,6 +179,58 @@ impl ContextMenuDialog {
             anchor,
             vec![
                 (ContextMenuAction::RestoreAll, "Restore All"),
+                (ContextMenuAction::ToggleSectionCollapse, collapse_label),
+            ],
+        )
+    }
+
+    /// Menu for a session on another machine. Same entries as
+    /// [`Self::for_session`] minus the three that would answer from this
+    /// machine's state: "Add project" would add the remote's path to this
+    /// machine's project list, and fork and view switching both resolve agent
+    /// config locally.
+    pub fn for_remote_session(
+        anchor: (u16, u16),
+        can_rename: bool,
+        archive: Option<bool>,
+        snooze: Option<bool>,
+        unread: Option<bool>,
+    ) -> Self {
+        let mut items = vec![(ContextMenuAction::NewFromSelection, "New Session")];
+        if can_rename {
+            items.push((ContextMenuAction::Rename, "Rename"));
+        }
+        // A row mid-create or mid-delete has no settled state to toggle, so
+        // these three are absent rather than present and refused.
+        if let Some(is_archived) = archive {
+            let archive_label = if is_archived { "Unarchive" } else { "Archive" };
+            items.push((ContextMenuAction::ToggleArchive, archive_label));
+        }
+        if let Some(is_snoozed) = snooze {
+            let snooze_label = if is_snoozed { "Unsnooze" } else { "Snooze" };
+            items.push((ContextMenuAction::ToggleSnooze, snooze_label));
+        }
+        if let Some(is_unread) = unread {
+            let unread_label = if is_unread {
+                "Mark read"
+            } else {
+                "Mark unread"
+            };
+            items.push((ContextMenuAction::ToggleUnread, unread_label));
+        }
+        items.push((ContextMenuAction::Delete, "Delete"));
+        Self::new(anchor, items)
+    }
+
+    /// Menu for a machine header, this one's or a remote's. It gathers rows
+    /// rather than owning them, so its actions are "launch here" and the
+    /// collapse toggle. `collapsed` flips the toggle's label.
+    pub fn for_machine_header(anchor: (u16, u16), collapsed: bool) -> Self {
+        let collapse_label = if collapsed { "Expand" } else { "Collapse" };
+        Self::new(
+            anchor,
+            vec![
+                (ContextMenuAction::NewFromSelection, "New Session"),
                 (ContextMenuAction::ToggleSectionCollapse, collapse_label),
             ],
         )

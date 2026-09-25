@@ -8,7 +8,12 @@ impl HomeView {
         let mut all_peer_deleted: Vec<String> = Vec::new();
 
         for (profile_name, storage) in &self.storages {
-            let tui_rows: Vec<Instance> = self.cloned_instances_for_profile(profile_name);
+            let tui_rows: Vec<Instance> = self
+                .instances()
+                .filter(|instance| instance.source_profile == *profile_name)
+                .filter(|instance| self.creating_stub_id.as_deref() != Some(instance.id.as_str()))
+                .cloned()
+                .collect();
             let dels: HashSet<String> = self
                 .pending_deletions
                 .get(profile_name)
@@ -81,8 +86,9 @@ impl HomeView {
         Ok(())
     }
 
-    /// Drop in-memory mirror rows that no longer exist on disk (peer-deleted via the CLI or
-    /// aoe serve), rebuilding derived UI state so callers don't target removed rows.
+    /// Drop in-memory mirror rows that no longer exist on disk (peer-deleted
+    /// via CLI / aoe serve). Rebuilds derived UI state so callers don't
+    /// render or target removed rows.
     pub(super) fn drop_peer_deleted_rows(&mut self, ids: &[String]) {
         if ids.is_empty() {
             return;
@@ -130,6 +136,9 @@ impl HomeView {
                         .get_instance(id.as_str())
                         .map(|i| i.source_profile.clone());
                 }
+                crate::session::Item::LocalGroup { .. }
+                | crate::session::Item::RemoteGroup { .. }
+                | crate::session::Item::RemoteSession { .. } => return None,
                 crate::session::Item::Group { profile, path, .. } => {
                     if let Some(p) = profile {
                         return Some(p.clone());
@@ -163,17 +172,10 @@ impl HomeView {
             .any(|t| !t.get_all_groups().is_empty())
     }
 
-    /// Centralized instance addition: inserts into the ordered map (insertion order is
-    /// sidebar order) and records the id in `pending_added`, so the next `save`
-    /// distinguishes TUI-new rows from peer-deleted ones, which look identical on disk.
+    /// Test fixture helper: insert a row and register it as TUI-added so a
+    /// following `save` persists it. Production row arrival is daemon-owned.
+    #[cfg(test)]
     pub(in crate::tui) fn add_instance(&mut self, instance: Instance) {
-        // Count only finalized session inserts for the opt-in create-trend counter (#1897).
-        // `add_instance` is also the funnel for `Creating` stubs, so counting every call
-        // would double-count a successful background create and count a cancelled one. A
-        // real create is never `Creating`. Mirrors the serve side's single increment.
-        if instance.status != crate::session::Status::Creating {
-            crate::tui::app::record_session_create();
-        }
         self.pending_added
             .entry(instance.source_profile.clone())
             .or_default()
@@ -181,26 +183,13 @@ impl HomeView {
         self.instances.insert(instance.id.clone(), instance);
     }
 
-    /// Publish a row this process already committed through `Storage::update`. Unlike a
-    /// provisional TUI add, a later missing disk row is a peer deletion and must not be
-    /// recreated by `save()`.
-    pub(super) fn publish_persisted_instance(&mut self, instance: Instance) {
-        let profile = instance.source_profile.clone();
-        let id = instance.id.clone();
-        self.add_instance(instance);
-        let remove_profile_entry = self.pending_added.get_mut(&profile).is_some_and(|pending| {
-            pending.remove(&id);
-            pending.is_empty()
-        });
-        if remove_profile_entry {
-            self.pending_added.remove(&profile);
-        }
-    }
-
-    /// Centralized instance removal: shift-removes from the ordered map (swap_remove would
-    /// silently reorder the sidebar), records the id in `pending_deletions` so the next
-    /// `save` propagates it under the flock, and clears any `pending_added` entry so an
-    /// add+remove in one save cycle is not persisted. Idempotent.
+    /// Centralized instance removal: shift-removes from the ordered map
+    /// (preserves the order of trailing rows; swap_remove would silently
+    /// reorder the sidebar), records the id in `pending_deletions` so the
+    /// next `save` propagates the removal under the flock, and clears any
+    /// `pending_added` entry so an add+remove in the same save cycle does
+    /// not end up persisted. Idempotent: safe to call on ids already
+    /// removed.
     pub(in crate::tui) fn remove_instance(&mut self, id: &str) {
         if let Some(inst) = self.instances.get(id) {
             let profile = inst.source_profile.clone();
@@ -239,18 +228,20 @@ impl HomeView {
             .extend(descendants);
     }
 
-    /// Centralized instance mutation: applies `f` in place, a no-op on unknown ids so
-    /// callers can be idempotent (matching `remove_instance`).
+    /// Centralized instance mutation: applies `f` to the entry in place.
+    /// No-op on unknown ids so callers can be idempotent (matches
+    /// `remove_instance`).
     pub(in crate::tui) fn mutate_instance(&mut self, id: &str, f: impl FnOnce(&mut Instance)) {
         if let Some(inst) = self.instances.get_mut(id) {
             f(inst);
         }
     }
 
-    /// Acquire the per-session title flock and then the source profile's per-instance
-    /// lifecycle flock, and replace the TUI snapshot with the authoritative source row.
-    /// Only TUI-owned launch configuration is merged from the snapshot; lifecycle and
-    /// runtime fields stay as reloaded under the lifecycle lock.
+    /// Acquire the per-session title flock followed by the source profile's
+    /// per-instance lifecycle flock, then replace the TUI snapshot with the
+    /// authoritative source row. Only TUI-owned launch configuration is merged
+    /// from the snapshot; lifecycle/runtime fields always remain the values
+    /// reloaded under the source lifecycle lock.
     pub(in crate::tui) fn lock_session_mutation_and_reload(
         &mut self,
         id: &str,
@@ -278,10 +269,12 @@ impl HomeView {
             .map_err(|error| {
                 anyhow::anyhow!("failed to acquire session lifecycle lock: {error}")
             })?;
-        // Read-only: both flocks are already held, so a plain `load()` gives the
-        // authoritative row without `update()`, which would rewrite sessions.json and fire
-        // `notify_local_change` even when nothing changed. `move_group_to_profile` acquires
-        // these guards per member in a loop, so an update-per-read would be N rewrites.
+        // Read-only: both flocks (title + lifecycle) are already held above, so
+        // a plain `load()` gives the authoritative on-disk row without going
+        // through `update()`, which would unconditionally rewrite sessions.json
+        // and fire a `notify_local_change` even when nothing changed. Callers
+        // like `move_group_to_profile` acquire these guards per member in a
+        // loop, so an update-per-read would be N identical rewrites.
         let mut authoritative = storage
             .load()?
             .into_iter()
@@ -306,27 +299,15 @@ impl HomeView {
         })
     }
 
-    /// Move a row between profiles as one dual-locked storage transaction,
-    /// then publish the committed row in memory.
-    pub(in crate::tui) fn move_to_profile(
-        &mut self,
-        id: &str,
-        target: &str,
-        requested: Instance,
-        baseline: Option<&Instance>,
-        account_swap: bool,
-    ) -> anyhow::Result<()> {
-        self.move_to_profile_with_effect(id, target, requested, baseline, account_swap, |_| Ok(()))
-    }
-
-    /// Cross-profile move: structurally distinct from `mutate_instance` because the source
-    /// row and group metadata must be removed in the same transaction that durably
-    /// publishes the target row and metadata.
+    /// Cross-profile move: structurally distinct from `mutate_instance`
+    /// because the source row and group metadata must be removed in the same
+    /// transaction that durably publishes the target row and metadata.
     ///
-    /// `before_commit` runs after authoritative target validation while both profile
-    /// storage locks are held; it may perform only bounded worktree/container effects and
-    /// must not re-enter storage or rekey tmux. Callers retain [`SessionMutationGuards`]
-    /// around the transaction and any post-persist rekey.
+    /// `before_commit` runs after authoritative target validation while both
+    /// profile storage locks are held. It may perform only bounded
+    /// worktree/container effects; it must not re-enter storage or rekey tmux.
+    /// Callers retain [`SessionMutationGuards`] around the transaction and any
+    /// post-persist tmux rekey.
     pub(in crate::tui) fn move_to_profile_with_effect<B>(
         &mut self,
         id: &str,
@@ -420,62 +401,5 @@ impl HomeView {
             }
         }
         Ok(())
-    }
-
-    /// Persist a passively-detected status transition so the next disk reload (a relaunch,
-    /// or a peer like `aoe serve`) finds disk caught up instead of misreading a stale
-    /// snapshot as a fresh transition (#2690). Best effort: unlike `apply_user_action`, a
-    /// write failure does not roll back the in-memory update, since the poller is the sole
-    /// authority on live status.
-    ///
-    /// `mark_unread` folds the Running -> Idle unread mark into the same `Storage::update`
-    /// instead of a second flock round-trip on the same row in the same tick, matching the
-    /// daemon's per-tick batching. Terminal rows only; see the `is_structured()` return.
-    pub(in crate::tui) fn persist_passive_status_transition(&self, id: &str, mark_unread: bool) {
-        let Some(inst) = self.instances.get(id) else {
-            return;
-        };
-        let Some(storage) = self.storages.get(&inst.source_profile) else {
-            return;
-        };
-        // A structured row has nothing for the TUI to persist, so bail before taking the
-        // flock.
-        //
-        // Its status is a daemon-side overlay rebuilt from live worker state and re-derived
-        // at daemon boot by `seed_acp_statuses`, and the daemon's own passive writer gates
-        // its patch on exactly this predicate. Persisting it here would strand a row at
-        // `Running` or `Error` with no producer left to heal it once the daemon is gone,
-        // since the tmux poller bails on structured rows: the #3201 regression from #3170.
-        //
-        // Its unread mark is the daemon's too (#3181), written from the live ACP turn-end
-        // event, and the caller's predicate is gated on `!structured` to match, so
-        // `mark_unread` is only ever `false` here and this return is total.
-        if inst.is_structured() {
-            return;
-        }
-        let patch = crate::session::PassiveStatusPatch::from_instance(inst);
-        if let Err(e) = storage.update(|insts, _groups| {
-            if let Some(disk) = insts.iter_mut().find(|i| i.id == id) {
-                disk.merge_passive_status_patch(id, &patch);
-                if mark_unread {
-                    disk.mark_unread();
-                }
-            }
-            Ok(())
-        }) {
-            // Best-effort persistence (see method docstring): a write
-            // failure here does not roll back the in-memory update, but
-            // silence would obscure a persistent flock timeout or EIO
-            // loop. The daemon's sibling path in
-            // `api::persist_session_update` logs the same class of
-            // failure at `target: "http.api.sessions"`; log here so a
-            // TUI-only user has parity visibility under
-            // `AOE_LOG_LEVEL=debug`.
-            tracing::warn!(
-                target: "session.store",
-                session_id = %id,
-                "persist_passive_status_transition failed: {e}"
-            );
-        }
     }
 }

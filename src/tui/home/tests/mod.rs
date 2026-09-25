@@ -47,6 +47,7 @@ fn key(code: KeyCode) -> KeyEvent {
 mod apply_session_id_updates;
 mod archive_restart_grouping;
 mod click_to_select;
+mod creation_fence;
 mod default_attach_mode;
 mod divider_drag;
 mod footer_toolbar;
@@ -60,6 +61,7 @@ mod post_create_attach_mode;
 mod preview_drag_select;
 mod preview_links;
 mod profile_duplicate_reconciliation;
+mod remote_rows;
 mod render_and_save;
 mod right_click_context_menu;
 mod save_field_merge;
@@ -82,125 +84,47 @@ struct TestEnv {
     _temp: TempDir,
 }
 
-/// An isolated app dir for a fixture; the guard must outlive every storage write.
-fn test_home() -> (TempDir, AppDirGuard) {
+fn create_test_env_empty() -> TestEnv {
+    use crate::session::config::GroupByMode;
     let temp = TempDir::new().unwrap();
-    let guard = setup_test_home(&temp);
-    (temp, guard)
-}
-
-fn test_view(profile: Option<&str>) -> HomeView {
-    HomeView::new_for_test(
-        profile.map(str::to_string),
-        AvailableTools::with_tools(&["claude"]),
+    let _guard = setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap(); // ensure profile dir exists
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new_for_test(
+        Some("test".to_string()),
+        tools,
         crate::file_watch::FileWatchService::noop(),
     )
-    .unwrap()
-}
-
-/// Persist `instances` (with derived groups) to `profile`.
-fn seed_profile(profile: &str, instances: &[Instance]) {
-    Storage::new_unwatched(profile)
-        .unwrap()
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = GroupTree::new_with_groups(instances, &[]).get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-}
-
-/// A view over profile "test" seeded with `instances`. `manual` switches to manual
-/// grouping and rebuilds the rows, which most fixtures want.
-fn seeded_env(
-    (temp, guard): (TempDir, AppDirGuard),
-    instances: &[Instance],
-    manual: bool,
-) -> TestEnv {
-    seed_profile("test", instances);
-    let mut view = test_view(Some("test"));
-    if manual {
-        view.group_by = crate::session::config::GroupByMode::Manual;
-        view.flat_items = view.build_flat_items();
-        view.update_selected();
-    }
+    .unwrap();
+    view.group_by = GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
     TestEnv {
         view,
-        _guard: guard,
+        _guard,
         _temp: temp,
     }
-}
-
-/// Session id of the `flat_items` row at `idx`, or `None` when it is not a session row.
-fn session_id_at(view: &HomeView, idx: usize) -> Option<String> {
-    match view.flat_items.get(idx) {
-        Some(Item::Session { id, .. }) => Some(id.clone()),
-        _ => None,
-    }
-}
-
-/// Session id under the cursor, or `None` when the cursor is not on a session row.
-fn cursor_session_id(view: &HomeView) -> Option<String> {
-    session_id_at(view, view.cursor)
-}
-
-/// A `StatusUpdate` carrying the three fields the apply-path tests vary; everything else
-/// takes the "producer had nothing to say" value.
-fn status_update(
-    id: &str,
-    status: Status,
-    idle_entered_at: crate::tui::status_poller::IdleIntent,
-) -> crate::tui::status_poller::StatusUpdate {
-    crate::tui::status_poller::StatusUpdate {
-        id: id.to_string(),
-        status,
-        last_error: None,
-        idle_entered_at,
-        last_accessed_at: None,
-        pane_dead: false,
-        live_status_baseline: None,
-        detection: None,
-    }
-}
-
-fn instance_in(title: &str, path: &str, group: &str) -> Instance {
-    let mut inst = Instance::new(title, path);
-    inst.group_path = group.to_string();
-    inst
-}
-
-fn instance_with_status(title: &str, path: &str, status: Status) -> Instance {
-    let mut inst = Instance::new(title, path);
-    inst.status = status;
-    inst
-}
-
-fn create_test_env_empty() -> TestEnv {
-    seeded_env(test_home(), &[], true)
-}
-
-fn create_test_env_with_sessions(count: usize) -> TestEnv {
-    let instances: Vec<_> = (0..count)
-        .map(|i| Instance::new(&format!("session{i}"), &format!("/tmp/{i}")))
-        .collect();
-    seeded_env(test_home(), &instances, true)
 }
 
 #[tokio::test(flavor = "current_thread")]
 #[serial]
 async fn config_watch_keys_distinguish_global_from_profile_named_global() {
-    let (_temp, _guard) = test_home();
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
     let profile_name = "<global>";
-    // Outside the create grammar, so lay the legacy directory down directly.
+    // `<` and `>` are outside the create grammar, so lay the directory down
+    // directly: a legacy profile of this shape still opens, and that is what
+    // the key must keep apart from the app-wide subscription.
     let profile_dir = crate::session::get_app_dir()
         .unwrap()
         .join("profiles")
         .join(profile_name);
     std::fs::create_dir_all(&profile_dir).unwrap();
     let _storage = Storage::open_unwatched(profile_name).unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
     let view = HomeView::new_for_test(
         Some(profile_name.to_string()),
-        AvailableTools::with_tools(&["claude"]),
+        tools,
         crate::file_watch::FileWatchService::new().unwrap(),
     )
     .unwrap();
@@ -216,19 +140,78 @@ async fn config_watch_keys_distinguish_global_from_profile_named_global() {
         .contains_key(&ConfigWatchKey::profile(profile_name)));
 }
 
-/// Render once off-screen so geometry fields (`list_inner_area`, `shelf_inner_area`) are real.
+/// Render the view once into an off-screen backend so geometry-dependent
+/// fields (`list_inner_area`, `shelf_inner_area`, scroll offsets) reflect a
+/// real layout. Needed by mouse tests that click rows in the pinned Trash /
+/// Archived shelf, whose position can't be faked the way `setup_inner` fakes
+/// the flat list rect.
 fn render_geometry(view: &mut HomeView) {
-    render_home_to_string(view, 120, 40);
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let theme = load_theme("empire");
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            view.render(f, area, &theme, None, None, None);
+        })
+        .unwrap();
 }
 
-/// Screen row of the shelf item at `flat_items` index `idx`, assuming an unscrolled shelf.
+/// Screen row (0-indexed) of the shelf item at absolute `flat_items` index
+/// `idx`, after `render_geometry` has populated `shelf_inner_area`. Assumes the
+/// shelf isn't scrolled (true for the small fixtures these tests build).
 fn shelf_row_for_idx(view: &HomeView, idx: usize) -> u16 {
     let list_len = view.shelf_start().expect("a shelf must be present");
     assert!(idx >= list_len, "idx {idx} is in the list, not the shelf");
     view.shelf_inner_area.y + (idx - list_len) as u16
 }
 
-/// With trash-first delete on, `d` trashes instead of opening the delete dialog.
+fn create_test_env_with_sessions(count: usize) -> TestEnv {
+    use crate::session::config::GroupByMode;
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+    let mut instances = Vec::new();
+    for i in 0..count {
+        instances.push(Instance::new(
+            &format!("session{}", i),
+            &format!("/tmp/{}", i),
+        ));
+    }
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new_for_test(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    }
+}
+
+/// Disable trash-first delete for tests that assert the permanent-delete
+/// dialog opens on `d` / `Shift+D` / context-menu Delete. With the default
+/// (`delete_to_trash = true`) those keys move the session to the trash
+/// instead of opening the dialog; the trash-first path has its own coverage
+/// (`trash_then_restore_round_trip`). Must run after `setup_test_home` so it
+/// writes into the test HOME. See #2489.
 fn disable_delete_to_trash() {
     crate::session::config::update_config(|config| {
         config.session.delete_to_trash = false;
@@ -236,7 +219,9 @@ fn disable_delete_to_trash() {
     .unwrap();
 }
 
-/// Makes `d` trash on the keystroke instead of opening the confirmation dialog.
+/// Turn off `session.confirm_delete` so `d` trashes on the keystroke instead
+/// of opening the confirmation dialog. Must run after `setup_test_home` so it
+/// writes into the test HOME. See #2583, #3364.
 fn disable_confirm_delete() {
     crate::session::config::update_config(|config| {
         config.session.confirm_delete = false;
@@ -245,25 +230,100 @@ fn disable_confirm_delete() {
 }
 
 fn create_test_env_with_groups() -> TestEnv {
-    let instances = [
-        Instance::new("ungrouped", "/tmp/u"),
-        instance_in("work-project", "/tmp/work", "work"),
-        instance_in("personal-project", "/tmp/personal", "personal"),
-    ];
-    seeded_env(test_home(), &instances, true)
+    use crate::session::config::GroupByMode;
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+    let mut instances = Vec::new();
+
+    let inst1 = Instance::new("ungrouped", "/tmp/u");
+    instances.push(inst1);
+
+    let mut inst2 = Instance::new("work-project", "/tmp/work");
+    inst2.group_path = "work".to_string();
+    instances.push(inst2);
+
+    let mut inst3 = Instance::new("personal-project", "/tmp/personal");
+    inst3.group_path = "personal".to_string();
+    instances.push(inst3);
+
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new_for_test(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    }
 }
 
 fn create_test_env_with_mixed_sessions() -> TestEnv {
-    let instances = [
-        Instance::new("Uncategorized", "/tmp/u"),
-        instance_in("Zebra", "/tmp/z", "work"),
-        instance_in("Mango", "/tmp/m", "work"),
-        instance_in("Apple", "/tmp/a", "work"),
-    ];
-    seeded_env(test_home(), &instances, true)
+    use crate::session::GroupTree;
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+    let mut instances = Vec::new();
+
+    let inst_ungrouped = Instance::new("Uncategorized", "/tmp/u");
+    instances.push(inst_ungrouped);
+
+    let mut inst1 = Instance::new("Zebra", "/tmp/z");
+    inst1.group_path = "work".to_string();
+    instances.push(inst1);
+
+    let mut inst2 = Instance::new("Mango", "/tmp/m");
+    inst2.group_path = "work".to_string();
+    instances.push(inst2);
+
+    let mut inst3 = Instance::new("Apple", "/tmp/a");
+    inst3.group_path = "work".to_string();
+    instances.push(inst3);
+
+    let group_tree = GroupTree::new_with_groups(&instances, &[]);
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = group_tree.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new_for_test(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    }
 }
 
-/// The only catalog tip is earned: cross its threshold on disk and refresh the badge.
+// The only catalog tip is earned, so it (and the badge) appears only after the
+// `new_session_with_selection` counter crosses its threshold. Set that on disk
+// and refresh the cached badge so a test starts with the tip eligible.
 fn earn_tip(env: &mut TestEnv) {
     crate::session::config::update_app_state(|state| {
         state.new_session_with_selection_count = crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD;
@@ -275,9 +335,28 @@ fn earn_tip(env: &mut TestEnv) {
     env.view.tips_unseen = crate::tui::home::tips_unseen_count(&config);
 }
 
+// Group deletion tests
+
 fn create_test_env_with_group_sessions() -> TestEnv {
-    let mut sandboxed = instance_in("work-session-2", "/tmp/work2", "work");
-    sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
+    use crate::session::{GroupTree, SandboxInfo};
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+    let mut instances = Vec::new();
+
+    // Ungrouped session
+    let inst1 = Instance::new("ungrouped", "/tmp/u");
+    instances.push(inst1);
+
+    // Sessions in "work" group
+    let mut inst2 = Instance::new("work-session-1", "/tmp/work1");
+    inst2.group_path = "work".to_string();
+    instances.push(inst2);
+
+    let mut inst3 = Instance::new("work-session-2", "/tmp/work2");
+    inst3.group_path = "work".to_string();
+    inst3.sandbox_info = Some(SandboxInfo {
         enabled: true,
         container_id: None,
         image: "ubuntu:latest".to_string(),
@@ -287,56 +366,152 @@ fn create_test_env_with_group_sessions() -> TestEnv {
         before_start_env: Vec::new(),
         container_workdir: None,
     });
-    let instances = [
-        Instance::new("ungrouped", "/tmp/u"),
-        instance_in("work-session-1", "/tmp/work1", "work"),
-        sandboxed,
-        instance_in("work-nested", "/tmp/work/nested", "work/projects"),
-    ];
-    seeded_env(test_home(), &instances, true)
+    instances.push(inst3);
+
+    // Session in nested group
+    let mut inst4 = Instance::new("work-nested", "/tmp/work/nested");
+    inst4.group_path = "work/projects".to_string();
+    instances.push(inst4);
+
+    // Build group tree from instances and save with groups
+    let group_tree = GroupTree::new_with_groups(&instances, &[]);
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = group_tree.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new_for_test(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    }
 }
 
-/// Attention-sorted view of a Running session and one with `other` status, plus both row indices.
-fn attention_env_running_then(other: Status) -> (TestEnv, usize, usize) {
-    use crate::session::config::SortOrder;
-    let instances = [
-        instance_with_status("running", "/tmp/running", Status::Running),
-        instance_with_status("other", "/tmp/other", other),
-    ];
-    let mut env = seeded_env(test_home(), &instances, false);
-    env.view.strict_hotkeys = false;
-    env.view.group_by = crate::session::config::GroupByMode::Manual;
-    env.view.sort_order = SortOrder::Attention;
-    env.view.flat_items = env.view.build_flat_items();
-    env.view.update_selected();
-
-    let row_with = |status: Status| {
-        env.view
-            .flat_items
-            .iter()
-            .position(|item| match item {
-                Item::Session { id, .. } => {
-                    env.view.get_instance(id).map(|i| i.status) == Some(status)
-                }
-                _ => false,
-            })
-            .expect("a session row with the requested status")
-    };
-    let (running, other) = (row_with(Status::Running), row_with(other));
-    (env, running, other)
-}
-
+/// Build a flat list of one Running and one Waiting session in the given mode.
+/// Returns the env plus the flat index of each so callers can park the cursor.
+/// Statuses are seeded in storage before construction so `instances` and
+/// what `get_instance`/`jump_to_next_waiting` read agree.
 fn attention_env_running_then_waiting() -> (TestEnv, usize, usize) {
-    attention_env_running_then(Status::Waiting)
+    use crate::session::config::{GroupByMode, SortOrder};
+    use crate::session::Status;
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let mut running = Instance::new("running", "/tmp/running");
+    running.status = Status::Running;
+    let mut waiting = Instance::new("waiting", "/tmp/waiting");
+    waiting.status = Status::Waiting;
+    let instances = vec![running, waiting];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new_for_test(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.strict_hotkeys = false;
+    view.group_by = GroupByMode::Manual;
+    view.sort_order = SortOrder::Attention;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+    let env = TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    };
+
+    let status_at = |env: &TestEnv, idx: usize| match env.view.flat_items.get(idx) {
+        Some(Item::Session { id, .. }) => env.view.get_instance(id).map(|i| i.status),
+        _ => None,
+    };
+    let running = (0..env.view.flat_items.len())
+        .find(|&i| status_at(&env, i) == Some(Status::Running))
+        .expect("a Running session row");
+    let waiting = (0..env.view.flat_items.len())
+        .find(|&i| status_at(&env, i) == Some(Status::Waiting))
+        .expect("a Waiting session row");
+    (env, running, waiting)
 }
 
 fn attention_env_running_then_idle() -> (TestEnv, usize, usize) {
-    attention_env_running_then(Status::Idle)
+    use crate::session::config::{GroupByMode, SortOrder};
+    use crate::session::Status;
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let mut running = Instance::new("running", "/tmp/running");
+    running.status = Status::Running;
+    let mut idle = Instance::new("idle", "/tmp/idle");
+    idle.status = Status::Idle;
+    let instances = vec![running, idle];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new_for_test(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.strict_hotkeys = false;
+    view.group_by = GroupByMode::Manual;
+    view.sort_order = SortOrder::Attention;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+    let env = TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    };
+
+    let status_at = |env: &TestEnv, idx: usize| match env.view.flat_items.get(idx) {
+        Some(Item::Session { id, .. }) => env.view.get_instance(id).map(|i| i.status),
+        _ => None,
+    };
+    let running = (0..env.view.flat_items.len())
+        .find(|&i| status_at(&env, i) == Some(Status::Running))
+        .expect("a Running session row");
+    let idle = (0..env.view.flat_items.len())
+        .find(|&i| status_at(&env, i) == Some(Status::Idle))
+        .expect("an Idle session row");
+    (env, running, idle)
 }
 
 /// Flatten a rendered row into its plain text, dropping styling.
 fn rendered_row_text(view: &HomeView, item: &Item) -> String {
-    let theme = crate::tui::styles::Theme::default();
+    use crate::tui::styles::Theme;
+    let theme = Theme::default();
     view.render_item_line(item, false, false, &theme, 200)
         .spans
         .iter()
@@ -348,9 +523,23 @@ fn rendered_single_session_text(
     inst: Instance,
     row_tag_mode: crate::session::config::RowTagMode,
 ) -> String {
-    let (_temp, _guard) = test_home();
-    seed_profile("alpha", &[inst]);
-    let mut view = test_view(None);
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+
+    let storage = Storage::new_unwatched("alpha").unwrap();
+    let instances = vec![inst];
+    let group_tree = GroupTree::new_with_groups(&instances, &[]);
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = group_tree.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view =
+        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.row_tag_mode = row_tag_mode;
     view.flat_items = view.build_flat_items();
@@ -358,54 +547,73 @@ fn rendered_single_session_text(
 
     view.flat_items
         .iter()
-        .find(|item| matches!(item, Item::Session { .. }))
-        .map(|item| rendered_row_text(&view, item))
+        .find_map(|item| {
+            if let Item::Session { .. } = item {
+                Some(rendered_row_text(&view, item))
+            } else {
+                None
+            }
+        })
         .expect("session row should render")
 }
 
-/// Fixture for async-creation finalization: a single-commit git repo and a `default` profile view.
+/// Live-send state targeting the agent pane with the default exit chord.
+pub(super) fn live_send_state(
+    session_id: &str,
+    title: &str,
+    tmux_name: &str,
+) -> super::live_send::LiveSendState {
+    super::live_send::LiveSendState {
+        session_id: session_id.to_string(),
+        title: title.to_string(),
+        tmux_name: tmux_name.to_string(),
+        target: super::live_send::LiveSendTarget::Agent,
+        exit_chords: super::live_send::parse_chord_list(super::live_send::DEFAULT_EXIT_CHORD),
+        leader: None,
+        remote: None,
+    }
+}
+
+/// Fixture for the creation tests: a temp home with a project directory and a
+/// `HomeView` bound to the `default` profile in manual-group mode.
 struct CreationTestEnv {
     view: HomeView,
-    storage: Storage,
     project_dir: std::path::PathBuf,
     _guard: AppDirGuard,
     _temp: TempDir,
 }
 
 fn setup_creation_test_env() -> CreationTestEnv {
-    let (temp, guard) = test_home();
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+
     let project_dir = temp.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
-    {
-        let repo = git2::Repository::init(&project_dir).unwrap();
-        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
-        std::fs::write(project_dir.join("README.md"), "test\n").unwrap();
-        let tree_id = {
-            let mut index = repo.index().unwrap();
-            index.add_path(std::path::Path::new("README.md")).unwrap();
-            index.write_tree().unwrap()
-        };
-        let tree = repo.find_tree(tree_id).unwrap();
-        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
-            .unwrap();
-    }
 
-    let mut view = test_view(Some("default"));
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new_for_test(
+        Some("default".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
     CreationTestEnv {
         view,
-        storage: Storage::new_unwatched("default").unwrap(),
         project_dir,
-        _guard: guard,
+        _guard,
         _temp: temp,
     }
 }
 
+/// Base new-session data targeting the shared repo. Callers tweak the
+/// title/group and worktree fields per scenario.
 fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> NewSessionData {
     NewSessionData {
+        remote: None,
         profile: "default".to_string(),
         title: title.to_string(),
         path: project_dir.to_str().unwrap().to_string(),
@@ -428,36 +636,22 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
     }
 }
 
-/// Pump `apply_creation_results` until the builder delivers: `Some(id)` on success, `None` on rollback.
-fn drain_creation_result(view: &mut HomeView) -> Option<String> {
-    let start = std::time::Instant::now();
-    loop {
-        if let Some(id) = view.apply_creation_results() {
-            return Some(id);
-        }
-        if !view.is_creation_pending() {
-            return None;
-        }
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(10),
-            "background creation timed out"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
-/// Render the full home view into a TestBackend and dump the screen as one string.
+/// Render the full home view into a TestBackend and dump the screen as one
+/// string, for asserting on preview/list text.
 fn render_home_to_string(view: &mut HomeView, width: u16, height: u16) -> String {
-    let theme = crate::tui::styles::load_theme("empire");
-    let mut terminal =
-        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let theme = load_theme("empire");
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|f| {
             let area = f.area();
             view.render(f, area, &theme, None, None, None);
         })
         .unwrap();
-    let buf = terminal.backend().buffer();
+    let buf = terminal.backend().buffer().clone();
     let mut screen = String::new();
     for y in 0..buf.area.height {
         for x in 0..buf.area.width {
@@ -468,76 +662,253 @@ fn render_home_to_string(view: &mut HomeView, width: u16, height: u16) -> String
     screen
 }
 
-/// Two projects, each with sessions of different attention statuses.
+/// Build a HomeView seeded with two distinct projects, each containing
+/// sessions with different attention statuses. Helper for the Project +
+/// Attention combination tests below.
 fn create_test_env_two_projects_mixed_attention() -> TestEnv {
-    let instances = [
-        instance_with_status("alpha-waiting", "/repos/alpha", Status::Waiting),
-        instance_with_status("alpha-running", "/repos/alpha", Status::Running),
-        instance_with_status("beta-running", "/repos/beta", Status::Running),
-        instance_with_status("beta-error", "/repos/beta", Status::Error),
-    ];
-    seeded_env(test_home(), &instances, false)
-}
+    use crate::session::Status;
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
 
-/// Init a git repo at `temp/name`, with an `origin` remote when given.
-fn git_repo(temp: &TempDir, name: &str, origin: Option<&str>) -> String {
-    let dir = temp.path().join(name);
-    std::fs::create_dir_all(&dir).unwrap();
-    let repo = git2::Repository::init(&dir).unwrap();
-    if let Some(url) = origin {
-        repo.remote("origin", url).unwrap();
+    let mut alpha_waiting = Instance::new("alpha-waiting", "/repos/alpha");
+    alpha_waiting.status = Status::Waiting;
+    let mut alpha_running = Instance::new("alpha-running", "/repos/alpha");
+    alpha_running.status = Status::Running;
+
+    let mut beta_running = Instance::new("beta-running", "/repos/beta");
+    beta_running.status = Status::Running;
+    let mut beta_error = Instance::new("beta-error", "/repos/beta");
+    beta_error.status = Status::Error;
+
+    let instances = vec![alpha_waiting, alpha_running, beta_running, beta_error];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let view = HomeView::new_for_test(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
     }
-    dir.to_str().unwrap().to_string()
 }
 
-/// Sessions in repos with GitHub and GitLab `origin`s plus one with no remote, for org grouping.
+/// Build a HomeView seeded with three sessions: two live in real git repos
+/// with distinct hosted `origin` remotes on different hosts entirely
+/// (GitHub, GitLab) to prove owner resolution isn't GitHub-specific, and one
+/// live in a real git repo with no `origin` remote at all. Helper for
+/// `build_flat_items_by_org` grouping tests, which (unlike project mode)
+/// need an actual `.git` directory since `get_remote_owner` reads the
+/// on-disk remote configuration rather than parsing the path string.
 fn create_test_env_two_orgs() -> TestEnv {
-    let home = test_home();
-    let instances = [
-        Instance::new(
-            "a-session",
-            &git_repo(&home.0, "repo-a", Some("git@github.com:org-a/repo-a.git")),
-        ),
-        Instance::new(
-            "b-session",
-            &git_repo(&home.0, "repo-b", Some("git@gitlab.com:org-b/repo-b.git")),
-        ),
-        Instance::new(
-            "no-remote-session",
-            &git_repo(&home.0, "repo-no-remote", None),
-        ),
-    ];
-    seeded_env(home, &instances, false)
-}
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
 
-/// Same owner login on two hosts: org grouping must keep them apart.
-fn create_test_env_same_owner_two_hosts() -> TestEnv {
-    let home = test_home();
-    let instances = [
-        Instance::new(
-            "gh-session",
-            &git_repo(&home.0, "repo-gh", Some("git@github.com:acme/repo-gh.git")),
-        ),
-        Instance::new(
-            "gl-session",
-            &git_repo(&home.0, "repo-gl", Some("git@gitlab.com:acme/repo-gl.git")),
-        ),
-    ];
-    seeded_env(home, &instances, false)
-}
+    let repo_a = temp.path().join("repo-a");
+    std::fs::create_dir_all(&repo_a).unwrap();
+    git2::Repository::init(&repo_a)
+        .unwrap()
+        .remote("origin", "git@github.com:org-a/repo-a.git")
+        .unwrap();
 
-/// Live-send state targeting the agent pane with the default exit chord and no leader.
-pub(super) fn live_send_state(
-    session_id: &str,
-    title: &str,
-    tmux_name: &str,
-) -> super::live_send::LiveSendState {
-    super::live_send::LiveSendState {
-        session_id: session_id.to_string(),
-        title: title.to_string(),
-        tmux_name: tmux_name.to_string(),
-        target: super::live_send::LiveSendTarget::Agent,
-        exit_chords: super::live_send::parse_chord_list(super::live_send::DEFAULT_EXIT_CHORD),
-        leader: None,
+    let repo_b = temp.path().join("repo-b");
+    std::fs::create_dir_all(&repo_b).unwrap();
+    git2::Repository::init(&repo_b)
+        .unwrap()
+        .remote("origin", "git@gitlab.com:org-b/repo-b.git")
+        .unwrap();
+
+    let repo_no_remote = temp.path().join("repo-no-remote");
+    std::fs::create_dir_all(&repo_no_remote).unwrap();
+    git2::Repository::init(&repo_no_remote).unwrap();
+
+    let inst_a = Instance::new("a-session", repo_a.to_str().unwrap());
+    let inst_b = Instance::new("b-session", repo_b.to_str().unwrap());
+    let inst_no_remote = Instance::new("no-remote-session", repo_no_remote.to_str().unwrap());
+
+    let instances = vec![inst_a, inst_b, inst_no_remote];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let view = HomeView::new_for_test(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
     }
+}
+
+/// Build a HomeView seeded with two sessions whose repos share the same
+/// owner login ("acme") but live on different hosts (GitHub, GitLab).
+/// Regression fixture for the Required #1 review fix: before it,
+/// `org_group_key` returned the bare owner, so these two repos merged into
+/// one org bucket and one bulk-archive scope despite having nothing to do
+/// with each other.
+fn create_test_env_same_owner_two_hosts() -> TestEnv {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let repo_gh = temp.path().join("repo-gh");
+    std::fs::create_dir_all(&repo_gh).unwrap();
+    git2::Repository::init(&repo_gh)
+        .unwrap()
+        .remote("origin", "git@github.com:acme/repo-gh.git")
+        .unwrap();
+
+    let repo_gl = temp.path().join("repo-gl");
+    std::fs::create_dir_all(&repo_gl).unwrap();
+    git2::Repository::init(&repo_gl)
+        .unwrap()
+        .remote("origin", "git@gitlab.com:acme/repo-gl.git")
+        .unwrap();
+
+    let inst_gh = Instance::new("gh-session", repo_gh.to_str().unwrap());
+    let inst_gl = Instance::new("gl-session", repo_gl.to_str().unwrap());
+
+    let instances = vec![inst_gh, inst_gl];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let view = HomeView::new_for_test(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    }
+}
+
+/// Run an archive-flipping interaction and settle what it submitted through the
+/// native lane: drain the submission, then apply the snapshot the daemon would
+/// publish. Interactions that submit nothing (no selection, or a trashed row
+/// that restores instead) are left to their own path.
+fn with_canonical_archive(env: &mut TestEnv, action: impl FnOnce(&mut TestEnv)) {
+    use crate::daemon::{RuntimeCursor, SessionMutation};
+    let mut respond = env.view.session_feed.command_driver_for_test();
+    action(env);
+    let revision = env.view.session_feed.next_revision_for_test();
+    let Some((id, SessionMutation::Archive(body))) = respond(Ok(RuntimeCursor {
+        epoch: "test".into(),
+        revision,
+    })) else {
+        return;
+    };
+    publish_canonical_rows(env, &[(id, body.archived)], revision);
+}
+
+fn with_canonical_group_archive(env: &mut TestEnv, action: impl FnOnce(&mut TestEnv)) {
+    use crate::daemon::{RuntimeCursor, SessionMutation};
+    let expected: std::collections::HashSet<_> = env
+        .view
+        .active_sessions_in_selected_group()
+        .into_iter()
+        .collect();
+    assert!(!expected.is_empty());
+    let mut respond = env.view.session_feed.command_driver_for_test();
+    action(env);
+    assert!(expected.iter().all(|id| env
+        .view
+        .get_instance(id)
+        .is_some_and(|row| !row.is_archived())));
+    let first_revision = env.view.session_feed.next_revision_for_test();
+    let mut received = std::collections::HashSet::new();
+    let stamps: Vec<_> = (0..expected.len())
+        .map(|index| {
+            let (id, mutation) = respond(Ok(RuntimeCursor {
+                epoch: "test".into(),
+                revision: first_revision + index as u64,
+            }))
+            .expect("each selected group member submitted");
+            assert!(matches!(mutation, SessionMutation::Archive(body) if body.archived && body.kill_pane));
+            received.insert(id.clone());
+            (id, true)
+        })
+        .collect();
+    assert_eq!(received, expected);
+    publish_canonical_rows(env, &stamps, first_revision + stamps.len() as u64 - 1);
+}
+
+/// Publish the view's rows with the daemon's archive stamps for this commit.
+fn publish_canonical_rows(env: &mut TestEnv, stamps: &[(String, bool)], revision: u64) {
+    use crate::tui::session_feed::SessionFeedResult;
+    let now = chrono::Utc::now().to_rfc3339();
+    let sessions: Vec<crate::daemon::SessionResponse> = env
+        .view
+        .instances()
+        .map(|inst| {
+            let archived_at = stamps
+                .iter()
+                .find(|(id, _)| id == &inst.id)
+                .map(|(_, archived)| archived.then(|| now.clone()))
+                .unwrap_or_else(|| inst.archived_at.map(|at| at.to_rfc3339()));
+            serde_json::from_value(serde_json::json!({
+                "id": inst.id,
+                "title": inst.title,
+                "project_path": inst.project_path,
+                "profile": inst.source_profile,
+                "tool": inst.tool,
+                "status": format!("{:?}", inst.status),
+                "view": if inst.is_structured() { "structured" } else { "terminal" },
+                "group_path": inst.group_path,
+                "archived_at": archived_at,
+            }))
+            .expect("a canonical row")
+        })
+        .collect();
+    let snapshot = crate::daemon::RuntimeSnapshot {
+        cursor: crate::daemon::RuntimeCursor {
+            epoch: "test".into(),
+            revision,
+        },
+        contents: crate::daemon::RuntimeContents {
+            health: crate::daemon::RuntimeHealth::Healthy,
+            capabilities: crate::daemon::RuntimeCapabilities {
+                mutations: true,
+                native_interaction: true,
+            },
+            default_profile: "test".into(),
+            sessions,
+            profiles: Vec::new(),
+            workspace_ordering: Vec::new(),
+            global_projects: Vec::new(),
+        },
+    };
+    env.view
+        .session_feed
+        .publish_for_test(SessionFeedResult::Snapshot(std::sync::Arc::new(snapshot)));
+    env.view.apply_session_feed();
 }

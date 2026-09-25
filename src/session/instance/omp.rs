@@ -25,7 +25,9 @@ fn omp_routing_fingerprint_check(plan: &OmpCapturePlan) -> String {
     )
 }
 
-/// Wait briefly for the parent to publish this launch generation's hidden capture metadata.
+/// Wait briefly for the parent to publish this launch generation's hidden
+/// capture metadata. A timeout runs the uninstrumented command, so capture
+/// fails closed without preventing the agent from starting.
 pub(super) fn gate_omp_launch(
     raw_command: &str,
     marked_command: &str,
@@ -54,7 +56,9 @@ pub(super) fn gate_omp_launch(
     shell_stdin_command("sh", false, &script, "AOE_OMP_CAPTURE_GATE")
 }
 
-/// Apply profile assignments to the marker wrapper itself, not only to its eventual OMP command.
+/// Apply profile assignments to the marker wrapper itself, not only to its
+/// eventual OMP command. The routing fingerprint must observe the same
+/// effective environment that OMP inherits.
 pub(super) fn wrap_omp_host_launch(
     env_prefix: &str,
     tool_cmd: &str,
@@ -179,7 +183,9 @@ pub(super) fn wrap_omp_launch(tool_cmd: &str, plan: &OmpCapturePlan) -> String {
 }
 
 impl Instance {
-    /// Capture is safe only for the built-in OMP command and a transparent, parseable argv.
+    /// Capture is safe only for the built-in OMP command and a transparent,
+    /// parseable argv. Benign arguments remain supported; store-selecting
+    /// flags are interpreted by the capture resolver.
     pub(super) fn omp_capture_options(&self) -> Option<OmpCliCaptureOptions> {
         if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp) {
             return None;
@@ -218,7 +224,9 @@ impl Instance {
         })
     }
 
-    /// Reconstruct metadata only for a legacy pane which predates launch snapshots.
+    /// Reconstruct metadata only for a legacy pane which predates launch
+    /// snapshots. New launches transport their already-resolved plan directly
+    /// into `finalize_launch` and never call this method.
     fn resolve_legacy_omp_capture_metadata(
         &self,
         options: &OmpCliCaptureOptions,
@@ -243,8 +251,9 @@ impl Instance {
         })
     }
 
-    /// Load typed launch metadata directly from tmux. A pane carrying the regular bootstrap
-    /// generation is modern.
+    /// Load typed launch metadata directly from tmux. A pane carrying the
+    /// regular bootstrap generation is modern; if its hidden metadata is
+    /// absent, capture stays disabled instead of being legacy-migrated.
     pub(super) fn omp_capture_metadata(
         &self,
         session_name: &str,
@@ -377,104 +386,106 @@ impl Instance {
 
     /// Publish the capture plan's generation, or mint a tombstone generation
     /// for an OMP launch whose capture plan could not be resolved.
-    pub(super) fn publish_omp_launch_generation(
+    pub(super) fn publish_omp_launch_generation_with_store(
         &mut self,
-        profile: &str,
+        storage: &dyn crate::session::SessionStore,
         metadata: Option<&OmpCaptureMetadata>,
         expected_prior: Option<&str>,
-    ) -> bool {
+    ) -> Result<bool> {
         if let Some(metadata) = metadata {
             return self.persist_omp_capture_generation(
-                profile,
+                storage,
                 &metadata.launch_id,
                 expected_prior,
             );
         }
         if self.resolved_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp) {
-            return true;
+            return Ok(true);
         }
-        // No capture plan: persist a distinct sentinel so any observation still carrying the prior
-        // generation fails the CAS.
+        // A tombstone rejects observations carrying the previous generation.
         let tombstone = format!("tombstone-{}", Uuid::new_v4());
-        self.persist_omp_capture_generation(profile, &tombstone, expected_prior)
+        self.persist_omp_capture_generation(storage, &tombstone, expected_prior)
+    }
+
+    #[cfg(test)]
+    pub(super) fn publish_omp_launch_generation(
+        &mut self,
+        profile: &str,
+        metadata: Option<&OmpCaptureMetadata>,
+        expected_prior: Option<&str>,
+    ) -> Result<bool> {
+        let storage = crate::session::storage::Storage::new_unwatched(profile)?;
+        self.publish_omp_launch_generation_with_store(&storage, metadata, expected_prior)
     }
 
     /// CAS-persist one OMP capture generation and reload the durable winner
     /// when another writer has already advanced it.
     fn persist_omp_capture_generation(
         &mut self,
-        profile: &str,
+        storage: &dyn crate::session::SessionStore,
         generation: &str,
         expected_prior: Option<&str>,
-    ) -> bool {
-        let storage =
-            match crate::session::storage::Storage::new(profile, self.resolve_file_watch()) {
-                Ok(storage) => storage,
-                Err(error) => {
-                    tracing::warn!(
-                        target: "session.store",
-                        instance = %self.id,
-                        "Failed to open storage for OMP generation persist: {error}"
-                    );
-                    return false;
-                }
-            };
-        let outcome = storage.update(|instances, _groups| {
-            let Some(instance) = instances.iter_mut().find(|instance| instance.id == self.id)
-            else {
-                return Ok(SidWrite::Failed);
-            };
+    ) -> Result<bool> {
+        let applied = storage.update(|instances, _| {
+            let instance = instances
+                .iter_mut()
+                .find(|row| row.id == self.id)
+                .ok_or(LifecycleReservationError::Superseded)?;
             if instance.omp_capture_generation.as_deref() != expected_prior {
-                return Ok(SidWrite::Skipped);
+                return Ok(false);
             }
-            instance.omp_capture_generation = Some(generation.to_string());
-            Ok(SidWrite::Applied)
-        });
-        if matches!(outcome, Ok(SidWrite::Applied)) {
-            self.omp_capture_generation = Some(generation.to_string());
-            return true;
+            instance.omp_capture_generation = Some(generation.to_owned());
+            Ok(true)
+        })?;
+        if applied {
+            self.omp_capture_generation = Some(generation.to_owned());
+            return Ok(true);
         }
-        if let Ok(instances) = storage.load() {
-            if let Some(instance) = instances.iter().find(|instance| instance.id == self.id) {
-                self.omp_capture_generation = instance.omp_capture_generation.clone();
-            }
-        }
+        let winner = storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == self.id)
+            .ok_or(LifecycleReservationError::Superseded)?;
+        self.omp_capture_generation = winner.omp_capture_generation;
         tracing::warn!(
             target: "session.store",
             instance = %self.id,
             generation,
             "OMP generation CAS failed; launch continues with capture disabled"
         );
-        false
+        Ok(false)
     }
 
     /// Last-chance exact-pane OMP capture while the old pane still exists.
-    pub(super) fn capture_omp_before_restart(&mut self, profile: &str) {
-        self.reconcile_from_disk();
+    pub(super) fn capture_omp_before_restart(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+    ) -> Result<()> {
         if self.source_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp)
             || (self.is_sandboxed() && self.omp_capture_generation.is_none())
         {
-            return;
+            return Ok(());
         }
-        let Some(observation) = self.try_retroactive_capture() else {
-            return;
+        let Some(observation) = self.try_retroactive_capture_in(CaptureStorage::Scoped(storage))?
+        else {
+            return Ok(());
         };
-        match persist_session_to_storage(
-            profile,
+        match super::sid_persist::persist_session_with_storage(
+            storage,
             &self.id,
             &observation,
             &self.conversation_state(),
-            &self.resolve_file_watch(),
         ) {
             SidWrite::Applied => {
                 self.apply_conversation_observation(&observation);
                 self.resume_probe_failed_sid = None;
             }
-            // A pinned-foreign publication is a deliberate non-write; like a
-            // divergence skip, it carries no update worth reconciling.
-            SidWrite::Skipped | SidWrite::PinnedForeign => self.reconcile_from_disk(),
+            SidWrite::Skipped | SidWrite::PinnedForeign => {
+                self.reconcile_from_store(storage)?;
+            }
             SidWrite::Failed => {}
         }
+        Ok(())
     }
 }
 
@@ -554,7 +565,9 @@ mod tests {
             inst.resolved_capture_backend(),
             Some(crate::agents::SessionCaptureBackend::Omp)
         );
-        assert!(inst.publish_omp_launch_generation(PROFILE, None, None));
+        assert!(inst
+            .publish_omp_launch_generation(PROFILE, None, None)
+            .unwrap());
         let generation = inst
             .omp_capture_generation
             .as_deref()

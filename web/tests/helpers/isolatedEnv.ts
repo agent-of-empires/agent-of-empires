@@ -44,6 +44,7 @@ export const HOST_STATE_VARS = new Set([
   "AOE_TUI_TEST_ENTERED",
   "AOE_GITHUB_CLONE_BASE", // redirects plugin clones at a host path or tree
   "AOE_OPEN_URL_TO", // appends every URL the TUI opens to a host file
+  "AOE_REMOTE_PASSPHRASE", // host credential `aoe remote` logs in with
   "AOE_SERVE_INSTANCE_ID", // identifies a host daemon process as this one
   "AOE_SERVE_PASSPHRASE", // host credential for the daemon's own auth
   // Names one launch's publication. The launch routes its own value into the

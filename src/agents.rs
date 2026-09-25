@@ -109,9 +109,11 @@ pub enum ForkStrategy {
     Unsupported,
 }
 
-/// Data-only lifecycle state. A new variant needs an arm in `AgentDef::lifecycle_label`
-/// and in the TS mirrors (`web/src/lib/types.ts`, `web/src/lib/agentProfiles.ts`).
+/// Data-only lifecycle state. A new variant needs an arm in `AgentDef::lifecycle_label`;
+/// the dashboard's copy is generated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "../web/src/lib/apiWire.ts"))]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum AgentLifecycle {
     Active,

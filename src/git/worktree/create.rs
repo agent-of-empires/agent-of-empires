@@ -114,6 +114,24 @@ impl GitWorktree {
         create_branch: bool,
         base_branch: Option<&str>,
     ) -> Result<Vec<String>> {
+        self.create_worktree_tracked(
+            branch,
+            path,
+            create_branch,
+            base_branch,
+            &mut super::WorktreeCreation::default(),
+        )
+    }
+
+    pub(crate) fn create_worktree_tracked(
+        &self,
+        branch: &str,
+        path: &Path,
+        create_branch: bool,
+        base_branch: Option<&str>,
+        created: &mut super::WorktreeCreation,
+    ) -> Result<Vec<String>> {
+        *created = super::WorktreeCreation::default();
         let total_start = Instant::now();
         let mut warnings: Vec<String> = Vec::new();
         tracing::info!(target: "git.worktree",
@@ -136,6 +154,7 @@ impl GitWorktree {
             tracing::info!(target: "git.worktree", "worktree create: fetch step done in {:?}", t.elapsed());
             let t = Instant::now();
             self.create_branch_from_base(branch, base)?;
+            created.branch_created = true;
             tracing::info!(target: "git.worktree", "worktree create: branch resolve done in {:?}", t.elapsed());
         } else {
             self.fetch_with_warning(&mut warnings, FETCH_REMOTE, branch);
@@ -146,6 +165,7 @@ impl GitWorktree {
         }
 
         self.add_worktree(branch, path, &mut warnings)?;
+        created.checkout_created = true;
 
         // Relative, so the checkout resolves when mounted elsewhere.
         let t = Instant::now();

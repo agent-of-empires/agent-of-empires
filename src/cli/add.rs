@@ -329,7 +329,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             let resolve_extra = |path: &std::path::Path| {
                 let project = project_bases
                     .get(&crate::session::projects::canonical_key(
-                        &path.to_string_lossy(),
+                        path.to_string_lossy(),
                     ))
                     .map(String::as_str);
                 builder::resolve_base_branch(session_base, project, global_default)

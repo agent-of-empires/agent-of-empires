@@ -2,205 +2,369 @@
 
 use super::*;
 
-/// Ensure the main agent tmux session is alive, restarting it if dead.
-///
-/// Mirrors the TUI's `attach_session` restart logic and returns the resulting
-/// status so the frontend can decide whether to proceed with the WebSocket
-/// attach. A per-instance mutex serializes ensure calls for one session, so two
-/// rapid POSTs cannot both decide "dead" and race on `tmux new-session`.
-///
-/// In read-only mode the endpoint may report `alive` but returns 403 when a
-/// restart would be needed.
-///
-/// Latency is bounded by `RESUME_PROBE_MAX` (~3s) per probe, so HTTP clients
-/// should budget ~3-4s worst case for the resume probe.
-pub async fn ensure_session(
+pub async fn stop_auxiliary(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> impl IntoResponse {
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
-    }
-    // Serialize concurrent ensure calls for the same session: the decision
-    // phase reads tmux state and the restart phase mutates it.
-    let inst_lock = state.instance_lock(&id).await;
-    let _guard = inst_lock.lock().await;
-
-    let Some(instance) = find_instance(&state, &id).await else {
-        return bare_not_found();
-    };
-
-    // Inspect tmux and decide on a blocking thread. Refresh the cache first so
-    // rapid re-calls see current state; the poller only refreshes every 2s.
-    let decision_instance = instance.clone();
-    let id_for_log = id.clone();
-    let decision = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-        crate::tmux::refresh_session_cache();
-        let tmux_session = decision_instance.tmux_session()?;
-        let exists = tmux_session.exists();
-        let pane_dead = exists && tmux_session.is_pane_dead();
-        let needs_restart = if !exists || pane_dead {
-            true
-        } else if crate::hooks::read_hook_status(&decision_instance.id).is_some() {
-            // Hook status tracks this session; shell detection is unreliable.
-            false
-        } else if decision_instance.has_command_override() {
-            // Custom command overrides run agents through wrapper scripts that
-            // look like shells to tmux, so shell detection cannot decide here.
-            false
-        } else {
-            !decision_instance.expects_shell() && tmux_session.is_pane_running_shell()
-        };
-        tracing::debug!(target: "http.api.sessions",
-            session_id = id_for_log,
-            exists,
-            pane_dead,
-            needs_restart,
-            "ensure_session: restart decision"
-        );
-        Ok(needs_restart)
-    })
-    .await;
-
-    let needs_restart = match decision {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
-            tracing::error!(target: "http.api.sessions", "ensure_session: failed to inspect tmux for {id}: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!(target: "http.api.sessions", "ensure_session inspect panicked for {id}: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response();
-        }
-    };
-
-    if !needs_restart {
-        return (StatusCode::OK, Json(serde_json::json!({"status": "alive"}))).into_response();
-    }
-
-    if state.read_only {
-        // Read-only viewers must not kill + respawn a dead session. Signal
-        // the frontend so it can show "session is stopped; ask an owner to
-        // reattach" instead of silently replacing the agent process.
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "read_only",
-            "Session is stopped or errored. Restart requires write access.",
-        );
-    }
-
-    {
-        let mut instances = state.instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            inst.status = crate::session::Status::Starting;
-            inst.last_error = None;
-        }
-    }
-
-    let sync_base = instance.clone();
-    let restart_result = tokio::task::spawn_blocking(
-        move || -> Result<(Instance, crate::session::StartOutcome), Box<(Instance, anyhow::Error)>> {
-            let mut inst = instance;
-            // `ensure_session` respawns on demand before a WS attach or send,
-            // so it is always `Allow`, ignoring `auto_resume_on_restart`, and
-            // attaching never drops the agent's context. The instance-level
-            // cascade holds the lifecycle lock across final poller drain,
-            // exact-pane OMP capture, kill and relaunch.
-            match inst.restart_with_resume_policy(
-                None,
-                false,
-                crate::session::ResumeAttemptPolicy::Allow,
-            ) {
-                Ok(outcome) => Ok((inst, outcome)),
-                Err(e) => Err(Box::new((inst, e))),
-            }
-        },
-    )
-    .await;
-
-    match restart_result {
-        Ok(Ok((started, outcome))) => {
-            let mut instances = state.instances.write().await;
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                apply_post_restart_sync(inst, &sync_base, &started);
-            }
-            let resume_outcome = match &outcome {
-                crate::session::StartOutcome::Resumed => "resumed",
-                crate::session::StartOutcome::ResumeFailed { .. } => "resume_failed",
-                crate::session::StartOutcome::Fresh => "fresh",
-                crate::session::StartOutcome::FreshAfterFailedResume { .. } => {
-                    "fresh_after_failed_resume"
-                }
-            };
-            let mut body = serde_json::json!({
-                "status": "restarted",
-                "resume_outcome": resume_outcome,
-            });
-            if let crate::session::StartOutcome::ResumeFailed { sid } = &outcome {
-                body["status"] = serde_json::Value::String("resume_failed".to_string());
-                body["error"] = serde_json::Value::String("resume_failed".to_string());
-                body["message"] = serde_json::Value::String(format!(
-                    "Resume failed for sid {sid}; preserved for explicit retry"
-                ));
-                body["resume_session_id"] = serde_json::Value::String(sid.clone());
-                return (StatusCode::CONFLICT, Json(body)).into_response();
-            }
-            if let crate::session::StartOutcome::FreshAfterFailedResume { sid } = &outcome {
-                body["message"] = serde_json::Value::String(format!(
-                    "Started fresh; a prior resume attempt failed for sid {sid}. \
-                     The old conversation is still reachable via the agent's own \
-                     resume/history picker."
-                ));
-                body["prior_session_id"] = serde_json::Value::String(sid.clone());
-            }
-            (StatusCode::OK, Json(body)).into_response()
-        }
-        Ok(Err(boxed)) => {
-            let (started, e) = *boxed;
-            let msg = e.to_string();
-            tracing::warn!(target: "http.api.sessions", "ensure_session restart failed for {id}: {msg}");
-            let mut instances = state.instances.write().await;
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                if apply_post_restart_sync(inst, &sync_base, &started) {
-                    inst.status = crate::session::Status::Error;
-                    inst.last_error = Some(msg.clone());
-                }
-            }
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, "restart_failed", msg)
-        }
-        Err(e) => {
-            tracing::error!(target: "http.api.sessions", "ensure_session panicked for {id}: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
-            )
-                .into_response()
-        }
-    }
-}
-
-// --- Paired terminal ---
-
-pub async fn ensure_terminal(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    axum::extract::Query(q): axum::extract::Query<crate::server::live_ws::TerminalIndexQuery>,
+    body: Result<Json<crate::session::AuxiliaryTarget>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-    if let Some(resp) = crate::server::api::cityhall_block(&state) {
-        return resp;
+    if let Some(response) = crate::server::api::cityhall_block(&state) {
+        return response;
     }
-    let index = q.index;
+    let Json(target) = match body {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+    match crate::server::pane::stop_native_auxiliary(
+        &state,
+        &id,
+        crate::server::pane::AuxiliaryStopRequest::Target(target),
+    )
+    .await
+    {
+        Ok(cursor) => crate::server::runtime::mutation_response(&cursor, StatusCode::NO_CONTENT),
+        Err(error) => {
+            if let Some(response) = lifecycle_rejection(&state, &error) {
+                return response;
+            }
+            if error.is::<crate::server::pane::AuxiliaryTargetUnavailable>() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"auxiliary_target_unavailable"})),
+                )
+                    .into_response();
+            }
+            if error.is::<crate::session::NativeStoreUnavailable>() {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            tracing::warn!(target: "http.api.sessions", session = %id, %error, "auxiliary stop failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn ensure_tool(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<crate::daemon::EnsureToolBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    if let Some(response) = crate::server::api::cityhall_block(&state) {
+        return response;
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let namespace = state.profile_namespace.read().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let lock = state.instance_lock(&id).await;
+    let guard = lock.lock().await;
+    let Some(mut instance) = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == id)
+        .cloned()
+    else {
+        return crate::server::api::session_not_found();
+    };
+    let worker_state = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let native = crate::server::session_store::NativeSessionStore::open(
+            worker_state,
+            &instance.source_profile,
+            None,
+        )?;
+        let (tool, created) = instance.start_tool_with_size_in(
+            &body.tool_name,
+            body.size.map(|size| (size.cols.get(), size.rows.get())),
+            &native,
+        )?;
+        Ok((tool, created, instance, body.tool_name))
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    drop(guard);
+    drop(namespace);
+    let result = match result {
+        Ok((tool, true, instance, tool_name)) => {
+            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                tool.wait_until_ready()?;
+                Ok((tool, true, instance, tool_name))
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
+        }
+        Ok(result) => Ok(result),
+        Err(error) => Err(error),
+    };
+    let result = match result {
+        Ok((tool, created, instance, tool_name)) => {
+            crate::server::pane::publish_auxiliary_after_ensure(
+                &state,
+                instance,
+                crate::session::AuxiliaryTarget::Tool { tool_name },
+            )
+            .await
+            .map(|cursor| (tool, created, cursor))
+        }
+        Err(error) => Err(error),
+    };
+    let (tool, created, cursor) = match result {
+        Ok(tool) => tool,
+        Err(error) => {
+            if let Some(response) = lifecycle_rejection(&state, &error) {
+                return response;
+            }
+            if error.is::<crate::session::NativeStoreUnavailable>() {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            if error.is::<crate::session::ToolLaunchUnavailable>() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "tool_unavailable"})),
+                )
+                    .into_response();
+            }
+            tracing::warn!(target: "http.api.sessions", session = %id, %error, "tool ensure failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    crate::server::runtime::mutation_response(
+        &cursor,
+        Json(crate::daemon::TerminalTarget {
+            tmux_session: tool.session_name().to_owned(),
+            status: if created {
+                crate::daemon::TerminalTargetStatus::Created
+            } else {
+                crate::daemon::TerminalTargetStatus::Exists
+            },
+        }),
+    )
+}
+
+pub async fn ensure_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<
+        Option<Json<crate::daemon::StartSessionBody>>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> impl IntoResponse {
+    super::lifecycle::prepare_agent_session(
+        state,
+        id,
+        body,
+        super::lifecycle::AgentPreparation::Ensure,
+        None,
+    )
+    .await
+}
+
+pub(super) fn ready_agent_session(instance: &Instance) -> anyhow::Result<Option<String>> {
+    let panes = crate::tmux::batch_pane_metadata()?;
+    let Some((name, pane)) =
+        crate::tmux::agent_pane_metadata_in(&panes, &instance.id, &instance.title)?
+    else {
+        return Ok(None);
+    };
+    if pane.pane_dead {
+        return Ok(None);
+    }
+    if !instance.expects_shell()
+        && !instance.has_command_override()
+        && crate::hooks::read_hook_status(&instance.id).is_none()
+    {
+        let command = pane
+            .pane_current_command
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Agent pane command is unknown"))?;
+        if crate::tmux::utils::is_pane_running_shell_command(
+            command,
+            pane.pane_start_command_is_protected,
+        ) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(name.to_owned()))
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Agent pane is not ready")]
+struct AgentTargetUnavailable;
+
+pub(super) async fn agent_target_response(
+    state: &Arc<AppState>,
+    id: &str,
+    outcome: Option<crate::session::StartOutcome>,
+) -> axum::response::Response {
+    let Some(mut instance) = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == id)
+        .cloned()
+    else {
+        return crate::server::api::session_not_found();
+    };
+    if instance.is_structured() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if outcome.is_some() {
+        instance = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let session = instance.tmux_session()?;
+            instance.wait_for_pane_ready(&session);
+            Ok(instance)
+        })
+        .await
+        {
+            Ok(Ok(instance)) => instance,
+            Ok(Err(error)) => return agent_target_error(state, error),
+            Err(error) => return agent_target_error(state, error.into()),
+        };
+    }
+    let namespace = state.profile_namespace.read().await;
+    let lock = state.instance_lock(id).await;
+    let guard = lock.lock().await;
+    let worker_state = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        use crate::session::SessionStore;
+        let native = crate::server::session_store::NativeSessionStore::open(
+            worker_state,
+            &instance.source_profile,
+            None,
+        )?;
+        let generation = instance.lifecycle_generation;
+        let title = instance.title.clone();
+        let ownership = instance.acquire_auxiliary_locks_in(&native)?;
+        anyhow::ensure!(
+            instance.lifecycle_generation == generation && instance.title == title,
+            crate::session::LifecycleReservationError::Superseded
+        );
+        anyhow::ensure!(!instance.is_structured(), AgentTargetUnavailable);
+        native.configuration(Some(&instance.source_profile))?;
+        let name = ready_agent_session(&instance)?.ok_or(AgentTargetUnavailable)?;
+        native.adopt_agent_observation(
+            &instance,
+            crate::session::PaneObservation {
+                state: crate::session::PanePresence::Alive,
+                tmux_session: Some(name.clone()),
+            },
+        )?;
+        Ok((instance, name, ownership))
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    let (instance, name, ownership) = match result {
+        Ok(target) => target,
+        Err(error) => return agent_target_error(state, error),
+    };
+    let current = {
+        let _publication = state.publication.read().await;
+        state.instances.read().await.iter().any(|row| {
+            row.id == id
+                && row.lifecycle_generation == instance.lifecycle_generation
+                && row.source_profile == instance.source_profile
+                && row.title == instance.title
+        })
+    };
+    drop(ownership);
+    drop(guard);
+    drop(namespace);
+    if !current {
+        return agent_target_error(
+            state,
+            crate::session::LifecycleReservationError::Superseded.into(),
+        );
+    }
+    let snapshot = match state.runtime.publish(state).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return agent_target_error(state, error),
+    };
+    if snapshot.value.contents.health != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if !snapshot.value.contents.sessions.iter().any(|row| {
+        row.id == id && row.profile == instance.source_profile && row.title == instance.title
+    }) {
+        return agent_target_error(
+            state,
+            crate::session::LifecycleReservationError::Superseded.into(),
+        );
+    }
+    let mut body = serde_json::json!({
+        "tmux_session": name,
+        "status": if outcome.is_some() { "restarted" } else { "alive" },
+    });
+    if let Some(outcome) = outcome {
+        body["resume_outcome"] = match outcome {
+            crate::session::StartOutcome::Resumed => "resumed",
+            crate::session::StartOutcome::Fresh => "fresh",
+            crate::session::StartOutcome::ResumeFailed { .. } => "resume_failed",
+            crate::session::StartOutcome::FreshAfterFailedResume { sid } => {
+                body["message"] = format!("Started fresh; the prior conversation {sid} remains available in the agent's history.").into();
+                body["prior_session_id"] = sid.into();
+                "fresh_after_failed_resume"
+            }
+        }.into();
+    }
+    crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(body))
+}
+
+fn agent_target_error(state: &AppState, error: anyhow::Error) -> axum::response::Response {
+    if let Some(response) = lifecycle_rejection(state, &error) {
+        return response;
+    }
+    if error.is::<crate::session::NativeStoreUnavailable>() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if error.is::<AgentTargetUnavailable>() {
+        return if state.read_only {
+            crate::server::api::read_only_response()
+        } else {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error":"agent_not_ready"})),
+            )
+                .into_response()
+        };
+    }
+    tracing::warn!(target: "http.api.sessions", %error, "agent preparation failed");
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
+pub async fn ensure_terminal(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<crate::server::live_ws::TerminalIndexQuery>,
+    body: Result<
+        Option<Json<crate::daemon::StartSessionBody>>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> impl IntoResponse {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    if let Some(response) = crate::server::api::cityhall_block(&state) {
+        return response;
+    }
+    let body = match body {
+        Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
+        Err(rejection) => return rejection.into_response(),
+    };
+    let index = query.index;
     if index > crate::server::pane::MAX_TERMINAL_INDEX {
         return (
             StatusCode::BAD_REQUEST,
@@ -208,179 +372,149 @@ pub async fn ensure_terminal(
         )
             .into_response();
     }
-    // Serialize concurrent terminal-ensure calls for the same session, or two
-    // parallel requests both try to create the same tmux session. Taken before
-    // the snapshot read so a concurrent mutation cannot hand `spawn_blocking` a
-    // stale clone.
-    let inst_lock = state.instance_lock(&id).await;
-    let _guard = inst_lock.lock().await;
-
-    let Some(inst) = find_instance(&state, &id).await else {
-        return bare_not_found();
+    let namespace = state.profile_namespace.read().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let lock = state.instance_lock(&id).await;
+    let guard = lock.lock().await;
+    let Some(mut instance) = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == id)
+        .cloned()
+    else {
+        return crate::server::api::session_not_found();
     };
-
-    // Index 0 has the in-memory `terminal_info.created` fast path; later
-    // terminals are queried straight from tmux. Either way the pane shell can
-    // exit while the session keeps existing (`remain-on-exit on`), so a
-    // live-but-dead pane must be respawned the way the TUI does on attach.
-    {
-        let session = inst.terminal_tmux_session_indexed(index).ok();
-        let known = if index == 0 {
-            inst.has_terminal()
-        } else {
-            session.as_ref().map(|s| s.exists()).unwrap_or(false)
-        };
-        if known {
-            let pane_dead = session
-                .map(|s| s.exists() && s.is_pane_dead())
-                .unwrap_or(false);
-            if !pane_dead {
-                return (
-                    StatusCode::OK,
-                    Json(serde_json::json!({"status": "exists"})),
-                )
-                    .into_response();
-            }
-            tracing::warn!(
-                target: "terminal.ws",
-                session = %id,
-                index,
-                "paired terminal pane is dead, respawning"
-            );
-        }
-    }
-
-    let mut inst_clone = inst;
-
-    let result = tokio::task::spawn_blocking(move || {
-        let _ = inst_clone.kill_terminal_if_dead_indexed(index);
-        inst_clone.start_terminal_with_size_indexed(index, None)
+    let worker_state = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let native = crate::server::session_store::NativeSessionStore::open(
+            worker_state,
+            &instance.source_profile,
+            None,
+        )?;
+        let (terminal, created) = instance.start_terminal_with_size_indexed_in(
+            index,
+            body.size.map(|size| (size.cols.get(), size.rows.get())),
+            &native,
+        )?;
+        Ok((terminal, created, instance))
     })
-    .await;
-
-    match result {
-        Ok(Ok(())) => {
-            // Only index 0 carries an in-memory cache flag.
-            if index == 0 {
-                let mut instances = state.instances.write().await;
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                    inst.terminal_info = Some(crate::session::TerminalInfo { created: true });
-                }
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    drop(guard);
+    drop(namespace);
+    let result = match result {
+        Ok((terminal, created, instance)) => crate::server::pane::publish_auxiliary_after_ensure(
+            &state,
+            instance,
+            crate::session::AuxiliaryTarget::Host { index },
+        )
+        .await
+        .map(|cursor| (terminal, created, cursor)),
+        Err(error) => Err(error),
+    };
+    let (terminal, created, cursor) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(response) = lifecycle_rejection(&state, &error) {
+                return response;
             }
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({"status": "created"})),
-            )
-                .into_response()
+            if error.is::<crate::session::NativeStoreUnavailable>() {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            tracing::warn!(target: "http.api.sessions", session = %id, %error, "terminal ensure failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        Ok(Err(e)) => {
-            tracing::error!(target: "http.api.sessions", "Terminal creation failed: {}", e);
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "create_failed",
-                "Failed to create terminal",
-            )
-        }
-        Err(e) => {
-            tracing::error!(target: "http.api.sessions", "Terminal creation panicked: {}", e);
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "Internal server error",
-            )
-        }
-    }
+    };
+    crate::server::runtime::mutation_response(
+        &cursor,
+        (
+            if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            },
+            Json(crate::daemon::TerminalTarget {
+                tmux_session: terminal.name().to_owned(),
+                status: if created {
+                    crate::daemon::TerminalTargetStatus::Created
+                } else {
+                    crate::daemon::TerminalTargetStatus::Exists
+                },
+            }),
+        ),
+    )
 }
 
 pub async fn ensure_container_terminal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<crate::server::live_ws::TerminalIndexQuery>,
+    body: Result<
+        Option<Json<crate::daemon::StartSessionBody>>,
+        axum::extract::rejection::JsonRejection,
+    >,
 ) -> impl IntoResponse {
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-    if let Some(resp) = crate::server::api::cityhall_block(&state) {
-        return resp;
+    if let Some(response) = crate::server::api::cityhall_block(&state) {
+        return response;
     }
-    let index = q.index;
-    if index > crate::server::pane::MAX_TERMINAL_INDEX {
+    if q.index > crate::server::pane::MAX_TERMINAL_INDEX {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "index_out_of_range"})),
         )
             .into_response();
     }
-    // Lock-then-read, matching `ensure_terminal`.
-    let inst_lock = state.instance_lock(&id).await;
-    let _guard = inst_lock.lock().await;
-
-    let Some(inst) = find_instance(&state, &id).await else {
-        return bare_not_found();
+    let body = match body {
+        Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
+        Err(error) => return error.into_response(),
     };
-
-    // Same dead-pane rescue as `ensure_terminal`: an existing-but-dead pane
-    // would silently swallow every keystroke from the browser. Container
-    // terminals are always tmux-queried.
-    {
-        let session = inst.container_terminal_tmux_session_indexed(index).ok();
-        if session.as_ref().map(|s| s.exists()).unwrap_or(false) {
-            let pane_dead = session
-                .map(|s| s.exists() && s.is_pane_dead())
-                .unwrap_or(false);
-            if !pane_dead {
-                return (
-                    StatusCode::OK,
-                    Json(serde_json::json!({"status": "exists"})),
-                )
-                    .into_response();
-            }
-            tracing::warn!(
-                target: "terminal.ws",
-                session = %id,
-                index,
-                "container terminal pane is dead, respawning"
-            );
-        }
+    let namespace = state.profile_namespace.read().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-
-    let mut inst_clone = inst;
-
-    let result = tokio::task::spawn_blocking(move || {
-        let _ = inst_clone.kill_container_terminal_if_dead_indexed(index);
-        inst_clone.start_container_terminal_with_size_indexed(index, None)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(())) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({"status": "created"})),
-        )
-            .into_response(),
-        Ok(Err(e)) => {
-            tracing::error!(target: "http.api.sessions", "Container terminal creation failed: {}", e);
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "create_failed",
-                "Failed to create container terminal",
-            )
+    let lock = state.instance_lock(&id).await;
+    let guard = lock.lock().await;
+    if !state.instances.read().await.iter().any(|row| row.id == id) {
+        return crate::server::api::session_not_found();
+    }
+    let size = body.size.map(|size| (size.cols.get(), size.rows.get()));
+    drop(guard);
+    drop(namespace);
+    match crate::server::pane::ensure_native_container_terminal(&state, &id, q.index, size).await {
+        Ok((target, cursor)) => {
+            let status = if matches!(&target.status, crate::daemon::TerminalTargetStatus::Created) {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            crate::server::runtime::mutation_response(&cursor, (status, Json(target)))
         }
-        Err(e) => {
-            tracing::error!(target: "http.api.sessions", "Container terminal creation panicked: {}", e);
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "Internal server error",
-            )
+        Err(error) => {
+            if let Some(response) = lifecycle_rejection(&state, &error) {
+                return response;
+            }
+            if error.is::<crate::session::NativeStoreUnavailable>() {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            tracing::warn!(target: "http.api.sessions", session = %id, %error, "container terminal ensure failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
 
-/// Kill an additional paired terminal (host and container) at `index`, so a
-/// closed extra terminal tab does not leak its tmux shell for the session's
-/// lifetime. Index 0 is shared with the native TUI, which keeps its shell, so
-/// this endpoint rejects it (#2437).
+/// Kill an additional paired terminal (host + container) at `index`. Used when
+/// the web dashboard closes an extra terminal tab so its tmux shell does not
+/// leak for the session's lifetime. Index 0 is the primary terminal shared with
+/// the native TUI; closing it in the web UI only hides the pane (the TUI keeps
+/// its shell), so this endpoint rejects index 0. See #2437.
 pub async fn kill_terminal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -400,44 +534,40 @@ pub async fn kill_terminal(
         )
             .into_response();
     }
-    // Lock-then-read, matching `ensure_terminal`.
-    let inst_lock = state.instance_lock(&id).await;
-    let _guard = inst_lock.lock().await;
-
-    let Some(inst) = find_instance(&state, &id).await else {
-        return bare_not_found();
-    };
-
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        // A missing session is success, since the `kill_*` helpers no-op when
-        // the tmux session is absent; only a real tmux failure surfaces here.
-        inst.kill_terminal_indexed(index)?;
-        inst.kill_container_terminal_indexed(index)?;
-        Ok(())
-    })
-    .await;
-
-    match result {
-        Ok(Ok(())) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "killed"})),
-        )
-            .into_response(),
-        Ok(Err(e)) => {
-            tracing::error!(target: "http.api.sessions", "Terminal kill failed: {}", e);
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "kill_failed",
-                "Failed to kill terminal",
-            )
-        }
-        Err(e) => {
-            tracing::error!(target: "http.api.sessions", "Terminal kill panicked: {}", e);
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "Internal server error",
-            )
+    let namespace = state.profile_namespace.read().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let lock = state.instance_lock(&id).await;
+    let guard = lock.lock().await;
+    if !state.instances.read().await.iter().any(|row| row.id == id) {
+        return crate::server::api::session_not_found();
+    }
+    drop(guard);
+    drop(namespace);
+    match crate::server::pane::stop_native_auxiliary(
+        &state,
+        &id,
+        crate::server::pane::AuxiliaryStopRequest::PairedTerminals { index },
+    )
+    .await
+    {
+        Ok(cursor) => crate::server::runtime::mutation_response(
+            &cursor,
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "killed"})),
+            ),
+        ),
+        Err(error) => {
+            if let Some(response) = lifecycle_rejection(&state, &error) {
+                return response;
+            }
+            if error.is::<crate::session::NativeStoreUnavailable>() {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            tracing::error!(target: "http.api.sessions", session = %id, %error, "Terminal kill failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "kill_failed", "message": "Failed to kill terminal"}))).into_response()
         }
     }
 }

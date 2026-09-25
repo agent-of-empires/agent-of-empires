@@ -1,3 +1,7 @@
+import type { AgentLifecycle as AgentLifecycleInfo } from "./apiWire";
+
+export type { AgentLifecycleInfo };
+
 // Per-agent tool-card classifier profiles; the React side of src/acp/agent_profiles.rs.
 
 /** Keep aligned with `ToolCards.renderToolCard`. */
@@ -135,16 +139,6 @@ const GEMINI: AgentProfile = {
     replacement: "antigravity",
   },
 };
-
-/** Mirrors `AgentLifecycle` in src/agents.rs; lives here so this module stays dependency-free. */
-export type AgentLifecycleInfo =
-  | { state: "active" }
-  | {
-      state: "deprecated";
-      since: string;
-      note: string;
-      replacement: string | null;
-    };
 
 export const ACTIVE_LIFECYCLE: AgentLifecycleInfo = { state: "active" };
 

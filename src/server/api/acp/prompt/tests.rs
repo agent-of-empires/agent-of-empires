@@ -325,6 +325,10 @@ async fn no_revive_refuses_a_prompt_to_a_stopped_worker() {
     .into_response();
 
     assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        crate::daemon::ApiErrorCode::from_headers(response.status(), response.headers(), false),
+        Some(crate::daemon::ApiErrorCode::NoRevive),
+    );
     assert!(state
         .session_service
         .queued_prompts_snapshot(&id)

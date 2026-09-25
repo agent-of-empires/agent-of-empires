@@ -3,79 +3,11 @@
 
 use super::*;
 
-#[derive(Deserialize)]
-pub struct UpdatePinBody {
-    pub pinned: bool,
-}
-
-#[derive(Deserialize)]
-pub struct UpdateColorBody {
-    /// A palette member (`red` / `amber` / `green`) sets the label; `null`
-    /// clears it. Validated against `crate::session::is_valid_session_color`.
-    #[serde(default)]
-    pub color: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct UpdateArchiveBody {
-    pub archived: bool,
-    /// On archive, tear down every tmux session this instance owns. `false`
-    /// keeps tmux state alive; structured-view supervisor shutdown is
-    /// unconditional. Ignored when `archived = false` (#1868).
-    #[serde(default = "default_kill_pane")]
-    pub kill_pane: bool,
-}
-
-fn default_kill_pane() -> bool {
-    true
-}
-
-#[derive(Deserialize)]
-pub struct TrashSessionBody {
-    /// On trash, tear down every tmux session this instance owns. `false` keeps
-    /// tmux state alive; structured-view supervisor shutdown, which preserves
-    /// the transcript, is unconditional. Defaults to `true`.
-    #[serde(default = "default_kill_pane")]
-    pub kill_pane: bool,
-}
-
-// A no-body trash request resolves through `unwrap_or_default()`, so `Default`
-// must match the serde field default (`true`); the derived one would leave the
-// pane running (#2523).
-impl Default for TrashSessionBody {
-    fn default() -> Self {
-        Self {
-            kill_pane: default_kill_pane(),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-pub struct UpdateSnoozeBody {
-    /// `Some(positive minutes)` snoozes for that duration; `None` unsnoozes.
-    /// Validated against `crate::session::validate_snooze_duration`, so the TUI
-    /// dialog and CLI bounds apply here too.
-    #[serde(default)]
-    pub minutes: Option<u32>,
-}
-
-#[derive(Deserialize)]
-pub struct UpdateUnreadBody {
-    /// `true` flags the session manually unread; `false` marks it read,
-    /// clearing both auto and manual markers. The auto-clear on view is driven
-    /// separately by the client, which only fires it for an `auto` marker, so a
-    /// `false` here never drops a manual flag the user meant to keep.
-    pub unread: bool,
-}
-
 pub async fn update_session_pin(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     body: Result<Json<UpdatePinBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
-    }
     if state.read_only {
         return crate::server::api::read_only_response();
     }
@@ -84,25 +16,28 @@ pub async fn update_session_pin(
         Err(rej) => return rej.into_response(),
     };
 
+    let namespace = state.profile_namespace.read().await;
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
 
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return session_not_found();
+            return crate::server::api::session_not_found();
         };
         inst.source_profile.clone()
     };
 
     let pinned = body.pinned;
 
-    // Persist first; only mutate memory once disk is durable. See #1589.
     let persist_id = id.clone();
-    if persist_session_update(
+    let committed = commit_profile_update(
+        &state,
         profile,
         "pin update",
-        state.file_watch.clone(),
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                 if pinned {
@@ -112,31 +47,69 @@ pub async fn update_session_pin(
                 }
             }
         },
+        None,
     )
-    .await
-    .is_err()
-    {
-        return persist_failed_response();
+    .await;
+    if let Err(response) = committed {
+        return response;
     }
+    drop(_guard);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+}
 
-    let mut instances = state.instances.write().await;
-    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        tracing::warn!(
-            target: "http.api.sessions",
-            session = %id,
-            "pin update: instance vanished after persist"
-        );
-        return crate::server::api::session_gone_after_persist();
+pub async fn update_session_favorite(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateFavoriteBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
-    if pinned {
-        inst.pin();
-    } else {
-        inst.unpin();
-    }
 
-    let response =
-        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+    let namespace = state.profile_namespace.read().await;
+    let lock = state.instance_lock(&id).await;
+    let guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
+            return crate::server::api::session_not_found();
+        };
+        instance.source_profile.clone()
+    };
+    let persist_id = id.clone();
+    let committed = commit_profile_update(
+        &state,
+        profile,
+        "favorite update",
+        move |instances| {
+            if let Some(instance) = instances
+                .iter_mut()
+                .find(|instance| instance.id == persist_id)
+            {
+                if body.favorited {
+                    instance.favorite();
+                } else {
+                    instance.unfavorite();
+                }
+            }
+        },
+        None,
+    )
+    .await;
+    if let Err(response) = committed {
+        return response;
+    }
+    drop(guard);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
 
 pub async fn update_session_color(
@@ -144,9 +117,6 @@ pub async fn update_session_color(
     Path(id): Path<String>,
     body: Result<Json<UpdateColorBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
-    }
     if state.read_only {
         return crate::server::api::read_only_response();
     }
@@ -155,7 +125,7 @@ pub async fn update_session_color(
         Err(rej) => return rej.into_response(),
     };
 
-    // Validate up front so an unknown color never reaches disk; `None` clears
+    // Validate up front so an unknown color never reaches disk. `None` clears
     // the label. Mirrors the CLI's palette check.
     let new_color = body.color.map(|c| c.trim().to_lowercase());
     if let Some(c) = &new_color {
@@ -170,51 +140,41 @@ pub async fn update_session_color(
         }
     }
 
+    let namespace = state.profile_namespace.read().await;
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
 
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return session_not_found();
+            return crate::server::api::session_not_found();
         };
         inst.source_profile.clone()
     };
 
-    // Persist first; only mutate memory once disk is durable. See #1589.
     let persist_id = id.clone();
-    let persist_color = new_color.clone();
-    if persist_session_update(
+    let committed = commit_profile_update(
+        &state,
         profile,
         "color update",
-        state.file_watch.clone(),
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                 // Pre-validated above, so this cannot fail.
-                let _ = inst.set_color(persist_color);
+                let _ = inst.set_color(new_color);
             }
         },
+        None,
     )
-    .await
-    .is_err()
-    {
-        return persist_failed_response();
+    .await;
+    if let Err(response) = committed {
+        return response;
     }
-
-    let mut instances = state.instances.write().await;
-    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        tracing::warn!(
-            target: "http.api.sessions",
-            session = %id,
-            "color update: instance vanished after persist"
-        );
-        return crate::server::api::session_gone_after_persist();
-    };
-    let _ = inst.set_color(new_color);
-
-    let response =
-        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+    drop(_guard);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
 
 pub async fn update_session_archive(
@@ -222,145 +182,176 @@ pub async fn update_session_archive(
     Path(id): Path<String>,
     body: Result<Json<UpdateArchiveBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
     }
     if state.read_only {
         return crate::server::api::read_only_response();
     }
     let Json(body) = match body {
-        Ok(b) => b,
-        Err(rej) => return rej.into_response(),
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
     };
-
-    let Some(_submission) = state
+    let namespace = state.profile_namespace.read().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Some(submission) = state
         .session_service
         .prompt_submission_for_session(&id)
         .await
     else {
-        return session_not_found();
+        return crate::server::api::session_not_found();
     };
     let lock = state.instance_lock(&id).await;
-    let _guard = lock.lock().await;
-
-    // Read the profile without mutating yet: persisting first means a storage
-    // failure returns 500 with disk and memory in agreement, and the tmux/acp
-    // teardown never fires on a write that did not land (#1589).
+    let guard = lock.lock().await;
     let profile = {
         let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return session_not_found();
+        let Some(instance) = instances.iter().find(|row| row.id == id) else {
+            return crate::server::api::session_not_found();
         };
-        inst.source_profile.clone()
+        instance.source_profile.clone()
     };
-
-    let archived = body.archived;
-    let persist_id = id.clone();
-    if persist_session_update(
-        profile,
-        "archive update",
-        state.file_watch.clone(),
-        move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                if archived {
-                    inst.archive();
-                } else {
-                    inst.unarchive();
-                }
+    let worker_state = state.clone();
+    let worker_id = id.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let native = crate::server::session_store::NativeSessionStore::open(
+            worker_state.clone(), &profile, Some(worker_id.clone()),
+        )?;
+        let store: &dyn crate::session::SessionStore = &native;
+        let _title = crate::session::acquire_session_title_lock(&worker_id)?;
+        let _lifecycle = store.storage().acquire_instance_lifecycle_lock(&worker_id)?;
+        let reserved = store.update(|rows, _| {
+            let row = rows.iter_mut().find(|row| row.id == worker_id)
+                .ok_or(LifecycleTargetError::Missing)?;
+            if worker_state.cityhall_mode && !row.is_structured() {
+                return Err(LifecycleTargetError::CityHall.into());
             }
-        },
-    )
-    .await
-    .is_err()
-    {
+            let now = chrono::Utc::now();
+            if matches!(row.status, Status::Creating | Status::Deleting)
+                || row.has_fresh_lifecycle_reservation(now) {
+                return Err(LifecycleTargetError::Busy.into());
+            }
+            if !body.archived {
+                row.unarchive();
+                return Ok(None);
+            }
+            let generation = row.try_acquire_lifecycle_reservation(
+                LifecycleOperation::Stop, Instance::LIFECYCLE_RESERVATION_TTL, now,
+            )?;
+            row.archive();
+            Ok(Some((generation, row.clone())))
+        })?;
+        let Some((generation, mut instance)) = reserved else {
+            return Ok(());
+        };
+        instance.source_profile = profile;
+        instance.file_watch = Some(worker_state.file_watch.clone());
+        let stopped = if instance.is_structured() {
+            match tokio::runtime::Handle::current().block_on(worker_state.acp_supervisor.shutdown(&worker_id)) {
+                Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
+                Err(error) => tracing::warn!(target: "acp.supervisor", session = %worker_id, %error, "shutdown during archive failed"),
+            }
+            if body.kill_pane {
+                instance.kill_ancillary_tmux_sessions_locked()
+            } else { Ok(()) }
+        } else if body.kill_pane {
+            instance.kill_all_tmux_sessions_locked()
+        } else { Ok(()) };
+        store.update(|rows, _| {
+            let row = rows.iter_mut().find(|row| row.id == worker_id)
+                .ok_or(LifecycleTargetError::Missing)?;
+            let status = if stopped.is_err() {
+                Status::Error
+            } else if instance.is_structured() || body.kill_pane {
+                Status::Stopped
+            } else {
+                row.status
+            };
+            if !row.finish_lifecycle_status(LifecycleOperation::Stop, generation, status) {
+                return Err(LifecycleTargetError::Busy.into());
+            }
+            if let Err(error) = &stopped { row.last_error = Some(error.to_string()); }
+            Ok(())
+        })?;
+        if instance.is_structured() || body.kill_pane {
+            native.refresh_pane_observations(&instance)?;
+        }
+        stopped
+    }).await.map_err(anyhow::Error::from).and_then(|result| result);
+    if let Err(error) = result {
+        if let Some(response) = lifecycle_rejection(&state, &error) {
+            return response;
+        }
+        if error.is::<crate::session::NativeStoreUnavailable>() {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        tracing::warn!(target: "http.api.sessions", session = %id, %error, "archive commit failed");
         return persist_failed_response();
     }
-
-    // Disk is durable; apply to memory and snapshot what the side effects need.
-    // The instance is cloned once so `kill()` can run outside the lock.
-    let (was_structured_view, inst_clone, kill_pane) = {
-        let mut instances = state.instances.write().await;
-        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::warn!(
-                target: "http.api.sessions",
-                session = %id,
-                "archive update: instance vanished after persist"
-            );
-            return crate::server::api::session_gone_after_persist();
-        };
-        if archived {
-            inst.archive();
-        } else {
-            inst.unarchive();
-        }
-        let response =
-            SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-
-        let structured_view = inst.is_structured();
-        let inst_snap = inst.clone();
-        drop(instances);
-
-        // Snapshot and drop the lock; side effects run below. Archive does NOT
-        // short-circuit on kill_pane=false, because structured-view shutdown is
-        // unconditional.
-        if !archived {
-            return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
-        }
-        (structured_view, inst_snap, body.kill_pane)
-    };
-
-    // Best-effort tmux teardown (helper logs at debug). #1868.
-    if was_structured_view {
-        // Worker shutdown before ancillary kill so in-flight tool output
-        // settles. `shutdown` preserves the transcript (#1710).
-        match state.acp_supervisor.shutdown(&id).await {
-            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
-            Err(e) => tracing::warn!(
-                target: "acp.supervisor",
-                session = %id,
-                "shutdown during archive failed: {e}"
-            ),
-        }
-        if kill_pane {
-            let inst_for_kill = inst_clone.clone();
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || inst_for_kill.kill_ancillary_tmux_sessions())
-                    .await
-            {
-                tracing::warn!(
-                    target: "http.api.sessions",
-                    "Archive: ancillary tmux kill join failed: {e}"
-                );
-            }
-        }
-    } else if kill_pane {
-        let inst_for_kill = inst_clone.clone();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || inst_for_kill.kill_all_tmux_sessions()).await
-        {
-            tracing::warn!(
-                target: "http.api.sessions",
-                "Archive: tmux kill join failed: {e}"
-            );
-        }
-    }
-
-    // Re-read so the response reflects the archived flag and picks up any peer
-    // write that landed during the unlock window.
-    let instances = state.instances.read().await;
-    let response = match instances.iter().find(|i| i.id == id) {
-        Some(inst) => {
-            SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
-        }
-        None => {
-            return session_not_found();
-        }
-    };
-    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+    drop(guard);
+    drop(submission);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
 
-/// `POST /api/sessions/:id/trash`. The per-instance lifecycle flock is held
-/// from the durable Trash reservation through teardown, relocation, and final commit.
+/// Commit the engagement timestamp and unsink an archived or snoozed row together.
+pub async fn touch_session_access(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let namespace = state.profile_namespace.read().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Some(submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return crate::server::api::session_not_found();
+    };
+    let lock = state.instance_lock(&id).await;
+    let guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(row) = instances.iter().find(|row| row.id == id) else {
+            return crate::server::api::session_not_found();
+        };
+        if row.is_trashed() || matches!(row.status, Status::Creating | Status::Deleting) {
+            return lifecycle_rejection(&state, &LifecycleTargetError::Busy.into())
+                .unwrap_or_else(|| StatusCode::CONFLICT.into_response());
+        }
+        row.source_profile.clone()
+    };
+    let persist_id = id.clone();
+    if let Err(response) = commit_profile_update(
+        &state,
+        profile,
+        "session access",
+        move |rows| {
+            if let Some(row) = rows.iter_mut().find(|row| row.id == persist_id) {
+                row.touch_last_accessed();
+            }
+        },
+        None,
+    )
+    .await
+    {
+        return response;
+    }
+    drop(guard);
+    drop(submission);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+}
+/// Recheck ownership under identity and lifecycle exclusion before relocation.
 pub async fn trash_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -373,172 +364,141 @@ pub async fn trash_session(
         return crate::server::api::read_only_response();
     }
     let body = body.map(|Json(body)| body).unwrap_or_default();
-
-    let Some(_submission) = state
+    let namespace = state.profile_namespace.read().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Some(submission) = state
         .session_service
         .prompt_submission_for_session(&id)
         .await
     else {
-        return session_not_found();
+        return crate::server::api::session_not_found();
     };
     let lock = state.instance_lock(&id).await;
-    let _guard = lock.lock().await;
-    let (profile, snapshot) = {
+    let guard = lock.lock().await;
+    let profile = {
         let instances = state.instances.read().await;
-        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
-            return session_not_found();
+        let Some(instance) = instances.iter().find(|row| row.id == id) else {
+            return crate::server::api::session_not_found();
         };
-        (instance.source_profile.clone(), instance.clone())
+        instance.source_profile.clone()
     };
-
-    let reserve_profile = profile.clone();
-    let reserve_id = id.clone();
-    let file_watch = state.file_watch.clone();
-    let (storage, lifecycle_lock, generation) = match tokio::task::spawn_blocking(
-        move || -> anyhow::Result<_> {
-            let storage = Storage::new(&reserve_profile, file_watch)?;
-            let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&reserve_id)?;
-            let generation = storage.update(|instances, _groups| {
-                let Some(instance) = instances
-                    .iter_mut()
-                    .find(|instance| instance.id == reserve_id)
-                else {
-                    anyhow::bail!("session disappeared before trash");
+    let worker_state = state.clone();
+    let worker_id = id.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let native = crate::server::session_store::NativeSessionStore::open(
+            worker_state.clone(), &profile, Some(worker_id.clone()),
+        )?;
+        let store: &dyn crate::session::SessionStore = &native;
+        let title = crate::session::acquire_session_title_lock(&worker_id)?;
+        let _lifecycle = store.storage().acquire_instance_lifecycle_lock(&worker_id)?;
+        let mut instance = store.update(|rows, _| {
+            let row = rows.iter_mut().find(|row| row.id == worker_id)
+                .ok_or(LifecycleTargetError::Missing)?;
+            if worker_state.cityhall_mode && !row.is_structured() {
+                return Err(LifecycleTargetError::CityHall.into());
+            }
+            row.try_acquire_lifecycle_reservation(
+                LifecycleOperation::Trash, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),
+            )?;
+            row.trash();
+            Ok(row.clone())
+        })?;
+        instance.source_profile = profile;
+        instance.file_watch = Some(worker_state.file_watch.clone());
+        let generation = instance.lifecycle_generation;
+        let stopped = if instance.is_structured() {
+            match tokio::runtime::Handle::current().block_on(worker_state.acp_supervisor.shutdown(&worker_id)) {
+                Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
+                Err(error) => tracing::warn!(target: "acp.supervisor", session = %worker_id, %error, "shutdown during trash failed"),
+            }
+            if body.kill_pane {
+                instance.kill_ancillary_tmux_sessions_locked()
+            } else { Ok(()) }
+        } else if body.kill_pane {
+            instance.kill_all_tmux_sessions_locked()
+        } else { Ok(()) };
+        if instance.is_structured() || body.kill_pane {
+            native.refresh_pane_observations(&instance)?;
+        }
+        drop(_lifecycle);
+        drop(title);
+        let _identity = crate::session::acquire_session_identity_lock()?;
+        let _lifecycle = store.storage().acquire_instance_lifecycle_lock(&worker_id)?;
+        instance = store.update(|rows, _| {
+            let row = rows.iter().find(|row| row.id == worker_id)
+                .ok_or(LifecycleTargetError::Missing)?;
+            if !row.is_trashed() || !row.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation) {
+                return Err(LifecycleTargetError::Busy.into());
+            }
+            Ok(row.clone())
+        })?;
+        instance.source_profile = store.storage().profile().to_owned();
+        instance.file_watch = Some(worker_state.file_watch.clone());
+        let outcome = match &stopped {
+            Ok(()) => crate::session::trash::prepare_trashed_worktree(&mut instance),
+            Err(error) => crate::session::trash::RelocateOutcome::Failed { reason: format!("Tmux teardown failed; worktree retained: {error}") },
+        };
+        store.update(|rows, _| {
+            if matches!(outcome, crate::session::trash::RelocateOutcome::Relocated { .. }) {
+                let relocation = crate::session::trash::TrashRelocation {
+                    new_project_path: instance.project_path,
+                    pre_trash_project_path: instance.pre_trash_project_path,
                 };
-                instance
-                    .try_acquire_lifecycle_reservation(
-                        LifecycleOperation::Trash,
-                        Instance::LIFECYCLE_RESERVATION_TTL,
-                        chrono::Utc::now(),
-                    )
-                    .map_err(anyhow::Error::new)?;
-                instance.trash();
-                Ok(instance.lifecycle_generation)
-            })?;
-            Ok((storage, lifecycle_lock, generation))
-        },
+                match crate::session::claim::commit_trash_relocation(rows, &worker_id, generation, &relocation) {
+                    crate::session::claim::RelocationCommit::Persisted => Ok(()),
+                    crate::session::claim::RelocationCommit::AlreadyGone => Err(LifecycleTargetError::Missing.into()),
+                    crate::session::claim::RelocationCommit::Superseded => Err(LifecycleTargetError::Busy.into()),
+                }
+            } else {
+                let row = rows.iter_mut().find(|row| row.id == worker_id)
+                    .ok_or(LifecycleTargetError::Missing)?;
+                if !row.release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation) {
+                    return Err(LifecycleTargetError::Busy.into());
+                }
+                if let Err(error) = &stopped {
+                    row.status = Status::Error;
+                    row.last_error = Some(error.to_string());
+                }
+                Ok(())
+            }
+        })?;
+        Ok(outcome)
+    }).await.map_err(anyhow::Error::from).and_then(|result| result);
+    let relocation = match result {
+        Ok(crate::session::trash::RelocateOutcome::Failed { reason }) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, %reason, "trash worktree relocation skipped");
+            crate::daemon::TrashRelocationOutcome::Failed { reason }
+        }
+        Ok(crate::session::trash::RelocateOutcome::Skipped) => {
+            crate::daemon::TrashRelocationOutcome::Skipped
+        }
+        Ok(crate::session::trash::RelocateOutcome::Relocated { .. }) => {
+            crate::daemon::TrashRelocationOutcome::Relocated
+        }
+        Err(error) => {
+            if let Some(response) = lifecycle_rejection(&state, &error) {
+                return response;
+            }
+            if error.is::<crate::session::NativeStoreUnavailable>() {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            tracing::warn!(target: "http.api.sessions", session = %id, %error, "trash transition failed");
+            return persist_failed_response();
+        }
+    };
+    drop(guard);
+    drop(submission);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(
+        &state,
+        &id,
+        Some(crate::daemon::TrashOutcome { relocation }),
     )
     .await
-    {
-        Ok(Ok(reserved)) => reserved,
-        Ok(Err(error)) => {
-            tracing::warn!(target: "http.api.sessions", session = %id, "trash reservation failed: {error}");
-            return api_error(StatusCode::CONFLICT, "lifecycle_busy", error.to_string());
-        }
-        Err(error) => {
-            tracing::error!(target: "http.api.sessions", session = %id, "trash reservation join failed: {error}");
-            return persist_failed_response();
-        }
-    };
-
-    let was_structured_view = snapshot.is_structured();
-    {
-        let mut instances = state.instances.write().await;
-        let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
-            return crate::server::api::session_gone_after_persist();
-        };
-        instance.trash();
-        instance.lifecycle_generation = generation;
-    }
-
-    if was_structured_view {
-        match state.acp_supervisor.shutdown(&id).await {
-            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
-            Err(error) => tracing::warn!(
-                target: "acp.supervisor",
-                session = %id,
-                "shutdown during trash failed: {error}"
-            ),
-        }
-    }
-
-    let work_id = id.clone();
-    let kill_pane = body.kill_pane;
-    let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let _lifecycle_lock = lifecycle_lock;
-        let mut instance = snapshot;
-        if kill_pane {
-            if was_structured_view {
-                instance.kill_ancillary_tmux_sessions_locked();
-            } else {
-                instance.kill_all_tmux_sessions_locked();
-            }
-        }
-        let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
-        let relocation = match &outcome {
-            crate::session::trash::RelocateOutcome::Relocated { .. } => {
-                Some(crate::session::trash::TrashRelocation {
-                    new_project_path: instance.project_path.clone(),
-                    pre_trash_project_path: instance.pre_trash_project_path.clone(),
-                })
-            }
-            crate::session::trash::RelocateOutcome::Skipped
-            | crate::session::trash::RelocateOutcome::Failed { .. } => None,
-        };
-        storage.update(|instances, _groups| {
-            if let Some(relocation) = &relocation {
-                let commit = crate::session::claim::commit_trash_relocation(
-                    instances, &work_id, generation, relocation,
-                );
-                anyhow::ensure!(
-                    commit == crate::session::claim::RelocationCommit::Persisted,
-                    "trash relocation reservation was superseded"
-                );
-            } else if let Some(stored) = instances
-                .iter_mut()
-                .find(|candidate| candidate.id == work_id)
-            {
-                stored
-                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation);
-            }
-            Ok(())
-        })?;
-        let durable = storage
-            .load()?
-            .into_iter()
-            .find(|candidate| candidate.id == work_id);
-        Ok((outcome, durable))
-    })
-    .await;
-
-    let (outcome, durable) = match transition {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => {
-            tracing::warn!(target: "http.api.sessions", session = %id, "trash transition failed: {error}");
-            return persist_failed_response();
-        }
-        Err(error) => {
-            tracing::warn!(target: "http.api.sessions", session = %id, "trash transition join failed: {error}");
-            return persist_failed_response();
-        }
-    };
-    if let crate::session::trash::RelocateOutcome::Failed { reason } = outcome {
-        tracing::warn!(
-            target: "http.api.sessions",
-            session = %id,
-            "trash worktree relocation skipped: {reason}",
-        );
-    }
-
-    let Some(durable) = durable else {
-        return session_not_found();
-    };
-    let response = {
-        let mut instances = state.instances.write().await;
-        let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
-            return crate::server::api::session_gone_after_persist();
-        };
-        instance.project_path = durable.project_path;
-        instance.pre_trash_project_path = durable.pre_trash_project_path;
-        instance.lifecycle_generation = durable.lifecycle_generation;
-        instance.lifecycle_reservation = durable.lifecycle_reservation;
-        SessionResponse::from_instance(instance, crate::claude_settings::read_tui_fullscreen())
-    };
-    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
-/// `POST /api/sessions/:id/restore`. The lifecycle flock covers reservation
-/// acquisition, worktree restoration, and durable untrash as one transition.
 pub async fn restore_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -549,165 +509,151 @@ pub async fn restore_session(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-
+    let namespace = state.profile_namespace.read().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Some(submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return crate::server::api::session_not_found();
+    };
     let lock = state.instance_lock(&id).await;
-    let _guard = lock.lock().await;
+    let guard = lock.lock().await;
     let profile = {
         let instances = state.instances.read().await;
-        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
-            return session_not_found();
+        let Some(instance) = instances.iter().find(|row| row.id == id) else {
+            return crate::server::api::session_not_found();
         };
         instance.source_profile.clone()
     };
+    #[derive(Debug, thiserror::Error)]
+    #[error("{0}")]
+    struct WorktreeFailure(String);
 
-    enum RestoreTransitionError {
-        NotFound,
-        Busy(String),
-        Worktree(String),
-        Persist(String),
-    }
-
-    let restore_profile = profile.clone();
-    let restore_id = id.clone();
-    let file_watch = state.file_watch.clone();
-    let restored = tokio::task::spawn_blocking(move || {
-        let run = || -> Result<Instance, RestoreTransitionError> {
-            let storage = Storage::new(&restore_profile, file_watch)
-                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-            let _lifecycle_lock = storage
-                .acquire_instance_lifecycle_lock(&restore_id)
-                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-            let decision = storage
-                .update(|instances, _groups| {
-                    crate::session::claim::decide_restore_claim(
-                        instances,
-                        &restore_id,
-                        chrono::Utc::now(),
-                    )
-                    .map_err(anyhow::Error::new)
-                })
-                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-            let generation = match decision {
-                crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
-                crate::session::claim::RestoreClaimDecision::AlreadyGone => {
-                    return Err(RestoreTransitionError::NotFound);
-                }
-                crate::session::claim::RestoreClaimDecision::Busy(holder) => {
-                    return Err(RestoreTransitionError::Busy(holder.busy_reason()));
-                }
-            };
-            let Some(mut instance) = storage
-                .load()
-                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?
-                .into_iter()
-                .find(|candidate| candidate.id == restore_id)
-            else {
-                return Err(RestoreTransitionError::NotFound);
-            };
-            if let crate::session::trash::RestoreOutcome::Failed { reason } =
-                crate::session::trash::restore_worktree_location(&mut instance)
-            {
-                let _ = storage.update(|instances, _groups| {
-                    if let Some(stored) = instances
-                        .iter_mut()
-                        .find(|candidate| candidate.id == restore_id)
-                    {
-                        stored.release_lifecycle_reservation_if_owned(
-                            LifecycleOperation::Restore,
-                            generation,
-                        );
-                    }
-                    Ok(())
-                });
-                return Err(RestoreTransitionError::Worktree(reason));
+    let worker_state = state.clone();
+    let worker_id = id.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let native = crate::server::session_store::NativeSessionStore::open(
+            worker_state.clone(),
+            &profile,
+            Some(worker_id.clone()),
+        )?;
+        let store: &dyn crate::session::SessionStore = &native;
+        let _identity = crate::session::acquire_session_identity_lock()?;
+        let _lifecycle = store
+            .storage()
+            .acquire_instance_lifecycle_lock(&worker_id)?;
+        let claimed = store.update(|rows, _| {
+            let row = rows
+                .iter()
+                .find(|row| row.id == worker_id)
+                .ok_or(LifecycleTargetError::Missing)?;
+            if worker_state.cityhall_mode && !row.is_structured() {
+                return Err(LifecycleTargetError::CityHall.into());
             }
-            let restored_path = instance.project_path.clone();
-            let restored_pre = instance.pre_trash_project_path.clone();
-            let commit = storage
-                .update(|instances, _groups| {
-                    Ok(crate::session::claim::finalize_restore_commit(
-                        instances,
-                        &restore_id,
-                        generation,
-                        &restored_path,
-                        &restored_pre,
-                    ))
-                })
-                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
-            match commit {
-                crate::session::claim::RestoreCommit::Committed => {
-                    instance.untrash();
-                    instance.lifecycle_reservation = None;
-                    Ok(instance)
+            let now = chrono::Utc::now();
+            if !row.is_trashed() {
+                if row.has_fresh_lifecycle_reservation(now) {
+                    return Err(LifecycleTargetError::Busy.into());
+                }
+                return Ok(None);
+            }
+            match crate::session::claim::decide_restore_claim(rows, &worker_id, now)? {
+                crate::session::claim::RestoreClaimDecision::Claimed(generation) => {
+                    let row = rows
+                        .iter()
+                        .find(|row| row.id == worker_id)
+                        .ok_or(LifecycleTargetError::Missing)?;
+                    Ok(Some((generation, row.clone())))
+                }
+                crate::session::claim::RestoreClaimDecision::AlreadyGone => {
+                    Err(LifecycleTargetError::Missing.into())
+                }
+                crate::session::claim::RestoreClaimDecision::Busy(_) => {
+                    Err(LifecycleTargetError::Busy.into())
+                }
+            }
+        })?;
+        let Some((generation, mut instance)) = claimed else {
+            return Ok(());
+        };
+        instance.source_profile = profile;
+        instance.file_watch = Some(worker_state.file_watch.clone());
+        if let crate::session::trash::RestoreOutcome::Failed { reason } =
+            crate::session::trash::restore_worktree_location(&mut instance)
+        {
+            store.update(|rows, _| {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| row.id == worker_id)
+                    .ok_or(LifecycleTargetError::Missing)?;
+                if !row
+                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Restore, generation)
+                {
+                    return Err(LifecycleTargetError::Busy.into());
+                }
+                Ok(())
+            })?;
+            return Err(WorktreeFailure(reason).into());
+        }
+        store.update(|rows, _| {
+            match crate::session::claim::finalize_restore_commit(
+                rows,
+                &worker_id,
+                generation,
+                &instance.project_path,
+                &instance.pre_trash_project_path,
+            ) {
+                crate::session::claim::RestoreCommit::Committed => Ok(()),
+                crate::session::claim::RestoreCommit::AlreadyGone => {
+                    Err(LifecycleTargetError::Missing.into())
                 }
                 crate::session::claim::RestoreCommit::Superseded => {
-                    Err(RestoreTransitionError::Busy(
-                        crate::session::NEWER_GENERATION_BUSY_REASON.to_string(),
-                    ))
-                }
-                crate::session::claim::RestoreCommit::AlreadyGone => {
-                    Err(RestoreTransitionError::NotFound)
+                    Err(LifecycleTargetError::Busy.into())
                 }
             }
-        };
-        run()
+        })
     })
-    .await;
-
-    let restored = match restored {
-        Ok(Ok(instance)) => instance,
-        Ok(Err(RestoreTransitionError::NotFound)) => return session_not_found(),
-        Ok(Err(RestoreTransitionError::Busy(holder))) => {
-            return api_error(
-                StatusCode::CONFLICT,
-                "lifecycle_busy",
-                format!("Session is {holder}, so it was not restored"),
-            );
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    if let Err(error) = result {
+        if let Some(response) = lifecycle_rejection(&state, &error) {
+            return response;
         }
-        Ok(Err(RestoreTransitionError::Worktree(reason))) => {
-            return api_error(
-                StatusCode::CONFLICT,
-                "worktree_restore_failed",
-                format!("Could not restore the worktree: {reason}"),
-            );
+        if let Some(WorktreeFailure(reason)) = error.downcast_ref::<WorktreeFailure>() {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "error": "worktree_restore_failed", "message": format!("Could not restore the worktree: {reason}"),
+            }))).into_response();
         }
-        Ok(Err(RestoreTransitionError::Persist(error))) => {
-            tracing::warn!(target: "http.api.sessions", session = %id, "restore transition failed: {error}");
-            return persist_failed_response();
+        if error.is::<crate::session::NativeStoreUnavailable>() {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
-        Err(error) => {
-            tracing::warn!(target: "http.api.sessions", session = %id, "restore transition join failed: {error}");
-            return persist_failed_response();
-        }
-    };
-
-    let response = {
-        let mut instances = state.instances.write().await;
-        let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
-            return crate::server::api::session_gone_after_persist();
-        };
-        instance.project_path = restored.project_path;
-        instance.pre_trash_project_path = restored.pre_trash_project_path;
-        instance.lifecycle_generation = restored.lifecycle_generation;
-        instance.lifecycle_reservation = restored.lifecycle_reservation;
-        instance.untrash();
-        SessionResponse::from_instance(instance, crate::claude_settings::read_tui_fullscreen())
-    };
-    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+        tracing::warn!(target: "http.api.sessions", session = %id, %error, "restore transition failed");
+        return persist_failed_response();
+    }
+    drop(guard);
+    drop(submission);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
 
-/// `POST /api/sessions/:id/smart-rename`. Manual "Auto-name now" for a
-/// structured session: clears the per-session attempted gate and regenerates the
-/// title from the first prompt, even over one already chosen. The rename runs
-/// detached and best-effort: a `202` means "re-run started", not "renamed".
+/// `POST /api/sessions/:id/smart-rename`. Regenerates a structured session's
+/// title from its first prompt, including over a title already chosen. The rename
+/// runs detached and best-effort; a `202` means the attempt started, not that
+/// the title changed.
 pub async fn force_smart_rename(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // CityHall rejects terminal targets before admitting any work.
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
-    if let Some(resp) = crate::server::api::read_only_block(&state) {
+    if let Some(resp) = crate::server::api::acp::read_only_block(&state) {
         return resp;
     }
 
@@ -725,23 +671,17 @@ pub async fn force_smart_rename(
             )
         })
     }) else {
-        return session_not_found();
+        return crate::server::api::session_not_found();
     };
 
-    // Preflight the SAME gate the spawned try_smart_rename re-applies, so this
-    // never reports 202 for a session the gate would silently drop. Resolves
-    // with the same repo-aware config the worker uses, so a repo-local
-    // smart_rename_agent or agent_command_override cannot make the two
-    // disagree. `setting_on` and `force` are true because the manual
-    // "Auto-name now" action runs even when auto-rename-on-start is off (#3039)
-    // and regenerates over any title; the spawned job gets `force = true` too.
+    // Manual requests bypass the setting and current-title gates; the worker revalidates all others.
     let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         &profile,
         std::path::Path::new(&project_path),
     );
     let config = &resolved.session;
     if let Err(reason) = crate::session::smart_rename::check_eligible_resolved(
-        structured,
+        true,
         true,
         true,
         &title,
@@ -751,25 +691,19 @@ pub async fn force_smart_rename(
         &command,
         &config.agent_command_override,
     ) {
-        use crate::session::smart_rename::SkipReason;
-        // Wording comes from the shared `user_message` so this response and the
-        // TUI dialog cannot drift; only the status code is per-reason.
-        let status = match reason {
-            SkipReason::NotStructured => StatusCode::BAD_REQUEST,
-            _ => StatusCode::CONFLICT,
-        };
         return (
-            status,
-            Json(serde_json::json!({ "message": reason.user_message() })),
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": reason.as_str(), "message": reason.user_message() })),
         )
             .into_response();
     }
 
     // A sandboxed session's one-shot runs inside its container, so a stopped
-    // container is the remaining way the spawned job would drop the session
-    // after the static gate passed. Without probing here this would answer 202
-    // while nothing renames. The spawned try_smart_rename re-probes and stays
-    // the authority.
+    // container is the one remaining way the spawned job would drop the session
+    // after the static gate passed. Probe it here too, else this would answer 202
+    // while nothing renames, which is exactly what the gate above exists to
+    // prevent. Same check and wording as the TUI's preflight; the spawned
+    // try_smart_rename re-probes and stays the authority.
     if sandboxed {
         use crate::containers::Probe;
         let sid = id.clone();
@@ -778,19 +712,47 @@ pub async fn force_smart_rename(
         })
         .await;
         // A failed inspection is not a stopped container: telling the user to
-        // start one that may already be running sends them the wrong way, so the
-        // runtime error is its own state. Same split as the TUI preflight.
+        // start a container that may already be running sends them the wrong
+        // way, so the runtime error is surfaced as its own state. Same split as
+        // the TUI preflight.
         let unknown = match probe {
             Ok(Probe::Running) => None,
             Ok(Probe::NotRunning) => {
-                return api_error(StatusCode::CONFLICT, "container_not_running", "The session's sandbox container is not running, so its agent cannot be asked for a name. Open the session to start it, then try again.");
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "container_not_running",
+                        "message": "The session's sandbox container is not running, so its agent cannot be asked for a name. Open the session to start it, then try again.",
+                    })),
+                )
+                    .into_response();
             }
             Ok(Probe::Unknown(e)) => Some(e.to_string()),
             Err(e) => Some(e.to_string()),
         };
         if let Some(err) = unknown {
-            return api_error(StatusCode::SERVICE_UNAVAILABLE, "container_state_unknown", format!("Couldn't check the session's sandbox container, so its agent cannot be asked for a name: {err}"));
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "container_state_unknown",
+                    "message": format!("Couldn't check the session's sandbox container, so its agent cannot be asked for a name: {err}"),
+                })),
+            )
+                .into_response();
         }
+    }
+
+    if !structured {
+        state.runtime.work.spawn(
+            "server.terminal_smart_rename",
+            crate::session::smart_rename::try_terminal_smart_rename(
+                state.clone(),
+                profile,
+                id,
+                true,
+            ),
+        );
+        return StatusCode::ACCEPTED.into_response();
     }
 
     let Some((first_user_prompt, agent_prose)) = state
@@ -799,14 +761,15 @@ pub async fn force_smart_rename(
     else {
         return (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({ "message": "No prompt to name this session from yet" })),
+            Json(serde_json::json!({ "error": "no_prompt", "message": "No prompt to name this session from yet" })), 
         )
             .into_response();
     };
     let context = crate::session::smart_rename::render_first_turn(&first_user_prompt, &agent_prose);
 
     // Clear the attempted gate so try_smart_rename does not short-circuit on a
-    // prior failed attempt. Its inflight guard still prevents a concurrent run.
+    // prior failed attempt. The inflight guard inside try_smart_rename still
+    // prevents a concurrent one-shot for the same session.
     {
         let mut attempted = state
             .smart_rename_attempted
@@ -815,33 +778,41 @@ pub async fn force_smart_rename(
         attempted.remove(&id);
     }
 
-    tokio::spawn(crate::session::smart_rename::try_smart_rename(
-        state.clone(),
-        id.clone(),
-        crate::session::smart_rename::SmartRenameInput {
-            first_user_prompt,
-            context,
-        },
-        // Manual action forces past the smart_rename-disabled gate (#3039).
-        true,
-    ));
+    state.runtime.work.spawn(
+        "server.smart_rename",
+        crate::session::smart_rename::try_smart_rename(
+            state.clone(),
+            id,
+            crate::session::smart_rename::SmartRenameInput {
+                first_user_prompt,
+                context,
+            },
+            // Manual requests bypass the automatic setting.
+            true,
+        ),
+    );
     StatusCode::ACCEPTED.into_response()
 }
 
-/// On-demand "summarize the conversation so far" for a structured-view session.
-/// Preflights the same eligibility gate the spawned task re-applies, then runs
-/// the summary one-shot detached. A `202` means "summary started"; the result
+/// On-demand "summarize the conversation so far" for a structured-view
+/// session. Preflights the same eligibility gate the spawned task re-applies
+/// so the caller never gets a 202 for a session that would silently drop, then
+/// runs the summary one-shot detached (best-effort, like the automatic
+/// trigger). A `202` means "summary started", not "summary ready"; the result
 /// arrives later as a `ConversationSummary` event over the structured-view WS.
-/// Bypasses the `conversation_summary` setting and the delta threshold, since
-/// an explicit request always runs if the session is eligible (#2808).
+/// Bypasses the `conversation_summary` setting and the delta threshold: an
+/// explicit request always runs if the session is eligible. See #2808.
 pub async fn summarize_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
     }
-    if let Some(resp) = crate::server::api::read_only_block(&state) {
+    if let Some(resp) = crate::server::api::acp::read_only_block(&state) {
         return resp;
     }
 
@@ -902,355 +873,879 @@ pub async fn summarize_session(
         return (status, Json(serde_json::json!({ "message": message }))).into_response();
     }
 
-    tokio::spawn(
+    state.runtime.work.spawn(
+        "server.conversation_summary",
         crate::session::conversation_summary::try_conversation_summary(
             state.clone(),
-            id.clone(),
+            id,
             crate::session::conversation_summary::SummaryTrigger::Manual,
         ),
     );
     StatusCode::ACCEPTED.into_response()
 }
 
-/// Stop a session, matching the TUI's `x` keybind: kill the tmux pane and stop
-/// (not remove) the Docker container for plain sessions, shut the worker down
-/// for structured ones. The record is preserved with status `Stopped`. NOT a
-/// delete.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum LifecycleTargetError {
+    #[error("session not found")]
+    Missing,
+    #[error("session is not writable in CityHall mode")]
+    CityHall,
+    #[error("session lifecycle is busy or superseded")]
+    Busy,
+}
+
+pub(crate) fn lifecycle_rejection(
+    state: &AppState,
+    error: &anyhow::Error,
+) -> Option<axum::response::Response> {
+    match error.downcast_ref::<LifecycleTargetError>() {
+        Some(LifecycleTargetError::Missing) => {
+            return Some(if state.cityhall_mode {
+                crate::server::api::cityhall_response()
+            } else {
+                crate::server::api::session_not_found()
+            })
+        }
+        Some(LifecycleTargetError::CityHall) => {
+            return Some(crate::server::api::cityhall_response())
+        }
+        _ => {}
+    }
+    if matches!(
+        error.downcast_ref::<LifecycleTargetError>(),
+        Some(LifecycleTargetError::Busy)
+    ) || matches!(
+        error.downcast_ref::<crate::session::LifecycleReservationError>(),
+        Some(
+            crate::session::LifecycleReservationError::Busy(_)
+                | crate::session::LifecycleReservationError::Superseded
+        )
+    ) {
+        return Some((StatusCode::CONFLICT,
+            crate::daemon::ApiErrorCode::LifecycleLocked.header(),
+            Json(serde_json::json!({"error": "lifecycle_busy", "message": "Session lifecycle is busy"}))).into_response());
+    }
+    None
+}
+
+async fn adopt_lifecycle_commit<R>(
+    state: &Arc<AppState>,
+    profile: String,
+    id: &str,
+    result: anyhow::Result<(R, Vec<Instance>, Vec<crate::session::Group>)>,
+    publication: &tokio::sync::RwLockWriteGuard<'_, ()>,
+) -> Result<R, axum::response::Response> {
+    if let Err(error) = &result {
+        if let Some(response) = lifecycle_rejection(state, error) {
+            return Err(response);
+        }
+    }
+    let result = result.map_err(|error| {
+        tracing::warn!(target: "http.api.sessions", session = %id, "lifecycle commit failed: {error}");
+    });
+    super::update::adopt_profile_update(state, profile, result, |row_id| row_id == id, publication)
+        .await
+}
+
+// The caller retains namespace, submission, and instance exclusion.
+async fn stop_with_commit(
+    state: &Arc<AppState>,
+    profile: String,
+    id: &str,
+) -> Result<(), axum::response::Response> {
+    let stop_profile = profile.clone();
+    let stop_id = id.to_owned();
+    let file_watch = state.file_watch.clone();
+    let opened = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let storage = Storage::open(&stop_profile, file_watch)?;
+        let title = crate::session::acquire_session_title_lock(&stop_id)?;
+        let lifecycle = storage.acquire_instance_lifecycle_lock(&stop_id)?;
+        let transition = storage.acquire_write_transition()?;
+        Ok((storage, title, lifecycle, transition))
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    let (storage, title, lifecycle, transition) = match opened {
+        Ok(opened) => opened,
+        Err(error) => {
+            let publication = state.publication.write().await;
+            return adopt_lifecycle_commit(state, profile, id, Err(error), &publication).await;
+        }
+    };
+
+    let publication = state.publication.write().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    }
+    let reserve_id = id.to_owned();
+    let cityhall = state.cityhall_mode;
+    let reserved = tokio::task::spawn_blocking(move || {
+        let result = transition.update_with_snapshot(&storage, |rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == reserve_id)
+                .ok_or(if cityhall {
+                    LifecycleTargetError::CityHall
+                } else {
+                    LifecycleTargetError::Missing
+                })?;
+            if cityhall && !row.is_structured() {
+                return Err(LifecycleTargetError::CityHall.into());
+            }
+            if matches!(row.status, Status::Creating | Status::Deleting) {
+                return Err(LifecycleTargetError::Busy.into());
+            }
+            let generation = row.try_acquire_lifecycle_reservation(
+                LifecycleOperation::Stop,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )?;
+            if row.status == Status::Stopped {
+                row.release_lifecycle_reservation_if_owned(LifecycleOperation::Stop, generation);
+                return Ok(None);
+            }
+            if row.is_structured() {
+                row.status = Status::Stopped;
+                row.mark_idle_dormant();
+            }
+            Ok(Some(generation))
+        });
+        (storage, lifecycle, transition, result)
+    })
+    .await;
+    let (storage, lifecycle, transition, result) = match reserved {
+        Ok(reserved) => reserved,
+        Err(error) => {
+            return adopt_lifecycle_commit(state, profile, id, Err(error.into()), &publication)
+                .await
+        }
+    };
+    let generation =
+        adopt_lifecycle_commit(state, profile.clone(), id, result, &publication).await?;
+    drop(publication);
+    drop(transition);
+    let Some(generation) = generation else {
+        return Ok(());
+    };
+    let instance = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == id)
+        .cloned()
+        .ok_or_else(crate::server::api::session_gone_after_persist)?;
+
+    let (effect, pi_update) = if instance.is_structured() {
+        let result = match state.acp_supervisor.shutdown(id).await {
+            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => Ok(()),
+            Err(error) => Err(anyhow::Error::from(error)),
+        };
+        (result, None)
+    } else {
+        match tokio::task::spawn_blocking(move || {
+            let result = instance.stop_resources_locked();
+            let pi = if result.is_ok() {
+                instance.read_pi_sidecar_update()
+            } else {
+                None
+            };
+            (result, pi)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => (Err(error.into()), None),
+        }
+    };
+    let stopped = effect.is_ok();
+    let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let panes = match crate::tmux::batch_pane_metadata() {
+            Ok(panes) => Some(panes),
+            Err(error) => {
+                tracing::warn!(target: "http.api.sessions", "post-stop pane observation failed: {error}");
+                None
+            }
+        };
+        let transition = storage.acquire_write_transition()?;
+        Ok((storage, lifecycle, transition, panes))
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    let publication = state.publication.write().await;
+    let (storage, lifecycle, transition, panes) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return adopt_lifecycle_commit(state, profile, id, Err(error), &publication).await
+        }
+    };
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    }
+    let commit_id = id.to_owned();
+    let finished = tokio::task::spawn_blocking(move || {
+        let result = transition.update_with_snapshot(&storage, |rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == commit_id)
+                .ok_or(LifecycleTargetError::Missing)?;
+            if !row.finish_lifecycle_status(
+                LifecycleOperation::Stop,
+                generation,
+                if stopped {
+                    Status::Stopped
+                } else {
+                    Status::Error
+                },
+            ) {
+                return Err(LifecycleTargetError::Busy.into());
+            }
+            if let Some(pi) = pi_update {
+                pi.apply(row);
+            }
+            if !stopped {
+                row.last_error = Some("Failed to stop session resources".into());
+            }
+            Ok(())
+        });
+        ((storage, lifecycle, transition), result)
+    })
+    .await;
+    let (prepared, result) = match finished {
+        Ok(finished) => finished,
+        Err(error) => {
+            return adopt_lifecycle_commit(state, profile, id, Err(error.into()), &publication)
+                .await
+        }
+    };
+    adopt_lifecycle_commit(state, profile, id, result, &publication).await?;
+    {
+        let mut rows = state.instances.write().await;
+        let row = rows
+            .iter_mut()
+            .find(|row| row.id == id)
+            .ok_or_else(crate::server::api::session_gone_after_persist)?;
+        let metadata = state.canonical_metadata.read().await;
+        let tools = metadata
+            .auxiliary_tools
+            .get(&row.source_profile)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        crate::server::pane::sample_panes(row, tools, panes.as_ref());
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    drop(publication);
+    drop(prepared);
+    drop(title);
+    if let Err(error) = effect {
+        tracing::warn!(target: "http.api.sessions", session = %id, "stop resources failed: {error}");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "stop_failed", "message": "Failed to stop session resources"})))
+            .into_response());
+    }
+    let cleanup_id = id.to_owned();
+    tokio::task::spawn_blocking(move || crate::hooks::cleanup_hook_status_dir(&cleanup_id))
+        .await.map_err(|error| {
+            tracing::warn!(target: "http.api.sessions", session = %id, "stop cleanup failed: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
+    Ok(())
+}
+
+/// Stop resources while retaining the session record for resume.
 pub async fn stop_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
     }
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-
-    let Some(_submission) = state
+    let namespace = state.profile_namespace.read().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Some(submission) = state
         .session_service
         .prompt_submission_for_session(&id)
         .await
     else {
-        return session_not_found();
+        return crate::server::api::session_not_found();
     };
     let lock = state.instance_lock(&id).await;
-    let _guard = lock.lock().await;
-
-    // Snapshot profile, session type and current status without mutating, so a
-    // persist failure leaves disk and memory in agreement.
-    let (profile, is_structured, already_stopped) = {
-        let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return session_not_found();
+    let guard = lock.lock().await;
+    let profile = {
+        let rows = state.instances.read().await;
+        let Some(row) = rows.iter().find(|row| row.id == id) else {
+            return crate::server::api::session_not_found();
         };
-
-        let structured = inst.is_structured();
-        // Mirror the TUI's `stop_selected` guard: a session already stopped or
-        // mid-lifecycle has nothing to stop.
-        let already = matches!(
-            inst.status,
-            Status::Stopped | Status::Deleting | Status::Creating
-        );
-        (inst.source_profile.clone(), structured, already)
+        row.source_profile.clone()
     };
-
-    if already_stopped {
-        let instances = state.instances.read().await;
-        let response = match instances.iter().find(|i| i.id == id) {
-            Some(inst) => {
-                SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
-            }
-            None => {
-                return session_not_found();
-            }
-        };
-        return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
+    if let Err(response) = stop_with_commit(&state, profile, &id).await {
+        return response;
     }
-
-    // Structured sessions have no tmux/container teardown transaction, so
-    // persist their dormant stop before asking the supervisor to shut down.
-    // Plain sessions delegate the full sequence to `Instance::stop` below.
-    if is_structured {
-        let persist_id = id.clone();
-        if persist_session_update(
-            profile.clone(),
-            "stop session",
-            state.file_watch.clone(),
-            move |instances| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                    inst.status = Status::Stopped;
-                    inst.mark_idle_dormant();
-                }
-            },
-        )
-        .await
-        .is_err()
-        {
-            return persist_failed_response();
-        }
-    }
-
-    let inst_clone = {
-        let mut instances = state.instances.write().await;
-        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::warn!(
-                target: "http.api.sessions",
-                session = %id,
-                "stop session: instance vanished before teardown"
-            );
-            return crate::server::api::session_gone_after_persist();
-        };
-        if is_structured {
-            inst.status = Status::Stopped;
-            inst.mark_idle_dormant();
-        }
-        inst.clone()
-    };
-
-    if is_structured {
-        // Structured view: shut down the worker so the reconciler does not race
-        // to respawn it. `shutdown` preserves the transcript.
-        match state.acp_supervisor.shutdown(&id).await {
-            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
-            Err(e) => tracing::warn!(
-                target: "acp.supervisor",
-                session = %id,
-                "shutdown during stop failed: {e}"
-            ),
-        }
-    } else {
-        // Plain session: kill the tmux pane and stop (not remove) the Docker
-        // container. `Instance::stop` can block ~10s on `docker stop`, so it
-        // runs off the async runtime.
-        let inst_for_stop = inst_clone.clone();
-        let stop_profile = profile.clone();
-        let stop_id = id.clone();
-        match tokio::task::spawn_blocking(move || {
-            let stop_result = inst_for_stop.stop();
-            let disk_result = Storage::new_unwatched(&stop_profile)
-                .and_then(|storage| storage.load())
-                .map(|instances| {
-                    instances
-                        .into_iter()
-                        .find(|instance| instance.id == stop_id)
-                });
-            (stop_result, disk_result)
-        })
-        .await
-        {
-            Ok((stop_result, disk_result)) => {
-                if let Err(e) = stop_result {
-                    tracing::warn!(target: "http.api.sessions", "Stop: session stop failed: {e}");
-                }
-                match disk_result {
-                    Ok(Some(stopped)) => {
-                        let mut instances = state.instances.write().await;
-                        if let Some(live) = instances.iter_mut().find(|instance| instance.id == id)
-                        {
-                            live.merge_post_start(&stopped);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!(
-                        target: "http.api.sessions",
-                        "Stop: failed to reload lifecycle generation: {e}"
-                    ),
-                }
-            }
-            Err(e) => tracing::warn!(
-                target: "http.api.sessions",
-                "Stop: stop join failed: {e}"
-            ),
-        }
-    }
-
-    // Re-read so the response reflects the Stopped status.
-    let instances = state.instances.read().await;
-    let response = match instances.iter().find(|i| i.id == id) {
-        Some(inst) => {
-            SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
-        }
-        None => {
-            return session_not_found();
-        }
-    };
-    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+    drop(guard);
+    drop(submission);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
 
-/// Start (resume) a stopped session, the inverse of [`stop_session`]. Plain
-/// sessions restart exactly like `ensure_session`; structured sessions are
-/// un-parked by clearing the idle-dormant mark so the acp reconciler respawns
-/// the worker on its next tick. No-op for a session that is not stopped.
+/// Resume a stopped session; structured workers restart through reconciliation.
 pub async fn start_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    body: Result<
+        Option<Json<crate::daemon::StartSessionBody>>,
+        axum::extract::rejection::JsonRejection,
+    >,
 ) -> impl IntoResponse {
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
+    prepare_agent_session(state, id, body, AgentPreparation::Start, None).await
+}
+
+pub async fn restart_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<
+        Option<Json<crate::daemon::RestartSessionBody>>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> axum::response::Response {
+    if let Some(response) = crate::server::api::cityhall_block(&state) {
+        return response;
+    }
+    let body = match body {
+        Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
+        Err(error) => return error.into_response(),
+    };
+    prepare_agent_session(
+        state,
+        id,
+        Ok(None),
+        AgentPreparation::Restart,
+        Some(Arc::new(body)),
+    )
+    .await
+}
+
+fn admit_restart(
+    row: &mut Instance,
+    body: &crate::daemon::RestartSessionBody,
+    account_swap: bool,
+) -> anyhow::Result<()> {
+    let now = chrono::Utc::now();
+    if row.is_trashed()
+        || row.is_archived()
+        || matches!(row.status, Status::Creating | Status::Deleting)
+        || row.has_fresh_lifecycle_reservation(now)
+    {
+        return Err(LifecycleTargetError::Busy.into());
+    }
+    row.try_acquire_lifecycle_reservation(
+        LifecycleOperation::Launch,
+        Instance::LIFECYCLE_RESERVATION_TTL,
+        now,
+    )?;
+    if let Some(tool) = &body.tool {
+        if row.tool != *tool {
+            if account_swap {
+                row.swap_account(tool);
+            } else {
+                row.swap_tool(tool);
+            }
+        }
+    }
+    if let Some(command) = &body.command_override {
+        row.command.clone_from(command);
+    }
+    if let Some(extra_args) = &body.extra_args {
+        row.extra_args.clone_from(extra_args);
+    }
+    if body.unsnooze {
+        row.unsnooze();
+    }
+    row.touch_last_accessed();
+    row.idle_dormant_since = None;
+    row.idle_entered_at = None;
+    row.last_error = None;
+    row.last_error_check = None;
+    row.status = Status::Starting;
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AgentPreparation {
+    Start,
+    Restart,
+    Ensure,
+}
+
+pub(super) async fn prepare_agent_session(
+    state: Arc<AppState>,
+    id: String,
+    body: Result<
+        Option<Json<crate::daemon::StartSessionBody>>,
+        axum::extract::rejection::JsonRejection,
+    >,
+    preparation: AgentPreparation,
+    restart: Option<Arc<crate::daemon::RestartSessionBody>>,
+) -> axum::response::Response {
+    if preparation == AgentPreparation::Ensure && state.cityhall_mode {
+        return crate::server::api::cityhall_response();
+    }
+    if state.read_only && preparation == AgentPreparation::Ensure {
+        return super::ensure::agent_target_response(&state, &id, None).await;
     }
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-
-    let lock = state.instance_lock(&id).await;
-    let _guard = lock.lock().await;
-
-    let (profile, is_structured, is_stopped, instance) = {
-        let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return session_not_found();
-        };
-
-        let structured = inst.is_structured();
-        (
-            inst.source_profile.clone(),
-            structured,
-            matches!(inst.status, Status::Stopped),
-            inst.clone(),
-        )
-    };
-
-    // Only a stopped session has anything to start; otherwise return current.
-    if !is_stopped {
-        let instances = state.instances.read().await;
-        let response = match instances.iter().find(|i| i.id == id) {
-            Some(inst) => {
-                SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
-            }
-            None => {
-                return session_not_found();
-            }
-        };
-        return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
+    let namespace = state.profile_namespace.read().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-
-    if is_structured {
-        // Un-park: clear the dormant mark and drop the Stopped status so the
-        // reconciler's next tick respawns the worker against the preserved
-        // transcript.
-        let persist_id = id.clone();
-        if persist_session_update(
-            profile,
-            "start session",
-            state.file_watch.clone(),
-            move |instances| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                    inst.idle_dormant_since = None;
-                    inst.status = Status::Idle;
-                    inst.last_error = None;
-                }
-            },
-        )
+    let Some(submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
         .await
-        .is_err()
-        {
-            return persist_failed_response();
-        }
-        {
-            let mut instances = state.instances.write().await;
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                inst.idle_dormant_since = None;
-                inst.status = Status::Idle;
-                inst.last_error = None;
-            }
-        }
-        let instances = state.instances.read().await;
-        let response = match instances.iter().find(|i| i.id == id) {
-            Some(inst) => {
-                SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
-            }
-            None => {
-                return session_not_found();
-            }
+    else {
+        return if state.cityhall_mode {
+            crate::server::api::cityhall_response()
+        } else {
+            crate::server::api::session_not_found()
         };
-        return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
+    };
+    let lock = state.instance_lock(&id).await;
+    let guard = lock.lock().await;
+    let instance = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|row| row.id == id) else {
+            return if state.cityhall_mode {
+                crate::server::api::cityhall_response()
+            } else {
+                crate::server::api::session_not_found()
+            };
+        };
+        instance.clone()
+    };
+    if preparation == AgentPreparation::Ensure && instance.is_structured() {
+        return StatusCode::BAD_REQUEST.into_response();
     }
-
-    // Plain session: restart the tmux pane, mirroring ensure_session. Show
-    // Starting immediately so the status poller does not flip it back while the
-    // restart is in flight.
-    {
-        let mut instances = state.instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            inst.status = Status::Starting;
-            inst.last_error = None;
+    if state.cityhall_mode && !instance.is_structured() {
+        return crate::server::api::cityhall_response();
+    }
+    let body = match body {
+        Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
+        Err(rejection) => return rejection.into_response(),
+    };
+    let size = restart
+        .as_ref()
+        .and_then(|body| body.size.as_ref())
+        .or(body.size.as_ref())
+        .map(|size| (size.cols.get(), size.rows.get()));
+    let worker_restart = restart.clone();
+    let worker_state = state.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        use crate::session::SessionStore;
+        let profile = instance.source_profile.clone();
+        let mut native = crate::server::session_store::NativeSessionStore::open(
+            worker_state.clone(),
+            &profile,
+            Some(instance.id.clone()),
+        )?;
+        native.configuration(Some(&profile))?;
+        let identity = worker_restart
+            .as_ref()
+            .map(|_| crate::session::acquire_session_identity_lock())
+            .transpose()?;
+        let title_lock = crate::session::acquire_session_title_lock(&instance.id)?;
+        let mut lifecycle_lock = native
+            .storage()
+            .acquire_instance_lifecycle_lock(&instance.id)?;
+        let target = worker_restart
+            .as_ref()
+            .and_then(|body| body.profile.as_deref())
+            .filter(|target| *target != profile);
+        let target_native = target
+            .map(|target| {
+                let store = crate::server::session_store::NativeSessionStore::open(
+                    worker_state.clone(),
+                    target,
+                    Some(instance.id.clone()),
+                )?;
+                store.configuration(Some(target))?;
+                Ok::<_, anyhow::Error>(store)
+            })
+            .transpose()?;
+        let mut outgoing = instance.clone();
+        if worker_restart.is_some() {
+            outgoing.reconcile_from_store(&native)?;
         }
-    }
-
-    let sync_base = instance.clone();
-    let restart_result = tokio::task::spawn_blocking(
-        move || -> Result<(Instance, crate::session::StartOutcome), Box<(Instance, anyhow::Error)>> {
-            let mut inst = instance;
-            // Explicit restart endpoint: honor auto_resume_on_restart, same as
-            // TUI `e`/`Enter`. The instance-level cascade holds the lifecycle
-            // lock across final poller drain, exact-pane OMP capture, kill and
-            // relaunch.
-            match inst.restart_with_resume_policy(
-                None,
-                false,
-                crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
-            ) {
-                Ok(outcome) => Ok((inst, outcome)),
-                Err(e) => Err(Box::new((inst, e))),
+        let (account_swap, mut conversation_carry) = match worker_restart
+            .as_ref()
+            .and_then(|body| body.tool.as_deref())
+        {
+            Some(tool) if tool != outgoing.tool => {
+                match crate::session::conversation_carry::classify(
+                    &outgoing,
+                    target.unwrap_or(&profile),
+                    tool,
+                ) {
+                    crate::session::conversation_carry::ToolSwap::KeepConversation(carry) => {
+                        (true, carry)
+                    }
+                    crate::session::conversation_carry::ToolSwap::Park => (false, None),
+                }
             }
-        },
-    )
+            _ => (false, None),
+        };
+        if let Some(body) = &worker_restart {
+            let mut probe = outgoing.clone();
+            if let Some(target) = target {
+                probe.source_profile = target.into();
+            }
+            admit_restart(&mut probe, body, account_swap)?;
+            if let Some(target_native) = &target_native {
+                let rows = target_native.storage().load()?;
+                if rows.iter().any(|row| row.id == outgoing.id)
+                    || is_duplicate_session(rows.iter(), &probe.title, &probe.project_path, None)
+                {
+                    return Err(duplicate_session_error(&probe.title));
+                }
+            }
+            // Capture using the outgoing tool/profile, before the atomic edit parks its SID.
+            if !outgoing.is_structured() {
+                outgoing.capture_before_restart_in(&native)?;
+            }
+        }
+        let mut started = if let (Some(body), Some(target_native)) =
+            (&worker_restart, target_native)
+        {
+            let mut moved = None;
+            native.move_instances_to(
+                &target_native,
+                &[(outgoing.clone(), outgoing.clone())],
+                &crate::session::GroupMovePlan::single(&outgoing.group_path, &outgoing.group_path),
+                |existing, candidates| {
+                    let candidate = &mut candidates[0];
+                    if is_duplicate_session(
+                        existing.iter(),
+                        &candidate.title,
+                        &candidate.project_path,
+                        None,
+                    ) {
+                        return Err(duplicate_session_error(&candidate.title));
+                    }
+                    admit_restart(candidate, body, account_swap)?;
+                    moved = Some(candidate.clone());
+                    Ok(())
+                },
+            )?;
+            if let (Some(carry), Some(moved)) = (conversation_carry.as_mut(), moved.as_ref()) {
+                carry.retarget(crate::session::conversation_carry::conversation_ids(moved));
+            }
+            lifecycle_lock = target_native
+                .storage()
+                .acquire_instance_lifecycle_lock(&instance.id)?;
+            native = target_native;
+            moved
+        } else {
+            let store: &dyn crate::session::SessionStore = &native;
+            store.update(|rows, _| {
+                let row = rows
+                    .iter_mut()
+                    .find(|row| row.id == instance.id)
+                    .ok_or(LifecycleTargetError::Missing)?;
+                if worker_state.cityhall_mode && !row.is_structured() {
+                    return Err(LifecycleTargetError::CityHall.into());
+                }
+                if let Some(body) = &worker_restart {
+                    row.source_profile.clone_from(&profile);
+                    admit_restart(row, body, account_swap)?;
+                    return Ok(Some(row.clone()));
+                }
+                let now = chrono::Utc::now();
+                if row.is_trashed()
+                    || row.is_archived()
+                    || matches!(row.status, Status::Creating | Status::Deleting)
+                    || row.has_fresh_lifecycle_reservation(now)
+                {
+                    return Err(LifecycleTargetError::Busy.into());
+                }
+                if preparation == AgentPreparation::Ensure {
+                    anyhow::ensure!(
+                        !row.is_structured(),
+                        "Structured sessions have no agent pane"
+                    );
+                    if super::ensure::ready_agent_session(row)?.is_some() {
+                        return Ok(None);
+                    }
+                } else if row.status != Status::Stopped {
+                    return Ok(None);
+                }
+                let generation = row.try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Launch,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    now,
+                )?;
+                row.idle_dormant_since = None;
+                row.idle_entered_at = None;
+                row.last_error = None;
+                if row.is_structured() {
+                    row.status = Status::Idle;
+                    row.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Launch,
+                        generation,
+                    );
+                    return Ok(None);
+                }
+                row.status = Status::Starting;
+                Ok(Some(row.clone()))
+            })?
+        };
+        let Some(mut started) = started.take() else {
+            return Ok(None);
+        };
+        started.source_profile = native.storage().profile().to_owned();
+        started.file_watch = Some(worker_state.file_watch.clone());
+        crate::server::reload::merge_runtime_fields(outgoing, &mut started);
+        let store: &dyn crate::session::SessionStore = &native;
+        if worker_restart.as_ref().is_some_and(|body| {
+            body.discard_sandbox_container
+                || body
+                    .tool
+                    .as_ref()
+                    .is_some_and(|tool| *tool != instance.tool)
+        }) {
+            started.discard_reserved_restart_container(store, started.lifecycle_generation)?;
+        }
+        let generation = started.prepare_reserved_launch_hooks(
+            store,
+            worker_restart.is_none(),
+            crate::session::LaunchReservation {
+                generation: started.lifecycle_generation,
+                title_lock,
+                lifecycle_lock,
+            },
+        )?;
+        drop(identity);
+        Ok(Some((generation, started, native, conversation_carry)))
+    })
     .await;
-
-    match restart_result {
-        Ok(Ok((started, outcome))) => {
-            let resume_failed_sid = match &outcome {
-                crate::session::StartOutcome::ResumeFailed { sid } => Some(sid.clone()),
-                _ => None,
-            };
-            let mut instances = state.instances.write().await;
-            let response = match instances.iter_mut().find(|i| i.id == id) {
-                Some(inst) => {
-                    apply_post_restart_sync(inst, &sync_base, &started);
-                    SessionResponse::from_instance(
-                        inst,
-                        crate::claude_settings::read_tui_fullscreen(),
+    drop(guard);
+    drop(submission);
+    drop(namespace);
+    let requested_wake_message = restart.as_ref().and_then(|body| body.wake_message.clone());
+    let hooked = match result {
+        Ok(Ok(Some((generation, mut started, native, conversation_carry)))) => {
+            tokio::task::spawn_blocking(move || {
+                let _timeout = restart.as_ref().filter(|body| body.bound_hooks).map(|_| {
+                    crate::session::recovery::HookTimeoutScope::new(
+                        crate::session::recovery::recovery_hook_timeout(),
                     )
-                }
-                None => {
-                    return session_not_found();
+                });
+                let hooks = started.run_pre_launch_hooks(
+                    restart.as_ref().is_some_and(|body| body.skip_on_launch),
+                    &native,
+                    None,
+                );
+                Ok(Some((
+                    generation,
+                    started,
+                    native,
+                    hooks,
+                    conversation_carry,
+                )))
+            })
+            .await
+        }
+        Ok(Ok(None)) => Ok(Ok(None)),
+        Ok(Err(error)) => Ok(Err(error)),
+        Err(error) => Err(error),
+    };
+    let namespace = state.profile_namespace.read().await;
+    let submission = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await;
+    let guard = lock.lock().await;
+    let mut restart_identity = None;
+    let result = match hooked {
+        Ok(Ok(Some((generation, mut started, native, hooks, conversation_carry)))) => {
+            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                use crate::session::SessionStore;
+                let outcome = started.finish_reserved_launch(
+                    &native,
+                    size,
+                    crate::session::ResumeLaunchOptions {
+                        resume_policy: if preparation == AgentPreparation::Ensure {
+                            crate::session::ResumeAttemptPolicy::Allow
+                        } else {
+                            crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting
+                        },
+                        restart: true,
+                        conversation_carry,
+                    },
+                    generation,
+                    hooks,
+                );
+                let title = crate::session::acquire_session_title_lock(&started.id)?;
+                let lifecycle = native.storage().acquire_instance_lifecycle_lock(&started.id)?;
+                let panes = match crate::tmux::batch_pane_metadata() {
+                    Ok(panes) => Some(panes),
+                    Err(error) => {
+                        tracing::warn!(target: "http.api.sessions", session = %started.id, "post-launch pane observation failed: {error}");
+                        None
+                    }
+                };
+                Ok(Some((generation, started, outcome, (title, lifecycle), panes)))
+            })
+            .await
+        }
+        Ok(Ok(None)) => Ok(Ok(None)),
+        Ok(Err(error)) => Ok(Err(error)),
+        Err(error) => Err(error),
+    };
+    let outcome = match result {
+        Ok(Ok(Some((generation, started, outcome, ownership, panes)))) => {
+            let adopted = {
+                let _publication = state.publication.write().await;
+                let mut instances = state.instances.write().await;
+                match instances.iter_mut().find(|row| row.id == id) {
+                    Some(row)
+                        if row.lifecycle_generation == generation
+                            && started.lifecycle_generation == generation
+                            && row.source_profile == started.source_profile
+                            && row.title == started.title =>
+                    {
+                        row.inherit_process_runtime(started);
+                        restart_identity =
+                            Some((row.lifecycle_generation, row.source_profile.clone()));
+                        let metadata = state.canonical_metadata.read().await;
+                        let tools = metadata
+                            .auxiliary_tools
+                            .get(&row.source_profile)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default();
+                        crate::server::pane::sample_panes(row, tools, panes.as_ref());
+                        state
+                            .mutation_epoch
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        state.runtime.request_publish();
+                        true
+                    }
+                    _ => false,
                 }
             };
-            if let Some(sid) = resume_failed_sid {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": "resume_failed",
-                        "message": format!("Resume failed for sid {sid}; preserved for explicit retry"),
-                        "resume_session_id": sid,
-                    })),
-                )
-                    .into_response();
+            drop(ownership);
+            if adopted {
+                outcome.map(Some)
+            } else {
+                Err(crate::session::LifecycleReservationError::Superseded.into())
             }
-            (StatusCode::OK, Json(response)).into_response()
         }
-        Ok(Err(boxed)) => {
-            let (started, e) = *boxed;
-            let msg = e.to_string();
-            tracing::warn!(target: "http.api.sessions", "start_session restart failed for {id}: {msg}");
-            let mut instances = state.instances.write().await;
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                if apply_post_restart_sync(inst, &sync_base, &started) {
-                    inst.status = Status::Error;
-                    inst.last_error = Some(msg.clone());
-                }
+        Ok(Ok(None)) => Ok(None),
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(error.into()),
+    };
+    let outcome = match outcome {
+        Err(error) => {
+            if let Some(response) = lifecycle_rejection(&state, &error) {
+                return response;
             }
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, "restart_failed", msg)
-        }
-        Err(e) => {
-            tracing::error!(target: "http.api.sessions", "start_session panicked for {id}: {e}");
-            (
+            tracing::warn!(target: "http.api.sessions", session = %id, %error, "session start failed");
+            if error.is::<crate::session::NativeStoreUnavailable>() {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal"})),
+                Json(
+                    serde_json::json!({"error": "start_failed", "message": "Session start failed"}),
+                ),
             )
-                .into_response()
+                .into_response();
         }
+        Ok(Some(crate::session::StartOutcome::ResumeFailed { sid })) => {
+            return (StatusCode::CONFLICT, crate::daemon::ApiErrorCode::ResumeFailed.header(), Json(serde_json::json!({
+                "error": "resume_failed", "message": "Resume failed; preserved for explicit retry", "resume_session_id": sid,
+            }))).into_response();
+        }
+        Ok(outcome) => outcome,
+    };
+    drop(guard);
+    drop(submission);
+    drop(namespace);
+    if preparation == AgentPreparation::Restart {
+        let Some((generation, profile)) = restart_identity else {
+            return StatusCode::CONFLICT.into_response();
+        };
+        let rows = state.instances.read().await;
+        let Some(row) = rows.iter().find(|row| {
+            row.id == id && row.lifecycle_generation == generation && row.source_profile == profile
+        }) else {
+            return StatusCode::CONFLICT.into_response();
+        };
+        let target = if row.is_structured() {
+            None
+        } else {
+            let Some(name) = row
+                .agent_pane
+                .tmux_session
+                .as_ref()
+                .filter(|_| row.agent_pane.state == crate::session::PanePresence::Alive)
+            else {
+                return StatusCode::CONFLICT.into_response();
+            };
+            Some(crate::daemon::TerminalTarget {
+                tmux_session: name.clone(),
+                status: crate::daemon::TerminalTargetStatus::Restarted,
+            })
+        };
+        if matches!(
+            outcome,
+            Some(
+                crate::session::StartOutcome::Fresh
+                    | crate::session::StartOutcome::Resumed
+                    | crate::session::StartOutcome::FreshAfterFailedResume { .. }
+            )
+        ) {
+            let wake_message = requested_wake_message.unwrap_or_else(|| {
+                crate::session::resolve_config(&profile)
+                    .map(|config| config.session.restart_wake_message)
+                    .unwrap_or_else(|_| {
+                        crate::session::config::SessionConfig::default().restart_wake_message
+                    })
+            });
+            if !wake_message.is_empty() {
+                crate::session::restart::spawn_wake_worker(
+                    id.clone(),
+                    row.title.clone(),
+                    row.tool.clone(),
+                    wake_message,
+                    Some((profile.clone(), generation)),
+                );
+            }
+        }
+        drop(rows);
+        return crate::server::runtime::session_mutation_response(
+            &state,
+            &id,
+            Some(crate::daemon::RestartOutcome {
+                lifecycle_generation: generation,
+                profile,
+                target,
+            }),
+        )
+        .await;
+    }
+    if preparation == AgentPreparation::Ensure {
+        super::ensure::agent_target_response(&state, &id, outcome).await
+    } else {
+        crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
     }
 }
 
@@ -1259,9 +1754,6 @@ pub async fn update_session_snooze(
     Path(id): Path<String>,
     body: Result<Json<UpdateSnoozeBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
-    }
     if state.read_only {
         return crate::server::api::read_only_response();
     }
@@ -1270,28 +1762,39 @@ pub async fn update_session_snooze(
         Err(rej) => return rej.into_response(),
     };
 
-    // The TUI dialog presets, CLI and this endpoint share the same bounds; see
-    // `crate::session::config::validate_snooze_duration`.
+    // Share the CLI and TUI duration bounds.
     if let Some(minutes) = body.minutes {
         if let Err(msg) = crate::session::validate_snooze_duration(minutes as u64) {
-            return api_error(StatusCode::BAD_REQUEST, "validation_failed", msg);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "validation_failed",
+                    "message": msg,
+                })),
+            )
+                .into_response();
         }
     }
 
+    let namespace = state.profile_namespace.read().await;
+    // Submission precedes the instance lock for worker teardown.
     let Some(_submission) = state
         .session_service
         .prompt_submission_for_session(&id)
         .await
     else {
-        return session_not_found();
+        return crate::server::api::session_not_found();
     };
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
 
     let (was_structured_view, profile) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return session_not_found();
+            return crate::server::api::session_not_found();
         };
 
         let structured_view = inst.is_structured();
@@ -1300,13 +1803,11 @@ pub async fn update_session_snooze(
 
     let minutes = body.minutes;
 
-    // Persist first; only mutate memory once disk is durable, and fire the
-    // structured teardown below only on a write that landed (#1589).
     let persist_id = id.clone();
-    if persist_session_update(
+    let committed = commit_profile_update(
+        &state,
         profile,
         "snooze update",
-        state.file_watch.clone(),
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                 match minutes {
@@ -1315,34 +1816,14 @@ pub async fn update_session_snooze(
                 }
             }
         },
+        None,
     )
-    .await
-    .is_err()
-    {
-        return persist_failed_response();
+    .await;
+    if let Err(response) = committed {
+        return response;
     }
 
-    {
-        let mut instances = state.instances.write().await;
-        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::warn!(
-                target: "http.api.sessions",
-                session = %id,
-                "snooze update: instance vanished after persist"
-            );
-            return crate::server::api::session_gone_after_persist();
-        };
-        match minutes {
-            Some(m) => inst.snooze(m),
-            None => inst.unsnooze(),
-        }
-    }
-
-    // Snoozing tears a structured worker down the way archive does: snooze is
-    // a temporary archive, and the worker is too heavy to keep idle while the
-    // row is sunk. The reconciler skips snoozed sessions and re-picks them on
-    // the first tick after expiry. `shutdown` preserves the transcript, so that
-    // respawn resumes the conversation (#1710).
+    // Preserve the transcript; reconciliation resumes it after snooze expires.
     if was_structured_view && minutes.is_some() {
         match state.acp_supervisor.shutdown(&id).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
@@ -1354,30 +1835,18 @@ pub async fn update_session_snooze(
         }
     }
 
-    let instances = state.instances.read().await;
-    let response = match instances.iter().find(|i| i.id == id) {
-        Some(inst) => {
-            SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
-        }
-        None => {
-            return session_not_found();
-        }
-    };
-    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+    drop(_guard);
+    drop(_submission);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
 
-/// `PATCH /api/sessions/{id}/unread`: flag a session unread or mark it read.
-/// The client computes the target from current state rather than toggling
-/// server-side, so an optimistic UI update cannot desync. No-op when
-/// `session.unread_indicator` is off. Persist-then-mutate, like snooze.
+/// Set an explicit unread target; a disabled indicator leaves the row unchanged.
 pub async fn update_session_unread(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     body: Result<Json<UpdateUnreadBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
-    }
     if state.read_only {
         return crate::server::api::read_only_response();
     }
@@ -1387,25 +1856,28 @@ pub async fn update_session_unread(
     };
     let mark_unread = body.unread;
 
+    let namespace = state.profile_namespace.read().await;
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
 
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return session_not_found();
+            return crate::server::api::session_not_found();
         };
         inst.source_profile.clone()
     };
 
-    // Feature off: report the current state without mutating, matching the
-    // TUI's no-op when `session.unread_indicator` is disabled.
+    // A disabled indicator leaves the durable row untouched.
     if crate::session::unread_enabled() {
         let persist_id = id.clone();
-        if persist_session_update(
+        let committed = commit_profile_update(
+            &state,
             profile,
             "unread update",
-            state.file_watch.clone(),
             move |instances| {
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                     if mark_unread {
@@ -1415,37 +1887,15 @@ pub async fn update_session_unread(
                     }
                 }
             },
+            None,
         )
-        .await
-        .is_err()
-        {
-            return persist_failed_response();
-        }
-
-        let mut instances = state.instances.write().await;
-        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::warn!(
-                target: "http.api.sessions",
-                session = %id,
-                "unread update: instance vanished after persist"
-            );
-            return crate::server::api::session_gone_after_persist();
-        };
-        if mark_unread {
-            inst.mark_unread();
-        } else {
-            inst.mark_read();
+        .await;
+        if let Err(response) = committed {
+            return response;
         }
     }
 
-    let instances = state.instances.read().await;
-    let response = match instances.iter().find(|i| i.id == id) {
-        Some(inst) => {
-            SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
-        }
-        None => {
-            return session_not_found();
-        }
-    };
-    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+    drop(_guard);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }

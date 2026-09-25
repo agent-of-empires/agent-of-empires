@@ -28,6 +28,10 @@ Invariants worth knowing before touching this code:
 
 Trash is the reversible middle state: a delete moves the session there by default (`session.delete_to_trash`), keeping its transcript, worktree, branch, and container until it is restored, purged, or auto-purged after `session.trash_retention_days`. Retention is enforced by the daemon (a startup sweep plus an hourly tick), so without one, expired trash waits for the next daemon start or a manual purge. When the daemon permanently deletes a structured session it sends a best-effort `session/delete` (2s timeout) so adapters that implement it can release their own state, then proceeds with cancel, SIGTERM, and on-disk cleanup. CLI purges have no running worker, so they delete the local transcript only.
 
+Purge captures the selected row's path, branch and runner references before destroy hooks. Before irreversible row removal, it adds fresh row references and persists ownership in `pending-purge-owners.json`. Failed cleanup retains ownership across requests and daemon restart; success releases only its own token. Missing, malformed or unsupported journals refuse cleanup. Both ordinary and irreversible purges require a captured process group to exit before host cleanup, even if its worker record disappeared. Ordinary purge retains the row and releases its reservation when that check fails. Uncaptured evidence is not proof of runtime absence.
+
+Live owner references include missing descendants and symlink traversal dependencies. Permission errors, symlink loops and non-directory traversal refuse cleanup instead of being treated as absent owners.
+
 ## Who owns the state
 
 The daemon folds the event stream once per WebSocket connection into two projections, so clients do not re-derive them:

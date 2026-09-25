@@ -259,8 +259,8 @@ impl ProjectsDialog {
                     project,
                     self.add_allow_override,
                 ) {
-                    Ok(saved) => {
-                        let saved_name = saved.name.clone();
+                    Ok(committed) => {
+                        let saved = &committed.projects[committed.result];
                         self.info = Some(format!(
                             "Added '{}' [{}]",
                             saved.name,
@@ -272,7 +272,7 @@ impl ProjectsDialog {
                         self.close_on_add_cancel = false;
                         self.reload();
                         if !is_git {
-                            self.maybe_warn_non_git(&saved_name);
+                            self.maybe_warn_non_git(&saved.name);
                         }
                     }
                     Err(e) => self.error = Some(format!("Add failed: {}", e)),

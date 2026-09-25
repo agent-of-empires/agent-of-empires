@@ -118,6 +118,13 @@ const PAGES = [
       "Launch a session in a fresh scratch directory under ~/.agent-of-empires/scratch/ with no project path. The directory is removed when the session is deleted.",
   },
   {
+    source: "docs/guides/remotes.md",
+    dest: "guides/remotes.md",
+    title: "Remote Machines",
+    description:
+      "Register other machines' aoe serve daemons, list their sessions beside local ones, live-send into them, and create sessions on them from the TUI.",
+  },
+  {
     source: "docs/guides/live-mode.md",
     dest: "guides/live-mode.md",
     title: "Live Mode",
@@ -194,6 +201,13 @@ const PAGES = [
     title: "Plugin System Internals",
     description:
       "Code-level design for the plugin system: subprocess JSON-RPC runtime, event bus, contribution registries, and capability model.",
+  },
+  {
+    source: "docs/development/internals/client-transports.md",
+    dest: "docs/development/internals/client-transports.md",
+    title: "Daemon-to-Client Transports",
+    description:
+      "How a client reads and drives a daemon: the REST API, the runtime stream, and the live pane stream, where their wire types live, and which surface uses which.",
   },
   {
     source: "docs/development/writing-plugins.md",

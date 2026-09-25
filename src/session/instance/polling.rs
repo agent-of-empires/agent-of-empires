@@ -7,6 +7,13 @@ use sha2::{Digest as _, Sha256};
 const MANAGED_CAPTURE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Outcome of [`Instance::maybe_start_poller`].
+///
+/// Only the last two variants are failures a caller should retry with
+/// backoff or warn about. A session can legitimately have nothing to poll
+/// right now — its capture metadata is not resolvable yet, its sandbox
+/// store is not mounted, another process holds the store lease — and
+/// treating those as failed spawns misreports a healthy fleet as over
+/// budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollerStart {
     /// A poller thread is running for this session (started now, or already).
@@ -22,8 +29,15 @@ pub enum PollerStart {
     SpawnFailed,
 }
 
-/// An exclusive claim on one physical capture store, held for as long as the poller that owns it
-/// runs.
+/// An exclusive claim on one physical capture store, held for as long as the
+/// poller that owns it runs.
+///
+/// `Drop` unlocks explicitly rather than letting the descriptor close do it. A
+/// `flock` belongs to the open file description, not to one descriptor, so a
+/// process forked while the lease was open holds the lock alive through its
+/// inherited copy until `exec` clears it. Releasing by close alone leaves the
+/// store reading as owned by someone else for that window; `unlock` releases
+/// the description itself, and every inherited copy with it.
 #[derive(Debug)]
 struct ManagedCaptureLease(std::fs::File);
 
@@ -89,13 +103,8 @@ fn try_acquire_managed_capture_lease(
 }
 
 /// Use a unique live agent; paired-only or ambiguous live panes forbid fallback.
-fn log_observed_session_id(instance_id: &str) -> Box<dyn Fn(&str) + Send + 'static> {
-    let instance_id = instance_id.to_string();
-    Box::new(move |new_id| {
-        tracing::info!(target: "session.store", "Session ID observed for {}: {}", instance_id, new_id);
-    })
-}
-
+/// An empty or unavailable scan may use the derived name during MISSING_TARGET_GRACE.
+/// Its name-shape check remains necessary because no live kind marker is available.
 fn poller_seed_name(
     live: AgentSeed,
     derived: impl FnOnce() -> Option<String>,
@@ -110,9 +119,21 @@ fn poller_seed_name(
     }
 }
 
+fn log_observed_session_id(instance_id: &str) -> Box<dyn Fn(&str) + Send + 'static> {
+    let instance_id = instance_id.to_string();
+    Box::new(move |new_id| {
+        tracing::info!(target: "session.store", "Session ID observed for {}: {}", instance_id, new_id);
+    })
+}
+
 impl Instance {
-    /// Whether this session should run a session-id poller: the agent has a resume strategy to
-    /// capture for, and its conversation is not already known.
+    /// Whether this session should run a session-id poller: the agent has a
+    /// resume strategy to capture for, and its conversation is not already
+    /// known.
+    ///
+    /// Pi polls its sidecar or nothing: the pane publishes its own
+    /// conversation, and a store keyed by cwd cannot say which pane owns what.
+    /// Reads memory only: this runs per session on every TUI refresh.
     pub(crate) fn launch_has_session_publisher(&self) -> bool {
         let Some((capture, context)) = self.resolved_session_support() else {
             return false;
@@ -137,6 +158,7 @@ impl Instance {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn managed_capture_store_is_exclusive(
         &self,
         backend: crate::agents::SessionCaptureBackend,
@@ -207,12 +229,20 @@ impl Instance {
         }
         true
     }
-
     pub fn maybe_start_poller(&mut self) -> PollerStart {
-        self.maybe_start_poller_since(None)
+        let file_watch = self.resolve_file_watch();
+        self.maybe_start_poller_since_in(CaptureStorage::Profiles(&file_watch)).unwrap_or_else(|error| {
+            tracing::warn!(target: "session.capture", session = %self.id, %error, "capture setup failed");
+            PollerStart::SpawnFailed
+        })
     }
 
     /// Store a freshly spawned poller, or say why there is none.
+    ///
+    /// The one place a start succeeds, so it is also the one place the
+    /// repair schedule is cleared: a poller started directly (session
+    /// create, restart, resume) must not leave a stale backoff behind for
+    /// the next repair to wait out.
     fn install_poller(
         &mut self,
         poller: SessionPoller,
@@ -238,24 +268,24 @@ impl Instance {
         }
     }
 
-    pub(super) fn maybe_start_poller_since(
+    pub(super) fn maybe_start_poller_since_in(
         &mut self,
-        omp_metadata: Option<OmpCaptureMetadata>,
-    ) -> PollerStart {
+        stores: CaptureStorage<'_>,
+    ) -> Result<PollerStart> {
         if !crate::migrations::v033_isolate_sandbox_content::instance_ready(self).unwrap_or(false) {
             self.session_id_poller = None;
-            return PollerStart::NotApplicable;
+            return Ok(PollerStart::NotApplicable);
         }
         if self.session_id_poller_is_running() {
-            return PollerStart::Started;
+            return Ok(PollerStart::Started);
         }
         self.session_id_poller = None;
         let Some((capture, context)) = self.source_session_support() else {
-            return PollerStart::NotApplicable;
+            return Ok(PollerStart::NotApplicable);
         };
         let backend = capture.backend;
         if !self.supports_session_poller() {
-            return PollerStart::NotApplicable;
+            return Ok(PollerStart::NotApplicable);
         }
         let prime_options = if self.active_execution.is_none()
             && backend == crate::agents::SessionCaptureBackend::PrimeAgent
@@ -288,11 +318,11 @@ impl Instance {
             crate::agents::SessionCaptureBackend::OpenCode => false,
         };
         if !eligible {
-            return PollerStart::NotApplicable;
+            return Ok(PollerStart::NotApplicable);
         }
         // Avoid configuration I/O, lease and profile scans when no poller can be spawned.
         if !crate::session::poller::session_id_poller_budget_available() {
-            return PollerStart::BudgetExhausted;
+            return Ok(PollerStart::BudgetExhausted);
         }
         let prime_plan = if let Some(active) = &self.active_execution {
             match &active.capture {
@@ -300,7 +330,7 @@ impl Instance {
                 _ => None,
             }
         } else if let Some(options) = prime_options {
-            match self.prime_agent_capture_plan(options) {
+            match self.prime_agent_capture_plan_in(options, stores) {
                 Ok(plan) => Some(plan),
                 Err(error) => {
                     self.session_id_poller_retry_after =
@@ -308,7 +338,7 @@ impl Instance {
                     tracing::warn!(target: "session.capture", session = %self.id,
                         reason = %format_args!("{error:#}"), retry_after_secs = MANAGED_CAPTURE_RETRY_BACKOFF.as_secs(),
                         "Prime session capture deferred because its configuration could not be resolved");
-                    return PollerStart::Deferred;
+                    return Ok(PollerStart::Deferred);
                 }
             }
         } else {
@@ -322,7 +352,7 @@ impl Instance {
                 .map(|plan| plan.store.clone())
                 .or_else(|| self.capture_store_dir())
             else {
-                return PollerStart::NotApplicable;
+                return Ok(PollerStart::NotApplicable);
             };
             // Lease contention is the common multi-process loser path. Check it
             // before loading every profile to prove store exclusivity.
@@ -341,15 +371,17 @@ impl Instance {
                             "Session capture deferred because this store's lease could not be resolved");
                         }
                     }
-                    return PollerStart::Deferred;
+                    return Ok(PollerStart::Deferred);
                 }
             };
-            if !self.managed_capture_store_is_exclusive(backend) {
+            if !stores.with_store(&self.effective_profile(), |storage| {
+                storage.managed_capture_store_is_exclusive(self, backend, &store)
+            })? {
                 self.session_id_poller_retry_after =
                     Some(std::time::Instant::now() + MANAGED_CAPTURE_RETRY_BACKOFF);
                 tracing::warn!(target: "session.capture", session = %self.id, ?backend,
                 "Session capture deferred because store ownership is ambiguous");
-                return PollerStart::Deferred;
+                return Ok(PollerStart::Deferred);
             }
             Some(lease)
         } else {
@@ -357,8 +389,12 @@ impl Instance {
         };
         self.session_id_poller_retry_after = None;
 
-        // Unlike the eligibility checks above, this forks `tmux list-sessions`, so it stays behind
-        // the budget gate rather than joining them.
+        // Unlike the eligibility checks above, this forks `tmux list-sessions`,
+        // so it stays behind the budget gate rather than joining them: an
+        // over-budget process would otherwise pay a fork per deferred repair.
+        // A session that is both over budget and without an agent pane is
+        // reported as over budget, and the next repair tick stops looking once
+        // its own snapshot agrees the agent pane is gone.
         let Some(tmux_session_name) = poller_seed_name(
             self.live_agent_seed(),
             || self.tmux_session().ok().map(|s| s.name().to_string()),
@@ -367,7 +403,7 @@ impl Instance {
             tracing::debug!(target: "session.create",
                 "No agent tmux session resolves for {}; session-id poller not started",
                 self.id);
-            return PollerStart::NotApplicable;
+            return Ok(PollerStart::NotApplicable);
         };
         let omp_metadata = if backend == crate::agents::SessionCaptureBackend::Omp {
             if let Some(active) = &self.active_execution {
@@ -377,10 +413,9 @@ impl Instance {
                 }
             } else {
                 let Some(options) = self.omp_capture_options() else {
-                    return PollerStart::NotApplicable;
+                    return Ok(PollerStart::NotApplicable);
                 };
-                omp_metadata
-                    .or_else(|| self.omp_capture_metadata(&tmux_session_name, &options, None))
+                self.omp_capture_metadata(&tmux_session_name, &options, None)
             }
         } else {
             None
@@ -397,7 +432,7 @@ impl Instance {
 
         if backend == crate::agents::SessionCaptureBackend::Omp {
             let Some(metadata) = omp_metadata.as_ref() else {
-                return PollerStart::NotApplicable;
+                return Ok(PollerStart::NotApplicable);
             };
             let container_name = match &self.active_execution {
                 Some(active) => active
@@ -429,12 +464,12 @@ impl Instance {
             let on_change = log_observed_session_id(&self.id);
             let initial = initial_known.map(|sid| metadata.session_observation(sid));
             let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
-            return self.install_poller(poller, spawn);
+            return Ok(self.install_poller(poller, spawn));
         }
 
         if backend == crate::agents::SessionCaptureBackend::Pi {
             let Some(source) = self.pi_sidecar_source() else {
-                return PollerStart::NotApplicable;
+                return Ok(PollerStart::NotApplicable);
             };
             let inner = crate::session::capture::pi_sidecar_poll_fn(
                 self.id.clone(),
@@ -448,7 +483,7 @@ impl Instance {
                 crate::session::poller::SessionIdObservation::instance_sidecar(sid, None)
             });
             let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
-            return self.install_poller(poller, spawn);
+            return Ok(self.install_poller(poller, spawn));
         }
 
         if matches!(
@@ -470,7 +505,7 @@ impl Instance {
                 crate::session::poller::SessionIdObservation::instance_sidecar(sid, None)
             });
             let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
-            return self.install_poller(poller, spawn);
+            return Ok(self.install_poller(poller, spawn));
         }
 
         let capture_floor = self
@@ -497,7 +532,7 @@ impl Instance {
             | crate::agents::SessionCaptureBackend::Hermes
             | crate::agents::SessionCaptureBackend::Kimi) => {
                 let Some(store) = self.capture_store_dir() else {
-                    return PollerStart::NotApplicable;
+                    return Ok(PollerStart::NotApplicable);
                 };
                 let workdir = store_cwd.unwrap_or_else(|| self.container_workdir());
                 let id = self.id.clone();
@@ -544,7 +579,7 @@ impl Instance {
             }
             crate::agents::SessionCaptureBackend::PrimeAgent => {
                 let Some(plan) = prime_plan else {
-                    return PollerStart::NotApplicable;
+                    return Ok(PollerStart::NotApplicable);
                 };
                 let preferred_sidecar = self.prime_root_sidecar_poll_fn(plan.clone());
                 Box::new(prime_agent_poll_fn_sandboxed(
@@ -560,7 +595,7 @@ impl Instance {
             | crate::agents::SessionCaptureBackend::HookSidecar
             | crate::agents::SessionCaptureBackend::OpenCode
             | crate::agents::SessionCaptureBackend::Pi
-            | crate::agents::SessionCaptureBackend::Omp => return PollerStart::NotApplicable,
+            | crate::agents::SessionCaptureBackend::Omp => return Ok(PollerStart::NotApplicable),
         };
         let poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static> =
             if let Some(lease) = managed_lease {
@@ -591,7 +626,14 @@ impl Instance {
         let initial = initial_known
             .map(|sid| crate::session::poller::SessionIdObservation::instance_sidecar(sid, None));
         let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
-        self.install_poller(poller, spawn)
+        Ok(self.install_poller(poller, spawn))
+    }
+
+    #[cfg(test)]
+    pub(super) fn maybe_start_poller_since(&mut self) -> PollerStart {
+        let file_watch = self.resolve_file_watch();
+        self.maybe_start_poller_since_in(CaptureStorage::Profiles(&file_watch))
+            .unwrap_or(PollerStart::SpawnFailed)
     }
 
     pub(crate) fn session_id_poller_is_running(&self) -> bool {
@@ -604,11 +646,16 @@ impl Instance {
     }
 
     /// Replace a missing or finished poller once its tmux pane is live.
+    ///
+    /// OMP pollers reload pane metadata on every tick, so a replacement binds
+    /// to the durable generation that won any concurrent restart race.
     pub(crate) fn repair_session_id_poller_if_needed(
         &mut self,
         snapshot: &crate::tmux::LiveSessionSnapshot,
     ) -> bool {
-        // Structured sessions have ACP workers rather than tmux panes.
+        // Structured sessions have ACP workers rather than tmux panes. Their
+        // lifecycle is reconciled by the daemon, so probing tmux here can only
+        // fail and is especially costly from the native TUI's refresh loop.
         if self.is_structured()
             || !self.supports_session_poller()
             || self.session_id_poller_is_running()
@@ -622,8 +669,9 @@ impl Instance {
             return false;
         }
         let now = std::time::Instant::now();
-        // A failed attempt schedules the next one (5 s doubling to 60 s), so an over-budget fleet
-        // is not re-probed — and re-warned — for every session on every 2 s tick.
+        // A failed attempt schedules the next one (5 s doubling to 60 s), so
+        // an over-budget fleet is not re-probed — and re-warned — for every
+        // session on every 2 s tick.
         if !self.poller_repair.due(now) {
             return false;
         }
@@ -631,8 +679,9 @@ impl Instance {
         match self.maybe_start_poller() {
             // `install_poller` cleared the schedule.
             PollerStart::Started => true,
-            // Nothing failed: the session has nothing to poll right now, or the managed store's own
-            // retry deadline governs.
+            // Nothing failed: the session has nothing to poll right now, or
+            // the managed store's own retry deadline governs. Neither is a
+            // reason to back off or to blame the thread budget.
             PollerStart::NotApplicable | PollerStart::Deferred => {
                 self.poller_repair.reset();
                 false
@@ -699,24 +748,41 @@ impl Instance {
                 return;
             }
         };
-        self.stop_and_flush_poller_lifecycle_locked();
+        if let Err(error) = self.stop_and_flush_poller_lifecycle_locked(&storage) {
+            tracing::warn!(target: "session.sync", session = %self.id, %error, "final capture failed");
+        }
     }
 
-    pub(super) fn stop_and_flush_poller_lifecycle_locked(&mut self) {
-        // A Pi pane's last word is in its sidecar, which no poller may have read: a CLI-only pane
-        // has none, and a restart tears the pane down before the next one starts.
-        self.flush_published_if_present();
-        // stop_poller() signals the thread but leaves the handle in place, so this is_some() means
-        // "a poller existed and may have queued a final observation".
-        self.stop_poller();
-        if self.session_id_poller.is_some() {
-            let file_watch = self.resolve_file_watch();
-            let _ = crate::session::sync::drain_and_persist_session_ids_lifecycle_locked(
-                std::slice::from_mut(self),
-                &file_watch,
-            );
+    pub(super) fn stop_and_flush_poller_lifecycle_locked(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+    ) -> anyhow::Result<()> {
+        let flush = self.flush_published_conversation(storage);
+        if !matches!(flush, Some(SidWrite::Failed)) {
+            if let Ok(rows) = storage.load() {
+                if let Some(row) = rows.into_iter().find(|row| row.id == self.id) {
+                    self.adopt_conversation_state(row.conversation_state());
+                    self.resume_probe_failed_sid = row.resume_probe_failed_sid;
+                    self.omp_capture_generation = row.omp_capture_generation;
+                }
+            }
         }
+        self.stop_poller();
+        let result = match flush {
+            Some(SidWrite::Failed) => Err(anyhow::anyhow!(
+                "could not persist final conversation publication"
+            )),
+            _ if self.session_id_poller.is_some() => {
+                crate::session::sync::drain_and_persist_session_ids_lifecycle_locked(
+                    std::slice::from_mut(self),
+                    storage,
+                )
+                .map(|_| ())
+            }
+            _ => Ok(()),
+        };
         self.session_id_poller = None;
+        result
     }
 }
 
@@ -937,7 +1003,8 @@ mod tests {
         let published = "01a053b6-c470-78de-9d8f-bc00ef05332a";
         super::super::test_helpers::publish_host_pi_transcript(&inst.id, published, home.path());
 
-        inst.stop_and_flush_poller_lifecycle_locked();
+        inst.stop_and_flush_poller_lifecycle_locked(&storage)
+            .unwrap();
 
         assert_eq!(
             storage.load().unwrap()[0].agent_session_id.as_deref(),

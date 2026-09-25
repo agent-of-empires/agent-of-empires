@@ -138,9 +138,11 @@ fn right_click_archive_action_archives_session() {
         "precondition: session starts unarchived"
     );
 
-    env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
-    env.view.handle_key(key(KeyCode::Down), None); // Rename -> Archive
-    env.view.handle_key(key(KeyCode::Enter), None);
+    with_canonical_archive(&mut env, |env| {
+        env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
+        env.view.handle_key(key(KeyCode::Down), None); // Rename -> Archive
+        env.view.handle_key(key(KeyCode::Enter), None);
+    });
 
     assert!(env.view.context_menu.is_none(), "menu closes after archive");
     assert!(
@@ -161,7 +163,9 @@ fn right_click_unarchive_action_restores_session() {
     env.view.cursor = 0;
     env.view.update_selected();
     let id = env.view.selected_session.clone().unwrap();
-    env.view.toggle_archive_at_cursor().unwrap();
+    with_canonical_archive(&mut env, |env| {
+        env.view.toggle_archive_at_cursor().unwrap();
+    });
     assert!(env.view.get_instance(&id).unwrap().is_archived());
 
     // Right-click the archived row: its menu must read "Unarchive".
@@ -177,9 +181,11 @@ fn right_click_unarchive_action_restores_session() {
     let row = shelf_row_for_idx(&env.view, idx);
     assert!(env.view.handle_right_click(5, row));
 
-    env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
-    env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive
-    env.view.handle_key(key(KeyCode::Enter), None);
+    with_canonical_archive(&mut env, |env| {
+        env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
+        env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive
+        env.view.handle_key(key(KeyCode::Enter), None);
+    });
     assert!(
         !env.view.get_instance(&id).unwrap().is_archived(),
         "context-menu Unarchive must unarchive the session"
@@ -412,6 +418,7 @@ fn left_click_on_empty_sidebar_in_live_mode_exits_live_mode() {
         target: live_send::LiveSendTarget::Agent,
         exit_chords: live_send::parse_chord_list(live_send::DEFAULT_EXIT_CHORD),
         leader: None,
+        remote: None,
     });
     assert!(env.view.live_send.is_some());
     assert!(env.view.handle_empty_list_click(5, 5));

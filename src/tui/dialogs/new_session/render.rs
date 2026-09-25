@@ -79,6 +79,9 @@ impl NewSessionDialog {
             };
 
         let mut constraints = Vec::new();
+        if self.has_remote_selection() {
+            constraints.push(Constraint::Length(2)); // Remote
+        }
         if has_profile_selection {
             constraints.push(Constraint::Length(profile_field_height)); // Profile
         }
@@ -142,10 +145,19 @@ impl NewSessionDialog {
 
         let fields = self.field_indices();
 
+        // Machine picker, drawn only when a remote is configured.
+        if self.has_remote_selection() {
+            let area = chunks[ci];
+            self.render_remote_field(frame, area, theme);
+            self.focusable_rects.push((fields.remote, area));
+            ci += 1;
+        }
+
+        // Profile picker (only when multiple profiles)
         if has_profile_selection {
             let area = chunks[ci];
             self.render_profile_field(frame, area, theme);
-            self.focusable_rects.push((0, area));
+            self.focusable_rects.push((fields.profile, area));
             ci += 1;
         }
 
@@ -516,12 +528,30 @@ impl NewSessionDialog {
         }
     }
 
+    fn render_remote_field(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let remote = self.selected_remote();
+        let mut spans = profile_cycler_spans(
+            "Remote:",
+            remote.map_or("Local", |t| t.name.as_str()),
+            self.remote_targets.len() + 1,
+            self.focused_field == 0,
+            theme,
+        );
+        if let Some(Err(unavailable)) = remote.map(|t| &t.machine) {
+            spans.push(Span::styled(
+                format!("  ({})", unavailable.label()),
+                Style::default().fg(theme.dimmed),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
     fn render_profile_field(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let spans = profile_cycler_spans(
             "Profile:",
             self.selected_profile(),
             self.available_profiles.len(),
-            self.focused_field == 0,
+            self.focused_field == self.field_indices().profile,
             theme,
         );
 
@@ -1109,6 +1139,7 @@ impl NewSessionDialog {
         // Base fields: Scratch, Title, Path, YOLO, Worktree, Group + close hint
         let base_height: u16 = 20;
         let dialog_height: u16 = base_height
+            + if self.has_remote_selection() { 3 } else { 0 }
             + if has_profile_selection { 3 } else { 0 }
             + if has_tool_selection { 3 } else { 0 }
             + if has_sandbox { 3 } else { 0 }
@@ -1133,6 +1164,7 @@ impl NewSessionDialog {
         // not silently shift every condition by one.
         for help in FIELD_HELP {
             let show = match help.name {
+                "Remote" => self.has_remote_selection(),
                 "Profile" => has_profile_selection,
                 "Tool" => has_tool_selection,
                 "YOLO Mode" => !self.selected_tool_always_yolo(),

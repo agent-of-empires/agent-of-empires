@@ -135,9 +135,10 @@ describe("row patches", () => {
 });
 
 describe("mouse forwarding", () => {
+  // Buttons only: the wheel goes as a `wheel` control message the daemon
+  // encodes, so a viewer without the size lock can still scroll. See
+  // `useLiveTerminal.forward.test.ts`.
   it.each([
-    ["SGR wheel", (h: ReturnType<typeof useLiveTerminal>) => h.forwardWheel(true, true, 3, 3), ["\x1b[<64;3;3M"]],
-    ["legacy X10 wheel", (h: ReturnType<typeof useLiveTerminal>) => h.forwardWheel(false, false, 3, 3), ["\x1b[Ma##"]],
     [
       "SGR press, drag, release",
       (h: ReturnType<typeof useLiveTerminal>) => {

@@ -17,6 +17,7 @@ export function useForwardInput({
   lineH,
   rowsRef,
   forwardModeRef,
+  mouseTrackingRef,
   mouseSgrRef,
   pointerCell,
   inputPaneMiddleRow,
@@ -29,10 +30,11 @@ export function useForwardInput({
   lineH: number;
   rowsRef: RefObject<number>;
   forwardModeRef: RefObject<boolean>;
+  mouseTrackingRef: RefObject<boolean>;
   mouseSgrRef: RefObject<boolean>;
   pointerCell: (clientX: number, clientY: number) => Cell;
   inputPaneMiddleRow: () => number;
-  forwardWheel: (up: boolean, sgr: boolean, col: number, row: number) => void;
+  forwardWheel: (up: boolean, col: number, row: number, count?: number) => void;
   forwardButton: (
     baseButton: number,
     release: boolean,
@@ -59,9 +61,9 @@ export function useForwardInput({
       wheelAccumRef.current = remainder;
       if (notches === 0) return;
       const { col, row } = pointerCell(e.clientX, e.clientY);
-      for (let i = 0; i < Math.abs(notches); i++) forwardWheel(notches < 0, mouseSgrRef.current, col, row);
+      forwardWheel(notches < 0, col, row, Math.abs(notches));
     },
-    [lineH, rowsRef, pointerCell, forwardWheel, forwardModeRef, mouseSgrRef],
+    [lineH, rowsRef, pointerCell, forwardWheel, forwardModeRef],
   );
 
   const cancelTouchWheelQueue = useCallback(() => notchPacer.cancel(), [notchPacer]);
@@ -75,10 +77,10 @@ export function useForwardInput({
         if (!forwardModeRef.current) return;
         const { col } = pointerCell(clientX, clientY);
         const row = inputPaneMiddleRow();
-        for (let i = 0; i < count; i++) forwardWheel(up, mouseSgrRef.current, col, row);
+        forwardWheel(up, col, row, count);
       });
     },
-    [lineH, notchPacer, pointerCell, forwardWheel, forwardModeRef, mouseSgrRef, inputPaneMiddleRow],
+    [lineH, notchPacer, pointerCell, forwardWheel, forwardModeRef, inputPaneMiddleRow],
   );
   useEffect(() => cancelTouchWheelQueue, [cancelTouchWheelQueue]);
   // A frame after a forwarded notch acknowledges it, releasing the next burst.
@@ -120,7 +122,8 @@ export function useForwardInput({
   // Mouse buttons for a full-screen mouse app; touch has its own path and Shift keeps local selection.
   const onPointerDown = useCallback(
     (e: React.PointerEvent) => {
-      if (e.pointerType !== "mouse" || !forwardModeRef.current || e.shiftKey) return;
+      if (e.pointerType !== "mouse" || !forwardModeRef.current || !mouseTrackingRef.current) return;
+      if (e.shiftKey) return;
       const base = [0, 1, 2].includes(e.button) ? e.button : -1;
       // A primary press on a link belongs to the browser; capture would retarget the click away from it.
       if (base < 0 || (base === 0 && (e.target as Element | null)?.closest?.("a[href]"))) return;
@@ -136,7 +139,7 @@ export function useForwardInput({
         // Unsupported in jsdom; capture is optional.
       }
     },
-    [pointerCell, forwardButton, inputRef, forwardModeRef, mouseSgrRef],
+    [pointerCell, forwardButton, inputRef, forwardModeRef, mouseTrackingRef, mouseSgrRef],
   );
   const onPointerMove = useCallback(
     (e: React.PointerEvent) => {

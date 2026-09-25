@@ -4,6 +4,39 @@
 use super::*;
 
 impl Instance {
+    pub(crate) fn inherit_runtime(&mut self, mut prior: Self, preserve_errors: bool) {
+        if preserve_errors {
+            self.last_error = prior.last_error.take();
+            self.last_error_check = prior.last_error_check;
+        }
+        self.live_status_baseline = prior.live_status_baseline;
+        self.ever_confirmed_present = prior.ever_confirmed_present;
+        self.unknown_since = prior.unknown_since;
+        self.detection = prior.detection;
+        self.pane_dead_observed = prior.pane_dead_observed;
+        self.agent_pane = std::mem::take(&mut prior.agent_pane);
+        self.auxiliary = std::mem::take(&mut prior.auxiliary);
+        self.inherit_process_runtime(prior);
+    }
+
+    /// Keep launch-owned process state without replacing a fresh status observation.
+    pub(crate) fn inherit_process_runtime(&mut self, prior: Self) {
+        self.last_start_time = prior.last_start_time;
+        self.session_id_poller = prior.session_id_poller;
+        self.poller_repair = prior.poller_repair;
+        self.session_id_poller_retry_after = prior.session_id_poller_retry_after;
+        self.retroactive_capture_excludes = prior.retroactive_capture_excludes;
+        self.acp_load_session_capable = prior.acp_load_session_capable;
+        self.force_fresh_next_launch = prior.force_fresh_next_launch;
+        self.pending_host_env = prior.pending_host_env;
+        self.pi_extension_launched = prior.pi_extension_launched;
+        self.identity_publisher_launched = prior.identity_publisher_launched;
+        self.file_watch = self.file_watch.take().or(prior.file_watch);
+        if let (Some(fresh), Some(previous)) = (self.sandbox_info.as_mut(), prior.sandbox_info) {
+            fresh.before_start_env = previous.before_start_env;
+        }
+    }
+
     /// Mutates launch-owned state. A strictly newer lifecycle generation also
     /// imports its status timestamps, capture floor, and error snapshot as one unit.
     pub fn merge_post_start(&mut self, src: &Self) {
@@ -27,7 +60,9 @@ impl Instance {
         self.capture_started_at = src.capture_started_at;
     }
 
-    /// Same fields as `merge_post_start`.
+    /// Same fields as `merge_post_start`. Resume-probe failure markers are
+    /// copied only when the sid still matches so peer poller writes that land
+    /// between phase 2 and phase 3 of the restart remain authoritative.
     pub fn merge_post_restart(&mut self, src: &Self) {
         if src.lifecycle_generation < self.lifecycle_generation {
             return;
@@ -70,9 +105,11 @@ impl Instance {
         }
     }
 
-    /// Carry runtime-only state across a storage reload without constructing a lifecycle snapshot
-    /// from two different generations.
+    /// Preserve runtime observations; newer lifecycle state owns status and pane liveness.
+    /// A purge reservation retains its in-memory Deleting overlay.
     pub(crate) fn merge_runtime_from_reload(&mut self, previous: &Self) {
+        self.agent_pane.clone_from(&previous.agent_pane);
+        self.auxiliary.clone_from(&previous.auxiliary);
         let purge_in_flight = previous.status == Status::Deleting
             && self.lifecycle_reservation_is_owned(
                 LifecycleOperation::Purge,
@@ -81,9 +118,10 @@ impl Instance {
         if self.lifecycle_generation <= previous.lifecycle_generation || purge_in_flight {
             self.status = previous.status;
             self.idle_entered_at = previous.idle_entered_at;
+            self.live_status_baseline = previous.live_status_baseline;
+            self.pane_dead_observed = previous.pane_dead_observed;
         }
-        // Reachability sentinels and detection bookkeeping are runtime-only just like poller
-        // errors.
+        // Storage does not contain detection proposals or runtime diagnostics.
         self.ever_confirmed_present = previous.ever_confirmed_present;
         self.unknown_since = previous.unknown_since;
         self.detection = previous.detection;
@@ -100,8 +138,8 @@ impl Instance {
         self.acp_load_session_capable = previous.acp_load_session_capable;
     }
 
-    /// Carry every in-process field from a pre-move live row onto the committed disk-derived
-    /// candidate published by `HomeView`.
+    /// Carry live launch and polling state across a committed profile move.
+    /// Keep reload and move merging aligned when adding runtime-only fields.
     pub(crate) fn merge_runtime_for_profile_move(&mut self, previous: &Self) {
         self.merge_runtime_from_reload(previous);
         self.live_status_baseline = previous.live_status_baseline;
@@ -118,7 +156,15 @@ impl Instance {
         }
     }
 
-    /// Splice TUI-mirrored, persisted fields from `src` onto `self`.
+    /// Splice TUI-mirrored, persisted fields from `src` onto `self`. Used by
+    /// `HomeView::save` for fields the TUI is the canonical disk writer of
+    /// (the daemon's `status_poll_loop` keeps these in memory only). The
+    /// server's `send_message` respawn briefly writes `status` via
+    /// `apply_post_restart_sync`; the resulting transient mis-paint
+    /// converges on the next `status_poll` tick.
+    /// User-action fields (archived/favorited/snoozed/title/group_path/...)
+    /// are NOT here; they go through `apply_user_action` per-action so peer
+    /// writers (CLI) cannot be clobbered by a stale TUI snapshot.
     pub fn merge_from_tui(&mut self, src: &Self) {
         if src.lifecycle_generation >= self.lifecycle_generation {
             self.lifecycle_generation = src.lifecycle_generation;
@@ -131,8 +177,12 @@ impl Instance {
                 self.settle_archived_status();
             }
         }
-        // Launch-config fields are TUI-authoritative and only mutated after creation by the restart
-        // dialog (engine / command / args swap).
+        // Launch-config fields are TUI-authoritative and only mutated after
+        // creation by the restart dialog (engine / command / args swap). They
+        // have no peer writer, so a plain copy is safe. Syncing them here is
+        // required: `reconcile_from_disk`'s `*self = disk` reload runs on every
+        // launch, so a swap that never reached disk is silently reverted and
+        // the session respawns with its original tool. See #switching-tools.
         self.tool = src.tool.clone();
         self.command = src.command.clone();
         self.extra_args = src.extra_args.clone();
@@ -169,13 +219,16 @@ impl Instance {
             self.resume_binding = None;
         }
         self.adopt_tool(new_tool);
+
         self.acp_load_session_capable = None;
         self.resume_probe_failed_sid = None;
         self.active_execution = None;
         self.acp_effort = None;
         self.agent_model = None;
+
         self.import_pending = None;
         self.fork_pending = None;
+
         self.agent_name = None;
     }
 
@@ -228,8 +281,32 @@ impl Instance {
                 .into_owned();
     }
 
-    /// Apply a passively-detected status transition to a disk row. Touches the same three fields as
-    /// [`Self::merge_from_tui`] (`status`, `idle_entered_at`, `last_accessed_at`).
+    /// Apply a passively-detected status transition to a disk row. Touches
+    /// the same three fields as [`Self::merge_from_tui`] (`status`,
+    /// `idle_entered_at`, `last_accessed_at`); the real distinction is the
+    /// API shape (a minimal [`PassiveStatusPatch`] rather than a full
+    /// `Self`) and the merge policy on `last_accessed_at`: `merge_from_tui`
+    /// takes the monotone max, this drops the incoming `last_accessed_at`
+    /// outright when disk already has a strictly newer one, so a
+    /// poller-produced patch loses to a newer explicit user touch instead of
+    /// racing it.
+    ///
+    /// `status`/`idle_entered_at` apply independently of timestamp only while
+    /// the patch's lifecycle generation is current. This prevents an old pane
+    /// poll from repainting a newer Stop/Restart/Archive commit.
+    ///
+    /// The `>=` guard on `last_accessed_at` compares `chrono::Utc::now()`
+    /// values, which delegate to `SystemTime::now()` (wall clock, not
+    /// monotonic). Under an NTP rewind, a genuinely newer live observation
+    /// stamped after the rewind can compare less than a value stamped
+    /// before it and be silently dropped. Best-effort monotone, not a hard
+    /// guarantee; the next poll tick converges regardless.
+    ///
+    /// A `last_accessed_at` older-or-equal to disk is silently dropped
+    /// (the `>=` guard) with a `session.store` debug log at drop time,
+    /// while `status` and `idle_entered_at` still apply unconditionally.
+    /// Callers relying on the observable `last_accessed_at` change must
+    /// re-read the field after `merge_passive_status_patch` returns.
     pub(crate) fn merge_passive_status_patch(&mut self, id: &str, patch: &PassiveStatusPatch) {
         if patch.lifecycle_generation < self.lifecycle_generation {
             tracing::debug!(
@@ -244,8 +321,10 @@ impl Instance {
         self.lifecycle_generation = patch.lifecycle_generation;
         self.status = patch.status;
         self.idle_entered_at = patch.idle_entered_at;
-        // A patch decided from a pane observed before a concurrent archive landed is stale by
-        // construction: the archive tore the tmux down.
+        // A patch decided from a pane observed before a concurrent archive
+        // landed is stale by construction: the archive tore the tmux down.
+        // Writing its Running/Waiting verbatim would resurrect the frozen
+        // pending-permission row the archived poll guard settles.
         if self.is_archived() {
             self.settle_archived_status();
         }
@@ -265,71 +344,104 @@ impl Instance {
         self.last_accessed_at = Some(incoming);
     }
 
-    /// Merge the complete user-requested delta for a cross-profile move while preserving unrelated
-    /// fields refreshed by a peer after `pre` was read. `account_swap` says the tool change keeps
-    /// the same agent and changes only which account it runs as, so the conversation travels with
-    /// the row instead of being parked (#4030). The caller classifies it, rather than this
-    /// deciding for itself, so the row that lands matches the swap the restart already planned its
-    /// transcript copy for.
+    /// Merge the complete user-requested delta for a cross-profile move while
+    /// preserving unrelated fields refreshed by a peer after `pre` was read.
+    /// A tool change is one atomic state transition: the tool name and every
+    /// conversation field staged by `swap_tool` must travel together.
+    /// `account_swap` says the tool change keeps the same agent and changes
+    /// only which account it runs as, so the conversation travels with the row
+    /// instead of being parked (#4030). The caller classifies it, rather than
+    /// this deciding for itself, so the row that lands matches the swap the
+    /// restart already planned its transcript copy for.
     pub(crate) fn merge_profile_move_diff(&mut self, pre: &Self, post: &Self, account_swap: bool) {
         self.merge_user_action_diff(pre, post);
         if pre.tool != post.tool {
             // Apply the requested transition to the freshly locked disk row.
+            // The TUI post snapshot can carry parked session ids captured
+            // before a poller or peer refreshed the durable conversation state.
             if account_swap {
                 self.swap_account(&post.tool);
             } else {
                 self.swap_tool(&post.tool);
             }
         }
-        splice(&mut self.command, &pre.command, &post.command);
-        splice(&mut self.extra_args, &pre.extra_args, &post.extra_args);
+        if pre.command != post.command {
+            self.command = post.command.clone();
+        }
+        if pre.extra_args != post.extra_args {
+            self.extra_args = post.extra_args.clone();
+        }
     }
 
-    /// Per-field-conditional splice: copy `post.X` onto `self.X` only when `pre.X != post.X`.
+    /// Per-field-conditional splice: copy `post.X` onto `self.X` only when
+    /// `pre.X != post.X`. Peer writes to fields the mutation did not touch
+    /// survive even when the field is in the user-action set.
+    /// `last_accessed_at` is monotone-max (no diff guard).
+    /// `source_profile` is excluded from this splice. Same-profile actions call
+    /// this directly; cross-profile moves call it through
+    /// `merge_profile_move_diff` and assign `source_profile` separately.
+    /// Post-splice rules enforce the same cross-field invariants the
+    /// per-mutation methods enforce (archive XOR favorite, touch unarchives)
+    /// so concurrent peer writes cannot violate them.
     pub fn merge_user_action_diff(&mut self, pre: &Self, post: &Self) {
         debug_assert_eq!(
             pre.source_profile, post.source_profile,
             "apply_user_action must not change source_profile; cross-profile moves go through mutate_instance"
         );
-        splice(&mut self.title, &pre.title, &post.title);
-        splice(&mut self.group_path, &pre.group_path, &post.group_path);
-        splice(&mut self.archived_at, &pre.archived_at, &post.archived_at);
-        splice(
-            &mut self.favorited_at,
-            &pre.favorited_at,
-            &post.favorited_at,
-        );
-        splice(
-            &mut self.snoozed_until,
-            &pre.snoozed_until,
-            &post.snoozed_until,
-        );
-        splice(&mut self.pinned_at, &pre.pinned_at, &post.pinned_at);
-        splice(&mut self.trashed_at, &pre.trashed_at, &post.trashed_at);
-        splice(
-            &mut self.pre_trash_project_path,
-            &pre.pre_trash_project_path,
-            &post.pre_trash_project_path,
-        );
-        splice(&mut self.unread, &pre.unread, &post.unread);
-        splice(
-            &mut self.base_branch_override,
-            &pre.base_branch_override,
-            &post.base_branch_override,
-        );
-        splice(&mut self.color, &pre.color, &post.color);
-        // Worktree workdir edit (move dir / rename branch) mutates these two.
-        splice(
-            &mut self.project_path,
-            &pre.project_path,
-            &post.project_path,
-        );
-        splice(
-            &mut self.worktree_info,
-            &pre.worktree_info,
-            &post.worktree_info,
-        );
-        // `workspace_info` deliberately has NO arm.
+        if pre.title != post.title {
+            self.title = post.title.clone();
+        }
+        if pre.group_path != post.group_path {
+            self.group_path = post.group_path.clone();
+        }
+        if pre.archived_at != post.archived_at {
+            self.archived_at = post.archived_at;
+        }
+        if pre.favorited_at != post.favorited_at {
+            self.favorited_at = post.favorited_at;
+        }
+        if pre.snoozed_until != post.snoozed_until {
+            self.snoozed_until = post.snoozed_until;
+        }
+        if pre.pinned_at != post.pinned_at {
+            self.pinned_at = post.pinned_at;
+        }
+        if pre.trashed_at != post.trashed_at {
+            self.trashed_at = post.trashed_at;
+        }
+        if pre.pre_trash_project_path != post.pre_trash_project_path {
+            self.pre_trash_project_path = post.pre_trash_project_path.clone();
+        }
+        if pre.unread != post.unread {
+            self.unread = post.unread;
+        }
+        if pre.base_branch_override != post.base_branch_override {
+            self.base_branch_override = post.base_branch_override.clone();
+        }
+        if pre.color != post.color {
+            self.color = post.color.clone();
+        }
+        // Worktree workdir edit (move dir / rename branch) mutates these two;
+        // both the TUI and the CLI can write them, so they go through the
+        // same conditional-diff path as the triage fields. See #1723.
+        if pre.project_path != post.project_path {
+            self.project_path = post.project_path.clone();
+        }
+        if pre.worktree_info != post.worktree_info {
+            self.worktree_info = post.worktree_info.clone();
+        }
+        // `workspace_info` deliberately has NO arm. Attaching a project (#3103)
+        // converts the session into a workspace, but it does that through
+        // `Storage::update` (which takes both lock layers) rather than through a
+        // user-action diff, so the value on disk is already authoritative here.
+        // Assigning `post`'s copy would let a stale TUI snapshot clobber a
+        // conversion a peer landed between the `pre` snapshot and this merge.
+        // `status` deliberately has no arm. It is runtime state, not user
+        // intent; copying it from a stale TUI snapshot could overwrite a
+        // lifecycle transition loaded under the storage lock.
+        // Lifecycle ownership is intentionally never spliced from a TUI
+        // snapshot. Only transition code holding the per-instance flock may
+        // mutate the durable reservation and generation.
         self.last_accessed_at = self.last_accessed_at.max(post.last_accessed_at);
 
         let archived_changed = pre.archived_at != post.archived_at;
@@ -360,28 +472,33 @@ impl Instance {
             self.archived_at = None;
             self.snoozed_until = None;
         }
-        // touch_last_accessed(): clears archived + snoozed + idle-dormant. Does NOT clear favorite
-        // or pin (both are explicit user-surfacing signals, not sink states).
+        // touch_last_accessed(): clears archived + snoozed + idle-dormant.
+        // Does NOT clear favorite or pin (both are explicit user-surfacing
+        // signals, not sink states). Mirrors touch_last_accessed() so the
+        // wake-from-dormancy invariant holds on the concurrent-writer merge
+        // path too, not just direct touches (#1689).
         if touched {
             self.archived_at = None;
             self.snoozed_until = None;
             self.idle_dormant_since = None;
         }
-        // Final-state invariant: archive is the strongest dismiss and wins over snooze.
+        // Final-state invariant: archive is the strongest dismiss and
+        // wins over snooze. The per-mutation rules above clear other
+        // flags on the change side, but the diff can also leave disk
+        // archived (pre-existing) AND snoozed (added by post); without
+        // this check the row would persist both and the web sidebar's
+        // tier comparator (which assumes exactly one active triage
+        // state) would render contradictory chips. See #1581.
         if self.archived_at.is_some() {
             self.snoozed_until = None;
         }
-        // archive(): a row whose tmux archive tore down cannot hold a live-interaction status.
+        // archive(): a row whose tmux archive tore down (#1868) cannot hold a
+        // live-interaction status. `status` has no splice arm above, so the
+        // Idle that `archive()` settled on `post` never travels here on its
+        // own; settle disk's own copy instead, whichever writer archived it.
         if self.is_archived() {
             self.settle_archived_status();
         }
-    }
-}
-
-/// Copy `post` onto `dst` only when the user action changed it (`pre != post`).
-fn splice<T: PartialEq + Clone>(dst: &mut T, pre: &T, post: &T) {
-    if pre != post {
-        *dst = post.clone();
     }
 }
 

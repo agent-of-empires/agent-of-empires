@@ -1,7 +1,9 @@
 //! `POST /api/projects` without a `name` derives one from the path basename; two paths sharing a
 //! basename must both register (see `projects::unique_name`) instead of the second getting a 409.
 
-use agent_of_empires::server::test_support::{build_router_for_test, build_test_app_state};
+use agent_of_empires::server::test_support::{
+    build_router_for_test, build_test_app_state, refresh_canonical_metadata_for_test,
+};
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{Method, Request, StatusCode};
@@ -30,7 +32,11 @@ async fn create_project(
     app: &axum::Router,
     path: &std::path::Path,
 ) -> (StatusCode, serde_json::Value) {
-    let body = serde_json::json!({ "path": path.to_string_lossy() });
+    let body = serde_json::json!({
+        "path": path.to_string_lossy(),
+        "profile": "test",
+        "scope": "global",
+    });
     let resp = app
         .clone()
         .oneshot(request(
@@ -62,7 +68,9 @@ async fn create_project_dedupes_auto_derived_name_on_basename_collision() {
     std::fs::create_dir_all(&repo_a).unwrap();
     std::fs::create_dir_all(&repo_b).unwrap();
 
+    agent_of_empires::session::create_profile("test").unwrap();
     let state = build_test_app_state(Vec::new());
+    refresh_canonical_metadata_for_test(&state).await;
     let app = build_router_for_test(state);
 
     let (status_a, body_a) = create_project(&app, &repo_a).await;
