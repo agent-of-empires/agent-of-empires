@@ -96,6 +96,24 @@ pub struct SessionCaptureSpec {
     pub sandbox: SessionCaptureContext,
 }
 
+impl SessionCaptureSpec {
+    /// Whether, in `context`, the pane's conversation id is published into the AoE hook sidecar
+    /// under this pane's own `AOE_INSTANCE_ID`.
+    ///
+    /// The single decision every sidecar consumer (poller, retroactive capture, reconciliation,
+    /// sidecar cleanup, wrapper attribution) goes through, so none of them can disagree about
+    /// where an id comes from. Codex is context-dependent: a host pane publishes from its
+    /// `SessionStart` hook, while a sandboxed one keeps the isolated managed-store scan, so it
+    /// reads the sidecar only when `PaneScoped`.
+    pub(crate) fn reads_hook_sidecar(&self, context: SessionCaptureContext) -> bool {
+        match self.backend {
+            SessionCaptureBackend::Claude | SessionCaptureBackend::HookSidecar => true,
+            SessionCaptureBackend::Codex => context == SessionCaptureContext::PaneScoped,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionSupport {
     pub resume: ResumeStrategy,
@@ -562,7 +580,9 @@ pub const AGENTS: &[AgentDef] = &[
         session_support: session_support(
             ResumeStrategy::Subcommand("resume"),
             SessionCaptureBackend::Codex,
-            SessionCaptureContext::Unsupported,
+            // Host: the `SessionStart` hook publishes into the pane's sidecar.
+            // Sandbox: the isolated managed store, as before.
+            SessionCaptureContext::PaneScoped,
             SessionCaptureContext::ManagedExclusiveStore,
         ),
         fork_strategy: ForkStrategy::CodexFork,

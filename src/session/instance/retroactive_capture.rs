@@ -39,6 +39,18 @@ impl Instance {
         }
         let exclusion = HashSet::new();
         match backend {
+            // Guarded first so a context-dependent backend (Codex on a host pane) reads the
+            // sidecar rather than its store-backed arm.
+            _ if capture.reads_hook_sidecar(context) => super::execution::hook_session_observation(
+                &self.id,
+                self.active_execution.as_ref(),
+                None,
+            )
+            .filter(|observation| {
+                !self
+                    .retroactive_capture_exclusion_set(observation.source.as_ref())
+                    .contains(&observation.sid)
+            }),
             crate::agents::SessionCaptureBackend::Claude
             | crate::agents::SessionCaptureBackend::HookSidecar => {
                 super::execution::hook_session_observation(
