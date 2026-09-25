@@ -510,85 +510,56 @@ mod tests {
         );
     }
 
+    /// Parked sessions (archive, stop, live snooze), an ambiguously failed resume sid, and a
+    /// wrapper without native resume identity (#3678) are never startup-recovery candidates;
+    /// clearing the state restores eligibility. Archive and stop both kill the pane, so a
+    /// dead pane alone must not trigger recovery.
     #[test]
-    fn custom_direct_alias_is_recoverable_but_wrapper_is_not() {
-        let mut inst = Instance::new("custom", "/tmp/test");
-        inst.tool = "custom-agent".to_string();
-        inst.detect_as = "claude".to_string();
-        inst.agent_session_id = Some("11111111-1111-4111-8111-111111111111".into());
-        inst.command = "claude --model opus".to_string();
-        assert!(is_recovery_candidate(&inst));
-
-        inst.command = "/opt/wrappers/claude".to_string();
-        assert!(!is_recovery_candidate(&inst));
-    }
-    // Regression: archiving a session kills its tmux pane, so the next startup observes a dead pane
-    // on a resume-capable agent.
-    #[test]
-    fn archived_instance_is_not_recovery_candidate() {
-        let mut inst = Instance::new("archived", "/tmp/test");
-        inst.agent_session_id = Some("11111111-1111-4111-8111-111111111111".into());
-        assert!(
-            is_recovery_candidate(&inst),
-            "baseline: claude + valid sid is a recovery candidate"
-        );
-        inst.archive();
-        assert!(
-            !is_recovery_candidate(&inst),
-            "archived sessions must be excluded from startup recovery"
-        );
-        inst.unarchive();
-        assert!(
-            is_recovery_candidate(&inst),
-            "unarchive must restore recovery eligibility"
-        );
-    }
-
-    // Regression for: pressing `x` in the session picker stops a session, which sets
-    // `Status::Stopped` and kills the tmux pane.
-    #[test]
-    fn stopped_instance_is_not_recovery_candidate() {
-        let mut inst = Instance::new("stopped", "/tmp/test");
-        inst.agent_session_id = Some("33333333-3333-4333-8333-333333333333".into());
-        assert!(
-            is_recovery_candidate(&inst),
-            "baseline: claude + valid sid is a recovery candidate"
-        );
-        inst.status = super::super::Status::Stopped;
-        assert!(
-            !is_recovery_candidate(&inst),
-            "stopped sessions must be excluded from startup recovery"
-        );
-        inst.status = super::super::Status::Starting;
-        assert!(
-            is_recovery_candidate(&inst),
-            "transitioning off Stopped (e.g. user reopens) must restore recovery eligibility"
-        );
-    }
-
-    #[test]
-    fn snoozed_or_probe_failed_instance_is_not_recovery_candidate_until_cleared() {
-        let sid = "22222222-2222-4222-8222-222222222222".to_string();
-        let mut inst = Instance::new("snoozed", "/tmp/test");
-        inst.agent_session_id = Some(sid.clone());
-        inst.snooze(30);
-        assert!(
-            !is_recovery_candidate(&inst),
-            "snoozed sessions must be excluded while the timer is live"
-        );
-        inst.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
-        assert!(
-            is_recovery_candidate(&inst),
-            "expired snooze must restore recovery eligibility"
-        );
-
-        inst.resume_probe_failed_sid = Some(sid);
-        assert!(
-            !is_recovery_candidate(&inst),
-            "startup recovery must not loop on an ambiguously failed resume sid"
-        );
-        inst.resume_probe_failed_sid = None;
-        assert!(is_recovery_candidate(&inst));
+    fn recovery_candidacy_follows_parked_state_and_resume_identity() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        type Set = fn(&mut Instance);
+        let cases: [(&str, Set, Set); 5] = [
+            ("archived", |i| i.archive(), |i| i.unarchive()),
+            (
+                "stopped",
+                |i| i.status = super::super::Status::Stopped,
+                |i| i.status = super::super::Status::Starting,
+            ),
+            (
+                "snoozed",
+                |i| i.snooze(30),
+                |i| i.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::minutes(1)),
+            ),
+            (
+                "probe-failed",
+                |i| i.resume_probe_failed_sid = i.agent_session_id.clone(),
+                |i| i.resume_probe_failed_sid = None,
+            ),
+            (
+                "wrapper",
+                |i| i.command = "/opt/wrappers/claude".to_string(),
+                |i| i.command = "claude --model opus".to_string(),
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (case, park, clear) in cases {
+            let mut inst = Instance::new(case, "/tmp/test");
+            inst.tool = "custom-agent".to_string();
+            inst.detect_as = "claude".to_string();
+            inst.command = "claude --model opus".to_string();
+            inst.agent_session_id = Some(sid.into());
+            let baseline = is_recovery_candidate(&inst);
+            park(&mut inst);
+            let parked = is_recovery_candidate(&inst);
+            clear(&mut inst);
+            let observed = (baseline, parked, is_recovery_candidate(&inst));
+            if observed != (true, false, true) {
+                failures.push(format!(
+                    "{case}: (baseline, parked, cleared) = {observed:?}"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     #[test]

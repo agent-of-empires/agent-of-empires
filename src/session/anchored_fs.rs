@@ -577,7 +577,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn opens_through_a_symlinked_ancestor() {
+    fn opens_through_a_symlinked_ancestor_but_not_a_symlinked_leaf() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -595,19 +595,11 @@ mod tests {
                 .as_deref(),
             Some(&b"anchored"[..])
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn refuses_a_symlinked_anchor_leaf() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().unwrap();
-        let real = temp.path().join("real");
-        std::fs::create_dir_all(&real).unwrap();
         symlink(&real, temp.path().join("leaf-link")).unwrap();
-
-        assert!(AnchoredDir::open(&temp.path().join("leaf-link")).is_err());
+        assert!(
+            AnchoredDir::open(&temp.path().join("leaf-link")).is_err(),
+            "the anchor leaf itself must not be a symlink"
+        );
     }
 
     #[cfg(unix)]

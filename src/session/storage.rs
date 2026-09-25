@@ -4234,7 +4234,7 @@ mod tests {
     }
 
     #[test]
-    fn group_repair_scope_matches_apply_group_move() -> Result<()> {
+    fn group_repair_mirrors_apply_group_move() -> Result<()> {
         let cases = [
             ("gscope-single", false, true, true),
             ("gscope-subtree", true, false, false),
@@ -4274,6 +4274,46 @@ mod tests {
             );
             assert_eq!(journal_entry_count(&source), 0, "{tag}");
         }
+
+        {
+            let (_temp, _guard, source, target, before, _after) = setup_recovery_env("gparity")?;
+            let archived_at = chrono::Utc::now();
+            source.update(|_instances, groups| {
+                let work = groups
+                    .iter_mut()
+                    .find(|group| group.path == "work")
+                    .unwrap();
+                work.collapsed = true;
+                work.archived_at = Some(archived_at);
+                let mut indirect = Group::new("b", "work/a/b");
+                indirect.collapsed = true;
+                groups.push(indirect);
+                let mut bystander = Group::new("moved", "moved");
+                bystander.collapsed = true;
+                groups.push(bystander);
+                Ok(())
+            })?;
+            push_copy(&target, &before)?;
+            let entry = fresh_journal_entry(&source, &target, &before.id);
+            move_journal::record(&entry, source.sessions_path())?;
+
+            let outcome = reconcile_loaded(&[&source, &target]);
+
+            assert!(outcome.repaired);
+            let groups = source.load_with_groups()?.1;
+            let work = groups.iter().find(|group| group.path == "work").unwrap();
+            assert!(
+                work.collapsed,
+                "indirect descendant preserves parent metadata"
+            );
+            assert_eq!(work.archived_at, Some(archived_at));
+            assert!(groups.iter().any(|group| group.path == "work/a/b"));
+            let bystander = groups.iter().find(|group| group.path == "moved").unwrap();
+            assert!(
+                bystander.collapsed,
+                "other-side name is unrelated on source"
+            );
+        }
         Ok(())
     }
 
@@ -4299,48 +4339,6 @@ mod tests {
         assert!(b.load()?.is_empty(), "superseded profile is emptied");
         assert_eq!(journal_entry_count(&a), 0);
         assert_eq!(journal_entry_count(&b), 0);
-        Ok(())
-    }
-
-    #[test]
-    fn group_repair_preserves_indirect_metadata_and_other_side_name() -> Result<()> {
-        let (_temp, _guard, source, target, before, _after) = setup_recovery_env("gparity")?;
-        let archived_at = chrono::Utc::now();
-        source.update(|_instances, groups| {
-            let work = groups
-                .iter_mut()
-                .find(|group| group.path == "work")
-                .unwrap();
-            work.collapsed = true;
-            work.archived_at = Some(archived_at);
-            let mut indirect = Group::new("b", "work/a/b");
-            indirect.collapsed = true;
-            groups.push(indirect);
-            let mut bystander = Group::new("moved", "moved");
-            bystander.collapsed = true;
-            groups.push(bystander);
-            Ok(())
-        })?;
-        push_copy(&target, &before)?;
-        let entry = fresh_journal_entry(&source, &target, &before.id);
-        move_journal::record(&entry, source.sessions_path())?;
-
-        let outcome = reconcile_loaded(&[&source, &target]);
-
-        assert!(outcome.repaired);
-        let groups = source.load_with_groups()?.1;
-        let work = groups.iter().find(|group| group.path == "work").unwrap();
-        assert!(
-            work.collapsed,
-            "indirect descendant preserves parent metadata"
-        );
-        assert_eq!(work.archived_at, Some(archived_at));
-        assert!(groups.iter().any(|group| group.path == "work/a/b"));
-        let bystander = groups.iter().find(|group| group.path == "moved").unwrap();
-        assert!(
-            bystander.collapsed,
-            "other-side name is unrelated on source"
-        );
         Ok(())
     }
 
@@ -4377,7 +4375,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_repair_directory_sync_retains_journal() -> Result<()> {
+    fn repair_durability_covers_both_files_and_retains_the_journal_on_failure() -> Result<()> {
         let (_temp, _guard, source, target, before, _after) = setup_recovery_env("sync-fail")?;
         push_copy(&target, &before)?;
         let entry = fresh_journal_entry(&source, &target, &before.id);
@@ -4401,26 +4399,25 @@ mod tests {
         let outcome = reconcile_loaded(&[&source, &target]);
         assert!(outcome.repaired, "rerun consumes retained evidence safely");
         assert_eq!(journal_entry_count(&source), 0);
-        Ok(())
-    }
 
-    #[test]
-    fn repaired_profile_sync_covers_sessions_and_groups_paths() -> Result<()> {
-        let (_temp, _guard, source, _target, _before, _after) = setup_recovery_env("sync-both")?;
-        let mut calls = Vec::new();
+        {
+            let (_temp, _guard, source, _target, _before, _after) =
+                setup_recovery_env("sync-both")?;
+            let mut calls = Vec::new();
 
-        sync_repaired_profile_durably(&source, |path| {
-            calls.push(path.to_path_buf());
-            Ok(())
-        })?;
+            sync_repaired_profile_durably(&source, |path| {
+                calls.push(path.to_path_buf());
+                Ok(())
+            })?;
 
-        assert_eq!(
-            calls,
-            vec![
-                source.sessions_path().to_path_buf(),
-                source.sessions_path().with_file_name("groups.json"),
-            ]
-        );
+            assert_eq!(
+                calls,
+                vec![
+                    source.sessions_path().to_path_buf(),
+                    source.sessions_path().with_file_name("groups.json"),
+                ]
+            );
+        }
         Ok(())
     }
 
