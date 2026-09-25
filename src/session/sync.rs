@@ -1491,7 +1491,7 @@ mod tests {
                 agent: "pi".into(),
                 stores: vec!["/tmp/pi-store".into()],
                 configuration: Vec::new(),
-                exported_default_store: false,
+                exported_default_store: None,
                 cwd: "/tmp/pi-stale-after-failed-path".into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),
