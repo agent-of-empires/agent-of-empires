@@ -933,23 +933,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn sandbox_skips_host_hook_path_disclosure_guard() {
-        let temp = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let mut inst = Instance::new("sandbox cursor", "/tmp/test");
-        inst.tool = "cursor".to_string();
-        inst.sandbox_info = Some(crate::session::instance::test_helpers::test_sandbox(
-            "sandbox-cursor",
-            None,
-        ));
-        inst.pending_host_env = vec![("HOME".to_string(), "/tmp/runtime-home".to_string())];
-
-        inst.ensure_disclosed_host_hook_path(crate::agents::get_agent("cursor"))
-            .unwrap();
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn codex_hook_installer_follows_detect_as_and_profile_hook_setting() {
         // (tool, profile config, global hooks off, expect hooks.json)
         for (tool, profile, global_off, installed) in [
@@ -1074,42 +1057,55 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn host_hook_mutation_requires_durable_acknowledgement() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
-        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
-        let mut inst = hook_inst("cursor");
+    fn host_hook_disclosure_gate_requires_ack_only_for_host_hooks_it_will_write() {
+        // Nothing is acknowledged and HOME is redirected, so only a skipped gate passes.
+        // (tool, sandboxed, profile config, hooks file that must stay absent, refused)
+        let mut failures = Vec::new();
+        for (tool, sandboxed, profile, hooks_file, refused) in [
+            ("cursor", false, None, ".cursor/hooks.json", true),
+            ("cursor", true, None, ".cursor/hooks.json", false),
+            ("opencode", false, None, ".opencode", false),
+            (
+                "gemini",
+                false,
+                Some("[session]\nagent_status_hooks = false\n"),
+                ".gemini/settings.json",
+                false,
+            ),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+            let _home_guard = crate::session::test_support::isolate_home(tmp.path());
+            let mut inst = hook_inst(tool);
+            if sandboxed {
+                inst.sandbox_info = Some(crate::session::instance::test_helpers::test_sandbox(
+                    "sandbox-hooks",
+                    None,
+                ));
+            }
+            if let Some(config) = profile {
+                write_profile("hook-gate", config);
+                inst.source_profile = "hook-gate".to_string();
+            }
+            inst.pending_host_env = vec![("HOME".to_string(), "/undisclosed/home".to_string())];
+            let agent = crate::agents::get_agent(tool);
 
-        let error = inst
-            .ensure_disclosed_host_hook_path(crate::agents::get_agent("cursor"))
-            .unwrap_err();
-        inst.install_agent_status_hooks(crate::agents::get_agent("cursor"), None);
+            let gate = inst.ensure_disclosed_host_hook_path(agent);
+            inst.install_agent_status_hooks(agent, None);
 
-        assert!(error.to_string().contains("have not been acknowledged"));
-        assert!(!tmp.path().join(".cursor/hooks.json").exists());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn status_only_agent_needs_no_ack_when_status_hooks_are_disabled() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
-        let _home_guard = crate::session::test_support::isolate_home(tmp.path());
-        write_profile(
-            "status-hooks-disabled",
-            "[session]
-agent_status_hooks = false
-",
-        );
-        let mut inst = hook_inst("gemini");
-        inst.source_profile = "status-hooks-disabled".to_string();
-        let agent = crate::agents::get_agent("gemini");
-
-        inst.ensure_disclosed_host_hook_path(agent).unwrap();
-        inst.install_agent_status_hooks(agent, None);
-
-        assert!(!tmp.path().join(".gemini/settings.json").exists());
-        assert!(!inst.identity_publisher_launched);
+            let gate_ok = match &gate {
+                Err(error) => refused && error.to_string().contains("have not been acknowledged"),
+                Ok(()) => !refused,
+            };
+            if !gate_ok || tmp.path().join(hooks_file).exists() || inst.identity_publisher_launched
+            {
+                failures.push(format!(
+                    "{tool} sandboxed={sandboxed}: gate {gate:?}, wrote {hooks_file}: {}",
+                    tmp.path().join(hooks_file).exists()
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     #[test]
@@ -1405,15 +1401,5 @@ agent_status_hooks = false
             );
             assert!(std::fs::read_to_string(path).unwrap().contains("aoe-hooks"));
         }
-    }
-    #[test]
-    #[serial_test::serial]
-    fn agent_without_hooks_skips_host_path_disclosure_checks() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
-        let mut inst = tool_instance("opencode", "/tmp/test");
-        inst.pending_host_env = vec![("HOME".to_string(), "/undisclosed/home".to_string())];
-        inst.ensure_disclosed_host_hook_path(crate::agents::get_agent("opencode"))
-            .unwrap();
     }
 }
