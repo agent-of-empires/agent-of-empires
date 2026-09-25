@@ -166,6 +166,26 @@ async fn resolve_diff_repos(
     })
 }
 
+/// Pick the repo a per-file request names. An omitted `?repo=` defaults to the
+/// first member, matching the legacy single-repo URL contract. A named repo that
+/// does not exist is rejected, so a stale link cannot quietly read the wrong one
+/// (#1047).
+fn select_diff_repo(
+    ctx: DiffContext,
+    repo: Option<&str>,
+) -> Result<DiffRepo, axum::response::Response> {
+    let selected = match repo {
+        Some(name) => ctx
+            .repos
+            .into_iter()
+            .find(|r| r.name.as_deref() == Some(name))
+            .ok_or("unknown workspace repo"),
+        // A workspace row can persist with `repos: []`.
+        None => ctx.repos.into_iter().next().ok_or("workspace has no repos"),
+    };
+    selected.map_err(|msg| api_error(StatusCode::BAD_REQUEST, "bad_request", msg))
+}
+
 /// The repo entries for one session, split out of [`resolve_diff_repos`] so the
 /// per-repo base plumbing is testable without an `AppState`.
 pub(super) fn diff_repos_of(inst: &crate::session::Instance) -> Vec<DiffRepo> {
@@ -338,37 +358,12 @@ pub async fn session_diff_file(
     if let Some(resp) = crate::server::api::cityhall_block(&state) {
         return resp;
     }
-    let ctx = match resolve_diff_repos(&state, &id).await {
-        Ok(c) => c,
+    let selected_repo = match resolve_diff_repos(&state, &id)
+        .await
+        .and_then(|ctx| select_diff_repo(ctx, query.repo.as_deref()))
+    {
+        Ok(r) => r,
         Err(resp) => return resp,
-    };
-
-    // Default to the first member when `?repo=` is missing, matching the
-    // legacy single-repo URL contract. A named repo that does not exist is
-    // rejected, so a stale link cannot quietly diff the wrong one (#1047).
-    let selected_repo = match query.repo.as_deref() {
-        Some(name) => match ctx.repos.iter().find(|r| r.name.as_deref() == Some(name)) {
-            Some(r) => r.clone(),
-            None => {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    "bad_request",
-                    "unknown workspace repo",
-                );
-            }
-        },
-        // A workspace row can persist with `repos: []`; without this arm the
-        // omitted-`repo` default would panic on the empty list.
-        None => match ctx.repos.first() {
-            Some(r) => r.clone(),
-            None => {
-                return api_error(
-                    StatusCode::BAD_REQUEST,
-                    "bad_request",
-                    "workspace has no repos",
-                );
-            }
-        },
     };
     let project_path = selected_repo.path;
     let selected_repo_name = selected_repo.name;
@@ -526,6 +521,99 @@ pub async fn session_diff_file(
             )
         }
     }
+}
+
+/// Serve the current worktree bytes of a diffed file for the dashboard's
+/// "Open file". The path is confined to the selected repo's worktree with the
+/// session file reader's checks and no provenance fallback, so a file deleted
+/// from the worktree is a 404.
+pub async fn session_diff_file_raw(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<FileDiffQuery>,
+) -> impl IntoResponse {
+    if let Some(resp) = crate::server::api::cityhall_block(&state) {
+        return resp;
+    }
+    let repo = match resolve_diff_repos(&state, &id)
+        .await
+        .and_then(|ctx| select_diff_repo(ctx, query.repo.as_deref()))
+    {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let requested = std::path::Path::new(&query.path);
+        // Diff paths are repo-relative, and refusing the rest keeps this from
+        // probing host paths outside the worktree.
+        if requested.is_absolute() {
+            return Err((StatusCode::BAD_REQUEST, "absolute path not allowed"));
+        }
+        let root = std::path::Path::new(&repo.path)
+            .canonicalize()
+            .map_err(|_| (StatusCode::NOT_FOUND, "file not found"))?;
+        let confined = crate::server::api::file_provenance::confine_path(
+            std::slice::from_ref(&root),
+            std::collections::HashSet::new,
+            requested,
+        )?;
+        let bytes = crate::server::api::file_provenance::read_confined_bytes(
+            &confined,
+            super::artifacts::MAX_RAW_FILE_BYTES,
+        )?;
+        Ok((open_file_mime(requested, &bytes), bytes))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((mime, bytes))) => {
+            super::artifacts::raw_file_response(&mime, !renders_inline(&mime), "no-store", bytes)
+        }
+        Ok(Err((status, msg))) => (
+            status,
+            Json(serde_json::json!({"error": "file_read", "message": msg})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", "Raw file read panicked: {}", e);
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "Internal server error",
+            )
+        }
+    }
+}
+
+/// The type "Open file" serves a worktree file as. Text goes out as UTF-8 plain
+/// text, since `mime_guess` misnames many source types (`.ts` is a video type)
+/// and every browser shows plain text. A PDF can be plain ASCII yet still needs
+/// the viewer, and a scriptable type keeps its type so it is downloaded.
+fn open_file_mime(path: &std::path::Path, bytes: &[u8]) -> mime_guess::Mime {
+    use mime_guess::mime;
+    let guessed = mime_guess::from_path(path).first_or_octet_stream();
+    let is_text = !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok();
+    if is_text
+        && guessed != mime::APPLICATION_PDF
+        && !super::artifacts::is_scriptable(guessed.essence_str())
+    {
+        mime::TEXT_PLAIN_UTF_8
+    } else {
+        guessed
+    }
+}
+
+/// Types a browser renders in a tab. Anything else is sent as an attachment,
+/// which the dashboard saves under the file's own name.
+fn renders_inline(ty: &mime_guess::Mime) -> bool {
+    use mime_guess::mime;
+    let top = ty.type_();
+    top == mime::IMAGE
+        || top == mime::AUDIO
+        || top == mime::VIDEO
+        || ty.essence_str() == "text/plain"
+        || *ty == mime::APPLICATION_PDF
 }
 
 #[derive(Deserialize)]

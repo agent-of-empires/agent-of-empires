@@ -2917,6 +2917,217 @@ async fn diff_file_rejects_workspace_with_no_repos() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// "Open file" in the diff list: the raw route serves the selected repo's
+/// current worktree bytes, typed so passive files render in the tab while
+/// scriptable or unrenderable ones download, and refuses whatever the confined
+/// reader refuses.
+mod diff_file_raw {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::extract::Query;
+    use axum::http::header;
+
+    fn state_for(inst: Instance, cityhall: bool) -> Arc<crate::server::AppState> {
+        if cityhall {
+            crate::server::test_support::build_test_app_state_cityhall(vec![inst])
+        } else {
+            crate::server::test_support::build_test_app_state(vec![inst])
+        }
+    }
+
+    fn single_repo(dir: &std::path::Path) -> Instance {
+        let mut inst = Instance::new("raw", dir.to_str().unwrap());
+        inst.id = "raw".to_string();
+        inst
+    }
+
+    async fn get(
+        state: &Arc<crate::server::AppState>,
+        id: &str,
+        path: &str,
+        repo: Option<&str>,
+    ) -> axum::response::Response {
+        session_diff_file_raw(
+            State(state.clone()),
+            Path(id.to_string()),
+            Query(FileDiffQuery {
+                path: path.to_string(),
+                repo: repo.map(str::to_string),
+            }),
+        )
+        .await
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn renders_passive_types_and_downloads_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        // (file name, bytes, Content-Type, Content-Disposition)
+        let cases: [(&str, &[u8], &str, Option<&str>); 10] = [
+            (
+                "report.pdf",
+                b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n",
+                "application/pdf",
+                None,
+            ),
+            ("shot.png", b"\x89PNG\r\n\x1a\n\0\0", "image/png", None),
+            ("notes.txt", b"hello\n", "text/plain; charset=utf-8", None),
+            // mime_guess calls `.ts` a video type; the text shows as text.
+            (
+                "main.ts",
+                b"export const a = 1;\n",
+                "text/plain; charset=utf-8",
+                None,
+            ),
+            (
+                "page.html",
+                b"<script>alert(1)</script>",
+                "application/octet-stream",
+                Some("attachment"),
+            ),
+            (
+                "d.svg",
+                b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+                "application/octet-stream",
+                Some("attachment"),
+            ),
+            (
+                "data.xml",
+                b"<a/>",
+                "application/octet-stream",
+                Some("attachment"),
+            ),
+            (
+                "feed.rss",
+                b"<rss/>",
+                "application/octet-stream",
+                Some("attachment"),
+            ),
+            (
+                "archive.zip",
+                b"PK\x03\x04\0\0",
+                "application/zip",
+                Some("attachment"),
+            ),
+            (
+                "blob.unknown",
+                b"\0\x01\x02",
+                "application/octet-stream",
+                Some("attachment"),
+            ),
+        ];
+        for (name, bytes, _, _) in cases {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        let state = state_for(single_repo(dir.path()), false);
+
+        for (name, bytes, content_type, disposition) in cases {
+            let resp = get(&state, "raw", name, None).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{name}");
+            let headers = resp.headers();
+            assert_eq!(
+                headers.get(header::CONTENT_TYPE).unwrap(),
+                content_type,
+                "{name}"
+            );
+            assert_eq!(
+                headers
+                    .get(header::CONTENT_DISPOSITION)
+                    .map(|v| v.to_str().unwrap()),
+                disposition,
+                "{name}"
+            );
+            assert_eq!(
+                headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+                "nosniff",
+                "{name}"
+            );
+            assert_eq!(
+                headers.get(header::CACHE_CONTROL).unwrap(),
+                "no-store",
+                "{name}"
+            );
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(&body[..], bytes, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_paths_the_confined_reader_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), "KEY").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), dir.path().join("link")).unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        let absolute = dir.path().join("a.txt");
+        let state = state_for(single_repo(dir.path()), false);
+
+        // (path, repo, status)
+        for (path, repo, status) in [
+            ("deleted.txt", None, StatusCode::NOT_FOUND),
+            ("../secret", None, StatusCode::BAD_REQUEST),
+            (absolute.to_str().unwrap(), None, StatusCode::BAD_REQUEST),
+            ("", None, StatusCode::BAD_REQUEST),
+            ("sub", None, StatusCode::BAD_REQUEST),
+            ("link", None, StatusCode::FORBIDDEN),
+            ("a.txt", Some("other"), StatusCode::BAD_REQUEST),
+        ] {
+            let resp = get(&state, "raw", path, repo).await;
+            assert_eq!(resp.status(), status, "path={path:?} repo={repo:?}");
+        }
+
+        assert_eq!(
+            get(&state, "missing", "a.txt", None).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        let cityhall = state_for(single_repo(dir.path()), true);
+        assert_eq!(
+            get(&cityhall, "raw", "a.txt", None).await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// Workspace members can share a relative path, so `?repo=` must pick the
+    /// worktree, and an omitted one means the first member.
+    #[tokio::test]
+    async fn reads_from_the_named_workspace_repo() {
+        let ws = tempfile::tempdir().unwrap();
+        let member = |name: &str| {
+            let worktree = ws.path().join(name);
+            std::fs::create_dir(&worktree).unwrap();
+            std::fs::write(worktree.join("same.txt"), name).unwrap();
+            crate::session::WorkspaceRepo {
+                name: name.to_string(),
+                source_path: format!("/src/{name}"),
+                branch: "feature/x".to_string(),
+                worktree_path: worktree.to_string_lossy().into_owned(),
+                main_repo_path: format!("/src/{name}"),
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
+            }
+        };
+        let mut inst = single_repo(ws.path());
+        inst.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "feature/x".to_string(),
+            workspace_dir: ws.path().to_string_lossy().into_owned(),
+            repos: vec![member("api"), member("web")],
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+        let state = state_for(inst, false);
+
+        for (repo, expected) in [(Some("web"), "web"), (Some("api"), "api"), (None, "api")] {
+            let resp = get(&state, "raw", "same.txt", repo).await;
+            assert_eq!(resp.status(), StatusCode::OK, "repo={repo:?}");
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(&body[..], expected.as_bytes(), "repo={repo:?}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn send_message_refreshes_instance_after_instance_lock() {
     let _home = crate::session::test_support::isolate_app_dir();
