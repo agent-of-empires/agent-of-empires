@@ -17,8 +17,6 @@ use agent_of_empires::acp::approvals::{ApprovalDecision, ApprovalOption};
 use agent_of_empires::acp::state::{AcpSessionId, Event};
 
 use crate::common::{shim_path, shim_ready};
-
-
 /// Permission round-trip: shim asks for permission, structured view resolves
 /// allow, agent observes the selected option_id and reports back.
 #[tokio::test]
