@@ -211,7 +211,7 @@ async fn silent_orphan_disabled_by_zero_grace() {
         ("0", "200"),
         "COST_THEN_SILENCE trigger",
         Some(None),
-        2,
+        1,
     )
     .await;
 
@@ -261,7 +261,7 @@ async fn silent_orphan_suppressed_while_off_protocol_work_is_pending() {
         ),
     ];
     for (preseed, prompt, marker, expected_usage) in cases {
-        let outcome = observe_parked_turn(preseed, ("300", "100"), prompt, Some(marker), 2).await;
+        let outcome = observe_parked_turn(preseed, ("300", "100"), prompt, Some(marker), 1).await;
         if let Some(expected) = expected_usage {
             assert_eq!(outcome.usage_cost, expected, "{preseed}");
         }

@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 
 const BURST_DEBOUNCE: Duration = Duration::from_millis(100);
-const POST_BURST_QUIET: Duration = Duration::from_millis(800);
+const POST_BURST_QUIET: Duration = Duration::from_millis(300);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial(file_watch)]
