@@ -56,26 +56,23 @@ describe("UpdateBanner", () => {
     expect(screen.queryByText("Release notes")).toBeNull();
   });
 
-  it("renders nothing before the first poll or when there is nothing to show", async () => {
+  it("renders nothing before the first poll resolves", () => {
     fetchUpdateStatus.mockReturnValue(new Promise(() => {}));
-    expect(render(<UpdateBanner />).container.firstChild).toBeNull();
-    cleanup();
+    const { container } = render(<UpdateBanner />);
+    expect(container.firstChild).toBeNull();
+  });
 
-    // "off" mode has no separate client path: the server reports update_available: false, so only "auto" is
-    // special-cased here.
-    const cases: Partial<UpdateStatus>[] = [
-      { update_available: false },
-      { update_check_mode: "auto" },
-      { dismissed_version: "1.1.0" },
-    ];
-    for (const overrides of cases) {
-      fetchUpdateStatus.mockReset();
-      fetchUpdateStatus.mockResolvedValue(makeStatus(overrides));
-      const { container } = render(<UpdateBanner />);
-      await waitFor(() => expect(fetchUpdateStatus).toHaveBeenCalled());
-      expect(container.querySelector('[role="status"]'), JSON.stringify(overrides)).toBeNull();
-      cleanup();
-    }
+  // "off" mode has no separate client path: the server reports update_available: false, so only "auto" is
+  // special-cased here.
+  it.each([
+    ["no update is available", { update_available: false }],
+    ["auto mode handles the install", { update_check_mode: "auto" }],
+    ["the version was already dismissed server-side", { dismissed_version: "1.1.0" }],
+  ] as [string, Partial<UpdateStatus>][])("renders nothing when %s", async (_name, overrides) => {
+    fetchUpdateStatus.mockResolvedValue(makeStatus(overrides));
+    const { container } = render(<UpdateBanner />);
+    await waitFor(() => expect(fetchUpdateStatus).toHaveBeenCalled());
+    expect(container.querySelector('[role="status"]')).toBeNull();
   });
 
   it("dismiss hides the banner optimistically and persists via dismissUpdate", async () => {

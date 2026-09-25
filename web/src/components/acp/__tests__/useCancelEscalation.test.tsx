@@ -8,16 +8,13 @@ import { nextCancelAction, useCancelEscalation } from "../useCancelEscalation";
 // A second Stop must force-end without the server's `cancelling` confirmation,
 // which never arrives for an orphaned turn; the intent resets per turn and session.
 describe("nextCancelAction", () => {
-  it("cancels only when neither the server nor a prior press has asked", () => {
-    const cases = [
-      [false, false, "cancel"],
-      [false, true, "force"],
-      [true, false, "force"],
-      [true, true, "force"],
-    ] as const;
-    for (const [cancelling, alreadyRequested, expected] of cases) {
-      expect(nextCancelAction(cancelling, alreadyRequested), `${cancelling}/${alreadyRequested}`).toBe(expected);
-    }
+  it.each([
+    [false, false, "cancel"],
+    [false, true, "force"],
+    [true, false, "force"],
+    [true, true, "force"],
+  ])("cancelling=%s alreadyRequested=%s -> %s", (cancelling, alreadyRequested, expected) => {
+    expect(nextCancelAction(cancelling, alreadyRequested)).toBe(expected);
   });
 });
 

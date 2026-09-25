@@ -14,78 +14,69 @@ import {
 
 const keys = { key: "Enter", shiftKey: false, ctrlKey: false, metaKey: false, altKey: false, isComposing: false };
 
-describe("key decisions", () => {
-  it("decideEnterAction", () => {
-    for (const [over, isMobile, turnActive, expected] of [
-      // Only desktop mid-turn plain Enter takes the queue path; touch Enter is always a newline.
-      [{}, false, true, "send"],
-      [{}, false, false, "default"],
-      [{}, true, true, "default"],
-      [{}, true, false, "default"],
-      [{ key: "a" }, false, true, "default"],
-      [{ isComposing: true }, false, true, "default"],
-      [{ shiftKey: true }, false, true, "default"],
-      [{ ctrlKey: true }, false, true, "default"],
-      [{ metaKey: true }, false, true, "default"],
-    ] as const) {
-      expect(decideEnterAction({ ...keys, ...over }, { isMobile, turnActive }), JSON.stringify(over)).toBe(expected);
-    }
+describe("decideEnterAction", () => {
+  it.each([
+    // Only desktop mid-turn plain Enter takes the queue path; touch Enter is always a newline.
+    [{}, false, true, "send"],
+    [{}, false, false, "default"],
+    [{}, true, true, "default"],
+    [{}, true, false, "default"],
+    [{ key: "a" }, false, true, "default"],
+    [{ isComposing: true }, false, true, "default"],
+    [{ shiftKey: true }, false, true, "default"],
+    [{ ctrlKey: true }, false, true, "default"],
+    [{ metaKey: true }, false, true, "default"],
+  ])("%o mobile=%s turnActive=%s -> %s", (over, isMobile, turnActive, expected) => {
+    expect(decideEnterAction({ ...keys, ...over }, { isMobile, turnActive })).toBe(expected);
   });
+});
 
-  it("decideArrowRecall", () => {
-    const up = { ...keys, key: "ArrowUp" };
-    const down = { ...keys, key: "ArrowDown" };
-    for (const [event, caretAtStart, browsing, queueLen, expected] of [
-      [up, true, false, 2, "older"],
-      [up, false, false, 2, "default"],
-      [up, true, false, 0, "default"],
-      [up, false, true, 2, "older"],
-      [down, false, true, 2, "newer"],
-      [down, true, false, 2, "default"],
-      [{ ...up, key: "a" }, true, true, 2, "default"],
-      ...[{ shiftKey: true }, { ctrlKey: true }, { metaKey: true }, { altKey: true }, { isComposing: true }].map(
-        (mod) => [{ ...up, ...mod }, true, true, 2, "default"] as const,
-      ),
-    ] as const) {
-      expect(
-        decideArrowRecall(event, { caretAtStart, browsing, queueLen }),
-        JSON.stringify([event, caretAtStart, browsing]),
-      ).toBe(expected);
-    }
+describe("decideArrowRecall", () => {
+  const up = { ...keys, key: "ArrowUp" };
+  const down = { ...keys, key: "ArrowDown" };
+  it.each([
+    [up, true, false, 2, "older"],
+    [up, false, false, 2, "default"],
+    [up, true, false, 0, "default"],
+    [up, false, true, 2, "older"],
+    [down, false, true, 2, "newer"],
+    [down, true, false, 2, "default"],
+    [{ ...up, key: "a" }, true, true, 2, "default"],
+    ...[{ shiftKey: true }, { ctrlKey: true }, { metaKey: true }, { altKey: true }, { isComposing: true }].map(
+      (mod) => [{ ...up, ...mod }, true, true, 2, "default"] as const,
+    ),
+  ])("%o caretAtStart=%s browsing=%s queueLen=%i -> %s", (event, caretAtStart, browsing, queueLen, expected) => {
+    expect(decideArrowRecall(event, { caretAtStart, browsing, queueLen })).toBe(expected);
   });
+});
 
-  it("decideBeforeInputAction", () => {
-    for (const [inputType, isComposing, isMobile, expected] of [
-      ["insertLineBreak", false, true, "newline"],
-      ["insertParagraph", false, true, "newline"],
-      ["insertText", false, true, "default"],
-      ["deleteContentBackward", false, true, "default"],
-      ["insertLineBreak", false, false, "default"],
-      ["insertParagraph", false, false, "default"],
-      ["insertLineBreak", true, true, "default"],
-    ] as const) {
-      expect(
-        decideBeforeInputAction(inputType, isComposing, { isMobile }),
-        `${inputType} ${isComposing} ${isMobile}`,
-      ).toBe(expected);
-    }
+describe("decideBeforeInputAction", () => {
+  it.each([
+    ["insertLineBreak", false, true, "newline"],
+    ["insertParagraph", false, true, "newline"],
+    ["insertText", false, true, "default"],
+    ["deleteContentBackward", false, true, "default"],
+    ["insertLineBreak", false, false, "default"],
+    ["insertParagraph", false, false, "default"],
+    ["insertLineBreak", true, true, "default"],
+  ])("%s composing=%s mobile=%s -> %s", (inputType, isComposing, isMobile, expected) => {
+    expect(decideBeforeInputAction(inputType, isComposing, { isMobile })).toBe(expected);
   });
 });
 
 describe("composerWrapperLayout", () => {
-  it("pads for the keyboard and the iOS accessory bar", () => {
-    for (const [keyboardOpen, accessoryBarPx, padding, style] of [
-      [false, undefined, "pb-3", undefined],
-      [false, IOS_ACCESSORY_BAR_PX, "pb-3", undefined],
-      [true, undefined, "pb-0", undefined],
-      [true, 0, "pb-0", undefined],
-    ] as const) {
-      const label = `${keyboardOpen} ${accessoryBarPx}`;
-      const classes = composerWrapperLayout({ keyboardOpen, accessoryBarPx }).className.split(" ");
-      expect(classes, label).toContain(padding);
-      expect(classes, label).not.toContain(padding === "pb-3" ? "pb-0" : "pb-3");
-      expect(composerWrapperLayout({ keyboardOpen, accessoryBarPx }).style, label).toEqual(style);
-    }
+  it.each([
+    [false, undefined, "pb-3", undefined],
+    [false, IOS_ACCESSORY_BAR_PX, "pb-3", undefined],
+    [true, undefined, "pb-0", undefined],
+    [true, 0, "pb-0", undefined],
+    [true, IOS_ACCESSORY_BAR_PX, "pb-0", { paddingBottom: IOS_ACCESSORY_BAR_PX }],
+  ])("keyboardOpen=%s accessoryBarPx=%s", (keyboardOpen, accessoryBarPx, padding, style) => {
+    const layout = composerWrapperLayout({ keyboardOpen, accessoryBarPx });
+    const classes = layout.className.split(" ");
+    expect(classes).toContain(padding);
+    expect(classes).not.toContain(padding === "pb-3" ? "pb-0" : "pb-3");
+    expect(layout.style).toEqual(style);
   });
 });
 
@@ -113,33 +104,33 @@ afterEach(() => {
 });
 
 describe("caret insertion", () => {
-  it("is a no-op without a textarea", () => {
-    expect(() => insertAtCaret({ current: null }, "@")).not.toThrow();
-    expect(() => insertNewlineAtCaret({ current: null })).not.toThrow();
-    expect(() => insertSlashCommand({ current: null }, { id: "foo" } as never)).not.toThrow();
+  it.each([
+    ["no-op without a textarea", () => insertAtCaret({ current: null }, "@")],
+    ["newline no-op without a textarea", () => insertNewlineAtCaret({ current: null })],
+    ["slash no-op without a textarea", () => insertSlashCommand({ current: null }, { id: "foo" } as never)],
+  ])("%s", (_label, fn) => {
+    expect(fn).not.toThrow();
   });
 
-  it("insertAtCaret replaces the selection and emits one insertText InputEvent", () => {
-    for (const [value, start, end, text, expected, caret] of [
-      ["", 0, 0, "@", "@", 1],
-      ["hi ", 3, 3, "@", "hi @", 4],
-      // Mid-word triggers are padded so detection still fires.
-      ["hi", 2, 2, "/", "hi /", 4],
-      ["hello", 5, 5, "@", "hello @", 7],
-      ["hello world", 6, 11, "@", "hello @", 7],
-    ] as const) {
-      const ref = textareaRef(value, start, end);
-      const events = recordInputs(ref.current!);
-      insertAtCaret(ref, text);
-      expect(ref.current!.value).toBe(expected);
-      expect(ref.current!.selectionStart, value).toBe(caret);
-      // The trigger popover needs a real InputEvent carrying inputType and data.
-      expect(events, value).toHaveLength(1);
-      expect(events[0]!.event).toBeInstanceOf(InputEvent);
-      expect(events[0]!.event.bubbles).toBe(true);
-      expect(events[0]!.event.inputType).toBe("insertText");
-      expect(events[0]!.event.data).toBe(text);
-    }
+  it.each([
+    ["", 0, 0, "@", "@", 1],
+    ["hi ", 3, 3, "@", "hi @", 4],
+    // Mid-word triggers are padded so detection still fires.
+    ["hi", 2, 2, "/", "hi /", 4],
+    ["hello", 5, 5, "@", "hello @", 7],
+    ["hello world", 6, 11, "@", "hello @", 7],
+  ])("insertAtCaret(%j [%i,%i], %j)", (value, start, end, text, expected, caret) => {
+    const ref = textareaRef(value, start, end);
+    const events = recordInputs(ref.current!);
+    insertAtCaret(ref, text);
+    expect(ref.current!.value).toBe(expected);
+    expect(ref.current!.selectionStart).toBe(caret);
+    // The trigger popover needs a real InputEvent carrying inputType and data.
+    expect(events).toHaveLength(1);
+    expect(events[0]!.event).toBeInstanceOf(InputEvent);
+    expect(events[0]!.event.bubbles).toBe(true);
+    expect(events[0]!.event.inputType).toBe("insertText");
+    expect(events[0]!.event.data).toBe(text);
   });
 
   it("insertNewlineAtCaret replaces the selection and collapses the caret", () => {

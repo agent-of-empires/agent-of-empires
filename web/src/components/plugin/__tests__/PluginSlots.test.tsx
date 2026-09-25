@@ -144,18 +144,19 @@ describe("plugin slots", () => {
     expect(pokeMock).toHaveBeenCalled();
   });
 
-  it("composerDraftOperation parses valid kinds and rejects unknown ones", () => {
-    const parse = (draft_operation: Record<string, unknown>) =>
-      composerDraftOperation({ plugin_id: "a", slot: "composer-action", id: "d", payload: { draft_operation } });
-    expect(parse({ kind: "insert-text", id: "op-1", text: "hello" })).toEqual({
-      id: "op-1",
-      operation: { kind: "insert-text", text: "hello" },
-    });
-    expect(parse({ kind: "set-text", id: "op-2", text: "" })).toEqual({
-      id: "op-2",
-      operation: { kind: "set-text", text: "" },
-    });
-    expect(parse({ kind: "bad", id: "op-2", text: "hello" })).toBeNull();
+  it.each([
+    [
+      { kind: "insert-text", id: "op-1", text: "hello" },
+      { id: "op-1", operation: { kind: "insert-text", text: "hello" } },
+    ],
+    [
+      { kind: "set-text", id: "op-2", text: "" },
+      { id: "op-2", operation: { kind: "set-text", text: "" } },
+    ],
+    [{ kind: "bad", id: "op-2", text: "hello" }, null],
+  ])("composerDraftOperation parses %j", (draft_operation, expected) => {
+    const entry: PluginUiEntry = { plugin_id: "a", slot: "composer-action", id: "d", payload: { draft_operation } };
+    expect(composerDraftOperation(entry)).toEqual(expected);
   });
 });
 
@@ -279,19 +280,15 @@ describe("pane actions", () => {
 });
 
 describe("pane blocks", () => {
-  it("drops degenerate blocks", () => {
-    const cases: [Record<string, unknown>, string][] = [
-      [{ blocks: [{ kind: "action", label: "Refresh" }] }, "plugin-pane-action"],
-      [{ blocks: [{ kind: "callout", tone: "danger" }] }, "plugin-pane-callout"],
-      [{ blocks: [{ kind: "bar", segments: [{ value: 0 }] }] }, "plugin-pane-bar"],
-      [{ blocks: [{ kind: "columns", children: [] }] }, "plugin-pane-columns"],
-      [{ blocks: [{ kind: "heading", text: "GitHub" }], footer: {} }, "plugin-pane-footer"],
-    ];
-    for (const [payload, testId] of cases) {
-      const { unmount } = renderPane(payload);
-      expect(screen.queryByTestId(testId), testId).toBeNull();
-      unmount();
-    }
+  it.each([
+    ["action without a method", { blocks: [{ kind: "action", label: "Refresh" }] }, "plugin-pane-action"],
+    ["callout without title or detail", { blocks: [{ kind: "callout", tone: "danger" }] }, "plugin-pane-callout"],
+    ["bar without a positive segment", { blocks: [{ kind: "bar", segments: [{ value: 0 }] }] }, "plugin-pane-bar"],
+    ["columns without children", { blocks: [{ kind: "columns", children: [] }] }, "plugin-pane-columns"],
+    ["empty footer", { blocks: [{ kind: "heading", text: "GitHub" }], footer: {} }, "plugin-pane-footer"],
+  ])("%s renders nothing", (_, payload, testId) => {
+    renderPane(payload);
+    expect(screen.queryByTestId(testId)).toBeNull();
   });
 
   it("renders the simple title/body form and a refresh indicator only while polling", () => {

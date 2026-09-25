@@ -9,7 +9,7 @@ vi.mock("../../../hooks/useMobileKeyboard", () => ({
   useMobileKeyboard: () => mockKeyboard.current,
 }));
 
-import { StructuredViewRoot, structuredViewRootStyle } from "../StructuredView";
+import { StructuredViewRoot } from "../StructuredView";
 
 afterEach(() => {
   cleanup();
@@ -28,15 +28,12 @@ function renderRoot(keyboardHeight: number) {
 }
 
 describe("StructuredViewRoot", () => {
-  it("reserves a positive keyboard height as bottom padding", () => {
-    expect(structuredViewRootStyle(-12)).toBeUndefined();
-    for (const [height, padding] of [
-      [280, "280px"],
-      [0, ""],
-    ] as const) {
-      expect(renderRoot(height).style.paddingBottom).toBe(padding);
-      cleanup();
-    }
+  it.each([
+    [280, "280px"],
+    [0, ""],
+    [-12, ""],
+  ])("reserves keyboard height %s as bottom padding", (height, padding) => {
+    expect(renderRoot(height).style.paddingBottom).toBe(padding);
   });
 
   // rem, not px, so the transcript still follows the browser's root font size.

@@ -49,168 +49,156 @@ const TAGS = ["a", "b", "c"].map((v) => ({ value: v, label: v }));
 type Step = [() => void, Record<string, unknown> | string];
 
 describe("AskUserQuestionCard submission", () => {
-  it("validates each kind and submits the accepted payload", () => {
-    const cases: [string, ElicitationQuestion[], Step[]][] = [
-      ["free text", [q({ field_key: "name" })], [[() => type("Ada"), { name: "Ada" }]]],
+  it.each<[string, ElicitationQuestion[], Step[]]>([
+    ["free text", [q({ field_key: "name" })], [[() => type("Ada"), { name: "Ada" }]]],
+    [
+      "required free text",
+      [q({ field_key: "req", title: "Required", required: true })],
+      [[() => {}, "Please answer: Required"]],
+    ],
+    [
+      "email format",
+      [q({ field_key: "mail", title: "Email", format: "email" })],
       [
-        "required free text",
-        [q({ field_key: "req", title: "Required", required: true })],
-        [[() => {}, "Please answer: Required"]],
+        [() => type("not-an-email"), "Email is not a valid email"],
+        [() => type("a@b.co"), { mail: "a@b.co" }],
       ],
+    ],
+    [
+      "length and pattern",
+      [q({ field_key: "code", title: "Code", min_length: 3, max_length: 10, pattern: "^[a-z]+$" })],
       [
-        "email format",
-        [q({ field_key: "mail", title: "Email", format: "email" })],
+        [() => type("ab"), "Code must be at least 3 characters"],
+        [() => type("AB12"), "Code does not match the required format"],
+        [() => type("abc"), { code: "abc" }],
+      ],
+    ],
+    [
+      "max length",
+      [q({ field_key: "code", title: "Code", max_length: 3 })],
+      [[() => type("toolong"), "Code must be at most 3 characters"]],
+    ],
+    // The server skips invalid regexes too.
+    ["unparseable pattern", [q({ field_key: "any", pattern: "([" })], [[() => type("whatever"), { any: "whatever" }]]],
+    [
+      "single select",
+      [q({ field_key: "color", title: "Pick a color", kind: "single_select", options: COLORS })],
+      [[() => radio(/green/), { color: "green" }]],
+    ],
+    [
+      "required single select",
+      [q({ field_key: "color", title: "Pick a color", kind: "single_select", required: true, options: COLORS })],
+      [[() => {}, "Please answer: Pick a color"]],
+    ],
+    [
+      "multi select toggles",
+      [q({ field_key: "tags", kind: "multi_select", options: TAGS })],
+      [
         [
-          [() => type("not-an-email"), "Email is not a valid email"],
-          [() => type("a@b.co"), { mail: "a@b.co" }],
+          () => {
+            check("a");
+            check("b");
+            check("a");
+          },
+          { tags: ["b"] },
         ],
       ],
+    ],
+    ["empty optional multi select", [q({ field_key: "tags", kind: "multi_select", options: TAGS })], [[() => {}, {}]]],
+    [
+      "multi select bounds",
       [
-        "length and pattern",
-        [q({ field_key: "code", title: "Code", min_length: 3, max_length: 10, pattern: "^[a-z]+$" })],
+        q({
+          field_key: "tags",
+          title: "Tags",
+          kind: "multi_select",
+          required: true,
+          min_items: 2,
+          max_items: 2,
+          options: TAGS,
+        }),
+      ],
+      [
+        [() => {}, "Please answer: Tags"],
+        [() => check("a"), "Select at least 2 for Tags"],
         [
-          [() => type("ab"), "Code must be at least 3 characters"],
-          [() => type("AB12"), "Code does not match the required format"],
-          [() => type("abc"), { code: "abc" }],
+          () => {
+            check("b");
+            check("c");
+          },
+          "Select at most 2 for Tags",
+        ],
+        [() => check("c"), { tags: ["a", "b"] }],
+      ],
+    ],
+    ["number", [q({ field_key: "qty", kind: "number" })], [[() => typeNumber("3.5"), { qty: 3.5 }]]],
+    ["empty optional number", [q({ field_key: "qty", kind: "number" })], [[() => {}, {}]]],
+    [
+      "required number",
+      [q({ field_key: "qty", title: "Qty", kind: "number", required: true })],
+      [[() => {}, "Please answer: Qty"]],
+    ],
+    [
+      "number range",
+      [q({ field_key: "qty", title: "Qty", kind: "number", minimum: 1, maximum: 5 })],
+      [
+        [() => typeNumber("0"), "Qty must be at least 1"],
+        [() => typeNumber("9"), "Qty must be at most 5"],
+        [() => typeNumber("5"), { qty: 5 }],
+      ],
+    ],
+    [
+      "integer",
+      [q({ field_key: "count", title: "Count", kind: "integer" })],
+      [
+        [() => typeNumber("2.5"), "Count must be a whole number"],
+        [() => typeNumber("4"), { count: 4 }],
+      ],
+    ],
+    // A checkbox always has a definite value.
+    [
+      "unchecked boolean",
+      [q({ field_key: "agree", title: "Agree?", kind: "boolean" })],
+      [[() => {}, { agree: false }]],
+    ],
+    [
+      "checked boolean",
+      [q({ field_key: "agree", title: "Agree?", kind: "boolean" })],
+      [[() => check("Agree?"), { agree: true }]],
+    ],
+    [
+      "every kind in one form",
+      [
+        q({ field_key: "name", title: "Name" }),
+        q({ field_key: "color", title: "Color", kind: "single_select", options: [{ value: "blue", label: "blue" }] }),
+        q({ field_key: "tags", title: "Tags", kind: "multi_select", options: [{ value: "x", label: "x" }] }),
+        q({ field_key: "qty", title: "Qty", kind: "number" }),
+        q({ field_key: "agree", title: "Agree", kind: "boolean" }),
+      ],
+      [
+        [
+          () => {
+            type("Grace");
+            radio(/blue/);
+            check("x");
+            typeNumber("2");
+            check("Agree");
+          },
+          { name: "Grace", color: "blue", tags: ["x"], qty: 2, agree: true },
         ],
       ],
-      [
-        "max length",
-        [q({ field_key: "code", title: "Code", max_length: 3 })],
-        [[() => type("toolong"), "Code must be at most 3 characters"]],
-      ],
-      // The server skips invalid regexes too.
-      [
-        "unparseable pattern",
-        [q({ field_key: "any", pattern: "([" })],
-        [[() => type("whatever"), { any: "whatever" }]],
-      ],
-      [
-        "single select",
-        [q({ field_key: "color", title: "Pick a color", kind: "single_select", options: COLORS })],
-        [[() => radio(/green/), { color: "green" }]],
-      ],
-      [
-        "required single select",
-        [q({ field_key: "color", title: "Pick a color", kind: "single_select", required: true, options: COLORS })],
-        [[() => {}, "Please answer: Pick a color"]],
-      ],
-      [
-        "multi select toggles",
-        [q({ field_key: "tags", kind: "multi_select", options: TAGS })],
-        [
-          [
-            () => {
-              check("a");
-              check("b");
-              check("a");
-            },
-            { tags: ["b"] },
-          ],
-        ],
-      ],
-      [
-        "empty optional multi select",
-        [q({ field_key: "tags", kind: "multi_select", options: TAGS })],
-        [[() => {}, {}]],
-      ],
-      [
-        "multi select bounds",
-        [
-          q({
-            field_key: "tags",
-            title: "Tags",
-            kind: "multi_select",
-            required: true,
-            min_items: 2,
-            max_items: 2,
-            options: TAGS,
-          }),
-        ],
-        [
-          [() => {}, "Please answer: Tags"],
-          [() => check("a"), "Select at least 2 for Tags"],
-          [
-            () => {
-              check("b");
-              check("c");
-            },
-            "Select at most 2 for Tags",
-          ],
-          [() => check("c"), { tags: ["a", "b"] }],
-        ],
-      ],
-      ["number", [q({ field_key: "qty", kind: "number" })], [[() => typeNumber("3.5"), { qty: 3.5 }]]],
-      ["empty optional number", [q({ field_key: "qty", kind: "number" })], [[() => {}, {}]]],
-      [
-        "required number",
-        [q({ field_key: "qty", title: "Qty", kind: "number", required: true })],
-        [[() => {}, "Please answer: Qty"]],
-      ],
-      [
-        "number range",
-        [q({ field_key: "qty", title: "Qty", kind: "number", minimum: 1, maximum: 5 })],
-        [
-          [() => typeNumber("0"), "Qty must be at least 1"],
-          [() => typeNumber("9"), "Qty must be at most 5"],
-          [() => typeNumber("5"), { qty: 5 }],
-        ],
-      ],
-      [
-        "integer",
-        [q({ field_key: "count", title: "Count", kind: "integer" })],
-        [
-          [() => typeNumber("2.5"), "Count must be a whole number"],
-          [() => typeNumber("4"), { count: 4 }],
-        ],
-      ],
-      // A checkbox always has a definite value.
-      [
-        "unchecked boolean",
-        [q({ field_key: "agree", title: "Agree?", kind: "boolean" })],
-        [[() => {}, { agree: false }]],
-      ],
-      [
-        "checked boolean",
-        [q({ field_key: "agree", title: "Agree?", kind: "boolean" })],
-        [[() => check("Agree?"), { agree: true }]],
-      ],
-      [
-        "every kind in one form",
-        [
-          q({ field_key: "name", title: "Name" }),
-          q({ field_key: "color", title: "Color", kind: "single_select", options: [{ value: "blue", label: "blue" }] }),
-          q({ field_key: "tags", title: "Tags", kind: "multi_select", options: [{ value: "x", label: "x" }] }),
-          q({ field_key: "qty", title: "Qty", kind: "number" }),
-          q({ field_key: "agree", title: "Agree", kind: "boolean" }),
-        ],
-        [
-          [
-            () => {
-              type("Grace");
-              radio(/blue/);
-              check("x");
-              typeNumber("2");
-              check("Agree");
-            },
-            { name: "Grace", color: "blue", tags: ["x"], qty: 2, agree: true },
-          ],
-        ],
-      ],
-    ];
-    for (const [label, questions, steps] of cases) {
-      const onResolve = renderCard(questions);
-      for (const [act, expected] of steps) {
-        act();
-        submit();
-        if (typeof expected === "string") {
-          expect(screen.getByText(expected), label).toBeTruthy();
-          expect(onResolve, label).not.toHaveBeenCalled();
-        } else {
-          expect(onResolve, label).toHaveBeenCalledWith({ action: "accept", answers: expected });
-        }
+    ],
+  ])("%s", (_label, questions, steps) => {
+    const onResolve = renderCard(questions);
+    for (const [act, expected] of steps) {
+      act();
+      submit();
+      if (typeof expected === "string") {
+        expect(screen.getByText(expected)).toBeTruthy();
+        expect(onResolve).not.toHaveBeenCalled();
+      } else {
+        expect(onResolve).toHaveBeenCalledWith({ action: "accept", answers: expected });
       }
-      cleanup();
     }
   });
 
@@ -235,16 +223,13 @@ describe("AskUserQuestionCard submission", () => {
     });
   });
 
-  it("Skip declines and Cancel cancels", () => {
-    for (const [button, action] of [
-      ["Skip", "decline"],
-      ["Cancel", "cancel"],
-    ]) {
-      const onResolve = renderCard([q({ field_key: "q" })]);
-      fireEvent.click(screen.getByRole("button", { name: button }));
-      expect(onResolve).toHaveBeenCalledWith({ action });
-      cleanup();
-    }
+  it.each([
+    ["Skip", "decline"],
+    ["Cancel", "cancel"],
+  ])("%s resolves with %s", (button, action) => {
+    const onResolve = renderCard([q({ field_key: "q" })]);
+    fireEvent.click(screen.getByRole("button", { name: button }));
+    expect(onResolve).toHaveBeenCalledWith({ action });
   });
 
   it("shows a rollback message when onResolve rejects", async () => {
@@ -297,25 +282,22 @@ describe("AskUserQuestionCard rendering", () => {
 
   // Older adapters flattened `"<label> — <description>"` into the title; a structured
   // description (even empty) wins, and null falls back to the split.
-  it("splits option text into label and description", () => {
-    for (const [label, option, shown, hidden] of [
-      ["flattened label", { label: "Red — the warm one" }, "the warm one", null],
-      ["structured description", { label: "Red", description: "the warm one" }, "the warm one", null],
-      ["structured over flattened", { label: "Red — stale", description: "the warm one" }, "the warm one", "stale"],
-      ["empty structured description", { label: "Red — the warm one", description: "" }, null, "the warm one"],
-      ["null structured description", { label: "Red — the warm one", description: null }, "the warm one", null],
-    ] as const) {
-      const onResolve = renderCard([
-        q({ field_key: "question_0", kind: "single_select", title: "Pick", options: [{ value: "Red", ...option }] }),
-      ]);
-      expect(screen.getByText("Red"), label).toBeTruthy();
-      if (shown) expect(screen.getByText(shown), label).toBeTruthy();
-      if (hidden) expect(screen.queryByText(hidden), label).toBeNull();
-      fireEvent.click(screen.getAllByRole("radio")[0]!);
-      submit();
-      expect(onResolve, label).toHaveBeenCalledWith({ action: "accept", answers: { question_0: "Red" } });
-      cleanup();
-    }
+  it.each([
+    ["flattened label", { label: "Red — the warm one" }, "the warm one", null],
+    ["structured description", { label: "Red", description: "the warm one" }, "the warm one", null],
+    ["structured over flattened", { label: "Red — stale", description: "the warm one" }, "the warm one", "stale"],
+    ["empty structured description", { label: "Red — the warm one", description: "" }, null, "the warm one"],
+    ["null structured description", { label: "Red — the warm one", description: null }, "the warm one", null],
+  ])("splits option text for a %s", (_label, option, shown, hidden) => {
+    const onResolve = renderCard([
+      q({ field_key: "question_0", kind: "single_select", title: "Pick", options: [{ value: "Red", ...option }] }),
+    ]);
+    expect(screen.getByText("Red")).toBeTruthy();
+    if (shown) expect(screen.getByText(shown)).toBeTruthy();
+    if (hidden) expect(screen.queryByText(hidden)).toBeNull();
+    fireEvent.click(screen.getAllByRole("radio")[0]!);
+    submit();
+    expect(onResolve).toHaveBeenCalledWith({ action: "accept", answers: { question_0: "Red" } });
   });
 });
 
@@ -333,16 +315,14 @@ describe("ElicitationAnswerCard", () => {
     }
   });
 
-  it("isElicitationAnswersPayload accepts only question/answer string pairs", () => {
-    for (const [value, expected] of [
-      [[{ question: "q", answer: "a" }], true],
-      [[], false],
-      [undefined, false],
-      ["nope", false],
-      [[{ question: "q" }], false],
-      [[{ question: 1, answer: 2 }], false],
-    ] as const) {
-      expect(isElicitationAnswersPayload(value), JSON.stringify(value)).toBe(expected);
-    }
+  it.each([
+    [[{ question: "q", answer: "a" }], true],
+    [[], false],
+    [undefined, false],
+    ["nope", false],
+    [[{ question: "q" }], false],
+    [[{ question: 1, answer: 2 }], false],
+  ])("isElicitationAnswersPayload(%j) = %s", (value, expected) => {
+    expect(isElicitationAnswersPayload(value)).toBe(expected);
   });
 });

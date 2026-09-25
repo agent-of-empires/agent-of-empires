@@ -33,19 +33,19 @@ describe("SidebarSortPicker", () => {
     expect(menu()).toBeNull();
   });
 
-  it("selecting another mode fires onSortModeChange and closes; re-selecting the active mode only closes", () => {
-    for (const [current, next] of [
-      ["manual", "lastActivity"],
-      ["lastActivity", "attention"],
-      ["attention", "manual"],
-    ] as [SidebarSortMode, SidebarSortMode][]) {
-      const onChange = setup(current);
-      fireEvent.click(trigger());
-      fireEvent.click(option(next));
-      expect(onChange.mock.calls).toEqual([[next]]);
-      expect(menu()).toBeNull();
-      cleanup();
-    }
+  it.each<[SidebarSortMode, SidebarSortMode]>([
+    ["manual", "lastActivity"],
+    ["lastActivity", "attention"],
+    ["attention", "manual"],
+  ])("from %s selecting %s fires onSortModeChange and closes", (current, next) => {
+    const onChange = setup(current);
+    fireEvent.click(trigger());
+    fireEvent.click(option(next));
+    expect(onChange.mock.calls).toEqual([[next]]);
+    expect(menu()).toBeNull();
+  });
+
+  it("re-selecting the active mode closes without firing", () => {
     const onChange = setup("lastActivity");
     fireEvent.click(trigger());
     fireEvent.click(option("lastActivity"));

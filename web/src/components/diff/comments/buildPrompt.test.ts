@@ -72,12 +72,14 @@ describe("buildDiffCommentsPrompt", () => {
   const build = (comments: DiffComment[], intro: string, outro: string, isMultiRepo = false) =>
     buildDiffCommentsPrompt(comments, intro, outro, { isMultiRepo });
 
-  it("trims the outro, defaults a blank one, and ends the prompt with it", () => {
-    expect(build([mk({})], "", "").outro).toBe("Please address these comments.");
-    const built = build([mk({})], "", "   outro   ");
-    expect(built.outro).toBe("outro");
-    expect(built.assembledMarkdown.endsWith("outro\n")).toBe(true);
-    expect(built.assembledMarkdown).not.toContain("Please address these comments.");
+  it.each([
+    ["", "Please address these comments."],
+    ["   outro   ", "outro"],
+  ])("outro %j becomes %j and ends the prompt", (outro, expected) => {
+    const built = build([mk({})], "", outro);
+    expect(built.outro).toBe(expected);
+    expect(built.assembledMarkdown.endsWith(`${expected}\n`)).toBe(true);
+    if (outro) expect(built.assembledMarkdown).not.toContain("Please address these comments.");
   });
 
   it("prepends a trimmed intro before the comments section, without a sentinel", () => {
@@ -103,8 +105,7 @@ describe("parseDiffCommentsSentinel", () => {
     expect(payload).toEqual({ intro: "Take a look:", outro: "Thanks.", isMultiRepo: false, comments: [comment] });
   });
 
-  it("returns null for plain text and a malformed sentinel", () => {
-    expect(parseDiffCommentsSentinel("hello world")).toBeNull();
-    expect(parseDiffCommentsSentinel("<!-- aoe:diff-comments:v1 not-base64!@# -->\nbody\n")).toBeNull();
+  it.each(["hello world", "<!-- aoe:diff-comments:v1 not-base64!@# -->\nbody\n"])("returns null for %j", (text) => {
+    expect(parseDiffCommentsSentinel(text)).toBeNull();
   });
 });

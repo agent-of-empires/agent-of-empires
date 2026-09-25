@@ -46,15 +46,13 @@ describe("resolveSelectedProfile", () => {
     { name: "default", is_default: defaultName === "default" },
     { name: "work", is_default: defaultName === "work" },
   ];
-  it("keeps a valid selection, else falls back to the default-flagged profile, else 'default'", () => {
-    for (const [name, current, profiles, expected] of [
-      ["keeps a still-valid selection", "work", both("default"), "work"],
-      ["keeps a selection that is the default-flagged profile", "default", both("default"), "default"],
-      ["falls back to the default-flagged profile", "scratch", both("work"), "work"],
-      ["falls back to 'default' with no default flag", "missing", [{ name: "scratch", is_default: false }], "default"],
-      ["falls back to 'default' on an empty list", "anything", [], "default"],
-    ] as [string, string, { name: string; is_default: boolean }[], string][]) {
-      expect(resolveSelectedProfile(current, profiles), name).toBe(expected);
-    }
+  it.each([
+    ["keeps a still-valid selection", "work", both("default"), "work"],
+    ["keeps a selection that is the default-flagged profile", "default", both("default"), "default"],
+    ["falls back to the default-flagged profile", "scratch", both("work"), "work"],
+    ["falls back to 'default' with no default flag", "missing", [{ name: "scratch", is_default: false }], "default"],
+    ["falls back to 'default' on an empty list", "anything", [], "default"],
+  ])("%s", (_n, current, profiles, expected) => {
+    expect(resolveSelectedProfile(current, profiles)).toBe(expected);
   });
 });

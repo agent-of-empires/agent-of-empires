@@ -40,60 +40,53 @@ function noticeProps(overrides?: Partial<NoticeProps>): NoticeProps {
 const mount = (overrides?: Partial<NoticeProps>) => render(<SystemNotices {...noticeProps(overrides)} />);
 
 describe("SystemNotices", () => {
-  it("claims auto-resume only when the profile state is known", () => {
-    const cases: [boolean | undefined, RegExp | null][] = [
-      [true, /Auto-resume is armed/],
-      [false, /Auto-resume is off for this profile/],
-      [undefined, null],
-    ];
-    for (const [rateLimitAutoResume, expected] of cases) {
-      const { queryByText } = mount({ rateLimit: LIMITED, rateLimitAutoResume });
-      if (expected) expect(queryByText(expected)).not.toBeNull();
-      else expect(queryByText(/Auto-resume/)).toBeNull();
-      cleanup();
-    }
+  it.each([
+    [true, /Auto-resume is armed/],
+    [false, /Auto-resume is off for this profile/],
+    // Unknown: claim nothing.
+    [undefined, null],
+  ])("auto-resume %s", (rateLimitAutoResume, expected) => {
+    const { queryByText } = mount({ rateLimit: LIMITED, rateLimitAutoResume });
+    if (expected) expect(queryByText(expected)).not.toBeNull();
+    else expect(queryByText(/Auto-resume/)).toBeNull();
   });
 
   // Without a parseable reset, the banner shows the agent's own wording, never a made-up clock (#3174).
-  it("words the rate limit from the reported reset or the agent's own text", () => {
-    const cases: [string, { status: string; resets_at: string | null }, string][] = [
-      [
-        "a reported reset",
-        { status: PARIS, resets_at: "2099-01-01T09:30:00Z" },
-        `Rate-limited (rate_limit); resets at ${new Date("2099-01-01T09:30:00Z").toLocaleTimeString()}.`,
-      ],
-      [
-        "no reset",
-        { status: PARIS, resets_at: null },
-        "Rate-limited (rate_limit); You've hit your weekly limit · resets 4am (Europe/Paris)",
-      ],
-      [
-        "an unparseable reset",
-        { status: PARIS, resets_at: "not-a-timestamp" },
-        "Rate-limited (rate_limit); You've hit your weekly limit · resets 4am (Europe/Paris)",
-      ],
-      [
-        "transport prefixes and a JSON fingerprint",
-        {
-          status:
-            'ACP connection failed: Internal error: You\'ve hit your limit · resets 12:10pm (Europe/Paris): {\n  "errorKind":"rate_limit"\n}',
-          resets_at: null,
-        },
-        "Rate-limited (rate_limit); You've hit your limit · resets 12:10pm (Europe/Paris)",
-      ],
-      [
-        "only a fingerprint",
-        { status: '{"errorKind":"rate_limit"}', resets_at: null },
-        "Rate-limited (rate_limit); the agent did not report a reset time.",
-      ],
-    ];
-    for (const [label, limit, expected] of cases) {
-      const { getByText, container } = mount({ rateLimit: { ...limit, kind: "rate_limit" } });
-      expect(getByText(expected), label).toBeDefined();
-      expect(container.textContent, label).not.toMatch(/Invalid Date|errorKind|ACP connection failed/);
-      if (!expected.includes("resets at")) expect(container.textContent, label).not.toMatch(/resets at \d/);
-      cleanup();
-    }
+  it.each([
+    [
+      "a reported reset",
+      { status: PARIS, resets_at: "2099-01-01T09:30:00Z" },
+      `Rate-limited (rate_limit); resets at ${new Date("2099-01-01T09:30:00Z").toLocaleTimeString()}.`,
+    ],
+    [
+      "no reset",
+      { status: PARIS, resets_at: null },
+      "Rate-limited (rate_limit); You've hit your weekly limit · resets 4am (Europe/Paris)",
+    ],
+    [
+      "an unparseable reset",
+      { status: PARIS, resets_at: "not-a-timestamp" },
+      "Rate-limited (rate_limit); You've hit your weekly limit · resets 4am (Europe/Paris)",
+    ],
+    [
+      "transport prefixes and a JSON fingerprint",
+      {
+        status:
+          'ACP connection failed: Internal error: You\'ve hit your limit · resets 12:10pm (Europe/Paris): {\n  "errorKind":"rate_limit"\n}',
+        resets_at: null,
+      },
+      "Rate-limited (rate_limit); You've hit your limit · resets 12:10pm (Europe/Paris)",
+    ],
+    [
+      "only a fingerprint",
+      { status: '{"errorKind":"rate_limit"}', resets_at: null },
+      "Rate-limited (rate_limit); the agent did not report a reset time.",
+    ],
+  ])("words the rate limit for %s", (_label, limit, expected) => {
+    const { getByText, container } = mount({ rateLimit: { ...limit, kind: "rate_limit" } });
+    expect(getByText(expected)).toBeDefined();
+    expect(container.textContent).not.toMatch(/Invalid Date|errorKind|ACP connection failed/);
+    if (!expected.includes("resets at")) expect(container.textContent).not.toMatch(/resets at \d/);
   });
 
   it("shows both recovery actions only with a rate limit and their handlers", () => {
@@ -124,21 +117,13 @@ describe("SystemNotices", () => {
     expect(queryByRole("button", { name: /resume now/i })).toBeNull();
   });
 
-  it("disables Resume while retrying or after a successful request", () => {
-    const cases = [
-      ["retrying", /resuming/i, null],
-      ["ok", /resume requested/i, /Resume requested\. New events should start streaming shortly/i],
-    ] as const;
-    for (const [rateLimitResumeState, name, note] of cases) {
-      const { getByRole, queryByText } = mount({
-        rateLimit: LIMITED,
-        onResumeRateLimit: vi.fn(),
-        rateLimitResumeState,
-      });
-      expect((getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(true);
-      if (note) expect(queryByText(note)).not.toBeNull();
-      cleanup();
-    }
+  it.each([
+    ["retrying", /resuming/i, null],
+    ["ok", /resume requested/i, /Resume requested\. New events should start streaming shortly/i],
+  ] as const)("disables Resume while %s", (rateLimitResumeState, name, note) => {
+    const { getByRole, queryByText } = mount({ rateLimit: LIMITED, onResumeRateLimit: vi.fn(), rateLimitResumeState });
+    expect((getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(true);
+    if (note) expect(queryByText(note)).not.toBeNull();
   });
 
   it("shows failed resume feedback while retaining both actions", () => {
@@ -155,23 +140,19 @@ describe("SystemNotices", () => {
   });
 
   // `Stopped` does not clear `rate_limit` server-side, so a cap park keeps the snapshot and both buttons (#3693).
-  it("shows the auto-resume stopped note, with actions only while a snapshot remains", () => {
-    const cases: [NoticeProps["rateLimit"], boolean][] = [
-      [{ status: "limited", resets_at: "2099-01-01T00:00:00Z", kind: "usage" }, true],
-      [null, false],
-    ];
-    for (const [rateLimit, buttons] of cases) {
-      const { getByText, queryByRole } = mount({
-        rateLimitRetriesExhausted: true,
-        rateLimit,
-        onSwitchAgent: vi.fn(),
-        onResumeRateLimit: vi.fn(),
-      });
-      expect(getByText(/Auto-resume stopped: the same prompt was re-sent too many times/i)).toBeDefined();
-      expect(queryByRole("button", { name: /resume now/i }) !== null).toBe(buttons);
-      expect(queryByRole("button", { name: /continue in another agent/i }) !== null).toBe(buttons);
-      cleanup();
-    }
+  it.each([
+    [{ status: "limited", resets_at: "2099-01-01T00:00:00Z", kind: "usage" }, true],
+    [null, false],
+  ])("shows the auto-resume stopped note (snapshot %o)", (rateLimit, buttons) => {
+    const { getByText, queryByRole } = mount({
+      rateLimitRetriesExhausted: true,
+      rateLimit,
+      onSwitchAgent: vi.fn(),
+      onResumeRateLimit: vi.fn(),
+    });
+    expect(getByText(/Auto-resume stopped: the same prompt was re-sent too many times/i)).toBeDefined();
+    expect(queryByRole("button", { name: /resume now/i }) !== null).toBe(buttons);
+    expect(queryByRole("button", { name: /continue in another agent/i }) !== null).toBe(buttons);
   });
 });
 

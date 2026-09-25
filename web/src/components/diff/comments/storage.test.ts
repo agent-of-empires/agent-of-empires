@@ -54,11 +54,12 @@ describe("loadComments", () => {
     expect(loadComments("sess-2").comments.map((c) => c.id)).toEqual(["z"]);
   });
 
-  it("returns the empty envelope for corrupt JSON or an unknown version", () => {
-    for (const raw of ["not json", JSON.stringify({ ...withComment(), version: 99 })]) {
-      localStorage.setItem(storageKey("sess-1"), raw);
-      expect(loadComments("sess-1")).toEqual(EMPTY_STORAGE);
-    }
+  it.each([
+    ["corrupt JSON", "not json"],
+    ["an unknown version", JSON.stringify({ ...withComment(), version: 99 })],
+  ])("returns the empty envelope for %s", (_, raw) => {
+    localStorage.setItem(storageKey("sess-1"), raw);
+    expect(loadComments("sess-1")).toEqual(EMPTY_STORAGE);
   });
 
   it("drops malformed comments and defaults missing fields", () => {
@@ -82,9 +83,11 @@ describe("saveComments", () => {
     expect(keys()).toEqual([]);
   });
 
-  it("treats a lone draft as non-empty", () => {
-    expect(isEmptyState({ ...EMPTY_STORAGE, introDraft: "hi" })).toBe(false);
-    expect(isEmptyState({ ...EMPTY_STORAGE, outroDraft: "bye" })).toBe(false);
+  it.each<[Partial<DiffCommentsStorageV1>, boolean]>([
+    [{ introDraft: "hi" }, false],
+    [{ outroDraft: "bye" }, false],
+  ])("isEmptyState(%j) is %s", (over, empty) => {
+    expect(isEmptyState({ ...EMPTY_STORAGE, ...over })).toBe(empty);
   });
 });
 

@@ -53,11 +53,12 @@ describe("APPLY_PROFILE_DEFAULTS", () => {
 
   // A remembered or prefilled path resolves its repo probe at mount, often
   // before the chained profile+settings fetch seeds the defaults.
-  it("re-enables worktree only where the repo probe said yes", () => {
-    for (const pathIsGitRepo of [false, true]) {
-      const state = makeState({ path: "/tmp/p", pathIsGitRepo });
-      expect(reducer(state, defaults({ worktreeEnabled: true })).data.useWorktree).toBe(pathIsGitRepo);
-    }
+  it.each([
+    [false, false],
+    [true, true],
+  ])("re-enables worktree only where the repo probe said yes (pathIsGitRepo %s)", (pathIsGitRepo, expected) => {
+    const state = makeState({ path: "/tmp/p", pathIsGitRepo });
+    expect(reducer(state, defaults({ worktreeEnabled: true })).data.useWorktree).toBe(expected);
   });
 
   it("a late skipIfDirty apply keeps a dirty yoloMode edit but still records the worktree default", () => {
@@ -93,7 +94,7 @@ describe("APPLY_PROFILE_DEFAULTS", () => {
 
   // #3517: the configured view seeds past other dirty fields; a hand-set view survives mount-time
   // seeding but not a confirmed profile change; an import stays structured.
-  const viewCases = [
+  it.each([
     ["clean", {}, [], defaults({ useStructuredView: false }), false],
     ["dirty yoloMode", {}, [set("yoloMode", true)], defaults({ useStructuredView: false }), false],
     ["hand-set view", {}, [set("useStructuredView", true)], defaults({ useStructuredView: false }), true],
@@ -105,13 +106,8 @@ describe("APPLY_PROFILE_DEFAULTS", () => {
       false,
     ],
     ["import", { importAcpSessionId: "abc" }, [], defaults({ useStructuredView: false }), true],
-  ] as const;
-  it("seeds the configured view unless hand-set or imported", () => {
-    const got = viewCases.map(([name, data, edits, seed]) => [
-      name,
-      run(makeState(data), ...edits, seed).data.useStructuredView,
-    ]);
-    expect(got).toEqual(viewCases.map(([name, , , , view]) => [name, view]));
+  ] as const)("seeds the configured view: %s", (_, data, edits, seed, view) => {
+    expect(run(makeState(data), ...edits, seed).data.useStructuredView).toBe(view);
   });
 });
 
@@ -134,14 +130,13 @@ describe("SET_FIELD mutual exclusion", () => {
     });
   });
 
-  it("a non-empty path or extraRepoPaths clears scratch and the import id", () => {
-    for (const [field, value] of [
-      ["path", "/picked"],
-      ["extraRepoPaths", ["/lib"]],
-    ] as const) {
-      const next = reducer(makeState({ scratch: true, importAcpSessionId: "abc" }), set(field, value));
-      expect(next.data).toMatchObject({ scratch: false, importAcpSessionId: "" });
-    }
+  it.each([
+    ["path", "/picked"],
+    ["extraRepoPaths", ["/lib"]],
+  ])("a non-empty %s clears scratch and the import id", (field, value) => {
+    const next = reducer(makeState({ scratch: true, importAcpSessionId: "abc" }), set(field, value));
+    expect(next.data.scratch).toBe(false);
+    expect(next.data.importAcpSessionId).toBe("");
   });
 
   it("disabling scratch keeps the existing path", () => {

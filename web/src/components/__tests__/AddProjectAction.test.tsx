@@ -55,23 +55,26 @@ async function submit(value: string | null, { reuseBranch = false } = {}) {
 }
 
 describe("SessionRow Add project entry", () => {
-  it("is offered only where `attach_project::plan` accepts the row", () => {
-    for (const [over, options, offered] of [
-      // Running is decided by the server's turn probe; a 409 surfaces in the modal.
-      [{ status: "Running" }, {}, true],
-      [{}, { readOnly: true }, false],
-      [{ scratch: true }, {}, false],
-      [{ status: "Creating" }, {}, false],
-      [{ archived_at: "2025-01-02T00:00:00Z" }, {}, false],
-      [{ trashed_at: "2025-01-02T00:00:00Z" }, {}, false],
-    ] as [Partial<SessionResponse>, { readOnly?: boolean }, boolean][]) {
+  it.each([
+    // Running is decided by the server's turn probe; a 409 surfaces in the modal.
+    ["a Running row", { status: "Running" }, {}, true],
+    ["a read-only row", {}, { readOnly: true }, false],
+    // The rest are refused by `attach_project::plan`.
+    ["a scratch session", { scratch: true }, {}, false],
+    ["a mid-create session", { status: "Creating" }, {}, false],
+    ["an archived session", { archived_at: "2025-01-02T00:00:00Z" }, {}, false],
+    ["a trashed session", { trashed_at: "2025-01-02T00:00:00Z" }, {}, false],
+  ] as [string, Partial<SessionResponse>, { readOnly?: boolean }, boolean][])(
+    "on %s: offered=%s",
+    (_n, over, options, offered) => {
       openRowMenu(ws(over), options);
       expect(screen.queryByTestId("sidebar-context-menu-add-project") != null).toBe(offered);
       // The menu opened, so a hidden entry is the per-entry gate.
       expect(screen.queryByTestId("sidebar-context-menu-rename")).not.toBeNull();
-      cleanup();
-    }
-    // A mid-delete row opens no menu at all.
+    },
+  );
+
+  it("is unreachable on a mid-delete row, which opens no menu", () => {
     renderRow(ws({ status: "Deleting" }));
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
     expect(screen.queryByTestId("sidebar-context-menu")).toBeNull();

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 import type { McpServersResponse, McpResolveResult } from "../../lib/api";
 
@@ -100,11 +100,12 @@ async function openConflictModal() {
 }
 
 describe("McpServers conflict resolution", () => {
-  it("each winner button posts its winner with the fingerprint and reloads", async () => {
-    for (const [button, winner] of [
-      ["Keep AoE version", "aoe"],
-      ["Use native", "native"],
-    ] as [string, "aoe" | "native"][]) {
+  it.each([
+    ["Keep AoE version", "aoe"],
+    ["Use native", "native"],
+  ] as [string, "aoe" | "native"][])(
+    "'%s' posts its winner with the fingerprint and reloads",
+    async (button, winner) => {
       resolveMcpConflict.mockResolvedValue("applied");
       const dialog = await openConflictModal();
       // After an applied resolution the surface reloads with no conflict.
@@ -112,21 +113,17 @@ describe("McpServers conflict resolution", () => {
       fireEvent.click(within(dialog).getByText(button));
       await waitFor(() => expect(resolveMcpConflict).toHaveBeenCalledWith("fs", "claude", winner, "fp-123"));
       await waitFor(() => expect(screen.queryByLabelText("resolve fs")).toBeNull());
-      cleanup();
-    }
-  });
+    },
+  );
 
-  it("stale and error results show their notices", async () => {
-    for (const [result, notice] of [
-      ["stale", /already resolved by another surface/],
-      ["error", /Could not resolve "fs"/],
-    ] as [McpResolveResult, RegExp][]) {
-      resolveMcpConflict.mockResolvedValue(result);
-      const dialog = await openConflictModal();
-      fireEvent.click(within(dialog).getByText("Keep AoE version"));
-      expect(await screen.findByText(notice)).toBeTruthy();
-      cleanup();
-    }
+  it.each([
+    ["stale", /already resolved by another surface/],
+    ["error", /Could not resolve "fs"/],
+  ] as [McpResolveResult, RegExp][])("a %s result shows its notice", async (result, notice) => {
+    resolveMcpConflict.mockResolvedValue(result);
+    const dialog = await openConflictModal();
+    fireEvent.click(within(dialog).getByText("Keep AoE version"));
+    expect(await screen.findByText(notice)).toBeTruthy();
   });
 
   it("cancel closes the modal without resolving", async () => {
@@ -151,21 +148,18 @@ describe("McpServers keep / drop", () => {
     });
   }
 
-  it("keep and drop apply to the server and reload on success", async () => {
-    for (const [action, call] of [
-      ["keep", keepMcpServer],
-      ["drop", dropMcpServer],
-    ] as [string, typeof keepMcpServer][]) {
-      fetchMcpServers.mockResolvedValue(keptResponse());
-      call.mockResolvedValue(true);
-      const { unmount } = render(<McpServers />);
-      const button = await screen.findByLabelText(`${action} gone`);
-      fetchMcpServers.mockResolvedValue(response());
-      fireEvent.click(button);
-      await waitFor(() => expect(call).toHaveBeenCalledWith("gone", "claude"));
-      await waitFor(() => expect(screen.queryByLabelText(`${action} gone`)).toBeNull());
-      unmount();
-    }
+  it.each([
+    ["keep", keepMcpServer],
+    ["drop", dropMcpServer],
+  ] as [string, typeof keepMcpServer][])("%s applies to the server and reloads on success", async (action, call) => {
+    fetchMcpServers.mockResolvedValue(keptResponse());
+    call.mockResolvedValue(true);
+    render(<McpServers />);
+    const button = await screen.findByLabelText(`${action} gone`);
+    fetchMcpServers.mockResolvedValue(response());
+    fireEvent.click(button);
+    await waitFor(() => expect(call).toHaveBeenCalledWith("gone", "claude"));
+    await waitFor(() => expect(screen.queryByLabelText(`${action} gone`)).toBeNull());
   });
 
   it("a failed keep shows a notice and leaves the row in place", async () => {

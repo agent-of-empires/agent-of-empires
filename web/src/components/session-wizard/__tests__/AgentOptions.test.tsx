@@ -61,18 +61,21 @@ describe("AgentPickerEssentials", () => {
     expect(screen.queryByText("No agents installed")).toBeNull();
   });
 
-  it("badges deprecated agents and warns only when one is selected", () => {
-    const agents = [agent("gemini"), claude, agent("custom-tool")];
-    renderPicker("claude", agents);
-    expect(screen.getByTestId("wizard-agent-deprecated-badge-gemini")).toBeTruthy();
+  it.each([
+    ["gemini", true],
+    ["claude", false],
+  ])("badges and warns for deprecated agents (%s)", (tool, deprecated) => {
+    renderPicker(tool, [agent("gemini"), claude, agent("custom-tool")]);
+    expect(!!screen.queryByTestId(`wizard-agent-deprecated-badge-gemini`)).toBe(true);
     expect(screen.queryByTestId("wizard-agent-deprecated-badge-claude")).toBeNull();
     expect(screen.queryByTestId("wizard-agent-deprecated-badge-custom-tool")).toBeNull();
-    expect(screen.queryByTestId("wizard-agent-deprecated-warning")).toBeNull();
-    cleanup();
-    renderPicker("gemini", agents);
-    expect(screen.getByTestId("wizard-agent-deprecated-warning").textContent).toContain(
-      "consider switching to antigravity",
-    );
+    const warning = screen.queryByTestId("wizard-agent-deprecated-warning");
+    expect(!!warning).toBe(deprecated);
+    if (warning) {
+      expect(warning.textContent).toContain("since 2026-06-18");
+      expect(warning.textContent).toContain("enterprise/API-key remain valid");
+      expect(warning.textContent).toContain("consider switching to antigravity");
+    }
   });
 
   it("prefers the server lifecycle over the static mirror", () => {
@@ -107,17 +110,15 @@ describe("AgentOptions view card", () => {
     expect(viewSwitch()?.getAttribute("aria-checked")).toBe("false");
   });
 
-  it("shows only the terminal fallback, with its reason, for agents without structured view", () => {
-    for (const [tool, agents, text] of [
-      ["aider", undefined, /has no ACP adapter yet/],
-      ["remote-helper", undefined, /Custom agents run in the terminal unless they define agent_acp_cmd/],
-      ["claude", [{ ...claude, acp_allowed: false }], /not on the operator's allowed agents list/],
-    ] as const) {
-      renderOptions({ tool }, { agents: agents && [...agents] });
-      expect(viewSwitch()).toBeNull();
-      expect(screen.getByText(text)).toBeTruthy();
-      cleanup();
-    }
+  it.each([
+    ["aider", undefined, /has no ACP adapter yet/],
+    ["remote-helper", undefined, /Custom agents run in the terminal unless they define agent_acp_cmd/],
+    ["claude", [{ ...claude, acp_allowed: false }], /not on the operator's allowed agents list/],
+  ])("shows only the terminal fallback for %s", (tool, agents, text) => {
+    renderOptions({ tool }, { agents });
+    expect(viewSwitch()).toBeNull();
+    expect(screen.getByText(text)).toBeTruthy();
+    if (tool === "claude") expect(screen.queryByText(/no ACP adapter yet/i)).toBeNull();
   });
 });
 
@@ -136,21 +137,20 @@ describe("AgentOptions workflow presets", () => {
     expect(onChange).toHaveBeenCalledWith("profile", "work");
   });
 
-  it("confirms before switching away from preset or view edits", () => {
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
-    try {
-      for (const dirty of [{ profileDirty: true }, { structuredViewDirty: true }]) {
-        confirmSpy.mockClear();
+  it.each([{ profileDirty: true }, { structuredViewDirty: true }])(
+    "confirms before switching away from edits: %o",
+    (dirty) => {
+      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+      try {
         const { onChange } = renderOptions({ profile: "default", ...dirty }, { profiles: PROFILES });
         fireEvent.click(screen.getByRole("radio", { name: /work/ }));
         expect(confirmSpy).toHaveBeenCalled();
         expect(onChange).not.toHaveBeenCalledWith("profile", "work");
-        cleanup();
+      } finally {
+        confirmSpy.mockRestore();
       }
-    } finally {
-      confirmSpy.mockRestore();
-    }
-  });
+    },
+  );
 
   it("hides the picker with a single profile", () => {
     renderOptions({}, { profiles: [PROFILES[0]!] });

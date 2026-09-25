@@ -24,21 +24,20 @@ beforeEach(() => {
 });
 
 describe("TerminalSettings localStorage contract", () => {
-  it("each control writes its key", () => {
-    const cases: [string, number, string, string, unknown][] = [
-      ["input[type=range]", 0, "10", "mobileFontSize", 10],
-      ["select", 0, "16", "mobileFontSize", 16],
-      ["input[type=range]", 1, "18", "desktopFontSize", 18],
-      ["select", 1, "20", "desktopFontSize", 20],
-      ["#terminal-font-family", 0, "MesloLGS NF", "terminalFontFamily", "MesloLGS NF"],
-      ["#sidebar-side", 0, "right", "sidebarSide", "right"],
-    ];
-    for (const [selector, i, value, key, expected] of cases) {
-      const { container, unmount } = render(<TerminalSettings />);
-      fireEvent.change(container.querySelectorAll(selector)[i]!, { target: { value } });
-      expect(readStored()[key], `${selector}[${i}]`).toBe(expected);
-      unmount();
-    }
+  it.each([
+    ["mobile font slider", "input[type=range]", 0, "10", "mobileFontSize", 10],
+    ["mobile font select", "select", 0, "16", "mobileFontSize", 16],
+    ["desktop font slider", "input[type=range]", 1, "18", "desktopFontSize", 18],
+    ["desktop font select", "select", 1, "20", "desktopFontSize", 20],
+    ["font family input", "#terminal-font-family", 0, "MesloLGS NF", "terminalFontFamily", "MesloLGS NF"],
+    ["sidebar side select", "#sidebar-side", 0, "right", "sidebarSide", "right"],
+  ] as [string, string, number, string, string, unknown][])("%s writes %s", (_n, selector, i, value, key, expected) => {
+    const { container } = render(<TerminalSettings />);
+    fireEvent.change(container.querySelectorAll(selector)[i]!, { target: { value } });
+    expect(readStored()[key]).toBe(expected);
+  });
+
+  it("checkboxes write the keyboard and persistent-terminal flags", () => {
     const { container } = render(<TerminalSettings />);
     const checkboxes = container.querySelectorAll("input[type=checkbox]");
     fireEvent.click(checkboxes[0]!);

@@ -35,27 +35,23 @@ describe("SnoozeModal", () => {
     expect(onCancel).toHaveBeenCalledTimes(3);
   });
 
-  it("converts custom durations to minutes and rejects out-of-range values", () => {
-    for (const [value, unit, minutes] of [
-      ["3", null, 180],
-      ["45", "m", 45],
-      ["2", "d", 2 * 24 * 60],
-      ["1", "w", 7 * 24 * 60],
-      ["0", null, null],
-      ["5", "w", null],
-    ] as const) {
-      const { onPick } = setup();
-      change("snooze-modal-custom-value", value);
-      if (unit) change("snooze-modal-custom-unit", unit);
-      click("snooze-modal-custom-submit");
-      const name = `${value}${unit ?? ""}`;
-      if (minutes == null) {
-        expect(onPick, name).not.toHaveBeenCalled();
-        expect(screen.queryByTestId("snooze-modal-custom-error"), name).not.toBeNull();
-      } else {
-        expect(onPick, name).toHaveBeenCalledWith(minutes);
-      }
-      cleanup();
+  it.each([
+    ["3", null, 180],
+    ["45", "m", 45],
+    ["2", "d", 2 * 24 * 60],
+    ["1", "w", 7 * 24 * 60],
+    ["0", null, null],
+    ["5", "w", null],
+  ])("custom %s %s picks %s", (value, unit, minutes) => {
+    const { onPick } = setup();
+    change("snooze-modal-custom-value", value);
+    if (unit) change("snooze-modal-custom-unit", unit);
+    click("snooze-modal-custom-submit");
+    if (minutes == null) {
+      expect(onPick).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("snooze-modal-custom-error")).not.toBeNull();
+    } else {
+      expect(onPick).toHaveBeenCalledWith(minutes);
     }
   });
 
@@ -84,15 +80,16 @@ describe("with a fixed clock", () => {
     expect(minutes).toBeLessThan(30 * 24 * 60);
   });
 
-  it("rejects an empty, past, or beyond-30-day until value", () => {
-    for (const value of ["", "2026-05-01T12:00", "2099-01-01T00:00"]) {
-      const { onPick } = setup();
-      if (value) change("snooze-modal-until-value", value);
-      click("snooze-modal-until-submit");
-      expect(onPick, value).not.toHaveBeenCalled();
-      expect(screen.queryByTestId("snooze-modal-until-error"), value).not.toBeNull();
-      cleanup();
-    }
+  it.each([
+    ["empty", ""],
+    ["past", "2026-05-01T12:00"],
+    ["beyond 30 days", "2099-01-01T00:00"],
+  ])("rejects an %s until value", (_n, value) => {
+    const { onPick } = setup();
+    if (value) change("snooze-modal-until-value", value);
+    click("snooze-modal-until-submit");
+    expect(onPick).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("snooze-modal-until-error")).not.toBeNull();
   });
 
   it("makeOptimisticSnoozedUntil returns now plus minutes", () => {
@@ -100,17 +97,15 @@ describe("with a fixed clock", () => {
     expect(makeOptimisticSnoozedUntil(24 * 60)).toBe("2026-06-02T12:00:00.000Z");
   });
 
-  it("formatSnoozeRemainingShort rounds to the largest unit", () => {
-    for (const [iso, label] of [
-      ["2026-06-01T12:00:30Z", "<1m"],
-      ["2026-06-01T12:30:00Z", "30m"],
-      ["2026-06-01T15:30:00Z", "3h"],
-      ["2026-06-04T12:00:00Z", "3d"],
-      // Optimistic state can briefly outlive the wake time.
-      ["2026-05-31T12:00:00Z", "soon"],
-      ["not-a-date", "snoozed"],
-    ]) {
-      expect(formatSnoozeRemainingShort(iso), iso).toBe(label);
-    }
+  it.each([
+    ["2026-06-01T12:00:30Z", "<1m"],
+    ["2026-06-01T12:30:00Z", "30m"],
+    ["2026-06-01T15:30:00Z", "3h"],
+    ["2026-06-04T12:00:00Z", "3d"],
+    // Optimistic state can briefly outlive the wake time.
+    ["2026-05-31T12:00:00Z", "soon"],
+    ["not-a-date", "snoozed"],
+  ])("formatSnoozeRemainingShort(%s) is %s", (iso, label) => {
+    expect(formatSnoozeRemainingShort(iso)).toBe(label);
   });
 });

@@ -39,41 +39,34 @@ describe("SessionGroupModal", () => {
     expect(document.activeElement).toBe(input);
   });
 
-  it("saves the trimmed value then closes, or closes without saving when unchanged", async () => {
-    for (const [current, typed, saved, via] of [
-      ["", "  work/api  ", "work/api", "click"],
-      ["old", "new", "new", "enter"],
-      // A blank value ungroups.
-      ["work", "   ", "", "click"],
-      ["work", "  work  ", null, "click"],
-    ] as const) {
-      const { input, saveBtn, onSave, onClose } = setup(current);
-      fireEvent.change(input, { target: { value: typed } });
-      if (via === "enter") fireEvent.keyDown(input, { key: "Enter" });
-      else fireEvent.click(saveBtn);
-      if (saved == null) expect(onSave).not.toHaveBeenCalled();
-      else expect(onSave).toHaveBeenCalledWith(saved);
-      await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
-      cleanup();
-    }
+  it.each([
+    ["Save click", "", "  work/api  ", "work/api", "click"],
+    ["Enter", "old", "new", "new", "enter"],
+    ["blank value ungroups", "work", "   ", "", "click"],
+    ["unchanged value closes without saving", "work", "  work  ", null, "click"],
+  ] as const)("%s: saves the trimmed value then closes", async (_name, current, typed, saved, via) => {
+    const { input, saveBtn, onSave, onClose } = setup(current);
+    fireEvent.change(input, { target: { value: typed } });
+    if (via === "enter") fireEvent.keyDown(input, { key: "Enter" });
+    else fireEvent.click(saveBtn);
+    if (saved == null) expect(onSave).not.toHaveBeenCalled();
+    else expect(onSave).toHaveBeenCalledWith(saved);
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
   });
 
-  it("a failed save shows an update or clear error and stays open", async () => {
-    for (const [current, typed, message] of [
-      ["", "work", "Failed to update group."],
-      ["work", "", "Failed to clear group."],
-    ]) {
-      const { input, saveBtn, onClose } = setup(current, vi.fn().mockResolvedValue(false));
-      fireEvent.change(input, { target: { value: typed } });
-      fireEvent.click(saveBtn);
-      await waitFor(() => expect(errorText()).toBe(message));
-      expect(onClose).not.toHaveBeenCalled();
-      expect(saveBtn.disabled).toBe(false);
-      expect(document.activeElement).toBe(input);
-      fireEvent.change(input, { target: { value: "again" } });
-      expect(errorText()).toBeUndefined();
-      cleanup();
-    }
+  it.each([
+    ["", "work", "Failed to update group."],
+    ["work", "", "Failed to clear group."],
+  ])("from %j to %j a failed save shows %j and stays open", async (current, typed, message) => {
+    const { input, saveBtn, onClose } = setup(current, vi.fn().mockResolvedValue(false));
+    fireEvent.change(input, { target: { value: typed } });
+    fireEvent.click(saveBtn);
+    await waitFor(() => expect(errorText()).toBe(message));
+    expect(onClose).not.toHaveBeenCalled();
+    expect(saveBtn.disabled).toBe(false);
+    expect(document.activeElement).toBe(input);
+    fireEvent.change(input, { target: { value: "again" } });
+    expect(errorText()).toBeUndefined();
   });
 
   it("disables controls and ignores repeat saves while one is in flight", async () => {

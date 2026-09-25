@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { fireEvent, render } from "@testing-library/react";
 
 import type { PushState } from "../../hooks/usePushSubscription";
 
@@ -68,21 +68,31 @@ describe("NotificationSettings", () => {
     expect(disable).toHaveBeenCalledTimes(1);
   });
 
-  it("explains non-actionable states and offers Enable only where it can help", () => {
-    const cases: [PushState, string, boolean][] = [
-      [{ kind: "denied" }, "", true],
-      [{ kind: "error", message: "boom" }, "boom", true],
-      [{ kind: "unsupported", reason: "ios-not-standalone" }, "How to install on iPhone", false],
-      [{ kind: "unsupported", reason: "insecure-origin" }, "require HTTPS", false],
-      [{ kind: "disabled-by-server" }, "turned off by the server", false],
-      [{ kind: "asking" }, "Asking your browser", false],
-    ];
-    for (const [state, text, enableShown] of cases) {
-      const c = renderFor(state);
-      const name = JSON.stringify(state);
-      expect(c.textContent, name).toContain(text);
-      expect(buttonByText(c, "Enable notifications") !== null, name).toBe(enableShown);
-      cleanup();
-    }
+  it.each([
+    ["'denied' keeps the Enable button", { kind: "denied" }, null, true],
+    ["'error' renders its message", { kind: "error", message: "boom" }, "boom", true],
+    [
+      "'unsupported / ios-not-standalone' renders the install help",
+      { kind: "unsupported", reason: "ios-not-standalone" },
+      "How to install on iPhone",
+      false,
+    ],
+    [
+      "'unsupported / insecure-origin' surfaces the HTTPS hint",
+      { kind: "unsupported", reason: "insecure-origin" },
+      "require HTTPS",
+      false,
+    ],
+    [
+      "'disabled-by-server' surfaces the server hint",
+      { kind: "disabled-by-server" },
+      "turned off by the server",
+      false,
+    ],
+    ["'asking' shows status text instead of Enable", { kind: "asking" }, "Asking your browser", false],
+  ] as [string, PushState, string | null, boolean][])("%s", (_name, state, text, enableShown) => {
+    const container = renderFor(state);
+    if (text) expect(container.textContent).toContain(text);
+    expect(buttonByText(container, "Enable notifications") !== null).toBe(enableShown);
   });
 });

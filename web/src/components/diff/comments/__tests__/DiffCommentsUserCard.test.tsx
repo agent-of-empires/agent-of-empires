@@ -69,12 +69,9 @@ describe("DiffCommentsUserCard", () => {
     expect(c.textContent).toContain("lines 5-9");
   });
 
-  it("shows the repo chip only for multi-repo", () => {
-    for (const isMultiRepo of [false, true]) {
-      const c = renderCard({ isMultiRepo, comments: [comment({ repoName: "frontend" })] });
-      expect(c.textContent?.includes("frontend")).toBe(isMultiRepo);
-      cleanup();
-    }
+  it.each([false, true])("shows the repo chip only for multi-repo (%s)", (isMultiRepo) => {
+    const c = renderCard({ isMultiRepo, comments: [comment({ repoName: "frontend" })] });
+    expect(c.textContent?.includes("frontend")).toBe(isMultiRepo);
   });
 
   it("sorts by repo, file, then start line", () => {

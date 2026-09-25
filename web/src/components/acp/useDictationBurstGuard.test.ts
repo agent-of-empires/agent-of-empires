@@ -161,33 +161,27 @@ describe("decideDictationAction", () => {
     flushPending,
     armTimeoutMs: null,
   });
-  it("decides each transition", () => {
-    const cases = [
-      [
-        "inactive replacement enters",
-        inactive,
-        { kind: "input", inputType: "insertReplacementText", nowMs: 1300 },
-        enter,
-      ],
-      ["active replacement extends", active, { kind: "input", inputType: "insertReplacementText", nowMs: 1300 }, enter],
-      ["active timeout flushes", active, { kind: "timeout", nowMs: 2300 }, end(true)],
-      ["active blur flushes", active, { kind: "blur" }, end(true)],
-      [
-        "active typing flushes without suppressing",
-        active,
-        { kind: "input", inputType: "insertText", nowMs: 1100 },
-        end(true),
-      ],
-      [
-        "active backspace flushes",
-        active,
-        { kind: "input", inputType: "deleteContentBackward", nowMs: 1100 },
-        end(true),
-      ],
-      ["inactive typing is a no-op", inactive, { kind: "input", inputType: "insertText", nowMs: 1000 }, end(false)],
-      ["inactive blur is a no-op", inactive, { kind: "blur" }, end(false)],
-      ["stale timeout is a no-op", inactive, { kind: "timeout", nowMs: 5000 }, end(false)],
-    ] as const;
-    for (const [label, prev, ev, expected] of cases) expect(decideDictationAction(prev, ev), label).toEqual(expected);
+  it.each([
+    [
+      "inactive replacement enters",
+      inactive,
+      { kind: "input", inputType: "insertReplacementText", nowMs: 1300 },
+      enter,
+    ],
+    ["active replacement extends", active, { kind: "input", inputType: "insertReplacementText", nowMs: 1300 }, enter],
+    ["active timeout flushes", active, { kind: "timeout", nowMs: 2300 }, end(true)],
+    ["active blur flushes", active, { kind: "blur" }, end(true)],
+    [
+      "active typing flushes without suppressing",
+      active,
+      { kind: "input", inputType: "insertText", nowMs: 1100 },
+      end(true),
+    ],
+    ["active backspace flushes", active, { kind: "input", inputType: "deleteContentBackward", nowMs: 1100 }, end(true)],
+    ["inactive typing is a no-op", inactive, { kind: "input", inputType: "insertText", nowMs: 1000 }, end(false)],
+    ["inactive blur is a no-op", inactive, { kind: "blur" }, end(false)],
+    ["stale timeout is a no-op", inactive, { kind: "timeout", nowMs: 5000 }, end(false)],
+  ] as const)("%s", (_label, prev, ev, expected) => {
+    expect(decideDictationAction(prev, ev)).toEqual(expected);
   });
 });

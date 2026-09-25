@@ -45,24 +45,17 @@ async function openPanel(button: "+ New" | "Rename", selected = "work") {
 const INVALID = "Only letters, digits, hyphens, and underscores";
 
 describe("ProfileSelector create", () => {
-  it("validateProfileName rejects blank and path-unsafe names and accepts the allowed charset", () => {
-    for (const name of [
-      "",
-      "bad name",
-      "bad;name",
-      "bad$name",
-      "bad|name",
-      "bad&name",
-      "bad`name",
-      "bad/name",
-      "..",
-      ".hidden",
-    ]) {
-      expect(validateProfileName(name), name).toBe(name ? INVALID : "Name is required");
-    }
-    for (const name of ["work", "work-2", "work_2", "A", "my-profile_42"]) {
-      expect(validateProfileName(name), name).toBeNull();
-    }
+  it.each([
+    ["", "Name is required"],
+    ...["bad name", "bad;name", "bad$name", "bad|name", "bad&name", "bad`name", "bad/name", "..", ".hidden"].map(
+      (n) => [n, INVALID],
+    ),
+  ])("validateProfileName rejects %j", (name, message) => {
+    expect(validateProfileName(name)).toBe(message);
+  });
+
+  it.each(["work", "work-2", "work_2", "A", "my-profile_42"])("validateProfileName accepts %s", (good) => {
+    expect(validateProfileName(good)).toBeNull();
   });
 
   it("rejects blank and unsafe names without calling createProfile, then creates a trimmed name", async () => {

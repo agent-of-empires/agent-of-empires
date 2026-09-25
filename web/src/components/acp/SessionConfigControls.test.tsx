@@ -46,23 +46,19 @@ function mount(
 const byId = (id: string) => screen.queryByTestId(`config-option-${id}`);
 
 describe("SessionConfigControls", () => {
-  it("renders widgets only for known categories", () => {
-    const cases: [ConfigOptionDescriptor[], string[]][] = [
-      [[], []],
-      [[UNKNOWN], []],
-      [[MODEL], ["model"]],
-      [[EFFORT], ["effort"]],
-      [
-        [UNKNOWN, MODEL, EFFORT],
-        ["model", "effort"],
-      ],
-    ];
-    for (const [options, shown] of cases) {
-      const { container } = mount(options);
-      if (shown.length === 0) expect(container.firstChild).toBeNull();
-      for (const id of ["model", "effort", "future"]) expect(byId(id) !== null, id).toBe(shown.includes(id));
-      cleanup();
-    }
+  it.each([
+    [[], []],
+    [[UNKNOWN], []],
+    [[MODEL], ["model"]],
+    [[EFFORT], ["effort"]],
+    [
+      [UNKNOWN, MODEL, EFFORT],
+      ["model", "effort"],
+    ],
+  ])("renders widgets for %#", (options, shown) => {
+    const { container } = mount(options);
+    if (shown.length === 0) expect(container.firstChild).toBeNull();
+    for (const id of ["model", "effort", "future"]) expect(byId(id) !== null).toBe(shown.includes(id));
   });
 
   it("uses a segmented control for short effort lists, sending the value, and a dropdown past the threshold", () => {
@@ -106,51 +102,47 @@ describe("SessionConfigControls", () => {
   });
 
   // Up when a floor's worth of room exists above, else the roomier side, clamped to what is visible (#3747).
-  it("lays out the model menu in the roomier direction with a clamped max height", () => {
-    const cases = [
-      ["ample room above", 400, 420, 800, undefined, 0, "up", 288],
-      ["cramped above, ample below", 50, 60, 800, undefined, 0, "down", 288],
-      ["prefers up once the floor clears, even with more room below", 200, 220, 800, undefined, 0, "up", 192],
-      ["cramped both ways, above larger", 50, 60, 100, undefined, 0, "up", 42],
-      ["cramped both ways, below larger", 20, 30, 100, undefined, 0, "down", 62],
-      ["exact tie resolves to up", 58, 68, 126, undefined, 0, "up", 50],
-      // A zoom offset shifts the visible top, leaving too little room above.
-      ["visualViewport offset flips the direction", 250, 270, 1000, 800, 200, "down", 288],
-    ] as const;
+  it.each([
+    ["ample room above", 400, 420, 800, undefined, 0, "up", 288],
+    ["cramped above, ample below", 50, 60, 800, undefined, 0, "down", 288],
+    ["prefers up once the floor clears, even with more room below", 200, 220, 800, undefined, 0, "up", 192],
+    ["cramped both ways, above larger", 50, 60, 100, undefined, 0, "up", 42],
+    ["cramped both ways, below larger", 20, 30, 100, undefined, 0, "down", 62],
+    ["exact tie resolves to up", 58, 68, 126, undefined, 0, "up", 50],
+    // A zoom offset shifts the visible top, leaving too little room above.
+    ["visualViewport offset flips the direction", 250, 270, 1000, 800, 200, "down", 288],
+  ])("menu layout: %s", (_label, top, bottom, innerHeight, vvHeight, vvOffsetTop, direction, maxHeight) => {
     const restore = [
       ["innerHeight", Object.getOwnPropertyDescriptor(window, "innerHeight")],
       ["visualViewport", Object.getOwnPropertyDescriptor(window, "visualViewport")],
     ] as const;
     const rectSpy = vi.spyOn(Element.prototype, "getBoundingClientRect");
     try {
-      for (const [label, top, bottom, innerHeight, vvHeight, vvOffsetTop, direction, maxHeight] of cases) {
-        Object.defineProperty(window, "innerHeight", { value: innerHeight, configurable: true, writable: true });
-        Object.defineProperty(window, "visualViewport", {
-          value:
-            vvHeight == null
-              ? undefined
-              : { height: vvHeight, offsetTop: vvOffsetTop, addEventListener: vi.fn(), removeEventListener: vi.fn() },
-          configurable: true,
-          writable: true,
-        });
-        rectSpy.mockReturnValue({
-          top,
-          bottom,
-          left: 0,
-          right: 0,
-          width: 0,
-          height: bottom - top,
-          x: 0,
-          y: top,
-          toJSON: () => ({}),
-        } as DOMRect);
-        mount([MODEL]);
-        fireEvent.click(byId("model")!);
-        const menu = document.getElementById("config-option-menu-model")!;
-        expect(menu.className, label).toContain(direction === "up" ? "bottom-full" : "top-full");
-        expect(menu.style.maxHeight, label).toBe(`${maxHeight}px`);
-        cleanup();
-      }
+      Object.defineProperty(window, "innerHeight", { value: innerHeight, configurable: true, writable: true });
+      Object.defineProperty(window, "visualViewport", {
+        value:
+          vvHeight == null
+            ? undefined
+            : { height: vvHeight, offsetTop: vvOffsetTop, addEventListener: vi.fn(), removeEventListener: vi.fn() },
+        configurable: true,
+        writable: true,
+      });
+      rectSpy.mockReturnValue({
+        top,
+        bottom,
+        left: 0,
+        right: 0,
+        width: 0,
+        height: bottom - top,
+        x: 0,
+        y: top,
+        toJSON: () => ({}),
+      } as DOMRect);
+      mount([MODEL]);
+      fireEvent.click(byId("model")!);
+      const menu = document.getElementById("config-option-menu-model")!;
+      expect(menu.className).toContain(direction === "up" ? "bottom-full" : "top-full");
+      expect(menu.style.maxHeight).toBe(`${maxHeight}px`);
     } finally {
       rectSpy.mockRestore();
       for (const [key, descriptor] of restore) {

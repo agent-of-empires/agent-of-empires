@@ -38,38 +38,30 @@ function renderGlobs(props: Partial<Parameters<typeof VolumeIgnoresGlobDialog>[0
   return { onConfirm, onCancel };
 }
 
-const SHELLS = [
+describe.each([
   ["hooks-trust", renderHooks, "hooks-trust-list"],
   ["volume-ignores-glob", renderGlobs, "volume-ignores-glob-list"],
-] as const;
-
-describe("confirm dialog shell", () => {
+] as const)("%s dialog shell", (prefix, setup, innerTestId) => {
   it("Proceed and Enter confirm; Cancel, the backdrop, and Escape cancel, an inner click does not", () => {
-    for (const [prefix, setup, innerTestId] of SHELLS) {
-      const { onConfirm, onCancel } = setup();
-      fireEvent.click(screen.getByText("Cancel"));
-      fireEvent.click(screen.getByTestId(`${prefix}-dialog`));
-      fireEvent.click(screen.getByTestId(innerTestId));
-      fireEvent.keyDown(document, { key: "Escape" });
-      expect(onCancel).toHaveBeenCalledTimes(3);
-      fireEvent.click(screen.getByTestId(`${prefix}-proceed`));
-      expect(onConfirm).toHaveBeenCalledTimes(1);
-      cleanup();
-      const byEnter = setup();
-      fireEvent.keyDown(document.body, { key: "Enter" });
-      expect(byEnter.onConfirm).toHaveBeenCalledTimes(1);
-      cleanup();
-    }
+    const { onConfirm, onCancel } = setup();
+    fireEvent.click(screen.getByText("Cancel"));
+    fireEvent.click(screen.getByTestId(`${prefix}-dialog`));
+    fireEvent.click(screen.getByTestId(innerTestId));
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(onCancel).toHaveBeenCalledTimes(3);
+    fireEvent.click(screen.getByTestId(`${prefix}-proceed`));
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+    cleanup();
+    const byEnter = setup();
+    fireEvent.keyDown(document.body, { key: "Enter" });
+    expect(byEnter.onConfirm).toHaveBeenCalledTimes(1);
   });
 
   it("re-enables Proceed when onConfirm rejects", async () => {
-    for (const [prefix, setup] of SHELLS) {
-      setup({ onConfirm: vi.fn().mockRejectedValue(new Error("create failed")) });
-      const proceed = screen.getByTestId(`${prefix}-proceed`) as HTMLButtonElement;
-      fireEvent.click(proceed);
-      await waitFor(() => expect(proceed.disabled).toBe(false));
-      cleanup();
-    }
+    setup({ onConfirm: vi.fn().mockRejectedValue(new Error("create failed")) });
+    const proceed = screen.getByTestId(`${prefix}-proceed`) as HTMLButtonElement;
+    fireEvent.click(proceed);
+    await waitFor(() => expect(proceed.disabled).toBe(false));
   });
 });
 
@@ -83,25 +75,19 @@ describe("HooksTrustDialog", () => {
     expect(list).not.toContain("on_destroy");
   });
 
-  it("mentions .mcp.json only when it needs trust", () => {
-    for (const needsMcpTrust of [true, false]) {
-      renderHooks({ needsMcpTrust });
-      expect(screen.getByTestId("hooks-trust-dialog").textContent?.includes(".mcp.json")).toBe(needsMcpTrust);
-      cleanup();
-    }
+  it.each([true, false])("mentions .mcp.json only when it needs trust (%s)", (needsMcpTrust) => {
+    renderHooks({ needsMcpTrust });
+    expect(screen.getByTestId("hooks-trust-dialog").textContent?.includes(".mcp.json")).toBe(needsMcpTrust);
   });
 });
 
 describe("VolumeIgnoresGlobDialog", () => {
-  it("confirms with the dontShowAgain choice", () => {
-    for (const tick of [false, true]) {
-      const { onConfirm } = renderGlobs();
-      const checkbox = screen.getByTestId("volume-ignores-glob-dont-show-again");
-      if (tick) fireEvent.click(checkbox);
-      expect(checkbox.getAttribute("data-checked")).toBe(String(tick));
-      fireEvent.click(screen.getByTestId("volume-ignores-glob-proceed"));
-      expect(onConfirm).toHaveBeenCalledWith(tick);
-      cleanup();
-    }
+  it.each([false, true])("confirms with dontShowAgain=%s", (tick) => {
+    const { onConfirm } = renderGlobs();
+    const checkbox = screen.getByTestId("volume-ignores-glob-dont-show-again");
+    if (tick) fireEvent.click(checkbox);
+    expect(checkbox.getAttribute("data-checked")).toBe(String(tick));
+    fireEvent.click(screen.getByTestId("volume-ignores-glob-proceed"));
+    expect(onConfirm).toHaveBeenCalledWith(tick);
   });
 });

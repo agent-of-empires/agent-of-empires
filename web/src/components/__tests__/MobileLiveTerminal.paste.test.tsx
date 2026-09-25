@@ -61,21 +61,22 @@ describe("MobileLiveTerminal paste", () => {
     expect(sendData).toHaveBeenCalledWith("\x1b[200~hello world\x1b[201~");
   });
 
-  it("pastes an uploaded image's host path, escaped, beside any clipboard text (#2678)", async () => {
-    const cases = [
-      ["", "/repo/.aoe-pasted-images/x.png", " /repo/.aoe-pasted-images/x.png "],
-      ["", "/Users/me/Agent of Empires/x.png", " /Users/me/Agent\\ of\\ Empires/x.png "],
-      ["look at", "/repo/x.png", " look at /repo/x.png "],
-    ];
-    for (const [text, path, pasted] of cases) {
-      const upload = vi.fn(async () => path);
-      const { input, sendData, unmount } = renderTerm(upload);
-      const file = png();
-      fireEvent.paste(input, clipboard(text, [imageItem(file)]));
-      expect(upload).toHaveBeenCalledWith(file);
-      await vi.waitFor(() => expect(sendData).toHaveBeenCalledWith(`\x1b[200~${pasted}\x1b[201~`));
-      unmount();
-    }
+  it.each([
+    [
+      "the host path of an uploaded image (#2678)",
+      "",
+      "/repo/.aoe-pasted-images/x.png",
+      " /repo/.aoe-pasted-images/x.png ",
+    ],
+    ["an escaped path with spaces", "", "/Users/me/Agent of Empires/x.png", " /Users/me/Agent\\ of\\ Empires/x.png "],
+    ["clipboard text beside the path", "look at", "/repo/x.png", " look at /repo/x.png "],
+  ])("pastes %s", async (_n, text, path, pasted) => {
+    const upload = vi.fn(async () => path);
+    const { input, sendData } = renderTerm(upload);
+    const file = png();
+    fireEvent.paste(input, clipboard(text, [imageItem(file)]));
+    expect(upload).toHaveBeenCalledWith(file);
+    await vi.waitFor(() => expect(sendData).toHaveBeenCalledWith(`\x1b[200~${pasted}\x1b[201~`));
   });
 
   it("sends nothing when the image upload fails", async () => {
@@ -151,49 +152,42 @@ describe("MobileLiveTerminal paste", () => {
 });
 
 describe("MobileLiveTerminal key sequences", () => {
-  it("encodes special keys, modifier chords, and Alt letters as terminal bytes", () => {
-    const cases: [string, KeyboardEventInit, string][] = [
-      ["Enter", {}, "\r"],
-      ["Enter", { altKey: true }, "\r"],
-      // Shift and Ctrl Enter insert a soft newline for agents.
-      ["Enter", { ctrlKey: true }, "\x1b\r"],
-      ["Enter", { shiftKey: true }, "\x1b\r"],
-      ["Backspace", { altKey: true }, "\x1b\x7f"],
-      ["Backspace", { ctrlKey: true }, "\x7f"],
-      ["Tab", {}, "\t"],
-      ["Tab", { shiftKey: true }, "\x1b[Z"],
-      ["Escape", {}, "\x1b"],
-      ["ArrowUp", {}, "\x1b[A"],
-      ["Delete", {}, "\x1b[3~"],
-      ["ArrowUp", { shiftKey: true }, "\x1b[1;2A"],
-      ["ArrowDown", { altKey: true }, "\x1b[1;3B"],
-      ["ArrowLeft", { ctrlKey: true }, "\x1b[1;5D"],
-      ["End", { ctrlKey: true, shiftKey: true }, "\x1b[1;6F"],
-      ["PageUp", { altKey: true }, "\x1b[5;3~"],
-      ["c", { ctrlKey: true }, "\x03"],
-      ["v", { code: "KeyV", altKey: true }, "\x1bv"],
-      ["V", { code: "KeyV", altKey: true, shiftKey: true }, "\x1bV"],
-      // Option+V composes a symbol; the physical code recovers the letter.
-      ["√", { code: "KeyV", altKey: true }, "\x1bv"],
-    ];
+  it.each([
+    ["Enter", {}, "\r"],
+    ["Enter", { altKey: true }, "\r"],
+    // Shift and Ctrl Enter insert a soft newline for agents.
+    ["Enter", { ctrlKey: true }, "\x1b\r"],
+    ["Enter", { shiftKey: true }, "\x1b\r"],
+    ["Backspace", { altKey: true }, "\x1b\x7f"],
+    ["Backspace", { ctrlKey: true }, "\x7f"],
+    ["Tab", {}, "\t"],
+    ["Tab", { shiftKey: true }, "\x1b[Z"],
+    ["Escape", {}, "\x1b"],
+    ["ArrowUp", {}, "\x1b[A"],
+    ["Delete", {}, "\x1b[3~"],
+    ["ArrowUp", { shiftKey: true }, "\x1b[1;2A"],
+    ["ArrowDown", { altKey: true }, "\x1b[1;3B"],
+    ["ArrowLeft", { ctrlKey: true }, "\x1b[1;5D"],
+    ["End", { ctrlKey: true, shiftKey: true }, "\x1b[1;6F"],
+    ["PageUp", { altKey: true }, "\x1b[5;3~"],
+    ["c", { ctrlKey: true }, "\x03"],
+    ["v", { code: "KeyV", altKey: true }, "\x1bv"],
+    ["V", { code: "KeyV", altKey: true, shiftKey: true }, "\x1bV"],
+    // Option+V composes a symbol; the physical code recovers the letter.
+    ["√", { code: "KeyV", altKey: true }, "\x1bv"],
+  ])("%s %o sends %j", (key, init, expected) => {
     const { input, sendData } = renderTerm();
-    const sent = cases.map(([key, init]) => {
-      sendData.mockClear();
-      const passed = fireEvent.keyDown(input, { key, ...init });
-      return [key, init, passed ? "(not prevented)" : sendData.mock.calls.at(-1)?.[0]];
-    });
-    expect(sent).toEqual(cases);
+    expect(fireEvent.keyDown(input, { key, ...init })).toBe(false);
+    expect(sendData).toHaveBeenCalledWith(expected);
   });
 
-  it("leaves Meta navigation, macOS dead keys, and AltGr chords to the browser", () => {
+  it.each([
+    ["Meta navigation", { key: "ArrowLeft", metaKey: true }],
+    ["macOS dead keys", { key: "Dead", code: "KeyE", altKey: true }],
+    ["Ctrl+Alt printable chords (AltGr)", { key: "v", ctrlKey: true, altKey: true }],
+  ])("leaves %s to the browser", (_n, init) => {
     const { input, sendData } = renderTerm();
-    for (const init of [
-      { key: "ArrowLeft", metaKey: true },
-      { key: "Dead", code: "KeyE", altKey: true },
-      { key: "v", ctrlKey: true, altKey: true },
-    ]) {
-      expect(fireEvent.keyDown(input, init)).toBe(true);
-    }
+    expect(fireEvent.keyDown(input, init)).toBe(true);
     expect(sendData).not.toHaveBeenCalled();
   });
 
@@ -219,16 +213,16 @@ describe("MobileLiveTerminal key sequences", () => {
     }
   });
 
-  it("Ctrl+Shift+C copies a selection, is a no-op without one, and never sends ^C", () => {
+  it.each([
+    ["copies the selection", "selected output", ["selected output"]],
+    ["is a no-op without a selection", "", []],
+  ])("Ctrl+Shift+C %s and never sends ^C", (_n, selected, copied) => {
     writeClipboard.mockClear();
-    let selected = "selected output";
     const spy = vi.spyOn(window, "getSelection").mockReturnValue({ toString: () => selected } as unknown as Selection);
     try {
       const { input, sendData } = renderTerm();
       fireEvent.keyDown(input, { key: "C", ctrlKey: true, shiftKey: true });
-      selected = "";
-      fireEvent.keyDown(input, { key: "C", ctrlKey: true, shiftKey: true });
-      expect(writeClipboard.mock.calls.map(([t]) => t)).toEqual(["selected output"]);
+      expect(writeClipboard.mock.calls.map(([t]) => t)).toEqual(copied);
       expect(sendData).not.toHaveBeenCalledWith("\x03");
     } finally {
       spy.mockRestore();

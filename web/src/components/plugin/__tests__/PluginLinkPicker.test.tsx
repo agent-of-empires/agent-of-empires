@@ -22,28 +22,30 @@ afterEach(() => {
 });
 
 describe("PluginLinkPicker", () => {
-  it("opens the chosen link on a digit key or click, without an opener, and closes", () => {
+  it.each([
+    ["digit key", () => fireEvent.keyDown(document, { key: "2" }), links[1]!.href],
+    ["click", () => fireEvent.click(screen.getByText("a: PR #1")), links[0]!.href],
+  ])("opens the chosen link on %s and closes", (_, trigger, href) => {
     const { open, onClose } = setup();
-    fireEvent.keyDown(document, { key: "2" });
-    expect(open).toHaveBeenLastCalledWith(links[1]!.href, "_blank", "noopener,noreferrer");
-    fireEvent.click(screen.getByText("a: PR #1"));
-    expect(open).toHaveBeenLastCalledWith(links[0]!.href, "_blank", "noopener,noreferrer");
-    expect(onClose).toHaveBeenCalledTimes(2);
+    trigger();
+    expect(open).toHaveBeenCalledWith(href, "_blank", "noopener,noreferrer");
+    expect(onClose).toHaveBeenCalled();
   });
 
-  it("ignores out-of-range and modified digits, then closes on Escape without opening", () => {
+  it("closes on Escape without opening", () => {
     const { open, onClose } = setup();
-    for (const event of [
-      { key: "5" },
-      { key: "1", ctrlKey: true },
-      { key: "1", metaKey: true },
-      { key: "1", altKey: true },
-    ]) {
-      fireEvent.keyDown(document, event);
-    }
-    expect(onClose).not.toHaveBeenCalled();
     fireEvent.keyDown(document, { key: "Escape" });
     expect(open).not.toHaveBeenCalled();
     expect(onClose).toHaveBeenCalled();
   });
+
+  it.each([{ key: "5" }, { key: "1", ctrlKey: true }, { key: "1", metaKey: true }, { key: "1", altKey: true }])(
+    "ignores %j",
+    (event) => {
+      const { open, onClose } = setup();
+      fireEvent.keyDown(document, event);
+      expect(open).not.toHaveBeenCalled();
+      expect(onClose).not.toHaveBeenCalled();
+    },
+  );
 });

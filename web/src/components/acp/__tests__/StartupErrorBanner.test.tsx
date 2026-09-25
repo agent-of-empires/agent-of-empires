@@ -23,33 +23,29 @@ function renderBanner(message = NATIVE_BINARY_MSG, sessionId = "s-1") {
 }
 
 describe("StartupErrorBanner remediation", () => {
-  it("routes known failures to their own copy and others to doctor --fix", () => {
-    const cases: [string, string, string[], boolean][] = [
-      [
-        "native binary",
-        NATIVE_BINARY_MSG,
-        ["Architecture mismatch", "dynamic loader", "bind-mounted into a container"],
-        false,
-      ],
-      // A respawn-budget park embeds the ProjectPathMissing text when the cwd moved.
-      [
-        "moved project path",
-        "Structured view worker failed to stay up after 5 restart attempts in 60s; auto-respawn paused. project path no longer exists: /Users/me/aoe/worktrees/Burmese",
-        ["working directory no longer exists", "/Users/me/aoe/worktrees/Burmese"],
-        false,
-      ],
-      ["generic", "some unknown failure", ["aoe acp doctor --fix"], true],
-    ];
+  it.each<[string, string, string[], boolean]>([
+    [
+      "native binary",
+      NATIVE_BINARY_MSG,
+      ["Architecture mismatch", "dynamic loader", "bind-mounted into a container"],
+      false,
+    ],
+    // A respawn-budget park embeds the ProjectPathMissing text when the cwd moved.
+    [
+      "moved project path",
+      "Structured view worker failed to stay up after 5 restart attempts in 60s; auto-respawn paused. project path no longer exists: /Users/me/aoe/worktrees/Burmese",
+      ["working directory no longer exists", "/Users/me/aoe/worktrees/Burmese"],
+      false,
+    ],
+    ["generic failure", "some unknown failure", ["aoe acp doctor --fix"], true],
+  ])("routes %s to its own copy or doctor --fix", (label, message, copy, doctor) => {
     stubLog({ exists: false, tail: "" });
-    for (const [label, message, copy, doctor] of cases) {
-      const { container } = renderBanner(message);
-      for (const text of copy) expect(container.textContent, label).toContain(text);
-      expect(container.textContent?.includes("aoe acp doctor --fix"), label).toBe(doctor);
-      if (label === "native binary") {
-        const anchor = container.querySelector("a[href*='structured-view']");
-        expect(anchor?.getAttribute("href")).toContain("native-binary-launch-failure");
-      }
-      cleanup();
+    const { container } = renderBanner(message);
+    for (const text of copy) expect(container.textContent).toContain(text);
+    expect(container.textContent?.includes("aoe acp doctor --fix")).toBe(doctor);
+    if (label === "native binary") {
+      const anchor = container.querySelector("a[href*='structured-view']");
+      expect(anchor?.getAttribute("href")).toContain("native-binary-launch-failure");
     }
   });
 });
@@ -65,19 +61,15 @@ describe("AgentLogDisclosure", () => {
     expect(fetchSpy.mock.calls[0]?.[0]).toContain("/api/sessions/abc-123/acp/worker-log?tail=200");
   });
 
-  it("describes a missing, empty, or truncated log", async () => {
-    const cases: [string, { exists: boolean; tail: string; truncated?: boolean }][] = [
-      ["No log output yet", { exists: false, tail: "" }],
-      ["Log file exists but is empty", { exists: true, tail: "" }],
-      ["Log is large; showing the tail", { exists: true, tail: "tail content", truncated: true }],
-    ];
-    for (const [expected, body] of cases) {
-      stubLog(body);
-      const { getByTestId, container } = renderBanner();
-      fireEvent.click(getByTestId("acp-agent-log-toggle"));
-      await waitFor(() => expect(container.textContent).toContain(expected));
-      cleanup();
-    }
+  it.each([
+    ["No log output yet", { exists: false, tail: "" }],
+    ["Log file exists but is empty", { exists: true, tail: "" }],
+    ["Log is large; showing the tail", { exists: true, tail: "tail content", truncated: true }],
+  ])("renders %s", async (expected, body) => {
+    stubLog(body);
+    const { getByTestId, container } = renderBanner();
+    fireEvent.click(getByTestId("acp-agent-log-toggle"));
+    await waitFor(() => expect(container.textContent).toContain(expected));
   });
 
   it("shows an error message when the fetch fails", async () => {

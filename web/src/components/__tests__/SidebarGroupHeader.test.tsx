@@ -72,34 +72,28 @@ const text = (id: string) => screen.queryByTestId(id)?.textContent;
 afterEach(cleanup);
 
 describe("SidebarGroupHeader", () => {
-  it("counts only live workspaces (#2372)", () => {
-    for (const [name, workspaces, count] of [
-      ["two live workspaces", views(workspace("a", idle(2)), workspace("b", idle(3))), "(2)"],
-      // Sunk rows render in the footer, so they are not counted (#2372).
-      [
-        "live plus sunk",
-        views(workspace("live", idle(1)), workspace("arch", idle(1), "archived"), workspace("zz", idle(1), "snoozed")),
-        "(1)",
-      ],
-      ["only sunk", views(workspace("arch", idle(2), "archived"), workspace("zz", idle(1), "snoozed")), "(0)"],
-    ] as const) {
-      renderHeader({ group: group({ workspaces }) });
-      expect(text("sidebar-group-session-count"), name).toBe(count);
-      cleanup();
-    }
+  it.each([
+    ["two live workspaces", views(workspace("a", idle(2)), workspace("b", idle(3))), "(2)"],
+    // Sunk rows render in the footer, so they are not counted (#2372).
+    [
+      "live plus sunk",
+      views(workspace("live", idle(1)), workspace("arch", idle(1), "archived"), workspace("zz", idle(1), "snoozed")),
+      "(1)",
+    ],
+    ["only sunk", views(workspace("arch", idle(2), "archived"), workspace("zz", idle(1), "snoozed")), "(0)"],
+  ])("counts %s as %s", (_n, workspaces, count) => {
+    renderHeader({ group: group({ workspaces }) });
+    expect(text("sidebar-group-session-count")).toBe(count);
   });
 
-  it("badges live Waiting and Error sessions", () => {
-    for (const [name, workspaces, badge] of [
-      ["Waiting and Error sessions", views(workspace("a", ["Waiting", "Running"]), workspace("b", ["Error"])), "2"],
-      ["nothing needing attention", views(workspace("w1", idle(3))), undefined],
-      // Sunk wins over Waiting.
-      ["waiting but archived sessions", views(workspace("arch", ["Waiting", "Waiting"], "archived")), undefined],
-    ] as const) {
-      renderHeader({ group: group({ workspaces }) });
-      expect(text("sidebar-group-attention-badge"), name).toBe(badge);
-      cleanup();
-    }
+  it.each([
+    ["Waiting and Error sessions", views(workspace("a", ["Waiting", "Running"]), workspace("b", ["Error"])), "2"],
+    ["nothing needing attention", views(workspace("w1", idle(3))), undefined],
+    // Sunk wins over Waiting.
+    ["waiting but archived sessions", views(workspace("arch", ["Waiting", "Waiting"], "archived")), undefined],
+  ])("attention badge for %s is %s", (_n, workspaces, badge) => {
+    renderHeader({ group: group({ workspaces }) });
+    expect(text("sidebar-group-attention-badge")).toBe(badge);
   });
 
   it("renders the owner avatar when there is a remote owner, else the folder icon", () => {

@@ -3,7 +3,7 @@
 // part the pane has not seen may be sent.
 
 import { describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent } from "@testing-library/react";
+import { fireEvent } from "@testing-library/react";
 import { installResizeObserver, renderLiveTerminal } from "./liveTerminalHarness";
 
 vi.mock("../../hooks/useWebSettings", () => ({
@@ -201,13 +201,11 @@ describe("MobileLiveTerminal Android IME word commits", () => {
     },
   ];
 
-  it("sends only what the pane has not seen, per case", () => {
-    const results = cases.map((c) => {
+  for (const c of cases) {
+    it(c.name, () => {
       const t = renderTerm(c.accepted);
       c.run(t);
-      cleanup();
-      return [c.name, t.sent()];
+      expect(t.sent()).toEqual(c.sent);
     });
-    expect(results).toEqual(cases.map((c) => [c.name, c.sent]));
-  });
+  }
 });

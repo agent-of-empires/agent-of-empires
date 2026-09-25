@@ -44,32 +44,31 @@ function renderWithProfile(
 
 describe("QueuedPromptsStrip", () => {
   // Two entries stay under the desktop collapse threshold, so both rows render.
-  it("draws a divider after each of the agent's server-owned clear aliases", () => {
-    const cases: [string, string[], number][] = [
-      ["claude", ["first", "/clear"], 1],
-      ["claude", ["/clear", "second"], 1],
-      ["claude", ["first", "second"], 0],
-      ["claude", ["first", "/clear --hard"], 1],
-      ["codex", ["first", "/new"], 1],
-      // gemini has no clear aliases, so `/clear` text is not a boundary.
-      ["gemini", ["first", "/clear"], 0],
-    ];
-    for (const [tool, texts, dividers] of cases) {
-      const { queryAllByTestId } = renderWithProfile(
-        tool,
-        texts.map((t, i) => mk(String(i), t)),
-      );
-      expect(queryAllByTestId("queued-clear-boundary"), `${tool} ${texts.join("|")}`).toHaveLength(dividers);
-      cleanup();
-    }
+  it.each([
+    ["claude", ["first", "/clear"], 1],
+    ["claude", ["/clear", "second"], 1],
+    ["claude", ["first", "second"], 0],
+    ["claude", ["first", "/clear --hard"], 1],
+    ["codex", ["first", "/new"], 1],
+    // gemini has no clear aliases, so `/clear` text is not a boundary.
+    ["gemini", ["first", "/clear"], 0],
+  ])("%s queue %o renders %i clear-boundary dividers", (tool, texts, dividers) => {
+    const { queryAllByTestId } = renderWithProfile(
+      tool,
+      texts.map((t, i) => mk(String(i), t)),
+    );
+    expect(queryAllByTestId("queued-clear-boundary")).toHaveLength(dividers);
   });
 
-  it("offers Clear all only with more than one queued prompt", () => {
-    expect(renderWithProfile("claude", [mk("0", "only")]).queryByRole("button", { name: /clear all/i })).toBeNull();
-    cleanup();
-    expect(
-      renderWithProfile("claude", [mk("0", "first"), mk("1", "second")]).queryByRole("button", { name: /clear all/i }),
-    ).not.toBeNull();
+  it.each([
+    [["only"], false],
+    [["first", "second"], true],
+  ])("Clear all for %o: %s", (texts, shown) => {
+    const { queryByRole } = renderWithProfile(
+      "claude",
+      texts.map((t, i) => mk(String(i), t)),
+    );
+    expect(queryByRole("button", { name: /clear all/i }) !== null).toBe(shown);
   });
 
   it("force-sends the row's prompt when Send now is clicked", () => {
@@ -80,21 +79,20 @@ describe("QueuedPromptsStrip", () => {
     expect(sent).toEqual([row]);
   });
 
-  it("labels Send now by whether it interrupts, disabling it only when the session is down", () => {
-    const cases: [boolean, boolean, string, boolean][] = [
-      [false, true, "Send this queued message now", false],
-      [true, true, "Stop the current turn and send this queued message", false],
-      [false, false, "Send this queued message now", true],
-    ];
-    for (const [sendNowInterrupts, canSendNow, label, disabled] of cases) {
+  it.each([
+    [false, true, "Send this queued message now", false],
+    [true, true, "Stop the current turn and send this queued message", false],
+    [false, false, "Send this queued message now", true],
+  ])(
+    "labels Send now (interrupts=%s, canSendNow=%s) as %s, disabled=%s",
+    (sendNowInterrupts, canSendNow, label, disabled) => {
       const btn = renderWithProfile("claude", [mk("a", "go")], { sendNowInterrupts, canSendNow }).getByTestId(
         "queued-send-now",
       );
       expect(btn.getAttribute("aria-label")).toBe(label);
       expect((btn as HTMLButtonElement).disabled).toBe(disabled);
-      cleanup();
-    }
-  });
+    },
+  );
 
   it("renders a thumbnail for an image attachment and no strip for text-only rows", () => {
     const withImage: QueuedPrompt = {

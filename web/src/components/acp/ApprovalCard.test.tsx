@@ -96,17 +96,15 @@ describe("ApprovalCard args", () => {
 });
 
 describe("ApprovalCard decisions", () => {
-  it("benign decisions resolve on a single tap", () => {
-    for (const [button, decision] of [
-      ["Allow", "Allow"],
-      ["Always", "AllowAlways"],
-      ["Deny", "Deny"],
-    ]) {
-      const onResolve = mount(makeApproval());
-      fireEvent.click(screen.getByText(button));
-      expect(onResolve).toHaveBeenCalledExactlyOnceWith(decision, undefined);
-      cleanup();
-    }
+  it.each([
+    ["Allow", "Allow"],
+    ["Always", "AllowAlways"],
+    ["Deny", "Deny"],
+  ])("benign %s resolves %s on a single tap", (button, decision) => {
+    const onResolve = mount(makeApproval());
+    fireEvent.click(screen.getByText(button));
+    expect(onResolve).toHaveBeenCalledTimes(1);
+    expect(onResolve).toHaveBeenCalledWith(decision, undefined);
   });
 
   it("shows the rolled-back message when onResolve rejects", async () => {

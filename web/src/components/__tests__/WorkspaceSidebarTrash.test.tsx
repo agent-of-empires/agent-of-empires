@@ -115,13 +115,13 @@ describe("WorkspaceSidebar Trash control", () => {
     expect(follows(badge, label)).toBe(true);
   });
 
-  it("closes on Escape and on an outside click", () => {
+  it.each([
+    ["Escape", () => fireEvent.keyDown(document, { key: "Escape" })],
+    ["an outside click", () => fireEvent.mouseDown(document.body)],
+  ])("closes on %s", (_n, dismiss) => {
     withTrash();
     click("sidebar-trash-toggle");
-    fireEvent.keyDown(document, { key: "Escape" });
-    expect(query("sidebar-trash-menu")).toBeNull();
-    click("sidebar-trash-toggle");
-    fireEvent.mouseDown(document.body);
+    dismiss();
     expect(query("sidebar-trash-menu")).toBeNull();
   });
 
