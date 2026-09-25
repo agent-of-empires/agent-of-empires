@@ -67,14 +67,16 @@ const payload = (part: Part) => JSON.parse(part.argsText!);
 describe("clearFoldGeneration", () => {
   const TURNS = [user("q1"), message("a1"), user("q2", "u2"), message("a2", "m2")];
   const cleared = [...TURNS, row("c1", "session_cleared", "cleared")];
-  it.each([
-    ["no clear", TURNS, false, "none"],
-    ["turn appended", [...TURNS, message("a3", "m3")], false, "none"],
-    ["cleared shown", cleared, true, "all"],
-    ["folded", cleared, false, "c1"],
-    ["folded twice", [...cleared, row("c2", "session_cleared", "again")], false, "c2"],
-  ])("%s", (_label, rows, showCleared, expected) => {
-    expect(clearFoldGeneration(rows, showCleared)).toBe(expected);
+  it("picks the fold generation", () => {
+    for (const [label, rows, showCleared, expected] of [
+      ["no clear", TURNS, false, "none"],
+      ["turn appended", [...TURNS, message("a3", "m3")], false, "none"],
+      ["cleared shown", cleared, true, "all"],
+      ["folded", cleared, false, "c1"],
+      ["folded twice", [...cleared, row("c2", "session_cleared", "again")], false, "c2"],
+    ] as const) {
+      expect(clearFoldGeneration(rows, showCleared), label).toBe(expected);
+    }
   });
 });
 
@@ -82,39 +84,38 @@ describe("tool-call grouping", () => {
   const readRun = (prefix: string, n: number) => Array.from({ length: n }, (_, i) => toolStart(`${prefix}${i + 1}`));
   const todoRun = (prefix: string, n: number) => Array.from({ length: n }, (_, i) => todo(`${prefix}${i + 1}`));
 
-  it.each<[string, ActivityRow[], (string | undefined)[], boolean?]>([
-    ["folds 3+ tool calls", readRun("t", 4), [TOOL_GROUP_NAME]],
-    ["keeps 1-2 inline", readRun("t", 2), ["read", "read"]],
-    [
-      "text splits runs",
-      [...readRun("a", 3), message("Found it."), ...readRun("b", 3)],
-      [TOOL_GROUP_NAME, TOOL_GROUP_NAME],
-    ],
-    ["folds 3+ todo snapshots", todoRun("td", 3), [TODO_GROUP_NAME]],
-    // An empty clear with the bare TodoWrite title is still a snapshot.
-    [
-      "folds a run ending in an empty clear",
-      [todo("td1", undefined, "TodoWrite"), todo("td2", undefined, "TodoWrite"), todo("td3", [], "TodoWrite")],
-      [TODO_GROUP_NAME],
-    ],
-    ["keeps 2 todo snapshots inline", todoRun("td", 2), ["think", "think"]],
-    // A status update among real work stays in the timeline.
-    [
-      "keeps todo mixed with work inline",
-      [...readRun("a", 2), todo("td1"), toolStart("c")],
-      ["read", "read", "think", "read"],
-    ],
-    ["keeps todo-then-work inline", [...todoRun("td", 2), toolStart("r1")], ["think", "think", "read"]],
-    [
-      "text splits todo runs below the threshold",
-      [...todoRun("a", 2), message("Working."), ...todoRun("b", 2)],
-      ["think", "think", "think", "think"],
-    ],
-  ])("%s", (_label, rows, expected) => {
-    expect(names(toolParts(rows))).toEqual(expected);
-  });
-
-  it("uses the generic group for todo-shaped runs when todos are disabled", () => {
+  it("folds runs of 3+ tool calls or todo snapshots and keeps shorter or mixed runs inline", () => {
+    const cases: [string, ActivityRow[], (string | undefined)[]][] = [
+      ["folds 3+ tool calls", readRun("t", 4), [TOOL_GROUP_NAME]],
+      ["keeps 1-2 inline", readRun("t", 2), ["read", "read"]],
+      [
+        "text splits runs",
+        [...readRun("a", 3), message("Found it."), ...readRun("b", 3)],
+        [TOOL_GROUP_NAME, TOOL_GROUP_NAME],
+      ],
+      ["folds 3+ todo snapshots", todoRun("td", 3), [TODO_GROUP_NAME]],
+      // An empty clear with the bare TodoWrite title is still a snapshot.
+      [
+        "folds a run ending in an empty clear",
+        [todo("td1", undefined, "TodoWrite"), todo("td2", undefined, "TodoWrite"), todo("td3", [], "TodoWrite")],
+        [TODO_GROUP_NAME],
+      ],
+      ["keeps 2 todo snapshots inline", todoRun("td", 2), ["think", "think"]],
+      // A status update among real work stays in the timeline.
+      [
+        "keeps todo mixed with work inline",
+        [...readRun("a", 2), todo("td1"), toolStart("c")],
+        ["read", "read", "think", "read"],
+      ],
+      ["keeps todo-then-work inline", [...todoRun("td", 2), toolStart("r1")], ["think", "think", "read"]],
+      [
+        "text splits todo runs below the threshold",
+        [...todoRun("a", 2), message("Working."), ...todoRun("b", 2)],
+        ["think", "think", "think", "think"],
+      ],
+    ];
+    for (const [label, rows, expected] of cases) expect(names(toolParts(rows)), label).toEqual(expected);
+    // Todo-shaped runs use the generic group when todos are disabled.
     expect(names(toolParts(todoRun("td", 3), false, false))).toEqual([TOOL_GROUP_NAME]);
   });
 
@@ -128,15 +129,14 @@ describe("tool-call grouping", () => {
   });
 
   // Anchored on the first child so a growing run keeps its card and expand state.
-  it.each([
-    [readRun("t", 3), readRun("t", 4), "group-t1"],
-    [todoRun("td", 3), todoRun("td", 4), "todogroup-td1"],
-  ])("keeps the group id stable as the run grows (%#)", (three, four, id) => {
-    expect(toolParts(three)[0]!.toolCallId).toBe(id);
-    expect(toolParts(four)[0]!.toolCallId).toBe(id);
-  });
-
-  it("gives text-split runs distinct ids", () => {
+  it("keeps the group id stable as the run grows, and distinct across text-split runs", () => {
+    for (const [three, four, id] of [
+      [readRun("t", 3), readRun("t", 4), "group-t1"],
+      [todoRun("td", 3), todoRun("td", 4), "todogroup-td1"],
+    ] as const) {
+      expect(toolParts(three)[0]!.toolCallId).toBe(id);
+      expect(toolParts(four)[0]!.toolCallId).toBe(id);
+    }
     const parts = toolParts([...readRun("a", 3), message("Found it."), ...readRun("b", 3)]);
     expect(parts.map((p) => p.toolCallId)).toEqual(["group-a1", "group-b1"]);
   });
@@ -208,16 +208,15 @@ describe("subagents", () => {
     expect(payload(sub!).children[0].result.stopped).toBe(true);
   });
 
-  it.each([
-    ["_aoe_parent_tool_call_id", { parent_tool_call_id: "task-parent-1" }, "task-parent-1"],
-    [
-      "_aoe_memory_recall",
-      { memory_recall: { mode: "synthesize" as const, synthesized_text: "remembered" } },
-      { mode: "synthesize", synthesized_text: "remembered" },
-    ],
-  ])("smuggles %s through argsText", (key, over, expected) => {
-    const [part] = toolParts([toolStart("x", over)]);
-    expect(payload(part!)[key]).toEqual(expected);
+  it("smuggles parent id and memory recall through argsText", () => {
+    const [part] = toolParts([
+      toolStart("x", {
+        parent_tool_call_id: "task-parent-1",
+        memory_recall: { mode: "synthesize", synthesized_text: "remembered" },
+      }),
+    ]);
+    expect(payload(part!)._aoe_parent_tool_call_id).toBe("task-parent-1");
+    expect(payload(part!)._aoe_memory_recall).toEqual({ mode: "synthesize", synthesized_text: "remembered" });
   });
 
   // The server transcript drops raw_name; the client keeps the wire name from the first
@@ -288,16 +287,18 @@ describe("subagents", () => {
 });
 
 describe("user and callout rows", () => {
-  it.each([
-    ["user_diff_comments", "diffComments", { intro: "Take a look:", comments: [{ id: "c-1" }] }],
-    ["elicitation_answered", "elicitationAnswers", [{ question: "Proceed?", answer: "Yes" }]],
-  ] as const)("renders %s as a user message with its payload on metadata, or none", (kind, key, value) => {
-    const [withPayload] = activityToThreadMessages([row("r1", kind, "body text", { [key]: value })], false);
-    expect(withPayload!.role).toBe("user");
-    expect(withPayload!.content).toEqual([{ type: "text", text: "body text" }]);
-    expect((withPayload!.metadata as { custom: Record<string, unknown> }).custom[key]).toEqual(value);
-    const [without] = activityToThreadMessages([row("r2", kind, "plain")], false);
-    expect(without!.metadata).toBeUndefined();
+  it("renders diff comments and elicitation answers as user messages with their payload on metadata", () => {
+    for (const [kind, key, value] of [
+      ["user_diff_comments", "diffComments", { intro: "Take a look:", comments: [{ id: "c-1" }] }],
+      ["elicitation_answered", "elicitationAnswers", [{ question: "Proceed?", answer: "Yes" }]],
+    ] as const) {
+      const [withPayload] = activityToThreadMessages([row("r1", kind, "body text", { [key]: value })], false);
+      expect(withPayload!.role).toBe("user");
+      expect(withPayload!.content).toEqual([{ type: "text", text: "body text" }]);
+      expect((withPayload!.metadata as { custom: Record<string, unknown> }).custom[key], kind).toEqual(value);
+      const [without] = activityToThreadMessages([row("r2", kind, "plain")], false);
+      expect(without!.metadata).toBeUndefined();
+    }
   });
 
   it("renders a summary as a quoted callout", () => {

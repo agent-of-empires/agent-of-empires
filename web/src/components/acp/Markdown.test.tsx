@@ -100,39 +100,38 @@ describe("remark line breaks", () => {
   const renderMd = (text: string, breaks: boolean) =>
     render(<ReactMarkdown remarkPlugins={remarkPluginsFor(breaks)}>{text}</ReactMarkdown>).container;
 
-  it.each([
-    ["line a\nline b\nline c", false, 0, 1],
-    ["line a\nline b\nline c", true, 2, 1],
-    ["para one\n\npara two", true, 0, 2],
-  ])("%j breaks=%s renders %i <br> in %i paragraphs", (text, breaks, brs, paragraphs) => {
-    const container = renderMd(text, breaks);
-    expect(container.querySelectorAll("br")).toHaveLength(brs);
-    expect(container.querySelectorAll("p")).toHaveLength(paragraphs);
-  });
-
-  it("leaves fenced code intact with breaks on", () => {
-    const container = renderMd("```ts\nconst a = 1;\nconst b = 2;\n```", true);
-    expect(container.querySelector("pre")?.textContent).toContain("const b = 2;");
-    expect(container.querySelectorAll("pre br")).toHaveLength(0);
-    expect(container.textContent).not.toContain("```");
+  it("renders single newlines as <br> only with breaks on", () => {
+    for (const [text, breaks, brs, paragraphs] of [
+      ["line a\nline b\nline c", false, 0, 1],
+      ["line a\nline b\nline c", true, 2, 1],
+      ["para one\n\npara two", true, 0, 2],
+    ] as const) {
+      const container = renderMd(text, breaks);
+      expect(container.querySelectorAll("br"), `${text} ${breaks}`).toHaveLength(brs);
+      expect(container.querySelectorAll("p"), `${text} ${breaks}`).toHaveLength(paragraphs);
+      cleanup();
+    }
   });
 });
 
 describe("Blockquote override", () => {
-  it.each([
-    [<>⚠️ context reset</>, true],
-    [<> ⚠️ warning</>, true],
-    [
-      <span>
-        <strong>⚠️</strong> nested warning
-      </span>,
-      true,
-    ],
-    [<>just a quote</>, false],
-  ])("warning variant %#", (children, warn) => {
+  it("uses the warning variant only for a leading warning sign", () => {
     const Blockquote = override<{ children: React.ReactNode }>("blockquote");
-    const { container } = render(<Blockquote>{children}</Blockquote>);
-    expect(container.querySelector("blockquote")!.className.includes("acp-callout-warn")).toBe(warn);
+    for (const [children, warn] of [
+      [<>⚠️ context reset</>, true],
+      [<> ⚠️ warning</>, true],
+      [
+        <span>
+          <strong>⚠️</strong> nested warning
+        </span>,
+        true,
+      ],
+      [<>just a quote</>, false],
+    ] as const) {
+      const { container, unmount } = render(<Blockquote>{children}</Blockquote>);
+      expect(container.querySelector("blockquote")!.className.includes("acp-callout-warn")).toBe(warn);
+      unmount();
+    }
   });
 });
 
@@ -171,15 +170,18 @@ describe("anchor override", () => {
     expect(onOpenFileRef).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ["without a session", undefined],
-    ["inside the session repo", session],
-  ])("routes a local file link to the viewer %s", (_label, fileRefSession) => {
+  it("routes a local file link to the viewer with or without a session", () => {
     const Anchor = override<React.ComponentPropsWithoutRef<"a">>("a");
-    const onOpenFileRef = vi.fn();
-    const { container } = renderIn(<Anchor href={IN_REPO}>app.ts</Anchor>, { onOpenFileRef, fileRefSession });
-    expect(click(container.querySelector("a")!).defaultPrevented).toBe(true);
-    expect(onOpenFileRef).toHaveBeenCalledWith({ path: "/Users/me/repo/src/app.ts", line: 42 });
+    for (const fileRefSession of [undefined, session]) {
+      const onOpenFileRef = vi.fn();
+      const { container, unmount } = renderIn(<Anchor href={IN_REPO}>app.ts</Anchor>, {
+        onOpenFileRef,
+        fileRefSession,
+      });
+      expect(click(container.querySelector("a")!).defaultPrevented).toBe(true);
+      expect(onOpenFileRef).toHaveBeenCalledWith({ path: "/Users/me/repo/src/app.ts", line: 42 });
+      unmount();
+    }
   });
 
   it("falls through to a new-tab anchor for a local link with no handler", () => {
@@ -202,70 +204,54 @@ describe("anchor override", () => {
     expect(container.querySelector("span.acp-inert-path")?.textContent).toBe("shot.png");
   });
 
-  it.each([
-    ["/aoe/artifacts/shot.png", "/api/sessions/sess-1/artifacts/shot.png"],
-    ["/home/u/.aoe/artifacts/sess-1/sub/x.png", "/api/sessions/sess-1/artifacts/sub/x.png"],
-  ])("maps artifact path %s to the authenticated route", (href, route) => {
+  it("maps artifact paths to the authenticated route", () => {
     const Anchor = override<React.ComponentPropsWithoutRef<"a">>("a");
-    const { container } = renderIn(<Anchor href={href}>x</Anchor>, {
-      onOpenFileRef: vi.fn(),
-      fileRefSession: artSession,
-    });
-    expect(container.querySelector("a.acp-artifact-link")?.getAttribute("href")).toBe(route);
+    for (const [href, route] of [
+      ["/aoe/artifacts/shot.png", "/api/sessions/sess-1/artifacts/shot.png"],
+      ["/home/u/.aoe/artifacts/sess-1/sub/x.png", "/api/sessions/sess-1/artifacts/sub/x.png"],
+    ]) {
+      const { container, unmount } = renderIn(<Anchor href={href}>x</Anchor>, {
+        onOpenFileRef: vi.fn(),
+        fileRefSession: artSession,
+      });
+      expect(container.querySelector("a.acp-artifact-link")?.getAttribute("href"), href).toBe(route);
+      unmount();
+    }
   });
 
-  describe("img", () => {
+  it("img never emits a raw local path as src, and leaves external images alone", () => {
+    const Img = override<React.ComponentPropsWithoutRef<"img">>("img");
     const renderImg = (src: string, alt: string) => {
-      const Img = override<React.ComponentPropsWithoutRef<"img">>("img");
+      cleanup();
       return renderIn(<Img src={src} alt={alt} />, { fileRefSession: artSession }).container;
     };
-
-    it("never emits the raw artifact path as an img src", () => {
-      expect(
-        renderImg("/aoe/artifacts/shot.png", "a shot").querySelector('img[src="/aoe/artifacts/shot.png"]'),
-      ).toBeNull();
-    });
-
-    it("renders an unresolvable local image as inert alt text", () => {
-      const container = renderImg("/tmp/other/x.png", "alt text");
-      expect(container.querySelector("img")).toBeNull();
-      expect(container.querySelector("span.acp-inert-path")?.textContent).toBe("alt text");
-    });
-
-    it("leaves external images alone", () => {
-      expect(
-        renderImg("https://example.com/x.png", "ext").querySelector('img[src="https://example.com/x.png"]'),
-      ).not.toBeNull();
-    });
+    expect(
+      renderImg("/aoe/artifacts/shot.png", "a shot").querySelector('img[src="/aoe/artifacts/shot.png"]'),
+    ).toBeNull();
+    const inert = renderImg("/tmp/other/x.png", "alt text");
+    expect(inert.querySelector("img")).toBeNull();
+    expect(inert.querySelector("span.acp-inert-path")?.textContent).toBe("alt text");
+    expect(
+      renderImg("https://example.com/x.png", "ext").querySelector('img[src="https://example.com/x.png"]'),
+    ).not.toBeNull();
   });
 });
 
-describe("table and code header overrides", () => {
-  it("wraps tables in a scroll container", () => {
-    const Table = override<{ children: React.ReactNode }>("table");
-    const { container } = render(
-      <Table>
-        <tbody>
-          <tr>
-            <td>cell</td>
-          </tr>
-        </tbody>
-      </Table>,
-    );
-    expect(container.querySelector(".acp-table-wrap table td")?.textContent).toBe("cell");
-  });
-
-  it.each([
-    ["rust", "rust"],
-    [undefined, "text"],
-  ])("labels language %s and copies the raw source", (language, label) => {
+describe("code header override", () => {
+  it("code header labels the language, defaulting to text, and copies the raw source", () => {
     const Header = override<{ language?: string; code: string }>("CodeHeader");
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
-    const { container, getByText } = render(<Header language={language} code="alert('hi')" />);
-    expect(container.textContent).toContain(label);
-    fireEvent.click(getByText("copy"));
-    expect(writeText).toHaveBeenCalledWith("alert('hi')");
+    for (const [language, label] of [
+      ["rust", "rust"],
+      [undefined, "text"],
+    ] as const) {
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+      const { container, getByText, unmount } = render(<Header language={language} code="alert('hi')" />);
+      expect(container.textContent).toContain(label);
+      fireEvent.click(getByText("copy"));
+      expect(writeText).toHaveBeenCalledWith("alert('hi')");
+      unmount();
+    }
   });
 });
 

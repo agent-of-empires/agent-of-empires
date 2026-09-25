@@ -63,200 +63,216 @@ function renderCard(tool: ToolCall, result?: ActivityRow, opts: RenderOpts = {})
 }
 
 const args = (a: Record<string, unknown>) => JSON.stringify(a);
+
+type Case = [string, ToolCall, ActivityRow | undefined, RenderOpts, string[], string[]];
+
+function expectCases(cases: Case[], expand = false) {
+  for (const [label, tool, result, opts, contains, excludes] of cases) {
+    const { text, toggle, unmount } = renderCard(tool, result, opts);
+    if (expand) toggle();
+    for (const s of contains) expect(text(), label).toContain(s);
+    for (const s of excludes) expect(text(), label).not.toContain(s);
+    unmount();
+  }
+}
 const MEMORY_DIR = "/home/u/.claude/projects/proj/memory";
 
 describe("ToolCard headers", () => {
-  it.each<[string, ToolCall, ActivityRow | undefined, RenderOpts, string[], string[]]>([
-    ["bash", fixtures.bash, makeCompletion({ text: "a\nb" }), {}, ["bash", "ls -la", "done"], []],
-    [
-      "read with range",
-      makeToolCall({ kind: "read", args_preview: args({ path: "src/main.ts", offset: 1, limit: 10 }) }),
-      undefined,
-      {},
-      ["read", "src/main.ts", "L1–11", "running"],
-      [],
-    ],
-    ["edit", fixtures.edit, undefined, {}, ["edit", "/tmp/main.rs"], []],
-    ["write", fixtures.write, undefined, {}, ["write", "/tmp/new.rs"], []],
-    ["codex structured diff", fixtures.codexEdit, undefined, {}, ["edit", "src/codex.rs"], ["(unknown file)"]],
-    [
-      "codex multi-file diff",
-      fixtures.codexEditMultiFile,
-      undefined,
-      {},
-      ["src/alpha.rs", "+1 more"],
-      ["(unknown file)"],
-    ],
-    ["delete", fixtures.del, undefined, {}, ["delete", "/tmp/gone.rs"], []],
-    [
-      "search",
-      makeToolCall({ kind: "search", args_preview: args({ query: "TODO", path: "src" }) }),
-      makeCompletion({ text: "hit1\nhit2\nhit3" }),
-      {},
-      ["search", "TODO", "in src", "3 matches"],
-      [],
-    ],
-    ["fetch", fixtures.fetch, undefined, {}, ["fetch", "example.com"], []],
-    ["think", makeToolCall({ kind: "think", name: "Reasoning" }), undefined, {}, ["Reasoning"], ["running"]],
-    [
-      "generic",
-      makeToolCall({ kind: "weird", name: "DoThing" }),
-      makeCompletion({ text: "out" }),
-      {},
-      ["weird", "DoThing"],
-      [],
-    ],
-    // A failed think's error is its whole content, so it routes to the generic card.
-    [
-      "failed think",
-      makeToolCall({ kind: "think", name: "task" }),
-      makeError({ text: "AI_NoSuchToolError: unavailable tool 'task'. Available tools: Read, Write, Bash." }),
-      {},
-      ["failed", "unavailable tool 'task'", "Available tools: Read, Write, Bash."],
-      [],
-    ],
-    ["stopped", fixtures.bash, makeStopped(), {}, ["stopped"], ["running", "failed", "done"]],
-    [
-      "stopped duration is frozen",
-      makeToolCall({ kind: "execute", started_at: "2026-05-21T00:00:00Z" }),
-      makeStopped({ at: "2026-05-21T00:00:01Z" }),
-      {},
-      ["1.0s"],
-      [],
-    ],
-    [
-      "completed duration",
-      makeToolCall({ kind: "execute", started_at: "2026-01-01T00:00:00.000Z" }),
-      makeCompletion({ at: "2026-01-01T00:00:02.500Z" }),
-      {},
-      ["2.5s"],
-      [],
-    ],
-    ["mcp", fixtures.mcp, undefined, { toolKey: "claude" }, ["MCP", "Slack", "Send message"], []],
-    [
-      "memory file",
-      makeToolCall({ kind: "read", args_preview: args({ path: `${MEMORY_DIR}/feedback_x.md` }) }),
-      makeCompletion({ text: "body" }),
-      {},
-      ["Memory", "recalled", "feedback_x.md"],
-      [],
-    ],
-    [
-      "memory index",
-      makeToolCall({ kind: "read", args_preview: args({ path: `${MEMORY_DIR}/MEMORY.md` }) }),
-      makeCompletion({ text: "index body" }),
-      {},
-      ["Memory index", "read index"],
-      [],
-    ],
-    ["memory recall", fixtures.memoryRecallList, undefined, {}, ["Memory recall", "Recalled", "2 memories"], []],
-    ["memory synthesize", fixtures.memoryRecallSynthesize, undefined, {}, ["Memory recall", "Synthesised memory"], []],
-    [
-      "subagent child",
-      makeToolCall({ kind: "read", args_preview: args({ path: "child.ts", _aoe_parent_tool_call_id: "p" }) }),
-      undefined,
-      {},
-      ["subagent", "child.ts"],
-      [],
-    ],
-    [
-      "nested subagent child",
-      makeToolCall({ kind: "read", args_preview: args({ path: "child.ts", _aoe_parent_tool_call_id: "p" }) }),
-      undefined,
-      { nested: true },
-      ["child.ts"],
-      ["subagent"],
-    ],
-    ["claude todos", fixtures.todoWrite, undefined, { toolKey: "claude" }, ["todos", "Step one", "Step three"], []],
-    // An empty todos array is a real clear, not a bare think card.
-    [
-      "claude todos clear",
-      makeToolCall({ name: "TodoWrite", kind: "think", args_preview: args({ todos: [] }) }),
-      makeCompletion(),
-      { toolKey: "claude" },
-      ["todos", "todos cleared"],
-      [],
-    ],
-    [
-      "opencode todos",
-      makeToolCall({
-        name: "5 todos",
-        args_preview: args({
-          todos: [
-            { content: "Check ACP schema", status: "completed" },
-            { content: "Render OpenCode todos", status: "in_progress" },
-          ],
+  it("renders each tool kind's header", () => {
+    expectCases([
+      ["bash", fixtures.bash, makeCompletion({ text: "a\nb" }), {}, ["bash", "ls -la", "done"], []],
+      [
+        "read with range",
+        makeToolCall({ kind: "read", args_preview: args({ path: "src/main.ts", offset: 1, limit: 10 }) }),
+        undefined,
+        {},
+        ["read", "src/main.ts", "L1–11", "running"],
+        [],
+      ],
+      ["edit", fixtures.edit, undefined, {}, ["edit", "/tmp/main.rs"], []],
+      ["write", fixtures.write, undefined, {}, ["write", "/tmp/new.rs"], []],
+      ["codex structured diff", fixtures.codexEdit, undefined, {}, ["edit", "src/codex.rs"], ["(unknown file)"]],
+      [
+        "codex multi-file diff",
+        fixtures.codexEditMultiFile,
+        undefined,
+        {},
+        ["src/alpha.rs", "+1 more"],
+        ["(unknown file)"],
+      ],
+      ["delete", fixtures.del, undefined, {}, ["delete", "/tmp/gone.rs"], []],
+      [
+        "search",
+        makeToolCall({ kind: "search", args_preview: args({ query: "TODO", path: "src" }) }),
+        makeCompletion({ text: "hit1\nhit2\nhit3" }),
+        {},
+        ["search", "TODO", "in src", "3 matches"],
+        [],
+      ],
+      ["fetch", fixtures.fetch, undefined, {}, ["fetch", "example.com"], []],
+      ["think", makeToolCall({ kind: "think", name: "Reasoning" }), undefined, {}, ["Reasoning"], ["running"]],
+      [
+        "generic",
+        makeToolCall({ kind: "weird", name: "DoThing" }),
+        makeCompletion({ text: "out" }),
+        {},
+        ["weird", "DoThing"],
+        [],
+      ],
+      // A failed think's error is its whole content, so it routes to the generic card.
+      [
+        "failed think",
+        makeToolCall({ kind: "think", name: "task" }),
+        makeError({ text: "AI_NoSuchToolError: unavailable tool 'task'. Available tools: Read, Write, Bash." }),
+        {},
+        ["failed", "unavailable tool 'task'", "Available tools: Read, Write, Bash."],
+        [],
+      ],
+      ["stopped", fixtures.bash, makeStopped(), {}, ["stopped"], ["running", "failed", "done"]],
+      [
+        "stopped duration is frozen",
+        makeToolCall({ kind: "execute", started_at: "2026-05-21T00:00:00Z" }),
+        makeStopped({ at: "2026-05-21T00:00:01Z" }),
+        {},
+        ["1.0s"],
+        [],
+      ],
+      [
+        "completed duration",
+        makeToolCall({ kind: "execute", started_at: "2026-01-01T00:00:00.000Z" }),
+        makeCompletion({ at: "2026-01-01T00:00:02.500Z" }),
+        {},
+        ["2.5s"],
+        [],
+      ],
+      ["mcp", fixtures.mcp, undefined, { toolKey: "claude" }, ["MCP", "Slack", "Send message"], []],
+      [
+        "memory file",
+        makeToolCall({ kind: "read", args_preview: args({ path: `${MEMORY_DIR}/feedback_x.md` }) }),
+        makeCompletion({ text: "body" }),
+        {},
+        ["Memory", "recalled", "feedback_x.md"],
+        [],
+      ],
+      [
+        "memory index",
+        makeToolCall({ kind: "read", args_preview: args({ path: `${MEMORY_DIR}/MEMORY.md` }) }),
+        makeCompletion({ text: "index body" }),
+        {},
+        ["Memory index", "read index"],
+        [],
+      ],
+      ["memory recall", fixtures.memoryRecallList, undefined, {}, ["Memory recall", "Recalled", "2 memories"], []],
+      [
+        "memory synthesize",
+        fixtures.memoryRecallSynthesize,
+        undefined,
+        {},
+        ["Memory recall", "Synthesised memory"],
+        [],
+      ],
+      [
+        "subagent child",
+        makeToolCall({ kind: "read", args_preview: args({ path: "child.ts", _aoe_parent_tool_call_id: "p" }) }),
+        undefined,
+        {},
+        ["subagent", "child.ts"],
+        [],
+      ],
+      [
+        "nested subagent child",
+        makeToolCall({ kind: "read", args_preview: args({ path: "child.ts", _aoe_parent_tool_call_id: "p" }) }),
+        undefined,
+        { nested: true },
+        ["child.ts"],
+        ["subagent"],
+      ],
+      ["claude todos", fixtures.todoWrite, undefined, { toolKey: "claude" }, ["todos", "Step one", "Step three"], []],
+      // An empty todos array is a real clear, not a bare think card.
+      [
+        "claude todos clear",
+        makeToolCall({ name: "TodoWrite", kind: "think", args_preview: args({ todos: [] }) }),
+        makeCompletion(),
+        { toolKey: "claude" },
+        ["todos", "todos cleared"],
+        [],
+      ],
+      [
+        "opencode todos",
+        makeToolCall({
+          name: "5 todos",
+          args_preview: args({
+            todos: [
+              { content: "Check ACP schema", status: "completed" },
+              { content: "Render OpenCode todos", status: "in_progress" },
+            ],
+          }),
         }),
-      }),
-      undefined,
-      { toolKey: "opencode" },
-      ["todos", "2 items", "Check ACP schema", "Render OpenCode todos"],
-      [],
-    ],
-    ["claude skill", fixtures.skill, undefined, { toolKey: "claude" }, ["skill", "investigate"], []],
-    ["wakeup", fixtures.scheduleWakeup, undefined, { toolKey: "claude" }, ["checking deploy", "in 5m"], []],
-    [
-      "wakeup with humanised delay",
-      makeToolCall({
-        name: "ScheduleWakeup",
-        args_preview: args({ delaySeconds: 194, reason: "check CI", prompt: "x" }),
-      }),
-      makeCompletion(),
-      { toolKey: "claude" },
-      ["scheduled wakeup", "in 3m 14s", "check CI"],
-      [],
-    ],
-    [
-      "cron create",
-      makeToolCall({ name: "CronCreate", args_preview: args({ _aoe_title: "CronCreate", schedule: "0 9 * * *" }) }),
-      makeCompletion(),
-      { toolKey: "claude" },
-      ["cron schedule created", "0 9 * * *"],
-      [],
-    ],
-    [
-      "cron list",
-      makeToolCall({ name: "CronList" }),
-      makeCompletion({ text: "schedule A" }),
-      { toolKey: "claude" },
-      ["cron schedules", "list active schedules"],
-      [],
-    ],
-    [
-      "cron delete",
-      makeToolCall({ name: "CronDelete", args_preview: args({ id: "job-7" }) }),
-      makeCompletion(),
-      { toolKey: "claude" },
-      ["cron schedule deleted", "job-7"],
-      [],
-    ],
-    ["tool search", fixtures.toolSearch, undefined, { toolKey: "claude" }, ["tool search", "select:Read,Edit"], []],
-    [
-      "monitor",
-      fixtures.monitor,
-      undefined,
-      { toolKey: "claude" },
-      ["monitor", "errors in deploy.log", "persistent"],
-      [],
-    ],
-    ["task stop", fixtures.taskStop, undefined, { toolKey: "claude" }, ["task stop", "task-abc123"], []],
-    ["empty tool search", makeToolCall({ name: "ToolSearch" }), undefined, { toolKey: "claude" }, ["search tools"], []],
-    ["empty monitor", makeToolCall({ name: "Monitor" }), undefined, { toolKey: "claude" }, ["background watch"], []],
-    ["empty task stop", makeToolCall({ name: "TaskStop" }), undefined, { toolKey: "claude" }, ["stop task"], []],
-    // Harness names are Claude-only; a coincidental Monitor elsewhere is generic.
-    ["codex Monitor", fixtures.monitor, undefined, { toolKey: "codex" }, ["Monitor"], ["errors in deploy.log"]],
-  ])("%s", (_label, tool, result, opts, contains, excludes) => {
-    const { text } = renderCard(tool, result, opts);
-    for (const s of contains) expect(text()).toContain(s);
-    for (const s of excludes) expect(text()).not.toContain(s);
-  });
-
-  it("ticks a live duration while running", () => {
-    const { text } = renderCard(
-      makeToolCall({ kind: "execute", started_at: new Date(Date.now() - 1500).toISOString() }),
-    );
-    expect(text()).toContain("running");
-    expect(text()).toMatch(/\ds/);
+        undefined,
+        { toolKey: "opencode" },
+        ["todos", "2 items", "Check ACP schema", "Render OpenCode todos"],
+        [],
+      ],
+      ["claude skill", fixtures.skill, undefined, { toolKey: "claude" }, ["skill", "investigate"], []],
+      ["wakeup", fixtures.scheduleWakeup, undefined, { toolKey: "claude" }, ["checking deploy", "in 5m"], []],
+      [
+        "wakeup with humanised delay",
+        makeToolCall({
+          name: "ScheduleWakeup",
+          args_preview: args({ delaySeconds: 194, reason: "check CI", prompt: "x" }),
+        }),
+        makeCompletion(),
+        { toolKey: "claude" },
+        ["scheduled wakeup", "in 3m 14s", "check CI"],
+        [],
+      ],
+      [
+        "cron create",
+        makeToolCall({ name: "CronCreate", args_preview: args({ _aoe_title: "CronCreate", schedule: "0 9 * * *" }) }),
+        makeCompletion(),
+        { toolKey: "claude" },
+        ["cron schedule created", "0 9 * * *"],
+        [],
+      ],
+      [
+        "cron list",
+        makeToolCall({ name: "CronList" }),
+        makeCompletion({ text: "schedule A" }),
+        { toolKey: "claude" },
+        ["cron schedules", "list active schedules"],
+        [],
+      ],
+      [
+        "cron delete",
+        makeToolCall({ name: "CronDelete", args_preview: args({ id: "job-7" }) }),
+        makeCompletion(),
+        { toolKey: "claude" },
+        ["cron schedule deleted", "job-7"],
+        [],
+      ],
+      ["tool search", fixtures.toolSearch, undefined, { toolKey: "claude" }, ["tool search", "select:Read,Edit"], []],
+      [
+        "monitor",
+        fixtures.monitor,
+        undefined,
+        { toolKey: "claude" },
+        ["monitor", "errors in deploy.log", "persistent"],
+        [],
+      ],
+      ["task stop", fixtures.taskStop, undefined, { toolKey: "claude" }, ["task stop", "task-abc123"], []],
+      [
+        "empty tool search",
+        makeToolCall({ name: "ToolSearch" }),
+        undefined,
+        { toolKey: "claude" },
+        ["search tools"],
+        [],
+      ],
+      ["empty monitor", makeToolCall({ name: "Monitor" }), undefined, { toolKey: "claude" }, ["background watch"], []],
+      ["empty task stop", makeToolCall({ name: "TaskStop" }), undefined, { toolKey: "claude" }, ["stop task"], []],
+      // Harness names are Claude-only; a coincidental Monitor elsewhere is generic.
+      ["codex Monitor", fixtures.monitor, undefined, { toolKey: "codex" }, ["Monitor"], ["errors in deploy.log"]],
+    ]);
   });
 
   it("renders the resolved skill's provenance badge", () => {
@@ -282,41 +298,52 @@ describe("ToolCard headers", () => {
 });
 
 describe("ToolCard expanded bodies", () => {
-  it.each<[string, ToolCall, ActivityRow | undefined, RenderOpts, string[], string[]]>([
-    ["bash output", fixtures.bash, makeCompletion({ text: "hello world\n" }), {}, ["hello world"], []],
-    ["codex second file", fixtures.codexEditMultiFile, undefined, {}, ["src/beta.rs"], []],
-    [
-      "monitor timeout chip and body",
-      makeToolCall({
-        name: "Monitor",
-        args_preview: args({ description: "watch", command: "npm run build", timeout_ms: 90000 }),
-      }),
-      makeCompletion({ text: "build ok" }),
-      { toolKey: "claude" },
-      ["1m 30s", "npm run build", "build ok"],
-      [],
-    ],
-    [
-      "skill input without bookkeeping",
-      makeToolCall({ name: "Skill", args_preview: args({ skill: "investigate", _aoe_title: "Skill", arg: "value" }) }),
-      makeCompletion({ text: "ran" }),
-      { toolKey: "claude" },
-      ["input", "value"],
-      ["_aoe_title"],
-    ],
-    [
-      "memory frontmatter",
-      makeToolCall({ kind: "read", args_preview: args({ path: `${MEMORY_DIR}/feedback_x.md` }) }),
-      makeCompletion({ text: "---\nname: feedback x\ntype: feedback\ndescription: a note\n---\nbody text here" }),
-      {},
-      ["a note", "body text here"],
-      [],
-    ],
-  ])("%s", (_label, tool, result, opts, contains, excludes) => {
-    const { text, toggle } = renderCard(tool, result, opts);
-    toggle();
-    for (const s of contains) expect(text()).toContain(s);
-    for (const s of excludes) expect(text()).not.toContain(s);
+  it("renders each kind's expanded body", () => {
+    expectCases(
+      [
+        ["bash output", fixtures.bash, makeCompletion({ text: "hello world\n" }), {}, ["hello world"], []],
+        ["codex second file", fixtures.codexEditMultiFile, undefined, {}, ["src/beta.rs"], []],
+        [
+          "monitor timeout chip and body",
+          makeToolCall({
+            name: "Monitor",
+            args_preview: args({ description: "watch", command: "npm run build", timeout_ms: 90000 }),
+          }),
+          makeCompletion({ text: "build ok" }),
+          { toolKey: "claude" },
+          ["1m 30s", "npm run build", "build ok"],
+          [],
+        ],
+        [
+          "skill input without bookkeeping",
+          makeToolCall({
+            name: "Skill",
+            args_preview: args({ skill: "investigate", _aoe_title: "Skill", arg: "value" }),
+          }),
+          makeCompletion({ text: "ran" }),
+          { toolKey: "claude" },
+          ["input", "value"],
+          ["_aoe_title"],
+        ],
+        [
+          "memory frontmatter",
+          makeToolCall({ kind: "read", args_preview: args({ path: `${MEMORY_DIR}/feedback_x.md` }) }),
+          makeCompletion({ text: "---\nname: feedback x\ntype: feedback\ndescription: a note\n---\nbody text here" }),
+          {},
+          ["a note", "body text here"],
+          [],
+        ],
+        [
+          "recalled memory paths",
+          fixtures.memoryRecallList,
+          undefined,
+          {},
+          ["user_role.md", "feedback_no_em_dashes.md"],
+          [],
+        ],
+      ],
+      true,
+    );
   });
 
   it("keeps a successful card collapsed until toggled", () => {
@@ -325,21 +352,10 @@ describe("ToolCard expanded bodies", () => {
     expect(text()).not.toContain("hello world");
   });
 
-  it.each([
-    [fixtures.codexEdit, 1],
-    [fixtures.codexEditMultiFile, 2],
-  ])("renders structured diff bodies (%#)", (tool, count) => {
-    const { container, toggle } = renderCard(tool);
+  it("renders one structured diff body per file", () => {
+    const { container, toggle } = renderCard(fixtures.codexEditMultiFile);
     toggle();
-    expect(container.querySelectorAll('[data-testid="string-diff"]').length).toBe(count);
-  });
-
-  it("lists recalled memory paths", () => {
-    const { getByTestId, toggle } = renderCard(fixtures.memoryRecallList);
-    toggle();
-    const list = getByTestId("memory-recall-paths");
-    expect(list.textContent).toContain("user_role.md");
-    expect(list.textContent).toContain("feedback_no_em_dashes.md");
+    expect(container.querySelectorAll('[data-testid="string-diff"]').length).toBe(2);
   });
 
   it("renders synthesized memory as markdown with the envelope and line numbers stripped", () => {
@@ -411,63 +427,89 @@ describe("failed-card folding", () => {
     expect(text()).not.toContain("tool failed");
   });
 
-  it.each([
-    ["memory recall", fixtures.memoryRecallList],
-    ["wakeup", fixtures.scheduleWakeup],
-    ["memory file", makeToolCall({ kind: "read", args_preview: args({ file_path: `${MEMORY_DIR}/feedback.md` }) })],
-  ])("auto-opens and folds a failed %s card", (_label, tool) => {
-    const { text, toggle } = renderCard(tool, makeError({ text: "kind-specific boom" }), { toolKey: "claude" });
-    expect(text()).toContain("tool failed");
-    toggle();
-    expect(text()).not.toContain("tool failed");
+  it("auto-opens and folds failed kind-specific cards", () => {
+    for (const tool of [
+      fixtures.memoryRecallList,
+      fixtures.scheduleWakeup,
+      makeToolCall({ kind: "read", args_preview: args({ file_path: `${MEMORY_DIR}/feedback.md` }) }),
+    ]) {
+      const { text, toggle, unmount } = renderCard(tool, makeError({ text: "kind-specific boom" }), {
+        toolKey: "claude",
+      });
+      expect(text(), tool.name).toContain("tool failed");
+      toggle();
+      expect(text(), tool.name).not.toContain("tool failed");
+      unmount();
+    }
   });
 });
 
 describe("structured output media", () => {
   const withOutput = (output: ToolOutputBlock[]) => renderCard(fixtures.generic, makeCompletion({ output }));
 
-  it.each<[string, ToolOutputBlock, string, string | null, string]>([
-    ["image data", { kind: "image", mime_type: "image/png", data: "AAAA" }, "img", "data:image/png;base64,AAAA", ""],
-    ["audio data", { kind: "audio", mime_type: "audio/wav", data: "QUJD" }, "audio", "data:audio/wav;base64,QUJD", ""],
-    [
-      "link",
-      { kind: "resource_link", uri: "file:///report.pdf", name: "report.pdf" },
-      "a",
-      "file:///report.pdf",
-      "report.pdf",
-    ],
-    [
-      "blob download",
-      { kind: "resource", uri: "file:///out.bin", mime_type: "application/octet-stream", data: "QkxPQg==" },
-      'a[download="out.bin"]',
-      "data:application/octet-stream;base64,QkxPQg==",
-      "out.bin",
-    ],
-    ["text", { kind: "text", text: "structured text" }, "pre", null, "structured text"],
-    ["text resource", { kind: "resource", uri: "file:///x.txt", text: "resource body" }, "pre", null, "resource body"],
-  ])("renders %s", (_label, block, selector, attr, visible) => {
-    const { container, text } = withOutput([block]);
-    const el = [...container.querySelectorAll(selector)].at(-1);
-    expect(el).toBeTruthy();
-    if (attr) expect(el!.getAttribute(selector === "a" || selector.startsWith("a[") ? "href" : "src")).toBe(attr);
-    expect(text()).toContain(visible);
+  it("renders each media block kind", () => {
+    const cases: [string, ToolOutputBlock, string, string | null, string][] = [
+      ["image data", { kind: "image", mime_type: "image/png", data: "AAAA" }, "img", "data:image/png;base64,AAAA", ""],
+      [
+        "audio data",
+        { kind: "audio", mime_type: "audio/wav", data: "QUJD" },
+        "audio",
+        "data:audio/wav;base64,QUJD",
+        "",
+      ],
+      [
+        "link",
+        { kind: "resource_link", uri: "file:///report.pdf", name: "report.pdf" },
+        "a",
+        "file:///report.pdf",
+        "report.pdf",
+      ],
+      [
+        "blob download",
+        { kind: "resource", uri: "file:///out.bin", mime_type: "application/octet-stream", data: "QkxPQg==" },
+        'a[download="out.bin"]',
+        "data:application/octet-stream;base64,QkxPQg==",
+        "out.bin",
+      ],
+      ["text", { kind: "text", text: "structured text" }, "pre", null, "structured text"],
+      [
+        "text resource",
+        { kind: "resource", uri: "file:///x.txt", text: "resource body" },
+        "pre",
+        null,
+        "resource body",
+      ],
+    ];
+    for (const [label, block, selector, attr, visible] of cases) {
+      const { container, text, unmount } = withOutput([block]);
+      const el = [...container.querySelectorAll(selector)].at(-1);
+      expect(el, label).toBeTruthy();
+      if (attr)
+        expect(el!.getAttribute(selector === "a" || selector.startsWith("a[") ? "href" : "src"), label).toBe(attr);
+      expect(text(), label).toContain(visible);
+      unmount();
+    }
   });
 
   // Agent-controlled uris never reach a sink; unusable blocks degrade to a placeholder.
-  it.each<[string, ToolOutputBlock, string, string]>([
-    ["image without data", { kind: "image", mime_type: "image/png" }, "img", "image (image/png)"],
-    [
-      "javascript image",
-      { kind: "image", mime_type: "image/png", uri: "javascript:alert(1)" },
-      "img",
-      "image (image/png)",
-    ],
-    ["audio without data", { kind: "audio", mime_type: "audio/wav" }, "audio", "audio (audio/wav)"],
-    ["javascript link", { kind: "resource_link", uri: "javascript:alert(1)", name: "evil.html" }, "a", "evil.html"],
-  ])("degrades %s to a placeholder", (_label, block, selector, label) => {
-    const { container, text } = withOutput([block]);
-    expect(container.querySelector(selector)).toBeNull();
-    expect(text()).toContain(label);
+  it("degrades unusable or unsafe blocks to a placeholder", () => {
+    const cases: [string, ToolOutputBlock, string, string][] = [
+      ["image without data", { kind: "image", mime_type: "image/png" }, "img", "image (image/png)"],
+      [
+        "javascript image",
+        { kind: "image", mime_type: "image/png", uri: "javascript:alert(1)" },
+        "img",
+        "image (image/png)",
+      ],
+      ["audio without data", { kind: "audio", mime_type: "audio/wav" }, "audio", "audio (audio/wav)"],
+      ["javascript link", { kind: "resource_link", uri: "javascript:alert(1)", name: "evil.html" }, "a", "evil.html"],
+    ];
+    for (const [label, block, selector, placeholder] of cases) {
+      const { container, text, unmount } = withOutput([block]);
+      expect(container.querySelector(selector), label).toBeNull();
+      expect(text(), label).toContain(placeholder);
+      unmount();
+    }
   });
 });
 
@@ -481,17 +523,24 @@ describe("repo-relative paths", () => {
   const editAt = (file_path: string) =>
     makeToolCall({ kind: "edit", args_preview: args({ file_path, old_string: "a", new_string: "b" }) });
 
-  it.each<[string, ToolCall, FileRefSession, string, string | null]>([
-    ["edit", fixtures.edit, session, "main.rs", "/tmp/main.rs"],
-    ["read", fixtures.read, session, "main.rs", "/tmp/main.rs"],
-    ["delete", fixtures.del, session, "gone.rs", "/tmp/gone.rs"],
-    ["write", fixtures.write, session, "new.rs", "/tmp/new.rs"],
-    ["multi-repo workspace", editAt("/tmp/api/src/h.ts"), multi, "api/src/h.ts", "/tmp/api/src/h.ts"],
-    ["outside every root", editAt("/etc/hosts"), session, "/etc/hosts", null],
-  ])("%s", (_label, tool, fileRefSession, shown, hidden) => {
-    const { text } = renderCard(tool, undefined, { session: fileRefSession });
-    expect(text()).toContain(shown);
-    if (hidden) expect(text()).not.toContain(hidden);
+  it("shows paths relative to the session's repo roots", () => {
+    const cases: [string, ToolCall, FileRefSession, string, string | null][] = [
+      ["edit", fixtures.edit, session, "main.rs", "/tmp/main.rs"],
+      ["read", fixtures.read, session, "main.rs", "/tmp/main.rs"],
+      ["delete", fixtures.del, session, "gone.rs", "/tmp/gone.rs"],
+      ["write", fixtures.write, session, "new.rs", "/tmp/new.rs"],
+      ["multi-repo workspace", editAt("/tmp/api/src/h.ts"), multi, "api/src/h.ts", "/tmp/api/src/h.ts"],
+      ["outside every root", editAt("/etc/hosts"), session, "/etc/hosts", null],
+    ];
+    for (const [label, tool, fileRefSession, shown, hidden] of cases) {
+      const { text, unmount } = renderCard(tool, undefined, { session: fileRefSession });
+      expect(text(), label).toContain(shown);
+      if (hidden) expect(text(), label).not.toContain(hidden);
+      unmount();
+    }
+    // The absolute path stays in the title tooltip.
+    const { container } = renderCard(fixtures.edit, undefined, { session });
+    expect(container.querySelector('[title="/tmp/main.rs"]')!.textContent).toContain("main.rs");
   });
 
   it("renders each multi-file diff header relative", () => {
@@ -511,31 +560,27 @@ describe("repo-relative paths", () => {
     expect(text()).not.toContain("/tmp/src/beta.rs");
   });
 
-  it.each([
-    ["read", "read"],
-    ["edit", "write"],
-    ["delete", "delete"],
-  ])("falls back to (unknown file) for a path-less %s tool", (kind, label) => {
-    const { text } = renderCard(makeToolCall({ name: "", kind }), undefined, { session });
-    expect(text()).toContain(label);
-    expect(text()).toContain("(unknown file)");
+  it("falls back to (unknown file) for path-less tools", () => {
+    for (const [kind, label] of [
+      ["read", "read"],
+      ["edit", "write"],
+      ["delete", "delete"],
+    ]) {
+      const { text, unmount } = renderCard(makeToolCall({ name: "", kind }), undefined, { session });
+      expect(text(), kind).toContain(label);
+      expect(text(), kind).toContain("(unknown file)");
+      unmount();
+    }
   });
 
-  it("keeps the absolute path in the title tooltip", () => {
-    const { container } = renderCard(fixtures.edit, undefined, { session });
-    expect(container.querySelector('[title="/tmp/main.rs"]')!.textContent).toContain("main.rs");
-  });
-
-  it.each([
-    [fixtures.read, "/tmp/main.rs"],
-    [fixtures.write, "/tmp/new.rs"],
-  ])("opens %#'s file via onOpenFileRef, or renders plain text without a handler", (tool, path) => {
+  it("opens the file via onOpenFileRef, or renders plain text without a handler", () => {
+    const path = "/tmp/main.rs";
     const onOpenFileRef = vi.fn();
-    const { container } = renderCard(tool, undefined, { session, onOpenFileRef });
+    const { container } = renderCard(fixtures.read, undefined, { session, onOpenFileRef });
     fireEvent.click(container.querySelector(`button[title="${path}"]`)!);
     expect(onOpenFileRef).toHaveBeenCalledWith({ path });
     cleanup();
-    const plain = renderCard(tool, undefined, { session });
+    const plain = renderCard(fixtures.read, undefined, { session });
     expect(plain.container.querySelector(`button[title="${path}"]`)).toBeNull();
     expect(plain.container.querySelector(`[title="${path}"]`)).not.toBeNull();
   });
@@ -568,34 +613,38 @@ describe("TodoGroupCard", () => {
     expect(text).toContain("1 items");
   });
 
-  it.each([
-    // An empty clear counts toward the fold and previews as cleared.
-    [
-      "empty clear",
-      {
-        tool: makeToolCall({ id: "c", name: "TodoWrite", kind: "think", args_preview: args({ todos: [] }) }),
-        result: makeCompletion(),
-      },
-      ["updated 4 times", "todos cleared"],
-      ["Step Charlie"],
-    ],
-    // Failed and stopped tails preview the last live snapshot but label the header.
-    [
-      "failed tail",
-      snapshot("td4", "Broken plan", "in_progress", makeError()),
-      ["Step Charlie", "failed"],
-      ["Broken plan"],
-    ],
-    [
-      "stopped tail",
-      snapshot("td4", "Interrupted plan", "in_progress", makeStopped()),
-      ["Step Charlie", "stopped"],
-      ["Interrupted plan", "done"],
-    ],
-  ])("%s", (_label, tail, contains, excludes) => {
-    const { container } = renderGroup([...items, tail]);
-    for (const s of contains) expect(container.textContent).toContain(s);
-    for (const s of excludes) expect(container.textContent).not.toContain(s);
+  it("previews clear, failed, and stopped tails", () => {
+    const cases: [string, (typeof items)[number], string[], string[]][] = [
+      // An empty clear counts toward the fold and previews as cleared.
+      [
+        "empty clear",
+        {
+          tool: makeToolCall({ id: "c", name: "TodoWrite", kind: "think", args_preview: args({ todos: [] }) }),
+          result: makeCompletion(),
+        },
+        ["updated 4 times", "todos cleared"],
+        ["Step Charlie"],
+      ],
+      // Failed and stopped tails preview the last live snapshot but label the header.
+      [
+        "failed tail",
+        snapshot("td4", "Broken plan", "in_progress", makeError()),
+        ["Step Charlie", "failed"],
+        ["Broken plan"],
+      ],
+      [
+        "stopped tail",
+        snapshot("td4", "Interrupted plan", "in_progress", makeStopped()),
+        ["Step Charlie", "stopped"],
+        ["Interrupted plan", "done"],
+      ],
+    ];
+    for (const [label, tail, contains, excludes] of cases) {
+      const { container, unmount } = renderGroup([...items, tail]);
+      for (const s of contains) expect(container.textContent, label).toContain(s);
+      for (const s of excludes) expect(container.textContent, label).not.toContain(s);
+      unmount();
+    }
   });
 
   it("keeps opencode todowrite groups visible", () => {
@@ -688,14 +737,16 @@ describe("SubagentCard", () => {
     expect(container.textContent).not.toContain("task_result");
   });
 
-  it.each([
-    ['<task id="ses_1" state="completed"><task_result>done here</task_result></task>', "done here"],
-    ['\n  <task id="s"><task_result>\n  ok\n  </task_result></task>  \n', "ok"],
-    ["just a plain report", "just a plain report"],
-    ["<task_result>no closing task tag", "<task_result>no closing task tag"],
-    ["<task><task_result>use Vec<String> and a < b</task_result></task>", "use Vec<String> and a < b"],
-  ])("extractTaskResult(%j)", (input, expected) => {
-    expect(extractTaskResult(input)).toBe(expected);
+  it("extractTaskResult unwraps the task envelope", () => {
+    for (const [input, expected] of [
+      ['<task id="ses_1" state="completed"><task_result>done here</task_result></task>', "done here"],
+      ['\n  <task id="s"><task_result>\n  ok\n  </task_result></task>  \n', "ok"],
+      ["just a plain report", "just a plain report"],
+      ["<task_result>no closing task tag", "<task_result>no closing task tag"],
+      ["<task><task_result>use Vec<String> and a < b</task_result></task>", "use Vec<String> and a < b"],
+    ]) {
+      expect(extractTaskResult(input!), input).toBe(expected);
+    }
   });
 });
 
@@ -752,29 +803,30 @@ describe("AsyncSubagentCard", () => {
 });
 
 describe("duration formatting", () => {
-  it.each([
-    [0, "0 ms"],
-    [999, "999 ms"],
-    [1000, "1.0s"],
-    [4231, "4.2s"],
-    [59_999, "60.0s"],
-    [60_000, "1m 0s"],
-    [90_000, "1m 30s"],
-    [3_661_000, "61m 1s"],
-  ])("formatDurationMs(%i) = %s", (ms, expected) => {
-    expect(formatDurationMs(ms)).toBe(expected);
-  });
-
-  it.each([
-    [45, "45s"],
-    [180, "3m"],
-    [194, "3m 14s"],
-    [3600, "1h"],
-    [4020, "1h 7m"],
-    [2 * 86400, "2d"],
-    [2 * 86400 + 4 * 3600, "2d 4h"],
-  ])("formatDurationSeconds(%i) = %s", (s, expected) => {
-    expect(formatDurationSeconds(s)).toBe(expected);
+  it("formats milliseconds and seconds", () => {
+    for (const [ms, expected] of [
+      [0, "0 ms"],
+      [999, "999 ms"],
+      [1000, "1.0s"],
+      [4231, "4.2s"],
+      [59_999, "60.0s"],
+      [60_000, "1m 0s"],
+      [90_000, "1m 30s"],
+      [3_661_000, "61m 1s"],
+    ] as const) {
+      expect(formatDurationMs(ms), String(ms)).toBe(expected);
+    }
+    for (const [sec, expected] of [
+      [45, "45s"],
+      [180, "3m"],
+      [194, "3m 14s"],
+      [3600, "1h"],
+      [4020, "1h 7m"],
+      [2 * 86400, "2d"],
+      [2 * 86400 + 4 * 3600, "2d 4h"],
+    ] as const) {
+      expect(formatDurationSeconds(sec), String(sec)).toBe(expected);
+    }
   });
 });
 

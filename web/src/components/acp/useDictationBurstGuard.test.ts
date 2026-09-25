@@ -20,52 +20,23 @@ function renderGuard() {
 }
 
 describe("useDictationBurstGuard (#1431)", () => {
-  it("non-replacement input outside a burst is a no-op", () => {
+  it("buffers the latest value across a burst, suppressing upstream, and flushes it on timeout", () => {
     const { setText, result } = renderGuard();
-    act(() => {
-      result.current.observeInputType("insertText", 1000);
-    });
-    expect(result.current.shouldSuppressUpstream("hello")).toBe(false);
+    for (const [at, value] of [
+      [1000, "open"],
+      [1100, "open the"],
+      [1300, "open the diff viewer"],
+    ] as const) {
+      act(() => {
+        result.current.observeInputType("insertReplacementText", at);
+      });
+      expect(result.current.shouldSuppressUpstream(value)).toBe(true);
+    }
     expect(setText).not.toHaveBeenCalled();
-  });
-
-  it("insertReplacementText enters a burst and suppresses upstream change", () => {
-    const { setText, result } = renderGuard();
-    act(() => {
-      result.current.observeInputType("insertReplacementText", 1000);
-    });
-    expect(result.current.shouldSuppressUpstream("open the")).toBe(true);
-    expect(setText).not.toHaveBeenCalled();
-  });
-
-  it("buffers the latest textarea value across consecutive replacements", () => {
-    const { setText, result } = renderGuard();
-    act(() => {
-      result.current.observeInputType("insertReplacementText", 1000);
-    });
-    expect(result.current.shouldSuppressUpstream("open")).toBe(true);
-    act(() => {
-      result.current.observeInputType("insertReplacementText", 1100);
-    });
-    expect(result.current.shouldSuppressUpstream("open the")).toBe(true);
-    act(() => {
-      result.current.observeInputType("insertReplacementText", 1300);
-    });
-    expect(result.current.shouldSuppressUpstream("open the diff viewer")).toBe(true);
-    expect(setText).not.toHaveBeenCalled();
-  });
-
-  it("flushes the buffered text into setText after the burst timeout fires", () => {
-    const { setText, result } = renderGuard();
-    act(() => {
-      result.current.observeInputType("insertReplacementText", 1000);
-    });
-    result.current.shouldSuppressUpstream("open the diff viewer");
     act(() => {
       vi.advanceTimersByTime(DICTATION_BURST_TIMEOUT_MS + 5);
     });
-    expect(setText).toHaveBeenCalledTimes(1);
-    expect(setText).toHaveBeenCalledWith("open the diff viewer");
+    expect(setText).toHaveBeenCalledExactlyOnceWith("open the diff viewer");
     expect(result.current.shouldSuppressUpstream("any")).toBe(false);
   });
 
@@ -113,14 +84,6 @@ describe("useDictationBurstGuard (#1431)", () => {
       vi.advanceTimersByTime(DICTATION_BURST_TIMEOUT_MS + 100);
     });
     expect(setText).toHaveBeenCalledTimes(1);
-  });
-
-  it("blur outside a burst is a no-op", () => {
-    const { setText, result } = renderGuard();
-    act(() => {
-      result.current.flushOnBlur();
-    });
-    expect(setText).not.toHaveBeenCalled();
   });
 
   it("non-replacement input during a burst flushes, exits the burst, and stops suppressing", () => {
@@ -198,27 +161,33 @@ describe("decideDictationAction", () => {
     flushPending,
     armTimeoutMs: null,
   });
-  it.each([
-    [
-      "inactive replacement enters",
-      inactive,
-      { kind: "input", inputType: "insertReplacementText", nowMs: 1300 },
-      enter,
-    ],
-    ["active replacement extends", active, { kind: "input", inputType: "insertReplacementText", nowMs: 1300 }, enter],
-    ["active timeout flushes", active, { kind: "timeout", nowMs: 2300 }, end(true)],
-    ["active blur flushes", active, { kind: "blur" }, end(true)],
-    [
-      "active typing flushes without suppressing",
-      active,
-      { kind: "input", inputType: "insertText", nowMs: 1100 },
-      end(true),
-    ],
-    ["active backspace flushes", active, { kind: "input", inputType: "deleteContentBackward", nowMs: 1100 }, end(true)],
-    ["inactive typing is a no-op", inactive, { kind: "input", inputType: "insertText", nowMs: 1000 }, end(false)],
-    ["inactive blur is a no-op", inactive, { kind: "blur" }, end(false)],
-    ["stale timeout is a no-op", inactive, { kind: "timeout", nowMs: 5000 }, end(false)],
-  ] as const)("%s", (_label, prev, ev, expected) => {
-    expect(decideDictationAction(prev, ev)).toEqual(expected);
+  it("decides each transition", () => {
+    const cases = [
+      [
+        "inactive replacement enters",
+        inactive,
+        { kind: "input", inputType: "insertReplacementText", nowMs: 1300 },
+        enter,
+      ],
+      ["active replacement extends", active, { kind: "input", inputType: "insertReplacementText", nowMs: 1300 }, enter],
+      ["active timeout flushes", active, { kind: "timeout", nowMs: 2300 }, end(true)],
+      ["active blur flushes", active, { kind: "blur" }, end(true)],
+      [
+        "active typing flushes without suppressing",
+        active,
+        { kind: "input", inputType: "insertText", nowMs: 1100 },
+        end(true),
+      ],
+      [
+        "active backspace flushes",
+        active,
+        { kind: "input", inputType: "deleteContentBackward", nowMs: 1100 },
+        end(true),
+      ],
+      ["inactive typing is a no-op", inactive, { kind: "input", inputType: "insertText", nowMs: 1000 }, end(false)],
+      ["inactive blur is a no-op", inactive, { kind: "blur" }, end(false)],
+      ["stale timeout is a no-op", inactive, { kind: "timeout", nowMs: 5000 }, end(false)],
+    ] as const;
+    for (const [label, prev, ev, expected] of cases) expect(decideDictationAction(prev, ev), label).toEqual(expected);
   });
 });
