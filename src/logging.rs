@@ -1062,41 +1062,40 @@ mod tests {
     }
 
     #[test]
-    fn resolve_log_path_relative_joins_app_dir() {
-        let cfg = make_cfg(RotationKind::Size, 50, 5);
+    fn resolve_log_path_joins_only_relative_paths() {
         let dir = std::path::PathBuf::from("/tmp/aoe-test");
-        assert_eq!(resolve_log_path(&cfg, &dir), dir.join("debug.log"));
+        for (file_path, expected) in [
+            ("debug.log", dir.join("debug.log")),
+            (
+                "/var/log/aoe.log",
+                std::path::PathBuf::from("/var/log/aoe.log"),
+            ),
+        ] {
+            let mut cfg = make_cfg(RotationKind::Size, 50, 5);
+            cfg.file_path = file_path.into();
+            assert_eq!(resolve_log_path(&cfg, &dir), expected);
+        }
     }
 
+    /// Only a foreground serve may log to stdout; the TUI owns the terminal,
+    /// so it is coerced to the file with a warning.
     #[test]
-    fn resolve_log_path_absolute_used_verbatim() {
-        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
-        cfg.file_path = "/var/log/aoe.log".into();
-        let dir = std::path::PathBuf::from("/tmp/aoe-test");
-        assert_eq!(
-            resolve_log_path(&cfg, &dir),
-            std::path::PathBuf::from("/var/log/aoe.log")
-        );
-    }
-
-    #[test]
-    fn resolve_sink_tui_with_stdout_coerces_to_file_with_warning() {
-        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
-        cfg.output = crate::session::config::SinkKind::Stdout;
-        let dir = std::path::PathBuf::from("/tmp/aoe-test");
-        let r = resolve_sink(&cfg, &dir, ProcessContext::Tui);
-        assert!(matches!(r.target, SubscriberTarget::File(_, _)));
-        assert!(r.warning.is_some(), "coercion should surface a warning");
-    }
-
-    #[test]
-    fn resolve_sink_serve_foreground_honors_stdout() {
+    fn resolve_sink_honors_stdout_only_outside_the_tui() {
         let mut cfg = make_cfg(RotationKind::Size, 50, 5);
         cfg.output = crate::session::config::SinkKind::Stdout;
         let dir = std::path::PathBuf::from("/tmp/aoe-test");
-        let r = resolve_sink(&cfg, &dir, ProcessContext::ServeForeground);
-        assert!(matches!(r.target, SubscriberTarget::Stdout));
-        assert!(r.warning.is_none());
+        for (context, to_stdout) in [
+            (ProcessContext::Tui, false),
+            (ProcessContext::ServeForeground, true),
+        ] {
+            let r = resolve_sink(&cfg, &dir, context);
+            assert_eq!(matches!(r.target, SubscriberTarget::Stdout), to_stdout);
+            assert_eq!(
+                r.warning.is_some(),
+                !to_stdout,
+                "coercion surfaces a warning"
+            );
+        }
     }
 
     #[test]

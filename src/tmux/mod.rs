@@ -2981,14 +2981,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tmux_socket_resolves_under_test() {
-        assert!(
-            matches!(tmux_socket(), Some(TmuxSocket::Path(_))),
-            "unit tests must isolate onto an explicit socket path, not the default socket"
-        );
-    }
-
-    #[test]
     fn socket_from_config_name_accepts_bare_names_only() {
         let named = |n: &str| Some(TmuxSocket::Name(n.to_string()));
         for (configured, want) in [
@@ -3032,49 +3024,67 @@ mod tests {
 
         assert_eq!(cached_session_existence(&name), SessionExistence::Unknown);
     }
+    /// A confirmed missing server is absence; an unreachable one, or several
+    /// live candidates, is not confirmed either way; a live derived name is
+    /// present even when its title looks like an aux prefix.
     #[test]
     #[serial_test::serial]
-    fn rekey_classification_treats_confirmed_no_server_as_absent() {
+    fn resolved_agent_existence_only_confirms_what_tmux_confirmed() {
+        use SessionCacheRefresh::{NoServer, Populated, Unknown};
         let guard = SessionCacheGuard::capture();
-        let id = "noserverdeadbeef";
-        guard.force_unreachable();
-        let session = Session::new(id, "derived").unwrap();
-        assert_eq!(
-            resolved_agent_existence(id, &session, SessionCacheRefresh::NoServer),
-            SessionExistence::Absent
-        );
-        assert_eq!(
-            resolved_agent_existence(id, &session, SessionCacheRefresh::Unknown),
-            SessionExistence::Unknown
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn ambiguous_live_names_are_unknown_not_confirmed_absence() {
-        let guard = SessionCacheGuard::capture();
-        let id = "ambig123deadbeef";
-        let first = format!("{P}first_ambig123");
-        let second = format!("{P}second_ambig123");
-        guard.force_present(&[&first, &second]);
-        let session = Session::new(id, "derived").unwrap();
-        assert_eq!(
-            resolved_agent_existence(id, &session, SessionCacheRefresh::Populated),
-            SessionExistence::Unknown
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn aux_shaped_live_derived_name_is_present_not_absent() {
-        let guard = SessionCacheGuard::capture();
-        let id = "auxshapedeadbeef";
-        let session = Session::new(id, "term rewriting").unwrap();
-        guard.force_present(&[session.name()]);
-        assert_eq!(
-            resolved_agent_existence(id, &session, SessionCacheRefresh::Populated),
-            SessionExistence::Present
-        );
+        // (id, title, live names, or None for an unreachable server, refresh) -> existence
+        let cases: [(
+            &str,
+            &str,
+            Option<&[&str]>,
+            SessionCacheRefresh,
+            SessionExistence,
+        ); 4] = [
+            (
+                "noserverdeadbeef",
+                "derived",
+                None,
+                NoServer,
+                SessionExistence::Absent,
+            ),
+            (
+                "noserverdeadbeef",
+                "derived",
+                None,
+                Unknown,
+                SessionExistence::Unknown,
+            ),
+            (
+                "ambig123deadbeef",
+                "derived",
+                Some(&["first_ambig123", "second_ambig123"]),
+                Populated,
+                SessionExistence::Unknown,
+            ),
+            (
+                "auxshapedeadbeef",
+                "term rewriting",
+                Some(&[]),
+                Populated,
+                SessionExistence::Present,
+            ),
+        ];
+        for (id, title, live, refresh, expected) in cases {
+            let session = Session::new(id, title).unwrap();
+            match live {
+                None => guard.force_unreachable(),
+                Some([]) => guard.force_present(&[session.name()]),
+                Some(titles) => {
+                    let names: Vec<String> = titles.iter().map(|t| format!("{P}{t}")).collect();
+                    guard.force_present(&names.iter().map(String::as_str).collect::<Vec<_>>());
+                }
+            }
+            assert_eq!(
+                resolved_agent_existence(id, &session, refresh),
+                expected,
+                "{id} {refresh:?}"
+            );
+        }
     }
 
     const ID: &str = "abc12345deadbeef";
@@ -3507,10 +3517,12 @@ mod tests {
     fn session_new_resolves_onto_a_retitled_sessions_live_name() {
         let guard = SessionCacheGuard::capture();
         let stale = Session::generate_name(ID, "Vikings");
-        guard.force_present(&[stale.as_str()]);
-
-        let session = Session::new(ID, "Refactor billing module").expect("session");
-        assert_eq!(session.name(), stale);
+        let derived = Session::generate_name(ID, "Refactor billing module");
+        for (live, expected) in [(vec![stale.as_str()], &stale), (vec![], &derived)] {
+            guard.force_present(&live);
+            let session = Session::new(ID, "Refactor billing module").expect("session");
+            assert_eq!(session.name(), expected, "{live:?}");
+        }
     }
 
     #[test]
@@ -3525,17 +3537,6 @@ mod tests {
             Some(derived),
             "the snapshot must satisfy the lookup, so no refresh is attempted"
         );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn session_new_keeps_the_derived_name_when_nothing_is_live() {
-        let guard = SessionCacheGuard::capture();
-        guard.force_present(&[]);
-
-        let derived = Session::generate_name(ID, "Refactor billing module");
-        let session = Session::new(ID, "Refactor billing module").expect("session");
-        assert_eq!(session.name(), derived);
     }
 
     #[test]

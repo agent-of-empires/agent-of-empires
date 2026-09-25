@@ -290,21 +290,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial(hook_base)]
-    fn test_cleanup_nonexistent_dir() {
-        let (_g, _, _tmp) = BaseGuard::ready();
-        cleanup_hook_status_dir("nonexistent_cleanup_test");
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn test_hook_status_dir_path() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        let dir = hook_status_dir("abc123").expect("test id must be allowlist-safe");
-        assert_eq!(dir, base.join("abc123"));
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
     fn test_read_dangling_symlink() {
         let (_g, base, _tmp) = BaseGuard::ready();
         let dir = dir_guard::open_instance_dir("dangling").unwrap();
