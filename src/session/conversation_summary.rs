@@ -444,25 +444,25 @@ mod tests {
     }
 
     #[test]
-    fn extract_reduces_tool_calls_to_intent_and_caps_args() {
-        let big = "x".repeat(5000);
-        let events = vec![(1, tool("Bash", &big))];
-        let (text, _, _) = extract_transcript_delta(&events, 0);
-        assert!(text.contains("[Tool: Bash]"));
-        assert!(
-            text.len() < 500,
-            "tool args not capped: {} bytes",
-            text.len()
-        );
-    }
-
-    #[test]
-    fn extract_truncates_oversized_delta_from_the_head() {
-        let long = "y".repeat(MAX_INPUT_BYTES + 10_000);
-        let events = vec![(1, user("start")), (2, agent(&long))];
-        let (text, _, _) = extract_transcript_delta(&events, 0);
-        assert!(text.len() <= MAX_INPUT_BYTES + 64);
-        assert!(text.starts_with("[... earlier turns"));
+    fn extract_reduces_tool_calls_and_bounds_the_delta() {
+        {
+            let big = "x".repeat(5000);
+            let events = vec![(1, tool("Bash", &big))];
+            let (text, _, _) = extract_transcript_delta(&events, 0);
+            assert!(text.contains("[Tool: Bash]"));
+            assert!(
+                text.len() < 500,
+                "tool args not capped: {} bytes",
+                text.len()
+            );
+        }
+        {
+            let long = "y".repeat(MAX_INPUT_BYTES + 10_000);
+            let events = vec![(1, user("start")), (2, agent(&long))];
+            let (text, _, _) = extract_transcript_delta(&events, 0);
+            assert!(text.len() <= MAX_INPUT_BYTES + 64);
+            assert!(text.starts_with("[... earlier turns"));
+        }
     }
 
     #[test]

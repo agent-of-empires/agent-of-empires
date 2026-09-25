@@ -164,68 +164,68 @@ mod tests {
     }
 
     #[test]
-    fn poller_claims_only_post_launch_matching_chat() {
-        let tmp = tempfile::tempdir().unwrap();
-        let chats = chats_dir(tmp.path());
-        let hash = project_hash("/workspace");
-        for (name, id, project_hash, mtime) in [
-            ("stale", "gemini_stale", hash.as_str(), 1_000),
-            ("wrong", "gemini_wrong", "wrong", 4_000),
-            ("fresh", "gemini_fresh", hash.as_str(), 3_000),
-        ] {
-            let path = chats.join(format!("session-{name}.json"));
+    fn poller_claims_matching_chat_and_skips_hostile_artifacts() {
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let chats = chats_dir(tmp.path());
+            let hash = project_hash("/workspace");
+            for (name, id, project_hash, mtime) in [
+                ("stale", "gemini_stale", hash.as_str(), 1_000),
+                ("wrong", "gemini_wrong", "wrong", 4_000),
+                ("fresh", "gemini_fresh", hash.as_str(), 3_000),
+            ] {
+                let path = chats.join(format!("session-{name}.json"));
+                std::fs::write(
+                    &path,
+                    format!(r#"{{"sessionId":"{id}","projectHash":"{project_hash}"}}"#),
+                )
+                .unwrap();
+                set_mtime_ms(&path, mtime * 1000);
+            }
+            assert_eq!(poll(tmp.path(), 2_000)().as_deref(), Some("gemini_fresh"));
+        }
+        #[cfg(unix)]
+        {
+            use super::super::test_support::{make_fifo, open_fifo_guard};
+            use std::os::unix::fs::symlink;
+            use std::time::{Duration, Instant};
+
+            let tmp = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let chats = chats_dir(tmp.path());
+            let hash = project_hash("/workspace");
+            let good = chats.join("session-good.json");
             std::fs::write(
-                &path,
-                format!(r#"{{"sessionId":"{id}","projectHash":"{project_hash}"}}"#),
+                &good,
+                format!(r#"{{"sessionId":"gemini_good","projectHash":"{hash}"}}"#),
             )
             .unwrap();
-            set_mtime_ms(&path, mtime * 1000);
+            let outside_file = outside.path().join("outside.json");
+            std::fs::write(
+                &outside_file,
+                format!(r#"{{"sessionId":"gemini_linked","projectHash":"{hash}"}}"#),
+            )
+            .unwrap();
+            symlink(&outside_file, chats.join("session-linked.json")).unwrap();
+            let fifo = chats.join("session-pipe.json");
+            make_fifo(&fifo);
+            let _fifo_guard = open_fifo_guard(&fifo);
+            std::fs::write(
+                chats.join("session-large.json"),
+                vec![b' '; GEMINI_SESSION_MAX_BYTES + 1],
+            )
+            .unwrap();
+
+            let store_poll = poll(tmp.path(), 100);
+            let started = Instant::now();
+            assert_eq!(store_poll().as_deref(), Some("gemini_good"));
+            std::fs::remove_file(good).unwrap();
+            assert_eq!(store_poll(), None);
+            assert!(started.elapsed() < Duration::from_secs(2));
+
+            let intermediate = tempfile::tempdir().unwrap();
+            symlink(outside.path(), intermediate.path().join("tmp")).unwrap();
+            assert_eq!(poll(intermediate.path(), 100)(), None);
         }
-        assert_eq!(poll(tmp.path(), 2_000)().as_deref(), Some("gemini_fresh"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn poller_skips_symlinks_fifo_and_oversized_json() {
-        use super::super::test_support::{make_fifo, open_fifo_guard};
-        use std::os::unix::fs::symlink;
-        use std::time::{Duration, Instant};
-
-        let tmp = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let chats = chats_dir(tmp.path());
-        let hash = project_hash("/workspace");
-        let good = chats.join("session-good.json");
-        std::fs::write(
-            &good,
-            format!(r#"{{"sessionId":"gemini_good","projectHash":"{hash}"}}"#),
-        )
-        .unwrap();
-        let outside_file = outside.path().join("outside.json");
-        std::fs::write(
-            &outside_file,
-            format!(r#"{{"sessionId":"gemini_linked","projectHash":"{hash}"}}"#),
-        )
-        .unwrap();
-        symlink(&outside_file, chats.join("session-linked.json")).unwrap();
-        let fifo = chats.join("session-pipe.json");
-        make_fifo(&fifo);
-        let _fifo_guard = open_fifo_guard(&fifo);
-        std::fs::write(
-            chats.join("session-large.json"),
-            vec![b' '; GEMINI_SESSION_MAX_BYTES + 1],
-        )
-        .unwrap();
-
-        let store_poll = poll(tmp.path(), 100);
-        let started = Instant::now();
-        assert_eq!(store_poll().as_deref(), Some("gemini_good"));
-        std::fs::remove_file(good).unwrap();
-        assert_eq!(store_poll(), None);
-        assert!(started.elapsed() < Duration::from_secs(2));
-
-        let intermediate = tempfile::tempdir().unwrap();
-        symlink(outside.path(), intermediate.path().join("tmp")).unwrap();
-        assert_eq!(poll(intermediate.path(), 100)(), None);
     }
 }

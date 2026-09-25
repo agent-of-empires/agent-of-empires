@@ -1880,7 +1880,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn build_instance_resolves_custom_agent_detect_as_mapping() {
+    fn build_instance_resolves_custom_agent_commands_and_detect_as() {
         let temp_home = tempfile::tempdir().unwrap();
         let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let app_dir = isolated_app_dir(temp_home.path());
@@ -1891,6 +1891,8 @@ mod tests {
                 [session.custom_agents]
                 remote-claude = "ssh -t host claude"
                 remote-opencode = "ssh -t host opencode"
+
+                whitespace-agent = "   "
 
                 [session.agent_detect_as]
                 remote-claude = "claude"
@@ -1921,31 +1923,15 @@ mod tests {
         .unwrap();
         assert_eq!(unmapped.instance.command, "ssh -t host opencode");
         assert_eq!(unmapped.instance.detect_as, "");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn build_instance_rejects_custom_agent_without_resolved_command() {
-        let temp_home = tempfile::tempdir().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
-        let app_dir = isolated_app_dir(temp_home.path());
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(
-            app_dir.join("config.toml"),
-            "[session.custom_agents]\nwhitespace-agent = \"   \"\n",
-        )
-        .unwrap();
-        let project = tempfile::tempdir().unwrap();
 
         for tool in ["remote-missing", "whitespace-agent"] {
-            let err = match build_instance(
+            let Err(err) = build_instance(
                 custom_agent_params(project.path(), tool),
                 &[],
                 &[],
                 "default",
-            ) {
-                Ok(_) => panic!("{tool}: custom agent without a command should fail"),
-                Err(err) => err,
+            ) else {
+                panic!("{tool}: custom agent without a command should fail");
             };
             assert!(
                 err.to_string().contains(&format!(
@@ -1958,7 +1944,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn build_instance_scratch_provisions_app_dir() {
+    fn build_instance_provisions_scratch_and_rejects_invalid_worktree_requests() {
         let temp_home = tempfile::tempdir().unwrap();
         let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let app_dir = isolated_app_dir(temp_home.path());
@@ -1966,14 +1952,9 @@ mod tests {
         std::fs::write(app_dir.join("config.toml"), "").unwrap();
 
         let mut params = custom_agent_params(std::path::Path::new(""), "claude");
-        params.tool = "claude".to_string();
-        params.path = String::new();
         params.scratch = true;
-        params.sandbox = false;
-
-        let result = build_instance(params, &[], &[], "default")
+        let result = build_instance(params.clone(), &[], &[], "default")
             .expect("scratch build must succeed without a project path");
-
         assert!(
             result.instance.scratch,
             "scratch flag must be persisted on the instance"
@@ -1981,14 +1962,35 @@ mod tests {
         let provisioned = std::path::PathBuf::from(&result.instance.project_path);
         assert!(provisioned.exists());
         assert!(super::super::scratch::is_scratch_path(&provisioned));
-
         let _ = std::fs::remove_dir_all(&provisioned);
+
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("feat".to_string());
+        let Err(err) = build_instance(params, &[], &[], "default") else {
+            panic!("scratch + worktree must error");
+        };
+        assert!(
+            err.to_string()
+                .contains("Cannot combine --scratch with worktree mode"),
+            "unexpected error: {err}"
+        );
+
+        let project = tempfile::tempdir().unwrap();
+        let mut params = custom_agent_params(project.path(), "claude");
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("feat".to_string());
+        let Err(err) = build_instance(params, &[], &[], "default") else {
+            panic!("worktree on a non-git path must error");
+        };
+        assert!(
+            err.chain()
+                .filter_map(|c| c.downcast_ref::<crate::git::error::GitError>())
+                .any(|g| matches!(g, crate::git::error::GitError::NotAGitRepo)),
+            "expected a typed GitError::NotAGitRepo in the chain, got: {err:#}"
+        );
     }
 
-    #[test]
-    #[serial_test::serial]
     fn build_instance_applies_structured_fork_seed() {
-        let _app_guard = crate::session::test_support::isolate_app_dir();
         use crate::session::ForkSeed;
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         let params = InstanceParams {
@@ -2026,10 +2028,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    #[serial_test::serial]
     fn build_instance_applies_terminal_fork_seed() {
-        let _app_guard = crate::session::test_support::isolate_app_dir();
         use crate::session::ForkSeed;
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         // The CLI e2e covers the separate application in `add.rs`; this is the
@@ -2087,7 +2086,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn fork_seed_tests_restore_default_profile_registry() {
+    fn fork_seed_builds_apply_the_seed_and_restore_default_profile_registry() {
         let _app_guard = crate::session::test_support::isolate_app_dir();
         const ALIAS_AGENT: &str = "fork-seed-registry-alias";
         const RULE_AGENT: &str = "fork-seed-registry-rule";
@@ -2125,58 +2124,5 @@ mod tests {
                 "{label}: fork-seed build must restore the prior alias and compiled rule"
             );
         }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn build_instance_rejects_scratch_with_worktree() {
-        let temp_home = tempfile::tempdir().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
-        let app_dir = isolated_app_dir(temp_home.path());
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(app_dir.join("config.toml"), "").unwrap();
-
-        let mut params = custom_agent_params(std::path::Path::new(""), "claude");
-        params.tool = "claude".to_string();
-        params.scratch = true;
-        params.worktree_enabled = true;
-        params.worktree_branch = Some("feat".to_string());
-
-        let err = match build_instance(params, &[], &[], "default") {
-            Ok(_) => panic!("scratch + worktree must error"),
-            Err(e) => e,
-        };
-        assert!(
-            err.to_string()
-                .contains("Cannot combine --scratch with worktree mode"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn build_instance_worktree_on_non_git_path_returns_typed_not_a_git_repo() {
-        let temp_home = tempfile::tempdir().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
-        let app_dir = isolated_app_dir(temp_home.path());
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(app_dir.join("config.toml"), "").unwrap();
-
-        let project = tempfile::tempdir().unwrap();
-        let mut params = custom_agent_params(project.path(), "claude");
-        params.tool = "claude".to_string();
-        params.worktree_enabled = true;
-        params.worktree_branch = Some("feat".to_string());
-
-        let err = match build_instance(params, &[], &[], "default") {
-            Ok(_) => panic!("worktree on a non-git path must error"),
-            Err(e) => e,
-        };
-        assert!(
-            err.chain()
-                .filter_map(|c| c.downcast_ref::<crate::git::error::GitError>())
-                .any(|g| matches!(g, crate::git::error::GitError::NotAGitRepo)),
-            "expected a typed GitError::NotAGitRepo in the chain, got: {err:#}"
-        );
     }
 }

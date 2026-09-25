@@ -1262,7 +1262,7 @@ mod serve {
 
         #[tokio::test]
         #[serial_test::serial]
-        async fn apply_auto_title_skips_duplicate_title_and_path() {
+        async fn apply_auto_title_skips_duplicates_and_force_overwrites_manual_titles() {
             let _guard = crate::session::test_support::isolate_app_dir();
             let storage =
                 crate::session::storage::Storage::new_unwatched("default").expect("storage");
@@ -1271,66 +1271,36 @@ mod serve {
             let target_id = target.id.clone();
             let mut owner = crate::session::Instance::new("Already owned", "/tmp/shared");
             owner.source_profile = "default".to_string();
-            storage
-                .update(|instances, _groups| {
-                    *instances = vec![target.clone(), owner.clone()];
-                    Ok(())
-                })
-                .unwrap();
-            let state = crate::server::test_support::build_test_app_state(vec![target, owner]);
-
-            apply_auto_title(&state, &target_id, "default", "Already owned", false).await;
-
-            let persisted = storage.load().unwrap();
-            assert_eq!(
-                persisted
-                    .iter()
-                    .find(|instance| instance.id == target_id)
-                    .unwrap()
-                    .title,
-                "Franks"
-            );
-            let in_memory = state.instances.read().await;
-            assert_eq!(
-                in_memory
-                    .iter()
-                    .find(|instance| instance.id == target_id)
-                    .unwrap()
-                    .title,
-                "Franks"
-            );
-        }
-
-        #[tokio::test]
-        #[serial_test::serial]
-        async fn apply_auto_title_forced_overwrites_a_manual_title() {
-            let _guard = crate::session::test_support::isolate_app_dir();
-            let storage =
-                crate::session::storage::Storage::new_unwatched("default").expect("storage");
             let mut manual = crate::session::Instance::new("Britons", "/tmp/y");
             manual.source_profile = "default".to_string();
             manual.title = "Hand-picked".to_string();
             let manual_id = manual.id.clone();
+            let rows = vec![target, owner, manual];
             storage
                 .update(|instances, _groups| {
-                    *instances = vec![manual.clone()];
+                    *instances = rows.clone();
                     Ok(())
                 })
                 .unwrap();
-            let state = crate::server::test_support::build_test_app_state(vec![manual]);
+            let state = crate::server::test_support::build_test_app_state(rows);
 
+            apply_auto_title(&state, &target_id, "default", "Already owned", false).await;
             apply_auto_title(&state, &manual_id, "default", "Regenerated title", true).await;
 
-            let title_of = |instances: &[crate::session::Instance]| {
+            let title_of = |instances: &[crate::session::Instance], id: &str| {
                 instances
                     .iter()
-                    .find(|instance| instance.id == manual_id)
+                    .find(|instance| instance.id == id)
                     .unwrap()
                     .title
                     .clone()
             };
-            assert_eq!(title_of(&storage.load().unwrap()), "Regenerated title");
-            assert_eq!(title_of(&state.instances.read().await), "Regenerated title");
+            let persisted = storage.load().unwrap();
+            let in_memory = state.instances.read().await.clone();
+            for rows in [&persisted, &in_memory] {
+                assert_eq!(title_of(rows, &target_id), "Franks");
+                assert_eq!(title_of(rows, &manual_id), "Regenerated title");
+            }
         }
 
         #[test]
@@ -1463,24 +1433,6 @@ mod serve {
                 should_trigger_smart_rename(&clean, "other-session", &attempted, &empty),
                 "gates must be per-session, not global"
             );
-        }
-
-        #[test]
-        fn force_smart_rename_attempted_clear_re_enables_retry() {
-            // `force_smart_rename` at sessions.rs:2582-2587 clears the attempted gate before
-            // spawning `try_smart_rename`, and does NOT wait for an `Event::Stopped`: the manual
-            // retry path stays on-demand.
-            use crate::acp::state::Event;
-            let id = "s-1";
-            let mut attempted = HashSet::new();
-            attempted.insert(id.to_string());
-            let inflight = HashSet::new();
-            let ev = Event::Stopped {
-                reason: "prompt_complete".into(),
-            };
-            assert!(!should_trigger_smart_rename(&ev, id, &attempted, &inflight));
-            attempted.remove(id);
-            assert!(should_trigger_smart_rename(&ev, id, &attempted, &inflight));
         }
     }
 }
@@ -1659,56 +1611,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_sandboxed_session_may_only_be_named_by_its_own_agent() {
-        let overrides = HashMap::new();
-        let resolved = |rename_agent: &str, sandboxed: bool| {
-            check_eligible_resolved(
-                true,
-                true,
-                false,
-                "Vikings",
-                "claude",
-                rename_agent,
-                sandboxed,
-                "",
-                &overrides,
-            )
-        };
-        assert!(resolved("", true).is_ok(), "its own agent is fine");
-        assert!(matches!(
-            resolved("codex", true),
-            Err(SkipReason::SandboxRenameAgentMismatch)
-        ));
-        assert!(
-            matches!(resolved("cursor", true), Err(SkipReason::NoOneshot)),
-            "an agent with no one-shot mode reports that, not the sandbox gate"
-        );
-        assert!(resolved("codex", false).is_ok(), "host sessions are free");
-    }
-
     #[tokio::test]
-    async fn host_session_spawns_the_agent_binary_in_the_project_dir() {
+    async fn oneshot_target_runs_on_the_host_only_for_host_sessions() {
         let argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
         let target = resolve_oneshot_target("abc123", false, "/workspace", "/repo", argv.clone())
             .await
             .expect("host target");
         assert_eq!(target.argv, argv, "a host one-shot must not be wrapped");
         assert_eq!(target.cwd, "/repo");
-    }
-
-    #[tokio::test]
-    async fn sandboxed_session_spawns_through_the_container_runtime() {
         assert!(
-            resolve_oneshot_target(
-                "nosuchsession",
-                true,
-                "/workspace",
-                "/repo",
-                vec!["claude".to_string()],
-            )
-            .await
-            .is_none(),
+            resolve_oneshot_target("nosuchsession", true, "/workspace", "/repo", argv)
+                .await
+                .is_none(),
             "a sandboxed session with no usable container must not fall back to the host"
         );
     }
@@ -1806,6 +1720,30 @@ mod tests {
             .is_ok(),
             "the session's own command is irrelevant to a distinct rename agent"
         );
+
+        // A sandboxed session may only be named by its own agent.
+        let sandboxed = |rename_agent: &str| {
+            check_eligible_resolved(
+                true,
+                true,
+                false,
+                "Vikings",
+                "claude",
+                rename_agent,
+                true,
+                "",
+                &none,
+            )
+        };
+        assert!(sandboxed("").is_ok(), "its own agent is fine");
+        assert!(matches!(
+            sandboxed("codex"),
+            Err(SkipReason::SandboxRenameAgentMismatch)
+        ));
+        assert!(
+            matches!(sandboxed("cursor"), Err(SkipReason::NoOneshot)),
+            "an agent with no one-shot mode reports that, not the sandbox gate"
+        );
     }
 
     const CLAUDE_BANNER_TRANSCRIPT: &str = "\
@@ -1828,7 +1766,10 @@ I'll look at the auth redirect logic now.
 Patched the race in auth.rs and added a regression test.";
 
     #[test]
-    fn strip_agent_banner_drops_claude_startup_box() {
+    fn strip_agent_banner_drops_only_the_claude_startup_box() {
+        let lc = INSTRUCTION.to_lowercase();
+        assert!(lc.contains("startup banner") && lc.contains("ignore"));
+
         let stripped = strip_agent_banner(CLAUDE_BANNER_TRANSCRIPT, "claude");
         assert!(!stripped.contains("Claude Code v"));
         assert!(!stripped.contains("Welcome back"));
@@ -1838,10 +1779,7 @@ Patched the race in auth.rs and added a regression test.";
         assert!(!stripped.contains('╭') && !stripped.contains('│') && !stripped.contains('█'));
         assert!(stripped.contains("fix the flaky login redirect test"));
         assert!(stripped.contains("Patched the race in auth.rs"));
-    }
 
-    #[test]
-    fn strip_agent_banner_leaves_everything_else_alone() {
         let banner_only = "\
 ╭─── Claude Code v2.1.216 ──────────╮
 │         Welcome back Nathan!      │
@@ -1869,14 +1807,7 @@ Rewrote the getting-started section and fixed two broken links.",
     }
 
     #[test]
-    fn instruction_tells_model_to_ignore_startup_banner() {
-        let lc = INSTRUCTION.to_lowercase();
-        assert!(lc.contains("startup banner"));
-        assert!(lc.contains("ignore"));
-    }
-
-    #[test]
-    fn render_first_turn_frames_prompt_and_agent() {
+    fn first_turn_and_prompt_are_framed_and_bounded() {
         let r = render_first_turn("fix the login bug", "Patched the redirect in auth.rs");
         assert_eq!(
             r,
@@ -1897,10 +1828,7 @@ Rewrote the getting-started section and fixed two broken links.",
             r.contains("concise agent summary"),
             "each half is capped independently, so agent prose survives a huge prompt"
         );
-    }
 
-    #[test]
-    fn build_prompt_truncates_and_strips_nul() {
         let msg = format!("start{}\u{0}end", "x".repeat(5000));
         let p = build_prompt(&msg);
         assert!(p.contains("start"));
@@ -2188,7 +2116,7 @@ claude = "repo-wrapper"
 
     #[test]
     #[serial_test::serial]
-    fn apply_terminal_title_renames_auto_named_session_and_marks_attempted() {
+    fn apply_terminal_title_writes_only_overwritable_non_duplicate_titles() {
         use crate::session::instance::Instance;
         use crate::session::storage::Storage;
         let home = tempfile::tempdir().expect("tempdir HOME");
@@ -2196,86 +2124,42 @@ claude = "repo-wrapper"
         let storage = Storage::new_unwatched("default").expect("storage");
         let civ = Instance::new("Vikings", "/tmp/x");
         let civ_id = civ.id.clone();
-        storage
-            .update(|instances, _groups| {
-                instances.push(civ);
-                Ok(())
-            })
-            .unwrap();
-
-        apply_terminal_title(&storage, &civ_id, Some("Fix login bug"), false).unwrap();
-
-        let inst = storage
-            .load()
-            .unwrap()
-            .into_iter()
-            .find(|i| i.id == civ_id)
-            .unwrap();
-        assert_eq!(inst.title, "Fix login bug");
-        assert_eq!(inst.last_auto_title.as_deref(), Some("Fix login bug"));
-        assert!(inst.smart_rename_attempted);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn apply_terminal_title_never_overwrites_a_manual_title() {
-        use crate::session::instance::Instance;
-        use crate::session::storage::Storage;
-        let home = tempfile::tempdir().expect("tempdir HOME");
-        let _home_guard = crate::session::test_support::isolate_home(home.path());
-        let storage = Storage::new_unwatched("default").expect("storage");
         let mut manual = Instance::new("Britons", "/tmp/y");
         manual.title = "Hand-picked".to_string();
         let manual_id = manual.id.clone();
+        let mut forced = manual.clone();
+        forced.id = format!("{}f", manual.id);
+        let forced_id = forced.id.clone();
         let duplicate_candidate = Instance::new("Franks", "/tmp/z/");
         let duplicate_id = duplicate_candidate.id.clone();
         let mut duplicate_owner = Instance::new("Saxons", "/tmp/z");
         duplicate_owner.title = "Already owned".to_string();
         storage
             .update(|instances, _groups| {
-                instances.extend([manual, duplicate_candidate, duplicate_owner]);
+                instances.extend([civ, manual, forced, duplicate_candidate, duplicate_owner]);
                 Ok(())
             })
             .unwrap();
 
+        apply_terminal_title(&storage, &civ_id, Some("Fix login bug"), false).unwrap();
         apply_terminal_title(&storage, &manual_id, Some("Should Not Apply"), false).unwrap();
+        apply_terminal_title(&storage, &forced_id, Some("Regenerated title"), true).unwrap();
         apply_terminal_title(&storage, &duplicate_id, Some("Already owned"), false).unwrap();
 
         let instances = storage.load().unwrap();
-        let manual = instances.iter().find(|i| i.id == manual_id).unwrap();
-        assert_eq!(manual.title, "Hand-picked");
-        assert!(manual.smart_rename_attempted);
-        let duplicate = instances.iter().find(|i| i.id == duplicate_id).unwrap();
-        assert_eq!(duplicate.title, "Franks");
-        assert_eq!(duplicate.last_auto_title, None);
-        assert!(duplicate.smart_rename_attempted);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn apply_terminal_title_forced_overwrites_a_manual_title() {
-        use crate::session::instance::Instance;
-        use crate::session::storage::Storage;
-        let home = tempfile::tempdir().expect("tempdir HOME");
-        let _home_guard = crate::session::test_support::isolate_home(home.path());
-        let storage = Storage::new_unwatched("default").expect("storage");
-        let mut manual = Instance::new("Britons", "/tmp/y");
-        manual.title = "Hand-picked".to_string();
-        let manual_id = manual.id.clone();
-        storage
-            .update(|instances, _groups| {
-                instances.push(manual);
-                Ok(())
-            })
-            .unwrap();
-
-        apply_terminal_title(&storage, &manual_id, Some("Regenerated title"), true).unwrap();
-
-        let instances = storage.load().unwrap();
-        let manual = instances.iter().find(|i| i.id == manual_id).unwrap();
-        assert_eq!(manual.title, "Regenerated title");
-        assert_eq!(manual.last_auto_title.as_deref(), Some("Regenerated title"));
-        assert!(manual.smart_rename_attempted);
+        let row = |id: &str| instances.iter().find(|i| i.id == id).unwrap();
+        // (id, title, last_auto_title); every attempt is marked.
+        for (id, title, last_auto) in [
+            (&civ_id, "Fix login bug", Some("Fix login bug")),
+            (&manual_id, "Hand-picked", None),
+            (&forced_id, "Regenerated title", Some("Regenerated title")),
+            (&duplicate_id, "Franks", None),
+        ] {
+            let row = row(id);
+            assert_eq!(row.title, title);
+            assert_eq!(row.last_auto_title.as_deref(), last_auto, "{title}");
+            assert!(row.smart_rename_attempted, "{title}");
+        }
     }
 
     #[test]

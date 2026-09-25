@@ -542,10 +542,35 @@ mod tests {
     }
 
     #[test]
-    fn a_future_schema_version_is_refused() {
-        let raw = format!("schema_version = {}\n", SCHEMA_VERSION + 1);
-        let err = CityHallBundle::from_toml(&raw).unwrap_err().to_string();
-        assert!(err.contains("schema_version"), "{err}");
+    fn bundle_validation_refuses_future_schemas_and_bad_settings_keys() {
+        {
+            let raw = format!("schema_version = {}\n", SCHEMA_VERSION + 1);
+            let err = CityHallBundle::from_toml(&raw).unwrap_err().to_string();
+            assert!(err.contains("schema_version"), "{err}");
+        }
+        {
+            let baseline = serde_json::to_value(Config::default()).unwrap();
+            let mut current = baseline.clone();
+            current["acp"]["max_concurrent_workers"] = json!(7);
+
+            let mut settings = empty_object();
+            apply_changed_leaves(&mut settings, &baseline, &current);
+            retain_schema_fields(&mut settings);
+            strip_local_only(&mut settings);
+            strip_nulls(&mut settings);
+
+            assert_eq!(leaf_count(&settings), 1, "only the moved leaf: {settings}");
+            validate_patch(&settings, Scope::Global, true).expect("export must validate");
+        }
+        {
+            let err = apply_settings(&json!({"acp": {"nope": 1}}))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("acp.nope"),
+                "must name the offending key: {err}"
+            );
+        }
     }
 
     #[test]
@@ -561,33 +586,6 @@ mod tests {
         let mut patch = json!({"session": {"cpu_limit": null, "confirm_delete": true}});
         strip_nulls(&mut patch);
         assert_eq!(patch, json!({"session": {"confirm_delete": true}}));
-    }
-
-    #[test]
-    fn an_exported_settings_patch_validates() {
-        let baseline = serde_json::to_value(Config::default()).unwrap();
-        let mut current = baseline.clone();
-        current["acp"]["max_concurrent_workers"] = json!(7);
-
-        let mut settings = empty_object();
-        apply_changed_leaves(&mut settings, &baseline, &current);
-        retain_schema_fields(&mut settings);
-        strip_local_only(&mut settings);
-        strip_nulls(&mut settings);
-
-        assert_eq!(leaf_count(&settings), 1, "only the moved leaf: {settings}");
-        validate_patch(&settings, Scope::Global, true).expect("export must validate");
-    }
-
-    #[test]
-    fn a_bad_settings_key_is_rejected_by_name() {
-        let err = apply_settings(&json!({"acp": {"nope": 1}}))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("acp.nope"),
-            "must name the offending key: {err}"
-        );
     }
 
     #[test]

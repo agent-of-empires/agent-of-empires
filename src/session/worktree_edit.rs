@@ -365,42 +365,42 @@ mod tests {
     }
 
     #[test]
-    fn worktree_move_required_only_when_the_leaf_changes() {
-        let cur = Path::new("/repos/wt/feature-login");
+    fn worktree_move_required_only_when_the_gated_leaf_changes() {
+        {
+            let cur = Path::new("/repos/wt/feature-login");
 
-        assert!(worktree_move_required(cur, "feature-logout"));
+            assert!(worktree_move_required(cur, "feature-logout"));
 
-        assert!(!worktree_move_required(cur, "feature-login"));
+            assert!(!worktree_move_required(cur, "feature-login"));
 
-        assert!(!worktree_move_required(cur, "feature/login"));
+            assert!(!worktree_move_required(cur, "feature/login"));
 
-        assert!(worktree_move_required(cur, "Feature Login"));
+            assert!(worktree_move_required(cur, "Feature Login"));
 
-        assert!(!worktree_move_required(cur, ""));
-        assert!(!worktree_move_required(cur, "   "));
+            assert!(!worktree_move_required(cur, ""));
+            assert!(!worktree_move_required(cur, "   "));
 
-        assert!(!worktree_move_required(Path::new("/"), "anything"));
-    }
-
-    // `worktree_move_required` must agree with `edit_worktree_workdir`'s own `path_changes`
-    // decision, since it exists purely to predict it.
-    #[test]
-    fn worktree_move_required_agrees_with_the_target_path_it_gates() {
-        let cur = Path::new("/repos/wt/feature-login");
-        for name in [
-            "feature-logout",
-            "feature-login",
-            "feature/login",
-            "Feature Login",
-            "wild  name",
-        ] {
-            let target = target_worktree_path(cur, name).expect("has a parent");
-            assert_eq!(
-                worktree_move_required(cur, name),
-                target != cur,
-                "disagreement for {name:?}: target resolved to {}",
-                target.display()
-            );
+            assert!(!worktree_move_required(Path::new("/"), "anything"));
+        }
+        // `worktree_move_required` must agree with `edit_worktree_workdir`'s own `path_changes`
+        // decision, since it exists purely to predict it.
+        {
+            let cur = Path::new("/repos/wt/feature-login");
+            for name in [
+                "feature-logout",
+                "feature-login",
+                "feature/login",
+                "Feature Login",
+                "wild  name",
+            ] {
+                let target = target_worktree_path(cur, name).expect("has a parent");
+                assert_eq!(
+                    worktree_move_required(cur, name),
+                    target != cur,
+                    "disagreement for {name:?}: target resolved to {}",
+                    target.display()
+                );
+            }
         }
     }
 
@@ -456,23 +456,23 @@ mod tests {
     }
 
     #[test]
-    fn leaf_from_title_slugifies() {
-        assert_eq!(worktree_leaf_from_title("Auth refactor"), "auth-refactor");
-        assert_eq!(
-            worktree_leaf_from_title("Fix: the/thing (v2)"),
-            "fix-the-thing-v2"
-        );
-        let leaf = worktree_leaf_from_title("jacob/feature-1");
-        assert_eq!(leaf, "jacob-feature-1");
-        assert!(!leaf.contains('/'));
-    }
-
-    #[test]
-    fn leaf_from_title_never_empty_or_traversal() {
-        assert_eq!(worktree_leaf_from_title("..."), "session");
-        assert_eq!(worktree_leaf_from_title("   "), "session");
-        let leaf = worktree_leaf_from_title("../escape");
-        assert!(!leaf.contains('/') && leaf != ".." && !leaf.is_empty());
+    fn leaf_from_title_slugifies_and_is_never_empty_or_traversal() {
+        {
+            assert_eq!(worktree_leaf_from_title("Auth refactor"), "auth-refactor");
+            assert_eq!(
+                worktree_leaf_from_title("Fix: the/thing (v2)"),
+                "fix-the-thing-v2"
+            );
+            let leaf = worktree_leaf_from_title("jacob/feature-1");
+            assert_eq!(leaf, "jacob-feature-1");
+            assert!(!leaf.contains('/'));
+        }
+        {
+            assert_eq!(worktree_leaf_from_title("..."), "session");
+            assert_eq!(worktree_leaf_from_title("   "), "session");
+            let leaf = worktree_leaf_from_title("../escape");
+            assert!(!leaf.contains('/') && leaf != ".." && !leaf.is_empty());
+        }
     }
 
     #[test]

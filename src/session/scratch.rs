@@ -67,34 +67,30 @@ mod tests {
 
     #[test]
     #[serial]
-    fn is_scratch_path_rejects_outside_root() {
-        let _tmp = isolate_app_dir();
-        assert!(!is_scratch_path(Path::new("/etc")));
-        assert!(!is_scratch_path(Path::new("/tmp/aoe-scratch-foo")));
-    }
+    fn scratch_paths_reject_outside_root_traversal_and_unsafe_ids() {
+        {
+            let _tmp = isolate_app_dir();
+            assert!(!is_scratch_path(Path::new("/etc")));
+            assert!(!is_scratch_path(Path::new("/tmp/aoe-scratch-foo")));
+        }
+        {
+            let _tmp = isolate_app_dir();
+            let id = format!("traverse-{}", uuid::Uuid::new_v4());
+            let real = provision_scratch_dir(&id).unwrap();
 
-    #[test]
-    #[serial]
-    fn is_scratch_path_rejects_dotdot_traversal() {
-        let _tmp = isolate_app_dir();
-        let id = format!("traverse-{}", uuid::Uuid::new_v4());
-        let real = provision_scratch_dir(&id).unwrap();
+            let tampered = real.join("..").join("..").join("..").join("etc");
+            assert!(
+                !is_scratch_path(&tampered),
+                "`..` traversal must not escape the scratch root"
+            );
 
-        let tampered = real.join("..").join("..").join("..").join("etc");
-        assert!(
-            !is_scratch_path(&tampered),
-            "`..` traversal must not escape the scratch root"
-        );
-
-        let _ = fs::remove_dir_all(&real);
-    }
-
-    #[test]
-    #[serial]
-    fn provision_scratch_dir_rejects_unsafe_id() {
-        let _tmp = isolate_app_dir();
-        assert!(provision_scratch_dir("../etc").is_err());
-        assert!(provision_scratch_dir("foo bar").is_err());
-        assert!(provision_scratch_dir("").is_err());
+            let _ = fs::remove_dir_all(&real);
+        }
+        {
+            let _tmp = isolate_app_dir();
+            assert!(provision_scratch_dir("../etc").is_err());
+            assert!(provision_scratch_dir("foo bar").is_err());
+            assert!(provision_scratch_dir("").is_err());
+        }
     }
 }

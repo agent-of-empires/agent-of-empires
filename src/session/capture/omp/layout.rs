@@ -825,53 +825,51 @@ mod tests {
     use serial_test::serial;
 
     #[test]
-    fn dotenv_parser_is_literal_and_mirrors_omp_names() {
-        let parsed = parse_dotenv(
+    fn dotenv_parsing_precedence_and_empty_launcher_values() {
+        {
+            let parsed = parse_dotenv(
             "export PI_CODING_AGENT_DIR=$HOME/store\nOMP_CODING_AGENT_SESSION_DIR='relative/$USER'\n",
         );
-        assert_eq!(parsed["PI_CODING_AGENT_DIR"], "$HOME/store");
-        assert_eq!(parsed["PI_CODING_AGENT_SESSION_DIR"], "relative/$USER");
-    }
-
-    #[test]
-    fn dotenv_precedence_is_exec_project_agent_config_home() {
-        let mut exec = HashMap::from([("HOME".to_string(), "/exec".to_string())]);
-        let files = [
-            HashMap::from([("HOME".to_string(), "/project".to_string())]),
-            HashMap::from([("XDG_DATA_HOME".to_string(), "/agent".to_string())]),
-            HashMap::from([("XDG_DATA_HOME".to_string(), "/config".to_string())]),
-            HashMap::from([("XDG_STATE_HOME".to_string(), "/home".to_string())]),
-        ];
-        let merged = merge_omp_environment(exec.clone(), &files);
-        assert_eq!(merged["HOME"], "/exec");
-        assert_eq!(merged["XDG_DATA_HOME"], "/agent");
-        assert_eq!(merged["XDG_STATE_HOME"], "/home");
-        exec.insert("HOME".to_string(), String::new());
-        assert_eq!(merge_omp_environment(exec, &files)["HOME"], "/project");
-    }
-
-    #[test]
-    fn bun_dotenv_replaces_an_empty_launcher_value_but_not_a_nonempty_one() {
-        let cwd = Path::new("/workspace");
-        for (launcher, expected) in [
-            (None, "from-dotenv"),
-            (Some(""), "from-dotenv"),
-            (Some("from-launcher"), "from-launcher"),
-        ] {
-            let mut env = HashMap::new();
-            if let Some(value) = launcher {
-                env.insert("PI_CODING_AGENT_DIR".to_string(), value.to_string());
+            assert_eq!(parsed["PI_CODING_AGENT_DIR"], "$HOME/store");
+            assert_eq!(parsed["PI_CODING_AGENT_SESSION_DIR"], "relative/$USER");
+        }
+        {
+            let mut exec = HashMap::from([("HOME".to_string(), "/exec".to_string())]);
+            let files = [
+                HashMap::from([("HOME".to_string(), "/project".to_string())]),
+                HashMap::from([("XDG_DATA_HOME".to_string(), "/agent".to_string())]),
+                HashMap::from([("XDG_DATA_HOME".to_string(), "/config".to_string())]),
+                HashMap::from([("XDG_STATE_HOME".to_string(), "/home".to_string())]),
+            ];
+            let merged = merge_omp_environment(exec.clone(), &files);
+            assert_eq!(merged["HOME"], "/exec");
+            assert_eq!(merged["XDG_DATA_HOME"], "/agent");
+            assert_eq!(merged["XDG_STATE_HOME"], "/home");
+            exec.insert("HOME".to_string(), String::new());
+            assert_eq!(merge_omp_environment(exec, &files)["HOME"], "/project");
+        }
+        {
+            let cwd = Path::new("/workspace");
+            for (launcher, expected) in [
+                (None, "from-dotenv"),
+                (Some(""), "from-dotenv"),
+                (Some("from-launcher"), "from-launcher"),
+            ] {
+                let mut env = HashMap::new();
+                if let Some(value) = launcher {
+                    env.insert("PI_CODING_AGENT_DIR".to_string(), value.to_string());
+                }
+                let resolved = autoload_bun_dotenv(env, cwd, |path| {
+                    Ok((path == cwd.join(".env"))
+                        .then(|| "PI_CODING_AGENT_DIR=from-dotenv\n".to_string()))
+                })
+                .unwrap();
+                assert_eq!(
+                    resolved.get("PI_CODING_AGENT_DIR").map(String::as_str),
+                    Some(expected),
+                    "launcher value: {launcher:?}"
+                );
             }
-            let resolved = autoload_bun_dotenv(env, cwd, |path| {
-                Ok((path == cwd.join(".env"))
-                    .then(|| "PI_CODING_AGENT_DIR=from-dotenv\n".to_string()))
-            })
-            .unwrap();
-            assert_eq!(
-                resolved.get("PI_CODING_AGENT_DIR").map(String::as_str),
-                Some(expected),
-                "launcher value: {launcher:?}"
-            );
         }
     }
 
@@ -964,93 +962,92 @@ mod tests {
 
     #[test]
     #[serial]
-    fn bun_cwd_dotenv_selects_profile_with_mode_local_priority() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let project = tmp.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join(".env"), "OMP_PROFILE=base\n").unwrap();
-        std::fs::write(project.join(".env.testing"), "OMP_PROFILE=mode\n").unwrap();
-        let _env = EnvGuard::unset(&OMP_STORE_ENV_KEYS);
-        let (mode_layout, _) = resolve_with_entries(
-            &[
-                format!("HOME={}", home.display()),
-                "NODE_ENV=testing".to_string(),
-            ],
-            project.to_str().unwrap(),
-            &OmpCliCaptureOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            mode_layout.sessions,
-            home.join(".omp/profiles/mode/agent/sessions")
-        );
+    fn profile_selection_honors_dotenv_mode_local_and_cli_priority() {
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            let project = tmp.path().join("project");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(project.join(".env"), "OMP_PROFILE=base\n").unwrap();
+            std::fs::write(project.join(".env.testing"), "OMP_PROFILE=mode\n").unwrap();
+            let _env = EnvGuard::unset(&OMP_STORE_ENV_KEYS);
+            let (mode_layout, _) = resolve_with_entries(
+                &[
+                    format!("HOME={}", home.display()),
+                    "NODE_ENV=testing".to_string(),
+                ],
+                project.to_str().unwrap(),
+                &OmpCliCaptureOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                mode_layout.sessions,
+                home.join(".omp/profiles/mode/agent/sessions")
+            );
 
-        std::fs::write(project.join(".env.local"), "OMP_PROFILE=local\n").unwrap();
-        let (layout, fingerprint) = resolve_with_entries(
-            &[
-                format!("HOME={}", home.display()),
-                "NODE_ENV=testing".to_string(),
-            ],
-            project.to_str().unwrap(),
-            &OmpCliCaptureOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            layout.sessions,
-            home.join(".omp/profiles/local/agent/sessions")
-        );
-        assert_eq!(fingerprint.len(), 64);
-        let launcher = resolve_omp_store_layout(
-            &[
-                format!("HOME={}", home.display()),
-                "NODE_ENV=testing".to_string(),
-                "OMP_PROFILE=launcher".to_string(),
-            ],
-            project.to_str().unwrap(),
-            &OmpCliCaptureOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            launcher.sessions,
-            home.join(".omp/profiles/launcher/agent/sessions")
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn cli_profile_selects_its_dotenv_locations_before_store_resolution() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let project = tmp.path().join("project");
-        let cli_agent = home.join(".omp/profiles/cli/agent");
-        let dotenv_agent = home.join(".omp/profiles/from_dotenv/agent");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(&cli_agent).unwrap();
-        std::fs::create_dir_all(&dotenv_agent).unwrap();
-        std::fs::write(project.join(".env"), "OMP_PROFILE=from_dotenv\n").unwrap();
-        std::fs::write(
-            cli_agent.join(".env"),
-            "PI_CODING_AGENT_SESSION_DIR=cli-profile-store\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dotenv_agent.join(".env"),
-            "PI_CODING_AGENT_SESSION_DIR=dotenv-profile-store\n",
-        )
-        .unwrap();
-        let _env = EnvGuard::unset(&OMP_STORE_ENV_KEYS);
-        let options = OmpCliCaptureOptions {
-            profile: Some("cli".to_string()),
-            ..OmpCliCaptureOptions::default()
-        };
-        let layout = resolve_omp_store_layout(
-            &[format!("HOME={}", home.display())],
-            project.to_str().unwrap(),
-            &options,
-        )
-        .unwrap();
-        assert_eq!(layout.sessions, project.join("cli-profile-store"));
+            std::fs::write(project.join(".env.local"), "OMP_PROFILE=local\n").unwrap();
+            let (layout, fingerprint) = resolve_with_entries(
+                &[
+                    format!("HOME={}", home.display()),
+                    "NODE_ENV=testing".to_string(),
+                ],
+                project.to_str().unwrap(),
+                &OmpCliCaptureOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                layout.sessions,
+                home.join(".omp/profiles/local/agent/sessions")
+            );
+            assert_eq!(fingerprint.len(), 64);
+            let launcher = resolve_omp_store_layout(
+                &[
+                    format!("HOME={}", home.display()),
+                    "NODE_ENV=testing".to_string(),
+                    "OMP_PROFILE=launcher".to_string(),
+                ],
+                project.to_str().unwrap(),
+                &OmpCliCaptureOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                launcher.sessions,
+                home.join(".omp/profiles/launcher/agent/sessions")
+            );
+        }
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            let project = tmp.path().join("project");
+            let cli_agent = home.join(".omp/profiles/cli/agent");
+            let dotenv_agent = home.join(".omp/profiles/from_dotenv/agent");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::create_dir_all(&cli_agent).unwrap();
+            std::fs::create_dir_all(&dotenv_agent).unwrap();
+            std::fs::write(project.join(".env"), "OMP_PROFILE=from_dotenv\n").unwrap();
+            std::fs::write(
+                cli_agent.join(".env"),
+                "PI_CODING_AGENT_SESSION_DIR=cli-profile-store\n",
+            )
+            .unwrap();
+            std::fs::write(
+                dotenv_agent.join(".env"),
+                "PI_CODING_AGENT_SESSION_DIR=dotenv-profile-store\n",
+            )
+            .unwrap();
+            let _env = EnvGuard::unset(&OMP_STORE_ENV_KEYS);
+            let options = OmpCliCaptureOptions {
+                profile: Some("cli".to_string()),
+                ..OmpCliCaptureOptions::default()
+            };
+            let layout = resolve_omp_store_layout(
+                &[format!("HOME={}", home.display())],
+                project.to_str().unwrap(),
+                &options,
+            )
+            .unwrap();
+            assert_eq!(layout.sessions, project.join("cli-profile-store"));
+        }
     }
 
     #[test]

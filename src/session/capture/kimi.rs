@@ -209,73 +209,73 @@ mod tests {
     }
 
     #[test]
-    fn poller_claims_only_post_launch_matching_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir(&sessions).unwrap();
-        let mut index = String::new();
-        for (leaf, mtime, work_dir) in [
-            ("stale", 1_000, "/workspace"),
-            ("boundary", 2_000, "/workspace"),
-            ("wrong", 4_000, "/other"),
-            ("fresh", 3_000, "/workspace"),
-        ] {
-            let path = sessions.join(leaf);
-            std::fs::create_dir(&path).unwrap();
-            set_mtime_ms(&path, mtime * 1000);
-            index.push_str(&format!(
+    fn poller_claims_matching_directory_and_skips_hostile_index() {
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let sessions = tmp.path().join("sessions");
+            std::fs::create_dir(&sessions).unwrap();
+            let mut index = String::new();
+            for (leaf, mtime, work_dir) in [
+                ("stale", 1_000, "/workspace"),
+                ("boundary", 2_000, "/workspace"),
+                ("wrong", 4_000, "/other"),
+                ("fresh", 3_000, "/workspace"),
+            ] {
+                let path = sessions.join(leaf);
+                std::fs::create_dir(&path).unwrap();
+                set_mtime_ms(&path, mtime * 1000);
+                index.push_str(&format!(
                 "{{\"sessionId\":\"kimi_{leaf}\",\"sessionDir\":\"/sessions/{leaf}\",\"workDir\":\"{work_dir}\"}}\n"
             ));
+            }
+            std::fs::write(tmp.path().join("session_index.jsonl"), index).unwrap();
+            assert_eq!(
+                poll(tmp.path(), 2_000_001.0)().as_deref(),
+                Some("kimi_fresh")
+            );
         }
-        std::fs::write(tmp.path().join("session_index.jsonl"), index).unwrap();
-        assert_eq!(
-            poll(tmp.path(), 2_000_001.0)().as_deref(),
-            Some("kimi_fresh")
-        );
-    }
+        #[cfg(unix)]
+        {
+            use super::super::test_support::{make_fifo, open_fifo_guard};
+            use std::os::unix::fs::symlink;
+            use std::time::{Duration, Instant};
 
-    #[cfg(unix)]
-    #[test]
-    fn poller_skips_hostile_index_and_session_directory() {
-        use super::super::test_support::{make_fifo, open_fifo_guard};
-        use std::os::unix::fs::symlink;
-        use std::time::{Duration, Instant};
+            let tmp = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let sessions = tmp.path().join("sessions");
+            std::fs::create_dir(&sessions).unwrap();
+            let good = sessions.join("good");
+            std::fs::create_dir(&good).unwrap();
+            std::fs::create_dir(outside.path().join("linked")).unwrap();
+            symlink(outside.path().join("linked"), sessions.join("linked")).unwrap();
+            let index = tmp.path().join("session_index.jsonl");
+            let index_content = concat!(
+                r#"{"sessionId":"kimi_linked","sessionDir":"/sessions/linked","workDir":"/workspace"}"#,
+                "\n",
+                r#"{"sessionId":"kimi_good","sessionDir":"/sessions/good","workDir":"/workspace"}"#,
+                "\n",
+            );
+            std::fs::write(&index, index_content).unwrap();
+            let poll = poll(tmp.path(), 0.0);
+            assert_eq!(poll().as_deref(), Some("kimi_good"));
+            std::fs::remove_dir(good).unwrap();
+            assert_eq!(poll(), None);
 
-        let tmp = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir(&sessions).unwrap();
-        let good = sessions.join("good");
-        std::fs::create_dir(&good).unwrap();
-        std::fs::create_dir(outside.path().join("linked")).unwrap();
-        symlink(outside.path().join("linked"), sessions.join("linked")).unwrap();
-        let index = tmp.path().join("session_index.jsonl");
-        let index_content = concat!(
-            r#"{"sessionId":"kimi_linked","sessionDir":"/sessions/linked","workDir":"/workspace"}"#,
-            "\n",
-            r#"{"sessionId":"kimi_good","sessionDir":"/sessions/good","workDir":"/workspace"}"#,
-            "\n",
-        );
-        std::fs::write(&index, index_content).unwrap();
-        let poll = poll(tmp.path(), 0.0);
-        assert_eq!(poll().as_deref(), Some("kimi_good"));
-        std::fs::remove_dir(good).unwrap();
-        assert_eq!(poll(), None);
-
-        std::fs::remove_file(&index).unwrap();
-        let outside_index = outside.path().join("session_index.jsonl");
-        std::fs::write(&outside_index, index_content).unwrap();
-        symlink(&outside_index, &index).unwrap();
-        assert_eq!(poll(), None);
-        std::fs::remove_file(&index).unwrap();
-        make_fifo(&index);
-        let fifo_guard = open_fifo_guard(&index);
-        let started = Instant::now();
-        assert_eq!(poll(), None);
-        assert!(started.elapsed() < Duration::from_secs(2));
-        drop(fifo_guard);
-        std::fs::remove_file(&index).unwrap();
-        std::fs::write(&index, vec![b' '; KIMI_INDEX_MAX_BYTES + 1]).unwrap();
-        assert_eq!(poll(), None);
+            std::fs::remove_file(&index).unwrap();
+            let outside_index = outside.path().join("session_index.jsonl");
+            std::fs::write(&outside_index, index_content).unwrap();
+            symlink(&outside_index, &index).unwrap();
+            assert_eq!(poll(), None);
+            std::fs::remove_file(&index).unwrap();
+            make_fifo(&index);
+            let fifo_guard = open_fifo_guard(&index);
+            let started = Instant::now();
+            assert_eq!(poll(), None);
+            assert!(started.elapsed() < Duration::from_secs(2));
+            drop(fifo_guard);
+            std::fs::remove_file(&index).unwrap();
+            std::fs::write(&index, vec![b' '; KIMI_INDEX_MAX_BYTES + 1]).unwrap();
+            assert_eq!(poll(), None);
+        }
     }
 }

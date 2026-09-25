@@ -208,67 +208,67 @@ mod tests {
     }
 
     #[test]
-    fn poller_claims_only_post_launch_matching_row() {
-        let tmp = tempfile::tempdir().unwrap();
-        let conn = rusqlite::Connection::open(tmp.path().join("state.db")).unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        for (id, started_at, cwd) in [
-            ("hermes_stale", 1_000.0, "/workspace"),
-            ("hermes_wrong", 4_000.0, "/other"),
-            ("hermes_fresh", 3_000.0, "/workspace"),
-        ] {
-            conn.execute(
-                "INSERT INTO sessions VALUES (?1, 'cli', ?2, NULL, ?3, NULL)",
-                rusqlite::params![id, started_at, cwd],
-            )
-            .unwrap();
-        }
-        drop(conn);
-        assert_eq!(poll(tmp.path(), 2_000)().as_deref(), Some("hermes_fresh"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn poller_refuses_symlink_fifo_and_excess_rows() {
-        use super::super::test_support::{make_fifo, open_fifo_guard};
-        use std::os::unix::fs::symlink;
-        use std::time::Instant;
-
-        let store = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let outside_db = outside.path().join("state.db");
-        let conn = rusqlite::Connection::open(&outside_db).unwrap();
-        conn.execute_batch(&format!(
-            "{SCHEMA} INSERT INTO sessions VALUES ('linked', 'cli', 10, NULL, '/workspace', NULL);"
-        ))
-        .unwrap();
-        drop(conn);
-        let db = store.path().join("state.db");
-        symlink(&outside_db, &db).unwrap();
-        let poll = poll(store.path(), 0);
-        assert_eq!(poll(), None);
-        std::fs::remove_file(&db).unwrap();
-        make_fifo(&db);
-        let fifo_guard = open_fifo_guard(&db);
-        let started = Instant::now();
-        assert_eq!(poll(), None);
-        assert!(started.elapsed() < Duration::from_secs(2));
-        drop(fifo_guard);
-        std::fs::remove_file(&db).unwrap();
-
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        let transaction = conn.unchecked_transaction().unwrap();
-        for index in 0..=HERMES_MAX_ROWS {
-            transaction
-                .execute(
-                    "INSERT INTO sessions VALUES (?1, 'cli', ?2, NULL, '/workspace', NULL)",
-                    rusqlite::params![format!("hermes_{index}"), index as f64 + 1.0],
+    fn poller_claims_matching_row_and_refuses_hostile_stores() {
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let conn = rusqlite::Connection::open(tmp.path().join("state.db")).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            for (id, started_at, cwd) in [
+                ("hermes_stale", 1_000.0, "/workspace"),
+                ("hermes_wrong", 4_000.0, "/other"),
+                ("hermes_fresh", 3_000.0, "/workspace"),
+            ] {
+                conn.execute(
+                    "INSERT INTO sessions VALUES (?1, 'cli', ?2, NULL, ?3, NULL)",
+                    rusqlite::params![id, started_at, cwd],
                 )
                 .unwrap();
+            }
+            drop(conn);
+            assert_eq!(poll(tmp.path(), 2_000)().as_deref(), Some("hermes_fresh"));
         }
-        transaction.commit().unwrap();
-        drop(conn);
-        assert_eq!(poll(), None);
+        #[cfg(unix)]
+        {
+            use super::super::test_support::{make_fifo, open_fifo_guard};
+            use std::os::unix::fs::symlink;
+            use std::time::Instant;
+
+            let store = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let outside_db = outside.path().join("state.db");
+            let conn = rusqlite::Connection::open(&outside_db).unwrap();
+            conn.execute_batch(&format!(
+            "{SCHEMA} INSERT INTO sessions VALUES ('linked', 'cli', 10, NULL, '/workspace', NULL);"
+        ))
+            .unwrap();
+            drop(conn);
+            let db = store.path().join("state.db");
+            symlink(&outside_db, &db).unwrap();
+            let poll = poll(store.path(), 0);
+            assert_eq!(poll(), None);
+            std::fs::remove_file(&db).unwrap();
+            make_fifo(&db);
+            let fifo_guard = open_fifo_guard(&db);
+            let started = Instant::now();
+            assert_eq!(poll(), None);
+            assert!(started.elapsed() < Duration::from_secs(2));
+            drop(fifo_guard);
+            std::fs::remove_file(&db).unwrap();
+
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            let transaction = conn.unchecked_transaction().unwrap();
+            for index in 0..=HERMES_MAX_ROWS {
+                transaction
+                    .execute(
+                        "INSERT INTO sessions VALUES (?1, 'cli', ?2, NULL, '/workspace', NULL)",
+                        rusqlite::params![format!("hermes_{index}"), index as f64 + 1.0],
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+            drop(conn);
+            assert_eq!(poll(), None);
+        }
     }
 }

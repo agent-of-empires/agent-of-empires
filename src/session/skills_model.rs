@@ -1341,7 +1341,7 @@ mod tests {
     }
 
     #[test]
-    fn create_then_read_round_trips_as_managed() {
+    fn create_validates_names_and_round_trips_as_managed() {
         let tmp = tempfile::tempdir().unwrap();
         let app = tmp.path().to_path_buf();
         create_skill(&app, "my-skill", Some("use for testing")).unwrap();
@@ -1369,16 +1369,15 @@ mod tests {
             edit_skill(tmp.path(), &app, "s", "not frontmatter"),
             Err(SkillError::InvalidInput(_))
         ));
-    }
 
-    #[test]
-    fn create_rejects_unsafe_names() {
-        let tmp = tempfile::tempdir().unwrap();
         for bad in ["..", ".", "a/b", "has space", "", &"x".repeat(65)] {
-            assert!(matches!(
-                create_skill(tmp.path(), bad, None),
-                Err(SkillError::InvalidInput(_))
-            ));
+            assert!(
+                matches!(
+                    create_skill(tmp.path(), bad, None),
+                    Err(SkillError::InvalidInput(_))
+                ),
+                "{bad:?}"
+            );
         }
     }
 
@@ -1423,16 +1422,9 @@ mod tests {
             ),
             Err(SkillError::ReadOnly(_))
         ));
-    }
 
-    #[test]
-    fn adopt_rejects_managed_source_and_collision() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let app = tmp.path().join("app");
-        write_skill(&home.join(".claude/skills"), "review", "review", "d");
+        // A managed source is not adoptable, and adoption never overwrites a managed skill.
         create_skill(&app, "review", None).unwrap();
-
         assert!(matches!(
             adopt_skill(&home, &app, &SkillProvenance::AoeManaged, "review", None),
             Err(SkillError::InvalidInput(_))
@@ -1525,54 +1517,39 @@ mod tests {
             ),
             SyncStatus::Conflict
         );
-    }
 
-    #[test]
-    fn sync_preserves_a_propagated_copy_the_user_edited() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let app = tmp.path().join("app");
-        let target = home.join(".claude/skills");
-        create_skill(&app, "review", Some("d")).unwrap();
+        // A copy aoe deployed but the user then edited survives upstream edits and deletion.
+        create_skill(&app, "edited", Some("d")).unwrap();
         sync_skills_into(&target, &app, "claude-user", &SyncOptions::default());
-
         std::fs::write(
-            target.join("review/SKILL.md"),
-            "---\nname: review\ndescription: d\n---\n\nmy edits\n",
+            target.join("edited/SKILL.md"),
+            "---\nname: edited\ndescription: d\n---\n\nmy edits\n",
         )
         .unwrap();
-
         edit_skill(
             &home,
             &app,
-            "review",
-            "---\nname: review\ndescription: d3\n---\n\nupstream\n",
+            "edited",
+            "---\nname: edited\ndescription: d3\n---\n\nupstream\n",
         )
         .unwrap();
-        assert_eq!(
+        let sync_edited = || {
             status_of(
                 &sync_skills_into(&target, &app, "claude-user", &SyncOptions::default()),
-                "review"
-            ),
-            SyncStatus::Conflict
-        );
-        assert!(std::fs::read_to_string(target.join("review/SKILL.md"))
+                "edited",
+            )
+        };
+        assert_eq!(sync_edited(), SyncStatus::Conflict);
+        assert!(std::fs::read_to_string(target.join("edited/SKILL.md"))
             .unwrap()
             .contains("my edits"));
-
-        delete_skill(&home, &app, "review").unwrap();
-        assert_eq!(
-            status_of(
-                &sync_skills_into(&target, &app, "claude-user", &SyncOptions::default()),
-                "review"
-            ),
-            SyncStatus::Conflict
-        );
-        assert!(target.join("review/SKILL.md").is_file());
+        delete_skill(&home, &app, "edited").unwrap();
+        assert_eq!(sync_edited(), SyncStatus::Conflict);
+        assert!(target.join("edited/SKILL.md").is_file());
     }
 
     #[test]
-    fn sync_leaves_a_symlinked_skill_alone() {
+    fn sync_replaces_a_symlinked_skill_only_on_request_and_never_writes_through_it() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let app = tmp.path().join("app");
@@ -1588,16 +1565,29 @@ mod tests {
         );
         std::fs::create_dir_all(&target).unwrap();
         std::os::unix::fs::symlink(&other_store, target.join("shared")).unwrap();
+        let is_symlink = || {
+            std::fs::symlink_metadata(target.join("shared"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        };
+        let untouched = || {
+            std::fs::read_to_string(other_store.join("SKILL.md"))
+                .unwrap()
+                .contains("someone else's")
+        };
 
         let out = sync_skills_into(&target, &app, "claude-user", &SyncOptions::default());
         assert_eq!(status_of(&out, "shared"), SyncStatus::Conflict);
-        assert!(std::fs::symlink_metadata(target.join("shared"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert!(std::fs::read_to_string(other_store.join("SKILL.md"))
-            .unwrap()
-            .contains("someone else's"));
+        assert!(is_symlink() && untouched());
+
+        let replace = SyncOptions {
+            replace: HashSet::from(["shared".to_string()]),
+            ..Default::default()
+        };
+        let out = sync_skills_into(&target, &app, "claude-user", &replace);
+        assert_eq!(status_of(&out, "shared"), SyncStatus::Updated);
+        assert!(!is_symlink() && untouched());
     }
 
     #[test]
@@ -1637,43 +1627,6 @@ mod tests {
             .contains("the user's own"));
     }
 
-    #[test]
-    fn replace_moves_a_symlink_without_touching_its_target() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let app = tmp.path().join("app");
-        let target = home.join(".claude/skills");
-        create_skill(&app, "shared", Some("managed")).unwrap();
-        write_skill(
-            &tmp.path().join("other"),
-            "shared",
-            "shared",
-            "someone else's",
-        );
-        let other_store = tmp.path().join("other/shared");
-        std::fs::create_dir_all(&target).unwrap();
-        std::os::unix::fs::symlink(&other_store, target.join("shared")).unwrap();
-
-        let replace = SyncOptions {
-            replace: HashSet::from(["shared".to_string()]),
-            ..Default::default()
-        };
-        assert_eq!(
-            status_of(
-                &sync_skills_into(&target, &app, "claude-user", &replace),
-                "shared"
-            ),
-            SyncStatus::Updated
-        );
-        assert!(!std::fs::symlink_metadata(target.join("shared"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert!(std::fs::read_to_string(other_store.join("SKILL.md"))
-            .unwrap()
-            .contains("someone else's"));
-    }
-
     // A process killed mid-swap leaves either a staging copy (litter) or a backup holding the only
     // copy of what used to be in the destination.
     #[test]
@@ -1711,40 +1664,29 @@ mod tests {
     }
 
     #[test]
-    fn a_scoped_sync_touches_only_the_named_skill() {
+    fn sync_removes_clean_orphans_only_within_its_scope() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         let app = tmp.path().join("app");
-        let target = home.join(".claude/skills");
+        let target = home.join(".gemini/skills");
         create_skill(&app, "wanted", Some("d")).unwrap();
-        create_skill(&app, "other", Some("d")).unwrap();
-        sync_skills_into(&target, &app, "claude-user", &SyncOptions::default());
-        delete_skill(&home, &app, "other").unwrap();
+        create_skill(&app, "doomed", Some("d")).unwrap();
+        write_skill(&target, "mine", "mine", "hand written");
+        sync_skills_into(&target, &app, "gemini-user", &SyncOptions::default());
+        assert!(target.join("doomed/SKILL.md").is_file());
+        delete_skill(&home, &app, "doomed").unwrap();
 
-        let out = sync_skills_into(&target, &app, "claude-user", &SyncOptions::only("wanted"));
+        let out = sync_skills_into(&target, &app, "gemini-user", &SyncOptions::only("wanted"));
         assert_eq!(
             out.iter().map(|o| o.directory.as_str()).collect::<Vec<_>>(),
             vec!["wanted"],
             "a scoped sync reports only its own skill"
         );
         assert!(
-            target.join("other").exists(),
+            target.join("doomed").exists(),
             "another skill's orphan is not this skill's business"
         );
-    }
 
-    #[test]
-    fn sync_removes_clean_orphans_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let app = tmp.path().join("app");
-        let target = home.join(".gemini/skills");
-        create_skill(&app, "doomed", Some("d")).unwrap();
-        write_skill(&target, "mine", "mine", "hand written");
-        sync_skills_into(&target, &app, "gemini-user", &SyncOptions::default());
-        assert!(target.join("doomed/SKILL.md").is_file());
-
-        delete_skill(&home, &app, "doomed").unwrap();
         let out = sync_skills_into(&target, &app, "gemini-user", &SyncOptions::default());
         assert_eq!(status_of(&out, "doomed"), SyncStatus::Removed);
         assert!(!target.join("doomed").exists());
@@ -1941,7 +1883,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn store_ops_reject_symlinked_skill_directory() {
+    fn store_ops_reject_symlinked_skill_directories_and_store_roots() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
@@ -1983,24 +1925,12 @@ mod tests {
             ),
             Err(SkillError::InvalidInput(_))
         ));
-    }
 
-    #[cfg(unix)]
-    #[test]
-    fn read_rejects_symlinked_store_root() {
-        use std::os::unix::fs::symlink;
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let app = tmp.path().join("app");
-
-        let outside = tmp.path().join("outside");
-        write_skill(&outside, "target", "target", "d");
-
-        std::fs::create_dir_all(&app).unwrap();
-        symlink(&outside, app.join("skills")).unwrap();
-
+        let rooted = tmp.path().join("rooted-app");
+        std::fs::create_dir_all(&rooted).unwrap();
+        symlink(&outside, rooted.join("skills")).unwrap();
         assert!(matches!(
-            read_skill(&home, &app, &SkillProvenance::AoeManaged, "target"),
+            read_skill(&home, &rooted, &SkillProvenance::AoeManaged, "target"),
             Err(SkillError::InvalidInput(_))
         ));
     }

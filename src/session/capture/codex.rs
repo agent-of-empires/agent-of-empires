@@ -227,94 +227,94 @@ mod tests {
     }
 
     #[test]
-    fn poller_claims_newest_post_launch_matching_rollout() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions/2026/08/23");
-        std::fs::create_dir_all(&sessions).unwrap();
-        let fresh_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        for (name, id, cwd, mtime) in [
-            (
-                "stale",
-                "11111111-2222-4333-8444-555555555555",
-                "/workspace",
-                1_000,
-            ),
-            (
-                "wrong",
-                "99999999-8888-4777-8666-555555555555",
-                "/other",
-                4_000,
-            ),
-            (
-                "older",
-                "22222222-2222-4333-8444-555555555555",
-                "/workspace",
-                2_500,
-            ),
-            ("fresh", fresh_id, "/workspace", 3_000),
-        ] {
-            let path = sessions.join(format!("rollout-{name}-{id}.jsonl"));
-            std::fs::write(&path, rollout_line(id, cwd)).unwrap();
-            set_mtime_ms(&path, mtime * 1000);
+    fn poller_claims_newest_matching_rollout_and_skips_hostile_artifacts() {
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let sessions = tmp.path().join("sessions/2026/08/23");
+            std::fs::create_dir_all(&sessions).unwrap();
+            let fresh_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+            for (name, id, cwd, mtime) in [
+                (
+                    "stale",
+                    "11111111-2222-4333-8444-555555555555",
+                    "/workspace",
+                    1_000,
+                ),
+                (
+                    "wrong",
+                    "99999999-8888-4777-8666-555555555555",
+                    "/other",
+                    4_000,
+                ),
+                (
+                    "older",
+                    "22222222-2222-4333-8444-555555555555",
+                    "/workspace",
+                    2_500,
+                ),
+                ("fresh", fresh_id, "/workspace", 3_000),
+            ] {
+                let path = sessions.join(format!("rollout-{name}-{id}.jsonl"));
+                std::fs::write(&path, rollout_line(id, cwd)).unwrap();
+                set_mtime_ms(&path, mtime * 1000);
+            }
+            assert_eq!(poll(tmp.path(), 2_000)().as_deref(), Some(fresh_id));
         }
-        assert_eq!(poll(tmp.path(), 2_000)().as_deref(), Some(fresh_id));
-    }
+        #[cfg(unix)]
+        {
+            use super::super::test_support::{make_fifo, open_fifo_guard};
+            use std::os::unix::fs::symlink;
 
-    #[cfg(unix)]
-    #[test]
-    fn poller_skips_hostile_artifacts_without_blocking() {
-        use super::super::test_support::{make_fifo, open_fifo_guard};
-        use std::os::unix::fs::symlink;
+            let tmp = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let sessions = tmp.path().join("sessions");
+            std::fs::create_dir(&sessions).unwrap();
+            let good_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+            let good = sessions.join(format!("rollout-good-{good_id}.jsonl"));
+            std::fs::write(&good, rollout_line(good_id, "/workspace")).unwrap();
+            set_mtime_ms(&good, 3_000_000);
 
-        let tmp = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let sessions = tmp.path().join("sessions");
-        std::fs::create_dir(&sessions).unwrap();
-        let good_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        let good = sessions.join(format!("rollout-good-{good_id}.jsonl"));
-        std::fs::write(&good, rollout_line(good_id, "/workspace")).unwrap();
-        set_mtime_ms(&good, 3_000_000);
+            let linked_id = "11111111-2222-4333-8444-555555555555";
+            let outside_file = outside
+                .path()
+                .join(format!("rollout-linked-{linked_id}.jsonl"));
+            std::fs::write(&outside_file, rollout_line(linked_id, "/workspace")).unwrap();
+            symlink(
+                &outside_file,
+                sessions.join(outside_file.file_name().unwrap()),
+            )
+            .unwrap();
+            std::fs::create_dir(outside.path().join("06")).unwrap();
+            symlink(outside.path().join("06"), sessions.join("2026")).unwrap();
 
-        let linked_id = "11111111-2222-4333-8444-555555555555";
-        let outside_file = outside
-            .path()
-            .join(format!("rollout-linked-{linked_id}.jsonl"));
-        std::fs::write(&outside_file, rollout_line(linked_id, "/workspace")).unwrap();
-        symlink(
-            &outside_file,
-            sessions.join(outside_file.file_name().unwrap()),
-        )
-        .unwrap();
-        std::fs::create_dir(outside.path().join("06")).unwrap();
-        symlink(outside.path().join("06"), sessions.join("2026")).unwrap();
+            let fifo = sessions.join("rollout-fifo-22222222-3333-4444-8555-666666666666.jsonl");
+            make_fifo(&fifo);
+            let _fifo_guard = open_fifo_guard(&fifo);
+            let oversized_id = "33333333-4444-4555-8666-777777777777";
+            let mut oversized = rollout_line(oversized_id, "/workspace").into_bytes();
+            oversized.resize(CODEX_ROLLOUT_MAX_BYTES + 1, b' ');
+            std::fs::write(
+                sessions.join(format!("rollout-large-{oversized_id}.jsonl")),
+                oversized,
+            )
+            .unwrap();
+            let bomb = zstd::stream::encode_all(
+                std::io::Cursor::new(vec![b' '; CODEX_METADATA_MAX_BYTES + 1]),
+                1,
+            )
+            .unwrap();
+            std::fs::write(
+                sessions.join("rollout-bomb-44444444-5555-4666-8777-888888888888.jsonl.zst"),
+                bomb,
+            )
+            .unwrap();
 
-        let fifo = sessions.join("rollout-fifo-22222222-3333-4444-8555-666666666666.jsonl");
-        make_fifo(&fifo);
-        let _fifo_guard = open_fifo_guard(&fifo);
-        let oversized_id = "33333333-4444-4555-8666-777777777777";
-        let mut oversized = rollout_line(oversized_id, "/workspace").into_bytes();
-        oversized.resize(CODEX_ROLLOUT_MAX_BYTES + 1, b' ');
-        std::fs::write(
-            sessions.join(format!("rollout-large-{oversized_id}.jsonl")),
-            oversized,
-        )
-        .unwrap();
-        let bomb = zstd::stream::encode_all(
-            std::io::Cursor::new(vec![b' '; CODEX_METADATA_MAX_BYTES + 1]),
-            1,
-        )
-        .unwrap();
-        std::fs::write(
-            sessions.join("rollout-bomb-44444444-5555-4666-8777-888888888888.jsonl.zst"),
-            bomb,
-        )
-        .unwrap();
-
-        let poll = poll(tmp.path(), 100);
-        let started = Instant::now();
-        assert_eq!(poll().as_deref(), Some(good_id));
-        std::fs::remove_file(good).unwrap();
-        assert_eq!(poll(), None);
-        assert!(started.elapsed() < Duration::from_secs(2));
+            let poll = poll(tmp.path(), 100);
+            let started = Instant::now();
+            assert_eq!(poll().as_deref(), Some(good_id));
+            std::fs::remove_file(good).unwrap();
+            assert_eq!(poll(), None);
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
     }
 }

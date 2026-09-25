@@ -648,67 +648,67 @@ mod tests {
     }
 
     #[test]
-    fn inherited_host_env_filtering() {
-        let vars = owned(&[
-            ("DISPLAY", ":0"),
-            ("XDG_RUNTIME_DIR", "/run/user/1000"),
-            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
-            ("WAYLAND_DISPLAY", ""),
-            ("PATH", "/usr/bin"),
-            ("GOPATH", "/home/me/go"),
-            ("AOE_TOKEN", "secret"),
-            ("AGENT_OF_EMPIRES_DEBUG", "1"),
-            ("TERM", "dumb"),
-            ("1BAD", "x"),
-        ]);
-        assert_eq!(
-            inherited_host_env_from(vars.clone(), false),
-            owned(&[
-                ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
-                ("DISPLAY", ":0"),
-                ("XDG_RUNTIME_DIR", "/run/user/1000"),
-            ])
-        );
-        assert_eq!(
-            inherited_host_env_from(vars, true),
-            owned(&[
-                ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
-                ("DISPLAY", ":0"),
-                ("GOPATH", "/home/me/go"),
-                ("PATH", "/usr/bin"),
-                ("XDG_RUNTIME_DIR", "/run/user/1000"),
-            ])
-        );
-        for key in ["AOE_ACP_SOCKET", "AGENT_OF_EMPIRES_PROFILE", "", "HAS-DASH"] {
-            assert!(passthrough_denyreason(key).is_some(), "{key:?}");
-        }
-    }
-
-    #[test]
     #[serial]
-    fn inherited_host_env_reads_the_setting_from_config() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
-        let _env = EnvGuard::set(&[("DISPLAY", ":7"), ("ENVTEST_CUSTOM_VAR", "custom-value")]);
-        let config_path = crate::session::config::config_path().expect("config path");
-        std::fs::create_dir_all(config_path.parent().expect("app dir")).expect("app dir");
-        let custom = |env: &[(String, String)]| {
-            env.iter()
-                .find(|(k, _)| k == "ENVTEST_CUSTOM_VAR")
-                .map(|(_, v)| v.clone())
-        };
+    fn inherited_host_env_filters_and_reads_the_setting_from_config() {
+        {
+            let vars = owned(&[
+                ("DISPLAY", ":0"),
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+                ("WAYLAND_DISPLAY", ""),
+                ("PATH", "/usr/bin"),
+                ("GOPATH", "/home/me/go"),
+                ("AOE_TOKEN", "secret"),
+                ("AGENT_OF_EMPIRES_DEBUG", "1"),
+                ("TERM", "dumb"),
+                ("1BAD", "x"),
+            ]);
+            assert_eq!(
+                inherited_host_env_from(vars.clone(), false),
+                owned(&[
+                    ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+                    ("DISPLAY", ":0"),
+                    ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ])
+            );
+            assert_eq!(
+                inherited_host_env_from(vars, true),
+                owned(&[
+                    ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+                    ("DISPLAY", ":0"),
+                    ("GOPATH", "/home/me/go"),
+                    ("PATH", "/usr/bin"),
+                    ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ])
+            );
+            for key in ["AOE_ACP_SOCKET", "AGENT_OF_EMPIRES_PROFILE", "", "HAS-DASH"] {
+                assert!(passthrough_denyreason(key).is_some(), "{key:?}");
+            }
+        }
+        {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+            let _env = EnvGuard::set(&[("DISPLAY", ":7"), ("ENVTEST_CUSTOM_VAR", "custom-value")]);
+            let config_path = crate::session::config::config_path().expect("config path");
+            std::fs::create_dir_all(config_path.parent().expect("app dir")).expect("app dir");
+            let custom = |env: &[(String, String)]| {
+                env.iter()
+                    .find(|(k, _)| k == "ENVTEST_CUSTOM_VAR")
+                    .map(|(_, v)| v.clone())
+            };
 
-        std::fs::write(&config_path, "").expect("write config");
-        let default = inherited_host_env("");
-        assert!(default.iter().any(|(k, _)| k == "DISPLAY"), "{default:?}");
-        assert_eq!(custom(&default), None);
+            std::fs::write(&config_path, "").expect("write config");
+            let default = inherited_host_env("");
+            assert!(default.iter().any(|(k, _)| k == "DISPLAY"), "{default:?}");
+            assert_eq!(custom(&default), None);
 
-        std::fs::write(&config_path, "[session]\ninherit_host_environment = true\n")
-            .expect("write config");
-        assert_eq!(
-            custom(&inherited_host_env("")).as_deref(),
-            Some("custom-value")
-        );
+            std::fs::write(&config_path, "[session]\ninherit_host_environment = true\n")
+                .expect("write config");
+            assert_eq!(
+                custom(&inherited_host_env("")).as_deref(),
+                Some("custom-value")
+            );
+        }
     }
 
     #[test]

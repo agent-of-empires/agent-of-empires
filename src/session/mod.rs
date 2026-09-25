@@ -461,58 +461,22 @@ mod profile_listing_tests {
     use std::os::unix::fs::symlink;
 
     #[test]
-    fn list_profile_names_skips_symlinks_to_real_profiles() {
+    fn list_profile_names_lists_real_dirs_in_plain_order() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let dir = tmp.path();
-        fs::create_dir(dir.join("default")).unwrap();
-        fs::create_dir(dir.join("personal")).unwrap();
+        for name in ["default", "alpha", "personal", "zeta"] {
+            fs::create_dir(dir.join(name)).unwrap();
+        }
         // The cs/cxa pattern: aliases are symlinks pointing at `default`.
         symlink("default", dir.join("forit-work")).unwrap();
         symlink("default", dir.join("wma-work")).unwrap();
-
-        let names = list_profile_names_in(dir).expect("list");
-        assert_eq!(
-            names,
-            vec!["default".to_string(), "personal".to_string()],
-            "symlinked aliases must be invisible to list_profiles; \
-             otherwise each alias inflates the all-profiles session list \
-             with duplicates of the linked profile's data (the original \
-             three-of-every-folder bug)."
-        );
-    }
-
-    #[test]
-    fn list_profile_names_includes_real_dirs_only() {
-        let tmp = tempfile::tempdir().expect("create tempdir");
-        let dir = tmp.path();
-        fs::create_dir(dir.join("default")).unwrap();
-        fs::create_dir(dir.join("work")).unwrap();
-        // A regular file in profiles/ should also be ignored.
         fs::write(dir.join("README"), "ignore me").unwrap();
 
+        // Symlinked aliases would duplicate the linked profile's sessions (the
+        // three-of-every-folder bug); "default" sorts like any other name here
+        // because resolution takes the first entry.
         let names = list_profile_names_in(dir).expect("list");
-        assert_eq!(names, vec!["default".to_string(), "work".to_string()]);
-    }
-
-    #[test]
-    fn list_profile_names_keeps_default_in_plain_order() {
-        // Resolution input: "default" sorts like any other name here.
-        let tmp = tempfile::tempdir().expect("create tempdir");
-        let dir = tmp.path();
-        for name in ["default", "alpha", "beta", "zeta"] {
-            fs::create_dir(dir.join(name)).unwrap();
-        }
-
-        let names = list_profile_names_in(dir).expect("list");
-        assert_eq!(
-            names,
-            vec![
-                "alpha".to_string(),
-                "beta".to_string(),
-                "default".to_string(),
-                "zeta".to_string(),
-            ]
-        );
+        assert_eq!(names, ["alpha", "default", "personal", "zeta"]);
     }
 
     #[test]
@@ -1162,24 +1126,16 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     #[serial_test::serial]
-    fn test_delete_profile_refuses_last_remaining() {
+    fn delete_profile_validates_names_but_removes_strays_and_keeps_the_last() {
         let temp = isolate_app_dir();
         let dir = app_dir(&temp);
-        fs::create_dir_all(dir.join("profiles").join("solo")).unwrap();
-
-        let err = delete_profile("solo").expect_err("deleting the last profile must fail");
-        assert!(err.to_string().contains("at least one profile must exist"));
-        assert!(dir.join("profiles").join("solo").exists());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_delete_profile_rejects_path_traversal() {
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-        fs::create_dir_all(dir.join("profiles").join("real")).unwrap();
+        let profiles = dir.join("profiles");
+        let stray = "work 0123456789abcdef Some Title";
+        fs::create_dir_all(profiles.join(stray)).unwrap();
+        fs::create_dir_all(profiles.join("real")).unwrap();
         let bystander = dir.join("bystander");
         fs::create_dir_all(&bystander).unwrap();
 
@@ -1196,9 +1152,14 @@ mod tests {
                 "unexpected error for {malicious:?}: {msg}"
             );
         }
-
         assert!(bystander.exists(), "bystander directory must survive");
-        assert!(dir.join("profiles").join("real").exists());
+
+        delete_profile(stray).expect("a pre-existing spaced stray must be deletable");
+        assert!(!profiles.join(stray).exists());
+
+        let err = delete_profile("real").expect_err("deleting the last profile must fail");
+        assert!(err.to_string().contains("at least one profile must exist"));
+        assert!(profiles.join("real").exists());
     }
 
     #[test]
@@ -1245,20 +1206,13 @@ mod tests {
                 .unwrap_or_else(|| panic!("expected create gate to reject {bad:?}"));
         }
         validate_new_profile_name(&"a".repeat(65)).expect_err("65 chars is too long");
-    }
 
-    #[test]
-    fn test_validate_new_profile_name_escapes_control_chars_in_error() {
-        let err = validate_new_profile_name("bad\u{1b}[31mname")
-            .expect_err("control char must be rejected");
-        let text = err.to_string();
+        let text = validate_new_profile_name("bad\u{1b}[31mname")
+            .expect_err("control char must be rejected")
+            .to_string();
         assert!(
-            !text.contains('\u{1b}'),
-            "raw ESC leaked into the error: {text:?}"
-        );
-        assert!(
-            text.contains("\\u{1b}"),
-            "expected the escaped form in the error: {text:?}"
+            !text.contains('\u{1b}') && text.contains("\\u{1b}"),
+            "expected only the escaped ESC in the error: {text:?}"
         );
     }
 
@@ -1289,6 +1243,8 @@ mod tests {
     #[serial_test::serial]
     fn test_require_known_profile_rejects_unknown_when_registry_nonempty() {
         let temp = isolate_app_dir();
+        require_known_profile("main")
+            .expect("first-run profile must be allowed when registry empty");
         let dir = app_dir(&temp);
         fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
 
@@ -1315,33 +1271,10 @@ mod tests {
         );
     }
 
-    #[test]
-    #[serial_test::serial]
-    fn test_require_known_profile_allows_first_run_empty_registry() {
-        let _temp = isolate_app_dir();
-        require_known_profile("main")
-            .expect("first-run profile must be allowed when registry empty");
-    }
-
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     #[serial_test::serial]
-    fn test_delete_profile_still_removes_preexisting_stray() {
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-        let stray = "work 0123456789abcdef Some Title";
-        fs::create_dir_all(dir.join("profiles").join(stray)).unwrap();
-        fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
-
-        delete_profile(stray).expect("a pre-existing spaced stray must be deletable");
-        assert!(!dir.join("profiles").join(stray).exists());
-        assert!(dir.join("profiles").join("work").exists());
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    #[serial_test::serial]
-    fn test_rename_profile_applies_create_grammar_to_destination() {
+    fn rename_profile_gates_the_destination_but_repairs_a_stray_source() {
         let temp = isolate_app_dir();
         let dir = app_dir(&temp);
         fs::create_dir_all(dir.join("profiles").join("real")).unwrap();
@@ -1370,17 +1303,9 @@ mod tests {
             );
             assert!(!dir.join("profiles").join(bad).exists());
         }
-    }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    #[serial_test::serial]
-    fn test_rename_profile_repairs_preexisting_stray_source() {
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
         let stray = "work 0123456789abcdef Some Title";
         fs::create_dir_all(dir.join("profiles").join(stray)).unwrap();
-
         rename_profile(stray, "work").expect("a spaced stray must be renameable");
         assert!(!dir.join("profiles").join(stray).exists());
         assert!(dir.join("profiles").join("work").exists());
@@ -1415,12 +1340,16 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_resolve_existing_profile_errors_on_unknown_name_without_creating_dir() {
+    fn resolve_existing_profile_never_creates_a_profile_it_was_not_asked_to_bootstrap() {
         let temp = isolate_app_dir();
         let dir = app_dir(&temp);
-        fs::create_dir_all(dir.join("profiles").join("real")).unwrap();
-        let unknown_dir = dir.join("profiles").join("ghost");
-        assert!(!unknown_dir.exists());
+        assert!(list_profiles().unwrap().is_empty());
+        assert_eq!(
+            resolve_existing_profile("").unwrap(),
+            "main",
+            "fresh install"
+        );
+        assert_eq!(list_profiles().unwrap(), vec!["main".to_string()]);
 
         let err = resolve_existing_profile("ghost").expect_err("unknown profile must error");
         let msg = err.to_string();
@@ -1429,120 +1358,60 @@ mod tests {
             msg.contains("aoe profile create"),
             "unexpected message: {msg}"
         );
-        assert!(
-            !unknown_dir.exists(),
-            "resolve_existing_profile must not create profiles/<unknown>/ as a side effect",
-        );
-    }
+        assert!(!dir.join("profiles").join("ghost").exists());
 
-    #[test]
-    #[serial_test::serial]
-    fn test_resolve_existing_profile_succeeds_for_created_profile() {
-        let _temp = isolate_app_dir();
         create_profile("newly-created").unwrap();
+        assert_eq!(
+            resolve_existing_profile("newly-created").unwrap(),
+            "newly-created"
+        );
 
-        let resolved = resolve_existing_profile("newly-created").unwrap();
-        assert_eq!(resolved, "newly-created");
-    }
+        fs::create_dir_all(dir.join("etc")).unwrap();
+        let err =
+            resolve_existing_profile("../etc").expect_err("path traversal name must be rejected");
+        assert!(err.to_string().contains("path separators"), "{err}");
 
-    #[test]
-    #[serial_test::serial]
-    fn test_resolve_existing_profile_empty_bootstraps_main_on_fresh_install() {
-        let _temp = isolate_app_dir();
-        assert!(list_profiles().unwrap().is_empty());
-
-        let resolved = resolve_existing_profile("").unwrap();
-        assert_eq!(resolved, "main");
-        assert_eq!(list_profiles().unwrap(), vec!["main".to_string()]);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_resolve_existing_profile_empty_errors_on_stale_configured_default() {
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-        fs::create_dir_all(dir.join("profiles").join("other")).unwrap();
         fs::write(
             dir.join("config.toml"),
             r#"default_profile = "deleted-profile""#,
         )
         .unwrap();
-        let stale_dir = dir.join("profiles").join("deleted-profile");
-        assert!(!stale_dir.exists());
-
         let err = resolve_existing_profile("").expect_err("stale default must error");
         assert!(err.to_string().contains("does not exist"));
         assert!(
-            !stale_dir.exists(),
+            !dir.join("profiles").join("deleted-profile").exists(),
             "stale default_profile must not be silently revived on disk",
         );
     }
 
     #[test]
-    #[serial_test::serial]
-    fn test_resolve_existing_profile_rejects_path_traversal_name() {
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-        fs::create_dir_all(dir.join("profiles").join("real")).unwrap();
-        fs::create_dir_all(dir.join("etc")).unwrap();
+    fn validate_instance_id_allowlists_one_path_component() {
+        for (id, ok) in [
+            ("a3f7c2d1e4b89012", true),
+            ("compact", true),
+            ("nested_first", true),
+            ("a-b-c", true),
+            ("", false),
+            ("..", false),
+            (".", false),
+            ("/etc", false),
+            ("foo/bar", false),
+            ("foo\\bar", false),
+            ("foo\0bar", false),
+            ("foo bar", false),
+            ("x".repeat(65).as_str(), false),
+        ] {
+            assert_eq!(validate_instance_id(id).is_ok(), ok, "{id:?}");
+        }
 
-        let err =
-            resolve_existing_profile("../etc").expect_err("path traversal name must be rejected");
-        assert!(
-            err.to_string().contains("path separators"),
-            "unexpected message: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_instance_id_rejects_unsafe() {
-        assert!(validate_instance_id("").is_err(), "empty");
-        assert!(validate_instance_id("..").is_err(), "parent ref");
-        assert!(validate_instance_id(".").is_err(), "current ref");
-        assert!(validate_instance_id("/etc").is_err(), "absolute path");
-        assert!(validate_instance_id("foo/bar").is_err(), "subdir traversal");
-        assert!(validate_instance_id("foo\\bar").is_err(), "backslash");
-        assert!(validate_instance_id("foo\0bar").is_err(), "NUL byte");
-        assert!(validate_instance_id("foo bar").is_err(), "whitespace");
-        assert!(
-            validate_instance_id(&"x".repeat(65)).is_err(),
-            "over length cap"
-        );
-    }
-
-    #[test]
-    fn validate_instance_id_accepts_production_and_test() {
-        assert!(
-            validate_instance_id("a3f7c2d1e4b89012").is_ok(),
-            "production hex"
-        );
-        assert!(
-            validate_instance_id("0123456789abcdef").is_ok(),
-            "production hex lower"
-        );
-        assert!(validate_instance_id("compact").is_ok(), "test label");
-        assert!(validate_instance_id("nested_first").is_ok(), "underscore");
-        assert!(validate_instance_id("a-b-c").is_ok(), "hyphen");
-    }
-
-    #[test]
-    fn validate_instance_id_error_messages_do_not_echo_input() {
+        // Errors must not echo input bytes (log injection).
         const SENTINEL: &str = "ZZ_unique_sentinel_aabbcc";
-
-        let bad = format!("{SENTINEL}/x");
-        let e = validate_instance_id(&bad).unwrap_err().to_string();
-        assert!(e.contains("disallowed"));
-        assert!(
-            !e.contains(SENTINEL),
-            "must not echo input bytes; risk of log injection"
-        );
-
-        let bad = format!("{SENTINEL}{}", "x".repeat(70));
-        let e = validate_instance_id(&bad).unwrap_err().to_string();
-        assert!(e.contains("too long"));
-        assert!(
-            !e.contains(SENTINEL),
-            "must not echo input bytes from oversize branch"
-        );
+        for (bad, reason) in [
+            (format!("{SENTINEL}/x"), "disallowed"),
+            (format!("{SENTINEL}{}", "x".repeat(70)), "too long"),
+        ] {
+            let e = validate_instance_id(&bad).unwrap_err().to_string();
+            assert!(e.contains(reason) && !e.contains(SENTINEL), "{e}");
+        }
     }
 }
