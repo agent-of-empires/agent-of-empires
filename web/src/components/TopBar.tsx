@@ -7,7 +7,9 @@ import { PluginStatusBarSegments } from "./plugin/PluginSlots";
 import { ActivityBar } from "./ActivityBar";
 import type { PaneDisplay } from "./Dock";
 import { useWebSettings } from "../hooks/useWebSettings";
+import type { AttentionBadgeColors } from "../lib/attentionBadgeColors";
 import { StrokeIcon } from "./icons";
+import { Tooltip } from "./Tooltip";
 
 interface Props {
   activeWorkspace: Workspace | undefined;
@@ -25,6 +27,13 @@ interface Props {
   onOpenHelp: () => void;
   onOpenAbout: () => void;
   onStartTutorial: () => void;
+  /** Sessions with an unseen finished turn, across every workspace; shown as a badge on the sidebar toggle. */
+  unreadCount: number;
+  /** Sessions waiting for input, across every workspace; shown as a badge on the sidebar toggle. */
+  waitingCount: number;
+  /** Colors for the unread/waiting badges, derived from the app's single resolved-theme read (in `App`); computed
+   *  here instead, it would call `useResolvedTheme()` a second time and race that one (see the function's doc). */
+  attentionBadgeColors: AttentionBadgeColors;
   onLogout: () => void;
   loginRequired: boolean;
   isOffline: boolean;
@@ -59,6 +68,9 @@ export function TopBar({
   onOpenHelp,
   onOpenAbout,
   onStartTutorial,
+  unreadCount,
+  waitingCount,
+  attentionBadgeColors,
   onLogout,
   loginRequired,
   isOffline,
@@ -95,15 +107,58 @@ export function TopBar({
       >
         <button
           onClick={onToggleSidebar}
-          className="w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors text-text-dim hover:text-text-secondary hover:bg-surface-700/50"
+          className="relative w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors text-text-dim hover:text-text-secondary hover:bg-surface-700/50"
           title="Toggle sidebar"
-          aria-label="Toggle sidebar"
+          aria-label={
+            unreadCount > 0 || waitingCount > 0
+              ? `Toggle sidebar, ${unreadCount} unread, ${waitingCount} waiting for your input`
+              : "Toggle sidebar"
+          }
         >
           <StrokeIcon size={16} strokeWidth="1.5">
             <rect x="3" y="3" width="18" height="18" rx="2" />
             <line x1="9" y1="3" x2="9" y2="21" />
           </StrokeIcon>
+          {unreadCount > 0 && (
+            // Positioned on this wrapper, not the pill inside Tooltip: Tooltip's own trigger span is an
+            // in-flow inline-flex box, and leaving it in flow would inflate the button's own `relative` box.
+            // aria-hidden: the button's own aria-label and the live region below carry the accessible counts.
+            <span className="absolute -top-1 -right-1" aria-hidden="true">
+              <Tooltip text={`${unreadCount} unread`}>
+                {/* Solid fill in the theme's own resolved accent, with a foreground picked at render time (not a
+                   fixed class) from that same resolved color: `waiting`/`unread` are user-configurable per theme
+                   (resolved.rs), so no single hardcoded foreground clears WCAG AA against every possible accent. */}
+                <span
+                  className="block min-w-[1.1rem] rounded-full px-1 text-[10px] font-semibold leading-[1.1rem] tabular-nums text-center"
+                  style={{ backgroundColor: attentionBadgeColors.unreadBg, color: attentionBadgeColors.unreadFg }}
+                  data-testid="topbar-unread-badge"
+                >
+                  {unreadCount}
+                </span>
+              </Tooltip>
+            </span>
+          )}
+          {waitingCount > 0 && (
+            <span className="absolute -bottom-1 -right-1" aria-hidden="true">
+              <Tooltip text={`${waitingCount} waiting for your input`}>
+                <span
+                  className="block min-w-[1.1rem] rounded-full px-1 text-[10px] font-semibold leading-[1.1rem] tabular-nums text-center"
+                  style={{ backgroundColor: attentionBadgeColors.waitingBg, color: attentionBadgeColors.waitingFg }}
+                  data-testid="topbar-waiting-badge"
+                >
+                  {waitingCount}
+                </span>
+              </Tooltip>
+            </span>
+          )}
         </button>
+        {/* Persistent (not conditionally mounted) and always carrying the concrete counts, even at zero: emptying
+           the text on the last-cleared transition relies on `aria-relevant`'s default (which excludes removals) to
+           announce it, so screen readers could miss it. A "0 unread, 0 waiting" text change is a reliable text
+           mutation instead. */}
+        <span className="sr-only" aria-live="polite" aria-atomic="true" data-testid="topbar-attention-live-region">
+          {`${unreadCount} unread, ${waitingCount} waiting for your input`}
+        </span>
 
         <button
           onClick={onGoDashboard}

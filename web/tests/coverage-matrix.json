@@ -752,6 +752,25 @@
       "components": ["web/src/components/TopBar.tsx"]
     },
     {
+      "id": "app-shell.topbar-attention-badges",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/__tests__/TopBar.test.tsx",
+        "src/lib/__tests__/session.test.ts",
+        "src/hooks/useAttentionCounts.test.tsx",
+        "src/lib/__tests__/contrastColor.test.ts",
+        "src/lib/__tests__/attentionBadgeColors.test.ts"
+      ],
+      "components": [
+        "web/src/components/TopBar.tsx",
+        "web/src/lib/session.ts",
+        "web/src/hooks/useAttentionCounts.ts",
+        "web/src/lib/contrastColor.ts",
+        "web/src/lib/attentionBadgeColors.ts"
+      ]
+    },
+    {
       "id": "app-shell.activity-bar",
       "kind": "vitest",
       "risk": "low",
@@ -1555,6 +1574,18 @@
         "web/src/components/SidebarSortPicker.tsx",
         "web/src/components/plugin/PluginSlots.tsx"
       ]
+    },
+    {
+      "id": "plugins.link-navigation",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/plugin-link-navigation.spec.ts"],
+      "components": [
+        "web/src/components/plugin/PluginSlots.tsx",
+        "web/src/components/plugin/SlotChrome.tsx",
+        "web/src/App.tsx"
+      ],
+      "notes": "A plugin-supplied UI link's internal/external classification and path resolution (src/lib/pluginHref.ts) is unit-tested in src/lib/__tests__/pluginHref.test.ts; this covers the browser-level click behavior: an internal relative href navigates via the router (no full page load), a session-shaped href goes through the same session-selection flow a sidebar click uses, an external href opens a new tab, and a modified click is not intercepted."
     },
     {
       "id": "sidebar.plugin-row-slots",

@@ -14,6 +14,7 @@ import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
+import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
@@ -35,6 +36,8 @@ import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups"
 import { useProjects } from "./hooks/useProjects";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useResolvedTheme } from "./hooks/useResolvedTheme";
+import type { ResolvedTheme } from "./lib/theme";
+import { getAttentionBadgeColors } from "./lib/attentionBadgeColors";
 import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
@@ -100,7 +103,7 @@ import { fetchActiveProfileSettings } from "./lib/appSettings";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
-import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
+import { NAVIGATE_EVENT, OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
 import {
   clearMobileKeyboardProxyInput,
@@ -178,7 +181,7 @@ export default function App() {
   // The pre-React /theme-bootstrap.js (referenced from index.html)
   // paints the cached theme before hydration; this hook keeps it in
   // sync with the server's view.
-  useResolvedTheme();
+  const resolvedTheme = useResolvedTheme();
   const [loginRequired, setLoginRequired] = useState<boolean | null>(null);
   const [loginAuthenticated, setLoginAuthenticated] = useState(true);
   const [tokenExpired, setTokenExpired] = useState(false);
@@ -288,6 +291,7 @@ export default function App() {
                   loginRequired={loginRequired}
                   onLogout={handleLogout}
                   onSettingsRefresh={refreshAppSettings}
+                  resolvedTheme={resolvedTheme}
                 />
               </PluginUiProvider>
               <ElevationPrompt />
@@ -319,10 +323,12 @@ function AppContent({
   loginRequired,
   onLogout,
   onSettingsRefresh,
+  resolvedTheme,
 }: {
   loginRequired: boolean;
   onLogout: () => void;
   onSettingsRefresh: () => Promise<void> | void;
+  resolvedTheme: ResolvedTheme | null;
 }) {
   useDashboardPresence();
   // Wire the localStorage write chokepoint and pull the server-side UI-state
@@ -366,6 +372,9 @@ function AppContent({
   // every one of its sessions is trashed, and Restore/Delete then cover all of
   // them. See #2533.
   const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
+
+  const { unreadCount, waitingCount } = useAttentionCounts(sessions, activeSessionId);
+  const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103).
   useLastSessionRestore({ activeSessionId, sessions, sessionsLoaded });
@@ -938,12 +947,12 @@ function AppContent({
   );
 
   const handleSelectSession = useCallback(
-    (sessionId: string) => {
+    (sessionId: string, path?: string) => {
       const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
       if (ws) {
         const picked = ws.sessions.find((s) => s.id === sessionId);
         transitionKeyboardProxy(sessionId, sessionId === activeSessionId && singlePane ? rightPanelView : "agent");
-        navigate(`/session/${encodeURIComponent(sessionId)}`);
+        navigate(path ?? `/session/${encodeURIComponent(sessionId)}`);
         // iOS does not permit a session's asynchronously mounted terminal
         // input to inherit this sidebar tap's keyboard authorization. The
         // persistent keyboard input keeps the gesture-authorized focus while
@@ -964,6 +973,12 @@ function AppContent({
           focusKeyboardProxy();
           focusAgentInput(picked);
         }
+        if (window.innerWidth < 768) setSidebarOpen(false);
+      } else if (path) {
+        // Not yet in the locally known workspace list (e.g. a session a
+        // plugin just created); the route itself resolves the session
+        // independently of this list, so a bare navigation still works.
+        navigate(path);
         if (window.innerWidth < 768) setSidebarOpen(false);
       }
     },
@@ -1014,14 +1029,28 @@ function AppContent({
   // the user taps it; navigate to the session that triggered the push.
   useEffect(() => {
     const onOpen = (e: Event) => {
-      const detail = (e as CustomEvent).detail as { sessionId?: string } | undefined;
+      const detail = (e as CustomEvent).detail as { sessionId?: string; path?: string } | undefined;
       if (detail?.sessionId) {
-        handleSelectSession(detail.sessionId);
+        handleSelectSession(detail.sessionId, detail.path);
       }
     };
     window.addEventListener(OPEN_SESSION_EVENT, onOpen);
     return () => window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
   }, [handleSelectSession]);
+
+  // A plugin-supplied link that resolves to aoe's own origin navigates via
+  // the router instead of opening a new tab.
+  useEffect(() => {
+    const onNavigate = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { path?: string } | undefined;
+      if (!detail?.path) return;
+      navigate(detail.path);
+      // See handleSelectSession: a mobile sidebar left open would cover the destination.
+      if (window.innerWidth < 768) setSidebarOpen(false);
+    };
+    window.addEventListener(NAVIGATE_EVENT, onNavigate);
+    return () => window.removeEventListener(NAVIGATE_EVENT, onNavigate);
+  }, [navigate]);
 
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
   const [deletingSessionIds, setDeletingSessionIds] = useState<string[] | null>(null);
@@ -2270,6 +2299,9 @@ function AppContent({
             onOpenHelp={handleOpenHelp}
             onOpenAbout={handleOpenAbout}
             onStartTutorial={tour.startTour}
+            unreadCount={unreadCount}
+            waitingCount={waitingCount}
+            attentionBadgeColors={attentionBadgeColors}
             onLogout={onLogout}
             loginRequired={loginRequired}
             isOffline={!!error}

@@ -710,7 +710,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 instance.resume_intent = crate::session::ResumeIntent::Fork {
                     from: parent.session_id.clone(),
                 };
-                instance.resume_binding = Some(parent);
+                instance.resume_binding = Some(*parent);
             }
             crate::session::ForkSeed::Structured { .. } => {}
         }

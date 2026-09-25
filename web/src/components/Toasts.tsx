@@ -1,7 +1,8 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { toastBus, type ToastApi, type ToastKind } from "../lib/toastBus";
 import { requestOpenSession } from "../lib/sessionRoute";
-import { isExternalHttpUrl, openExternal } from "../lib/pluginCommands";
+import { openPluginLink } from "../lib/pluginCommands";
+import { isAllowedHref } from "../lib/pluginHref";
 
 interface Toast {
   id: number;
@@ -101,9 +102,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           const clickable = !!t.sessionId || !!t.href;
           const onToastClick = () => {
             if (t.href) {
-              // Defensive re-check: the server already rejects non-http(s) notification hrefs, but never hand an
+              // Defensive re-check: the server already rejects disallowed notification hrefs, but never hand an
               // unvalidated scheme to window.open in case a future push path skips that gate.
-              if (isExternalHttpUrl(t.href)) openExternal(t.href);
+              if (isAllowedHref(t.href)) openPluginLink(t.href);
             } else if (t.sessionId) {
               requestOpenSession(t.sessionId);
             } else {

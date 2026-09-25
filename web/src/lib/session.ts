@@ -75,6 +75,38 @@ export function getStatusTextClass(
   return STATUS_TEXT_CLASS[session.status] ?? "text-status-idle";
 }
 
+/** Live (not archived/snoozed/trashed), resting (Idle/Unknown) session with an unseen finished turn, excluding the
+ *  one currently open. Mirrors the sidebar row's own gate (`rowModel.ts`'s `showUnreadGlyph`): a live status like
+ *  Running or Waiting outranks the unread marker, since a session already busy on a new turn isn't something that
+ *  needs attention *now* just because an earlier turn went unread. */
+export function sessionIsUnread(s: SessionResponse, activeSessionId: string | null): boolean {
+  if (s.archived_at != null || s.snoozed_until != null || s.trashed_at != null) return false;
+  if (s.status !== "Idle" && s.status !== "Unknown") return false;
+  return s.unread === true && s.id !== activeSessionId;
+}
+
+/** Live (not archived/snoozed/trashed) session waiting for input. */
+export function sessionIsWaitingForInput(s: SessionResponse): boolean {
+  if (s.archived_at != null || s.snoozed_until != null || s.trashed_at != null) return false;
+  return s.status === "Waiting";
+}
+
+/** Count of unread sessions for the top-bar badge; 0 when the user has turned the unread indicator off, mirroring
+ *  the sidebar row's own gate (`rowModel.ts`) so a disabled indicator doesn't reappear here. */
+export function countUnreadSessions(
+  sessions: readonly SessionResponse[],
+  activeSessionId: string | null,
+  unreadIndicatorEnabled: boolean,
+): number {
+  if (!unreadIndicatorEnabled) return 0;
+  return sessions.filter((s) => sessionIsUnread(s, activeSessionId)).length;
+}
+
+/** Count of sessions waiting for input, for the top-bar badge. */
+export function countWaitingSessions(sessions: readonly SessionResponse[]): number {
+  return sessions.filter(sessionIsWaitingForInput).length;
+}
+
 /** Fresh-idle counts as active. */
 export function isSessionActive(
   session: Pick<SessionResponse, "status" | "idle_entered_at"> | SessionStatus,
