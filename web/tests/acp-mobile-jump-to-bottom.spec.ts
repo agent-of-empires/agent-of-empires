@@ -20,7 +20,7 @@ async function userScroll(viewport: Locator, top: number) {
 test.use({ ...devices["iPhone 13"] });
 
 test.describe("mobile jump-to-bottom", () => {
-  test("appears while scrolled up in a long transcript and re-pins on tap", async ({ page }) => {
+  test("appears while scrolled up in a long transcript, survives a reload, and re-pins on tap", async ({ page }) => {
     const longText = Array.from({ length: 120 }, (_, i) => `transcript line ${i}`).join("\n");
     const mock = await mockAcpSession(page, {
       title: "story-jump-bottom",
@@ -35,6 +35,11 @@ test.describe("mobile jump-to-bottom", () => {
     await expect(button).toBeHidden();
 
     await userScroll(viewport, 0);
+    await expect(button).toBeVisible();
+
+    // Reopening (reload) preserves the scrolled-up position.
+    await page.reload();
+    await waitForComposerConnected(page);
     await expect(button).toBeVisible();
 
     await button.click();
@@ -111,25 +116,6 @@ test.describe("mobile jump-to-bottom", () => {
     await textarea.fill(Array.from({ length: 8 }, (_, i) => `draft line ${i}`).join("\n"));
     await expect.poll(() => textarea.evaluate((el) => el.getBoundingClientRect().height)).toBeGreaterThan(beforeHeight);
     await expect.poll(isPinned).toBe(true);
-  });
-
-  test("reopening (reload) preserves a scrolled-up position", async ({ page }) => {
-    const longText = Array.from({ length: 200 }, (_, i) => `transcript history line number ${i}`).join("\n");
-    const mock = await mockAcpSession(page, {
-      title: "story-reopen-up",
-      initialEvents: [agentMessageChunk(longText), stopped()],
-    });
-    await openStructuredSession(page, mock);
-    await waitForComposerConnected(page);
-
-    const viewport = page.getByTestId("acp-viewport");
-    await expect.poll(() => viewport.evaluate((el) => el.scrollHeight > el.clientHeight + 40)).toBe(true);
-    await userScroll(viewport, 0);
-    await expect(page.getByTestId("acp-jump-to-bottom")).toBeVisible();
-
-    await page.reload();
-    await waitForComposerConnected(page);
-    await expect(page.getByTestId("acp-jump-to-bottom")).toBeVisible();
   });
 
   test("reopening a session with loadable earlier history still lands at the bottom", async ({ page }) => {

@@ -109,7 +109,7 @@ async function installCityHallMocks(page: Page) {
   );
 }
 
-test("Settings, its Sessions and Theme tabs, and settings search are curated to the CityHall subset", async ({
+test("Settings, its tabs, and settings search are curated to the CityHall subset; MCP and Plugins are read-only", async ({
   page,
 }) => {
   await installCityHallMocks(page);
@@ -146,11 +146,8 @@ test("Settings, its Sessions and Theme tabs, and settings search are curated to 
   await expect(page.locator("button:visible", { hasText: "Theme" }).first()).toBeVisible();
   await expect(page.getByText("Color mode")).toHaveCount(0);
   await expect(page.getByText("Idle decay")).toHaveCount(0);
-});
 
-test("CityHall MCP + Plugins tabs render read-only", async ({ page }) => {
-  await installCityHallMocks(page);
-
+  // MCP and Plugins render read-only.
   await page.goto("/settings/mcp");
   await expect(page.getByRole("heading", { name: "MCP Servers" }).first()).toBeVisible();
   await expect(page.getByRole("button", { name: /resolve dup/ })).toHaveCount(0);

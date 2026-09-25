@@ -40,7 +40,9 @@ async function tabCenter(page: Page, id: string): Promise<{ x: number; y: number
 }
 
 test.describe("Dockable pane system", () => {
-  test("the activity bar toggles the built-in diff and terminal panes", async ({ page }) => {
+  test("the activity bar toggles the built-in panes and the new-terminal button adds a closable tab", async ({
+    page,
+  }) => {
     await openSession(page);
     await page.goto(`/session/${SESSION}`);
 
@@ -57,6 +59,14 @@ test.describe("Dockable pane system", () => {
 
     await diffToggle.click();
     await expect(diffToggle).toHaveAttribute("aria-pressed", "true");
+
+    // The new-terminal button opens a second terminal tab that can be closed.
+    await expect(page.getByTestId("pane-tab-terminal:1")).toHaveCount(0);
+    await page.getByLabel("New terminal").first().click();
+    await expect(page.getByTestId("pane-tab-terminal:1")).toBeVisible();
+    await page.getByLabel("Close terminal 2").click();
+    await expect(page.getByTestId("pane-tab-terminal:1")).toHaveCount(0);
+    await expect(page.getByTestId("pane-tab-terminal:0")).toBeVisible();
   });
 
   test("a pane moves from the right dock to the bottom dock", async ({ page }) => {
@@ -210,21 +220,6 @@ test.describe("Dockable pane system", () => {
 
     await expect.poll(() => dockTabOrder(page, "right")).toEqual([]);
     await expect.poll(() => dockTabOrder(page, "bottom")).toContain("terminal:0");
-  });
-
-  test("the new-terminal button opens a second terminal tab that can be closed", async ({ page }) => {
-    await openSession(page);
-    await page.goto(`/session/${SESSION}`);
-
-    await expect(page.getByTestId("pane-tab-terminal:0")).toBeVisible();
-    await expect(page.getByTestId("pane-tab-terminal:1")).toHaveCount(0);
-
-    await page.getByLabel("New terminal").first().click();
-    await expect(page.getByTestId("pane-tab-terminal:1")).toBeVisible();
-
-    await page.getByLabel("Close terminal 2").click();
-    await expect(page.getByTestId("pane-tab-terminal:1")).toHaveCount(0);
-    await expect(page.getByTestId("pane-tab-terminal:0")).toBeVisible();
   });
 
   test("dragging a tab onto a pane body splits the right dock into two groups that persist", async ({ page }) => {

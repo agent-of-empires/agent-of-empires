@@ -73,7 +73,7 @@ async function openProfiles(page: Page) {
   await expect(page.getByRole("heading", { name: "Profiles" })).toBeVisible();
 }
 
-test("create profile via + New profile POSTs and the rail gains the row", async ({ page }) => {
+test("+ New profile POSTs and the rail gains the row; Set as default PATCHes and moves the badge", async ({ page }) => {
   const handle = await installProfilesPageMocks(page);
   await openProfiles(page);
 
@@ -85,15 +85,9 @@ test("create profile via + New profile POSTs and the rail gains the row", async 
   await expect.poll(() => handle.posts).toEqual([{ name: "work" }]);
   await expect(page.getByRole("button", { name: "work", exact: true })).toBeVisible();
   expect(handle.profiles.map((p) => p.name).sort()).toEqual(["main", "work"]);
-});
-
-test("set as default PATCHes /api/default-profile and moves the badge", async ({ page }) => {
-  const handle = await installProfilesPageMocks(page, { profiles: ["main", "work"] });
-  await openProfiles(page);
 
   await page.getByRole("button", { name: "work", exact: true }).click();
   await page.getByRole("button", { name: "Set as default" }).click();
-
   await expect.poll(() => handle.defaultPatches).toEqual([{ name: "work" }]);
   // The page re-fetches the list after the PATCH; the badge follows the flag.
   await expect(page.getByRole("button", { name: "work default" })).toBeVisible();

@@ -80,7 +80,9 @@ test.describe("Mobile keyboard detection and layout", () => {
     expect(result.calls).toContainEqual([0, 0]);
   });
 
-  test("auto-resizes back when keyboard closes (occlusion releases)", async ({ page }) => {
+  test("auto-resizes back when keyboard closes (occlusion releases), with no React hooks errors", async ({ page }) => {
+    const errors: string[] = [];
+    page.on("pageerror", (err) => errors.push(err.message));
     await setupAndOpen(page);
 
     await simulateKeyboardOpen(page, 300);
@@ -96,6 +98,8 @@ test.describe("Mobile keyboard detection and layout", () => {
     const after = await getKeyboardState(page);
     // #1432: occlusion releases when the keyboard dismisses.
     expect(parseInt(after.rootPaddingBottom) || 0).toBe(0);
+    // Session open (pending -> ready) and the keyboard cycle must not reorder hooks.
+    expect(errors.filter((e) => /hook|Rendered/i.test(e))).toEqual([]);
   });
 
   test("Claude terminal selection keeps the keyboard closed", async ({ page }) => {
@@ -190,26 +194,5 @@ test.describe("Mobile proxy input keydown handling", () => {
     await expect
       .poll(() => terminal.liveMessages.map((message) => message.toString()).join("\n"))
       .toContain("reselected");
-  });
-});
-
-test.describe("Mobile keyboard hooks ordering", () => {
-  test("no React hooks error from session open through a keyboard open and close", async ({ page }) => {
-    const errors: string[] = [];
-    page.on("pageerror", (err) => errors.push(err.message));
-
-    const handle = await mockTerminalApis(page);
-    await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
-    await openSession(page, handle);
-
-    await simulateKeyboardOpen(page, 300);
-    await expect
-      .poll(async () => parseInt((await getKeyboardState(page)).rootPaddingBottom))
-      .toBeGreaterThanOrEqual(250);
-    await simulateKeyboardClose(page);
-    await expect.poll(async () => parseInt((await getKeyboardState(page)).rootPaddingBottom) || 0).toBe(0);
-
-    const hookErrors = errors.filter((e) => e.includes("hook") || e.includes("Hook") || e.includes("Rendered"));
-    expect(hookErrors).toEqual([]);
   });
 });

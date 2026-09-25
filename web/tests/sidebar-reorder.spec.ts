@@ -62,7 +62,9 @@ test.describe("desktop rows", () => {
     }
   });
 
-  test("press-and-hold drag lifts the row, PUTs the new order once, and persists across reload", async ({ page }) => {
+  test("press-and-hold drag lifts the row, PUTs the new order once, suppresses the trailing click, and persists", async ({
+    page,
+  }) => {
     const sessions = threeSessionsInOneRepo();
     const handle = await openDesktop(page, sessions, { persistPutOrdering: true });
     await expect.poll(() => readVisibleSessionTitles(page), { timeout: 8_000 }).toEqual(["alpha", "beta", "gamma"]);
@@ -81,22 +83,14 @@ test.describe("desktop rows", () => {
 
     await putWait;
     expect(handle.puts.map((p) => p.order)).toEqual([[sessions[2]!, sessions[0]!, sessions[1]!].map(workspaceId)]);
+    // Chromium dispatches a click on the drop target after mouseup; navigating there would defeat the drag.
+    await observeFor(page, 400, async () => {
+      expect(new URL(page.url()).pathname).toBe("/");
+    });
     await expect.poll(() => readVisibleSessionTitles(page), { timeout: 4_000 }).toEqual(["gamma", "alpha", "beta"]);
     // The reloaded order comes from the served ordering, not a client sort.
     await page.reload();
     await expect.poll(() => readVisibleSessionTitles(page), { timeout: 8_000 }).toEqual(["gamma", "alpha", "beta"]);
-  });
-
-  test("click-after-drag suppression keeps the URL on the source row", async ({ page }) => {
-    // Chromium dispatches a click on the drop target after mouseup; navigating there would defeat the drag.
-    const handle = await openDesktop(page);
-    const wrappers = page.locator(WRAPPERS);
-    await expect(wrappers).toHaveCount(3);
-    await dragRow(page, wrappers.nth(2), wrappers.nth(0));
-    await expect.poll(() => handle.puts.length, { timeout: 3_000 }).toBe(1);
-    await observeFor(page, 400, async () => {
-      expect(new URL(page.url()).pathname).toBe("/");
-    });
   });
 
   test("a 4px movement does not start a drag; a stationary click navigates without reordering", async ({ page }) => {

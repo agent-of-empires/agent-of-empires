@@ -74,40 +74,7 @@ test.describe("Mobile live-view scrollback", () => {
     expect(visibleText, "a scroll-up shows loaded scrollback, not blank").toContain("history line");
   });
 
-  test("reading a deep history mounts only a window of rows (virtualized)", async ({ page }) => {
-    await installTerminalSpies(page);
-    const handle = await mockTerminalApis(page, { liveHistory: 600 });
-    await openSession(page, handle);
-
-    await scroller(page).evaluate((el) => {
-      el.scrollTop = el.scrollHeight * 0.5;
-    });
-    await expect.poll(() => scroller(page).evaluate((el) => el.scrollHeight), { timeout: 3_000 }).toBeGreaterThan(8000);
-
-    // Rows are virtualized: only a window is mounted while scrollHeight spans the history.
-    await scroller(page).evaluate((el) => {
-      el.scrollTop = el.scrollHeight * 0.5;
-    });
-    await expect
-      .poll(() =>
-        scroller(page).evaluate((el) => {
-          const pane = el.getBoundingClientRect();
-          return Array.from(el.querySelectorAll("[data-live-content] > div")).some((row) => {
-            const rect = row.getBoundingClientRect();
-            return rect.bottom > pane.top && rect.top < pane.bottom && row.textContent?.includes("history line");
-          });
-        }),
-      )
-      .toBe(true);
-    const m = await scroller(page).evaluate((el) => ({
-      mounted: el.querySelectorAll("[data-live-content] > div").length,
-      scrollHeight: el.scrollHeight,
-    }));
-    expect(m.mounted, "only a window of the deep history is mounted").toBeLessThan(250);
-    expect(m.scrollHeight, "the document still spans the full history").toBeGreaterThan(8000);
-  });
-
-  test("jumping to the bottom while reading does not show a blank spacer frame", async ({ page }) => {
+  test("a deep history is virtualized, and jumping to the bottom shows no blank spacer frame", async ({ page }) => {
     await installTerminalSpies(page);
     const handle = await mockTerminalApis(page, { liveHistory: 600 });
     await openSession(page, handle);
@@ -119,8 +86,12 @@ test.describe("Mobile live-view scrollback", () => {
     });
     await expect.poll(() => scroller(page).evaluate((el) => el.scrollHeight), { timeout: 3_000 }).toBeGreaterThan(8000);
 
-    // Keep the live tail mounted so the flip back to live renders rows, not a spacer.
+    // Rows are virtualized: only a window of the deep history is mounted.
     await expect(page.locator("[data-live-content]")).toContainText("history line");
+    const mounted = await scroller(page).evaluate((el) => el.querySelectorAll("[data-live-content] > div").length);
+    expect(mounted, "only a window of the deep history is mounted").toBeLessThan(250);
+
+    // Keep the live tail mounted so the flip back to live renders rows, not a spacer.
     const visibleText = await scroller(page).evaluate((el) => {
       el.scrollTop = el.scrollHeight - el.clientHeight;
       el.dispatchEvent(new Event("scroll"));

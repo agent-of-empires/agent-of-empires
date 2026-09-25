@@ -13,32 +13,9 @@ import {
 
 test.use({ viewport: { width: 1280, height: 720 } });
 
-// #2489: the default Delete moves a session to Trash; Restore brings it back.
+// #2489: trash and restore round-trip against the server in live/session-actions.spec.ts.
 test.describe("Session trash flow", () => {
   const SESSION = { id: "sess-trash", title: "story-trash", projectPath: "/tmp/story", groupPath: "/tmp" };
-  const row = (page: Page, title = "story-trash") => sessionRows(page).filter({ hasText: title }).first();
-
-  test("trash moves the row into Trash, restore brings it back", async ({ page }) => {
-    const handle = await installTrashMocks(page, [{ ...SESSION, trashed: false }]);
-    await page.goto("/session/sess-trash");
-
-    const dialog = await openDeleteDialogFromRow(page, row(page));
-    await expect(dialog.locator('[data-testid="delete-session-permanent"]')).not.toBeChecked();
-    await confirmDelete(dialog);
-    await expect.poll(() => handle.trashedIds.length, { timeout: 10_000 }).toBe(1);
-
-    await expect(trashToggle(page)).toContainText("Trash", { timeout: 10_000 });
-    await openTrash(page);
-    const trashRow = trashRows(page).filter({ hasText: "story-trash" });
-    await expect(trashRow.locator('[data-testid="sidebar-trash-open"]')).toContainText("Open");
-    await expect(trashRow.locator('[data-testid="sidebar-trash-restore"]')).toContainText("Restore");
-    await expect(trashRow.locator('[data-testid="sidebar-trash-purge"]')).toContainText("Delete");
-
-    await trashRow.locator('[data-testid="sidebar-trash-restore"]').click();
-    await expect.poll(() => handle.restoredIds.length, { timeout: 10_000 }).toBe(1);
-    await expect(trashToggle(page)).toHaveCount(0, { timeout: 10_000 });
-    await expect(row(page)).toBeVisible({ timeout: 10_000 });
-  });
 
   test("Delete on a long-named trashed row opens a usable permanent-delete dialog", async ({ page }) => {
     const title = `story-trash-${"x".repeat(240)}`;

@@ -188,7 +188,7 @@ test.describe("Sidebar multi-session (#956)", () => {
     await expect(page.getByRole("link", { name: /Italians/i }).getByTestId("sidebar-session-row-tag")).toHaveCount(0);
   });
 
-  test("project group context menu stores alias and background color", async ({ page }) => {
+  test("project group context menu opens from the keyboard and stores alias and background color", async ({ page }) => {
     await mockApis(page, [
       {
         id: "sess-a",
@@ -210,7 +210,9 @@ test.describe("Sidebar multi-session (#956)", () => {
     const projectHeader = page.locator('[data-testid="sidebar-group-header"][data-group-id="/tmp/agent-of-empires"]');
     await expect(projectHeader).toBeVisible();
 
-    await projectHeader.click({ button: "right" });
+    // The appearance menu opens from the keyboard too.
+    await projectHeader.focus();
+    await page.keyboard.press("Shift+F10");
     const menu = page.locator("[data-testid='sidebar-group-context-menu']");
     await expect(menu).toBeVisible();
     await menu.locator("[data-testid='sidebar-group-context-menu-rename']").click();
@@ -288,27 +290,5 @@ test.describe("Sidebar multi-session (#956)", () => {
 
     await expect.poll(() => archived.slice().sort()).toEqual(["sess-a", "sess-b"]);
     expect(confirmText).toContain("Archive all 2 sessions");
-  });
-
-  test("project group appearance menu opens from keyboard", async ({ page }) => {
-    await mockApis(page, [
-      {
-        id: "sess-a",
-        title: "Ethiopians",
-        project_path: "/tmp/agent-of-empires",
-        branch: null,
-      },
-    ]);
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-
-    const projectHeader = page.locator('[data-testid="sidebar-group-header"][data-group-id="/tmp/agent-of-empires"]');
-    await projectHeader.focus();
-    await page.keyboard.press("Shift+F10");
-
-    const menu = page.locator("[data-testid='sidebar-group-context-menu']");
-    await expect(menu).toBeVisible();
-    await expect(menu.locator("[data-testid='sidebar-group-context-menu-rename']")).toBeVisible();
   });
 });

@@ -19,14 +19,6 @@ const BRANCH_PLACEHOLDER = "Uses session title if empty";
 const GROUP_PLACEHOLDER = "Optional, for organizing related sessions";
 
 test.describe("essentials", () => {
-  test("recent project + default agent launches with one click, no paging", async ({ page }) => {
-    const created = await startWizard(page, WORKTREE_ON);
-    await expect(page.getByRole("button", { name: "Next" })).toHaveCount(0);
-    await launch(page);
-    await expect.poll(() => created[0]?.path).toBe("/tmp/example");
-    expect(created[0]?.tool).toBe("claude");
-  });
-
   test("only essentials show on open; advanced controls hide behind collapsed More options", async ({ page }) => {
     await startWizard(page, WORKTREE_ON);
     const w = wizard(page);
@@ -89,6 +81,8 @@ test.describe("essentials", () => {
 
   test("Cmd/Ctrl+Enter fires the create-session POST with the default worktree", async ({ page }) => {
     const created = await startWizard(page, WORKTREE_ON);
+    // The recent project and default agent need no paging.
+    await expect(page.getByRole("button", { name: "Next" })).toHaveCount(0);
     await setTitle(page, "kbd-launch");
     await page.keyboard.press("ControlOrMeta+Enter");
     await expect.poll(() => created[0]?.tool).toBe("claude");
