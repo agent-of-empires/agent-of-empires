@@ -535,8 +535,9 @@ mod tests {
         }
         assert!(!do_not_track());
 
-        let _opt_out = EnvGuard::set(&[("DO_NOT_TRACK", "1")]);
-        assert!(
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_config(|c| c.telemetry.enabled = true).unwrap();
+        let build = || {
             build_usage_snapshot(
                 Surface::Tui,
                 &[Instance::new("s", "/tmp/p")],
@@ -544,10 +545,14 @@ mod tests {
                 0,
                 None,
                 None,
-                &StructuredInteractionCounts::default()
+                &StructuredInteractionCounts::default(),
             )
-            .is_none(),
-            "opted-out install must not build a snapshot"
+        };
+        assert!(build().is_some(), "an opted-in install builds a snapshot");
+        let _opt_out = EnvGuard::set(&[("DO_NOT_TRACK", "1")]);
+        assert!(
+            build().is_none(),
+            "DO_NOT_TRACK must veto an opted-in install"
         );
     }
 
