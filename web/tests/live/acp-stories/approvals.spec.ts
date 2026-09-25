@@ -167,3 +167,38 @@ test("elicitation form with number + boolean fields round-trips", async ({ page,
   await expect(postChunk).toBeVisible({ timeout: 10_000 });
   await expect(questionDialog).toBeHidden({ timeout: 10_000 });
 });
+
+test("free-text question (the 'Other' box) submits on Enter, not just the Submit button click", async ({
+  page,
+  spawnServe,
+}) => {
+  const { serve, sessionId } = await startAcpSession(spawnServe, {
+    title: "story-ask-enter",
+    fakeAcpScript: turn(
+      chunk("What's your name?"),
+      {
+        sessionUpdate: "elicitation_request",
+        message: "What's your name?",
+        requestedSchema: {
+          type: "object",
+          properties: {
+            question_0: { type: "string", title: "Name" },
+          },
+        },
+      },
+      chunk("Nice to meet you."),
+    ),
+  });
+  await openStructuredView(page, serve, sessionId, "ask my name");
+
+  const questionDialog = page.getByRole("alertdialog", { name: /Question from the agent/i });
+  await expect(questionDialog).toBeVisible({ timeout: 10_000 });
+  const postAnswerChunk = page.getByText("Nice to meet you.");
+  await expect(postAnswerChunk).toHaveCount(0);
+
+  const answerBox = questionDialog.getByPlaceholder("Type your answer");
+  await answerBox.fill("Ada");
+  await answerBox.press("Enter");
+  await expect(postAnswerChunk).toBeVisible({ timeout: 10_000 });
+  await expect(questionDialog).toBeHidden({ timeout: 10_000 });
+});
