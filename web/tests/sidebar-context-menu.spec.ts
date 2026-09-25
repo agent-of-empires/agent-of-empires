@@ -411,6 +411,8 @@ test.describe("Long-press menu (mobile)", () => {
       type: "touchStart",
       touchPoints: [{ x, y, id: 1 }],
     });
+    // The guard window starts at open; expect's backoff alone can spend most of it.
+    await page.waitForFunction((sel) => document.querySelector(sel) !== null, MENU, { polling: "raf" });
     await expect(menu(page)).toBeVisible();
 
     // The menu sits under the finger, which is what makes the inside-menu guard matter.
