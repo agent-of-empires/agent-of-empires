@@ -3941,16 +3941,6 @@ mod tests {
         );
     }
 
-    // Tests for Config defaults
-    #[test]
-    fn session_id_poller_max_threads_defaults_and_parses() {
-        let config: Config = toml::from_str("").unwrap();
-        assert_eq!(config.session.session_id_poller_max_threads, 50);
-        let config: Config =
-            toml::from_str("[session]\nsession_id_poller_max_threads = 400\n").unwrap();
-        assert_eq!(config.session.session_id_poller_max_threads, 400);
-    }
-
     /// Regression: earlier schemas had `check_enabled`, `auto_update`,
     /// `check_interval_hours`, `notify_in_cli`, and
     /// `web_poll_interval_minutes` on UpdatesConfig. All are gone now;

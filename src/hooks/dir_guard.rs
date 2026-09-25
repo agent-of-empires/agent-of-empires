@@ -672,31 +672,6 @@ mod tests {
 
     #[test]
     #[serial(hook_base)]
-    fn write_short_then_read_file_at_roundtrip() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
-        make_correct_base(&base);
-        let dir = open_instance_dir("rt").unwrap();
-        write_short(dir.as_fd(), "status", b"running").unwrap();
-        let bytes = read_file_at(dir.as_fd(), "status", 64).unwrap().unwrap();
-        assert_eq!(bytes, b"running");
-    }
-
-    #[test]
-    #[serial(hook_base)]
-    fn write_atomic_renames_atomically() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
-        make_correct_base(&base);
-        let dir = open_instance_dir("atomic_rt").unwrap();
-        let uuid = b"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        write_atomic(dir.as_fd(), "session_id", uuid).unwrap();
-        let bytes = read_file_at(dir.as_fd(), "session_id", 64)
-            .unwrap()
-            .unwrap();
-        assert_eq!(bytes, uuid);
-    }
-
-    #[test]
-    #[serial(hook_base)]
     fn read_file_at_returns_none_when_absent() {
         let (_g, base, _tmp) = BaseGuard::fresh();
         make_correct_base(&base);

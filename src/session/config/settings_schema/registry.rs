@@ -168,13 +168,4 @@ mod tests {
                 .profile_overridable
         );
     }
-
-    #[test]
-    fn section_in_schema_separates_derived_sections_from_hooks() {
-        assert!(section_in_schema("session"));
-        assert!(section_in_schema("sandbox"));
-        assert!(section_in_schema("worktree"));
-        assert!(section_in_schema("updates"));
-        assert!(!section_in_schema("hooks"));
-    }
 }

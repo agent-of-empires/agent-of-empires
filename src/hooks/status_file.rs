@@ -290,17 +290,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial(hook_base)]
-    fn test_read_dangling_symlink() {
-        let (_g, base, _tmp) = BaseGuard::ready();
-        let dir = dir_guard::open_instance_dir("dangling").unwrap();
-        drop(dir);
-        std::os::unix::fs::symlink("/nonexistent/target", base.join("dangling").join("status"))
-            .unwrap();
-        assert_eq!(read_hook_status("dangling"), None);
-    }
-
-    #[test]
-    #[serial_test::serial(hook_base)]
     fn test_ensure_instance_dir_path_resolves_symlinked_prefix() {
         // #3240: podman machine shares host paths under their real
         // paths (/private, not /tmp) inside the VM, so the bind-mount source

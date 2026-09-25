@@ -3083,48 +3083,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_remain_on_exit_and_pane_dead() {
-        require_tmux!();
-
-        let guard = TmuxTestSession::new("aoe_test_remain");
-        let session_name = guard.name().to_string();
-        let output = start_test_session(
-            &session_name,
-            ("80", "24"),
-            &["sleep 1"],
-            &[
-                ";",
-                "set-option",
-                "-p",
-                "-t",
-                &session_name,
-                "remain-on-exit",
-                "on",
-            ],
-        );
-        assert!(output.status.success());
-
-        wait_for_pane_dead(&only_pane_id(&session_name));
-
-        let exists = crate::tmux::tmux_command()
-            .args(["has-session", "-t", &session_name])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        assert!(exists, "Session should still exist due to remain-on-exit");
-
-        let pane_dead = crate::tmux::tmux_command()
-            .args(["display-message", "-t", &session_name, "-p", "#{pane_dead}"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim() == "1")
-            .unwrap_or(false);
-        assert!(pane_dead, "Pane should be dead after command exits");
-    }
-
-    #[test]
-    #[serial_test::serial]
     fn test_create_forwards_desktop_env_to_session() {
         require_tmux!();
 

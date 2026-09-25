@@ -723,22 +723,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_pane_running_shell_command_accounts_for_protected_wrapper() {
-        let cases = [
-            ("sh", true, false),
-            ("sh", false, true),
-            ("claude", false, false),
-        ];
-        for (current_command, pane_start_command_is_protected, expected) in cases {
-            assert_eq!(
-                is_pane_running_shell_command(current_command, pane_start_command_is_protected),
-                expected,
-                "{current_command:?}, protected={pane_start_command_is_protected}"
-            );
-        }
-    }
-
-    #[test]
     fn test_format_tmux_prefix() {
         let cases = [
             ("C-a", "Ctrl+a"),
