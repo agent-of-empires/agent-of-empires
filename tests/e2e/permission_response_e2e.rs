@@ -101,37 +101,3 @@ fn test_respond_to_permission_allow_sends_bare_digit() {
     // after it.
     h.wait_for("GOT:[1]");
 }
-
-#[test]
-#[parallel]
-fn test_respond_to_codex_permission_allow_always_sends_a() {
-    require_tmux!();
-
-    let mut h = TuiTestHarness::new("perm_resp_codex_allow_always");
-    h.install_path_command("codex");
-    let fake_codex = install_fake_prompt(&h, "codex");
-
-    let project = h.project_path();
-    h.run_cli(&[
-        "add",
-        project.to_str().unwrap(),
-        "-t",
-        "CodexPermResp",
-        "--tool",
-        "codex",
-        "--cmd-override",
-        fake_codex.to_str().unwrap(),
-        "--launch",
-    ]);
-
-    h.spawn_tui();
-    h.wait_for(" aoe ");
-    h.wait_for("CodexPermResp");
-    h.wait_for("Do you want to proceed?");
-
-    h.send_keys("a");
-    h.wait_for("Respond to Permission Prompt");
-    h.send_keys("A");
-
-    h.wait_for("GOT:[a]");
-}

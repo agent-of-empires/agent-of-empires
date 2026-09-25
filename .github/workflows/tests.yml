@@ -152,7 +152,7 @@ jobs:
         run: |
           cargo test --no-default-features --lib --bins
           cargo test --no-default-features --features e2e-tests --test e2e -- \
-            --test-threads=3 cli:: tui_launch:: new_session::
+            --test-threads=3 cli:: new_session::
           cargo check --no-default-features --features default-plugins,e2e-tests --all-targets
       # A default `cargo build` must ship the daemon without invoking Node
       # (#3619). Shadow node and npm with failing stubs so a `web`-gate

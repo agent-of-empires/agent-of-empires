@@ -1,6 +1,6 @@
 //! e2e: peer-process writes to `sessions.json` reach the TUI through the
 //! five-second storage heartbeat fallback (the watcher path is covered by
-//! `filewatch_tui_burst_reload`). The test creates a previously unknown
+//! `filewatch_tui_dynamic_profile`). The test creates a previously unknown
 //! profile while live-send is active, so no disk watch can already cover it;
 //! the periodic storage-only reload must discover it without running the
 //! deferred full heartbeat.
