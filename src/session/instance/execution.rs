@@ -156,8 +156,7 @@ pub(crate) fn attest_observed_default_store(
     binding: &mut ConversationBinding,
     observed: Option<&ExecutionBinding>,
 ) -> bool {
-    let Some(observed) = observed.filter(|o| o.agent == "claude" && o.filesystem == "host")
-    else {
+    let Some(observed) = observed.filter(|o| o.agent == "claude" && o.filesystem == "host") else {
         return false;
     };
     let Some(observed_store) = single_store(&observed.stores) else {
@@ -2515,10 +2514,7 @@ mod tests {
         // Two spellings of one store are one store, so the marker is written.
         let mut binding = legacy("claude", "host", temp.path().join("claude/"));
         let before = binding.clone();
-        assert!(attest_observed_default_store(
-            &mut binding,
-            Some(&observed)
-        ));
+        assert!(attest_observed_default_store(&mut binding, Some(&observed)));
         assert_eq!(marker(&binding), Some(true));
         assert_eq!(without_marker(&binding), without_marker(&before));
         assert_eq!(binding, before, "the marker is not part of the identity");
@@ -2549,12 +2545,7 @@ mod tests {
                 store.clone(),
                 observed.clone(),
             ),
-            (
-                "claude",
-                "host",
-                other_store,
-                observed.clone(),
-            ),
+            ("claude", "host", other_store, observed.clone()),
             (
                 "claude",
                 "host",

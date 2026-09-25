@@ -333,6 +333,7 @@ impl Instance {
             self.adopt_conversation_state(canonical);
         }
         if let Some(execution) = prepared.execution.take() {
+            let attested = self.attested_claude_store_route(&execution);
             self.active_execution = Some(ActiveExecution {
                 launch_id: execution.inputs.launch_id,
                 binding: execution.binding.clone(),
@@ -378,7 +379,6 @@ impl Instance {
                 // configuration as it stands the moment a launch settles it.
                 // Both the binding being adopted and the ones still held are
                 // stamped, and the save below carries whichever persists.
-                let attested = self.attested_claude_store_route(&execution);
                 super::execution::attest_observed_default_store(&mut binding, attested.as_ref());
                 self.attest_launch_default_store(attested.as_ref());
                 self.set_agent_conversation(Some(sid), Some(binding), self.pi_session_path.clone());
@@ -608,7 +608,9 @@ fn attested_default_store(
         .and_then(|value| {
             crate::session::capture::canonicalize_allowing_missing_leaf(std::path::Path::new(value))
         })
-        .zip(crate::session::capture::canonicalize_allowing_missing_leaf(store));
+        .zip(crate::session::capture::canonicalize_allowing_missing_leaf(
+            store,
+        ));
     Some(
         routed.is_some_and(|(routed, store)| routed == store)
             && crate::session::capture::is_default_claude_store(store, home),
@@ -665,14 +667,14 @@ mod tests {
         std::fs::create_dir_all(&default).unwrap();
         let binding =
             |store: &std::path::Path, agent: &str, marker: Option<bool>| ExecutionBinding {
-            agent: agent.into(),
-            stores: vec![store.to_path_buf()],
-            configuration: Vec::new(),
-            cwd: home.clone(),
-            cwd_filesystem: "host".into(),
-            filesystem: "host".into(),
-            exported_default_store: marker,
-        };
+                agent: agent.into(),
+                stores: vec![store.to_path_buf()],
+                configuration: Vec::new(),
+                cwd: home.clone(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: marker,
+            };
         let routing = |dir: Option<&std::path::Path>| {
             vec![
                 ("HOME".to_string(), Some(home.display().to_string())),
