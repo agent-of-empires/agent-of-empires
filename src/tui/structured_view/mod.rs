@@ -609,7 +609,7 @@ fn drain_plugin_toast(state: &mut StructuredViewState, toast_deadline: &mut Opti
     // A notification carrying an href is a worker `ui.open_url`; the seq dedupe
     // in `next_plugin_toast` guarantees one open per notification.
     if let Some(href) = &n.href {
-        let url = crate::tui::open_url::resolve_href(&state.endpoint.base_url, href);
+        let url = crate::tui::open_url::resolve_href(&state.endpoint.browser_base_url(), href);
         let _ = crate::tui::open_url::open_url(&url);
     }
     let text = match &n.body {
@@ -970,7 +970,8 @@ async fn handle_terminal_event(
         Intent::OpenInBrowser => {
             let url = format!(
                 "{}/sessions/{}/acp",
-                state.endpoint.base_url, state.session_id
+                state.endpoint.browser_base_url(),
+                state.session_id
             );
             if let Err(e) = crate::tui::open_url::open_url(&url) {
                 set_toast(
@@ -1368,7 +1369,7 @@ async fn handle_plugin_command(
 /// Open one resolved plugin link in the browser (through the test seam) and
 /// toast the outcome.
 fn open_link(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>, href: &str) {
-    let url = crate::tui::open_url::resolve_href(&state.endpoint.base_url, href);
+    let url = crate::tui::open_url::resolve_href(&state.endpoint.browser_base_url(), href);
     if let Err(e) = crate::tui::open_url::open_url(&url) {
         set_toast(
             state,

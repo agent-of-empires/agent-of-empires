@@ -87,6 +87,29 @@ impl DaemonEndpoint {
         self.unix_path.as_deref()
     }
 
+    /// The base a browser can reach, for a plugin's relative href or an
+    /// "open in browser" action. A unix endpoint's `base_url` is only a host
+    /// for the request line, so the daemon's published address is used
+    /// instead; without one there is nothing better than the placeholder.
+    pub(crate) fn browser_base_url(&self) -> String {
+        if self.unix_path.is_none() {
+            return self.base_url.clone();
+        }
+        crate::cli::serve::read_serve_urls()
+            .first()
+            .map(|entry| {
+                entry
+                    .url
+                    .split('?')
+                    .next()
+                    .unwrap_or(&entry.url)
+                    .trim_end_matches('/')
+                    .to_string()
+            })
+            .filter(|base| !base.is_empty())
+            .unwrap_or_else(|| self.base_url.clone())
+    }
+
     pub(crate) fn new(base_url: String, token: Option<String>, source: Source) -> Self {
         Self {
             base_url,
@@ -218,4 +241,34 @@ pub fn discover_local() -> Result<DaemonEndpoint, DiscoveryError> {
     let path =
         crate::daemon::transport::local_socket_path().map_err(|_| DiscoveryError::LocalPath)?;
     Ok(DaemonEndpoint::local_unix(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unix endpoint's `base_url` is a request-line placeholder, so a URL
+    /// meant for a browser comes from the daemon's published address. Without
+    /// this, a plugin's relative href resolved to `http://localhost/...`.
+    #[test]
+    #[serial_test::serial]
+    fn a_unix_endpoint_browses_the_daemons_published_address() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let dir = crate::session::get_app_dir().expect("isolated app dir");
+        std::fs::write(dir.join("serve.url"), "http://127.0.0.1:8123/?token=abc\n").unwrap();
+        let unix = DaemonEndpoint::local_unix(PathBuf::from("/tmp/aoe.sock"));
+        assert_eq!(unix.browser_base_url(), "http://127.0.0.1:8123");
+
+        // An http endpoint already knows where it is.
+        let http = DaemonEndpoint::new("http://10.0.0.2:8080".into(), None, Source::LocalDaemon);
+        assert_eq!(http.browser_base_url(), "http://10.0.0.2:8080");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_unix_endpoint_keeps_its_placeholder_when_no_address_is_published() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let unix = DaemonEndpoint::local_unix(PathBuf::from("/tmp/aoe.sock"));
+        assert_eq!(unix.browser_base_url(), "http://localhost");
+    }
 }
