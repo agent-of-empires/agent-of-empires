@@ -171,11 +171,11 @@ impl RateLimiter {
 mod tests {
     use super::*;
 
-    // Record failures with spacing > COALESCE_WINDOW so each counts separately.
-    async fn record_spaced(limiter: &RateLimiter, ip: IpAddr) -> bool {
-        let result = limiter.record_failure(ip).await;
-        tokio::time::sleep(COALESCE_WINDOW + std::time::Duration::from_millis(50)).await;
-        result
+    /// Record the `n`th failure `n` coalesce windows after `base`, so each counts
+    /// separately.
+    async fn record_spaced(limiter: &RateLimiter, ip: IpAddr, base: Instant, n: u32) -> bool {
+        let mut failures = limiter.failures.write().await;
+        RateLimiter::record_failure_at(&mut failures, ip, base + COALESCE_WINDOW * 2 * n)
     }
 
     /// The lockout arms on the `MAX_FAILURES`'th spaced failure and not before; further
@@ -185,13 +185,17 @@ mod tests {
         let limiter = RateLimiter::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         let other: IpAddr = "5.6.7.8".parse().unwrap();
+        let base = Instant::now();
         assert!(limiter.check_locked(ip).await.is_none());
 
-        for _ in 0..MAX_FAILURES - 1 {
-            assert!(!record_spaced(&limiter, ip).await);
+        for n in 0..MAX_FAILURES - 1 {
+            assert!(!record_spaced(&limiter, ip, base, n).await);
         }
         assert!(limiter.check_locked(ip).await.is_none());
-        assert!(record_spaced(&limiter, ip).await, "the threshold arms it");
+        assert!(
+            record_spaced(&limiter, ip, base, MAX_FAILURES).await,
+            "the threshold arms it"
+        );
         assert!(limiter.check_locked(ip).await.is_some());
         assert!(!limiter.record_failure(ip).await, "already locked");
         assert!(limiter.check_locked(other).await.is_none());
@@ -201,15 +205,16 @@ mod tests {
     async fn success_clears_failures() {
         let limiter = RateLimiter::new();
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let base = Instant::now();
 
-        for _ in 0..3 {
-            record_spaced(&limiter, ip).await;
+        for n in 0..3 {
+            record_spaced(&limiter, ip, base, n).await;
         }
         limiter.record_success(ip).await;
 
         // After success, should be able to fail again without lockout
-        for _ in 0..4 {
-            assert!(!record_spaced(&limiter, ip).await);
+        for n in 3..7 {
+            assert!(!record_spaced(&limiter, ip, base, n).await);
         }
     }
 

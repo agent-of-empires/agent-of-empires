@@ -262,10 +262,7 @@ mod tests {
                 .is_no_auth()
                 .await
         );
-    }
 
-    #[tokio::test]
-    async fn token_manager_validates_previous_in_grace() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
         let mgr = TokenManager::new(Some("old_token".to_string()), Duration::from_secs(3600));
         mgr.rotate().await;

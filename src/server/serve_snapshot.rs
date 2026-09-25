@@ -278,20 +278,26 @@ pub(super) fn decrement_reported_count(counter: &std::sync::atomic::AtomicU32, r
 mod tests {
     use super::*;
 
-    /// #1874 / #1875: a confirmed send clears only the increments it reported, so one
-    /// that lands mid-flight survives, and a zero report touches nothing.
+    /// #1874 / #1875 / #1888: a confirmed send clears only the increments it
+    /// reported, so one that lands mid-flight survives, a zero report touches
+    /// nothing, and a double clear saturates at zero instead of wrapping.
     #[test]
     fn reported_count_decrement_preserves_concurrent_increments() {
         use std::sync::atomic::{AtomicU32, Ordering};
 
-        let counter = AtomicU32::new(5);
-        let reported = counter.load(Ordering::Relaxed);
-        counter.fetch_add(1, Ordering::Relaxed);
-        decrement_reported_count(&counter, reported);
-        assert_eq!(counter.load(Ordering::Relaxed), 1);
-
-        decrement_reported_count(&counter, 0);
-        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        // (start, reported, landed mid-flight, want)
+        for (start, reported, landed, want) in
+            [(5, 5, 1, 1), (2, 2, 1, 1), (1, 0, 0, 1), (2, 5, 0, 0)]
+        {
+            let counter = AtomicU32::new(start);
+            counter.fetch_add(landed, Ordering::Relaxed);
+            decrement_reported_count(&counter, reported);
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                want,
+                "start={start} reported={reported} landed={landed}"
+            );
+        }
     }
 
     // #1883.
@@ -325,27 +331,5 @@ mod tests {
             1,
             "the open that arrived during the send must be retained"
         );
-    }
-
-    // #1888.
-    #[test]
-    fn reported_count_decrement_preserves_concurrent_structured_interaction() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        let plan_mode = AtomicU32::new(2);
-        let reported = plan_mode.load(Ordering::Relaxed);
-        plan_mode.fetch_add(1, Ordering::Relaxed);
-        decrement_reported_count(&plan_mode, reported);
-        assert_eq!(plan_mode.load(Ordering::Relaxed), 1);
-    }
-
-    // The decrement saturates rather than underflow-wrapping the AtomicU32, so a
-    // hypothetical future refactor that detaches sends (double-clearing a
-    // counter) degrades to zero instead of jumping to u32::MAX.
-    #[test]
-    fn reported_count_decrement_saturates_below_zero() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        let counter = AtomicU32::new(2);
-        decrement_reported_count(&counter, 5);
-        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 }
