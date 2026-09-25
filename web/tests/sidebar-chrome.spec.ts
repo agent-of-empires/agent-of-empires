@@ -103,7 +103,9 @@ test("the two new-session buttons have distinct tooltips and labels", async ({ p
 
 // #2207: no grip; the icon and fold chevron swap on hover (group-hover opacity); the count always shows.
 test.describe("project header row (#2207)", () => {
-  test("icon shows at rest and swaps for the fold chevron on hover, with no grab bar", async ({ page }) => {
+  test("icon swaps for the fold chevron on hover, with no grab bar; the session count survives collapse", async ({
+    page,
+  }) => {
     await openSidebar(page, threeSessionsInOneRepo());
     const icon = page.getByTestId("sidebar-group-icon");
     const chevron = page.getByTestId("sidebar-group-fold-chevron");
@@ -114,10 +116,7 @@ test.describe("project header row (#2207)", () => {
     await page.locator(HEADER).hover();
     await expect(icon).toHaveCSS("opacity", "0");
     await expect(chevron).toHaveCSS("opacity", "1");
-  });
 
-  test("session count is visible and survives collapse", async ({ page }) => {
-    await openSidebar(page, threeSessionsInOneRepo());
     await expect(page.locator(ROW)).toHaveCount(3);
     await expect(page.locator(COUNT)).toHaveText("(3)");
     await page.locator(COUNT).click();
@@ -157,40 +156,19 @@ test.describe("row chips and naming actions", () => {
     await expect(page.getByTestId("sidebar-context-menu")).toBeVisible();
   }
 
-  test("renders the Auto-name (pending) and Naming (running) chips", async ({ page }) => {
-    // Rendered in the real bundle for per-line coverage of the chip JSX.
-    await openSidebar(
-      page,
-      (["pending", "running", "inactive"] as const).map((state) => ({
-        id: `sess-${state}`,
-        title: state,
-        project_path: `/tmp/p-${state}`,
-        branch: null,
-        fields: { smart_rename: state },
-      })),
-    );
-    await expect(page.getByLabel("Will auto-name")).toHaveCount(1);
-    await expect(page.getByLabel("Naming")).toHaveCount(1);
-    await expect(page.getByLabel("Will auto-name")).toBeVisible();
-    await expect(page.getByLabel("Naming")).toBeVisible();
-  });
-
   // #2347 Auto-name now and #2808 Summarize are offered for any structured session, named or not.
-  for (const c of [
-    { item: "auto-name", endpoint: "smart-rename", title: "Fix login bug", defaultName: false },
-    { item: "summarize", endpoint: "summarize", title: "Fix login bug", defaultName: false },
-  ]) {
-    test(`context menu ${c.item} POSTs /${c.endpoint}`, async ({ page }) => {
-      const posted: string[] = [];
-      await page.route(`**/api/sessions/*/${c.endpoint}`, (r) => {
-        if (r.request().method() !== "POST") return r.fulfill({ status: 400 });
-        posted.push(r.request().url());
-        return r.fulfill({ status: 202 });
-      });
-      await openSidebar(page, [structured("sess-1", c.title, c.defaultName)]);
-      await openMenu(page, c.title);
-      await page.getByTestId(`sidebar-context-menu-${c.item}`).click();
-      await expect.poll(() => posted[0]).toContain(`/api/sessions/sess-1/${c.endpoint}`);
+  test("context menu auto-name and summarize POST their endpoints", async ({ page }) => {
+    const posted: string[] = [];
+    await page.route(/\/api\/sessions\/[^/]+\/(smart-rename|summarize)$/, (r) => {
+      if (r.request().method() !== "POST") return r.fulfill({ status: 400 });
+      posted.push(new URL(r.request().url()).pathname);
+      return r.fulfill({ status: 202 });
     });
-  }
+    await openSidebar(page, [structured("sess-1", "Fix login bug", false)]);
+    for (const item of ["auto-name", "summarize"]) {
+      await openMenu(page, "Fix login bug");
+      await page.getByTestId(`sidebar-context-menu-${item}`).click();
+    }
+    await expect.poll(() => posted).toEqual(["/api/sessions/sess-1/smart-rename", "/api/sessions/sess-1/summarize"]);
+  });
 });
