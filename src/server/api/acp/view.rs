@@ -389,6 +389,8 @@ pub async fn acp_disable(
             )
             .await;
         if let Err(error) = instance.switch_to_terminal_keep_context(worker.as_ref()) {
+            // `{:#}` is the only thing carrying the cause into the body the
+            // dashboard renders verbatim.
             return (StatusCode::CONFLICT, format!("{error:#}")).into_response();
         }
     } else {
