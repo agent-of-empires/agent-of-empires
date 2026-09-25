@@ -43,6 +43,33 @@ pub(crate) fn claude_home_for_host_environment(
     }
 }
 
+/// Whether `store` is Claude's built-in `<home>/.claude`. Exporting
+/// `CLAUDE_CONFIG_DIR` for it is not a no-op: Claude then reads its global
+/// config from `<home>/.claude/.claude.json` instead of `<home>/.claude.json`.
+pub(crate) fn is_default_claude_store(store: &Path, home: &Path) -> bool {
+    let identity = |path: &Path| {
+        super::canonicalize_allowing_missing_leaf(path).unwrap_or_else(|| path.to_path_buf())
+    };
+    identity(store) == identity(&home.join(".claude"))
+}
+
+/// The store a host Claude worker is pinned to by its selected conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeStorePin {
+    pub store: PathBuf,
+    /// The conversation's launch exported `CLAUDE_CONFIG_DIR` even for the default store.
+    pub explicit: bool,
+}
+
+impl ClaudeStorePin {
+    pub(crate) fn of(execution: &crate::session::ExecutionBinding) -> Option<Self> {
+        Some(Self {
+            store: execution.stores.first()?.clone(),
+            explicit: execution.exported_default_store,
+        })
+    }
+}
+
 /// True only when Claude's home resolves and `<config>/projects/<cwd>/<id>.jsonl`
 /// is missing, so a never-prompted pinned id can launch fresh instead of failing
 /// `--resume`. The config dir resolves as the launch does (see

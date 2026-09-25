@@ -1228,7 +1228,7 @@ pub async fn start_session(
                 )
                     .into_response();
             }
-            (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+            (StatusCode::OK, Json(response)).into_response()
         }
         Ok(Err(boxed)) => {
             let (started, e) = *boxed;

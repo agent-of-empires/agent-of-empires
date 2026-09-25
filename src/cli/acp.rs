@@ -948,7 +948,10 @@ async fn prompt(session: &str, text: &str) -> Result<()> {
     let body = read_text_arg(text)?;
     let endpoint = require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
-    client.prompt(session, &body).await.map_err(map_http)?;
+    client
+        .prompt(session, &body, false)
+        .await
+        .map_err(map_http)?;
     println!("prompt accepted ({} bytes)", body.len());
     Ok(())
 }

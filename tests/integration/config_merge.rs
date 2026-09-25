@@ -41,6 +41,7 @@ fn test_merge_overrides_global() -> Result<()> {
     Ok(())
 }
 
+/// A sparse on-disk override leaves unrelated global values intact.
 #[test]
 #[serial]
 fn test_merge_inherits_unset_fields() -> Result<()> {
@@ -52,15 +53,14 @@ fn test_merge_inherits_unset_fields() -> Result<()> {
         global.worktree.enabled = true;
     })?;
 
-    // Profile only overrides theme
-    let profile = profile_from(json!({"theme": {"name": "dark"}}));
+    let profile = profile_from(json!({"theme": {"idle_decay_minutes": 20}}));
     save_profile_config("default", &profile)?;
 
     let loaded_global = Config::load()?;
     let loaded_profile = load_profile_config("default")?;
     let merged = merge_configs(loaded_global, &loaded_profile);
 
-    assert_eq!(merged.theme.name, "dark", "Theme should be overridden");
+    assert_eq!(merged.theme.idle_decay_minutes, 20);
     assert_eq!(
         merged.session.snooze_duration_minutes, 12,
         "snooze_duration_minutes should inherit from global"

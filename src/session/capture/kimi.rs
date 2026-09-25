@@ -14,7 +14,7 @@ struct KimiSession {
     work_dir: String,
 }
 
-const KIMI_INDEX_MAX_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const KIMI_INDEX_MAX_BYTES: usize = 8 * 1024 * 1024;
 const KIMI_INDEX_MAX_LINE_BYTES: usize = 64 * 1024;
 const KIMI_INDEX_MAX_LINES: usize = 32 * 1024;
 const KIMI_INDEX_MAX_LIVE_SESSIONS: usize = 8 * 1024;
@@ -27,7 +27,10 @@ fn read_kimi_session_index(root: &AnchoredDir, relative: &Path) -> Result<Vec<Ki
         .ok_or_else(|| {
             anyhow::anyhow!("Kimi session index is missing or not a bounded regular file")
         })?;
+    parse_kimi_session_index(&content)
+}
 
+fn parse_kimi_session_index(content: &[u8]) -> Result<Vec<KimiSession>> {
     let mut live: HashMap<String, (String, String)> = HashMap::new();
     for (index, raw_line) in content.split(|byte| *byte == b'\n').enumerate() {
         if index >= KIMI_INDEX_MAX_LINES {
@@ -81,6 +84,46 @@ fn read_kimi_session_index(root: &AnchoredDir, relative: &Path) -> Result<Vec<Ki
         })
         .collect())
 }
+pub(crate) fn selected_index_record(
+    content: &[u8],
+    id: &str,
+    cwd: &str,
+    managed_sessions: &Path,
+) -> Result<Option<(String, serde_json::Value)>> {
+    if content.len() > KIMI_INDEX_MAX_BYTES {
+        return Ok(None);
+    }
+    let live = parse_kimi_session_index(content)?;
+    let Some(session) = live.iter().find(|session| session.id == id) else {
+        return Ok(None);
+    };
+    if canonicalize_or_raw(&session.work_dir) != canonicalize_or_raw(cwd) {
+        return Ok(None);
+    }
+    let session_path = Path::new(&session.session_dir);
+    let Some(leaf) = session_path.file_name().and_then(|leaf| leaf.to_str()) else {
+        return Ok(None);
+    };
+    if session_path.parent() != Some(managed_sessions)
+        || !super::is_valid_session_id(leaf)
+        || live.iter().any(|other| {
+            other.id != id && Path::new(&other.session_dir).file_name() == Some(leaf.as_ref())
+        })
+    {
+        return Ok(None);
+    }
+    let record = content
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .find(|value| value.get("sessionId").and_then(|id| id.as_str()) == Some(id));
+    Ok(record
+        .filter(|value| {
+            value.get("sessionDir").and_then(|value| value.as_str()) == Some(&session.session_dir)
+                && value.get("workDir").and_then(|value| value.as_str()) == Some(&session.work_dir)
+        })
+        .map(|value| (leaf.to_owned(), value)))
+}
 
 /// Strict launch floor: timestamp uncertainty fails closed.
 const KIMI_MTIME_FLOOR_SLACK_MS: f64 = 0.0;
@@ -91,11 +134,12 @@ pub(crate) fn kimi_poll_fn_sandboxed_store(
     container_workdir: String,
     instance_id: String,
     launch_time_ms: f64,
-    extra_excludes: HashSet<String>,
+    extra_excludes: HashSet<crate::session::ConversationBinding>,
+    source: Option<crate::session::ExecutionBinding>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let root = AnchoredDir::open(&store).ok()?;
-        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes, source.as_ref());
         let sessions = read_kimi_session_index(&root, Path::new("session_index.jsonl")).ok()?;
         let canonical_match = canonicalize_or_raw(&container_workdir);
         sessions
@@ -130,6 +174,7 @@ mod tests {
             "current".to_string(),
             launch_ms,
             HashSet::new(),
+            None,
         )
     }
 

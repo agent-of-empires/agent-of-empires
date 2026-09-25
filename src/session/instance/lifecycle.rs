@@ -155,6 +155,7 @@ impl Instance {
             stored.last_accessed_at = self.last_accessed_at;
             stored.sandbox_info = self.sandbox_info.clone();
             stored.capture_started_at = self.capture_started_at;
+            stored.active_execution = self.active_execution.clone();
             if restart && stored.agent_session_id == self.agent_session_id {
                 stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
             }

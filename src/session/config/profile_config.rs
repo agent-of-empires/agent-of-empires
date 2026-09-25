@@ -15,8 +15,8 @@ use crate::session::get_profile_dir;
 /// Every override is a section table keyed by config-section name (e.g.
 /// `sandbox`, `acp`) mirroring the `Config` JSON shape; an absent key
 /// inherits the global value. There are no typed per-section structs: a field
-/// is overridable purely by virtue of existing in the `Config` schema, so
-/// adding one never touches this file. Merging is the generic recursive
+/// is overridable according to its `Config` schema descriptor, so adding one
+/// never touches this file. Merging is the generic recursive
 /// [`merge_configs_generic`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileConfig {
@@ -187,13 +187,15 @@ pub fn resolve_config_or_warn(profile: &str) -> Config {
     }
 }
 
-/// Merge profile overrides into global config.
-///
-/// Delegates to [`merge_configs_generic`]: the profile's sparse override tree is
-/// JSON-merged onto the global config, so adding a config field never touches
-/// this function.
+/// Merge profile overrides, keeping schema-declared global-only fields global.
 pub fn merge_configs(global: Config, profile: &ProfileConfig) -> Config {
-    merge_configs_generic(&global, &profile.overrides_value())
+    let mut overrides = profile.overrides_value();
+    for field in super::settings_schema::schema_ref() {
+        if !field.profile_overridable {
+            super::settings_schema::clear_path(&mut overrides, &field.section, &field.field);
+        }
+    }
+    merge_configs_generic(&global, &overrides)
 }
 
 /// Generic single-source merge (#1692): serialize the global config to JSON,
@@ -470,7 +472,7 @@ mod tests {
     /// matching `sandbox.environment`; a per-agent `status_map` merges by key.
     #[test]
     fn merge_configs_overrides_named_keys_and_inherits_the_rest() {
-        use crate::session::config::UpdateCheckMode;
+        use crate::session::config::{SidebarPosition, UpdateCheckMode};
         type Case = (fn(&mut Config), serde_json::Value, fn(&Config));
         let cases: Vec<Case> = vec![
             // Nothing overridden.
@@ -529,9 +531,20 @@ mod tests {
                 },
             ),
             (
-                |global| global.theme.name = "catppuccin-latte".to_string(),
-                json!({"theme": {"name": "tokyo-night"}}),
-                |merged| assert_eq!(merged.theme.name, "tokyo-night"),
+                |global| {
+                    global.theme.name = "catppuccin-latte".to_string();
+                    global.session.sidebar_position = SidebarPosition::Right;
+                },
+                json!({
+                    "session": {"sidebar_position": "left", "snooze_duration_minutes": 12},
+                    "theme": {"name": "tokyo-night", "idle_decay_minutes": 20}
+                }),
+                |merged| {
+                    assert_eq!(merged.theme.name, "catppuccin-latte");
+                    assert_eq!(merged.session.sidebar_position, SidebarPosition::Right);
+                    assert_eq!(merged.session.snooze_duration_minutes, 12);
+                    assert_eq!(merged.theme.idle_decay_minutes, 20);
+                },
             ),
             (
                 |global| global.theme.name = "catppuccin-latte".to_string(),

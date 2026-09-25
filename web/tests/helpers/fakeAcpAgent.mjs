@@ -654,6 +654,7 @@ async function handleRequest(msg) {
 
     case "session/prompt": {
       const sessionId = params?.sessionId;
+      fakeDebug(`session/prompt prompt=${JSON.stringify(params?.prompt ?? [])}`);
       const turn = nextTurn();
       if (sessionId) cancelFlags.set(sessionId, false);
       if (sessionId) {

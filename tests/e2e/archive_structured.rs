@@ -2,7 +2,7 @@
 //! worker always shuts down, tool sub-sessions die only with `kill_pane`, and
 //! the transcript survives because no `session/delete` is sent (#1710).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serial_test::parallel;
 
@@ -26,20 +26,31 @@ fn archive_case(name: &str, kill_pane: bool) {
     tokio::runtime::Runtime::new()
         .expect("tokio runtime")
         .block_on(async {
-            let resp = reqwest::Client::new()
-                .patch(format!(
-                    "http://127.0.0.1:{port}/api/sessions/{session_id}/archive"
-                ))
-                .json(&serde_json::json!({ "archived": true, "kill_pane": kill_pane }))
-                .send()
-                .await
-                .expect("PATCH archive send");
-            assert!(
-                resp.status().is_success(),
-                "archive PATCH failed: {} {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default(),
-            );
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("reqwest client");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let resp = client
+                    .patch(format!(
+                        "http://127.0.0.1:{port}/api/sessions/{session_id}/archive"
+                    ))
+                    .json(&serde_json::json!({ "archived": true, "kill_pane": kill_pane }))
+                    .send()
+                    .await
+                    .expect("PATCH archive send");
+                let status = resp.status();
+                if status.is_success() {
+                    break;
+                }
+                let body = resp.text().await.unwrap_or_default();
+                assert!(
+                    status == reqwest::StatusCode::NOT_FOUND && Instant::now() < deadline,
+                    "archive PATCH failed: {status} {body}"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
         });
 
     wait_until(Duration::from_secs(10), Duration::from_millis(200), || {

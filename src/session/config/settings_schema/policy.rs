@@ -17,6 +17,7 @@ pub enum Scope {
 pub enum PatchRejection {
     UnknownSection(String),
     UnknownField(String),
+    GlobalOnly(String),
     Malformed(String),
     /// 403; every other rejection is 400.
     NeedsElevation {
@@ -52,6 +53,9 @@ impl PatchRejection {
             }
             PatchRejection::UnknownField(p) => {
                 format!("Settings field '{p}' is not a known setting.")
+            }
+            PatchRejection::GlobalOnly(p) => {
+                format!("Settings field '{p}' is global-only; use PATCH /api/settings.")
             }
             PatchRejection::Malformed(s) => {
                 format!("Settings section '{s}' has a malformed value.")
@@ -95,7 +99,7 @@ pub fn strip_local_only(patch: &mut Value) {
 }
 
 /// Returns the first rejection. A `null` leaf clears an override and skips value
-/// validation. Call [`strip_local_only`] first; `local_only` is not checked here.
+/// validation. Call [`strip_local_only`] before saving; `local_only` is not checked here.
 pub fn validate_patch(patch: &Value, scope: Scope, elevated: bool) -> Result<(), PatchRejection> {
     validate_patch_with(&schema(), patch, scope, elevated)
 }
@@ -128,6 +132,9 @@ pub fn validate_patch_with(
             let Some(d) = lookup_in(descriptors, section, field) else {
                 return Err(PatchRejection::UnknownField(path));
             };
+            if scope == Scope::Profile && !d.profile_overridable {
+                return Err(PatchRejection::GlobalOnly(path));
+            }
             if let WebWritePolicy::RequiresElevation { reason } = &d.web_write {
                 if !elevated {
                     return Err(PatchRejection::NeedsElevation {
@@ -266,7 +273,6 @@ mod tests {
         for body in [
             json!({"theme": {"idle_decay_minutes": 5}}),
             json!({"updates": {"update_check_mode": "notify"}}),
-            json!({"web": {"notify_on_idle": true}}),
             json!({"session": {"yolo_mode_default": true, "strict_hotkeys": false}}),
             json!({"description": "my profile"}),
         ] {
@@ -282,5 +288,16 @@ mod tests {
         let err =
             validate_patch(&json!({"theme": "not-an-object"}), Scope::Global, true).unwrap_err();
         assert!(matches!(err, PatchRejection::Malformed(_)));
+    }
+
+    #[test]
+    fn profile_scope_rejects_global_only_fields_including_resets() {
+        for field in schema().iter().filter(|field| !field.profile_overridable) {
+            let body = json!({&field.section: {&field.field: null}});
+            let err = validate_patch(&body, Scope::Profile, true).unwrap_err();
+            assert_eq!(err, PatchRejection::GlobalOnly(field.path()));
+            assert_eq!(err.status_code(), 400);
+            assert!(validate_patch(&body, Scope::Global, true).is_ok());
+        }
     }
 }

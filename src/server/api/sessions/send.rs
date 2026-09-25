@@ -128,6 +128,7 @@ pub async fn send_message(
 
     match send_result {
         Ok(Ok((outcome, started))) => {
+            let body = serde_json::json!({"sent": true});
             // ensure_pane_ready mutated `started` on the clone, so sync it back
             // or a rapid follow-up generates a fresh `agent_session_id` and
             // orphans the prior Claude conversation. See `apply_post_restart_sync`.
@@ -141,7 +142,7 @@ pub async fn send_message(
                 i.source_profile.clone()
             } else {
                 // Deleted between the send and the stamp; nothing to persist.
-                return (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response();
+                return (StatusCode::OK, Json(body)).into_response();
             };
             drop(instances);
             let id_for_save = id.clone();
@@ -167,7 +168,7 @@ pub async fn send_message(
                     }
                 }
             });
-            (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response()
+            (StatusCode::OK, Json(body)).into_response()
         }
         Ok(Err(boxed)) => {
             let (started, outcome, send_err) = *boxed;

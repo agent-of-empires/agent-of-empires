@@ -61,6 +61,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         seed_history_replay: false,
         generation: 0,
         artifact_dir: None,
+        claude_store_pin: None,
     };
 
     // Probe-scoped id so it never collides with a real structured-view worker.

@@ -14,6 +14,7 @@ import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
+import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
@@ -35,6 +36,8 @@ import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups"
 import { useProjects } from "./hooks/useProjects";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useResolvedTheme } from "./hooks/useResolvedTheme";
+import type { ResolvedTheme } from "./lib/theme";
+import { getAttentionBadgeColors } from "./lib/attentionBadgeColors";
 import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
@@ -58,6 +61,7 @@ import {
   restoreSessions,
   trashedWorkspaceRestoreIds,
   trashSessions,
+  sessionsSharingWorktree,
   workspaceCleanupDefaults,
 } from "./lib/trashActions";
 import {
@@ -98,7 +102,7 @@ import { fetchActiveProfileSettings } from "./lib/appSettings";
 import { parseSystemHealthEnabled, SystemHealthEnabledContext } from "./lib/systemHealth";
 import { toastBus, reportError } from "./lib/toastBus";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
-import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
+import { NAVIGATE_EVENT, OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
 import {
   clearMobileKeyboardProxyInput,
@@ -176,7 +180,7 @@ export default function App() {
   // The pre-React /theme-bootstrap.js (referenced from index.html)
   // paints the cached theme before hydration; this hook keeps it in
   // sync with the server's view.
-  useResolvedTheme();
+  const resolvedTheme = useResolvedTheme();
   const [loginRequired, setLoginRequired] = useState<boolean | null>(null);
   const [loginAuthenticated, setLoginAuthenticated] = useState(true);
   const [tokenExpired, setTokenExpired] = useState(false);
@@ -286,6 +290,7 @@ export default function App() {
                   loginRequired={loginRequired}
                   onLogout={handleLogout}
                   onSettingsRefresh={refreshAppSettings}
+                  resolvedTheme={resolvedTheme}
                 />
               </PluginUiProvider>
               <ElevationPrompt />
@@ -317,10 +322,12 @@ function AppContent({
   loginRequired,
   onLogout,
   onSettingsRefresh,
+  resolvedTheme,
 }: {
   loginRequired: boolean;
   onLogout: () => void;
   onSettingsRefresh: () => Promise<void> | void;
+  resolvedTheme: ResolvedTheme | null;
 }) {
   useDashboardPresence();
   // Wire the localStorage write chokepoint and pull the server-side UI-state
@@ -364,6 +371,9 @@ function AppContent({
   // every one of its sessions is trashed, and Restore/Delete then cover all of
   // them. See #2533.
   const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
+
+  const { unreadCount, waitingCount } = useAttentionCounts(sessions, activeSessionId);
+  const attentionBadgeColors = useMemo(() => getAttentionBadgeColors(resolvedTheme), [resolvedTheme]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103).
   useLastSessionRestore({ activeSessionId, sessions, sessionsLoaded });
@@ -931,12 +941,12 @@ function AppContent({
   );
 
   const handleSelectSession = useCallback(
-    (sessionId: string) => {
+    (sessionId: string, path?: string) => {
       const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
       if (ws) {
         const picked = ws.sessions.find((s) => s.id === sessionId);
         transitionKeyboardProxy(sessionId, sessionId === activeSessionId && singlePane ? rightPanelView : "agent");
-        navigate(`/session/${encodeURIComponent(sessionId)}`);
+        navigate(path ?? `/session/${encodeURIComponent(sessionId)}`);
         // iOS does not permit a session's asynchronously mounted terminal
         // input to inherit this sidebar tap's keyboard authorization. The
         // persistent keyboard input keeps the gesture-authorized focus while
@@ -957,6 +967,12 @@ function AppContent({
           focusKeyboardProxy();
           focusAgentInput(picked);
         }
+        if (window.innerWidth < 768) setSidebarOpen(false);
+      } else if (path) {
+        // Not yet in the locally known workspace list (e.g. a session a
+        // plugin just created); the route itself resolves the session
+        // independently of this list, so a bare navigation still works.
+        navigate(path);
         if (window.innerWidth < 768) setSidebarOpen(false);
       }
     },
@@ -1007,18 +1023,32 @@ function AppContent({
   // the user taps it; navigate to the session that triggered the push.
   useEffect(() => {
     const onOpen = (e: Event) => {
-      const detail = (e as CustomEvent).detail as { sessionId?: string } | undefined;
+      const detail = (e as CustomEvent).detail as { sessionId?: string; path?: string } | undefined;
       if (detail?.sessionId) {
-        handleSelectSession(detail.sessionId);
+        handleSelectSession(detail.sessionId, detail.path);
       }
     };
     window.addEventListener(OPEN_SESSION_EVENT, onOpen);
     return () => window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
   }, [handleSelectSession]);
 
+  // A plugin-supplied link that resolves to aoe's own origin navigates via
+  // the router instead of opening a new tab.
+  useEffect(() => {
+    const onNavigate = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { path?: string } | undefined;
+      if (!detail?.path) return;
+      navigate(detail.path);
+      // See handleSelectSession: a mobile sidebar left open would cover the destination.
+      if (window.innerWidth < 768) setSidebarOpen(false);
+    };
+    window.addEventListener(NAVIGATE_EVENT, onNavigate);
+    return () => window.removeEventListener(NAVIGATE_EVENT, onNavigate);
+  }, [navigate]);
+
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
-  const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
-  const [stoppingWorkspaceId, setStoppingWorkspaceId] = useState<string | null>(null);
+  const [deletingSessionIds, setDeletingSessionIds] = useState<string[] | null>(null);
+  const [stoppingSessionId, setStoppingSessionId] = useState<string | null>(null);
   const [switchViewTarget, setSwitchViewTarget] = useState<{ sessionId: string; toStructured: boolean } | null>(null);
   // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
   // the tour gates auto-launch on an explicit loaded flag instead.
@@ -1085,10 +1115,17 @@ function AppContent({
     void setTelemetryConsent(enabled);
   }, []);
 
-  const deletingWorkspace = deletingWorkspaceId ? workspaces.find((w) => w.id === deletingWorkspaceId) : null;
-  const deletingSessions = deletingWorkspace?.sessions ?? [];
+  // Ids, not a workspace id: a sidebar group slice covers only some of its workspace's sessions.
+  const deletingSessions = useMemo(
+    () =>
+      (deletingSessionIds ?? []).flatMap((id) => {
+        const session = sessions.find((s) => s.id === id);
+        return session ? [session] : [];
+      }),
+    [deletingSessionIds, sessions],
+  );
   const liveDeletingSessions = deletingSessions.filter((session) => !session.trashed_at);
-  const deletingSession = deletingWorkspace?.sessions[0] ?? null;
+  const deletingSession = deletingSessions[0] ?? null;
   const deletingDefaultToTrash = liveDeletingSessions.some((session) => session.cleanup_defaults.delete_to_trash);
   const deletingCleanupDefaults = deletingSession
     ? {
@@ -1096,20 +1133,23 @@ function AppContent({
         ...workspaceCleanupDefaults(deletingSessions),
       }
     : null;
+  const deletingWorktreeSharedWith = useMemo(
+    () => sessionsSharingWorktree(deletingSessions, sessions).map((session) => session.title),
+    [deletingSessions, sessions],
+  );
   const deletingBranchName =
     deletingSessions.find((session) => session.branch)?.branch ?? deletingSession?.branch ?? null;
 
-  const handleDeleteSession = useCallback((workspaceId: string) => {
-    setDeletingWorkspaceId(workspaceId);
+  const handleDeleteSession = useCallback((sessionIds: string[]) => {
+    setDeletingSessionIds(sessionIds);
   }, []);
 
   const handleConfirmDelete = async (options: DeleteSessionOptions) => {
-    if (!deletingWorkspace) return;
-    const sessions = deletingWorkspace.sessions;
+    if (deletingSessions.length === 0) return;
     // Close the dialog immediately; the loop, ordering, and toast logic live
     // in deleteWorkspaceSessions so they are unit-testable without the bundle.
-    setDeletingWorkspaceId(null);
-    await deleteWorkspaceSessions(sessions, options, activeSessionId, {
+    setDeletingSessionIds(null);
+    await deleteWorkspaceSessions(deletingSessions, options, activeSessionId, {
       setStatus: setSessionStatus,
       // Drop a deleted session's local-only state (#1358 acp cache + draft,
       // #1842 diff comments). Cross-tab / cross-device deletes fall to the
@@ -1182,14 +1222,13 @@ function AppContent({
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
   // deliberately KEEPS the per-session acp cache, draft, and stored comments
   // so a restore is faithful; only purge clears them. Trashes every session
-  // in the workspace so a multi-session workspace sinks as a whole.
+  // in the row together.
   const handleConfirmTrash = async () => {
-    if (!deletingWorkspace) return;
-    const ids = deletingWorkspace.sessions.map((s) => s.id);
+    const ids = deletingSessions.map((s) => s.id);
     if (ids.length === 0) return;
     const wasActive = activeSessionId != null && ids.includes(activeSessionId);
 
-    setDeletingWorkspaceId(null);
+    setDeletingSessionIds(null);
     for (const id of ids) setSessionStatus(id, "Stopped");
     if (wasActive) {
       navigate("/");
@@ -1212,11 +1251,10 @@ function AppContent({
     [applySession],
   );
 
-  const stoppingWorkspace = stoppingWorkspaceId ? workspaces.find((w) => w.id === stoppingWorkspaceId) : null;
-  const stoppingSession = stoppingWorkspace?.sessions[0] ?? null;
+  const stoppingSession = stoppingSessionId ? (sessions.find((s) => s.id === stoppingSessionId) ?? null) : null;
 
-  const handleStopSession = useCallback((workspaceId: string) => {
-    setStoppingWorkspaceId(workspaceId);
+  const handleStopSession = useCallback((sessionId: string) => {
+    setStoppingSessionId(sessionId);
   }, []);
 
   const handleConfirmStop = useCallback(async () => {
@@ -1225,7 +1263,7 @@ function AppContent({
 
     // Close the dialog and show "Stopped" immediately; the 2s status poller
     // reconciles the true state and corrects this if the request fails.
-    setStoppingWorkspaceId(null);
+    setStoppingSessionId(null);
     setSessionStatus(sessionId, "Stopped");
 
     const result = await stopSession(sessionId);
@@ -1250,32 +1288,37 @@ function AppContent({
     const { sessionId, toStructured } = switchViewTarget;
     // Keep the dialog mounted through the request so its "Switching..." spinner
     // shows; close it once the switch resolves.
-    const result = toStructured ? await acpEnable(sessionId) : await acpDisable(sessionId);
-    setSwitchViewTarget(null);
-    if (!result) {
-      toastBus.handler?.error(`Failed to switch to ${toStructured ? "structured view" : "terminal"}`);
-      return;
+    if (toStructured) {
+      const enabled = await acpEnable(sessionId);
+      setSwitchViewTarget(null);
+      if (!enabled) {
+        toastBus.handler?.error("Failed to switch to structured view");
+        return;
+      }
+    } else {
+      const disabled = await acpDisable(sessionId);
+      setSwitchViewTarget(null);
+      if (!disabled.ok) {
+        toastBus.handler?.error(disabled.message ?? "Failed to switch to terminal");
+        return;
+      }
     }
     toastBus.handler?.info(`Switched to ${toStructured ? "structured view" : "terminal"}`);
   }, [switchViewTarget]);
 
   const handleStartSession = useCallback(
-    async (workspaceId: string) => {
-      const ws = workspaces.find((w) => w.id === workspaceId);
-      const session = ws?.sessions[0];
-      if (!session) return;
-
+    async (sessionId: string) => {
       // Optimistic Starting; the status poller reconciles to the real state.
-      setSessionStatus(session.id, "Starting");
-      const result = await startSession(session.id);
+      setSessionStatus(sessionId, "Starting");
+      const result = await startSession(sessionId);
       if (!result) {
-        setSessionStatus(session.id, "Error");
+        setSessionStatus(sessionId, "Error");
         toastBus.handler?.error("Failed to start session");
         return;
       }
-      toastBus.handler?.info("Session started");
+      toastBus.handler?.info(result.message ?? "Session started");
     },
-    [workspaces, setSessionStatus],
+    [setSessionStatus],
   );
 
   const handleCreateSession = useCallback(
@@ -1657,12 +1700,12 @@ function AppContent({
         // abort. Cancel/stop must stay behind an explicit gesture
         // (the assistant-ui Stop button in the composer).
         onEscape: () => {
-          if (deletingWorkspaceId) {
-            setDeletingWorkspaceId(null);
+          if (deletingSessionIds) {
+            setDeletingSessionIds(null);
             return;
           }
-          if (stoppingWorkspaceId) {
-            setStoppingWorkspaceId(null);
+          if (stoppingSessionId) {
+            setStoppingSessionId(null);
             return;
           }
           if (showPalette) {
@@ -1690,8 +1733,8 @@ function AppContent({
         toggleDiff,
         toggleRightDock,
         showPalette,
-        deletingWorkspaceId,
-        stoppingWorkspaceId,
+        deletingSessionIds,
+        stoppingSessionId,
         showSettings,
         handleCloseSettings,
         navigate,
@@ -2238,6 +2281,9 @@ function AppContent({
             onOpenHelp={handleOpenHelp}
             onOpenAbout={handleOpenAbout}
             onStartTutorial={tour.startTour}
+            unreadCount={unreadCount}
+            waitingCount={waitingCount}
+            attentionBadgeColors={attentionBadgeColors}
             onLogout={onLogout}
             loginRequired={loginRequired}
             isOffline={!!error}
@@ -2382,9 +2428,10 @@ function AppContent({
               title: session.title,
               isSandboxed: session.is_sandboxed,
             }))}
+            worktreeSharedWith={deletingWorktreeSharedWith}
             onConfirm={handleConfirmDelete}
             onTrash={handleConfirmTrash}
-            onCancel={() => setDeletingWorkspaceId(null)}
+            onCancel={() => setDeletingSessionIds(null)}
           />
         )}
 
@@ -2392,7 +2439,7 @@ function AppContent({
           <StopSessionDialog
             sessionTitle={stoppingSession.title}
             onConfirm={handleConfirmStop}
-            onCancel={() => setStoppingWorkspaceId(null)}
+            onCancel={() => setStoppingSessionId(null)}
           />
         )}
 

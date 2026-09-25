@@ -126,7 +126,8 @@ pub(crate) fn codex_poll_fn_sandboxed_store(
     container_cwd: String,
     instance_id: String,
     capture_floor: SystemTime,
-    extra_excludes: HashSet<String>,
+    extra_excludes: HashSet<crate::session::ConversationBinding>,
+    source: Option<crate::session::ExecutionBinding>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let root = AnchoredDir::open(&store).ok()?;
@@ -135,7 +136,7 @@ pub(crate) fn codex_poll_fn_sandboxed_store(
         let mut entries = Vec::new();
         collect_codex_sessions_anchored(&root, sessions, 0, &mut 0, &mut entries).ok()?;
         entries.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
-        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes, source.as_ref());
         entries.into_iter().find_map(|(relative, modified)| {
             if modified <= capture_floor {
                 return None;
@@ -165,6 +166,7 @@ mod tests {
             "current".to_string(),
             capture_floor(floor),
             HashSet::new(),
+            None,
         )
     }
 

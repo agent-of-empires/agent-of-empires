@@ -1,8 +1,8 @@
 # Native Session Resume
 
-A terminal session resumes the same native agent conversation after a reboot, an `aoe` upgrade, or a tmux server restart, when the agent exposes an authoritative identity source. AoE records only identities attributable to that pane or to its physically isolated sandbox store; an ambiguous shared-store match is ignored rather than guessed.
+Explicit resume and fork require the native agent, physical store, working directory, and filesystem to agree with the prepared launch. Automatic start and restart also try a stored native ID when its binding cannot be attested, using the agent's normal resume selector and failed-resume probe. A status label or raw session ID does not qualify that ID for explicit use. Existing transcripts are never deleted to repair a mismatch.
 
-Runtime conversation changes (`/clear`, `/new`, a fork, a fresh pane generation) rotate the recorded identity when the agent publishes the change. Neither the old identity nor an artifact predating the launch boundary can be recaptured after an AoE restart.
+Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fresh pane generation rotate the recorded identity when the native agent publishes the change. The old identity and any artifact predating the launch boundary cannot be recaptured after an AoE process restart.
 
 ## Automatic capture matrix
 
@@ -21,7 +21,26 @@ Runtime conversation changes (`/clear`, `/new`, a fork, a fresh pane generation)
 
 Sandbox config and conversation stores are staged per AoE instance, including custom `agent_config_dir` roots, and a cross-process lease guards each managed store, so two sessions in the same directory cannot claim each other's conversation.
 
-Custom agents inherit native resume when `agent_detect_as` resolves to a built-in and the launch command is either that built-in's own binary token or a single bare token (the renamed-wrapper shape); command overrides follow the same rule. Path-qualified scripts, remote launchers, redirections, pipes, and other shell control syntax fail closed. Automatic capture is stricter still: a renamed wrapper keeps it only where the agent publishes its identity under the pane's own AoE marker (Claude, Cursor, Pi). Every other source infers ownership from the launch, so a wrapped OpenCode, OMP, or managed-store agent resumes a pinned id but captures nothing on its own.
+`agent_detect_as` controls status detection and ACP adapter inheritance, not terminal execution identity. Direct built-in commands identify their native agent independently. Opaque wrappers need the explicit contract described below for explicit resume or fork and capture from shared stores.
+
+## Execution identity and wrappers
+
+A conflicting built-in tool and command, such as tool `claude` with command `codex`, is rejected for managed resume and fork. An opaque wrapper requires both `session.agent_execution_as` and `session.agent_config_dir` in trusted global or profile configuration. This asserts that the wrapper invokes that native agent, forwards native arguments unchanged, and uses only the declared store and working-directory/filesystem context. Repository overrides are refused because a repository must not grant itself access to another native conversation store.
+
+A Default start or restart can pass native resume flags to a bare, non-path wrapper mapped by `agent_detect_as` and capture its pane-scoped published ID (for example Claude, Cursor, or Pi), even without the execution contract. If a failed-resume marker or disabled `auto_resume_on_restart` selects a fresh launch, Cleared intent starts fresh through the same wrapper, minting an ID and passing fresh-session flags where supported, then capturing its pane-scoped publication. The failed-resume marker applies to the next automatic attempt for that ID; a subsequent restart follows the resulting durable conversation state. Neither path proves the wrapper's execution identity or store. Shared-store capture, explicit resume, and fork still require the contract; shell-active commands, remote launchers, paths, and different built-in commands do not gain the exception. A known conversation can also be tried after an external working-directory or store move on Default; its old binding stays authoritative until a qualified observation updates it. Explicit operations still require a matching known binding before launch.
+
+Shell pipelines, remote launchers, redirections, expansion, and unrecognized context-changing arguments are not supported managed invocations. The program, routing environment, and native namespace arguments are fixed from one validated launch snapshot and restored after the login shell. If shell startup changes a pinned routing value, AoE refuses the launch instead of dispatching against the wrong store.
+
+## Supported managed contexts
+
+- **Claude:** the resolved `CLAUDE_CONFIG_DIR` or default Claude store. Conflicting store selectors are refused.
+- **Codex:** a local host-readable `CODEX_HOME`, file-backed API-key authentication, and local SQLite/thread storage. Cloud, keyring, profile, project-routing, managed-policy, and host macOS contexts are not currently proven.
+- **OpenCode:** an explicit `OPENCODE_DB`, or the common database when `OPENCODE_DISABLE_CHANNEL_DB` is already enabled. A workspace-routed target or different stored working directory is refused.
+- **Pi and OMP:** the verified transcript and exact store. Recovery uses `--store` with the transcript file. OMP also verifies its stored working directory and pins the resolved profile.
+- **Gemini, Cursor, Kimi, and Copilot:** their native config/share/home store inputs. AoE does not combine unrelated environment roots.
+- **Prime:** the resolved agent root and session directory, including a verified `--cwd`. A declared wrapper can resume an explicitly bound conversation but does not gain capture or fork capability.
+- **Hermes:** an explicitly declared configuration root and local `state.db`. Stored lineage and working directory must match the launch context.
+- **Vibe:** an explicitly declared configuration root and default session store. Remote and alternate-store selectors are refused.
 
 Disabling `agent_status_hooks` removes status writers only; identity hooks declared for native resume stay installed.
 
@@ -29,28 +48,45 @@ Disabling `agent_status_hooks` removes status writers only; identity hooks decla
 
 ## Pinning or resetting a conversation
 
+Pin a terminal session to a specific native conversation:
+
 ```sh
-aoe session set-session-id <session> <native-session-id>   # pin
-aoe session set-session-id <session> ""                    # start fresh once
+aoe session set-session-id <session-name-or-id> <native-session-id>
 ```
 
-A pin is sticky: every launch resumes it until you change it. If AoE cannot prove a pinned conversation invalid and only sees the resumed pane exit, it keeps the id and reports a recoverable resume failure rather than silently starting fresh. Clearing is one-shot: the next launch starts fresh, and automatic capture takes over again where the matrix supports it. To drop the persisted state entirely, delete and recreate the session.
+This records an assertion about the intended native target, separately from any observed conversation. The pin is sticky. If the execution context changes, restore it or explicitly rebind the intended conversation before retrying. Legacy IDs and IDs from old unqualified publishers remain unknown after migration; current configuration does not relabel them.
 
-Structured-view sessions manage their conversation through ACP and reject `set-session-id`. Toggle the session out of structured view first, or set the resume target from the structured view UI.
+Automatic start or restart attempts an unknown stored ID instead of discarding it. A capture from an attested launch can qualify the binding; without an attested launch it remains unknown even if native resume succeeds. If the native resume probe fails, AoE preserves the ID and starts fresh on the next automatic restart. Explicit resume pins and forks still require a qualified binding. To assert a store explicitly:
 
-State lives in the profile's `sessions.json`: `agent_session_id` (the observed conversation id), `resume_intent` (`Default`, `Use(id)`, or `Cleared`, absent when default), `resume_probe_failed_sid` (the last pinned id whose probe failed ambiguously, which stops startup recovery retrying it until you act), and, for Pi, `pi_session_path` (the transcript path the pane published, since Pi indexes conversations by the directory they started in). Only `resume_intent` is yours to set, through the CLI above.
+```sh
+aoe session set-session-id <session> <native-id> --store /absolute/native/store
+```
+
+`--store` explicitly selects a Claude configuration directory. For Pi and OMP it must name the exact existing transcript file, whose header must name the requested ID. Other agents resolve their store from configuration and reject explicit store routing.
+
+To start fresh once:
+
+```sh
+aoe session set-session-id <session-name-or-id> ""
+```
+
+Automatic capture then takes over where supported. The abandoned conversation stays excluded only in its recorded agent, store, and filesystem namespace. Legacy exclusions without a known namespace remain ID-wide.
+
+Structured-view conversations remain managed by ACP. For a Claude terminal handoff, AoE records the native execution resolved for the current ACP ID. A handoff whose store cannot be resolved, or which the structured worker does not share, is refused before worker teardown with recovery guidance. Other structured resume-target changes are rejected.
 
 ## Forking a session
 
 A fork starts a new, independent session from an existing session's conversation, so you can take the same history in a different direction. Only the fork is new: the original session and its transcript are untouched.
 
-- **TUI**: the command palette's **Fork session (resume context, diverge)**, or **Fork session** on a session row's right-click menu. There is no keyboard shortcut by design. The new-session dialog opens prefilled with the source's working directory and group, titled `<name> (fork)`.
+- **TUI**: the command palette's **Fork session (resume context, diverge)**, or **Fork session** on a session row's right-click menu. The dialog inherits the source working directory, group, and title. A rejected launch preserves the pending fork instead of silently starting fresh.
 - **Web**: **Fork session** on the sidebar context menu of a forkable session.
 - **CLI**: `aoe add --fork-from <session-id-or-title>`.
 
-The fork inherits the parent's conversation, agent, group, and working directory. The directory is required so the agent can resolve the prior conversation, which is also why `--fork-from` cannot be combined with `--worktree` / `--new-branch`, `--sandbox` / `--sandbox-image`, or a `--cmd` carrying its own `--resume` flags. Passing a `--tool` that differs from the parent's agent is rejected rather than run against the wrong agent, since a captured conversation is agent-specific. From there the fork is its own session: its own id, its own row, restarts independent of the parent.
+The fork inherits the parent tool, group, working directory, and qualified conversation binding. That binding must establish the native agent and store through a qualified publication, import, or explicit recovery assertion. A raw or preallocated ID is insufficient; status detection and matching tool labels grant no authority. A different tool, conflicting native command, or user-supplied resume/fork selector is refused before dispatch without clearing the pending fork. `--fork-from` cannot be combined with `--worktree` / `--new-branch` or `--sandbox` / `--sandbox-image`.
 
-Forking needs an agent that can branch a conversation: claude, codex, and opencode for terminal sessions, and the Claude adapter for structured sessions. Resume-only agents (gemini, vibe, copilot) and agents without resume in AoE (cursor, droid, kiro, qwen) hide or refuse the action.
+The child gets its own AoE ID and native conversation. The parent row and transcript remain unchanged. Automatic recovery still depends on the agent's capture capability and supported execution context; dispatching a native fork adds no new child-ID discovery path.
+
+Forking needs an agent that can branch a conversation: claude, codex, and opencode in the supported managed contexts, and the Claude adapter for structured sessions. Resume-only agents (gemini, vibe, copilot) and agents without resume in AoE (cursor, droid, kiro, qwen) hide or refuse the action.
 
 ## Swapping the engine on a restart
 

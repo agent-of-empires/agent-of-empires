@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.16.1"
+version = "1.17.2"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
@@ -53,6 +53,7 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 toml = "1.1"
 toml_edit = "0.25"
+dotenv-ng-core = "1.0"
 
 # File watching
 notify = "8.2"
@@ -234,11 +235,6 @@ serial_test = "4.0"
 # loop's grace deadline can be asserted without sleeping through it.
 # `cargo build` and released binaries never enable `test-util`.
 tokio = { version = "1.52", features = ["test-util"] }
-# Test-only tracing capture (#2756, I4): asserts the equal-timestamp guard's
-# drop branch logged. Its target `session.store` is rejected by the default
-# `agent_of_empires=trace` env filter, so `no-env-filter` is required; the
-# test scopes to its own span and matches the message, so wide capture is safe.
-tracing-test = { version = "0.2", features = ["no-env-filter"] }
 # Integration tests are separate crates and don't inherit the normal
 # `serde_json` dependency; the acp-runner orphan test parses a worker
 # registry record to mutate its pid structurally.

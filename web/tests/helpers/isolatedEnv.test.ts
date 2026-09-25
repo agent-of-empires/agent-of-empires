@@ -50,6 +50,7 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   AOE_OPEN_URL_TO: `${HOST}/opened-urls.txt`,
   AOE_SERVE_INSTANCE_ID: "host-daemon",
   AOE_SERVE_PASSPHRASE: "host-secret",
+  AOE_SESSION_SOURCE: "0f0f0f0f-0000-4000-8000-000000000000",
   AOE_TELEMETRY_ENDPOINT: "https://host.invalid/v1/telemetry",
   AOE_TMUX_SOCKET: "/tmp/tmux-1000/aoe.sock",
   AOE_UPDATE_API_BASE: "https://host.invalid/api",

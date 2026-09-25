@@ -8,6 +8,8 @@ Settings resolve in layers, each overriding the one before it, field by field:
 
 Unset fields inherit from the layer above. List fields replace rather than extend. Everything below is also editable from the TUI settings screen (`s`) and, unless noted, from the web dashboard.
 
+Global-only settings use the global config. On upgrade, the default profile's values for them move there, and other profiles' values are removed. `PATCH /api/profiles/<name>/settings` rejects global-only fields with HTTP 400; use `PATCH /api/settings` instead.
+
 A project registry entry can also override `worktree.enabled` and `session.smart_rename` for that project, from the web Projects view or the TUI add-project form. This override wins over all three layers. It lives in your own registry (`projects.json`), not the repo, so it does not weaken the `repo = "deny"` policy on either field.
 
 ## File locations
@@ -73,6 +75,7 @@ agent_status_hooks = true
 smart_rename = true
 auto_stop_idle_secs = 0   # 0 disables; e.g. 7200 = stop after 2h idle
 row_tag = "branch"        # none | auto | profile | sandbox | branch
+sidebar_position = "left" # left | right; TUI session list
 ```
 
 | Option | Default | Description |
@@ -82,8 +85,9 @@ row_tag = "branch"        # none | auto | profile | sandbox | branch
 | `auto_stop_idle_secs` | `0` | Seconds a plain tmux session may sit `Idle` before its tmux session and container are killed, leaving a restartable `Stopped` row. Idle age counts from the later of the last `Idle` transition and the last interaction, a session with an attached tmux client is spared, and the check runs about once a minute. Structured view workers use `acp.auto_stop_idle_secs`. |
 | `prevent_sleep_when_active` | `false` | Have the `aoe serve` daemon hold an OS sleep inhibitor (`caffeinate -i`, `systemd-inhibit`) while any session is active. Global only; a TUI without a daemon gets nothing. |
 | `prevent_sleep_idle_grace_minutes` | `15` | Minutes (0 to 240) every session must stay idle before the inhibitor is released. A session that never reaches `Idle` (`Waiting` on a prompt, `Creating` forever) holds it indefinitely. |
-| `session_id_poller_max_threads` | `50` | Ceiling on concurrent session-id pollers per process. Past the ceiling, the overflow's ids refresh on a 5 s to 60 s backoff instead of every status tick. Global only, applied at process start. |
+| `session_id_poller_max_threads` | `50` | Ceiling on concurrent session-id pollers per process. Past the ceiling, an overflow session's id is not refreshed until it gets a poller; starting one is retried on a 5 s to 60 s backoff. Global only, applied at process start. |
 | `row_tag` | `"branch"` | Metadata next to a TUI session title: `none`, `auto` (profile code in all-profiles view), `profile`, `sandbox`, or `branch`. |
+| `sidebar_position` | `"left"` | TUI session sidebar position: `left` or `right`. Global only. Narrow terminals keep the stacked layout. |
 | `tie_workdir_to_name` | `true` | Keep a managed worktree session's directory named after its title. See [Worktrees](worktrees.md#naming). |
 | `pre_trust_agent_folders` | `false` | Pre-trust each host session's worktree in the agent's own config (Claude Code, Codex, Gemini) so it does not open on a folder-trust prompt. Config-dir overrides are honored, and an `agent_config_dir` entry wins over them. Trust also activates the repo's `.claude/settings.json`, hooks included, so enable it only for directories you would have trusted by hand. Sandboxed sessions always pre-trust their own staged config. |
 | `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config; see [Adding a New Agent](../development/adding-agents.md#hook-format-reference). Disabling it leaves status to pane reading but keeps identity hooks used for native resume. |
@@ -93,9 +97,10 @@ row_tag = "branch"        # none | auto | profile | sandbox | branch
 | `smart_rename_model` | `{}` | Per-agent model for the rename one-shot, e.g. `{ claude = "haiku" }`. An absent key uses the agent's built-in default, an empty value forces the CLI default, and any other value is passed to the agent's model flag. |
 | `inherit_host_environment` | `false` | Forward AoE's whole environment to host sessions. See [Host environment](#host-environment). |
 | `agent_extra_args` | `{}` | Per-agent arguments appended after the binary, e.g. `{ opencode = "--port 8080" }`. Ignored for structured view sessions. |
-| `agent_command_override` | `{}` | Per-agent command replacing the binary. See [Agent command overrides](#agent-command-overrides). |
+| `agent_command_override` | `{}` | Per-agent command replacing the binary. Managed resume and fork validate the actual native command and store; opaque wrappers require an explicit execution contract. See [execution identity and wrappers](session-resume.md#execution-identity-and-wrappers). |
 | `custom_agents` | `{}` | User-defined agents (name to command). See [Custom agents](#custom-agents). |
-| `agent_detect_as` | `{}` | Maps a custom agent onto a built-in it inherits (status heuristics, ACP adapter, native resume). |
+| `agent_detect_as` | `{}` | Built-in status detection and ACP adapter inheritance for a custom agent. This is not authority for terminal resume or fork. |
+| `agent_execution_as` | `{}` | Explicit native-agent contract for an opaque terminal wrapper. Requires `agent_config_dir` naming its store. Trusted global/profile configuration only; repository overrides are refused. |
 | `agent_acp_cmd` | `{}` | ACP launch command that makes a custom agent structured-view capable, e.g. `{ "oc-superpowers" = "ocp run sp acp" }`. Split into argv and run with no shell. |
 | `agent_config_dir` | `{}` | Config directory an agent reads instead of its built-in default, keyed by agent name. Wins over the agent's config-dir environment variable. Two names pointing at the same agent are two accounts of it; a restart that swaps between them carries the conversation across, see [Session Resume](session-resume.md#swapping-the-engine-on-a-restart). Global/profile only. |
 | `agents.<name>.status_map` | `{}` | Trusted hook-event to status mapping (`running`, `waiting`, `idle`, `error`), applied on the next hook install. Hooks receive `AOE_PROFILE`, so a script can read the resolved map with `aoe -p "$AOE_PROFILE" profile show --status-map <agent> --json`. Global/profile only. |
@@ -145,11 +150,13 @@ agent_detect_as = { "lenovo-claude" = "claude" }
 ```
 
 - **`custom_agents`** maps a display name to the command AoE runs in a tmux pane.
-- **`agent_detect_as`** reuses a built-in's status detection and, when that built-in has one, its ACP adapter. Without it (and without `status_rules`) a custom agent always reports `Idle`. Native resume additionally requires the command to start with the built-in's exact binary token, or be a single bare token resolved on `PATH`; path-qualified scripts, remote launchers, and any shell control syntax fail closed.
+- **`agent_detect_as`** reuses built-in status detection and ACP adapter inheritance. It never proves which native CLI owns a terminal conversation.
+- **`agent_execution_as`** declares the native agent actually invoked by an opaque wrapper, together with its `agent_config_dir` store contract. This is required for managed resume and fork through such a wrapper.
+  Bare, non-path wrappers can receive Default automatic resume flags and pane-scoped capture without this contract. Cleared launches selected by a failed-resume marker or disabled `auto_resume_on_restart` start fresh, mint and pass fresh-session flags where supported, and capture the new pane-scoped ID; explicit resume and fork remain unavailable. See [Execution identity and wrappers](session-resume.md#execution-identity-and-wrappers).
 - **`agent_acp_cmd`** gives the agent its own ACP command (see below).
 - **`agent_config_dir`** names the config directory the wrapper points its CLI at (see below).
 
-Custom agents always show as available, since their command may target a remote host. Profile (and, for `agent_detect_as`, repo) values replace the global map entirely, so redeclare any entries you want to keep. The web wizard can select a custom agent but never edits these command strings.
+Custom agents remain selectable even for remote or unmanaged commands. Profile maps replace global maps, so redeclare entries you want to keep. `agent_execution_as` and `agent_config_dir` are trusted global/profile declarations; repository overrides are refused. The web wizard can select a custom agent but never edits these command strings.
 
 ### One CLI, two accounts
 
@@ -160,6 +167,9 @@ A wrapper that runs the same CLI against a second login usually exports the agen
 claude-personal = "claude-personal"      # a wrapper that exports CLAUDE_CONFIG_DIR
 
 [session.agent_detect_as]
+claude-personal = "claude"
+
+[session.agent_execution_as]
 claude-personal = "claude"
 
 [session.agent_config_dir]
@@ -304,7 +314,7 @@ vt_live = true
 | `status_bar` | `"auto"` | Paint aoe's themed status bar (title, branch, sandbox, detach hint) on its own sessions. The bar is a whole theme, so `"auto"` steps aside whenever you have a tmux config at all. `"disabled"` reverts aoe's session-scoped `status*` overrides, so your own config governs. See [tmux status bar](tmux-status-bar.md). |
 | `mouse` | `"auto"` | Set tmux `mouse` on aoe's sessions, which is what turns a wheel or touch scroll into copy-mode scrollback. `"auto"` defers only when your tmux config sets `mouse` itself, and enables it otherwise. |
 | `clipboard` | `"auto"` | Forward the agent's OSC 52 clipboard writes (`set-clipboard on`, `allow-passthrough on`) to your terminal or the dashboard. Without it, "select to copy" inside an agent silently fails. Same per-option `"auto"` as `mouse`; live-send forwarding stays on for `"auto"` and `"enabled"`. |
-| `socket_name` | unset | Run aoe's sessions on a private tmux server (`tmux -L <name>`), so your own `tmux ls` stays separate. Bare name only, applied at the next aoe start. Global/profile only. |
+| `socket_name` | unset | Run aoe's sessions on a private tmux server (`tmux -L <name>`), so your own `tmux ls` stays separate. Bare name only, applied at the next aoe start. Global only. |
 | `vt_live` | `true` | Render agent previews and the dashboard's agent terminal from a persistent VT channel instead of `capture-pane` polling. See [the VT live transport](live-mode.md#the-vt-live-transport). |
 
 Per-option detection reads `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`, and `~/.config/tmux/tmux.conf` for a `set` / `setw` of the option. It is deliberately conservative: an option reached through `source-file`, `if-shell`, a false `%if`, or a key binding is not detected, so set the mode to `"disabled"` if you keep yours in one of those places. `/etc/tmux.conf` is not consulted.
@@ -361,7 +371,7 @@ environment = ["GH_TOKEN=$AOE_GH_TOKEN"]
 
 ## Profiles
 
-Profiles are separate workspaces with their own sessions, groups, and overrides of anything above.
+Profiles are separate workspaces with their own sessions, groups, and overrides of profile-overridable settings.
 
 ```bash
 aoe                        # "default" profile

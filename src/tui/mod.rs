@@ -297,6 +297,9 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     let startup_session_config = crate::session::resolve_config(profile)
         .map(|c| c.session)
         .unwrap_or_default();
+    crate::session::poller::configure_session_id_poller_max_threads(
+        startup_session_config.session_id_poller_max_threads,
+    );
     let enable_mouse = mouse_capture_requested(&startup_session_config) && !mosh_active;
     let _terminal_guard = TerminalGuard::enter(enable_mouse, mosh_active)?;
 

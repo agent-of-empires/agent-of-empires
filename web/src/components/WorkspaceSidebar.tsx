@@ -70,12 +70,12 @@ interface Props {
   onEditProject: (project: ProjectInfo) => void;
   onRemoveProject: (group: RepoGroup) => void;
   onSettings: () => void;
-  onDeleteSession?: (workspaceId: string) => void;
+  onDeleteSession?: (sessionIds: string[]) => void;
   /** Receives every session id of the trashed workspace. */
   onRestoreSession?: (sessionIds: string[]) => void;
   onEmptyTrash?: () => void;
-  onStopSession?: (workspaceId: string) => void;
-  onStartSession?: (workspaceId: string) => void;
+  onStopSession?: (sessionId: string) => void;
+  onStartSession?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   readOnly?: boolean;
   /** False in CityHall client mode, which hides project management. */
@@ -371,7 +371,7 @@ export function WorkspaceSidebar(props: Props) {
               readOnly={readOnly}
               onOpen={selection.handleRowActivate}
               onRestore={(ids) => props.onRestoreSession?.(ids)}
-              onDelete={(id) => props.onDeleteSession?.(id)}
+              onDelete={(ids) => props.onDeleteSession?.(ids)}
               onEmptyTrash={() => props.onEmptyTrash?.()}
             />
           )}

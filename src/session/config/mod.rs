@@ -966,6 +966,16 @@ pub struct SessionConfig {
     #[setting(label = "Show system health strip", widget = "toggle")]
     pub show_diagnostics_pane: bool,
 
+    /// Side of the TUI session list. Narrow terminals keep the list above the preview.
+    #[serde(default)]
+    #[setting(
+        label = "Sidebar Position",
+        widget = "select",
+        options = "left:Left,right:Right",
+        global_only
+    )]
+    pub sidebar_position: SidebarPosition,
+
     /// Read the session state the `aoe serve` daemon owns (structured session
     /// status) from the running daemon, the way the web dashboard does, instead
     /// of from the local session store. With no daemon running the sidebar uses
@@ -1164,6 +1174,18 @@ pub struct SessionConfig {
         repo = "allow"
     )]
     pub agent_detect_as: HashMap<String, String>,
+
+    /// Explicit native execution contract: wrapper=builtin (e.g. lenovo-claude=claude).
+    /// Asserts which agent a wrapper executes and whose conversation namespace
+    /// it writes, paired with agent_config_dir.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[setting(
+        label = "Agent Execution As",
+        widget = "list",
+        web = "local_only:asserts the native execution and conversation namespace of a wrapper",
+        category = "Agents"
+    )]
+    pub agent_execution_as: HashMap<String, String>,
 
     /// ACP launch command for a custom agent, enabling it to run in the
     /// structured acp UI (e.g., "oc-superpowers" = "ocp run sp acp").
@@ -1722,6 +1744,15 @@ pub enum AttachMode {
     LiveSend,
 }
 
+/// Side of the session list in the TUI's horizontal layout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarPosition {
+    #[default]
+    Left,
+    Right,
+}
+
 /// What to render in the per-row tag slot next to the session title.
 ///
 /// Defaults to `Branch` to preserve worktree branch visibility. Users can pick
@@ -1751,6 +1782,7 @@ impl Default for SessionConfig {
             yolo_mode_default: false,
             pre_trust_agent_folders: false,
             show_diagnostics_pane: false,
+            sidebar_position: SidebarPosition::default(),
             daemon_sidebar: true,
             inherit_host_environment: false,
             agent_extra_args: HashMap::new(),
@@ -1767,8 +1799,9 @@ impl Default for SessionConfig {
             host_tab_title: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
-            agent_config_dir: HashMap::new(),
+            agent_execution_as: HashMap::new(),
             agent_acp_cmd: HashMap::new(),
+            agent_config_dir: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
             session_id_poller_max_threads: default_session_id_poller_max_threads(),
@@ -3233,7 +3266,7 @@ pub(crate) fn config_path() -> Result<PathBuf> {
 /// Sidecar lock file name for the global `config.toml`. Lives in `<app_dir>`
 /// next to `config.toml`, mirroring `storage.rs`'s `.storage.lock` /
 /// `.workspace-ordering.lock` sidecars.
-const CONFIG_LOCK_FILENAME: &str = ".config.lock";
+pub(crate) const CONFIG_LOCK_FILENAME: &str = ".config.lock";
 
 /// Process-wide mutex serialising [`update_config`] calls. Paired with a
 /// cross-process `flock` on [`CONFIG_LOCK_FILENAME`]; see that function and

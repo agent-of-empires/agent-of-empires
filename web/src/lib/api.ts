@@ -165,7 +165,11 @@ export async function ensureSession(id: string, signal?: AbortSignal): Promise<E
         message: stringField(payload, "message") ?? `Server error (${status})`,
       };
     }
-    return { ok: true, status: payload?.status as "alive" | "restarted" | undefined };
+    return {
+      ok: true,
+      status: payload?.status as "alive" | "restarted" | undefined,
+      message: stringField(payload, "message"),
+    };
   } catch (e) {
     if ((e as { name?: string }).name === "AbortError") return { ok: false, error: "aborted" };
     return { ok: false, message: e instanceof Error ? e.message : "Network error" };
@@ -222,6 +226,13 @@ export function getSessionFileContents(
   const params = new URLSearchParams({ path: filePath });
   if (repoName) params.set("repo", repoName);
   return fetchJson<RichFileContentsResponse>(`/api/sessions/${id}/diff/file?${params.toString()}`);
+}
+
+/** URL of a diffed file's current worktree bytes, for opening in a new tab. */
+export function sessionDiffRawFileUrl(id: string, filePath: string, repoName?: string): string {
+  const params = new URLSearchParams({ path: filePath });
+  if (repoName) params.set("repo", repoName);
+  return `/api/sessions/${id}/diff/file/raw?${params.toString()}`;
 }
 
 export interface SessionFileResponse {
@@ -1029,10 +1040,17 @@ export function acpEnable(sessionId: string): Promise<ViewSwitchResponse | null>
   return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/enable`, { method: "POST" });
 }
 
-export function acpDisable(sessionId: string): Promise<ViewSwitchResponse | null> {
-  return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/disable`, {
-    method: "POST",
-  });
+export async function acpDisable(
+  sessionId: string,
+): Promise<{ ok: true; data: ViewSwitchResponse } | { ok: false; message?: string }> {
+  try {
+    const response = await fetch("/api/sessions/" + encodeURIComponent(sessionId) + "/acp/disable", { method: "POST" });
+    if (response.ok) return { ok: true, data: (await response.json()) as ViewSwitchResponse };
+    const message = (await response.text()).trim();
+    return message ? { ok: false, message } : { ok: false };
+  } catch {
+    return { ok: false };
+  }
 }
 
 // --- Server-owned prompt queue ---

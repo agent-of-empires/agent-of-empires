@@ -14,6 +14,32 @@ use serial_test::serial;
 use tempfile::TempDir;
 use tui_input::Input;
 
+fn observed_fork_parent(agent: &str) -> Instance {
+    let mut instance = Instance::new("parent", "/tmp/repo");
+    instance.source_profile = "test".into();
+    instance.tool = agent.into();
+    let sid = "parent-1111-2222-3333-444444444444";
+    instance.set_agent_conversation(
+        Some(sid.into()),
+        Some(crate::session::ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: agent.into(),
+                stores: vec!["/native-store".into()],
+                configuration: Vec::new(),
+                exported_default_store: false,
+                cwd: "/tmp/repo".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            }),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        }),
+        None,
+    );
+    instance
+}
+
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
@@ -41,6 +67,7 @@ mod scroll_pane_isolation;
 mod search;
 mod session_feed_tests;
 mod settings_scroll_wiring;
+mod sidebar_position;
 mod stacked_single_seam;
 mod status_rows_menu;
 mod store_move;

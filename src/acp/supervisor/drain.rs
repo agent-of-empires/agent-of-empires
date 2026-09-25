@@ -11,13 +11,14 @@ use tracing::{debug, info, warn};
 
 use super::agents::log_wrapper_substitution;
 use super::launch::{
-    before_session_env, overlay_env, publish_rejection, refresh_spawn_model_effort,
-    resolve_mcp_servers,
+    apply_claude_store_pin, before_session_env, overlay_env, publish_rejection,
+    refresh_spawn_model_effort, resolve_mcp_servers,
 };
 use super::teardown::{settle_lease, tear_down_replacement, tear_down_runner, wait_for_exit};
 use super::{
-    lock_recover, next_seq, BroadcastSink, Launcher, ResumeReservation, SeqMap, SharedSet,
-    Supervisor, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
+    lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, ResumeReservation,
+    SeqMap, SharedSet, Supervisor, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF,
+    RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -32,6 +33,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: String,
         lease: Lease,
         inbound: mpsc::Receiver<Event>,
+        context_reset: Option<PendingContextReset>,
     ) -> JoinHandle<()> {
         let drain = Drain {
             session_id,
@@ -44,6 +46,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             launcher: Arc::clone(&self.launcher),
             notify: Arc::clone(&self.worker_notify),
             startup_failures: Arc::clone(&self.startup_failures),
+            pending_context_resets: Arc::clone(&self.pending_context_resets),
+            context_reset,
             respawned_in_place: Arc::clone(&self.respawned_in_place),
         };
         crate::task_util::spawn_supervised(
@@ -65,6 +69,8 @@ struct Drain<S> {
     launcher: Launcher,
     notify: Arc<tokio::sync::Notify>,
     startup_failures: SharedSet,
+    pending_context_resets: SharedSet,
+    context_reset: Option<PendingContextReset>,
     respawned_in_place: SharedSet,
 }
 
@@ -97,7 +103,7 @@ impl<S: BroadcastSink> Drain<S> {
         self.sink.publish(&self.session_id, seq, &event);
     }
 
-    async fn run(self, mut lease: Lease, mut inbound: mpsc::Receiver<Event>) {
+    async fn run(mut self, mut lease: Lease, mut inbound: mpsc::Receiver<Event>) {
         loop {
             let end = self.pump(&mut inbound, lease.epoch()).await;
             warn!(
@@ -142,7 +148,7 @@ impl<S: BroadcastSink> Drain<S> {
     }
 
     /// Publish events until the worker's channel closes.
-    async fn pump(&self, inbound: &mut mpsc::Receiver<Event>, generation: u64) -> StreamEnd {
+    async fn pump(&mut self, inbound: &mut mpsc::Receiver<Event>, generation: u64) -> StreamEnd {
         let mut end = StreamEnd::default();
         let mut established = false;
         while let Some(event) = inbound.recv().await {
@@ -157,31 +163,97 @@ impl<S: BroadcastSink> Drain<S> {
                 },
                 Event::AgentStartupError { .. } if !established => end.startup_failed = true,
                 Event::AcpSessionAssigned { acp_session_id } => {
-                    established = true;
-                    self.with_cached_config(|config| {
-                        info!(
-                            target: "acp.supervisor",
-                            session = %self.session_id,
-                            acp_session_id = %acp_session_id,
-                            "caching agent-assigned id for future respawn"
+                    if let Some(pending) = self.context_reset.take() {
+                        self.sink.publish_from_worker(
+                            &self.session_id,
+                            next_seq(&self.next_seqs, &self.session_id),
+                            &Event::SessionContextReset {
+                                reason: pending.reason,
+                            },
+                            generation,
                         );
-                        config.stored_acp_session_id = Some(acp_session_id.clone());
-                        config.seed_history_replay = false;
-                    })
-                    .await;
+                        let id = self.session_id.clone();
+                        let assigned = acp_session_id.clone();
+                        let acknowledged = tokio::task::spawn_blocking(move || {
+                            crate::migrations::v033_isolate_sandbox_content::acknowledge_context_reset(
+                                &pending.profile,
+                                &id,
+                                crate::migrations::v033_isolate_sandbox_content::NativeContextView::Structured,
+                                generation,
+                                &pending.transactions,
+                                Some(&assigned),
+                            )
+                        }).await;
+                        let failure = match acknowledged {
+                            Ok(Ok(())) => None,
+                            Ok(Err(error)) => Some(error.to_string()),
+                            Err(error) => Some(error.to_string()),
+                        };
+                        if let Some(error) = failure {
+                            end.startup_failed = true;
+                            self.sink.publish_from_worker(
+                                &self.session_id,
+                                next_seq(&self.next_seqs, &self.session_id),
+                                &Event::AgentStartupError {
+                                    message: format!(
+                                        "Could not commit the isolated native context: {error}"
+                                    ),
+                                },
+                                generation,
+                            );
+                            let client = self
+                                .workers
+                                .lock()
+                                .await
+                                .get(&self.session_id)
+                                .filter(|handle| handle.lease.epoch() == generation)
+                                .map(|handle| Arc::clone(&handle.client));
+                            if let Some(client) = client {
+                                let _ = client.shutdown().await;
+                            }
+                            return end;
+                        }
+                    }
+                    if self.clear_pending_context_reset() {
+                        self.notify.notify_waiters();
+                    }
+                    established = true;
+                    let mut workers = self.workers.lock().await;
+                    if let Some(handle) = workers.get_mut(&self.session_id) {
+                        if handle.lease.epoch() != generation {
+                            continue;
+                        }
+                        handle.native_session_id = Some(acp_session_id.clone());
+                        if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
+                            info!(
+                                target: "acp.supervisor",
+                                session = %self.session_id,
+                                acp_session_id = %acp_session_id,
+                                "caching agent-assigned id for future respawn"
+                            );
+                            spawn_config.stored_acp_session_id = Some(acp_session_id.clone());
+                            spawn_config.seed_history_replay = false;
+                        }
+                    }
                 }
                 Event::SessionContextReset { reason } => {
-                    self.with_cached_config(|config| {
-                        info!(
-                            target: "acp.supervisor",
-                            session = %self.session_id,
-                            %reason,
-                            "clearing cached id and any pending fork after a context reset"
-                        );
-                        config.stored_acp_session_id = None;
-                        config.fork_from = None;
-                    })
-                    .await;
+                    let mut workers = self.workers.lock().await;
+                    if let Some(handle) = workers.get_mut(&self.session_id) {
+                        if handle.lease.epoch() != generation {
+                            continue;
+                        }
+                        handle.native_session_id = None;
+                        if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
+                            info!(
+                                target: "acp.supervisor",
+                                session = %self.session_id,
+                                %reason,
+                                "clearing cached id and any pending fork after a context reset"
+                            );
+                            spawn_config.stored_acp_session_id = None;
+                            spawn_config.fork_from = None;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -193,13 +265,8 @@ impl<S: BroadcastSink> Drain<S> {
         end
     }
 
-    async fn with_cached_config(&self, f: impl FnOnce(&mut SpawnConfig)) {
-        let mut guard = self.workers.lock().await;
-        if let Some(WorkerKind::Runner { spawn_config }) =
-            guard.get_mut(&self.session_id).map(|h| &mut h.kind)
-        {
-            f(spawn_config);
-        }
+    fn clear_pending_context_reset(&self) -> bool {
+        lock_recover(&self.pending_context_resets).remove(&self.session_id)
     }
 
     /// Remove this epoch's handle; a no-op once a newer epoch replaced it.
@@ -208,7 +275,7 @@ impl<S: BroadcastSink> Drain<S> {
     /// their outcome: detach them, or a park leaves the panel showing them
     /// running and holds the sidebar dot lit for its length (#4001). Gated on
     /// the release so a newer epoch's sub-agents, which that epoch's own sweep
-    /// owns, are left alone; the detach runs off the `workers` guard because
+    /// owns, are left alone; the detach runs off the workers guard because
     /// it reads the store.
     async fn drop_handle(&self, lease: &Lease) {
         let dropped = {
@@ -220,6 +287,9 @@ impl<S: BroadcastSink> Drain<S> {
             dropped
         };
         if dropped {
+            if self.clear_pending_context_reset() {
+                self.notify.notify_waiters();
+            }
             super::publish::detach_orphaned_background_agents_on(
                 &*self.sink,
                 &self.next_seqs,
@@ -357,6 +427,7 @@ impl<S: BroadcastSink> Drain<S> {
                     Some(handle) => {
                         handle.client = Arc::clone(&client);
                         handle.lease = respawn_lease.clone();
+                        handle.native_session_id = None;
                         None
                     }
                     None => Some(InstallError::Stale),
@@ -431,6 +502,10 @@ impl<S: BroadcastSink> Drain<S> {
             ),
         }
 
+        let mut claude_config_dir = config
+            .claude_store_pin
+            .as_ref()
+            .map(|pin| pin.store.clone());
         if config.sandbox_info.is_none() {
             let minted = before_session_env(
                 session_id,
@@ -455,6 +530,10 @@ impl<S: BroadcastSink> Drain<S> {
                     "{what} on respawn; reusing the environment from the prior launch"
                 );
             }
+            claude_config_dir = apply_claude_store_pin(
+                &mut config.host_environment,
+                config.claude_store_pin.as_ref(),
+            );
         }
 
         config.mcp_servers = resolve_mcp_servers(
@@ -463,6 +542,7 @@ impl<S: BroadcastSink> Drain<S> {
             config.source_profile.clone(),
             config.cwd.clone(),
             config.host_environment.clone(),
+            claude_config_dir,
             "MCP re-resolution on respawn failed",
         )
         .await;
@@ -701,7 +781,7 @@ mod tests {
                 .test_install_handle(id, client, WorkerKind::Attached, None)
                 .await;
             let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(16);
-            let drain = sup.start_drain_task(id.into(), lease, inbound_rx);
+            let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
             inbound_tx
                 .send(Event::AcpSessionAssigned {
                     acp_session_id: "acp-1".into(),
@@ -788,7 +868,7 @@ mod tests {
             .test_install_handle(id, client, WorkerKind::Attached, None)
             .await;
         let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(16);
-        let drain = sup.start_drain_task(id.into(), lease, inbound_rx);
+        let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
         drop(inbound_tx);
         tokio::time::timeout(Duration::from_secs(5), drain)
             .await
@@ -835,7 +915,7 @@ mod tests {
             let sup = Supervisor::new(sink.clone());
             let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(16);
             let lease = sup.test_install_stdio(id).await;
-            let drain = sup.start_drain_task(id.into(), lease, inbound_rx);
+            let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
             for event in &events {
                 inbound_tx.send(event.clone()).await.unwrap();
             }
@@ -885,6 +965,50 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn failed_context_ack_does_not_publish_later_native_assignments() {
+        let (_home, _temp) = isolate_home();
+        let id = "s-reset-ack-failure";
+        let sink = VecSink::new();
+        let supervisor = Supervisor::new(sink.clone());
+        let lease = supervisor.test_install_stdio(id).await;
+        let (sender, inbound) = mpsc::channel(4);
+        let drain = supervisor.start_drain_task(
+            id.into(),
+            lease,
+            inbound,
+            Some(PendingContextReset {
+                profile: "default".into(),
+                reason: "native content changed".into(),
+                transactions: vec!["missing-slot".into()],
+            }),
+        );
+        for sid in ["first", "second"] {
+            sender
+                .send(Event::AcpSessionAssigned {
+                    acp_session_id: sid.into(),
+                })
+                .await
+                .unwrap();
+        }
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(2), drain)
+            .await
+            .unwrap()
+            .unwrap();
+        let events = sink.frames.lock().unwrap();
+        assert!(events
+            .iter()
+            .any(|(_, _, event)| matches!(event, Event::SessionContextReset { .. })));
+        assert!(events.iter().any(|(_, _, event)| matches!(event, Event::AgentStartupError { message } if message.contains("Could not commit the isolated native context"))));
+        assert!(!events
+            .iter()
+            .any(|(_, _, event)| matches!(event, Event::AcpSessionAssigned { .. })));
+        assert_eq!(supervisor.take_startup_failures(), vec![id.to_string()]);
+        assert!(!supervisor.workers.lock().await.contains_key(id));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn shutdown_during_respawn_retires_the_replacement() {
         let _home = isolate_home();
         let control =
@@ -910,7 +1034,7 @@ mod tests {
             )
             .await;
         let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
-        let drain = sup.start_drain_task("s-resp".into(), lease, inbound_rx);
+        let drain = sup.start_drain_task("s-resp".into(), lease, inbound_rx, None);
         drop(inbound_tx);
 
         gate.entered.notified().await;
@@ -971,7 +1095,7 @@ mod tests {
             )
             .await;
         let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
-        let _drain = sup.start_drain_task("s-crash".into(), lease, inbound_rx);
+        let _drain = sup.start_drain_task("s-crash".into(), lease, inbound_rx, None);
         drop(inbound_tx);
 
         gate.entered.notified().await;
@@ -990,5 +1114,117 @@ mod tests {
         }
         assert_eq!(flagged, vec!["s-crash".to_string()]);
         sup.shutdown_idle("s-crash").await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn respawn_reapplies_selected_claude_store_before_native_mcp_discovery() {
+        use agent_client_protocol::schema::v1::McpServer;
+
+        let (_home, temp) = isolate_home();
+        let declared = temp.path().join("declared");
+        let selected = temp.path().join("selected");
+        std::fs::create_dir_all(&declared).unwrap();
+        std::fs::create_dir_all(&selected).unwrap();
+        std::fs::write(
+            declared.join(".claude.json"),
+            r#"{ "mcpServers": { "declared": { "command": "declared" } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            selected.join(".claude.json"),
+            r#"{ "mcpServers": { "selected": { "command": "selected" } } }"#,
+        )
+        .unwrap();
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            format!(
+                "[host_hooks]\nbefore_session = \"printf 'CLAUDE_CONFIG_DIR={}\\nHOOK_VALUE=kept\\n'\"\n\
+                 [session.agent_config_dir]\nclaude = \"{}\"\n",
+                temp.path().join("hook").display(),
+                declared.display()
+            ),
+        )
+        .unwrap();
+
+        let control =
+            Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+        control.alive(4242).alive(4343);
+        let (config_tx, mut config_rx) = mpsc::unbounded_channel();
+        let held_senders: Arc<std::sync::Mutex<Vec<mpsc::Sender<Event>>>> = Default::default();
+        let launcher_senders = Arc::clone(&held_senders);
+        let launcher: Launcher = Arc::new(move |config, session_id| {
+            let config_tx = config_tx.clone();
+            let senders = Arc::clone(&launcher_senders);
+            Box::pin(async move {
+                save_record(&session_id.0, 4343, config.generation);
+                config_tx.send(config).unwrap();
+                let (client, tx) = crate::acp::acp_client::AcpClient::fake_for_test(session_id);
+                senders.lock().unwrap().push(tx);
+                Ok(client.with_runner_pid(4343))
+            })
+        });
+        let sup = Arc::new(
+            Supervisor::new(VecSink::new())
+                .with_process_control(control)
+                .with_launcher(launcher),
+        );
+        save_record("s-store", 4242, 0);
+        let socket = worker_registry::socket_path_for("s-store").unwrap();
+        let mut config = runner_config(socket);
+        config.claude_store_pin = Some(crate::session::capture::ClaudeStorePin {
+            store: selected.clone(),
+            explicit: false,
+        });
+        config.host_environment = vec![("CLAUDE_CONFIG_DIR".into(), "stale".into())];
+        let lease = sup
+            .test_install_runner(
+                "s-store",
+                config,
+                Some(RunnerIdentity {
+                    pid: 4242,
+                    generation: 0,
+                }),
+            )
+            .await;
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+        let drain = sup.start_drain_task("s-store".into(), lease, inbound_rx, None);
+        drop(inbound_tx);
+
+        let launched = tokio::time::timeout(Duration::from_secs(5), config_rx.recv())
+            .await
+            .expect("respawn should launch")
+            .expect("launcher should capture config");
+        let names: Vec<_> = launched
+            .mcp_servers
+            .iter()
+            .map(|server| match server {
+                McpServer::Stdio(server) => server.name.as_str(),
+                McpServer::Http(server) => server.name.as_str(),
+                McpServer::Sse(server) => server.name.as_str(),
+                _ => "unknown",
+            })
+            .collect();
+        assert_eq!(names, ["selected"]);
+        assert_eq!(
+            launched
+                .host_environment
+                .iter()
+                .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                .map(|(_, value)| value.as_str()),
+            selected.to_str()
+        );
+        assert!(launched
+            .host_environment
+            .contains(&("HOOK_VALUE".into(), "kept".into())));
+
+        sup.shutdown_idle("s-store").await.expect("shutdown");
+        held_senders.lock().unwrap().clear();
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("drain should stop")
+            .unwrap();
     }
 }

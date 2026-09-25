@@ -797,7 +797,6 @@ pub fn execute_hooks_in_container_streamed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tracing_test::traced_test;
 
     /// Pins `SHELL` to a resolvable `sh` (and takes the env lock) so local hooks
     /// cannot fail on an ambient or concurrently changing `SHELL` (#3449).
@@ -843,13 +842,13 @@ mod tests {
         );
     }
 
-    #[traced_test]
     #[test]
     fn parse_env_kv_lines_does_not_log_malformed_key() {
-        tracing::callsite::rebuild_interest_cache();
+        let logs = crate::session::test_support::LogCapture::start();
         assert!(parse_env_kv_lines("https://token:topsecret@example.test?x=ignored\n").is_empty());
-        assert!(logs_contain("invalid environment key"));
-        assert!(!logs_contain("topsecret"));
+        let logs = logs.contents();
+        assert!(logs.contains("invalid environment key"), "{logs}");
+        assert!(!logs.contains("topsecret"), "{logs}");
     }
 
     #[test]

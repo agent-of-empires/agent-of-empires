@@ -32,6 +32,9 @@ export { clearAcpCache, useBackgroundAgents } from "./acpSession/stateCache";
 type PromptSendResult =
   | { kind: "dispatched" }
   | { kind: "queued"; queuedId: string }
+  /** 503 `worker_not_ready`: the daemon resumed, the worker did not arrive, and nothing was
+   *  published. The caller owns the text and must re-queue it. */
+  | { kind: "worker_not_ready" }
   | { kind: "retryable_failure" }
   | { kind: "non_retryable_failure" };
 
@@ -193,7 +196,7 @@ export function useAcpSession(
         if (!res.ok) {
           const detail = await safeText(res);
           const rejected = res.status >= 400 && res.status < 500;
-          // The idle-stopped worker is still respawning: the caller re-queues it, so no banner.
+          // The worker is not up yet (idle-stopped or parked): the caller re-queues it, so no banner.
           const workerNotReady = res.status === 503 && detail.startsWith("worker_not_ready");
           const settle = rejected
             ? "prompt_send_rejected"
@@ -204,6 +207,7 @@ export function useAcpSession(
           if (!workerNotReady) {
             dispatch({ kind: "error", message: `Could not send prompt (${res.status}). ${detail}`.trim() });
           }
+          if (workerNotReady) return { kind: "worker_not_ready" };
           return { kind: rejected ? "non_retryable_failure" : "retryable_failure" };
         }
         let body: PromptDispatchBody = {};
@@ -276,21 +280,13 @@ export function useAcpSession(
         reportAcpInteraction("prompt_queued");
         return;
       }
-      // The daemon chose to send but has no worker yet (idle wake or rate-limit park), so queue it or lose it.
-      if (result.kind === "retryable_failure" && (state.workerIdleStopped || state.rateLimitRetriesExhausted)) {
+      // The daemon sent, resumed, and no worker arrived, so nothing was published. Keyed on its
+      // answer, not on this client's view of which states are wakeable, which can lag the daemon.
+      if (result.kind === "worker_not_ready") {
         enqueueServer(text, attachments);
       }
     },
-    [
-      sessionId,
-      archivedAtRef,
-      snoozedUntilRef,
-      state.workerIdleStopped,
-      state.rateLimitRetriesExhausted,
-      dispatchPromptNow,
-      enqueueServer,
-      showServerQueued,
-    ],
+    [sessionId, archivedAtRef, snoozedUntilRef, dispatchPromptNow, enqueueServer, showServerQueued],
   );
 
   // The daemon owns and drains the queue; re-list on connect and at each turn change. The first
@@ -367,7 +363,7 @@ export function useAcpSession(
       const result = await dispatchPromptNow(prompt.text, prompt.attachments);
       if (result.kind === "queued") {
         showServerQueued(result.queuedId, prompt.text, prompt.attachments);
-      } else if (result.kind === "retryable_failure") {
+      } else if (result.kind === "retryable_failure" || result.kind === "worker_not_ready") {
         enqueueServer(prompt.text, prompt.attachments);
       }
     },
@@ -430,7 +426,12 @@ export function useAcpSession(
       status === "open" &&
       !state.workerStopped &&
       !state.workerRestarting &&
-      (workerState === "running" || state.workerIdleStopped || state.rateLimitRetriesExhausted),
+      // Same mirror: "Send now" is offered wherever a prompt can start a worker, which is what
+      // lets a row queued before the park drain without waiting out the reset window.
+      (workerState === "running" ||
+        state.workerIdleStopped ||
+        state.rateLimitRetriesExhausted ||
+        state.rateLimitParked),
     /** Send now would cancel a running, non-steerable turn rather than send immediately. */
     sendNowInterruptsTurn: state.turnActive && !steerable,
     setConfigOption,
