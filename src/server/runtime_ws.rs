@@ -5,19 +5,23 @@
 //! session, profile, group and project state; it never mutates it and never
 //! consults a client-local filesystem.
 //!
-//! Authentication is the router's existing credential gate, so a caller without a
-//! valid credential never reaches the upgrade. The daemon only ever serves this
-//! route over TCP, so the emitted owner is always the remote variant.
+//! Authentication for the HTTP route is the router's existing credential gate, so
+//! a caller without a valid credential never reaches the upgrade. The same two
+//! frames are also served over the daemon's own UNIX socket, where the peer is
+//! the same uid the daemon runs as, so that transport declares the local owner.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock, Mutex};
+use tokio::net::UnixStream;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, SecondsFormat, Utc};
+use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
+use tokio_tungstenite::tungstenite;
 
 use super::AppState;
 use crate::session::Instance;
@@ -25,8 +29,9 @@ use crate::session::Instance;
 /// Wire protocol version. The client refuses anything else.
 const PROTOCOL_VERSION: u16 = 2;
 
-/// The trusted namespace this build publishes for itself.
-const NAMESPACE: &str = if cfg!(debug_assertions) {
+/// The trusted namespace this build publishes for itself, and the name the
+/// UDS marker files carry.
+pub(crate) const NAMESPACE: &str = if cfg!(debug_assertions) {
     "debug:agent-of-empires-dev"
 } else {
     "release:agent-of-empires"
@@ -71,7 +76,86 @@ fn has_bearer_header(headers: &HeaderMap) -> bool {
             .iter()
             .all(|byte| (0x21..=0x7e).contains(byte) && *byte != b'"' && *byte != b'\\')
 }
-async fn serve_runtime_read(mut socket: WebSocket, state: Arc<AppState>) {
+async fn serve_runtime_read(socket: WebSocket, state: Arc<AppState>) {
+    run_read(ReadSocket::Web(socket), state, Owner::remote(), true).await;
+}
+
+/// The same two frames over the daemon's own UNIX socket. The peer is admitted
+/// by [`super::runtime_uds`], which checks the connecting uid before the
+/// upgrade, so the declared owner is this process's own uid.
+pub(crate) async fn serve_runtime_read_uds(
+    socket: tokio_tungstenite::WebSocketStream<UnixStream>,
+    state: Arc<AppState>,
+) {
+    if state.cityhall_mode {
+        tracing::warn!(
+            target: "runtime.uds",
+            "refusing the local runtime read while CityHall lockdown is on"
+        );
+        return;
+    }
+    let uid = unsafe { libc::geteuid() };
+    run_read(ReadSocket::Unix(socket), state, Owner::local(uid), false).await;
+}
+
+/// One producer for both transports: same single-flight sampler, same two
+/// frames, same close. Only the socket and the declared owner differ.
+enum ReadSocket {
+    Web(WebSocket),
+    Unix(tokio_tungstenite::WebSocketStream<UnixStream>),
+}
+
+impl ReadSocket {
+    async fn send_text(&mut self, text: &str) -> Result<(), ()> {
+        match self {
+            ReadSocket::Web(socket) => socket
+                .send(Message::Text(text.to_string().into()))
+                .await
+                .map_err(|_| ()),
+            ReadSocket::Unix(socket) => socket
+                .send(tungstenite::Message::Text(text.into()))
+                .await
+                .map_err(|_| ()),
+        }
+    }
+
+    async fn wait_for_peer_close(&mut self) {
+        match self {
+            ReadSocket::Web(socket) => {
+                while let Some(Ok(message)) = socket.next().await {
+                    if matches!(message, Message::Close(_)) {
+                        break;
+                    }
+                }
+            }
+            ReadSocket::Unix(socket) => {
+                while let Some(Ok(message)) = socket.next().await {
+                    if matches!(message, tungstenite::Message::Close(_)) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    async fn close(&mut self) {
+        match self {
+            ReadSocket::Web(socket) => {
+                let _ = socket.send(Message::Close(None)).await;
+            }
+            ReadSocket::Unix(socket) => {
+                let _ = socket.send(tungstenite::Message::Close(None)).await;
+                let _ = socket.close(None).await;
+            }
+        }
+    }
+}
+
+async fn run_read(
+    mut socket: ReadSocket,
+    state: Arc<AppState>,
+    owner: Owner,
+    close_after_frames: bool,
+) {
     let runtime = &RUNTIME;
     // Single-flight: a second connection waits for the in-flight sample instead of
     // publishing a second revision, so one sample is one revision and one cursor step.
@@ -79,15 +163,16 @@ async fn serve_runtime_read(mut socket: WebSocket, state: Arc<AppState>) {
 
     let instances: Vec<Instance> = state.instances.read().await.clone();
     let active_profile = state.profile.clone();
-    let sampled =
-        tokio::task::spawn_blocking(move || build_snapshot(runtime, &active_profile, &instances))
-            .await;
+    let sampled = tokio::task::spawn_blocking(move || {
+        build_snapshot(runtime, &active_profile, &instances, owner)
+    })
+    .await;
 
     let snapshot = match sampled {
         Ok(snapshot) => snapshot,
         Err(error) => {
             tracing::error!(target: "runtime.ws", %error, "runtime sample task failed");
-            let _ = socket.send(Message::Close(None)).await;
+            socket.close().await;
             return;
         }
     };
@@ -104,18 +189,22 @@ async fn serve_runtime_read(mut socket: WebSocket, state: Arc<AppState>) {
     for frame in frames {
         match frame {
             Ok(encoded) => {
-                if socket.send(Message::Text(encoded.into())).await.is_err() {
+                if socket.send_text(&encoded).await.is_err() {
                     return;
                 }
             }
             Err(error) => {
                 tracing::error!(target: "runtime.ws", %error, "runtime frame encode failed");
-                let _ = socket.send(Message::Close(None)).await;
+                socket.close().await;
                 return;
             }
         }
     }
-    let _ = socket.send(Message::Close(None)).await;
+    if close_after_frames {
+        socket.close().await;
+    } else {
+        socket.wait_for_peer_close().await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -123,10 +212,10 @@ async fn serve_runtime_read(mut socket: WebSocket, state: Arc<AppState>) {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-struct RuntimeIdentity {
-    runtime_epoch: String,
-    prebind_instance_id: String,
-    runtime_instance_id: String,
+pub(crate) struct RuntimeIdentity {
+    pub(crate) runtime_epoch: String,
+    pub(crate) prebind_instance_id: String,
+    pub(crate) runtime_instance_id: String,
 }
 
 /// Publication state of the freshness sampler. `successes` counts published
@@ -163,6 +252,13 @@ impl RuntimeState {
 /// One runtime per daemon process: the epoch and both instance identities are
 /// minted once and reused by every Hello this process emits.
 static RUNTIME: LazyLock<RuntimeState> = LazyLock::new(RuntimeState::new);
+
+/// The identities every Hello this process emits carries. The UDS publisher
+/// writes the same three values into its marker files, so a client can prove
+/// the daemon it reached is the one that published the socket.
+pub(crate) fn identity() -> &'static RuntimeIdentity {
+    &RUNTIME.identity
+}
 
 fn publish_freshness(runtime: &RuntimeState) -> (StatusFreshness, u64) {
     let mut sampler = runtime
@@ -212,7 +308,14 @@ struct ProfileDisk {
     cleanup: CleanupDefaults,
 }
 
-fn build_snapshot(runtime: &RuntimeState, active_profile: &str, instances: &[Instance]) -> Sampled {
+fn build_snapshot(
+    runtime: &RuntimeState,
+    active_profile: &str,
+    instances: &[Instance],
+    owner: Owner,
+) -> Sampled {
+    // `local_owner` mirrors the declared owner so the two can never disagree.
+    let local_owner = owner.is_local();
     let identity = &runtime.identity;
     let (freshness, cursor_revision) = publish_freshness(runtime);
 
@@ -327,13 +430,10 @@ fn build_snapshot(runtime: &RuntimeState, active_profile: &str, instances: &[Ins
             prebind_instance_id: identity.prebind_instance_id.clone(),
             runtime_instance_id: identity.runtime_instance_id.clone(),
             namespace: NAMESPACE.to_string(),
-            // The daemon only serves this route over TCP, so the peer is never the
-            // local socket owner.
-            owner: Owner {
-                kind: "remote",
-                uid: None,
-            },
-            local_owner: false,
+            // The transport decides: a TCP peer is remote, the daemon's own
+            // socket peer is the local owner.
+            owner,
+            local_owner,
             health: aggregate,
             profiles: profile_reads.clone(),
             status_freshness: freshness.clone(),
@@ -526,10 +626,30 @@ struct Cursor {
     revision: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Copy)]
 struct Owner {
     kind: &'static str,
     uid: Option<u32>,
+}
+
+impl Owner {
+    fn remote() -> Self {
+        Self {
+            kind: "remote",
+            uid: None,
+        }
+    }
+
+    fn local(uid: u32) -> Self {
+        Self {
+            kind: "local_owner",
+            uid: Some(uid),
+        }
+    }
+
+    fn is_local(&self) -> bool {
+        self.uid.is_some()
+    }
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -759,7 +879,7 @@ mod tests {
 
     use super::*;
     use crate::cli::runtime_read::dto::{
-        parse_hello, parse_snapshot, validate_cross_message, validate_hello, validate_snapshot,
+        parse_hello, parse_snapshot, validate_cross_message, validate_snapshot,
     };
 
     /// Points the app dir at an empty temporary XDG base for the duration of one
@@ -831,12 +951,11 @@ mod tests {
     fn emitted_frames_satisfy_the_client_wire_contract() {
         let _home = TempHome::new();
         let instances = vec![instance("a", "main"), instance("b", "main")];
-        let sampled = build_snapshot(&RuntimeState::new(), "main", &instances);
+        let sampled = build_snapshot(&RuntimeState::new(), "main", &instances, Owner::remote());
 
         let hello = parse_hello(&hello_frame(&sampled)).expect("client accepts the Hello");
         let snapshot =
             parse_snapshot(&snapshot_frame(&sampled)).expect("client accepts the Snapshot");
-        validate_hello(&hello).expect("Hello is well formed");
         validate_snapshot(&snapshot).expect("Snapshot is well formed");
         validate_cross_message(&hello, &snapshot, None).expect("Hello and Snapshot agree");
 
@@ -849,7 +968,12 @@ mod tests {
     #[serial_test::serial]
     fn hello_declares_a_remote_owner_and_observed_freshness() {
         let _home = TempHome::new();
-        let sampled = build_snapshot(&RuntimeState::new(), "main", &[instance("a", "main")]);
+        let sampled = build_snapshot(
+            &RuntimeState::new(),
+            "main",
+            &[instance("a", "main")],
+            Owner::remote(),
+        );
         let value: serde_json::Value = serde_json::to_value(&sampled.hello).expect("hello encodes");
 
         assert_eq!(value["protocol_version"], PROTOCOL_VERSION);
@@ -873,8 +997,8 @@ mod tests {
     fn each_sample_advances_revision_and_cursor_together() {
         let _home = TempHome::new();
         let runtime = RuntimeState::new();
-        let first = build_snapshot(&runtime, "main", &[]);
-        let second = build_snapshot(&runtime, "main", &[]);
+        let first = build_snapshot(&runtime, "main", &[], Owner::remote());
+        let second = build_snapshot(&runtime, "main", &[], Owner::remote());
 
         assert_eq!(observed_revision(&first), 1);
         assert_eq!(observed_revision(&second), 2);

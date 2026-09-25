@@ -7534,7 +7534,7 @@ volume_ignores = ["target"]
             .unwrap();
 
         prepare_owned_fixture(
-            &mount,
+            mount,
             home.path(),
             None,
             CredentialFold::Freshest,

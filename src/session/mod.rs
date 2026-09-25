@@ -254,6 +254,10 @@ fn app_dir_for(xdg_name: &str, other_name: &str) -> Option<PathBuf> {
 }
 
 fn get_app_dir_path() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(dir) = test_support::app_dir_override() {
+        return Ok(dir);
+    }
     app_dir_for(APP_DIR_NAME_XDG, APP_DIR_NAME_OTHER)
         .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))
 }

@@ -130,6 +130,7 @@ dependencies = [
  "notify",
  "nucleo-matcher",
  "p256",
+ "parking_lot",
  "percent-encoding",
  "portable-pty",
  "pulldown-cmark",

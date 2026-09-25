@@ -428,9 +428,9 @@ async fn connect_admission(namespace: OwnedNamespace) -> Result<UdsConnection, R
     validate_socket_entry(dir, &postbind, euid)?;
 
     let path = admission._namespace.anchored_socket_path()?;
-    let std_stream = std::os::unix::net::UnixStream::connect(&path)
+    let stream = UnixStream::connect(&path)
+        .await
         .map_err(|_| ReadFailure::post("unavailable"))?;
-    let stream = UnixStream::from_std(std_stream).map_err(|_| ReadFailure::post("unavailable"))?;
     validate_connected_socket(stream.as_raw_fd(), dir, &postbind, euid)?;
     Ok(UdsConnection {
         stream,
@@ -443,7 +443,7 @@ async fn connect_admission(namespace: OwnedNamespace) -> Result<UdsConnection, R
         },
         home: admission._namespace.home.clone(),
         admission,
-        exchange_deadline: Instant::now(),
+        exchange_deadline: Instant::now() + super::EXCHANGE_BUDGET,
     })
 }
 

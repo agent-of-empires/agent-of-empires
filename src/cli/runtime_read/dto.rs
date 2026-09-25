@@ -702,14 +702,13 @@ fn validate_projects(projects: &[ProjectRead], scope: ProjectScope) -> Result<()
 }
 
 fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
-    for value in [
-        &session.id,
-        &session.title,
-        &session.tool,
-        &session.command,
-        &session.profile,
-    ] {
+    for value in [&session.id, &session.title, &session.profile] {
         validate_safe_text(value)?;
+    }
+    for value in [&session.tool, &session.command] {
+        if !valid_text(value) {
+            return Err("schema_invalid");
+        }
     }
     if session
         .agent_session_id

@@ -128,6 +128,7 @@ sha2 = "0.11"
 
 # File locking
 fs2 = "0.4"
+parking_lot = "0.12"
 
 # Stream utilities (for crossterm EventStream)
 futures-util = "0.3"

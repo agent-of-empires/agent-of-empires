@@ -421,11 +421,7 @@ where
     };
     match tokio::time::timeout(budget, stream.send(Message::Close(Some(frame)))).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(WsError::ConnectionClosed)) => {
-            let mut failure = ReadFailure::post("connection_closed");
-            failure.attempt_close = false;
-            Err(failure)
-        }
+        Ok(Err(WsError::ConnectionClosed | WsError::AlreadyClosed)) => Ok(()),
         Ok(Err(_)) | Err(_) => Err(ReadFailure::post("close_timeout")),
     }
 }

@@ -21,6 +21,7 @@ pub mod push_send;
 pub mod rate_limit;
 pub(crate) mod reload;
 pub(crate) mod router;
+pub(crate) mod runtime_uds;
 pub(crate) mod runtime_ws;
 pub(crate) mod serve_snapshot;
 pub(crate) mod session_identity;

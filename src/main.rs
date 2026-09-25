@@ -89,15 +89,11 @@ async fn main() -> Result<()> {
     };
 
     let read_source = cli::runtime_read::read_request_source(&cli);
-    // The daemon UDS publisher is not yet part of the serve lifecycle. Keep the
-    // local CLI path available until that producer lands; an explicit daemon
-    // endpoint always takes the read-only client path.
-    let remote_read = read_source.explicit_url.is_some() || read_source.env_url.is_some();
-    if remote_read {
-        if let Some(command) = cli::runtime_read::classify(cli.command.as_ref()) {
-            let outcome = cli::runtime_read::execute(command, &read_source).await;
-            emit_read_outcome(outcome);
-        }
+    // A scoped read is always served by the daemon: the default transport is
+    // the daemon's own UNIX socket, and an explicit endpoint replaces it.
+    if let Some(command) = cli::runtime_read::classify(cli.command.as_ref()) {
+        let outcome = cli::runtime_read::execute(command, &read_source).await;
+        emit_read_outcome(outcome);
     }
 
     if cli.profile.is_none() {

@@ -674,6 +674,33 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // Periodic opt-in `usage_snapshot` loop.
     spawn_serve_snapshot_loop(state.clone());
 
+    // The local runtime read shares this AppState: one producer, two
+    // transports. A daemon that cannot own the namespace simply does not
+    // offer it, and the HTTP route is unaffected either way.
+    let runtime_uds = match super::runtime_uds::publish() {
+        Ok(published) => {
+            info!(
+                target: "runtime.uds",
+                namespace = super::runtime_ws::NAMESPACE,
+                "local runtime read published"
+            );
+            Some(crate::task_util::spawn_supervised(
+                "runtime.uds.serve",
+                crate::task_util::PanicPolicy::Log,
+                super::runtime_uds::serve(state.clone(), published),
+            ))
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "runtime.uds",
+                code = error.code(),
+                %error,
+                "local runtime read not published; the HTTP route is unaffected"
+            );
+            None
+        }
+    };
+
     // GC the recently_restarted suppression map periodically; the TTL check on read filters
     // but does not remove entries.
     {
@@ -917,6 +944,12 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal)
     .await?;
+
+    // The signal handler already cancelled `state.shutdown`, so the accept loop
+    // has already returned and retracted its artifacts by the time this joins.
+    if let Some(runtime_uds) = runtime_uds {
+        let _ = runtime_uds.await;
+    }
 
     // Detach (but do NOT kill) every acp ACP worker.
     acp_supervisor.detach_all().await;
