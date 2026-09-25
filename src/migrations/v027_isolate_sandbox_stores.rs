@@ -2318,353 +2318,344 @@ mod tests {
         root
     }
 
-    /// Every runtime error that means "could not answer" must be classified
-    /// as such. `InspectFailed` is the catch-all `classify_probe_failure`
-    /// returns for an unrecognised stderr, which is what a timed-out probe on
-    /// a loaded daemon produces, so leaving it out aborts startup on exactly
-    /// the transient failure this is meant to survive.
     #[test]
-    fn every_unanswerable_runtime_error_defers_rather_than_aborting() {
-        use crate::containers::error::DockerError;
-        for error in [
-            DockerError::NotInstalled,
-            DockerError::DaemonNotRunning,
-            DockerError::PermissionDenied,
-            DockerError::InspectFailed("context deadline exceeded".to_string()),
-        ] {
-            assert!(
-                runtime_cannot_answer(&error),
-                "{error} must defer the row rather than fail the migration"
-            );
+    fn runtime_probe_and_row_state_cases() {
+        // Every runtime error that means "could not answer" must be classified
+        // as such. `InspectFailed` is the catch-all `classify_probe_failure`
+        // returns for an unrecognised stderr, which is what a timed-out probe on
+        // a loaded daemon produces, so leaving it out aborts startup on exactly
+        // the transient failure this is meant to survive.
+        {
+            use crate::containers::error::DockerError;
+            for error in [
+                DockerError::NotInstalled,
+                DockerError::DaemonNotRunning,
+                DockerError::PermissionDenied,
+                DockerError::InspectFailed("context deadline exceeded".to_string()),
+            ] {
+                assert!(
+                    runtime_cannot_answer(&error),
+                    "{error} must defer the row rather than fail the migration"
+                );
+            }
+            // A local fault is a real failure and must still surface.
+            assert!(!runtime_cannot_answer(&DockerError::IoError(
+                std::io::Error::other("disk")
+            )));
+            // A refused removal is the deliberate `force=false` abort.
+            assert!(!runtime_cannot_answer(&DockerError::RemoveFailed(
+                "container is running".to_string()
+            )));
         }
-        // A local fault is a real failure and must still surface.
-        assert!(!runtime_cannot_answer(&DockerError::IoError(
-            std::io::Error::other("disk")
-        )));
-        // A refused removal is the deliberate `force=false` abort.
-        assert!(!runtime_cannot_answer(&DockerError::RemoveFailed(
-            "container is running".to_string()
-        )));
-    }
-
-    /// The batch listing decides only where inspect would agree with it:
-    /// paused and restarting are live, exited and created are stopped, and
-    /// everything else (a transitional state, a container it did not list)
-    /// goes to the per-row inspect, which answers fail-closed.
-    #[test]
-    fn batched_probe_keeps_live_semantics_and_inspects_the_rest() {
-        use crate::containers::{ContainerState, DockerContainer};
-        let listing: std::collections::HashMap<String, ContainerState> = [
-            ("running", ContainerState::Running),
-            ("paused", ContainerState::Paused),
-            ("restarting", ContainerState::Restarting),
-            ("exited", ContainerState::Exited),
-            ("created", ContainerState::Created),
-            ("removing", ContainerState::Other),
-        ]
-        .into_iter()
-        .map(|(id, state)| (DockerContainer::generate_name(id), state))
-        .collect();
-        let batches = std::cell::Cell::new(0);
-        let inspected = std::cell::RefCell::new(Vec::new());
-        let probe = batched_running_probe_with(
-            || {
-                batches.set(batches.get() + 1);
-                listing.clone()
-            },
-            |id| {
-                inspected.borrow_mut().push(id.to_string());
-                // Inspect stands in for an unreachable runtime: unknown reads live.
-                Ok((true, true))
-            },
-            false,
-        );
-        let cases = [
-            ("running", true),
-            ("paused", true),
-            ("restarting", true),
-            ("exited", false),
-            ("created", false),
-            ("removing", true),
-            ("missing", true),
-        ];
-        for (id, live) in cases {
-            assert_eq!(probe(id).unwrap(), live, "{id}");
-        }
-        assert_eq!(batches.get(), 1, "one listing per pass");
-        assert_eq!(*inspected.borrow(), ["removing", "missing"]);
-    }
-
-    /// A parked row keeps its shared store, and the journal keeps naming the
-    /// legacy root it holds, for as long as it stays archived. Neither says a
-    /// private store is being written, so neither may gate `aoe sandbox
-    /// reclaim`, which would otherwise refuse on such a machine forever.
-    #[test]
-    fn only_a_published_transition_counts_as_in_flight() {
-        let temp = tempfile::tempdir().unwrap();
-        let app = temp.path().join("app");
-        fs::create_dir_all(&app).unwrap();
-        fs::write(
-            app.join("sessions.json"),
-            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"archived_at":"2026-01-01T00:00:00Z"}]"#,
-        )
-        .unwrap();
-        fs::write(app.join(JOURNAL), br#"["/home/u/.claude/sandbox"]"#).unwrap();
-
-        assert!(transition_may_be_pending(&app, false).unwrap());
-        assert!(
-            !transition_may_be_pending(&app, true).unwrap(),
-            "a bare start has nothing to do for a parked row and a journal"
-        );
-        assert!(!transition_in_flight(&app).unwrap());
-
-        // Planned by an earlier pass, then archived.
-        fs::write(
-            app.join("sessions.json"),
-            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"archived_at":"2026-01-01T00:00:00Z","sandbox_store_generation":1,"sandbox_store_transition_paths":[{"source":"/a","destination":"/b"}]}]"#,
-        )
-        .unwrap();
-        assert!(transition_may_be_pending(&app, false).unwrap());
-        assert!(!transition_may_be_pending(&app, true).unwrap());
-
-        fs::write(
-            app.join("sessions.json"),
-            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true}}]"#,
-        )
-        .unwrap();
-        assert!(transition_may_be_pending(&app, true).unwrap());
-
-        fs::write(
-            app.join("sessions.json"),
-            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"sandbox_store_transition_paths":[{"source":"/a","destination":"/b"}]}]"#,
-        )
-        .unwrap();
-
-        assert!(transition_may_be_pending(&app, true).unwrap());
-        assert!(transition_in_flight(&app).unwrap());
-
-        // Metadata the migration cannot parse is state it cannot validate, so
-        // it fails rather than reading as "no transition" and letting a
-        // reclaim run against a move it cannot see.
-        fs::write(
-            app.join("sessions.json"),
-            r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"sandbox_store_transition_paths":5}]"#,
-        )
-        .unwrap();
-
-        assert!(transition_in_flight(&app).is_err());
-    }
-
-    /// A machine whose container runtime is absent or unreachable must still
-    /// complete startup. The row stays pending and its legacy source survives,
-    /// so the pass that can reach the runtime finishes the transition.
-    #[test]
-    #[serial_test::serial]
-    fn unreachable_container_runtime_defers_instead_of_failing() {
-        let (_temp, _app_guard, app, home) = isolated();
-        fs::create_dir_all(&app).unwrap();
-        fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
-        fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
-        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
-
-        // The answers the production probes give when the runtime is
-        // unreachable: liveness cannot be disproved, and nothing is reaped.
-        super::run_in(
-            &app,
-            &home,
-            &|_| Ok(true),
-            &|_| Ok(false),
-            false,
-            true,
-            None,
-        )
-        .unwrap();
-        let deferred: Value = read_rows(&app);
-        assert_eq!(
-            deferred[0]["sandbox_store_generation"], 1,
-            "an unreaped row must not commit the current generation"
-        );
-        assert!(
-            home.join(".gemini/sandbox").is_dir(),
-            "the legacy source must survive a deferred reap"
-        );
-        assert!(transition_may_be_pending(&app, false).unwrap());
-
-        super::run_in(
-            &app,
-            &home,
-            &|_| Ok(false),
-            &|_| Ok(true),
-            false,
-            true,
-            None,
-        )
-        .unwrap();
-        let committed: Value = read_rows(&app);
-        assert_eq!(committed[0]["sandbox_store_generation"], 2);
-        assert_eq!(
-            fs::read(home.join(".gemini/sandbox-v2/one/history/id.json")).unwrap(),
-            b"legacy"
-        );
-        assert!(!home.join(".gemini/sandbox").exists());
-        assert!(!transition_may_be_pending(&app, false).unwrap());
-    }
-
-    /// `AOE_DEFER_SANDBOX_MIGRATION` must behave exactly like a live cohort: no
-    /// copy, no reap, the row pending, and a later undeferred pass finishing
-    /// the move. It also has to say so, since a silent deferral would look
-    /// like a migration that did nothing.
-    #[test]
-    #[serial_test::serial]
-    fn deferral_leaves_stores_pending_and_reports_it() {
-        let (_temp, _app_guard, app, home) = isolated();
-        fs::create_dir_all(&app).unwrap();
-        fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
-        fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
-        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
-
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = events.clone();
-        let guard = progress::install(Some(std::sync::Arc::new(move |event| {
-            sink.lock().unwrap().push(event)
-        })));
-        let probed = std::cell::Cell::new(false);
-        super::run_in(
-            &app,
-            &home,
-            &|_| {
-                probed.set(true);
-                Ok(false)
-            },
-            &|_| panic!("a deferred pass must not reap containers"),
-            true,
-            true,
-            None,
-        )
-        .unwrap();
-        drop(guard);
-        assert!(!probed.get(), "deferral skips the container probe");
-        let pending: Value = read_rows(&app);
-        assert_eq!(pending[0]["sandbox_store_generation"], 1);
-        assert!(!home.join(".gemini/sandbox-v2").exists());
-        assert!(home.join(".gemini/sandbox").is_dir());
-        assert!(app.join(JOURNAL).is_file());
-        let notices: Vec<String> = events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|event| match event {
-                progress::Event::Notice(line) => Some(line.clone()),
-                _ => None,
-            })
+        // The batch listing decides only where inspect would agree with it:
+        // paused and restarting are live, exited and created are stopped, and
+        // everything else (a transitional state, a container it did not list)
+        // goes to the per-row inspect, which answers fail-closed.
+        {
+            use crate::containers::{ContainerState, DockerContainer};
+            let listing: std::collections::HashMap<String, ContainerState> = [
+                ("running", ContainerState::Running),
+                ("paused", ContainerState::Paused),
+                ("restarting", ContainerState::Restarting),
+                ("exited", ContainerState::Exited),
+                ("created", ContainerState::Created),
+                ("removing", ContainerState::Other),
+            ]
+            .into_iter()
+            .map(|(id, state)| (DockerContainer::generate_name(id), state))
             .collect();
-        assert!(
-            notices
-                .iter()
-                .any(|line| line.contains(DEFER_ENV) && line.contains("1 sandboxed session")),
-            "deferral is announced: {notices:?}"
-        );
-        assert!(
-            notices.iter().any(|line| line.contains("1 still pending")),
-            "summary counts the pending row: {notices:?}"
-        );
-
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-        let committed: Value = read_rows(&app);
-        assert_eq!(committed[0]["sandbox_store_generation"], 2);
-        assert_eq!(
-            fs::read(home.join(".gemini/sandbox-v2/one/history/id.json")).unwrap(),
-            b"legacy"
-        );
-        assert!(!app.join(JOURNAL).exists());
-    }
-
-    /// The documented recipe end to end: `AOE_DEFER_SANDBOX_MIGRATION=1` on a
-    /// pre-v27 install commits the schema version (so the next start reaches
-    /// the reconcile path) while the store stays put and the row stays pending.
-    #[test]
-    #[serial_test::serial]
-    fn deferring_through_the_runner_advances_the_schema_and_keeps_the_store() {
-        let (_temp, _app_guard, app, home) = isolated();
-        fs::create_dir_all(&app).unwrap();
-        fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
-        fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
-        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
-        fs::write(app.join(".schema_version"), b"26").unwrap();
-
-        assert!(!defer_requested_by(None));
-        assert!(!defer_requested_by(Some(std::ffi::OsStr::new(""))));
-        assert!(defer_requested_by(Some(std::ffi::OsStr::new("1"))));
-
-        let _defer = crate::session::test_support::EnvGuard::set(&[(DEFER_ENV, "1")]);
-        let result = super::super::run_migrations_announced(None);
-        result.unwrap();
-
-        // The runner commits the build's target version, not v27 in
-        // particular: a later migration in the chain must not fail this test.
-        assert_eq!(
-            fs::read_to_string(app.join(".schema_version"))
-                .unwrap()
-                .trim(),
-            super::super::CURRENT_VERSION.to_string()
-        );
-        assert!(!super::super::has_pending_migrations());
-        assert!(transition_may_be_pending(&app, false).unwrap());
-        assert!(home.join(".gemini/sandbox").is_dir());
-        assert!(!home.join(".gemini/sandbox-v2").exists());
-        let pending: Value = read_rows(&app);
-        assert_eq!(pending[0]["sandbox_store_generation"], 1);
-    }
-
-    /// A bare start defers every copy, so its only output is the count of
-    /// what it left pending: movable rows, with held (trashed or archived)
-    /// rows counted beside them. A held-only backlog and a machine with
-    /// nothing pending both say nothing.
-    #[test]
-    #[serial_test::serial]
-    fn a_bare_start_reports_pending_rows_without_copying() {
-        let (_temp, _app_guard, app, home) = isolated();
-        fs::create_dir_all(&app).unwrap();
-        fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
-        fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
-        let movable = |id: &str| serde_json::json!({"id": id, "tool": "gemini", "sandbox_info": {"enabled": true}});
-        let held = |id: &str| {
-            serde_json::json!({"id": id, "tool": "gemini", "sandbox_info": {"enabled": true},
-                "archived_at": "2026-09-05T00:00:00Z"})
-        };
-        let current = serde_json::json!({"id": "cccccccccccccccc", "tool": "gemini",
-            "sandbox_info": {"enabled": true}, "sandbox_store_generation": 2});
-        let cases: [(&str, Vec<Value>, Option<&str>); 4] = [
-            ("movable only", vec![movable("aaaaaaaaaaaaaaaa"), movable("bbbbbbbbbbbbbbbb")],
-                Some("2 sandboxed session(s) still use the shared agent store; each moves")),
-            ("held only", vec![held("aaaaaaaaaaaaaaaa")], None),
-            ("mixed", vec![movable("aaaaaaaaaaaaaaaa"), held("bbbbbbbbbbbbbbbb"), current.clone()],
-                Some("1 sandboxed session(s) still use the shared agent store, plus 1 trashed or archived")),
-            ("nothing pending", vec![current.clone()], None),
-        ];
-        for (name, rows, expected) in cases {
-            let _ = fs::remove_file(app.join(JOURNAL));
+            let batches = std::cell::Cell::new(0);
+            let inspected = std::cell::RefCell::new(Vec::new());
+            let probe = batched_running_probe_with(
+                || {
+                    batches.set(batches.get() + 1);
+                    listing.clone()
+                },
+                |id| {
+                    inspected.borrow_mut().push(id.to_string());
+                    // Inspect stands in for an unreachable runtime: unknown reads live.
+                    Ok((true, true))
+                },
+                false,
+            );
+            let cases = [
+                ("running", true),
+                ("paused", true),
+                ("restarting", true),
+                ("exited", false),
+                ("created", false),
+                ("removing", true),
+                ("missing", true),
+            ];
+            for (id, live) in cases {
+                assert_eq!(probe(id).unwrap(), live, "{id}");
+            }
+            assert_eq!(batches.get(), 1, "one listing per pass");
+            assert_eq!(*inspected.borrow(), ["removing", "missing"]);
+        }
+        // A parked row keeps its shared store, and the journal keeps naming the
+        // legacy root it holds, for as long as it stays archived. Neither says a
+        // private store is being written, so neither may gate `aoe sandbox
+        // reclaim`, which would otherwise refuse on such a machine forever.
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let app = temp.path().join("app");
+            fs::create_dir_all(&app).unwrap();
             fs::write(
                 app.join("sessions.json"),
-                serde_json::to_vec(&rows).unwrap(),
+                r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"archived_at":"2026-01-01T00:00:00Z"}]"#,
             )
             .unwrap();
+            fs::write(app.join(JOURNAL), br#"["/home/u/.claude/sandbox"]"#).unwrap();
+
+            assert!(transition_may_be_pending(&app, false).unwrap());
+            assert!(
+                !transition_may_be_pending(&app, true).unwrap(),
+                "a bare start has nothing to do for a parked row and a journal"
+            );
+            assert!(!transition_in_flight(&app).unwrap());
+
+            // Planned by an earlier pass, then archived.
+            fs::write(
+                app.join("sessions.json"),
+                r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"archived_at":"2026-01-01T00:00:00Z","sandbox_store_generation":1,"sandbox_store_transition_paths":[{"source":"/a","destination":"/b"}]}]"#,
+            )
+            .unwrap();
+            assert!(transition_may_be_pending(&app, false).unwrap());
+            assert!(!transition_may_be_pending(&app, true).unwrap());
+
+            fs::write(
+                app.join("sessions.json"),
+                r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true}}]"#,
+            )
+            .unwrap();
+            assert!(transition_may_be_pending(&app, true).unwrap());
+
+            fs::write(
+                app.join("sessions.json"),
+                r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"sandbox_store_transition_paths":[{"source":"/a","destination":"/b"}]}]"#,
+            )
+            .unwrap();
+
+            assert!(transition_may_be_pending(&app, true).unwrap());
+            assert!(transition_in_flight(&app).unwrap());
+
+            // Metadata the migration cannot parse is state it cannot validate, so
+            // it fails rather than reading as "no transition" and letting a
+            // reclaim run against a move it cannot see.
+            fs::write(
+                app.join("sessions.json"),
+                r#"[{"id":"1111111111111111","sandbox_info":{"enabled":true},"sandbox_store_transition_paths":5}]"#,
+            )
+            .unwrap();
+
+            assert!(transition_in_flight(&app).is_err());
+        }
+        // row is parked reads both fields and ignores nulls
+        {
+            assert!(!row_is_parked(&serde_json::json!({"id":"a"})));
+            assert!(!row_is_parked(
+                &serde_json::json!({"trashed_at":null,"archived_at":null})
+            ));
+            assert!(row_is_parked(
+                &serde_json::json!({"trashed_at":"2026-09-05T00:00:00Z"})
+            ));
+            assert!(row_is_parked(
+                &serde_json::json!({"archived_at":"2026-09-05T00:00:00Z"})
+            ));
+        }
+        // Move A is parked inside its first progress callback while move B runs
+        // start to finish, so A's remaining files must be counted from where A
+        // left off. A shared counter reported B's reset and larger files to A.
+        #[cfg(unix)]
+        {
+            use std::sync::{mpsc, Arc, Mutex};
+
+            // Distinct file sizes so a leaked byte total is visible, and counts
+            // that make the two moves' 100-file report boundaries interleave.
+            const A_FILES: usize = 200;
+            const A_SIZE: usize = 10;
+            const B_FILES: usize = 150;
+            const B_SIZE: usize = 1000;
+
+            fn seed(root: &Path, files: usize, size: usize) {
+                fs::create_dir_all(root).unwrap();
+                for index in 0..files {
+                    fs::write(root.join(format!("f{index}")), vec![b'x'; size]).unwrap();
+                }
+            }
+
+            fn collecting_reporter(seen: &Arc<Mutex<Vec<String>>>) -> progress::Reporter {
+                let seen = Arc::clone(seen);
+                Arc::new(move |event| {
+                    if let progress::Event::Progress(message) = event {
+                        seen.lock().unwrap().push(message);
+                    }
+                })
+            }
+
+            let temp = tempfile::tempdir().unwrap();
+            seed(&temp.path().join("a/source"), A_FILES, A_SIZE);
+            seed(&temp.path().join("b/source"), B_FILES, B_SIZE);
+
+            let (parked_tx, parked_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel::<()>();
+            let a_seen = Arc::new(Mutex::new(Vec::new()));
+
+            let mover_a = {
+                let root = temp.path().to_path_buf();
+                let a_seen = Arc::clone(&a_seen);
+                std::thread::spawn(move || {
+                    let collect = collecting_reporter(&a_seen);
+                    // Park inside the first report only, so move B's whole copy
+                    // lands between A's 100th and 101st file.
+                    let gate = Mutex::new(Some((parked_tx, resume_rx)));
+                    let reporter: progress::Reporter = Arc::new(move |event| {
+                        collect(event);
+                        if let Some((parked_tx, resume_rx)) = gate.lock().unwrap().take() {
+                            parked_tx.send(()).unwrap();
+                            resume_rx.recv().unwrap();
+                        }
+                    });
+                    let _guard = progress::install(Some(reporter));
+                    assert!(publish_store(
+                        &root.join("a/source"),
+                        &root.join("a/private/one"),
+                        &BTreeSet::new(),
+                        None,
+                        false,
+                    )
+                    .unwrap());
+                })
+            };
+
+            parked_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("move A parked inside its first report");
+            let b_seen = Arc::new(Mutex::new(Vec::new()));
+            {
+                let _guard = progress::install(Some(collecting_reporter(&b_seen)));
+                assert!(publish_store(
+                    &temp.path().join("b/source"),
+                    &temp.path().join("b/private/two"),
+                    &BTreeSet::new(),
+                    None,
+                    false,
+                )
+                .unwrap());
+            }
+            resume_tx.send(()).unwrap();
+            mover_a.join().unwrap();
+
+            assert_eq!(
+                *a_seen.lock().unwrap(),
+                vec![
+                    format!("100 files, {}", progress::format_bytes(100 * A_SIZE as u64)),
+                    format!("200 files, {}", progress::format_bytes(200 * A_SIZE as u64)),
+                ]
+            );
+            assert_eq!(
+                *b_seen.lock().unwrap(),
+                vec![format!(
+                    "100 files, {}",
+                    progress::format_bytes(100 * B_SIZE as u64)
+                )]
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn deferral_keeps_stores_pending() {
+        // A machine whose container runtime is absent or unreachable must still
+        // complete startup. The row stays pending and its legacy source survives,
+        // so the pass that can reach the runtime finishes the transition.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            fs::create_dir_all(&app).unwrap();
+            fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
+            fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+            fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+
+            // The answers the production probes give when the runtime is
+            // unreachable: liveness cannot be disproved, and nothing is reaped.
+            super::run_in(
+                &app,
+                &home,
+                &|_| Ok(true),
+                &|_| Ok(false),
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+            let deferred: Value = read_rows(&app);
+            assert_eq!(
+                deferred[0]["sandbox_store_generation"], 1,
+                "an unreaped row must not commit the current generation"
+            );
+            assert!(
+                home.join(".gemini/sandbox").is_dir(),
+                "the legacy source must survive a deferred reap"
+            );
+            assert!(transition_may_be_pending(&app, false).unwrap());
+
+            super::run_in(
+                &app,
+                &home,
+                &|_| Ok(false),
+                &|_| Ok(true),
+                false,
+                true,
+                None,
+            )
+            .unwrap();
+            let committed: Value = read_rows(&app);
+            assert_eq!(committed[0]["sandbox_store_generation"], 2);
+            assert_eq!(
+                fs::read(home.join(".gemini/sandbox-v2/one/history/id.json")).unwrap(),
+                b"legacy"
+            );
+            assert!(!home.join(".gemini/sandbox").exists());
+            assert!(!transition_may_be_pending(&app, false).unwrap());
+        }
+        // `AOE_DEFER_SANDBOX_MIGRATION` must behave exactly like a live cohort: no
+        // copy, no reap, the row pending, and a later undeferred pass finishing
+        // the move. It also has to say so, since a silent deferral would look
+        // like a migration that did nothing.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            fs::create_dir_all(&app).unwrap();
+            fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
+            fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+            fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+
             let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let sink = events.clone();
             let guard = progress::install(Some(std::sync::Arc::new(move |event| {
                 sink.lock().unwrap().push(event)
             })));
+            let probed = std::cell::Cell::new(false);
             super::run_in(
                 &app,
                 &home,
-                &|_| panic!("a bare start must not probe containers"),
-                &|_| panic!("a bare start must not reap containers"),
+                &|_| {
+                    probed.set(true);
+                    Ok(false)
+                },
+                &|_| panic!("a deferred pass must not reap containers"),
                 true,
-                false,
+                true,
                 None,
             )
             .unwrap();
             drop(guard);
+            assert!(!probed.get(), "deferral skips the container probe");
+            let pending: Value = read_rows(&app);
+            assert_eq!(pending[0]["sandbox_store_generation"], 1);
+            assert!(!home.join(".gemini/sandbox-v2").exists());
+            assert!(home.join(".gemini/sandbox").is_dir());
+            assert!(app.join(JOURNAL).is_file());
             let notices: Vec<String> = events
                 .lock()
                 .unwrap()
@@ -2674,777 +2665,660 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            match expected {
-                Some(expected) => {
-                    assert_eq!(notices.len(), 1, "{name}: {notices:?}");
-                    assert!(notices[0].contains(expected), "{name}: {notices:?}");
-                    assert!(notices[0].contains("aoe migrate"), "{name}: {notices:?}");
+            assert!(
+                notices
+                    .iter()
+                    .any(|line| line.contains(DEFER_ENV) && line.contains("1 sandboxed session")),
+                "deferral is announced: {notices:?}"
+            );
+            assert!(
+                notices.iter().any(|line| line.contains("1 still pending")),
+                "summary counts the pending row: {notices:?}"
+            );
+
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+            let committed: Value = read_rows(&app);
+            assert_eq!(committed[0]["sandbox_store_generation"], 2);
+            assert_eq!(
+                fs::read(home.join(".gemini/sandbox-v2/one/history/id.json")).unwrap(),
+                b"legacy"
+            );
+            assert!(!app.join(JOURNAL).exists());
+        }
+        // The documented recipe end to end: `AOE_DEFER_SANDBOX_MIGRATION=1` on a
+        // pre-v27 install commits the schema version (so the next start reaches
+        // the reconcile path) while the store stays put and the row stays pending.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            fs::create_dir_all(&app).unwrap();
+            fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
+            fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+            fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+            fs::write(app.join(".schema_version"), b"26").unwrap();
+
+            assert!(!defer_requested_by(None));
+            assert!(!defer_requested_by(Some(std::ffi::OsStr::new(""))));
+            assert!(defer_requested_by(Some(std::ffi::OsStr::new("1"))));
+
+            let _defer = crate::session::test_support::EnvGuard::set(&[(DEFER_ENV, "1")]);
+            let result = super::super::run_migrations_announced(None);
+            result.unwrap();
+
+            // The runner commits the build's target version, not v27 in
+            // particular: a later migration in the chain must not fail this test.
+            assert_eq!(
+                fs::read_to_string(app.join(".schema_version"))
+                    .unwrap()
+                    .trim(),
+                super::super::CURRENT_VERSION.to_string()
+            );
+            assert!(!super::super::has_pending_migrations());
+            assert!(transition_may_be_pending(&app, false).unwrap());
+            assert!(home.join(".gemini/sandbox").is_dir());
+            assert!(!home.join(".gemini/sandbox-v2").exists());
+            let pending: Value = read_rows(&app);
+            assert_eq!(pending[0]["sandbox_store_generation"], 1);
+        }
+        // A bare start defers every copy, so its only output is the count of
+        // what it left pending: movable rows, with held (trashed or archived)
+        // rows counted beside them. A held-only backlog and a machine with
+        // nothing pending both say nothing.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            fs::create_dir_all(&app).unwrap();
+            fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
+            fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+            let movable = |id: &str| serde_json::json!({"id": id, "tool": "gemini", "sandbox_info": {"enabled": true}});
+            let held = |id: &str| {
+                serde_json::json!({"id": id, "tool": "gemini", "sandbox_info": {"enabled": true},
+                    "archived_at": "2026-09-05T00:00:00Z"})
+            };
+            let current = serde_json::json!({"id": "cccccccccccccccc", "tool": "gemini",
+                "sandbox_info": {"enabled": true}, "sandbox_store_generation": 2});
+            let cases: [(&str, Vec<Value>, Option<&str>); 4] = [
+                ("movable only", vec![movable("aaaaaaaaaaaaaaaa"), movable("bbbbbbbbbbbbbbbb")],
+                    Some("2 sandboxed session(s) still use the shared agent store; each moves")),
+                ("held only", vec![held("aaaaaaaaaaaaaaaa")], None),
+                ("mixed", vec![movable("aaaaaaaaaaaaaaaa"), held("bbbbbbbbbbbbbbbb"), current.clone()],
+                    Some("1 sandboxed session(s) still use the shared agent store, plus 1 trashed or archived")),
+                ("nothing pending", vec![current.clone()], None),
+            ];
+            for (name, rows, expected) in cases {
+                let _ = fs::remove_file(app.join(JOURNAL));
+                fs::write(
+                    app.join("sessions.json"),
+                    serde_json::to_vec(&rows).unwrap(),
+                )
+                .unwrap();
+                let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let sink = events.clone();
+                let guard = progress::install(Some(std::sync::Arc::new(move |event| {
+                    sink.lock().unwrap().push(event)
+                })));
+                super::run_in(
+                    &app,
+                    &home,
+                    &|_| panic!("a bare start must not probe containers"),
+                    &|_| panic!("a bare start must not reap containers"),
+                    true,
+                    false,
+                    None,
+                )
+                .unwrap();
+                drop(guard);
+                let notices: Vec<String> = events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|event| match event {
+                        progress::Event::Notice(line) => Some(line.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                match expected {
+                    Some(expected) => {
+                        assert_eq!(notices.len(), 1, "{name}: {notices:?}");
+                        assert!(notices[0].contains(expected), "{name}: {notices:?}");
+                        assert!(notices[0].contains("aoe migrate"), "{name}: {notices:?}");
+                    }
+                    None => assert!(notices.is_empty(), "{name}: {notices:?}"),
                 }
-                None => assert!(notices.is_empty(), "{name}: {notices:?}"),
+                assert!(
+                    !home.join(".gemini/sandbox-v2").exists(),
+                    "{name}: a bare start must not copy"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn publication_refuses_plan_drift() {
+        // publishes only after quiescence and removes transition artifacts
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            fs::create_dir_all(&app).unwrap();
+            fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
+            fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+            fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+
+            run_in(&app, &home, &|_| Ok(true)).unwrap();
+            let pending: Value = read_rows(&app);
+            assert_eq!(pending[0]["sandbox_store_generation"], 1);
+            assert!(app.join(JOURNAL).is_file());
+            assert!(home.join(".gemini/sandbox").is_dir());
+
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+            let committed: Value = read_rows(&app);
+            assert_eq!(committed[0]["sandbox_store_generation"], 2);
+            assert_eq!(
+                fs::read(home.join(".gemini/sandbox-v2/one/history/id.json")).unwrap(),
+                b"legacy"
+            );
+            assert!(!home.join(".gemini/sandbox").exists());
+            assert!(!app.join(JOURNAL).exists());
+            assert!(committed[0].get("sandbox_store_transition_paths").is_none());
+            assert!(fs::read_dir(home.join(".gemini/sandbox-v2"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".v027")));
+        }
+        // pending cohort refuses destination drift before writing it
+        {
+            let (temp, _app_guard, app, home) = isolated();
+            fs::create_dir_all(&app).unwrap();
+            let source = home.join(".gemini/sandbox");
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("conversation.json"), b"original").unwrap();
+            fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+
+            run_in(&app, &home, &|_| Ok(true)).unwrap();
+            pin_agent_dir(&app, &temp.path().join("changed-gemini"));
+
+            let changed_destination = temp.path().join("changed-gemini/sandbox-v2/one");
+            let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("restore the previous session.agent_config_dir"));
+            assert!(!changed_destination.exists());
+            assert_eq!(
+                fs::read(home.join(".gemini/sandbox/conversation.json")).unwrap(),
+                b"original"
+            );
+        }
+        // destination drift after publication keeps the checkpointed store
+        {
+            let (temp, _app_guard, app, home) = isolated();
+            let custom_a = temp.path().join("custom-a");
+            let custom_b = temp.path().join("custom-b");
+            fs::create_dir_all(custom_a.join("sandbox/one")).unwrap();
+            fs::write(custom_a.join("sandbox/one/data"), b"source").unwrap();
+            pin_agent_dir(&app, &custom_a);
+            fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+            run_in(&app, &home, &|_| Ok(true)).unwrap();
+            fs::create_dir_all(custom_a.join("sandbox-v2/one")).unwrap();
+            fs::write(custom_a.join("sandbox-v2/one/data"), b"published").unwrap();
+            pin_agent_dir(&app, &custom_b);
+
+            let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("restore the previous session.agent_config_dir"));
+            assert!(!custom_b.join("sandbox-v2/one").exists());
+            assert_eq!(
+                fs::read(custom_a.join("sandbox-v2/one/data")).unwrap(),
+                b"published"
+            );
+        }
+        // pending absent custom source still refuses plan drift
+        {
+            let (temp, _app_guard, app, home) = isolated();
+            let custom_a = temp.path().join("custom-a");
+            let custom_b = temp.path().join("custom-b");
+            fs::write(
+                app.join("config.toml"),
+                format!(
+                    "[session.agent_config_dir]\ngemini = \"{}\"\n",
+                    custom_a.display()
+                ),
+            )
+            .unwrap();
+            fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+
+            run_in(&app, &home, &|_| Ok(true)).unwrap();
+            let checkpoint: Value = read_rows(&app);
+            assert_eq!(
+                checkpoint[0]
+                    .get("sandbox_store_generation")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                1
+            );
+            fs::write(
+                app.join("config.toml"),
+                format!(
+                    "[session.agent_config_dir]\ngemini = \"{}\"\n",
+                    custom_b.display()
+                ),
+            )
+            .unwrap();
+            let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("restore the previous session.agent_config_dir"));
+            assert!(!custom_b.join("sandbox-v2/one").exists());
+            let checkpoint: Value = read_rows(&app);
+            assert_eq!(
+                checkpoint[0]
+                    .get("sandbox_store_generation")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                1
+            );
+            assert!(checkpoint[0]
+                .get("sandbox_store_transition_paths")
+                .is_some());
+        }
+        // pending present custom source fails closed after path change
+        {
+            let (temp, _app_guard, app, home) = isolated();
+            let custom_a = temp.path().join("custom-a");
+            let custom_b = temp.path().join("custom-b");
+            fs::create_dir_all(custom_a.join("sandbox/one")).unwrap();
+            fs::write(custom_a.join("sandbox/one/data"), b"data").unwrap();
+            fs::write(
+                app.join("config.toml"),
+                format!(
+                    r#"[session.agent_config_dir]
+    gemini = "{}"
+    "#,
+                    custom_a.display()
+                ),
+            )
+            .unwrap();
+            fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+
+            run_in(&app, &home, &|_| Ok(true)).unwrap();
+            let checkpoint: Value = read_rows(&app);
+            assert_eq!(checkpoint[0]["sandbox_store_generation"], 1);
+            assert_eq!(
+                checkpoint[0]["sandbox_store_transition_paths"][0]["source"],
+                serde_json::json!(fs::canonicalize(custom_a.join("sandbox")).unwrap())
+            );
+            fs::write(
+                app.join("config.toml"),
+                format!(
+                    r#"[session.agent_config_dir]
+    gemini = "{}"
+    "#,
+                    custom_b.display()
+                ),
+            )
+            .unwrap();
+
+            run_in(&app, &home, &|_| Ok(false)).unwrap_err();
+            assert_eq!(
+                fs::read(custom_a.join("sandbox/one/data")).unwrap(),
+                b"data"
+            );
+            assert!(!custom_b.join("sandbox-v2/one").exists());
+            let pending: Value = read_rows(&app);
+            assert_eq!(
+                pending[0]["sandbox_store_generation"],
+                checkpoint[0]["sandbox_store_generation"]
+            );
+            assert_eq!(
+                pending[0]["sandbox_store_transition_paths"],
+                checkpoint[0]["sandbox_store_transition_paths"]
+            );
+        }
+        // codex generation only fast path moves its existing private store
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            fs::create_dir_all(&app).unwrap();
+            let source = home.join(".codex/sandbox/codex-one");
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("auth.json"), b"secret").unwrap();
+            fs::write(
+                app.join("sessions.json"),
+                r#"[{"id":"codex-one","tool":"codex","sandbox_info":{"enabled":true}}]"#,
+            )
+            .unwrap();
+
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+            assert_eq!(
+                fs::read(home.join(".codex/sandbox-v2/codex-one/auth.json")).unwrap(),
+                b"secret"
+            );
+            let rows: Value = read_rows(&app);
+            assert_eq!(rows[0]["sandbox_store_generation"], 2);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn recovery_distrusts_unprovenanced_transition_metadata() {
+        // recovers publication before registry commit
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let source = home.join(".gemini/sandbox");
+            let destination = home.join(".gemini/sandbox-v2/one");
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("legacy"), b"legacy").unwrap();
+            fs::create_dir_all(&destination).unwrap();
+            fs::write(destination.join("published"), b"published").unwrap();
+            let quarantine = destination.parent().unwrap().join(".v027-quarantine-one");
+            let stage = destination.parent().unwrap().join(".v027-stage-one");
+            fs::create_dir_all(&quarantine).unwrap();
+            fs::create_dir_all(&stage).unwrap();
+            fs::write(quarantine.join("secret"), b"secret").unwrap();
+            let row = serde_json::json!({
+                "id": "one",
+                "tool": "gemini",
+                "sandbox_info": {"enabled": true},
+                "sandbox_store_generation": 1,
+                "sandbox_store_transition_paths": [{
+                    "source": source,
+                    "destination": destination
+                }]
+            });
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&vec![row]).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                app.join(JOURNAL),
+                serde_json::to_vec(&vec![source.to_string_lossy().into_owned()]).unwrap(),
+            )
+            .unwrap();
+
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+            assert!(!destination.join("published").exists());
+            assert_eq!(fs::read(destination.join("legacy")).unwrap(), b"legacy");
+            assert!(!source.exists());
+            assert!(!quarantine.exists());
+            assert!(!stage.exists());
+            assert!(!app.join(JOURNAL).exists());
+            let rows: Value = read_rows(&app);
+            assert_eq!(rows[0]["sandbox_store_generation"], 2);
+            assert!(rows[0].get("sandbox_store_transition_paths").is_none());
+        }
+        // recovers legacy quarantine before generation commit
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let source = home.join(".gemini/sandbox");
+            let destination = home.join(".gemini/sandbox-v2/one");
+            let legacy_quarantine = home.join(".gemini/.sandbox.v027-quarantine");
+            fs::create_dir_all(&destination).unwrap();
+            fs::write(destination.join("published"), b"published").unwrap();
+            fs::create_dir_all(&legacy_quarantine).unwrap();
+            fs::write(legacy_quarantine.join("legacy"), b"legacy").unwrap();
+            let row = serde_json::json!({
+                "id": "one",
+                "tool": "gemini",
+                "sandbox_info": {"enabled": true},
+                "sandbox_store_generation": 1,
+                "sandbox_store_transition_paths": [{
+                    "source": source,
+                    "destination": destination
+                }]
+            });
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&vec![row]).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                app.join(JOURNAL),
+                serde_json::to_vec(&vec![source.to_string_lossy().into_owned()]).unwrap(),
+            )
+            .unwrap();
+
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+            assert_eq!(
+                fs::read(destination.join("published")).unwrap(),
+                b"published"
+            );
+            assert!(!source.exists());
+            assert!(!legacy_quarantine.exists());
+            assert!(!app.join(JOURNAL).exists());
+            let rows: Value = read_rows(&app);
+            assert_eq!(rows[0]["sandbox_store_generation"], 2);
+            assert!(rows[0].get("sandbox_store_transition_paths").is_none());
+        }
+        // missing source still cleans publication artifacts
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let source = home.join(".gemini/sandbox");
+            let destination = home.join(".gemini/sandbox-v2/one");
+            let parent = destination.parent().unwrap();
+            fs::create_dir_all(parent.join(".v027-stage-one")).unwrap();
+            fs::create_dir_all(parent.join(".v027-quarantine-one")).unwrap();
+            let row = serde_json::json!({
+                "id": "one",
+                "tool": "gemini",
+                "sandbox_info": {"enabled": true},
+                "sandbox_store_generation": 1,
+                "sandbox_store_transition_paths": [{
+                    "source": source,
+                    "destination": destination
+                }]
+            });
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&vec![row]).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                app.join(JOURNAL),
+                serde_json::to_vec(&vec![source.to_string_lossy().into_owned()]).unwrap(),
+            )
+            .unwrap();
+
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+            assert!(destination.is_dir());
+            assert!(!parent.join(".v027-stage-one").exists());
+            assert!(!parent.join(".v027-quarantine-one").exists());
+        }
+        // rejects untrusted persisted transition paths
+        #[cfg(unix)]
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let victim = home.join("documents/sandbox");
+            fs::create_dir_all(&victim).unwrap();
+            fs::write(victim.join("keep"), b"keep").unwrap();
+            let row = serde_json::json!({
+                "id": "one",
+                "tool": "gemini",
+                "sandbox_info": {"enabled": true},
+                "sandbox_store_generation": 1,
+                "sandbox_store_transition_paths": [{
+                    "source": victim,
+                    "destination": home.join(".gemini/sandbox-v2/one")
+                }]
+            });
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&vec![row]).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                app.join(JOURNAL),
+                serde_json::to_vec(&vec![victim.to_string_lossy().into_owned()]).unwrap(),
+            )
+            .unwrap();
+
+            let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains("outside the expected sandbox roots"));
+            assert_eq!(fs::read(victim.join("keep")).unwrap(), b"keep");
+        }
+        // current rows scrub forged transition metadata without io
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let victim = home.join("current-generation-victim");
+            fs::create_dir_all(&victim).unwrap();
+            fs::write(victim.join("keep"), b"keep").unwrap();
+            let row = serde_json::json!({
+                "id": "one",
+                "tool": "gemini",
+                "sandbox_info": {"enabled": true},
+                "sandbox_store_generation": 2,
+                "sandbox_store_transition_paths": [{
+                    "source": victim,
+                    "destination": home.join(".gemini/sandbox-v2/one")
+                }]
+            });
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&vec![row]).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                app.join(JOURNAL),
+                serde_json::to_vec(&vec![victim.to_string_lossy().into_owned()]).unwrap(),
+            )
+            .unwrap();
+
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+            assert_eq!(fs::read(victim.join("keep")).unwrap(), b"keep");
+            assert!(!home.join(".gemini/sandbox-v2/one").exists());
+            assert!(!app.join(JOURNAL).exists());
+            let rows: Value = read_rows(&app);
+            assert!(rows[0].get("sandbox_store_transition_paths").is_none());
+        }
+        // ignores unprovenanced journal paths
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let victim = home.join("journal-victim");
+            fs::create_dir_all(&victim).unwrap();
+            fs::write(victim.join("keep"), b"keep").unwrap();
+            fs::write(app.join("sessions.json"), b"[]").unwrap();
+            fs::write(
+                app.join(JOURNAL),
+                serde_json::to_vec(&vec![victim.to_string_lossy().into_owned()]).unwrap(),
+            )
+            .unwrap();
+
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+            assert_eq!(fs::read(victim.join("keep")).unwrap(), b"keep");
+            assert!(!app.join(JOURNAL).exists());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn parked_rows_hold_only_their_own_roots() {
+        // A trashed or archived row must not have its store copied, and must not
+        // let the shared source be retired: a restore would otherwise open a
+        // session whose store had been moved out from under it.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let legacy = seed_store(&home, ".gemini/sandbox", b"data");
+            let rows = serde_json::json!([
+                {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true},
+                 "trashed_at":"2026-09-05T00:00:00Z"},
+                {"id":"2222222222222222","tool":"gemini","sandbox_info":{"enabled":true},
+                 "archived_at":"2026-09-05T00:00:00Z"},
+                {"id":"3333333333333333","tool":"gemini","sandbox_info":{"enabled":true}}
+            ]);
+            write_rows(&app, &rows);
+
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+            let rows: Value = read_rows(&app);
+            assert!(
+                rows[0].get("sandbox_store_generation").is_none(),
+                "trashed row moved"
+            );
+            assert!(
+                rows[1].get("sandbox_store_generation").is_none(),
+                "archived row moved"
+            );
+            assert_eq!(rows[2]["sandbox_store_generation"], 2);
+            for id in ["1111111111111111", "2222222222222222"] {
+                assert!(
+                    !home.join(".gemini/sandbox-v2").join(id).exists(),
+                    "parked row {id} must not get a private store"
+                );
             }
             assert!(
-                !home.join(".gemini/sandbox-v2").exists(),
-                "{name}: a bare start must not copy"
+                legacy.exists(),
+                "a parked row must protect the shared source it still reads"
             );
-        }
-    }
 
-    #[test]
-    #[serial_test::serial]
-    fn publishes_only_after_quiescence_and_removes_transition_artifacts() {
-        let (_temp, _app_guard, app, home) = isolated();
-        fs::create_dir_all(&app).unwrap();
-        fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
-        fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
-        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
-
-        run_in(&app, &home, &|_| Ok(true)).unwrap();
-        let pending: Value = read_rows(&app);
-        assert_eq!(pending[0]["sandbox_store_generation"], 1);
-        assert!(app.join(JOURNAL).is_file());
-        assert!(home.join(".gemini/sandbox").is_dir());
-
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-        let committed: Value = read_rows(&app);
-        assert_eq!(committed[0]["sandbox_store_generation"], 2);
-        assert_eq!(
-            fs::read(home.join(".gemini/sandbox-v2/one/history/id.json")).unwrap(),
-            b"legacy"
-        );
-        assert!(!home.join(".gemini/sandbox").exists());
-        assert!(!app.join(JOURNAL).exists());
-        assert!(committed[0].get("sandbox_store_transition_paths").is_none());
-        assert!(fs::read_dir(home.join(".gemini/sandbox-v2"))
-            .unwrap()
-            .all(|entry| !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".v027")));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn pending_cohort_refuses_destination_drift_before_writing_it() {
-        let (temp, _app_guard, app, home) = isolated();
-        fs::create_dir_all(&app).unwrap();
-        let source = home.join(".gemini/sandbox");
-        fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("conversation.json"), b"original").unwrap();
-        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
-
-        run_in(&app, &home, &|_| Ok(true)).unwrap();
-        pin_agent_dir(&app, &temp.path().join("changed-gemini"));
-
-        let changed_destination = temp.path().join("changed-gemini/sandbox-v2/one");
-        let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("restore the previous session.agent_config_dir"));
-        assert!(!changed_destination.exists());
-        assert_eq!(
-            fs::read(home.join(".gemini/sandbox/conversation.json")).unwrap(),
-            b"original"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn destination_drift_after_publication_keeps_the_checkpointed_store() {
-        let (temp, _app_guard, app, home) = isolated();
-        let custom_a = temp.path().join("custom-a");
-        let custom_b = temp.path().join("custom-b");
-        fs::create_dir_all(custom_a.join("sandbox/one")).unwrap();
-        fs::write(custom_a.join("sandbox/one/data"), b"source").unwrap();
-        pin_agent_dir(&app, &custom_a);
-        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
-        run_in(&app, &home, &|_| Ok(true)).unwrap();
-        fs::create_dir_all(custom_a.join("sandbox-v2/one")).unwrap();
-        fs::write(custom_a.join("sandbox-v2/one/data"), b"published").unwrap();
-        pin_agent_dir(&app, &custom_b);
-
-        let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("restore the previous session.agent_config_dir"));
-        assert!(!custom_b.join("sandbox-v2/one").exists());
-        assert_eq!(
-            fs::read(custom_a.join("sandbox-v2/one/data")).unwrap(),
-            b"published"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn pending_absent_custom_source_still_refuses_plan_drift() {
-        let (temp, _app_guard, app, home) = isolated();
-        let custom_a = temp.path().join("custom-a");
-        let custom_b = temp.path().join("custom-b");
-        fs::write(
-            app.join("config.toml"),
-            format!(
-                "[session.agent_config_dir]\ngemini = \"{}\"\n",
-                custom_a.display()
-            ),
-        )
-        .unwrap();
-        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
-
-        run_in(&app, &home, &|_| Ok(true)).unwrap();
-        let checkpoint: Value = read_rows(&app);
-        assert_eq!(
-            checkpoint[0]
-                .get("sandbox_store_generation")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            1
-        );
-        fs::write(
-            app.join("config.toml"),
-            format!(
-                "[session.agent_config_dir]\ngemini = \"{}\"\n",
-                custom_b.display()
-            ),
-        )
-        .unwrap();
-        let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("restore the previous session.agent_config_dir"));
-        assert!(!custom_b.join("sandbox-v2/one").exists());
-        let checkpoint: Value = read_rows(&app);
-        assert_eq!(
-            checkpoint[0]
-                .get("sandbox_store_generation")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            1
-        );
-        assert!(checkpoint[0]
-            .get("sandbox_store_transition_paths")
-            .is_some());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn pending_present_custom_source_fails_closed_after_path_change() {
-        let (temp, _app_guard, app, home) = isolated();
-        let custom_a = temp.path().join("custom-a");
-        let custom_b = temp.path().join("custom-b");
-        fs::create_dir_all(custom_a.join("sandbox/one")).unwrap();
-        fs::write(custom_a.join("sandbox/one/data"), b"data").unwrap();
-        fs::write(
-            app.join("config.toml"),
-            format!(
-                r#"[session.agent_config_dir]
-gemini = "{}"
-"#,
-                custom_a.display()
-            ),
-        )
-        .unwrap();
-        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
-
-        run_in(&app, &home, &|_| Ok(true)).unwrap();
-        let checkpoint: Value = read_rows(&app);
-        assert_eq!(checkpoint[0]["sandbox_store_generation"], 1);
-        assert_eq!(
-            checkpoint[0]["sandbox_store_transition_paths"][0]["source"],
-            serde_json::json!(fs::canonicalize(custom_a.join("sandbox")).unwrap())
-        );
-        fs::write(
-            app.join("config.toml"),
-            format!(
-                r#"[session.agent_config_dir]
-gemini = "{}"
-"#,
-                custom_b.display()
-            ),
-        )
-        .unwrap();
-
-        run_in(&app, &home, &|_| Ok(false)).unwrap_err();
-        assert_eq!(
-            fs::read(custom_a.join("sandbox/one/data")).unwrap(),
-            b"data"
-        );
-        assert!(!custom_b.join("sandbox-v2/one").exists());
-        let pending: Value = read_rows(&app);
-        assert_eq!(
-            pending[0]["sandbox_store_generation"],
-            checkpoint[0]["sandbox_store_generation"]
-        );
-        assert_eq!(
-            pending[0]["sandbox_store_transition_paths"],
-            checkpoint[0]["sandbox_store_transition_paths"]
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn codex_generation_only_fast_path_moves_its_existing_private_store() {
-        let (_temp, _app_guard, app, home) = isolated();
-        fs::create_dir_all(&app).unwrap();
-        let source = home.join(".codex/sandbox/codex-one");
-        fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("auth.json"), b"secret").unwrap();
-        fs::write(
-            app.join("sessions.json"),
-            r#"[{"id":"codex-one","tool":"codex","sandbox_info":{"enabled":true}}]"#,
-        )
-        .unwrap();
-
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-
-        assert_eq!(
-            fs::read(home.join(".codex/sandbox-v2/codex-one/auth.json")).unwrap(),
-            b"secret"
-        );
-        let rows: Value = read_rows(&app);
-        assert_eq!(rows[0]["sandbox_store_generation"], 2);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn recovers_publication_before_registry_commit() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let source = home.join(".gemini/sandbox");
-        let destination = home.join(".gemini/sandbox-v2/one");
-        fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("legacy"), b"legacy").unwrap();
-        fs::create_dir_all(&destination).unwrap();
-        fs::write(destination.join("published"), b"published").unwrap();
-        let quarantine = destination.parent().unwrap().join(".v027-quarantine-one");
-        let stage = destination.parent().unwrap().join(".v027-stage-one");
-        fs::create_dir_all(&quarantine).unwrap();
-        fs::create_dir_all(&stage).unwrap();
-        fs::write(quarantine.join("secret"), b"secret").unwrap();
-        let row = serde_json::json!({
-            "id": "one",
-            "tool": "gemini",
-            "sandbox_info": {"enabled": true},
-            "sandbox_store_generation": 1,
-            "sandbox_store_transition_paths": [{
-                "source": source,
-                "destination": destination
-            }]
-        });
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&vec![row]).unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            app.join(JOURNAL),
-            serde_json::to_vec(&vec![source.to_string_lossy().into_owned()]).unwrap(),
-        )
-        .unwrap();
-
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-
-        assert!(!destination.join("published").exists());
-        assert_eq!(fs::read(destination.join("legacy")).unwrap(), b"legacy");
-        assert!(!source.exists());
-        assert!(!quarantine.exists());
-        assert!(!stage.exists());
-        assert!(!app.join(JOURNAL).exists());
-        let rows: Value = read_rows(&app);
-        assert_eq!(rows[0]["sandbox_store_generation"], 2);
-        assert!(rows[0].get("sandbox_store_transition_paths").is_none());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn recovers_legacy_quarantine_before_generation_commit() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let source = home.join(".gemini/sandbox");
-        let destination = home.join(".gemini/sandbox-v2/one");
-        let legacy_quarantine = home.join(".gemini/.sandbox.v027-quarantine");
-        fs::create_dir_all(&destination).unwrap();
-        fs::write(destination.join("published"), b"published").unwrap();
-        fs::create_dir_all(&legacy_quarantine).unwrap();
-        fs::write(legacy_quarantine.join("legacy"), b"legacy").unwrap();
-        let row = serde_json::json!({
-            "id": "one",
-            "tool": "gemini",
-            "sandbox_info": {"enabled": true},
-            "sandbox_store_generation": 1,
-            "sandbox_store_transition_paths": [{
-                "source": source,
-                "destination": destination
-            }]
-        });
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&vec![row]).unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            app.join(JOURNAL),
-            serde_json::to_vec(&vec![source.to_string_lossy().into_owned()]).unwrap(),
-        )
-        .unwrap();
-
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-
-        assert_eq!(
-            fs::read(destination.join("published")).unwrap(),
-            b"published"
-        );
-        assert!(!source.exists());
-        assert!(!legacy_quarantine.exists());
-        assert!(!app.join(JOURNAL).exists());
-        let rows: Value = read_rows(&app);
-        assert_eq!(rows[0]["sandbox_store_generation"], 2);
-        assert!(rows[0].get("sandbox_store_transition_paths").is_none());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn missing_source_still_cleans_publication_artifacts() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let source = home.join(".gemini/sandbox");
-        let destination = home.join(".gemini/sandbox-v2/one");
-        let parent = destination.parent().unwrap();
-        fs::create_dir_all(parent.join(".v027-stage-one")).unwrap();
-        fs::create_dir_all(parent.join(".v027-quarantine-one")).unwrap();
-        let row = serde_json::json!({
-            "id": "one",
-            "tool": "gemini",
-            "sandbox_info": {"enabled": true},
-            "sandbox_store_generation": 1,
-            "sandbox_store_transition_paths": [{
-                "source": source,
-                "destination": destination
-            }]
-        });
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&vec![row]).unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            app.join(JOURNAL),
-            serde_json::to_vec(&vec![source.to_string_lossy().into_owned()]).unwrap(),
-        )
-        .unwrap();
-
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-
-        assert!(destination.is_dir());
-        assert!(!parent.join(".v027-stage-one").exists());
-        assert!(!parent.join(".v027-quarantine-one").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
-    fn rejects_untrusted_persisted_transition_paths() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let victim = home.join("documents/sandbox");
-        fs::create_dir_all(&victim).unwrap();
-        fs::write(victim.join("keep"), b"keep").unwrap();
-        let row = serde_json::json!({
-            "id": "one",
-            "tool": "gemini",
-            "sandbox_info": {"enabled": true},
-            "sandbox_store_generation": 1,
-            "sandbox_store_transition_paths": [{
-                "source": victim,
-                "destination": home.join(".gemini/sandbox-v2/one")
-            }]
-        });
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&vec![row]).unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            app.join(JOURNAL),
-            serde_json::to_vec(&vec![victim.to_string_lossy().into_owned()]).unwrap(),
-        )
-        .unwrap();
-
-        let error = run_in(&app, &home, &|_| Ok(false)).unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("outside the expected sandbox roots"));
-        assert_eq!(fs::read(victim.join("keep")).unwrap(), b"keep");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn current_rows_scrub_forged_transition_metadata_without_io() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let victim = home.join("current-generation-victim");
-        fs::create_dir_all(&victim).unwrap();
-        fs::write(victim.join("keep"), b"keep").unwrap();
-        let row = serde_json::json!({
-            "id": "one",
-            "tool": "gemini",
-            "sandbox_info": {"enabled": true},
-            "sandbox_store_generation": 2,
-            "sandbox_store_transition_paths": [{
-                "source": victim,
-                "destination": home.join(".gemini/sandbox-v2/one")
-            }]
-        });
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&vec![row]).unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            app.join(JOURNAL),
-            serde_json::to_vec(&vec![victim.to_string_lossy().into_owned()]).unwrap(),
-        )
-        .unwrap();
-
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-
-        assert_eq!(fs::read(victim.join("keep")).unwrap(), b"keep");
-        assert!(!home.join(".gemini/sandbox-v2/one").exists());
-        assert!(!app.join(JOURNAL).exists());
-        let rows: Value = read_rows(&app);
-        assert!(rows[0].get("sandbox_store_transition_paths").is_none());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn ignores_unprovenanced_journal_paths() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let victim = home.join("journal-victim");
-        fs::create_dir_all(&victim).unwrap();
-        fs::write(victim.join("keep"), b"keep").unwrap();
-        fs::write(app.join("sessions.json"), b"[]").unwrap();
-        fs::write(
-            app.join(JOURNAL),
-            serde_json::to_vec(&vec![victim.to_string_lossy().into_owned()]).unwrap(),
-        )
-        .unwrap();
-
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-
-        assert_eq!(fs::read(victim.join("keep")).unwrap(), b"keep");
-        assert!(!app.join(JOURNAL).exists());
-    }
-
-    /// A trashed or archived row must not have its store copied, and must not
-    /// let the shared source be retired: a restore would otherwise open a
-    /// session whose store had been moved out from under it.
-    #[test]
-    #[serial_test::serial]
-    fn parked_rows_are_not_copied_and_hold_the_shared_source() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let legacy = seed_store(&home, ".gemini/sandbox", b"data");
-        let rows = serde_json::json!([
-            {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true},
-             "trashed_at":"2026-09-05T00:00:00Z"},
-            {"id":"2222222222222222","tool":"gemini","sandbox_info":{"enabled":true},
-             "archived_at":"2026-09-05T00:00:00Z"},
-            {"id":"3333333333333333","tool":"gemini","sandbox_info":{"enabled":true}}
-        ]);
-        write_rows(&app, &rows);
-
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-
-        let rows: Value = read_rows(&app);
-        assert!(
-            rows[0].get("sandbox_store_generation").is_none(),
-            "trashed row moved"
-        );
-        assert!(
-            rows[1].get("sandbox_store_generation").is_none(),
-            "archived row moved"
-        );
-        assert_eq!(rows[2]["sandbox_store_generation"], 2);
-        for id in ["1111111111111111", "2222222222222222"] {
+            // Only the parked rows are left: `aoe migrate` must still say why.
+            let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = events.clone();
+            let guard = progress::install(Some(std::sync::Arc::new(move |event| {
+                sink.lock().unwrap().push(event)
+            })));
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+            drop(guard);
             assert!(
-                !home.join(".gemini/sandbox-v2").join(id).exists(),
-                "parked row {id} must not get a private store"
+                events.lock().unwrap().iter().any(|event| matches!(
+                    event,
+                    progress::Event::Notice(line) if line.starts_with("2 trashed or archived")
+                )),
+                "{:?}",
+                events.lock().unwrap()
             );
+            assert_eq!(sessions_on_shared_store().unwrap(), 2);
         }
-        assert!(
-            legacy.exists(),
-            "a parked row must protect the shared source it still reads"
-        );
-
-        // Only the parked rows are left: `aoe migrate` must still say why.
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = events.clone();
-        let guard = progress::install(Some(std::sync::Arc::new(move |event| {
-            sink.lock().unwrap().push(event)
-        })));
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-        drop(guard);
-        assert!(
-            events.lock().unwrap().iter().any(|event| matches!(
-                event,
-                progress::Event::Notice(line) if line.starts_with("2 trashed or archived")
-            )),
-            "{:?}",
-            events.lock().unwrap()
-        );
-        assert_eq!(sessions_on_shared_store().unwrap(), 2);
-    }
-
-    /// A parked row holds only its own root; unrelated roots can retire.
-    #[test]
-    #[serial_test::serial]
-    fn an_unrelated_parked_row_does_not_hold_a_ready_root() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let gemini = seed_store(&home, ".gemini/sandbox", b"g");
-        let claude = seed_store(&home, ".claude/sandbox", b"c");
-        let rows = serde_json::json!([
-            {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
-            {"id":"3333333333333333","tool":"claude","sandbox_info":{"enabled":true},
-             "archived_at":"2026-09-05T00:00:00Z"}
-        ]);
-        write_rows(&app, &rows);
-
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-
-        assert_eq!(
-            fs::read(home.join(".gemini/sandbox-v2/1111111111111111/data")).unwrap(),
-            b"g"
-        );
-        assert!(
-            !gemini.exists(),
-            "the gemini root had no held member and must be retired"
-        );
-        assert!(
-            claude.exists(),
-            "the claude root carries a parked member and must survive"
-        );
-    }
-
-    /// The scoped counterpart: a launch that empties its own cohort retires
-    /// that root, while the cohort it held keeps its own.
-    #[test]
-    #[serial_test::serial]
-    fn a_scoped_pass_retires_the_root_it_emptied() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let gemini = home.join(".gemini/sandbox");
-        fs::create_dir_all(&gemini).unwrap();
-        fs::write(gemini.join("data"), b"g").unwrap();
-        let claude = home.join(".claude/sandbox");
-        fs::create_dir_all(&claude).unwrap();
-        fs::write(claude.join("data"), b"c").unwrap();
-        let rows = serde_json::json!([
-            {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
-            {"id":"3333333333333333","tool":"claude","sandbox_info":{"enabled":true}}
-        ]);
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&rows).unwrap(),
-        )
-        .unwrap();
-
-        run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
-
-        assert!(
-            !gemini.exists(),
-            "the scoped cohort moved in full and its root must be retired"
-        );
-        assert!(
-            claude.exists(),
-            "the cohort this pass held must keep its source"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn a_restored_row_migrates_on_its_next_pass() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let legacy = home.join(".gemini/sandbox");
-        fs::create_dir_all(&legacy).unwrap();
-        fs::write(legacy.join("data"), b"data").unwrap();
-        let rows = serde_json::json!([
-            {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true},
-             "trashed_at":"2026-09-05T00:00:00Z"}
-        ]);
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&rows).unwrap(),
-        )
-        .unwrap();
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-        assert!(legacy.exists());
-
-        let restored = serde_json::json!([
-            {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}}
-        ]);
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&restored).unwrap(),
-        )
-        .unwrap();
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-
-        assert_eq!(
-            fs::read(home.join(".gemini/sandbox-v2/1111111111111111/data")).unwrap(),
-            b"data"
-        );
-    }
-
-    /// The regression the cohort scoping exists for: a scoped pass must still
-    /// ask about every session sharing the store, not just the one being
-    /// started. Scoping by row instead drops the peers from the cohort, the
-    /// liveness fold then only sees the named session, and the store is copied
-    /// while a live peer is still writing to it. The copy becomes
-    /// authoritative at generation 2, so the loss is silent.
-    #[test]
-    #[serial_test::serial]
-    fn a_scoped_pass_refuses_a_store_a_live_peer_is_writing() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let legacy = home.join(".gemini/sandbox");
-        fs::create_dir_all(&legacy).unwrap();
-        fs::write(legacy.join("data"), b"data").unwrap();
-        let rows = serde_json::json!([
-            {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
-            {"id":"2222222222222222","tool":"gemini","sandbox_info":{"enabled":true}}
-        ]);
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&rows).unwrap(),
-        )
-        .unwrap();
-
-        // Start 1111 while its cohort peer 2222 is live.
-        run_in_only(
-            &app,
-            &home,
-            &|id| Ok(id == "2222222222222222"),
-            "1111111111111111",
-        )
-        .unwrap();
-
-        assert!(
-            !home.join(".gemini/sandbox-v2/1111111111111111").exists(),
-            "a live cohort peer must block the scoped copy"
-        );
-        let rows: Value = read_rows(&app);
-        assert_ne!(
-            rows[0]["sandbox_store_generation"], 2,
-            "a blocked row must not be stamped current"
-        );
-        assert!(legacy.exists(), "the shared source must survive");
-
-        // Once the peer stops, the same scoped pass moves it.
-        run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
-        assert_eq!(
-            fs::read(home.join(".gemini/sandbox-v2/1111111111111111/data")).unwrap(),
-            b"data"
-        );
-    }
-
-    /// A scoped pass moves the named session's whole cohort, since the cohort
-    /// is the unit the liveness gate reasons about, and leaves every other
-    /// agent's cohort alone. That is what stops one launch paying for every
-    /// pending store on the machine.
-    #[test]
-    #[serial_test::serial]
-    fn a_scoped_pass_moves_only_the_named_cohort() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let legacy = home.join(".gemini/sandbox");
-        fs::create_dir_all(&legacy).unwrap();
-        fs::write(legacy.join("data"), b"data").unwrap();
-        let other = home.join(".claude/sandbox");
-        fs::create_dir_all(&other).unwrap();
-        fs::write(other.join("data"), b"other").unwrap();
-        let rows = serde_json::json!([
-            {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
-            {"id":"3333333333333333","tool":"claude","sandbox_info":{"enabled":true}}
-        ]);
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&rows).unwrap(),
-        )
-        .unwrap();
-
-        run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
-
-        assert_eq!(
-            fs::read(home.join(".gemini/sandbox-v2/1111111111111111/data")).unwrap(),
-            b"data"
-        );
-        assert!(
-            !home.join(".claude/sandbox-v2/3333333333333333").exists(),
-            "another agent's cohort must not be moved by a scoped pass"
-        );
-        assert!(
-            other.exists(),
-            "the untouched cohort still needs its shared source"
-        );
-        let rows: Value = read_rows(&app);
-        assert_eq!(rows[0]["sandbox_store_generation"], 2);
-        // The scoped-out row must not be stamped current: its store was never
-        // copied, and generation 2 would point the session at a private store
-        // that does not exist.
-        assert_ne!(rows[1]["sandbox_store_generation"], 2);
-    }
-
-    /// A parked row is skipped by the bulk passes, but `aoe send` / `aoe
-    /// session start` / the HTTP handlers start a trashed or archived session
-    /// without unparking it. The pass scoped to that session must move it, or
-    /// nothing ever will and its launch bails on the pending transition.
-    #[test]
-    #[serial_test::serial]
-    fn a_scoped_pass_moves_the_parked_row_it_names() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let legacy = home.join(".gemini/sandbox");
-        fs::create_dir_all(&legacy).unwrap();
-        fs::write(legacy.join("data"), b"data").unwrap();
-        let rows = serde_json::json!([
-            {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true},
-             "archived_at":"2026-09-05T00:00:00Z"},
-            {"id":"2222222222222222","tool":"gemini","sandbox_info":{"enabled":true},
-             "trashed_at":"2026-09-05T00:00:00Z"}
-        ]);
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&rows).unwrap(),
-        )
-        .unwrap();
-
-        run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
-
-        assert_eq!(
-            fs::read(home.join(".gemini/sandbox-v2/1111111111111111/data")).unwrap(),
-            b"data"
-        );
-        let rows: Value = read_rows(&app);
-        assert_eq!(rows[0]["sandbox_store_generation"], 2);
-        assert_ne!(rows[1]["sandbox_store_generation"], 2);
-        assert!(
-            legacy.exists(),
-            "the still-parked peer must keep the shared source"
-        );
-    }
-
-    /// A parked row is skipped for copying, not for the liveness question.
-    /// `archive` does not stop the container, and `aoe send` starts an
-    /// archived session without unparking it, so a parked peer can be writing
-    /// the shared store while an unparked peer is started. Dropping it from
-    /// the cohort would publish that store mid-write, at generation 2.
-    #[test]
-    #[serial_test::serial]
-    fn a_live_parked_peer_blocks_its_cohort() {
-        for scoped in [false, true] {
-            let temp = tempfile::tempdir().unwrap();
-            let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
-            let app = crate::session::get_app_dir().unwrap();
-            let home = dirs::home_dir().unwrap();
-            let legacy = home.join(".gemini/sandbox");
-            fs::create_dir_all(&legacy).unwrap();
-            fs::write(legacy.join("data"), b"data").unwrap();
+        // A parked row holds only its own root; unrelated roots can retire.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let gemini = seed_store(&home, ".gemini/sandbox", b"g");
+            let claude = seed_store(&home, ".claude/sandbox", b"c");
             let rows = serde_json::json!([
                 {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
-                {"id":"2222222222222222","tool":"gemini","sandbox_info":{"enabled":true},
+                {"id":"3333333333333333","tool":"claude","sandbox_info":{"enabled":true},
                  "archived_at":"2026-09-05T00:00:00Z"}
+            ]);
+            write_rows(&app, &rows);
+
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+            assert_eq!(
+                fs::read(home.join(".gemini/sandbox-v2/1111111111111111/data")).unwrap(),
+                b"g"
+            );
+            assert!(
+                !gemini.exists(),
+                "the gemini root had no held member and must be retired"
+            );
+            assert!(
+                claude.exists(),
+                "the claude root carries a parked member and must survive"
+            );
+        }
+        // The scoped counterpart: a launch that empties its own cohort retires
+        // that root, while the cohort it held keeps its own.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let gemini = home.join(".gemini/sandbox");
+            fs::create_dir_all(&gemini).unwrap();
+            fs::write(gemini.join("data"), b"g").unwrap();
+            let claude = home.join(".claude/sandbox");
+            fs::create_dir_all(&claude).unwrap();
+            fs::write(claude.join("data"), b"c").unwrap();
+            let rows = serde_json::json!([
+                {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
+                {"id":"3333333333333333","tool":"claude","sandbox_info":{"enabled":true}}
             ]);
             fs::write(
                 app.join("sessions.json"),
@@ -3452,641 +3326,808 @@ gemini = "{}"
             )
             .unwrap();
 
-            let live_peer = |id: &str| Ok(id == "2222222222222222");
-            if scoped {
-                run_in_only(&app, &home, &live_peer, "1111111111111111").unwrap();
-            } else {
-                run_in(&app, &home, &live_peer).unwrap();
-            }
+            run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
+
+            assert!(
+                !gemini.exists(),
+                "the scoped cohort moved in full and its root must be retired"
+            );
+            assert!(
+                claude.exists(),
+                "the cohort this pass held must keep its source"
+            );
+        }
+        // a restored row migrates on its next pass
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let legacy = home.join(".gemini/sandbox");
+            fs::create_dir_all(&legacy).unwrap();
+            fs::write(legacy.join("data"), b"data").unwrap();
+            let rows = serde_json::json!([
+                {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true},
+                 "trashed_at":"2026-09-05T00:00:00Z"}
+            ]);
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&rows).unwrap(),
+            )
+            .unwrap();
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+            assert!(legacy.exists());
+
+            let restored = serde_json::json!([
+                {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}}
+            ]);
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&restored).unwrap(),
+            )
+            .unwrap();
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+            assert_eq!(
+                fs::read(home.join(".gemini/sandbox-v2/1111111111111111/data")).unwrap(),
+                b"data"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn scoped_passes_move_only_their_cohort() {
+        // The regression the cohort scoping exists for: a scoped pass must still
+        // ask about every session sharing the store, not just the one being
+        // started. Scoping by row instead drops the peers from the cohort, the
+        // liveness fold then only sees the named session, and the store is copied
+        // while a live peer is still writing to it. The copy becomes
+        // authoritative at generation 2, so the loss is silent.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let legacy = home.join(".gemini/sandbox");
+            fs::create_dir_all(&legacy).unwrap();
+            fs::write(legacy.join("data"), b"data").unwrap();
+            let rows = serde_json::json!([
+                {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
+                {"id":"2222222222222222","tool":"gemini","sandbox_info":{"enabled":true}}
+            ]);
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&rows).unwrap(),
+            )
+            .unwrap();
+
+            // Start 1111 while its cohort peer 2222 is live.
+            run_in_only(
+                &app,
+                &home,
+                &|id| Ok(id == "2222222222222222"),
+                "1111111111111111",
+            )
+            .unwrap();
 
             assert!(
                 !home.join(".gemini/sandbox-v2/1111111111111111").exists(),
-                "scoped={scoped}: a live archived peer must block the copy"
+                "a live cohort peer must block the scoped copy"
             );
             let rows: Value = read_rows(&app);
             assert_ne!(
                 rows[0]["sandbox_store_generation"], 2,
-                "scoped={scoped}: a blocked row must not be stamped current"
+                "a blocked row must not be stamped current"
             );
-            assert!(
-                legacy.exists(),
-                "scoped={scoped}: the shared source must survive"
-            );
+            assert!(legacy.exists(), "the shared source must survive");
 
-            // Once the parked peer stops, the same pass moves the unparked row
-            // and still leaves the parked one on the shared store.
-            if scoped {
-                run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
-            } else {
-                run_in(&app, &home, &|_| Ok(false)).unwrap();
-            }
+            // Once the peer stops, the same scoped pass moves it.
+            run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
             assert_eq!(
                 fs::read(home.join(".gemini/sandbox-v2/1111111111111111/data")).unwrap(),
-                b"data",
-                "scoped={scoped}: the unparked row must move once the peer stops"
-            );
-            assert!(
-                !home.join(".gemini/sandbox-v2/2222222222222222").exists(),
-                "scoped={scoped}: the parked peer must not be copied"
-            );
-            assert!(
-                legacy.exists(),
-                "scoped={scoped}: the parked peer still holds the shared source"
-            );
-        }
-    }
-
-    /// A scoped pass must not retire a cleanup root a scoped-out cohort still
-    /// lives under. Codex sessions each own a child of one shared root, so
-    /// dropping `defer_source_retirement` in the cohort filter would quarantine
-    /// and delete every other codex session's store.
-    #[test]
-    #[serial_test::serial]
-    fn a_scoped_pass_holds_the_root_a_scoped_out_cohort_lives_under() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let root = home.join(".codex/sandbox");
-        fs::create_dir_all(root.join("1111111111111111")).unwrap();
-        fs::write(root.join("1111111111111111/data"), b"one").unwrap();
-        fs::create_dir_all(root.join("2222222222222222")).unwrap();
-        fs::write(root.join("2222222222222222/data"), b"two").unwrap();
-        let rows = serde_json::json!([
-            {"id":"1111111111111111","tool":"codex","sandbox_info":{"enabled":true}},
-            {"id":"2222222222222222","tool":"codex","sandbox_info":{"enabled":true}}
-        ]);
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&rows).unwrap(),
-        )
-        .unwrap();
-
-        run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
-
-        assert_eq!(
-            fs::read(root.join("2222222222222222/data")).unwrap(),
-            b"two",
-            "a scoped-out cohort's shared store must survive the pass"
-        );
-        assert_eq!(
-            fs::read(home.join(".codex/sandbox-v2/1111111111111111/data")).unwrap(),
-            b"one"
-        );
-    }
-
-    #[test]
-    fn row_is_parked_reads_both_fields_and_ignores_nulls() {
-        assert!(!row_is_parked(&serde_json::json!({"id":"a"})));
-        assert!(!row_is_parked(
-            &serde_json::json!({"trashed_at":null,"archived_at":null})
-        ));
-        assert!(row_is_parked(
-            &serde_json::json!({"trashed_at":"2026-09-05T00:00:00Z"})
-        ));
-        assert!(row_is_parked(
-            &serde_json::json!({"archived_at":"2026-09-05T00:00:00Z"})
-        ));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn unresolved_rows_do_not_block_ready_rows_or_retire_the_shared_source() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let legacy = home.join(".gemini/sandbox");
-        fs::create_dir_all(&legacy).unwrap();
-        fs::write(legacy.join("data"), b"data").unwrap();
-        let rows = serde_json::json!([
-            {"id":"1111111111111111","tool":"missing-agent","sandbox_info":{"enabled":true}},
-            {"tool":"missing-agent","sandbox_info":{"enabled":true}},
-            {"id":"2222222222222222","tool":"gemini","sandbox_info":{"enabled":true}}
-        ]);
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&rows).unwrap(),
-        )
-        .unwrap();
-
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-
-        let rows: Value = read_rows(&app);
-        assert!(rows[0].get("sandbox_store_generation").is_none());
-        assert_eq!(rows[2]["sandbox_store_generation"], 2);
-        assert_eq!(
-            fs::read(home.join(".gemini/sandbox-v2/2222222222222222/data")).unwrap(),
-            b"data"
-        );
-        assert!(
-            legacy.exists(),
-            "an unresolved row must protect the shared source"
-        );
-
-        let repaired = serde_json::json!([
-            {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
-            {"id":"3333333333333333","tool":"gemini","sandbox_info":{"enabled":true}},
-            rows[2].clone()
-        ]);
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&repaired).unwrap(),
-        )
-        .unwrap();
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-
-        let rows: Value = read_rows(&app);
-        assert!(rows
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["sandbox_store_generation"] == 2));
-        for id in ["1111111111111111", "2222222222222222", "3333333333333333"] {
-            assert_eq!(
-                fs::read(home.join(".gemini/sandbox-v2").join(id).join("data")).unwrap(),
                 b"data"
             );
         }
-        assert!(!legacy.exists());
-    }
+        // A scoped pass moves the named session's whole cohort, since the cohort
+        // is the unit the liveness gate reasons about, and leaves every other
+        // agent's cohort alone. That is what stops one launch paying for every
+        // pending store on the machine.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let legacy = home.join(".gemini/sandbox");
+            fs::create_dir_all(&legacy).unwrap();
+            fs::write(legacy.join("data"), b"data").unwrap();
+            let other = home.join(".claude/sandbox");
+            fs::create_dir_all(&other).unwrap();
+            fs::write(other.join("data"), b"other").unwrap();
+            let rows = serde_json::json!([
+                {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
+                {"id":"3333333333333333","tool":"claude","sandbox_info":{"enabled":true}}
+            ]);
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&rows).unwrap(),
+            )
+            .unwrap();
 
-    #[test]
-    #[cfg(unix)]
-    #[serial_test::serial]
-    fn persisted_sources_survive_ancestor_symlink_canonicalization() {
-        use std::os::unix::fs::symlink;
-        let (temp, _app_guard, app, home) = isolated();
-        let external = temp.path().join("external-gemini");
-        fs::create_dir_all(external.join("sandbox")).unwrap();
-        fs::write(external.join("sandbox/data"), b"data").unwrap();
-        symlink(&external, home.join(".gemini")).unwrap();
-        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+            run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
 
-        run_in(&app, &home, &|_| Ok(true)).unwrap();
-        run_in(&app, &home, &|_| Ok(true)).unwrap();
-        assert!(external.join("sandbox/data").is_file());
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
+            assert_eq!(
+                fs::read(home.join(".gemini/sandbox-v2/1111111111111111/data")).unwrap(),
+                b"data"
+            );
+            assert!(
+                !home.join(".claude/sandbox-v2/3333333333333333").exists(),
+                "another agent's cohort must not be moved by a scoped pass"
+            );
+            assert!(
+                other.exists(),
+                "the untouched cohort still needs its shared source"
+            );
+            let rows: Value = read_rows(&app);
+            assert_eq!(rows[0]["sandbox_store_generation"], 2);
+            // The scoped-out row must not be stamped current: its store was never
+            // copied, and generation 2 would point the session at a private store
+            // that does not exist.
+            assert_ne!(rows[1]["sandbox_store_generation"], 2);
+        }
+        // A parked row is skipped by the bulk passes, but `aoe send` / `aoe
+        // session start` / the HTTP handlers start a trashed or archived session
+        // without unparking it. The pass scoped to that session must move it, or
+        // nothing ever will and its launch bails on the pending transition.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let legacy = home.join(".gemini/sandbox");
+            fs::create_dir_all(&legacy).unwrap();
+            fs::write(legacy.join("data"), b"data").unwrap();
+            let rows = serde_json::json!([
+                {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true},
+                 "archived_at":"2026-09-05T00:00:00Z"},
+                {"id":"2222222222222222","tool":"gemini","sandbox_info":{"enabled":true},
+                 "trashed_at":"2026-09-05T00:00:00Z"}
+            ]);
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&rows).unwrap(),
+            )
+            .unwrap();
 
-        assert_eq!(
-            fs::read(external.join("sandbox-v2/one/data")).unwrap(),
-            b"data"
-        );
-        assert!(!external.join("sandbox").exists());
-    }
+            run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
 
-    #[test]
-    #[serial_test::serial]
-    fn an_unregistered_store_moves_without_being_expanded() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let root = home.join(".codex/sandbox");
-        let peer = "1111111111111111";
-        let orphan = "2222222222222222";
-        fs::create_dir_all(root.join(peer)).unwrap();
-        fs::create_dir_all(root.join(orphan)).unwrap();
-        fs::create_dir_all(root.join("sessions")).unwrap();
-        fs::write(root.join(peer).join("peer"), b"peer").unwrap();
-        fs::write(root.join(orphan).join("orphan"), b"orphan").unwrap();
-        fs::write(root.join("common"), b"common").unwrap();
-        fs::write(root.join("sessions").join("other"), b"other").unwrap();
-        fs::write(
-            app.join("sessions.json"),
-            format!(r#"[{{"id":"{peer}","tool":"codex","sandbox_info":{{"enabled":true}}}}]"#),
-        )
-        .unwrap();
+            assert_eq!(
+                fs::read(home.join(".gemini/sandbox-v2/1111111111111111/data")).unwrap(),
+                b"data"
+            );
+            let rows: Value = read_rows(&app);
+            assert_eq!(rows[0]["sandbox_store_generation"], 2);
+            assert_ne!(rows[1]["sandbox_store_generation"], 2);
+            assert!(
+                legacy.exists(),
+                "the still-parked peer must keep the shared source"
+            );
+        }
+        // A parked row is skipped for copying, not for the liveness question.
+        // `archive` does not stop the container, and `aoe send` starts an
+        // archived session without unparking it, so a parked peer can be writing
+        // the shared store while an unparked peer is started. Dropping it from
+        // the cohort would publish that store mid-write, at generation 2.
+        {
+            for scoped in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+                let app = crate::session::get_app_dir().unwrap();
+                let home = dirs::home_dir().unwrap();
+                let legacy = home.join(".gemini/sandbox");
+                fs::create_dir_all(&legacy).unwrap();
+                fs::write(legacy.join("data"), b"data").unwrap();
+                let rows = serde_json::json!([
+                    {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
+                    {"id":"2222222222222222","tool":"gemini","sandbox_info":{"enabled":true},
+                     "archived_at":"2026-09-05T00:00:00Z"}
+                ]);
+                fs::write(
+                    app.join("sessions.json"),
+                    serde_json::to_vec(&rows).unwrap(),
+                )
+                .unwrap();
 
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
+                let live_peer = |id: &str| Ok(id == "2222222222222222");
+                if scoped {
+                    run_in_only(&app, &home, &live_peer, "1111111111111111").unwrap();
+                } else {
+                    run_in(&app, &home, &live_peer).unwrap();
+                }
 
-        let destination = home.join(".codex/sandbox-v2");
-        assert_eq!(
-            fs::read(destination.join(peer).join("peer")).unwrap(),
-            b"peer"
-        );
-        assert_eq!(
-            fs::read(destination.join(peer).join("common")).unwrap(),
-            b"common",
-            "a shared root file still reaches the session that had no copy of it"
-        );
-        assert!(
-            !destination.join(peer).join("sessions").exists(),
-            "another session's history must not be replicated into a private store"
-        );
-        assert_eq!(
-            fs::read(destination.join(orphan).join("orphan")).unwrap(),
-            b"orphan",
-            "a store no session claims is preserved as it was"
-        );
-        assert!(
-            !destination.join(orphan).join("common").exists(),
-            "a store no session claims must not be expanded with the shared root"
-        );
-        assert!(!destination.join(peer).join(orphan).exists());
-        assert!(!root.join(peer).exists());
-        assert!(!root.join(orphan).exists());
-        assert!(!root.join("common").exists());
-        let recovered: Vec<_> =
-            fs::read_dir(home.join(crate::migrations::v033_isolate_sandbox_content::RECOVERY))
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .filter(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with("v027-"))
-                })
-                .collect();
-        assert_eq!(recovered.len(), 1, "the shared root is retained whole");
-        assert_eq!(
-            fs::read(recovered[0].join("original/sessions/other")).unwrap(),
-            b"other",
-            "what no private store received stays in the retained original"
-        );
-        assert!(
-            !root.exists(),
-            "a retained root leaves nothing at its old path"
-        );
-    }
+                assert!(
+                    !home.join(".gemini/sandbox-v2/1111111111111111").exists(),
+                    "scoped={scoped}: a live archived peer must block the copy"
+                );
+                let rows: Value = read_rows(&app);
+                assert_ne!(
+                    rows[0]["sandbox_store_generation"], 2,
+                    "scoped={scoped}: a blocked row must not be stamped current"
+                );
+                assert!(
+                    legacy.exists(),
+                    "scoped={scoped}: the shared source must survive"
+                );
 
-    /// A retirement a live mount defers must not be lost: the cohort stays
-    /// pending, and the pass that follows retires the root once the mount is
-    /// gone instead of stamping it current and leaving the shared store forever.
-    #[test]
-    #[serial_test::serial]
-    fn a_deferred_retirement_is_retried_by_a_later_pass() {
-        let (temp, _app_guard, app, home) = isolated();
-        let project = temp.path().join("project");
-        fs::create_dir_all(&project).unwrap();
-        let id = "3333333333333333";
-        let root = home.join(".gemini/sandbox");
-        fs::create_dir_all(root.join(id)).unwrap();
-        fs::write(root.join(id).join("own"), b"own").unwrap();
-        fs::write(
-            app.join("sessions.json"),
-            format!(
-                r#"[{{"id":"{id}","tool":"gemini","project_path":"{}","sandbox_info":{{"enabled":true}}}}]"#,
-                project.display()
-            ),
-        )
-        .unwrap();
-
-        let expose = |sources: Option<Vec<std::path::PathBuf>>| {
-            super::super::v033_isolate_sandbox_content::EXPOSED_SOURCES
-                .with(|hook| *hook.borrow_mut() = sources);
-        };
-        expose(Some(vec![home.clone()]));
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-        let rows: Value = read_rows(&app);
-        assert_eq!(
-            rows[0]
-                .get("sandbox_store_generation")
-                .and_then(Value::as_u64),
-            Some(1),
-            "a deferred retirement keeps its cohort on the pending generation: {rows}"
-        );
-        assert!(app.join(JOURNAL).is_file(), "the root stays pending");
-        assert!(root.join(id).is_dir(), "nothing moved while it was exposed");
-
-        expose(None);
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-        assert!(
-            !root.exists(),
-            "the next pass retires the shared store once nothing exposes it"
-        );
-        assert!(!app.join(JOURNAL).exists());
-        assert!(home.join(".gemini/sandbox-v2").join(id).is_dir());
-    }
-
-    /// A publish its quarantine defers must lose nothing either: the displaced
-    /// original keeps the destination from being renamed onto it, so the pass
-    /// publishes nothing and the row is retried with both stores intact.
-    #[test]
-    #[serial_test::serial]
-    fn a_deferred_publication_is_retried_by_a_later_pass() {
-        let (temp, _app_guard, app, home) = isolated();
-        let project = temp.path().join("project");
-        fs::create_dir_all(&project).unwrap();
-        let id = "4444444444444444";
-        let root = home.join(".gemini/sandbox");
-        fs::create_dir_all(root.join(id)).unwrap();
-        fs::write(root.join(id).join("own"), b"own").unwrap();
-        fs::write(root.join("auth.json"), b"auth").unwrap();
-        let layout = home.join(".gemini/sandbox-v2");
-        // A killed pass published this session and left the destination it
-        // displaced at the quarantine, where nothing has retained it yet.
-        let destination = layout.join(id);
-        fs::create_dir_all(&destination).unwrap();
-        fs::write(destination.join("published"), b"published").unwrap();
-        let quarantine = layout.join(format!(".v027-quarantine-{id}"));
-        fs::create_dir_all(&quarantine).unwrap();
-        fs::write(quarantine.join("displaced"), b"displaced").unwrap();
-        fs::write(
-            app.join("sessions.json"),
-            format!(
-                r#"[{{"id":"{id}","tool":"gemini","project_path":"{}","sandbox_info":{{"enabled":true}}}}]"#,
-                project.display()
-            ),
-        )
-        .unwrap();
-
-        let expose = |sources: Option<Vec<std::path::PathBuf>>| {
-            super::super::v033_isolate_sandbox_content::EXPOSED_SOURCES
-                .with(|hook| *hook.borrow_mut() = sources);
-        };
-        expose(Some(vec![home.clone()]));
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-
-        assert_eq!(
-            fs::read(destination.join("published")).unwrap(),
-            b"published",
-            "a deferred publish leaves the destination as it was"
-        );
-        assert_eq!(
-            fs::read(quarantine.join("displaced")).unwrap(),
-            b"displaced",
-            "a deferred retention leaves the quarantine as it was"
-        );
-        assert!(!destination.join("auth.json").exists());
-        assert!(!quarantine.join("published").exists());
-        assert!(root.join("auth.json").is_file());
-        let rows: Value = read_rows(&app);
-        assert_eq!(
-            rows[0]
-                .get("sandbox_store_generation")
-                .and_then(Value::as_u64),
-            Some(1),
-            "a deferred publish keeps its row on the pending generation: {rows}"
-        );
-        assert!(app.join(JOURNAL).is_file(), "the root stays pending");
-
-        expose(None);
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-
-        assert_eq!(fs::read(destination.join("auth.json")).unwrap(), b"auth");
-        assert!(!destination.join("published").exists());
-        assert!(
-            !quarantine.exists(),
-            "the pass that publishes retains the quarantine it publishes through"
-        );
-        assert!(!root.exists(), "the next pass retires the shared store");
-        assert!(!app.join(JOURNAL).exists());
-        let mut retained = Vec::new();
-        let recovery = home.join(crate::migrations::v033_isolate_sandbox_content::RECOVERY);
-        for transaction in fs::read_dir(recovery).unwrap() {
-            for original in fs::read_dir(transaction.unwrap().path().join("original")).unwrap() {
-                retained.push(original.unwrap().file_name().to_string_lossy().into_owned());
+                // Once the parked peer stops, the same pass moves the unparked row
+                // and still leaves the parked one on the shared store.
+                if scoped {
+                    run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
+                } else {
+                    run_in(&app, &home, &|_| Ok(false)).unwrap();
+                }
+                assert_eq!(
+                    fs::read(home.join(".gemini/sandbox-v2/1111111111111111/data")).unwrap(),
+                    b"data",
+                    "scoped={scoped}: the unparked row must move once the peer stops"
+                );
+                assert!(
+                    !home.join(".gemini/sandbox-v2/2222222222222222").exists(),
+                    "scoped={scoped}: the parked peer must not be copied"
+                );
+                assert!(
+                    legacy.exists(),
+                    "scoped={scoped}: the parked peer still holds the shared source"
+                );
             }
         }
-        for name in ["displaced", "published"] {
-            assert!(
-                retained.iter().any(|entry| entry == name),
-                "{name} is retained whole rather than dropped: {retained:?}"
+        // A scoped pass must not retire a cleanup root a scoped-out cohort still
+        // lives under. Codex sessions each own a child of one shared root, so
+        // dropping `defer_source_retirement` in the cohort filter would quarantine
+        // and delete every other codex session's store.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let root = home.join(".codex/sandbox");
+            fs::create_dir_all(root.join("1111111111111111")).unwrap();
+            fs::write(root.join("1111111111111111/data"), b"one").unwrap();
+            fs::create_dir_all(root.join("2222222222222222")).unwrap();
+            fs::write(root.join("2222222222222222/data"), b"two").unwrap();
+            let rows = serde_json::json!([
+                {"id":"1111111111111111","tool":"codex","sandbox_info":{"enabled":true}},
+                {"id":"2222222222222222","tool":"codex","sandbox_info":{"enabled":true}}
+            ]);
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&rows).unwrap(),
+            )
+            .unwrap();
+
+            run_in_only(&app, &home, &|_| Ok(false), "1111111111111111").unwrap();
+
+            assert_eq!(
+                fs::read(root.join("2222222222222222/data")).unwrap(),
+                b"two",
+                "a scoped-out cohort's shared store must survive the pass"
+            );
+            assert_eq!(
+                fs::read(home.join(".codex/sandbox-v2/1111111111111111/data")).unwrap(),
+                b"one"
             );
         }
     }
 
-    /// The orphan path defers on the same retention: an orphan that cannot
-    /// move keeps its root, and every row reading that root, pending rather
-    /// than retiring a root that still holds it.
     #[test]
     #[serial_test::serial]
-    fn a_deferred_orphan_move_keeps_its_root_pending() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let root = home.join(".codex/sandbox");
-        let peer = "1111111111111111";
-        let orphan = "2222222222222222";
-        fs::create_dir_all(root.join(peer)).unwrap();
-        fs::create_dir_all(root.join(orphan)).unwrap();
-        fs::write(root.join(peer).join("peer"), b"peer").unwrap();
-        fs::write(root.join(orphan).join("orphan"), b"orphan").unwrap();
-        let layout = home.join(".codex/sandbox-v2");
-        // A killed pass moved this orphan once and left the destination it
-        // displaced at the quarantine, where nothing has retained it yet.
-        let destination = layout.join(orphan);
-        fs::create_dir_all(&destination).unwrap();
-        fs::write(destination.join("moved"), b"moved").unwrap();
-        let quarantine = layout.join(format!(".v027-quarantine-{orphan}"));
-        fs::create_dir_all(&quarantine).unwrap();
-        fs::write(quarantine.join("displaced"), b"displaced").unwrap();
-        fs::write(
-            app.join("sessions.json"),
-            format!(r#"[{{"id":"{peer}","tool":"codex","sandbox_info":{{"enabled":true}}}}]"#),
-        )
-        .unwrap();
+    fn deferred_work_is_retried_by_a_later_pass() {
+        // unresolved rows do not block ready rows or retire the shared source
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let legacy = home.join(".gemini/sandbox");
+            fs::create_dir_all(&legacy).unwrap();
+            fs::write(legacy.join("data"), b"data").unwrap();
+            let rows = serde_json::json!([
+                {"id":"1111111111111111","tool":"missing-agent","sandbox_info":{"enabled":true}},
+                {"tool":"missing-agent","sandbox_info":{"enabled":true}},
+                {"id":"2222222222222222","tool":"gemini","sandbox_info":{"enabled":true}}
+            ]);
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&rows).unwrap(),
+            )
+            .unwrap();
 
-        let expose = |sources: Option<Vec<std::path::PathBuf>>| {
-            super::super::v033_isolate_sandbox_content::EXPOSED_SOURCES
-                .with(|hook| *hook.borrow_mut() = sources);
-        };
-        expose(Some(vec![home.clone()]));
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
 
-        assert_eq!(
-            fs::read(root.join(orphan).join("orphan")).unwrap(),
-            b"orphan",
-            "a deferred move leaves the orphan at its source"
-        );
-        assert_eq!(fs::read(destination.join("moved")).unwrap(), b"moved");
-        assert_eq!(
-            fs::read(quarantine.join("displaced")).unwrap(),
-            b"displaced"
-        );
-        assert!(root.is_dir(), "the root holding it stays where it is");
-        let rows: Value = read_rows(&app);
-        assert!(
-            rows[0]
-                .get("sandbox_store_generation")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                < 2,
-            "a root that still holds an orphan keeps its rows pending: {rows}"
-        );
-        assert!(app.join(JOURNAL).is_file(), "the root stays pending");
+            let rows: Value = read_rows(&app);
+            assert!(rows[0].get("sandbox_store_generation").is_none());
+            assert_eq!(rows[2]["sandbox_store_generation"], 2);
+            assert_eq!(
+                fs::read(home.join(".gemini/sandbox-v2/2222222222222222/data")).unwrap(),
+                b"data"
+            );
+            assert!(
+                legacy.exists(),
+                "an unresolved row must protect the shared source"
+            );
 
-        expose(None);
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
+            let repaired = serde_json::json!([
+                {"id":"1111111111111111","tool":"gemini","sandbox_info":{"enabled":true}},
+                {"id":"3333333333333333","tool":"gemini","sandbox_info":{"enabled":true}},
+                rows[2].clone()
+            ]);
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&repaired).unwrap(),
+            )
+            .unwrap();
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
 
-        assert_eq!(fs::read(destination.join("orphan")).unwrap(), b"orphan");
-        assert!(!destination.join("moved").exists());
-        assert!(!quarantine.exists());
-        assert!(!root.exists(), "the next pass retires the emptied root");
-        assert!(!app.join(JOURNAL).exists());
-        let mut retained = Vec::new();
-        let recovery = home.join(crate::migrations::v033_isolate_sandbox_content::RECOVERY);
-        for transaction in fs::read_dir(recovery).unwrap() {
-            for original in fs::read_dir(transaction.unwrap().path().join("original")).unwrap() {
-                retained.push(original.unwrap().file_name().to_string_lossy().into_owned());
+            let rows: Value = read_rows(&app);
+            assert!(rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["sandbox_store_generation"] == 2));
+            for id in ["1111111111111111", "2222222222222222", "3333333333333333"] {
+                assert_eq!(
+                    fs::read(home.join(".gemini/sandbox-v2").join(id).join("data")).unwrap(),
+                    b"data"
+                );
+            }
+            assert!(!legacy.exists());
+        }
+        // persisted sources survive ancestor symlink canonicalization
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let (temp, _app_guard, app, home) = isolated();
+            let external = temp.path().join("external-gemini");
+            fs::create_dir_all(external.join("sandbox")).unwrap();
+            fs::write(external.join("sandbox/data"), b"data").unwrap();
+            symlink(&external, home.join(".gemini")).unwrap();
+            fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
+
+            run_in(&app, &home, &|_| Ok(true)).unwrap();
+            run_in(&app, &home, &|_| Ok(true)).unwrap();
+            assert!(external.join("sandbox/data").is_file());
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+            assert_eq!(
+                fs::read(external.join("sandbox-v2/one/data")).unwrap(),
+                b"data"
+            );
+            assert!(!external.join("sandbox").exists());
+        }
+        // an unregistered store moves without being expanded
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let root = home.join(".codex/sandbox");
+            let peer = "1111111111111111";
+            let orphan = "2222222222222222";
+            fs::create_dir_all(root.join(peer)).unwrap();
+            fs::create_dir_all(root.join(orphan)).unwrap();
+            fs::create_dir_all(root.join("sessions")).unwrap();
+            fs::write(root.join(peer).join("peer"), b"peer").unwrap();
+            fs::write(root.join(orphan).join("orphan"), b"orphan").unwrap();
+            fs::write(root.join("common"), b"common").unwrap();
+            fs::write(root.join("sessions").join("other"), b"other").unwrap();
+            fs::write(
+                app.join("sessions.json"),
+                format!(r#"[{{"id":"{peer}","tool":"codex","sandbox_info":{{"enabled":true}}}}]"#),
+            )
+            .unwrap();
+
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+            let destination = home.join(".codex/sandbox-v2");
+            assert_eq!(
+                fs::read(destination.join(peer).join("peer")).unwrap(),
+                b"peer"
+            );
+            assert_eq!(
+                fs::read(destination.join(peer).join("common")).unwrap(),
+                b"common",
+                "a shared root file still reaches the session that had no copy of it"
+            );
+            assert!(
+                !destination.join(peer).join("sessions").exists(),
+                "another session's history must not be replicated into a private store"
+            );
+            assert_eq!(
+                fs::read(destination.join(orphan).join("orphan")).unwrap(),
+                b"orphan",
+                "a store no session claims is preserved as it was"
+            );
+            assert!(
+                !destination.join(orphan).join("common").exists(),
+                "a store no session claims must not be expanded with the shared root"
+            );
+            assert!(!destination.join(peer).join(orphan).exists());
+            assert!(!root.join(peer).exists());
+            assert!(!root.join(orphan).exists());
+            assert!(!root.join("common").exists());
+            let recovered: Vec<_> =
+                fs::read_dir(home.join(crate::migrations::v033_isolate_sandbox_content::RECOVERY))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("v027-"))
+                    })
+                    .collect();
+            assert_eq!(recovered.len(), 1, "the shared root is retained whole");
+            assert_eq!(
+                fs::read(recovered[0].join("original/sessions/other")).unwrap(),
+                b"other",
+                "what no private store received stays in the retained original"
+            );
+            assert!(
+                !root.exists(),
+                "a retained root leaves nothing at its old path"
+            );
+        }
+        // A retirement a live mount defers must not be lost: the cohort stays
+        // pending, and the pass that follows retires the root once the mount is
+        // gone instead of stamping it current and leaving the shared store forever.
+        {
+            let (temp, _app_guard, app, home) = isolated();
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).unwrap();
+            let id = "3333333333333333";
+            let root = home.join(".gemini/sandbox");
+            fs::create_dir_all(root.join(id)).unwrap();
+            fs::write(root.join(id).join("own"), b"own").unwrap();
+            fs::write(
+                app.join("sessions.json"),
+                format!(
+                    r#"[{{"id":"{id}","tool":"gemini","project_path":"{}","sandbox_info":{{"enabled":true}}}}]"#,
+                    project.display()
+                ),
+            )
+            .unwrap();
+
+            let expose = |sources: Option<Vec<std::path::PathBuf>>| {
+                super::super::v033_isolate_sandbox_content::EXPOSED_SOURCES
+                    .with(|hook| *hook.borrow_mut() = sources);
+            };
+            expose(Some(vec![home.clone()]));
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+            let rows: Value = read_rows(&app);
+            assert_eq!(
+                rows[0]
+                    .get("sandbox_store_generation")
+                    .and_then(Value::as_u64),
+                Some(1),
+                "a deferred retirement keeps its cohort on the pending generation: {rows}"
+            );
+            assert!(app.join(JOURNAL).is_file(), "the root stays pending");
+            assert!(root.join(id).is_dir(), "nothing moved while it was exposed");
+
+            expose(None);
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+            assert!(
+                !root.exists(),
+                "the next pass retires the shared store once nothing exposes it"
+            );
+            assert!(!app.join(JOURNAL).exists());
+            assert!(home.join(".gemini/sandbox-v2").join(id).is_dir());
+        }
+        // A publish its quarantine defers must lose nothing either: the displaced
+        // original keeps the destination from being renamed onto it, so the pass
+        // publishes nothing and the row is retried with both stores intact.
+        {
+            let (temp, _app_guard, app, home) = isolated();
+            let project = temp.path().join("project");
+            fs::create_dir_all(&project).unwrap();
+            let id = "4444444444444444";
+            let root = home.join(".gemini/sandbox");
+            fs::create_dir_all(root.join(id)).unwrap();
+            fs::write(root.join(id).join("own"), b"own").unwrap();
+            fs::write(root.join("auth.json"), b"auth").unwrap();
+            let layout = home.join(".gemini/sandbox-v2");
+            // A killed pass published this session and left the destination it
+            // displaced at the quarantine, where nothing has retained it yet.
+            let destination = layout.join(id);
+            fs::create_dir_all(&destination).unwrap();
+            fs::write(destination.join("published"), b"published").unwrap();
+            let quarantine = layout.join(format!(".v027-quarantine-{id}"));
+            fs::create_dir_all(&quarantine).unwrap();
+            fs::write(quarantine.join("displaced"), b"displaced").unwrap();
+            fs::write(
+                app.join("sessions.json"),
+                format!(
+                    r#"[{{"id":"{id}","tool":"gemini","project_path":"{}","sandbox_info":{{"enabled":true}}}}]"#,
+                    project.display()
+                ),
+            )
+            .unwrap();
+
+            let expose = |sources: Option<Vec<std::path::PathBuf>>| {
+                super::super::v033_isolate_sandbox_content::EXPOSED_SOURCES
+                    .with(|hook| *hook.borrow_mut() = sources);
+            };
+            expose(Some(vec![home.clone()]));
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+            assert_eq!(
+                fs::read(destination.join("published")).unwrap(),
+                b"published",
+                "a deferred publish leaves the destination as it was"
+            );
+            assert_eq!(
+                fs::read(quarantine.join("displaced")).unwrap(),
+                b"displaced",
+                "a deferred retention leaves the quarantine as it was"
+            );
+            assert!(!destination.join("auth.json").exists());
+            assert!(!quarantine.join("published").exists());
+            assert!(root.join("auth.json").is_file());
+            let rows: Value = read_rows(&app);
+            assert_eq!(
+                rows[0]
+                    .get("sandbox_store_generation")
+                    .and_then(Value::as_u64),
+                Some(1),
+                "a deferred publish keeps its row on the pending generation: {rows}"
+            );
+            assert!(app.join(JOURNAL).is_file(), "the root stays pending");
+
+            expose(None);
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+            assert_eq!(fs::read(destination.join("auth.json")).unwrap(), b"auth");
+            assert!(!destination.join("published").exists());
+            assert!(
+                !quarantine.exists(),
+                "the pass that publishes retains the quarantine it publishes through"
+            );
+            assert!(!root.exists(), "the next pass retires the shared store");
+            assert!(!app.join(JOURNAL).exists());
+            let mut retained = Vec::new();
+            let recovery = home.join(crate::migrations::v033_isolate_sandbox_content::RECOVERY);
+            for transaction in fs::read_dir(recovery).unwrap() {
+                for original in fs::read_dir(transaction.unwrap().path().join("original")).unwrap()
+                {
+                    retained.push(original.unwrap().file_name().to_string_lossy().into_owned());
+                }
+            }
+            for name in ["displaced", "published"] {
+                assert!(
+                    retained.iter().any(|entry| entry == name),
+                    "{name} is retained whole rather than dropped: {retained:?}"
+                );
             }
         }
-        assert!(
-            retained.iter().any(|entry| entry == "moved"),
-            "the displaced orphan store is retained whole: {retained:?}"
-        );
+        // The orphan path defers on the same retention: an orphan that cannot
+        // move keeps its root, and every row reading that root, pending rather
+        // than retiring a root that still holds it.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let root = home.join(".codex/sandbox");
+            let peer = "1111111111111111";
+            let orphan = "2222222222222222";
+            fs::create_dir_all(root.join(peer)).unwrap();
+            fs::create_dir_all(root.join(orphan)).unwrap();
+            fs::write(root.join(peer).join("peer"), b"peer").unwrap();
+            fs::write(root.join(orphan).join("orphan"), b"orphan").unwrap();
+            let layout = home.join(".codex/sandbox-v2");
+            // A killed pass moved this orphan once and left the destination it
+            // displaced at the quarantine, where nothing has retained it yet.
+            let destination = layout.join(orphan);
+            fs::create_dir_all(&destination).unwrap();
+            fs::write(destination.join("moved"), b"moved").unwrap();
+            let quarantine = layout.join(format!(".v027-quarantine-{orphan}"));
+            fs::create_dir_all(&quarantine).unwrap();
+            fs::write(quarantine.join("displaced"), b"displaced").unwrap();
+            fs::write(
+                app.join("sessions.json"),
+                format!(r#"[{{"id":"{peer}","tool":"codex","sandbox_info":{{"enabled":true}}}}]"#),
+            )
+            .unwrap();
+
+            let expose = |sources: Option<Vec<std::path::PathBuf>>| {
+                super::super::v033_isolate_sandbox_content::EXPOSED_SOURCES
+                    .with(|hook| *hook.borrow_mut() = sources);
+            };
+            expose(Some(vec![home.clone()]));
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+            assert_eq!(
+                fs::read(root.join(orphan).join("orphan")).unwrap(),
+                b"orphan",
+                "a deferred move leaves the orphan at its source"
+            );
+            assert_eq!(fs::read(destination.join("moved")).unwrap(), b"moved");
+            assert_eq!(
+                fs::read(quarantine.join("displaced")).unwrap(),
+                b"displaced"
+            );
+            assert!(root.is_dir(), "the root holding it stays where it is");
+            let rows: Value = read_rows(&app);
+            assert!(
+                rows[0]
+                    .get("sandbox_store_generation")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    < 2,
+                "a root that still holds an orphan keeps its rows pending: {rows}"
+            );
+            assert!(app.join(JOURNAL).is_file(), "the root stays pending");
+
+            expose(None);
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+            assert_eq!(fs::read(destination.join("orphan")).unwrap(), b"orphan");
+            assert!(!destination.join("moved").exists());
+            assert!(!quarantine.exists());
+            assert!(!root.exists(), "the next pass retires the emptied root");
+            assert!(!app.join(JOURNAL).exists());
+            let mut retained = Vec::new();
+            let recovery = home.join(crate::migrations::v033_isolate_sandbox_content::RECOVERY);
+            for transaction in fs::read_dir(recovery).unwrap() {
+                for original in fs::read_dir(transaction.unwrap().path().join("original")).unwrap()
+                {
+                    retained.push(original.unwrap().file_name().to_string_lossy().into_owned());
+                }
+            }
+            assert!(
+                retained.iter().any(|entry| entry == "moved"),
+                "the displaced orphan store is retained whole: {retained:?}"
+            );
+        }
     }
 
     #[test]
     #[serial_test::serial]
-    fn retiring_a_root_retains_its_complete_original() {
-        let temp = tempfile::tempdir().unwrap();
-        let _environment = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let host = temp.path().join(".claude");
-        let root = host.join("sandbox");
-        fs::create_dir_all(root.join("one")).unwrap();
-        fs::create_dir_all(root.join("sessions")).unwrap();
-        fs::write(root.join("one/own"), b"own").unwrap();
-        fs::write(root.join("sessions/other"), b"other").unwrap();
-        fs::write(root.join("auth.json"), b"secret").unwrap();
-        std::os::unix::fs::symlink("/outside-do-not-follow", root.join("latest")).unwrap();
-        let super::super::v033_isolate_sandbox_content::Retained::Original(kept) =
-            super::super::v033_isolate_sandbox_content::retain_legacy_original(&root, &host)
-                .unwrap()
-        else {
-            panic!("the complete original is retained")
-        };
-        assert!(!root.exists());
-        assert_eq!(fs::read(kept.join("one/own")).unwrap(), b"own");
-        assert_eq!(fs::read(kept.join("sessions/other")).unwrap(), b"other");
-        assert_eq!(fs::read(kept.join("auth.json")).unwrap(), b"secret");
-        assert_eq!(
-            fs::read_link(kept.join("latest")).unwrap(),
-            Path::new("/outside-do-not-follow")
-        );
-        assert!(matches!(
-            super::super::v033_isolate_sandbox_content::retain_legacy_original(&root, &host)
-                .unwrap(),
-            super::super::v033_isolate_sandbox_content::Retained::Absent
-        ));
-    }
+    fn root_retirement_keeps_published_and_original_stores() {
+        // retiring a root retains its complete original
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let _environment = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let host = temp.path().join(".claude");
+            let root = host.join("sandbox");
+            fs::create_dir_all(root.join("one")).unwrap();
+            fs::create_dir_all(root.join("sessions")).unwrap();
+            fs::write(root.join("one/own"), b"own").unwrap();
+            fs::write(root.join("sessions/other"), b"other").unwrap();
+            fs::write(root.join("auth.json"), b"secret").unwrap();
+            std::os::unix::fs::symlink("/outside-do-not-follow", root.join("latest")).unwrap();
+            let super::super::v033_isolate_sandbox_content::Retained::Original(kept) =
+                super::super::v033_isolate_sandbox_content::retain_legacy_original(&root, &host)
+                    .unwrap()
+            else {
+                panic!("the complete original is retained")
+            };
+            assert!(!root.exists());
+            assert_eq!(fs::read(kept.join("one/own")).unwrap(), b"own");
+            assert_eq!(fs::read(kept.join("sessions/other")).unwrap(), b"other");
+            assert_eq!(fs::read(kept.join("auth.json")).unwrap(), b"secret");
+            assert_eq!(
+                fs::read_link(kept.join("latest")).unwrap(),
+                Path::new("/outside-do-not-follow")
+            );
+            assert!(matches!(
+                super::super::v033_isolate_sandbox_content::retain_legacy_original(&root, &host)
+                    .unwrap(),
+                super::super::v033_isolate_sandbox_content::Retained::Absent
+            ));
+        }
+        // Retiring a fully replicated root deletes it, so every later row that
+        // plans against it meets a root that is not there: a restored session, a
+        // second profile, a generation reset. That row must publish and commit.
+        // Failing instead would fail `aoe migrate`, and every command that runs
+        // migrations, from then on, with nothing able to clear it.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            fs::create_dir_all(&app).unwrap();
+            let root = home.join(".codex/sandbox");
+            fs::create_dir_all(root.join("codex-one")).unwrap();
+            fs::write(root.join("codex-one").join("own"), b"own").unwrap();
+            fs::write(root.join("auth.json"), b"secret").unwrap();
+            fs::write(
+                app.join("sessions.json"),
+                r#"[{"id":"codex-one","tool":"codex","sandbox_info":{"enabled":true}}]"#,
+            )
+            .unwrap();
 
-    /// Retiring a fully replicated root deletes it, so every later row that
-    /// plans against it meets a root that is not there: a restored session, a
-    /// second profile, a generation reset. That row must publish and commit.
-    /// Failing instead would fail `aoe migrate`, and every command that runs
-    /// migrations, from then on, with nothing able to clear it.
-    #[test]
-    #[serial_test::serial]
-    fn a_retired_root_does_not_fail_the_next_row() {
-        let (_temp, _app_guard, app, home) = isolated();
-        fs::create_dir_all(&app).unwrap();
-        let root = home.join(".codex/sandbox");
-        fs::create_dir_all(root.join("codex-one")).unwrap();
-        fs::write(root.join("codex-one").join("own"), b"own").unwrap();
-        fs::write(root.join("auth.json"), b"secret").unwrap();
-        fs::write(
-            app.join("sessions.json"),
-            r#"[{"id":"codex-one","tool":"codex","sandbox_info":{"enabled":true}}]"#,
-        )
-        .unwrap();
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+            assert!(!root.exists(), "nothing was left unreplicated, so it goes");
 
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-        assert!(!root.exists(), "nothing was left unreplicated, so it goes");
+            fs::write(
+                app.join("sessions.json"),
+                r#"[{"id":"codex-one","tool":"codex","sandbox_info":{"enabled":true},"sandbox_store_generation":2},
+                    {"id":"codex-two","tool":"codex","sandbox_info":{"enabled":true}}]"#,
+            )
+            .unwrap();
 
-        fs::write(
-            app.join("sessions.json"),
-            r#"[{"id":"codex-one","tool":"codex","sandbox_info":{"enabled":true},"sandbox_store_generation":2},
-                {"id":"codex-two","tool":"codex","sandbox_info":{"enabled":true}}]"#,
-        )
-        .unwrap();
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
 
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
+            let rows: Value = read_rows(&app);
+            assert_eq!(rows[1]["sandbox_store_generation"], 2);
+            assert!(home.join(".codex/sandbox-v2/codex-two").is_dir());
+        }
+        // Retirement runs before the generation commit, so a pass killed partway
+        // through it leaves the row pending and the shared root half emptied.
+        // Removing the per-instance stores first is what makes that safe: the
+        // row's source is gone, so the next pass keeps the store it published
+        // rather than re-copying a root that has lost the credential it needs.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            fs::create_dir_all(&app).unwrap();
+            let root = home.join(".codex/sandbox");
+            let destination = home.join(".codex/sandbox-v2/codex-one");
+            fs::create_dir_all(&root).unwrap();
+            fs::create_dir_all(&destination).unwrap();
+            // The store published, its per-instance source already removed, and
+            // the shared root still holding the files that reached it.
+            fs::write(destination.join("auth.json"), b"secret").unwrap();
+            fs::write(destination.join("own"), b"own").unwrap();
+            fs::write(root.join("auth.json"), b"secret").unwrap();
+            fs::write(
+                app.join("sessions.json"),
+                r#"[{"id":"codex-one","tool":"codex","sandbox_info":{"enabled":true}}]"#,
+            )
+            .unwrap();
 
-        let rows: Value = read_rows(&app);
-        assert_eq!(rows[1]["sandbox_store_generation"], 2);
-        assert!(home.join(".codex/sandbox-v2/codex-two").is_dir());
-    }
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
 
-    /// Retirement runs before the generation commit, so a pass killed partway
-    /// through it leaves the row pending and the shared root half emptied.
-    /// Removing the per-instance stores first is what makes that safe: the
-    /// row's source is gone, so the next pass keeps the store it published
-    /// rather than re-copying a root that has lost the credential it needs.
-    #[test]
-    #[serial_test::serial]
-    fn an_interrupted_retirement_keeps_the_published_store() {
-        let (_temp, _app_guard, app, home) = isolated();
-        fs::create_dir_all(&app).unwrap();
-        let root = home.join(".codex/sandbox");
-        let destination = home.join(".codex/sandbox-v2/codex-one");
-        fs::create_dir_all(&root).unwrap();
-        fs::create_dir_all(&destination).unwrap();
-        // The store published, its per-instance source already removed, and
-        // the shared root still holding the files that reached it.
-        fs::write(destination.join("auth.json"), b"secret").unwrap();
-        fs::write(destination.join("own"), b"own").unwrap();
-        fs::write(root.join("auth.json"), b"secret").unwrap();
-        fs::write(
-            app.join("sessions.json"),
-            r#"[{"id":"codex-one","tool":"codex","sandbox_info":{"enabled":true}}]"#,
-        )
-        .unwrap();
+            assert_eq!(fs::read(destination.join("auth.json")).unwrap(), b"secret");
+            assert_eq!(fs::read(destination.join("own")).unwrap(), b"own");
+            assert!(!root.exists());
+            let rows: Value = read_rows(&app);
+            assert_eq!(rows[0]["sandbox_store_generation"], 2);
+        }
+        // The shared root goes when everything in it was replicated, exactly as
+        // it did before the overlay stopped folding directories in.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let root = home.join(".codex/sandbox");
+            let peer = "1111111111111111";
+            fs::create_dir_all(root.join(peer)).unwrap();
+            fs::write(root.join(peer).join("peer"), b"peer").unwrap();
+            fs::write(root.join("common"), b"common").unwrap();
+            fs::write(
+                app.join("sessions.json"),
+                format!(r#"[{{"id":"{peer}","tool":"codex","sandbox_info":{{"enabled":true}}}}]"#),
+            )
+            .unwrap();
 
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
 
-        assert_eq!(fs::read(destination.join("auth.json")).unwrap(), b"secret");
-        assert_eq!(fs::read(destination.join("own")).unwrap(), b"own");
-        assert!(!root.exists());
-        let rows: Value = read_rows(&app);
-        assert_eq!(rows[0]["sandbox_store_generation"], 2);
-    }
+            assert_eq!(
+                fs::read(home.join(".codex/sandbox-v2").join(peer).join("common")).unwrap(),
+                b"common"
+            );
+            assert!(!root.exists());
+        }
+        // A killed `aoe migrate` leaves a half-written staging directory in the
+        // private layout. The pass that picks that store up again must clear it,
+        // including on the rename path, which never opens the staging directory
+        // it has to remove.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            let root = home.join(".codex/sandbox");
+            let peer = "1111111111111111";
+            let orphan = "2222222222222222";
+            let destination = home.join(".codex/sandbox-v2");
+            fs::create_dir_all(root.join(peer)).unwrap();
+            fs::create_dir_all(root.join(orphan)).unwrap();
+            fs::write(root.join(orphan).join("orphan"), b"orphan").unwrap();
+            let stage = destination.join(format!(".v027-stage-{orphan}"));
+            fs::create_dir_all(stage.join("half")).unwrap();
+            fs::write(stage.join("half").join("written"), b"partial").unwrap();
+            fs::create_dir_all(destination.join(orphan)).unwrap();
+            fs::write(destination.join(orphan).join("stale"), b"stale").unwrap();
+            fs::write(
+                app.join("sessions.json"),
+                format!(r#"[{{"id":"{peer}","tool":"codex","sandbox_info":{{"enabled":true}}}}]"#),
+            )
+            .unwrap();
 
-    /// The shared root goes when everything in it was replicated, exactly as
-    /// it did before the overlay stopped folding directories in.
-    #[test]
-    #[serial_test::serial]
-    fn a_fully_replicated_shared_root_is_still_retired() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let root = home.join(".codex/sandbox");
-        let peer = "1111111111111111";
-        fs::create_dir_all(root.join(peer)).unwrap();
-        fs::write(root.join(peer).join("peer"), b"peer").unwrap();
-        fs::write(root.join("common"), b"common").unwrap();
-        fs::write(
-            app.join("sessions.json"),
-            format!(r#"[{{"id":"{peer}","tool":"codex","sandbox_info":{{"enabled":true}}}}]"#),
-        )
-        .unwrap();
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
 
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-
-        assert_eq!(
-            fs::read(home.join(".codex/sandbox-v2").join(peer).join("common")).unwrap(),
-            b"common"
-        );
-        assert!(!root.exists());
-    }
-
-    /// A killed `aoe migrate` leaves a half-written staging directory in the
-    /// private layout. The pass that picks that store up again must clear it,
-    /// including on the rename path, which never opens the staging directory
-    /// it has to remove.
-    #[test]
-    #[serial_test::serial]
-    fn an_interrupted_stage_is_cleared_when_an_unregistered_store_moves() {
-        let (_temp, _app_guard, app, home) = isolated();
-        let root = home.join(".codex/sandbox");
-        let peer = "1111111111111111";
-        let orphan = "2222222222222222";
-        let destination = home.join(".codex/sandbox-v2");
-        fs::create_dir_all(root.join(peer)).unwrap();
-        fs::create_dir_all(root.join(orphan)).unwrap();
-        fs::write(root.join(orphan).join("orphan"), b"orphan").unwrap();
-        let stage = destination.join(format!(".v027-stage-{orphan}"));
-        fs::create_dir_all(stage.join("half")).unwrap();
-        fs::write(stage.join("half").join("written"), b"partial").unwrap();
-        fs::create_dir_all(destination.join(orphan)).unwrap();
-        fs::write(destination.join(orphan).join("stale"), b"stale").unwrap();
-        fs::write(
-            app.join("sessions.json"),
-            format!(r#"[{{"id":"{peer}","tool":"codex","sandbox_info":{{"enabled":true}}}}]"#),
-        )
-        .unwrap();
-
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-
-        assert!(!stage.exists(), "the interrupted staging tree must be gone");
-        assert!(!destination
-            .join(format!(".v027-quarantine-{orphan}"))
-            .exists());
-        assert_eq!(
-            fs::read(destination.join(orphan).join("orphan")).unwrap(),
-            b"orphan"
-        );
-        assert!(
-            !destination.join(orphan).join("stale").exists(),
-            "the interrupted run's destination must be replaced, not merged into"
-        );
+            assert!(!stage.exists(), "the interrupted staging tree must be gone");
+            assert!(!destination
+                .join(format!(".v027-quarantine-{orphan}"))
+                .exists());
+            assert_eq!(
+                fs::read(destination.join(orphan).join("orphan")).unwrap(),
+                b"orphan"
+            );
+            assert!(
+                !destination.join(orphan).join("stale").exists(),
+                "the interrupted run's destination must be replaced, not merged into"
+            );
+        }
     }
 
     /// A registry row shaped like a real `Instance`, so `Storage::update`
@@ -4166,81 +4207,307 @@ gemini = "{}"
         }
     }
 
-    /// The copy runs without the transition lock, so publication re-reads
-    /// the registries and asks about liveness again. Each guard, alone: a
-    /// row that lost its plan is not published, a root that gained a reader
-    /// is not retired, and a container that came up keeps its cohort
-    /// pending.
     #[test]
     #[serial_test::serial]
-    fn publication_revalidates_what_changed_during_the_copy() {
-        enum Case {
-            RowGone,
-            NewReader,
-            ContainerUp,
+    fn concurrent_copies_publish_once_and_revalidate() {
+        // The copy runs without the transition lock, so publication re-reads
+        // the registries and asks about liveness again. Each guard, alone: a
+        // row that lost its plan is not published, a root that gained a reader
+        // is not retired, and a container that came up keeps its cohort
+        // pending.
+        {
+            enum Case {
+                RowGone,
+                NewReader,
+                ContainerUp,
+            }
+            for case in [Case::RowGone, Case::NewReader, Case::ContainerUp] {
+                let temp = tempfile::tempdir().unwrap();
+                let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+                let app = crate::session::get_app_dir().unwrap();
+                let home = dirs::home_dir().unwrap();
+                fs::create_dir_all(&app).unwrap();
+                fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
+                fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+                fs::write(
+                    app.join("sessions.json"),
+                    format!("[{}]", row("1111111111111111")),
+                )
+                .unwrap();
+                let pass = paused_pass_with(&app, &home, matches!(case, Case::ContainerUp));
+                pass.paused
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("the pass reached its copy");
+                match case {
+                    Case::RowGone => fs::write(app.join("sessions.json"), b"[]").unwrap(),
+                    Case::NewReader => {
+                        // Appended beside the checkpointed row, as a writer
+                        // holding the registry lock would.
+                        let mut rows: Value =
+                            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap())
+                                .unwrap();
+                        rows.as_array_mut()
+                            .unwrap()
+                            .push(serde_json::from_str(&row("2222222222222222")).unwrap());
+                        fs::write(
+                            app.join("sessions.json"),
+                            serde_json::to_vec(&rows).unwrap(),
+                        )
+                        .unwrap();
+                    }
+                    Case::ContainerUp => {}
+                }
+                pass.finish().unwrap().unwrap();
+
+                let rows: Value = read_rows(&app);
+                assert!(
+                    home.join(".gemini/sandbox/history/id.json").is_file(),
+                    "the shared source must survive"
+                );
+                match case {
+                    Case::RowGone => {
+                        assert_eq!(rows.as_array().unwrap().len(), 0, "the deletion stands");
+                    }
+                    Case::NewReader => {
+                        assert_eq!(
+                            rows[0]["sandbox_store_generation"], 2,
+                            "the planned row publishes"
+                        );
+                        assert_ne!(rows[1]["sandbox_store_generation"], 2, "the newcomer waits");
+                    }
+                    Case::ContainerUp => {
+                        assert_eq!(
+                            rows[0]["sandbox_store_generation"], 1,
+                            "a live cohort stays pending"
+                        );
+                        assert!(app.join(JOURNAL).is_file());
+                    }
+                }
+            }
         }
-        for case in [Case::RowGone, Case::NewReader, Case::ContainerUp] {
-            let temp = tempfile::tempdir().unwrap();
-            let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
-            let app = crate::session::get_app_dir().unwrap();
-            let home = dirs::home_dir().unwrap();
+        // The copy runs without the transition and registry locks, so session
+        // and group writes in every profile go through while it is in flight,
+        // and the publish that follows lands on the registry as those writes
+        // left it rather than on the snapshot the plan was made from.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
+            fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
+            fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
+            let project = home.join("project");
+            fs::create_dir_all(&project).unwrap();
+            let alpha = app.join("profiles/alpha/sessions.json");
+            let beta = app.join("profiles/beta/sessions.json");
+            fs::create_dir_all(alpha.parent().unwrap()).unwrap();
+            fs::create_dir_all(beta.parent().unwrap()).unwrap();
+            fs::write(
+                &alpha,
+                serde_json::to_vec(&vec![instance_row(
+                    "1111111111111111",
+                    project.to_str().unwrap(),
+                )])
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(&beta, b"[]").unwrap();
+
+            std::thread::scope(|scope| {
+                let pass = paused_pass(&app, &home);
+                pass.paused
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("the pass reached its copy");
+
+                let writes = {
+                    let (alpha, beta) = (alpha.clone(), beta.clone());
+                    let project = project.clone();
+                    scope.spawn(move || {
+                        let write = |profile: &str, path: PathBuf, title: &str| {
+                            crate::session::Storage::new_for_test_path(profile, path).update(
+                                |instances, _| {
+                                    match instances.first_mut() {
+                                        Some(first) => first.title = title.to_string(),
+                                        None => instances.push(crate::session::Instance::new(
+                                            title,
+                                            project.to_str().unwrap(),
+                                        )),
+                                    }
+                                    Ok(())
+                                },
+                            )
+                        };
+                        (
+                            write("alpha", alpha, "renamed mid-copy"),
+                            write("beta", beta, "beta row"),
+                        )
+                    })
+                };
+                wait_finished(&writes, "storage writes during the copy");
+                let (alpha_write, beta_write) = writes.join().unwrap();
+                alpha_write.unwrap();
+                beta_write.unwrap();
+
+                pass.finish().unwrap().unwrap();
+            });
+
+            let alpha_rows: Value = serde_json::from_slice(&fs::read(&alpha).unwrap()).unwrap();
+            assert_eq!(alpha_rows[0]["title"], "renamed mid-copy");
+            assert_eq!(alpha_rows[0]["sandbox_store_generation"], 2);
+            assert!(alpha_rows[0]
+                .get("sandbox_store_transition_paths")
+                .is_none());
+            let beta_rows: Value = serde_json::from_slice(&fs::read(&beta).unwrap()).unwrap();
+            assert_eq!(beta_rows[0]["title"], "beta row");
+            assert_eq!(
+                fs::read(home.join(".gemini/sandbox-v2/1111111111111111/history/id.json")).unwrap(),
+                b"legacy"
+            );
+            assert!(!home.join(".gemini/sandbox").exists());
+            assert!(!app.join(JOURNAL).exists());
+        }
+        // Two passes over one cohort cannot both copy and publish it. A full pass
+        // that finds the root held elsewhere leaves it pending and copies
+        // nothing; a pass scoped to a member waits for the holder and then finds
+        // the row current, so the store is copied exactly once.
+        {
+            let (_temp, _app_guard, app, home) = isolated();
             fs::create_dir_all(&app).unwrap();
             fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
             fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
             fs::write(
                 app.join("sessions.json"),
-                format!("[{}]", row("1111111111111111")),
+                format!("[{},{}]", row("1111111111111111"), row("2222222222222222")),
             )
             .unwrap();
-            let pass = paused_pass_with(&app, &home, matches!(case, Case::ContainerUp));
-            pass.paused
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .expect("the pass reached its copy");
-            match case {
-                Case::RowGone => fs::write(app.join("sessions.json"), b"[]").unwrap(),
-                Case::NewReader => {
-                    // Appended beside the checkpointed row, as a writer
-                    // holding the registry lock would.
-                    let mut rows: Value =
-                        serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap())
-                            .unwrap();
-                    rows.as_array_mut()
-                        .unwrap()
-                        .push(serde_json::from_str(&row("2222222222222222")).unwrap());
-                    fs::write(
-                        app.join("sessions.json"),
-                        serde_json::to_vec(&rows).unwrap(),
-                    )
-                    .unwrap();
-                }
-                Case::ContainerUp => {}
-            }
-            pass.finish().unwrap().unwrap();
 
-            let rows: Value = read_rows(&app);
-            assert!(
-                home.join(".gemini/sandbox/history/id.json").is_file(),
-                "the shared source must survive"
+            // Planning canonicalizes the source before choosing its cohort lock.
+            // Resolve it before publication removes it, including symlinked temp
+            // ancestors such as macOS /var -> /private/var.
+            let cohort_root = fs::canonicalize(home.join(".gemini/sandbox")).unwrap();
+
+            std::thread::scope(|scope| {
+                let holder = paused_pass(&app, &home);
+                holder
+                    .paused
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("the holder reached its copy");
+
+                let copies = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+                let counting_pass = |only: Option<&'static str>| {
+                    let contended_tx = contended_tx.clone();
+                    let (app, home, copies) = (app.clone(), home.clone(), copies.clone());
+                    scope.spawn(move || {
+                        let _observer = only.map(|_| {
+                            crate::session::observe_lock_contention_for_test(contended_tx)
+                        });
+                        COPY_GATE.with(|gate| {
+                            *gate.borrow_mut() = Some(Box::new(move |_: &Path| {
+                                copies.fetch_add(1, Ordering::Relaxed);
+                            }));
+                        });
+                        super::run_in(
+                            &app,
+                            &home,
+                            &|_| Ok(false),
+                            &|_| Ok(true),
+                            false,
+                            true,
+                            only,
+                        )
+                    })
+                };
+
+                // A full pass gets its turn at the transition lock, sees the root is
+                // busy, and returns without copying while the holder is still paused.
+                let full = counting_pass(None);
+                wait_finished(&full, "a full pass beside a held cohort");
+                full.join().unwrap().unwrap();
+                assert_eq!(copies.load(Ordering::Relaxed), 0);
+                let rows: Value = read_rows(&app);
+                assert_eq!(rows[0]["sandbox_store_generation"], 1, "nothing published");
+
+                // A scoped pass waits for the holder instead of copying beside it.
+                let scoped = counting_pass(Some("1111111111111111"));
+                let contention = contended_rx.recv_timeout(std::time::Duration::from_secs(10));
+                let finished_while_held = scoped.is_finished();
+                let copies_while_held = copies.load(Ordering::Relaxed);
+                let holder_result = holder.finish();
+                wait_finished(&scoped, "the scoped pass after the holder finished");
+                let scoped_result = scoped.join();
+                holder_result.unwrap().unwrap();
+                scoped_result.unwrap().unwrap();
+                assert_eq!(
+                    contention.expect("scoped pass must reach the held cohort lock"),
+                    app.join(cohort_lock_name(&cohort_root))
+                );
+                assert!(
+                    !finished_while_held,
+                    "a scoped pass must wait for the holder"
+                );
+                assert_eq!(copies_while_held, 0);
+                assert_eq!(
+                    copies.load(Ordering::Relaxed),
+                    0,
+                    "the holder's copy was the only one"
+                );
+
+                let rows: Value = read_rows(&app);
+                assert_eq!(rows[0]["sandbox_store_generation"], 2);
+                assert_eq!(rows[1]["sandbox_store_generation"], 2);
+                for id in ["1111111111111111", "2222222222222222"] {
+                    assert_eq!(
+                        fs::read(
+                            home.join(".gemini/sandbox-v2")
+                                .join(id)
+                                .join("history/id.json")
+                        )
+                        .unwrap(),
+                        b"legacy"
+                    );
+                }
+                assert!(!home.join(".gemini/sandbox").exists());
+                assert!(!app.join(JOURNAL).exists());
+            });
+        }
+        // storage update preserves a checkpointed plan
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let app = crate::session::get_app_dir().unwrap();
+            let source = temp.path().join("source");
+            let destination = temp.path().join("destination");
+            let mut value =
+                serde_json::to_value(crate::session::Instance::new("one", "/tmp")).unwrap();
+            value["sandbox_store_generation"] = 1.into();
+            value["sandbox_store_transition_paths"] = serde_json::json!([{
+                "source": source,
+                "destination": destination,
+            }]);
+            fs::write(
+                app.join("sessions.json"),
+                serde_json::to_vec(&vec![value]).unwrap(),
+            )
+            .unwrap();
+            let storage = crate::session::Storage::new_for_test_path(
+                "v027-plan-roundtrip",
+                app.join("sessions.json"),
             );
-            match case {
-                Case::RowGone => {
-                    assert_eq!(rows.as_array().unwrap().len(), 0, "the deletion stands");
-                }
-                Case::NewReader => {
-                    assert_eq!(
-                        rows[0]["sandbox_store_generation"], 2,
-                        "the planned row publishes"
-                    );
-                    assert_ne!(rows[1]["sandbox_store_generation"], 2, "the newcomer waits");
-                }
-                Case::ContainerUp => {
-                    assert_eq!(
-                        rows[0]["sandbox_store_generation"], 1,
-                        "a live cohort stays pending"
-                    );
-                    assert!(app.join(JOURNAL).is_file());
-                }
-            }
+
+            storage
+                .update(|instances, _| {
+                    instances[0].title = "updated".to_string();
+                    Ok(())
+                })
+                .unwrap();
+
+            let written: Value = read_rows(&app);
+            assert_eq!(
+                written[0]["sandbox_store_transition_paths"][0]["source"],
+                serde_json::json!(source)
+            );
+            assert_eq!(
+                written[0]["sandbox_store_transition_paths"][0]["destination"],
+                serde_json::json!(destination)
+            );
         }
     }
 
@@ -4255,444 +4522,115 @@ gemini = "{}"
         }
     }
 
-    /// The copy runs without the transition and registry locks, so session
-    /// and group writes in every profile go through while it is in flight,
-    /// and the publish that follows lands on the registry as those writes
-    /// left it rather than on the snapshot the plan was made from.
     #[test]
     #[serial_test::serial]
-    fn registries_stay_writable_while_a_store_copies() {
-        let (_temp, _app_guard, app, home) = isolated();
-        fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
-        fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
-        let project = home.join("project");
-        fs::create_dir_all(&project).unwrap();
-        let alpha = app.join("profiles/alpha/sessions.json");
-        let beta = app.join("profiles/beta/sessions.json");
-        fs::create_dir_all(alpha.parent().unwrap()).unwrap();
-        fs::create_dir_all(beta.parent().unwrap()).unwrap();
-        fs::write(
-            &alpha,
-            serde_json::to_vec(&vec![instance_row(
-                "1111111111111111",
-                project.to_str().unwrap(),
-            )])
-            .unwrap(),
-        )
-        .unwrap();
-        fs::write(&beta, b"[]").unwrap();
+    fn relocation_preserves_metadata_and_refuses_symlink_escape() {
+        // preserves symlink mtimes
+        #[cfg(unix)]
+        {
+            use nix::sys::stat::{utimensat, UtimensatFlags};
+            use nix::sys::time::TimeSpec;
+            use std::os::unix::fs::{symlink, MetadataExt};
 
-        std::thread::scope(|scope| {
-            let pass = paused_pass(&app, &home);
-            pass.paused
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .expect("the pass reached its copy");
-
-            let writes = {
-                let (alpha, beta) = (alpha.clone(), beta.clone());
-                let project = project.clone();
-                scope.spawn(move || {
-                    let write = |profile: &str, path: PathBuf, title: &str| {
-                        crate::session::Storage::new_for_test_path(profile, path).update(
-                            |instances, _| {
-                                match instances.first_mut() {
-                                    Some(first) => first.title = title.to_string(),
-                                    None => instances.push(crate::session::Instance::new(
-                                        title,
-                                        project.to_str().unwrap(),
-                                    )),
-                                }
-                                Ok(())
-                            },
-                        )
-                    };
-                    (
-                        write("alpha", alpha, "renamed mid-copy"),
-                        write("beta", beta, "beta row"),
-                    )
-                })
-            };
-            wait_finished(&writes, "storage writes during the copy");
-            let (alpha_write, beta_write) = writes.join().unwrap();
-            alpha_write.unwrap();
-            beta_write.unwrap();
-
-            pass.finish().unwrap().unwrap();
-        });
-
-        let alpha_rows: Value = serde_json::from_slice(&fs::read(&alpha).unwrap()).unwrap();
-        assert_eq!(alpha_rows[0]["title"], "renamed mid-copy");
-        assert_eq!(alpha_rows[0]["sandbox_store_generation"], 2);
-        assert!(alpha_rows[0]
-            .get("sandbox_store_transition_paths")
-            .is_none());
-        let beta_rows: Value = serde_json::from_slice(&fs::read(&beta).unwrap()).unwrap();
-        assert_eq!(beta_rows[0]["title"], "beta row");
-        assert_eq!(
-            fs::read(home.join(".gemini/sandbox-v2/1111111111111111/history/id.json")).unwrap(),
-            b"legacy"
-        );
-        assert!(!home.join(".gemini/sandbox").exists());
-        assert!(!app.join(JOURNAL).exists());
-    }
-
-    /// Two passes over one cohort cannot both copy and publish it. A full pass
-    /// that finds the root held elsewhere leaves it pending and copies
-    /// nothing; a pass scoped to a member waits for the holder and then finds
-    /// the row current, so the store is copied exactly once.
-    #[test]
-    #[serial_test::serial]
-    fn competing_passes_on_one_cohort_publish_once() {
-        let (_temp, _app_guard, app, home) = isolated();
-        fs::create_dir_all(&app).unwrap();
-        fs::create_dir_all(home.join(".gemini/sandbox/history")).unwrap();
-        fs::write(home.join(".gemini/sandbox/history/id.json"), b"legacy").unwrap();
-        fs::write(
-            app.join("sessions.json"),
-            format!("[{},{}]", row("1111111111111111"), row("2222222222222222")),
-        )
-        .unwrap();
-
-        // Planning canonicalizes the source before choosing its cohort lock.
-        // Resolve it before publication removes it, including symlinked temp
-        // ancestors such as macOS /var -> /private/var.
-        let cohort_root = fs::canonicalize(home.join(".gemini/sandbox")).unwrap();
-
-        std::thread::scope(|scope| {
-            let holder = paused_pass(&app, &home);
-            holder
-                .paused
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .expect("the holder reached its copy");
-
-            let copies = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let (contended_tx, contended_rx) = std::sync::mpsc::channel();
-            let counting_pass = |only: Option<&'static str>| {
-                let contended_tx = contended_tx.clone();
-                let (app, home, copies) = (app.clone(), home.clone(), copies.clone());
-                scope.spawn(move || {
-                    let _observer = only
-                        .map(|_| crate::session::observe_lock_contention_for_test(contended_tx));
-                    COPY_GATE.with(|gate| {
-                        *gate.borrow_mut() = Some(Box::new(move |_: &Path| {
-                            copies.fetch_add(1, Ordering::Relaxed);
-                        }));
-                    });
-                    super::run_in(
-                        &app,
-                        &home,
-                        &|_| Ok(false),
-                        &|_| Ok(true),
-                        false,
-                        true,
-                        only,
-                    )
-                })
-            };
-
-            // A full pass gets its turn at the transition lock, sees the root is
-            // busy, and returns without copying while the holder is still paused.
-            let full = counting_pass(None);
-            wait_finished(&full, "a full pass beside a held cohort");
-            full.join().unwrap().unwrap();
-            assert_eq!(copies.load(Ordering::Relaxed), 0);
-            let rows: Value = read_rows(&app);
-            assert_eq!(rows[0]["sandbox_store_generation"], 1, "nothing published");
-
-            // A scoped pass waits for the holder instead of copying beside it.
-            let scoped = counting_pass(Some("1111111111111111"));
-            let contention = contended_rx.recv_timeout(std::time::Duration::from_secs(10));
-            let finished_while_held = scoped.is_finished();
-            let copies_while_held = copies.load(Ordering::Relaxed);
-            let holder_result = holder.finish();
-            wait_finished(&scoped, "the scoped pass after the holder finished");
-            let scoped_result = scoped.join();
-            holder_result.unwrap().unwrap();
-            scoped_result.unwrap().unwrap();
-            assert_eq!(
-                contention.expect("scoped pass must reach the held cohort lock"),
-                app.join(cohort_lock_name(&cohort_root))
-            );
-            assert!(
-                !finished_while_held,
-                "a scoped pass must wait for the holder"
-            );
-            assert_eq!(copies_while_held, 0);
-            assert_eq!(
-                copies.load(Ordering::Relaxed),
-                0,
-                "the holder's copy was the only one"
-            );
-
-            let rows: Value = read_rows(&app);
-            assert_eq!(rows[0]["sandbox_store_generation"], 2);
-            assert_eq!(rows[1]["sandbox_store_generation"], 2);
-            for id in ["1111111111111111", "2222222222222222"] {
-                assert_eq!(
-                    fs::read(
-                        home.join(".gemini/sandbox-v2")
-                            .join(id)
-                            .join("history/id.json")
-                    )
-                    .unwrap(),
-                    b"legacy"
-                );
-            }
-            assert!(!home.join(".gemini/sandbox").exists());
-            assert!(!app.join(JOURNAL).exists());
-        });
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn storage_update_preserves_a_checkpointed_plan() {
-        let temp = tempfile::tempdir().unwrap();
-        let _app_guard = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let app = crate::session::get_app_dir().unwrap();
-        let source = temp.path().join("source");
-        let destination = temp.path().join("destination");
-        let mut value = serde_json::to_value(crate::session::Instance::new("one", "/tmp")).unwrap();
-        value["sandbox_store_generation"] = 1.into();
-        value["sandbox_store_transition_paths"] = serde_json::json!([{
-            "source": source,
-            "destination": destination,
-        }]);
-        fs::write(
-            app.join("sessions.json"),
-            serde_json::to_vec(&vec![value]).unwrap(),
-        )
-        .unwrap();
-        let storage = crate::session::Storage::new_for_test_path(
-            "v027-plan-roundtrip",
-            app.join("sessions.json"),
-        );
-
-        storage
-            .update(|instances, _| {
-                instances[0].title = "updated".to_string();
-                Ok(())
-            })
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let destination = temp.path().join("v2/one");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("target"), b"target").unwrap();
+            let link = source.join("link");
+            symlink("target", &link).unwrap();
+            let atime = TimeSpec::new(1_600_000_000, 123_000_000);
+            let mtime = TimeSpec::new(1_600_000_001, 456_000_000);
+            let source_dir = fs::File::open(&source).unwrap();
+            utimensat(
+                &source_dir,
+                "link",
+                &atime,
+                &mtime,
+                UtimensatFlags::NoFollowSymlink,
+            )
             .unwrap();
 
-        let written: Value = read_rows(&app);
-        assert_eq!(
-            written[0]["sandbox_store_transition_paths"][0]["source"],
-            serde_json::json!(source)
-        );
-        assert_eq!(
-            written[0]["sandbox_store_transition_paths"][0]["destination"],
-            serde_json::json!(destination)
-        );
-    }
+            assert!(publish_store(&source, &destination, &BTreeSet::new(), None, false).unwrap());
 
-    #[test]
-    #[cfg(unix)]
-    #[serial_test::serial]
-    fn preserves_symlink_mtimes() {
-        use nix::sys::stat::{utimensat, UtimensatFlags};
-        use nix::sys::time::TimeSpec;
-        use std::os::unix::fs::{symlink, MetadataExt};
-
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let destination = temp.path().join("v2/one");
-        fs::create_dir(&source).unwrap();
-        fs::write(source.join("target"), b"target").unwrap();
-        let link = source.join("link");
-        symlink("target", &link).unwrap();
-        let atime = TimeSpec::new(1_600_000_000, 123_000_000);
-        let mtime = TimeSpec::new(1_600_000_001, 456_000_000);
-        let source_dir = fs::File::open(&source).unwrap();
-        utimensat(
-            &source_dir,
-            "link",
-            &atime,
-            &mtime,
-            UtimensatFlags::NoFollowSymlink,
-        )
-        .unwrap();
-
-        assert!(publish_store(&source, &destination, &BTreeSet::new(), None, false).unwrap());
-
-        let copied = fs::symlink_metadata(destination.join("link")).unwrap();
-        assert_eq!(
-            (copied.atime(), copied.atime_nsec()),
-            (atime.tv_sec(), atime.tv_nsec())
-        );
-        assert_eq!(
-            (copied.mtime(), copied.mtime_nsec()),
-            (mtime.tv_sec(), mtime.tv_nsec())
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    #[serial_test::serial]
-    fn preserves_root_and_read_only_directory_modes() {
-        use std::os::unix::fs::PermissionsExt;
-        let (_temp, _app_guard, app, home) = isolated();
-        let source = home.join(".gemini/sandbox");
-        fs::create_dir_all(source.join("readonly")).unwrap();
-        fs::write(source.join("readonly/data"), b"data").unwrap();
-        fs::set_permissions(source.join("readonly"), fs::Permissions::from_mode(0o555)).unwrap();
-        fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
-
-        run_in(&app, &home, &|_| Ok(false)).unwrap();
-
-        let destination = home.join(".gemini/sandbox-v2/one");
-        assert_eq!(
-            fs::read(destination.join("readonly/data")).unwrap(),
-            b"data"
-        );
-        assert_eq!(
-            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(
-            fs::metadata(destination.join("readonly"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o555
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    #[serial_test::serial]
-    fn skips_escaping_source_symlinks_and_refuses_destination_symlink() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let outside = temp.path().join("outside");
-        let destination = temp.path().join("v2/one");
-        fs::create_dir(&source).unwrap();
-        fs::create_dir(&outside).unwrap();
-        fs::write(outside.join("secret"), b"secret").unwrap();
-        fs::write(source.join("credential"), b"credential").unwrap();
-        fs::set_permissions(source.join("credential"), fs::Permissions::from_mode(0o600)).unwrap();
-        symlink(outside.join("secret"), source.join("escape")).unwrap();
-        symlink("credential", source.join("credential-link")).unwrap();
-        assert!(publish_store(&source, &destination, &BTreeSet::new(), None, false).unwrap());
-        assert!(!destination.join("escape").exists());
-        assert_eq!(
-            fs::read(destination.join("credential-link")).unwrap(),
-            b"credential"
-        );
-        assert_eq!(
-            fs::metadata(destination.join("credential"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-
-        remove_tree_no_links(&destination).unwrap();
-        symlink(&outside, &destination).unwrap();
-        assert!(publish_store(&source, &destination, &BTreeSet::new(), None, false).is_err());
-        assert_eq!(fs::read(outside.join("secret")).unwrap(), b"secret");
-    }
-
-    /// Move A is parked inside its first progress callback while move B runs
-    /// start to finish, so A's remaining files must be counted from where A
-    /// left off. A shared counter reported B's reset and larger files to A.
-    #[test]
-    #[cfg(unix)]
-    fn concurrent_moves_report_only_their_own_totals() {
-        use std::sync::{mpsc, Arc, Mutex};
-
-        // Distinct file sizes so a leaked byte total is visible, and counts
-        // that make the two moves' 100-file report boundaries interleave.
-        const A_FILES: usize = 200;
-        const A_SIZE: usize = 10;
-        const B_FILES: usize = 150;
-        const B_SIZE: usize = 1000;
-
-        fn seed(root: &Path, files: usize, size: usize) {
-            fs::create_dir_all(root).unwrap();
-            for index in 0..files {
-                fs::write(root.join(format!("f{index}")), vec![b'x'; size]).unwrap();
-            }
+            let copied = fs::symlink_metadata(destination.join("link")).unwrap();
+            assert_eq!(
+                (copied.atime(), copied.atime_nsec()),
+                (atime.tv_sec(), atime.tv_nsec())
+            );
+            assert_eq!(
+                (copied.mtime(), copied.mtime_nsec()),
+                (mtime.tv_sec(), mtime.tv_nsec())
+            );
         }
-
-        fn collecting_reporter(seen: &Arc<Mutex<Vec<String>>>) -> progress::Reporter {
-            let seen = Arc::clone(seen);
-            Arc::new(move |event| {
-                if let progress::Event::Progress(message) = event {
-                    seen.lock().unwrap().push(message);
-                }
-            })
-        }
-
-        let temp = tempfile::tempdir().unwrap();
-        seed(&temp.path().join("a/source"), A_FILES, A_SIZE);
-        seed(&temp.path().join("b/source"), B_FILES, B_SIZE);
-
-        let (parked_tx, parked_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel::<()>();
-        let a_seen = Arc::new(Mutex::new(Vec::new()));
-
-        let mover_a = {
-            let root = temp.path().to_path_buf();
-            let a_seen = Arc::clone(&a_seen);
-            std::thread::spawn(move || {
-                let collect = collecting_reporter(&a_seen);
-                // Park inside the first report only, so move B's whole copy
-                // lands between A's 100th and 101st file.
-                let gate = Mutex::new(Some((parked_tx, resume_rx)));
-                let reporter: progress::Reporter = Arc::new(move |event| {
-                    collect(event);
-                    if let Some((parked_tx, resume_rx)) = gate.lock().unwrap().take() {
-                        parked_tx.send(()).unwrap();
-                        resume_rx.recv().unwrap();
-                    }
-                });
-                let _guard = progress::install(Some(reporter));
-                assert!(publish_store(
-                    &root.join("a/source"),
-                    &root.join("a/private/one"),
-                    &BTreeSet::new(),
-                    None,
-                    false,
-                )
-                .unwrap());
-            })
-        };
-
-        parked_rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("move A parked inside its first report");
-        let b_seen = Arc::new(Mutex::new(Vec::new()));
+        // preserves root and read only directory modes
+        #[cfg(unix)]
         {
-            let _guard = progress::install(Some(collecting_reporter(&b_seen)));
-            assert!(publish_store(
-                &temp.path().join("b/source"),
-                &temp.path().join("b/private/two"),
-                &BTreeSet::new(),
-                None,
-                false,
-            )
-            .unwrap());
-        }
-        resume_tx.send(()).unwrap();
-        mover_a.join().unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let (_temp, _app_guard, app, home) = isolated();
+            let source = home.join(".gemini/sandbox");
+            fs::create_dir_all(source.join("readonly")).unwrap();
+            fs::write(source.join("readonly/data"), b"data").unwrap();
+            fs::set_permissions(source.join("readonly"), fs::Permissions::from_mode(0o555))
+                .unwrap();
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(app.join("sessions.json"), format!("[{}]", row("one"))).unwrap();
 
-        assert_eq!(
-            *a_seen.lock().unwrap(),
-            vec![
-                format!("100 files, {}", progress::format_bytes(100 * A_SIZE as u64)),
-                format!("200 files, {}", progress::format_bytes(200 * A_SIZE as u64)),
-            ]
-        );
-        assert_eq!(
-            *b_seen.lock().unwrap(),
-            vec![format!(
-                "100 files, {}",
-                progress::format_bytes(100 * B_SIZE as u64)
-            )]
-        );
+            run_in(&app, &home, &|_| Ok(false)).unwrap();
+
+            let destination = home.join(".gemini/sandbox-v2/one");
+            assert_eq!(
+                fs::read(destination.join("readonly/data")).unwrap(),
+                b"data"
+            );
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(destination.join("readonly"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o555
+            );
+        }
+        // skips escaping source symlinks and refuses destination symlink
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let outside = temp.path().join("outside");
+            let destination = temp.path().join("v2/one");
+            fs::create_dir(&source).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("secret"), b"secret").unwrap();
+            fs::write(source.join("credential"), b"credential").unwrap();
+            fs::set_permissions(source.join("credential"), fs::Permissions::from_mode(0o600))
+                .unwrap();
+            symlink(outside.join("secret"), source.join("escape")).unwrap();
+            symlink("credential", source.join("credential-link")).unwrap();
+            assert!(publish_store(&source, &destination, &BTreeSet::new(), None, false).unwrap());
+            assert!(!destination.join("escape").exists());
+            assert_eq!(
+                fs::read(destination.join("credential-link")).unwrap(),
+                b"credential"
+            );
+            assert_eq!(
+                fs::metadata(destination.join("credential"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+
+            remove_tree_no_links(&destination).unwrap();
+            symlink(&outside, &destination).unwrap();
+            assert!(publish_store(&source, &destination, &BTreeSet::new(), None, false).is_err());
+            assert_eq!(fs::read(outside.join("secret")).unwrap(), b"secret");
+        }
     }
 }

@@ -528,217 +528,208 @@ mod tests {
 
     #[test]
     #[serial_test::serial(shell_env)]
-    fn rewrites_pre_v017_claude_settings_to_per_user_base() {
-        let _env = unset_agent_home_env();
-        let (_tmp, home, app_dir) = setup_dirs();
-        let claude = home.join(".claude").join("settings.json");
-        write_json(&claude, &pre_v017_claude_settings());
+    fn rewrite_hook_strings_for_per_user_base_cases() {
+        // rewrites pre v017 claude settings to per user base
+        {
+            let _env = unset_agent_home_env();
+            let (_tmp, home, app_dir) = setup_dirs();
+            let claude = home.join(".claude").join("settings.json");
+            write_json(&claude, &pre_v017_claude_settings());
 
-        run_in(&home, &app_dir).unwrap();
+            run_in(&home, &app_dir).unwrap();
 
-        assert_post_v017_canonical(&claude);
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn skips_files_without_aoe_marker() {
-        let _env = unset_agent_home_env();
-        let (_tmp, home, app_dir) = setup_dirs();
-        let claude = home.join(".claude").join("settings.json");
-        let user_settings = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "hooks": [{ "type": "command", "command": "echo user-only" }]
-                }]
-            }
-        });
-        write_json(&claude, &user_settings);
-
-        run_in(&home, &app_dir).unwrap();
-
-        let parsed: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
-        assert_eq!(
-            parsed["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-                .as_str()
-                .unwrap(),
-            "echo user-only",
-            "non-AoE file must be byte-untouched"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn idempotent_byte_identical_on_second_run() {
-        let _env = unset_agent_home_env();
-        let (_tmp, home, app_dir) = setup_dirs();
-        let claude = home.join(".claude").join("settings.json");
-        write_json(&claude, &pre_v017_claude_settings());
-
-        run_in(&home, &app_dir).unwrap();
-        let after_first = fs::read_to_string(&claude).unwrap();
-        run_in(&home, &app_dir).unwrap();
-        let after_second = fs::read_to_string(&claude).unwrap();
-
-        assert_eq!(after_first, after_second, "v017 must be byte-idempotent");
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn rewrite_failure_keeps_legacy_dir_intact_for_manual_recovery() {
-        use std::os::unix::fs::PermissionsExt;
-        let _env = unset_agent_home_env();
-        let (_tmp, home, app_dir) = setup_dirs();
-
-        let claude = home.join(".claude").join("settings.json");
-        write_json(&claude, &pre_v017_claude_settings());
-
-        let legacy = _tmp.path().join("legacy-aoe-hooks");
-        fs::create_dir(&legacy).unwrap();
-        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
-        let preserved_inst = legacy.join("inst-must-survive");
-        fs::create_dir(&preserved_inst).unwrap();
-        fs::write(preserved_inst.join("status"), b"running").unwrap();
-
-        super::override_legacy_for_test(legacy.clone());
-        super::force_rewrite_failure_for_test("claude");
-        let result = run_in(&home, &app_dir);
-        super::clear_rewrite_failure_for_test();
-        super::clear_legacy_override_for_test();
-        result.unwrap();
-
-        assert!(
-            legacy.exists(),
-            "legacy directory must remain when any rewrite failed"
-        );
-        assert!(
-            preserved_inst.exists(),
-            "owned legacy entries must remain so the operator can recover them"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn legacy_sweep_full_success_removes_owned_dir() {
-        use std::os::unix::fs::PermissionsExt;
-        let _env = unset_agent_home_env();
-        let (_tmp, home, app_dir) = setup_dirs();
-
-        let claude = home.join(".claude").join("settings.json");
-        write_json(&claude, &pre_v017_claude_settings());
-
-        let legacy = _tmp.path().join("legacy-aoe-hooks-clean");
-        fs::create_dir(&legacy).unwrap();
-        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
-        let inst_dir = legacy.join("inst-to-sweep");
-        fs::create_dir(&inst_dir).unwrap();
-        fs::write(inst_dir.join("status"), b"idle").unwrap();
-        fs::write(inst_dir.join("session_id"), b"deadbeef").unwrap();
-
-        super::override_legacy_for_test(legacy.clone());
-        let result = run_in(&home, &app_dir);
-        super::clear_legacy_override_for_test();
-        result.unwrap();
-
-        assert!(
-            !legacy.exists(),
-            "owned legacy directory must be swept on full rewrite success"
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn privdrop_v017_sweep_leaves_alien_uid_entry_intact() {
-        use crate::hooks::test_support::{make_alien_owned, privdrop_test_enabled};
-        use std::os::unix::fs::PermissionsExt;
-
-        if !privdrop_test_enabled() {
-            return;
+            assert_post_v017_canonical(&claude);
         }
-        let tmp = TempDir::new().unwrap();
-        let legacy = tmp.path().join("legacy-aoe-hooks-mixed");
-        fs::create_dir(&legacy).unwrap();
-        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
-
-        let owned = legacy.join("owned-instance");
-        fs::create_dir(&owned).unwrap();
-        fs::write(owned.join("status"), b"idle").unwrap();
-
-        let alien = legacy.join("alien-instance");
-        fs::create_dir(&alien).unwrap();
-        fs::write(alien.join("status"), b"running").unwrap();
-        make_alien_owned(&alien);
-
-        super::sweep_legacy_base_in(&legacy);
-
-        assert!(!owned.exists(), "owned legacy entry must be removed");
-        assert!(
-            alien.join("status").exists(),
-            "alien-owned legacy entry and its contents must survive"
-        );
-        assert!(
-            legacy.exists(),
-            "legacy parent must remain while an alien-owned entry exists"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn legacy_sweep_handles_symlink_at_legacy_path() {
-        use std::os::unix::fs::PermissionsExt;
-        let _env = unset_agent_home_env();
-        let (_tmp, home, app_dir) = setup_dirs();
-
-        let canary = _tmp.path().join("canary");
-        fs::create_dir(&canary).unwrap();
-        fs::write(canary.join("file"), b"do not delete").unwrap();
-
-        let legacy_link = _tmp.path().join("legacy-aoe-hooks-link");
-        std::os::unix::fs::symlink(&canary, &legacy_link).unwrap();
-
-        let claude = home.join(".claude").join("settings.json");
-        write_json(&claude, &pre_v017_claude_settings());
-        fs::set_permissions(_tmp.path().join("home"), fs::Permissions::from_mode(0o755)).ok();
-
-        super::override_legacy_for_test(legacy_link.clone());
-        let result = run_in(&home, &app_dir);
-        super::clear_legacy_override_for_test();
-        result.unwrap();
-
-        assert!(
-            canary.join("file").exists(),
-            "symlink target must be untouched"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn sandbox_baked_hooks_under_aoe_sandbox_subpath_are_untouched() {
-        let _env = unset_agent_home_env();
-        let (_tmp, home, app_dir) = setup_dirs();
-
-        let claude = home.join(".claude").join("settings.json");
-        write_json(&claude, &pre_v017_claude_settings());
-
-        let sandbox_settings = home.join(".claude").join("sandbox").join("settings.json");
-        let sandbox_baked = serde_json::json!({
-            "hooks": {
-                "PreToolUse": [{
-                    "hooks": [{
-                        "type": "command",
-                        "command": PRE_V017_STATUS_CMD
+        // skips files without aoe marker
+        {
+            let _env = unset_agent_home_env();
+            let (_tmp, home, app_dir) = setup_dirs();
+            let claude = home.join(".claude").join("settings.json");
+            let user_settings = serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "hooks": [{ "type": "command", "command": "echo user-only" }]
                     }]
-                }]
+                }
+            });
+            write_json(&claude, &user_settings);
+
+            run_in(&home, &app_dir).unwrap();
+
+            let parsed: Value =
+                serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
+            assert_eq!(
+                parsed["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap(),
+                "echo user-only",
+                "non-AoE file must be byte-untouched"
+            );
+        }
+        // idempotent byte identical on second run
+        {
+            let _env = unset_agent_home_env();
+            let (_tmp, home, app_dir) = setup_dirs();
+            let claude = home.join(".claude").join("settings.json");
+            write_json(&claude, &pre_v017_claude_settings());
+
+            run_in(&home, &app_dir).unwrap();
+            let after_first = fs::read_to_string(&claude).unwrap();
+            run_in(&home, &app_dir).unwrap();
+            let after_second = fs::read_to_string(&claude).unwrap();
+
+            assert_eq!(after_first, after_second, "v017 must be byte-idempotent");
+        }
+        // rewrite failure keeps legacy dir intact for manual recovery
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _env = unset_agent_home_env();
+            let (_tmp, home, app_dir) = setup_dirs();
+
+            let claude = home.join(".claude").join("settings.json");
+            write_json(&claude, &pre_v017_claude_settings());
+
+            let legacy = _tmp.path().join("legacy-aoe-hooks");
+            fs::create_dir(&legacy).unwrap();
+            fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
+            let preserved_inst = legacy.join("inst-must-survive");
+            fs::create_dir(&preserved_inst).unwrap();
+            fs::write(preserved_inst.join("status"), b"running").unwrap();
+
+            super::override_legacy_for_test(legacy.clone());
+            super::force_rewrite_failure_for_test("claude");
+            let result = run_in(&home, &app_dir);
+            super::clear_rewrite_failure_for_test();
+            super::clear_legacy_override_for_test();
+            result.unwrap();
+
+            assert!(
+                legacy.exists(),
+                "legacy directory must remain when any rewrite failed"
+            );
+            assert!(
+                preserved_inst.exists(),
+                "owned legacy entries must remain so the operator can recover them"
+            );
+        }
+        // legacy sweep full success removes owned dir
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _env = unset_agent_home_env();
+            let (_tmp, home, app_dir) = setup_dirs();
+
+            let claude = home.join(".claude").join("settings.json");
+            write_json(&claude, &pre_v017_claude_settings());
+
+            let legacy = _tmp.path().join("legacy-aoe-hooks-clean");
+            fs::create_dir(&legacy).unwrap();
+            fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
+            let inst_dir = legacy.join("inst-to-sweep");
+            fs::create_dir(&inst_dir).unwrap();
+            fs::write(inst_dir.join("status"), b"idle").unwrap();
+            fs::write(inst_dir.join("session_id"), b"deadbeef").unwrap();
+
+            super::override_legacy_for_test(legacy.clone());
+            let result = run_in(&home, &app_dir);
+            super::clear_legacy_override_for_test();
+            result.unwrap();
+
+            assert!(
+                !legacy.exists(),
+                "owned legacy directory must be swept on full rewrite success"
+            );
+        }
+        // legacy sweep handles symlink at legacy path
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _env = unset_agent_home_env();
+            let (_tmp, home, app_dir) = setup_dirs();
+
+            let canary = _tmp.path().join("canary");
+            fs::create_dir(&canary).unwrap();
+            fs::write(canary.join("file"), b"do not delete").unwrap();
+
+            let legacy_link = _tmp.path().join("legacy-aoe-hooks-link");
+            std::os::unix::fs::symlink(&canary, &legacy_link).unwrap();
+
+            let claude = home.join(".claude").join("settings.json");
+            write_json(&claude, &pre_v017_claude_settings());
+            fs::set_permissions(_tmp.path().join("home"), fs::Permissions::from_mode(0o755)).ok();
+
+            super::override_legacy_for_test(legacy_link.clone());
+            let result = run_in(&home, &app_dir);
+            super::clear_legacy_override_for_test();
+            result.unwrap();
+
+            assert!(
+                canary.join("file").exists(),
+                "symlink target must be untouched"
+            );
+        }
+        // sandbox baked hooks under aoe sandbox subpath are untouched
+        {
+            let _env = unset_agent_home_env();
+            let (_tmp, home, app_dir) = setup_dirs();
+
+            let claude = home.join(".claude").join("settings.json");
+            write_json(&claude, &pre_v017_claude_settings());
+
+            let sandbox_settings = home.join(".claude").join("sandbox").join("settings.json");
+            let sandbox_baked = serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": PRE_V017_STATUS_CMD
+                        }]
+                    }]
+                }
+            });
+            write_json(&sandbox_settings, &sandbox_baked);
+            let sandbox_before = fs::read_to_string(&sandbox_settings).unwrap();
+
+            run_in(&home, &app_dir).unwrap();
+
+            let sandbox_after = fs::read_to_string(&sandbox_settings).unwrap();
+            assert_eq!(
+                sandbox_before, sandbox_after,
+                "v017 must not touch settings under .claude/sandbox/ (baked into image)"
+            );
+        }
+        // privdrop v017 sweep leaves alien uid entry intact
+        #[cfg(target_os = "linux")]
+        {
+            use crate::hooks::test_support::{make_alien_owned, privdrop_test_enabled};
+            use std::os::unix::fs::PermissionsExt;
+
+            if !privdrop_test_enabled() {
+                return;
             }
-        });
-        write_json(&sandbox_settings, &sandbox_baked);
-        let sandbox_before = fs::read_to_string(&sandbox_settings).unwrap();
+            let tmp = TempDir::new().unwrap();
+            let legacy = tmp.path().join("legacy-aoe-hooks-mixed");
+            fs::create_dir(&legacy).unwrap();
+            fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
 
-        run_in(&home, &app_dir).unwrap();
+            let owned = legacy.join("owned-instance");
+            fs::create_dir(&owned).unwrap();
+            fs::write(owned.join("status"), b"idle").unwrap();
 
-        let sandbox_after = fs::read_to_string(&sandbox_settings).unwrap();
-        assert_eq!(
-            sandbox_before, sandbox_after,
-            "v017 must not touch settings under .claude/sandbox/ (baked into image)"
-        );
+            let alien = legacy.join("alien-instance");
+            fs::create_dir(&alien).unwrap();
+            fs::write(alien.join("status"), b"running").unwrap();
+            make_alien_owned(&alien);
+
+            super::sweep_legacy_base_in(&legacy);
+
+            assert!(!owned.exists(), "owned legacy entry must be removed");
+            assert!(
+                alien.join("status").exists(),
+                "alien-owned legacy entry and its contents must survive"
+            );
+            assert!(
+                legacy.exists(),
+                "legacy parent must remain while an alien-owned entry exists"
+            );
+        }
     }
 }

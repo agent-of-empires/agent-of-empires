@@ -53,50 +53,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clears_only_archived_error_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        fs::write(
-            &path,
-            r#"[
-                {"id":"a","status":"error","archived_at":"2026-06-05T16:04:12Z"},
-                {"id":"b","status":"error"},
-                {"id":"c","status":"idle","archived_at":"2026-06-05T16:04:12Z"},
-                {"id":"d","status":"stopped","archived_at":"2026-06-05T16:04:12Z"},
-                {"id":"e","status":"error","archived_at":null}
-            ]"#,
-        )
-        .unwrap();
+    fn clear_archived_tmux_gone_error_cases() {
+        // clears only archived error rows
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("sessions.json");
+            fs::write(
+                &path,
+                r#"[
+                    {"id":"a","status":"error","archived_at":"2026-06-05T16:04:12Z"},
+                    {"id":"b","status":"error"},
+                    {"id":"c","status":"idle","archived_at":"2026-06-05T16:04:12Z"},
+                    {"id":"d","status":"stopped","archived_at":"2026-06-05T16:04:12Z"},
+                    {"id":"e","status":"error","archived_at":null}
+                ]"#,
+            )
+            .unwrap();
 
-        clear_archived_error(&path).unwrap();
+            clear_archived_error(&path).unwrap();
 
-        let v: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        let arr = v.as_array().unwrap();
-        // archived + error -> idle (the bug footprint)
-        assert_eq!(arr[0]["status"], "idle");
-        // non-archived error -> untouched
-        assert_eq!(arr[1]["status"], "error");
-        // archived non-error -> untouched
-        assert_eq!(arr[2]["status"], "idle");
-        assert_eq!(arr[3]["status"], "stopped");
-        // explicit null archived_at counts as non-archived -> untouched
-        assert_eq!(arr[4]["status"], "error");
-    }
-
-    #[test]
-    fn missing_file_is_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        clear_archived_error(&dir.path().join("does-not-exist.json")).unwrap();
-    }
-
-    #[test]
-    fn corrupt_file_is_skipped_not_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        fs::write(&path, "{ not valid json").unwrap();
-        // Must not error; a corrupt file is left untouched.
-        clear_archived_error(&path).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "{ not valid json");
+            let v: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            let arr = v.as_array().unwrap();
+            // archived + error -> idle (the bug footprint)
+            assert_eq!(arr[0]["status"], "idle");
+            // non-archived error -> untouched
+            assert_eq!(arr[1]["status"], "error");
+            // archived non-error -> untouched
+            assert_eq!(arr[2]["status"], "idle");
+            assert_eq!(arr[3]["status"], "stopped");
+            // explicit null archived_at counts as non-archived -> untouched
+            assert_eq!(arr[4]["status"], "error");
+        }
+        // missing file is ok
+        {
+            let dir = tempfile::tempdir().unwrap();
+            clear_archived_error(&dir.path().join("does-not-exist.json")).unwrap();
+        }
+        // corrupt file is skipped not an error
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("sessions.json");
+            fs::write(&path, "{ not valid json").unwrap();
+            // Must not error; a corrupt file is left untouched.
+            clear_archived_error(&path).unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), "{ not valid json");
+        }
     }
 }

@@ -157,321 +157,318 @@ mod tests {
     }
 
     #[test]
-    fn promotes_only_the_default_profile_and_preserves_other_data() {
-        // (global prefix, default profile resolved from it)
-        for (default, winner) in [
-            ("default_profile = 'work'\n", Some("work")),
-            ("", Some("alpha")),
-            ("default_profile = ''\n", Some("alpha")),
-            ("default_profile = 'missing'\n", None),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let app = dir.path();
-            seed(
-                app,
-                "config.toml",
-                &format!("{default}[theme]\nname = 'empire'\n[unknown]\nkeep = 7\n"),
-            );
-            seed(
-                app,
-                "profiles/alpha/config.toml",
-                "[theme]\nname = 'dracula'\n[web]\nnotify_on_idle = true\n",
-            );
-            seed(app, "profiles/work/config.toml", "description = 'keep me'\n[theme]\nname = 'rose-pine'\ncolor_mode = 'palette'\nidle_decay_minutes = 5\n[session]\nconfirm_before_quit = false\nsession_id_poller_max_threads = 12\nsidebar_position = 'right'\ndefault_tool = 'codex'\n[web]\nnotify_on_error = false\n[unknown]\nkeep = 'profile'\n");
-
-            run_in(app, atomic_write).unwrap();
-
-            let global = read(app, "config.toml");
-            let get = |section: &str, field: &str| {
-                global
-                    .get(section)
-                    .and_then(|s| s.get(field))
-                    .map(ToString::to_string)
-            };
-            let theme = match winner {
-                Some("work") => "rose-pine",
-                Some(_) => "dracula",
-                None => "empire",
-            };
-            assert_eq!(global["theme"]["name"].as_str(), Some(theme), "{default:?}");
-            let work = winner == Some("work");
-            let alpha = winner == Some("alpha");
-            assert_eq!(get("theme", "color_mode").is_some(), work, "{default:?}");
-            assert_eq!(get("session", "confirm_before_quit").is_some(), work);
-            assert_eq!(
-                get("session", "session_id_poller_max_threads").is_some(),
-                work
-            );
-            assert_eq!(get("session", "sidebar_position").is_some(), work);
-            assert_eq!(get("web", "notify_on_error").is_some(), work);
-            assert_eq!(get("web", "notify_on_idle").is_some(), alpha);
-            if work {
-                assert_eq!(
-                    global["session"]["sidebar_position"].as_str(),
-                    Some("right")
-                );
-            }
-            assert_eq!(global["unknown"]["keep"].as_integer(), Some(7));
-            assert_eq!(read(app, "profiles/work/config.toml"), "description = 'keep me'\n[theme]\nidle_decay_minutes = 5\n[session]\ndefault_tool = 'codex'\n[unknown]\nkeep = 'profile'\n".parse::<toml::Table>().unwrap());
-            assert!(read(app, "profiles/alpha/config.toml").is_empty());
-            run_in(app, |_, _| {
-                anyhow::bail!("idempotent migration must not write")
-            })
-            .unwrap();
-        }
-    }
-
-    #[test]
-    fn resumes_after_each_write_failure_without_changing_the_winner() {
-        for fail_at in 0..4 {
-            let dir = tempfile::tempdir().unwrap();
-            let app = dir.path();
-            seed(app, "config.toml", "default_profile = 'work'\n");
-            for (name, theme) in [
-                ("alpha", "dracula"),
-                ("beta", "empire"),
-                ("work", "rose-pine"),
+    fn global_only_profile_settings_cases() {
+        // promotes only the default profile and preserves other data
+        {
+            // (global prefix, default profile resolved from it)
+            for (default, winner) in [
+                ("default_profile = 'work'\n", Some("work")),
+                ("", Some("alpha")),
+                ("default_profile = ''\n", Some("alpha")),
+                ("default_profile = 'missing'\n", None),
             ] {
+                let dir = tempfile::tempdir().unwrap();
+                let app = dir.path();
                 seed(
                     app,
-                    &format!("profiles/{name}/config.toml"),
-                    &format!("[theme]\nname = '{theme}'\n"),
+                    "config.toml",
+                    &format!("{default}[theme]\nname = 'empire'\n[unknown]\nkeep = 7\n"),
                 );
-            }
-            let mut writes = 0;
-            let result = run_in(app, |path, contents| {
-                let current = writes;
-                writes += 1;
-                anyhow::ensure!(current != fail_at, "injected write failure");
-                atomic_write(path, contents)
-            });
-            assert!(result.is_err());
-            // The default's value is never lost: it is global, or still in the profile.
-            let theme = |path| {
-                read(app, path)
-                    .get("theme")
-                    .and_then(|t| t.get("name"))
-                    .and_then(|n| n.as_str().map(str::to_owned))
-            };
-            assert!(
-                theme("config.toml").as_deref() == Some("rose-pine")
-                    || theme("profiles/work/config.toml").as_deref() == Some("rose-pine")
-            );
-            run_in(app, atomic_write).unwrap();
-            assert_eq!(
-                read(app, "config.toml")["theme"]["name"].as_str(),
-                Some("rose-pine")
-            );
-            for name in ["alpha", "beta", "work"] {
-                assert!(read(app, &format!("profiles/{name}/config.toml")).is_empty());
+                seed(
+                    app,
+                    "profiles/alpha/config.toml",
+                    "[theme]\nname = 'dracula'\n[web]\nnotify_on_idle = true\n",
+                );
+                seed(app, "profiles/work/config.toml", "description = 'keep me'\n[theme]\nname = 'rose-pine'\ncolor_mode = 'palette'\nidle_decay_minutes = 5\n[session]\nconfirm_before_quit = false\nsession_id_poller_max_threads = 12\nsidebar_position = 'right'\ndefault_tool = 'codex'\n[web]\nnotify_on_error = false\n[unknown]\nkeep = 'profile'\n");
+
+                run_in(app, atomic_write).unwrap();
+
+                let global = read(app, "config.toml");
+                let get = |section: &str, field: &str| {
+                    global
+                        .get(section)
+                        .and_then(|s| s.get(field))
+                        .map(ToString::to_string)
+                };
+                let theme = match winner {
+                    Some("work") => "rose-pine",
+                    Some(_) => "dracula",
+                    None => "empire",
+                };
+                assert_eq!(global["theme"]["name"].as_str(), Some(theme), "{default:?}");
+                let work = winner == Some("work");
+                let alpha = winner == Some("alpha");
+                assert_eq!(get("theme", "color_mode").is_some(), work, "{default:?}");
+                assert_eq!(get("session", "confirm_before_quit").is_some(), work);
+                assert_eq!(
+                    get("session", "session_id_poller_max_threads").is_some(),
+                    work
+                );
+                assert_eq!(get("session", "sidebar_position").is_some(), work);
+                assert_eq!(get("web", "notify_on_error").is_some(), work);
+                assert_eq!(get("web", "notify_on_idle").is_some(), alpha);
+                if work {
+                    assert_eq!(
+                        global["session"]["sidebar_position"].as_str(),
+                        Some("right")
+                    );
+                }
+                assert_eq!(global["unknown"]["keep"].as_integer(), Some(7));
+                assert_eq!(read(app, "profiles/work/config.toml"), "description = 'keep me'\n[theme]\nidle_decay_minutes = 5\n[session]\ndefault_tool = 'codex'\n[unknown]\nkeep = 'profile'\n".parse::<toml::Table>().unwrap());
+                assert!(read(app, "profiles/alpha/config.toml").is_empty());
+                run_in(app, |_, _| {
+                    anyhow::bail!("idempotent migration must not write")
+                })
+                .unwrap();
             }
         }
-    }
-
-    #[test]
-    fn rejects_malformed_input_before_any_writes() {
-        for (path, contents) in [
-            ("config.toml", "[invalid"),
-            ("profiles/work/config.toml", "[invalid"),
-            (
-                "profiles/aaa/config.toml",
-                "[session]\nconfirm_before_quit = 'wrong type'\n",
-            ),
-        ] {
+        // resumes after each write failure without changing the winner
+        {
+            for fail_at in 0..4 {
+                let dir = tempfile::tempdir().unwrap();
+                let app = dir.path();
+                seed(app, "config.toml", "default_profile = 'work'\n");
+                for (name, theme) in [
+                    ("alpha", "dracula"),
+                    ("beta", "empire"),
+                    ("work", "rose-pine"),
+                ] {
+                    seed(
+                        app,
+                        &format!("profiles/{name}/config.toml"),
+                        &format!("[theme]\nname = '{theme}'\n"),
+                    );
+                }
+                let mut writes = 0;
+                let result = run_in(app, |path, contents| {
+                    let current = writes;
+                    writes += 1;
+                    anyhow::ensure!(current != fail_at, "injected write failure");
+                    atomic_write(path, contents)
+                });
+                assert!(result.is_err());
+                // The default's value is never lost: it is global, or still in the profile.
+                let theme = |path| {
+                    read(app, path)
+                        .get("theme")
+                        .and_then(|t| t.get("name"))
+                        .and_then(|n| n.as_str().map(str::to_owned))
+                };
+                assert!(
+                    theme("config.toml").as_deref() == Some("rose-pine")
+                        || theme("profiles/work/config.toml").as_deref() == Some("rose-pine")
+                );
+                run_in(app, atomic_write).unwrap();
+                assert_eq!(
+                    read(app, "config.toml")["theme"]["name"].as_str(),
+                    Some("rose-pine")
+                );
+                for name in ["alpha", "beta", "work"] {
+                    assert!(read(app, &format!("profiles/{name}/config.toml")).is_empty());
+                }
+            }
+        }
+        // rejects malformed input before any writes
+        {
+            for (path, contents) in [
+                ("config.toml", "[invalid"),
+                ("profiles/work/config.toml", "[invalid"),
+                (
+                    "profiles/aaa/config.toml",
+                    "[session]\nconfirm_before_quit = 'wrong type'\n",
+                ),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let app = dir.path();
+                seed(
+                    app,
+                    "profiles/other/config.toml",
+                    "[theme]\nname = 'dracula'\n",
+                );
+                seed(app, path, contents);
+                assert!(run_in(app, |_, _| panic!(
+                    "must validate all inputs before writing"
+                ))
+                .is_err());
+                assert_eq!(fs::read_to_string(app.join(path)).unwrap(), contents);
+            }
+        }
+        // handles missing files and does not rewrite unrelated settings
+        {
             let dir = tempfile::tempdir().unwrap();
             let app = dir.path();
+            run_in(app, |_, _| panic!("fresh install must not write")).unwrap();
+            fs::create_dir_all(app.join("profiles/empty")).unwrap();
+            seed(
+                app,
+                "profiles/work/config.toml",
+                "# keep this comment\n[session]\ndefault_tool = 'codex'\n",
+            );
+            run_in(app, |_, _| {
+                panic!("unrelated settings must not be rewritten")
+            })
+            .unwrap();
             seed(
                 app,
                 "profiles/other/config.toml",
                 "[theme]\nname = 'dracula'\n",
             );
-            seed(app, path, contents);
-            assert!(run_in(app, |_, _| panic!(
-                "must validate all inputs before writing"
-            ))
-            .is_err());
-            assert_eq!(fs::read_to_string(app.join(path)).unwrap(), contents);
-        }
-    }
-
-    #[test]
-    fn handles_missing_files_and_does_not_rewrite_unrelated_settings() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path();
-        run_in(app, |_, _| panic!("fresh install must not write")).unwrap();
-        fs::create_dir_all(app.join("profiles/empty")).unwrap();
-        seed(
-            app,
-            "profiles/work/config.toml",
-            "# keep this comment\n[session]\ndefault_tool = 'codex'\n",
-        );
-        run_in(app, |_, _| {
-            panic!("unrelated settings must not be rewritten")
-        })
-        .unwrap();
-        seed(
-            app,
-            "profiles/other/config.toml",
-            "[theme]\nname = 'dracula'\n",
-        );
-        run_in(app, atomic_write).unwrap();
-        // `empty` is the default profile and has no file, so nothing moves.
-        assert!(!app.join("config.toml").exists());
-        assert!(read(app, "profiles/other/config.toml").is_empty());
-        assert!(fs::read_to_string(app.join("profiles/work/config.toml"))
-            .unwrap()
-            .starts_with("# keep this comment"));
-    }
-
-    #[test]
-    fn merges_default_profile_maps_and_replaces_lists() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path();
-        seed(app, "config.toml", "default_profile = 'work'\n[logging.targets]\ntmux = 'info'\nserver = 'error'\n[acp]\nallowed_agents = ['claude']\n");
-        seed(app, "profiles/alpha/config.toml", "[logging.targets]\nsession = 'debug'\nserver = 'warn'\n[acp]\nallowed_agents = ['gemini']\n");
-        seed(
-            app,
-            "profiles/work/config.toml",
-            "[logging.targets]\nserver = 'debug'\n[acp]\nallowed_agents = ['codex']\n",
-        );
-        run_in(app, atomic_write).unwrap();
-        let global = read(app, "config.toml");
-        assert_eq!(
-            global["logging"]["targets"],
-            toml::Value::Table(
-                "tmux = 'info'\nserver = 'debug'\n"
-                    .parse::<toml::Table>()
-                    .unwrap()
-            )
-        );
-        assert_eq!(
-            global["acp"]["allowed_agents"].as_array().unwrap(),
-            &[toml::Value::String("codex".into())]
-        );
-        assert!(read(app, "profiles/work/config.toml").is_empty());
-        assert!(read(app, "profiles/alpha/config.toml").is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn profile_aliases_preserve_precedence_and_retry_safety() {
-        for (default, winner) in [("", "dracula"), ("default_profile = 'aaa'\n", "rose-pine")] {
-            let dir = tempfile::tempdir().unwrap();
-            let app = dir.path();
-            seed(app, "config.toml", default);
-            seed(
-                app,
-                "profiles/alpha/config.toml",
-                "[theme]\nname = 'dracula'\n",
-            );
-            seed(
-                app,
-                "profiles/zulu/config.toml",
-                "[theme]\nname = 'rose-pine'\n",
-            );
-            std::os::unix::fs::symlink("zulu", app.join("profiles/aaa")).unwrap();
             run_in(app, atomic_write).unwrap();
-            assert_eq!(
-                read(app, "config.toml")["theme"]["name"].as_str(),
-                Some(winner)
-            );
-            assert!(app.join("profiles/aaa").is_symlink());
-        }
-        for fail_at in 0..3 {
-            let dir = tempfile::tempdir().unwrap();
-            let app = dir.path();
-            seed(app, "config.toml", "default_profile = 'zulu'\n");
-            seed(
-                app,
-                "profiles/alpha/config.toml",
-                "[theme]\nname = 'dracula'\n",
-            );
-            seed(
-                app,
-                "profiles/zulu/config.toml",
-                "[theme]\nname = 'rose-pine'\n",
-            );
-            fs::create_dir_all(app.join("profiles/beta")).unwrap();
-            std::os::unix::fs::symlink(
-                "../zulu/config.toml",
-                app.join("profiles/beta/config.toml"),
-            )
-            .unwrap();
-            let mut writes = 0;
-            assert!(run_in(app, |path, content| {
-                let current = writes;
-                writes += 1;
-                anyhow::ensure!(current != fail_at, "injected write failure");
-                atomic_write(path, content)
-            })
-            .is_err());
-            run_in(app, atomic_write).unwrap();
-            assert_eq!(
-                read(app, "config.toml")["theme"]["name"].as_str(),
-                Some("rose-pine")
-            );
-            assert!(read(app, "profiles/beta/config.toml").is_empty());
-            assert!(app.join("profiles/beta/config.toml").is_symlink());
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path();
-        seed(
-            app,
-            "config.toml",
-            "default_profile = 'work'\n[theme]\nname = 'dracula'\n",
-        );
-        fs::create_dir_all(app.join("profiles/work")).unwrap();
-        std::os::unix::fs::symlink("../../config.toml", app.join("profiles/work/config.toml"))
-            .unwrap();
-        seed(
-            app,
-            "profiles/alpha/config.toml",
-            "[theme]\nname = 'rose-pine'\n[web]\nnotify_on_idle = true\n",
-        );
-        run_in(app, atomic_write).unwrap();
-        assert!(read(app, "profiles/alpha/config.toml").is_empty());
-        assert!(!read(app, "config.toml").contains_key("web"));
-        assert!(app.join("profiles/work/config.toml").is_symlink());
-        run_in(app, |_, _| {
-            panic!("migrated aliases must not trigger writes")
-        })
-        .unwrap();
-        assert_eq!(
-            read(app, "config.toml")["theme"]["name"].as_str(),
-            Some("dracula")
-        );
-    }
-
-    #[test]
-    fn holds_the_global_config_lock_through_profile_cleanup() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path();
-        seed(
-            app,
-            "profiles/work/config.toml",
-            "[theme]\nname = 'dracula'\n",
-        );
-        let mut written = Vec::new();
-        run_in(app, |path, contents| {
-            assert!(
-                crate::session::try_acquire_storage_flock(app, CONFIG_LOCK_FILENAME)?.is_none()
-            );
-            atomic_write(path, contents)?;
-            written.push(path.strip_prefix(app).unwrap().to_path_buf());
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(
-            written,
-            [
-                Path::new("config.toml"),
-                Path::new("profiles/work/config.toml")
-            ]
-        );
-        assert!(
-            crate::session::try_acquire_storage_flock(app, CONFIG_LOCK_FILENAME)
+            // `empty` is the default profile and has no file, so nothing moves.
+            assert!(!app.join("config.toml").exists());
+            assert!(read(app, "profiles/other/config.toml").is_empty());
+            assert!(fs::read_to_string(app.join("profiles/work/config.toml"))
                 .unwrap()
-                .is_some()
-        );
+                .starts_with("# keep this comment"));
+        }
+        // merges default profile maps and replaces lists
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let app = dir.path();
+            seed(app, "config.toml", "default_profile = 'work'\n[logging.targets]\ntmux = 'info'\nserver = 'error'\n[acp]\nallowed_agents = ['claude']\n");
+            seed(app, "profiles/alpha/config.toml", "[logging.targets]\nsession = 'debug'\nserver = 'warn'\n[acp]\nallowed_agents = ['gemini']\n");
+            seed(
+                app,
+                "profiles/work/config.toml",
+                "[logging.targets]\nserver = 'debug'\n[acp]\nallowed_agents = ['codex']\n",
+            );
+            run_in(app, atomic_write).unwrap();
+            let global = read(app, "config.toml");
+            assert_eq!(
+                global["logging"]["targets"],
+                toml::Value::Table(
+                    "tmux = 'info'\nserver = 'debug'\n"
+                        .parse::<toml::Table>()
+                        .unwrap()
+                )
+            );
+            assert_eq!(
+                global["acp"]["allowed_agents"].as_array().unwrap(),
+                &[toml::Value::String("codex".into())]
+            );
+            assert!(read(app, "profiles/work/config.toml").is_empty());
+            assert!(read(app, "profiles/alpha/config.toml").is_empty());
+        }
+        // profile aliases preserve precedence and retry safety
+        #[cfg(unix)]
+        {
+            for (default, winner) in [("", "dracula"), ("default_profile = 'aaa'\n", "rose-pine")] {
+                let dir = tempfile::tempdir().unwrap();
+                let app = dir.path();
+                seed(app, "config.toml", default);
+                seed(
+                    app,
+                    "profiles/alpha/config.toml",
+                    "[theme]\nname = 'dracula'\n",
+                );
+                seed(
+                    app,
+                    "profiles/zulu/config.toml",
+                    "[theme]\nname = 'rose-pine'\n",
+                );
+                std::os::unix::fs::symlink("zulu", app.join("profiles/aaa")).unwrap();
+                run_in(app, atomic_write).unwrap();
+                assert_eq!(
+                    read(app, "config.toml")["theme"]["name"].as_str(),
+                    Some(winner)
+                );
+                assert!(app.join("profiles/aaa").is_symlink());
+            }
+            for fail_at in 0..3 {
+                let dir = tempfile::tempdir().unwrap();
+                let app = dir.path();
+                seed(app, "config.toml", "default_profile = 'zulu'\n");
+                seed(
+                    app,
+                    "profiles/alpha/config.toml",
+                    "[theme]\nname = 'dracula'\n",
+                );
+                seed(
+                    app,
+                    "profiles/zulu/config.toml",
+                    "[theme]\nname = 'rose-pine'\n",
+                );
+                fs::create_dir_all(app.join("profiles/beta")).unwrap();
+                std::os::unix::fs::symlink(
+                    "../zulu/config.toml",
+                    app.join("profiles/beta/config.toml"),
+                )
+                .unwrap();
+                let mut writes = 0;
+                assert!(run_in(app, |path, content| {
+                    let current = writes;
+                    writes += 1;
+                    anyhow::ensure!(current != fail_at, "injected write failure");
+                    atomic_write(path, content)
+                })
+                .is_err());
+                run_in(app, atomic_write).unwrap();
+                assert_eq!(
+                    read(app, "config.toml")["theme"]["name"].as_str(),
+                    Some("rose-pine")
+                );
+                assert!(read(app, "profiles/beta/config.toml").is_empty());
+                assert!(app.join("profiles/beta/config.toml").is_symlink());
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let app = dir.path();
+            seed(
+                app,
+                "config.toml",
+                "default_profile = 'work'\n[theme]\nname = 'dracula'\n",
+            );
+            fs::create_dir_all(app.join("profiles/work")).unwrap();
+            std::os::unix::fs::symlink("../../config.toml", app.join("profiles/work/config.toml"))
+                .unwrap();
+            seed(
+                app,
+                "profiles/alpha/config.toml",
+                "[theme]\nname = 'rose-pine'\n[web]\nnotify_on_idle = true\n",
+            );
+            run_in(app, atomic_write).unwrap();
+            assert!(read(app, "profiles/alpha/config.toml").is_empty());
+            assert!(!read(app, "config.toml").contains_key("web"));
+            assert!(app.join("profiles/work/config.toml").is_symlink());
+            run_in(app, |_, _| {
+                panic!("migrated aliases must not trigger writes")
+            })
+            .unwrap();
+            assert_eq!(
+                read(app, "config.toml")["theme"]["name"].as_str(),
+                Some("dracula")
+            );
+        }
+        // holds the global config lock through profile cleanup
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let app = dir.path();
+            seed(
+                app,
+                "profiles/work/config.toml",
+                "[theme]\nname = 'dracula'\n",
+            );
+            let mut written = Vec::new();
+            run_in(app, |path, contents| {
+                assert!(
+                    crate::session::try_acquire_storage_flock(app, CONFIG_LOCK_FILENAME)?.is_none()
+                );
+                atomic_write(path, contents)?;
+                written.push(path.strip_prefix(app).unwrap().to_path_buf());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                written,
+                [
+                    Path::new("config.toml"),
+                    Path::new("profiles/work/config.toml")
+                ]
+            );
+            assert!(
+                crate::session::try_acquire_storage_flock(app, CONFIG_LOCK_FILENAME)
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 }

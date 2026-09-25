@@ -181,55 +181,54 @@ pub(super) fn barrier(dir: &fs::File) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// A clone the filesystem cannot serve must read as "copy it yourself",
-    /// never as a failed migration. A character device is a source no clone
-    /// implementation accepts, so this holds on every platform, including one
-    /// whose filesystem would happily clone a regular file.
     #[test]
-    fn an_unclonable_source_falls_back_instead_of_failing() {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("copy");
-        let source = fs::File::open("/dev/null").unwrap();
-        let stat = nix::sys::stat::fstat(&source).unwrap();
-        let mut support = CloneSupport::default();
+    fn store_fs_cases() {
+        // A clone the filesystem cannot serve must read as "copy it yourself",
+        // never as a failed migration. A character device is a source no clone
+        // implementation accepts, so this holds on every platform, including one
+        // whose filesystem would happily clone a regular file.
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("copy");
+            let source = fs::File::open("/dev/null").unwrap();
+            let stat = nix::sys::stat::fstat(&source).unwrap();
+            let mut support = CloneSupport::default();
 
-        assert!(support.clone_file(&source, &stat, &target).is_none());
-        assert!(
-            !target.exists(),
-            "a refused clone must not leave a partial file behind"
-        );
-        assert!(
-            support.refused,
-            "one refusal must stop the move retrying a clone per file"
-        );
-    }
+            assert!(support.clone_file(&source, &stat, &target).is_none());
+            assert!(
+                !target.exists(),
+                "a refused clone must not leave a partial file behind"
+            );
+            assert!(
+                support.refused,
+                "one refusal must stop the move retrying a clone per file"
+            );
+        }
+        // Once refused, later files skip the syscall entirely rather than paying
+        // a failure each.
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let source_path = temp.path().join("source");
+            fs::write(&source_path, b"contents").unwrap();
+            let source = fs::File::open(&source_path).unwrap();
+            let stat = nix::sys::stat::fstat(&source).unwrap();
+            let mut support = CloneSupport { refused: true };
 
-    /// Once refused, later files skip the syscall entirely rather than paying
-    /// a failure each.
-    #[test]
-    fn a_refused_clone_is_not_retried() {
-        let temp = tempfile::tempdir().unwrap();
-        let source_path = temp.path().join("source");
-        fs::write(&source_path, b"contents").unwrap();
-        let source = fs::File::open(&source_path).unwrap();
-        let stat = nix::sys::stat::fstat(&source).unwrap();
-        let mut support = CloneSupport { refused: true };
+            assert!(support
+                .clone_file(&source, &stat, &temp.path().join("copy"))
+                .is_none());
+            assert!(!temp.path().join("copy").exists());
+        }
+        // syncing and barriering a directory succeed
+        {
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("file"), b"contents").unwrap();
+            let file = fs::File::open(temp.path().join("file")).unwrap();
+            let dir = fs::File::open(temp.path()).unwrap();
 
-        assert!(support
-            .clone_file(&source, &stat, &temp.path().join("copy"))
-            .is_none());
-        assert!(!temp.path().join("copy").exists());
-    }
-
-    #[test]
-    fn syncing_and_barriering_a_directory_succeed() {
-        let temp = tempfile::tempdir().unwrap();
-        fs::write(temp.path().join("file"), b"contents").unwrap();
-        let file = fs::File::open(temp.path().join("file")).unwrap();
-        let dir = fs::File::open(temp.path()).unwrap();
-
-        sync_to_drive(&file).unwrap();
-        sync_to_drive(&dir).unwrap();
-        barrier(&dir).unwrap();
+            sync_to_drive(&file).unwrap();
+            sync_to_drive(&dir).unwrap();
+            barrier(&dir).unwrap();
+        }
     }
 }

@@ -70,79 +70,79 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn false_legacy_toggle_seeds_row_tag_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(
-            &path,
-            "[worktree]\nshow_branch_in_tui = false\nauto_cleanup = true\n",
-        )
-        .unwrap();
-
-        migrate_config_file(&path).unwrap();
-
-        let doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(doc["session"]["row_tag"].as_str(), Some("none"));
-        assert!(!doc["worktree"]
-            .as_table()
-            .unwrap()
-            .contains_key("show_branch_in_tui"));
-        assert_eq!(doc["worktree"]["auto_cleanup"].as_bool(), Some(true));
-    }
-
-    #[test]
-    fn true_legacy_toggle_only_removes_stale_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(&path, "[worktree]\nshow_branch_in_tui = true\n").unwrap();
-
-        migrate_config_file(&path).unwrap();
-
-        let doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert!(!doc["worktree"]
-            .as_table()
-            .unwrap()
-            .contains_key("show_branch_in_tui"));
-        assert!(doc.get("session").is_none());
-    }
-
-    #[test]
-    fn existing_row_tag_wins() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(
-            &path,
-            "[session]\nrow_tag = \"profile\"\n\n[worktree]\nshow_branch_in_tui = false\n",
-        )
-        .unwrap();
-
-        migrate_config_file(&path).unwrap();
-
-        let doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(doc["session"]["row_tag"].as_str(), Some("profile"));
-        assert!(!doc["worktree"]
-            .as_table()
-            .unwrap()
-            .contains_key("show_branch_in_tui"));
-    }
-
-    #[test]
-    fn migrates_profile_configs() {
-        let dir = tempfile::tempdir().unwrap();
-        let profile = dir.path().join("profiles/default");
-        fs::create_dir_all(&profile).unwrap();
-        fs::write(
-            profile.join("config.toml"),
-            "[worktree]\nshow_branch_in_tui = false\n",
-        )
-        .unwrap();
-
-        run_in(dir.path()).unwrap();
-
-        let doc: toml::Table = fs::read_to_string(profile.join("config.toml"))
-            .unwrap()
-            .parse()
+    fn move_tui_branch_suffix_to_row_tag_cases() {
+        // false legacy toggle seeds row tag none
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            fs::write(
+                &path,
+                "[worktree]\nshow_branch_in_tui = false\nauto_cleanup = true\n",
+            )
             .unwrap();
-        assert_eq!(doc["session"]["row_tag"].as_str(), Some("none"));
+
+            migrate_config_file(&path).unwrap();
+
+            let doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+            assert_eq!(doc["session"]["row_tag"].as_str(), Some("none"));
+            assert!(!doc["worktree"]
+                .as_table()
+                .unwrap()
+                .contains_key("show_branch_in_tui"));
+            assert_eq!(doc["worktree"]["auto_cleanup"].as_bool(), Some(true));
+        }
+        // true legacy toggle only removes stale key
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            fs::write(&path, "[worktree]\nshow_branch_in_tui = true\n").unwrap();
+
+            migrate_config_file(&path).unwrap();
+
+            let doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+            assert!(!doc["worktree"]
+                .as_table()
+                .unwrap()
+                .contains_key("show_branch_in_tui"));
+            assert!(doc.get("session").is_none());
+        }
+        // existing row tag wins
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            fs::write(
+                &path,
+                "[session]\nrow_tag = \"profile\"\n\n[worktree]\nshow_branch_in_tui = false\n",
+            )
+            .unwrap();
+
+            migrate_config_file(&path).unwrap();
+
+            let doc: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+            assert_eq!(doc["session"]["row_tag"].as_str(), Some("profile"));
+            assert!(!doc["worktree"]
+                .as_table()
+                .unwrap()
+                .contains_key("show_branch_in_tui"));
+        }
+        // migrates profile configs
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let profile = dir.path().join("profiles/default");
+            fs::create_dir_all(&profile).unwrap();
+            fs::write(
+                profile.join("config.toml"),
+                "[worktree]\nshow_branch_in_tui = false\n",
+            )
+            .unwrap();
+
+            run_in(dir.path()).unwrap();
+
+            let doc: toml::Table = fs::read_to_string(profile.join("config.toml"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(doc["session"]["row_tag"].as_str(), Some("none"));
+        }
     }
 }

@@ -44,39 +44,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn renames_serve_log_to_legacy() {
-        let temp = tempfile::tempdir().unwrap();
-        let src = temp.path().join("serve.log");
-        fs::write(&src, "old daemon output\n").unwrap();
+    fn serve_log_to_legacy_cases() {
+        // renames serve log to legacy
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let src = temp.path().join("serve.log");
+            fs::write(&src, "old daemon output\n").unwrap();
 
-        run_in(temp.path()).unwrap();
+            run_in(temp.path()).unwrap();
 
-        assert!(!src.exists(), "serve.log should be gone");
-        let legacy = temp.path().join("serve.log.legacy");
-        assert!(legacy.exists(), "serve.log.legacy should exist");
-        assert_eq!(fs::read_to_string(&legacy).unwrap(), "old daemon output\n");
-    }
+            assert!(!src.exists(), "serve.log should be gone");
+            let legacy = temp.path().join("serve.log.legacy");
+            assert!(legacy.exists(), "serve.log.legacy should exist");
+            assert_eq!(fs::read_to_string(&legacy).unwrap(), "old daemon output\n");
+        }
+        // noop when no serve log
+        {
+            let temp = tempfile::tempdir().unwrap();
+            run_in(temp.path()).unwrap();
+            assert!(!temp.path().join("serve.log.legacy").exists());
+        }
+        // idempotent with existing legacy
+        {
+            let temp = tempfile::tempdir().unwrap();
+            fs::write(temp.path().join("serve.log"), "new bytes\n").unwrap();
+            fs::write(temp.path().join("serve.log.legacy"), "old bytes\n").unwrap();
 
-    #[test]
-    fn noop_when_no_serve_log() {
-        let temp = tempfile::tempdir().unwrap();
-        run_in(temp.path()).unwrap();
-        assert!(!temp.path().join("serve.log.legacy").exists());
-    }
+            run_in(temp.path()).unwrap();
 
-    #[test]
-    fn idempotent_with_existing_legacy() {
-        let temp = tempfile::tempdir().unwrap();
-        fs::write(temp.path().join("serve.log"), "new bytes\n").unwrap();
-        fs::write(temp.path().join("serve.log.legacy"), "old bytes\n").unwrap();
-
-        run_in(temp.path()).unwrap();
-
-        // Running again with no serve.log present should be a no-op.
-        run_in(temp.path()).unwrap();
-        assert_eq!(
-            fs::read_to_string(temp.path().join("serve.log.legacy")).unwrap(),
-            "new bytes\n"
-        );
+            // Running again with no serve.log present should be a no-op.
+            run_in(temp.path()).unwrap();
+            assert_eq!(
+                fs::read_to_string(temp.path().join("serve.log.legacy")).unwrap(),
+                "new bytes\n"
+            );
+        }
     }
 }

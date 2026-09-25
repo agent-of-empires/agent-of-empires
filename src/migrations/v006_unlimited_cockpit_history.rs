@@ -44,57 +44,57 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn rewrites_default_seed_value() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.toml");
-        fs::write(&path, "[cockpit]\nreplay_events = 500\n").unwrap();
+    fn rewrites_only_the_default_seed_value() {
+        // rewrites default seed value
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            fs::write(&path, "[cockpit]\nreplay_events = 500\n").unwrap();
 
-        run_in(temp.path()).unwrap();
+            run_in(temp.path()).unwrap();
 
-        let after: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        let cockpit = after.get("cockpit").unwrap().as_table().unwrap();
-        assert_eq!(
-            cockpit.get("replay_events").unwrap().as_integer().unwrap(),
-            0
-        );
-    }
+            let after: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+            let cockpit = after.get("cockpit").unwrap().as_table().unwrap();
+            assert_eq!(
+                cockpit.get("replay_events").unwrap().as_integer().unwrap(),
+                0
+            );
+        }
+        // leaves explicit user values alone
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            fs::write(&path, "[cockpit]\nreplay_events = 1000\n").unwrap();
 
-    #[test]
-    fn leaves_explicit_user_values_alone() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.toml");
-        fs::write(&path, "[cockpit]\nreplay_events = 1000\n").unwrap();
+            run_in(temp.path()).unwrap();
 
-        run_in(temp.path()).unwrap();
+            let after: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
+            let cockpit = after.get("cockpit").unwrap().as_table().unwrap();
+            assert_eq!(
+                cockpit.get("replay_events").unwrap().as_integer().unwrap(),
+                1000
+            );
+        }
+        // is idempotent when already zero
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            fs::write(&path, "[cockpit]\nreplay_events = 0\n").unwrap();
 
-        let after: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        let cockpit = after.get("cockpit").unwrap().as_table().unwrap();
-        assert_eq!(
-            cockpit.get("replay_events").unwrap().as_integer().unwrap(),
-            1000
-        );
-    }
-
-    #[test]
-    fn is_idempotent_when_already_zero() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.toml");
-        fs::write(&path, "[cockpit]\nreplay_events = 0\n").unwrap();
-
-        run_in(temp.path()).unwrap();
-        let first = fs::read_to_string(&path).unwrap();
-        run_in(temp.path()).unwrap();
-        let second = fs::read_to_string(&path).unwrap();
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn noop_when_no_cockpit_section() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.toml");
-        fs::write(&path, "[other]\nkey = \"value\"\n").unwrap();
-        run_in(temp.path()).unwrap();
-        let after = fs::read_to_string(&path).unwrap();
-        assert_eq!(after, "[other]\nkey = \"value\"\n");
+            run_in(temp.path()).unwrap();
+            let first = fs::read_to_string(&path).unwrap();
+            run_in(temp.path()).unwrap();
+            let second = fs::read_to_string(&path).unwrap();
+            assert_eq!(first, second);
+        }
+        // noop when no cockpit section
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            fs::write(&path, "[other]\nkey = \"value\"\n").unwrap();
+            run_in(temp.path()).unwrap();
+            let after = fs::read_to_string(&path).unwrap();
+            assert_eq!(after, "[other]\nkey = \"value\"\n");
+        }
     }
 }
