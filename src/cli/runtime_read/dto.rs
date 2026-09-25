@@ -467,6 +467,31 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
         .iter()
         .map(|profile| profile.name.as_str())
         .collect();
+    let mut profile_groups: HashMap<&str, HashSet<&str>> = HashMap::new();
+    let mut profile_projects: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for profile in &snapshot.profiles {
+        profile_groups.insert(
+            profile.name.as_str(),
+            profile
+                .groups
+                .iter()
+                .map(|group| group.path.as_str())
+                .collect(),
+        );
+        profile_projects.insert(
+            profile.name.as_str(),
+            profile
+                .projects
+                .iter()
+                .map(|project| project.path.as_str())
+                .collect(),
+        );
+    }
+    let global_projects: HashSet<&str> = snapshot
+        .global_projects
+        .iter()
+        .map(|project| project.path.as_str())
+        .collect();
     let mut session_ids = HashSet::new();
     let mut parents: HashMap<&str, (&str, Option<&str>)> = HashMap::new();
     for session in &snapshot.sessions {
@@ -476,6 +501,18 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
             return Err("schema_invalid");
         }
         validate_session(session)?;
+        let groups = profile_groups
+            .get(session.profile.as_str())
+            .ok_or("schema_invalid")?;
+        let projects = profile_projects
+            .get(session.profile.as_str())
+            .ok_or("schema_invalid")?;
+        if (!session.group_path.is_empty() && !groups.contains(session.group_path.as_str()))
+            || (!projects.contains(session.project_path.as_str())
+                && !global_projects.contains(session.project_path.as_str()))
+        {
+            return Err("schema_invalid");
+        }
         parents.insert(
             session.id.as_str(),
             (
@@ -542,7 +579,7 @@ pub(crate) fn validate_cross_message(
                 || hello.owner.kind != OwnerKind::Remote
                 || hello.owner.uid.is_some()
             {
-                return Err("unauthorized");
+                return Err("schema_invalid");
             }
         }
     }
@@ -568,6 +605,11 @@ fn validate_profile_health(health: &ProfileHealth) -> Result<(), &'static str> {
     validate_profile_component(health.profile_data)
 }
 
+fn validate_health_code(code: HealthCode) -> Result<(), &'static str> {
+    let _ = code;
+    Ok(())
+}
+
 fn validate_global_health(health: ComponentHealth) -> Result<(), &'static str> {
     if let ComponentHealth::Degraded { code } = health {
         if !matches!(code, HealthCode::Enumeration | HealthCode::Metadata) {
@@ -579,13 +621,13 @@ fn validate_global_health(health: ComponentHealth) -> Result<(), &'static str> {
 
 fn validate_profile_component(health: ComponentHealth) -> Result<(), &'static str> {
     if let ComponentHealth::Degraded { code } = health {
-        validate_health_code(code)?;
+        if !matches!(
+            code,
+            HealthCode::ProfileEnumeration | HealthCode::Metadata | HealthCode::ProfileData
+        ) {
+            return Err("schema_invalid");
+        }
     }
-    Ok(())
-}
-
-fn validate_health_code(code: HealthCode) -> Result<(), &'static str> {
-    let _ = code;
     Ok(())
 }
 
@@ -801,17 +843,27 @@ fn valid_text(value: &str) -> bool {
 }
 
 fn validate_safe_text(value: &str) -> Result<(), &'static str> {
-    valid_text(value).then_some(()).ok_or("schema_invalid")
+    (!value.is_empty() && valid_text(value))
+        .then_some(())
+        .ok_or("schema_invalid")
 }
 
 fn is_c1_c0(value: char) -> bool {
-    matches!(value as u32, 0x00..=0x1f | 0x7f..=0x9f)
+    matches!(
+        value as u32,
+        0x00..=0x1f | 0x7f..=0x9f | 0x2028..=0x2029 | 0x202a..=0x202e | 0x2066..=0x2069
+    )
 }
 
 fn valid_timestamp(value: &str) -> bool {
-    value.ends_with('Z')
+    value.len() == 20
+        && value.as_bytes()[4] == b'-'
+        && value.as_bytes()[7] == b'-'
+        && value.as_bytes()[10] == b'T'
+        && value.as_bytes()[13] == b':'
+        && value.as_bytes()[16] == b':'
+        && value.ends_with('Z')
         && chrono::DateTime::parse_from_rfc3339(value).is_ok()
-        && !value.contains('.')
 }
 
 fn valid_group_path(value: &str) -> bool {
@@ -822,10 +874,14 @@ fn valid_group_path(value: &str) -> bool {
 }
 
 fn valid_absolute_path(value: &str) -> bool {
-    value.starts_with('/')
-        && value.split('/').skip(1).all(|component| {
-            !component.is_empty() && component != "." && component != ".." && valid_text(component)
-        })
+    value == "/"
+        || (value.starts_with('/')
+            && value.split('/').skip(1).all(|component| {
+                !component.is_empty()
+                    && component != "."
+                    && component != ".."
+                    && valid_text(component)
+            }))
 }
 
 #[cfg(test)]

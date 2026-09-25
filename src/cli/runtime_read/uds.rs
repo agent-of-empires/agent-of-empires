@@ -61,6 +61,8 @@ struct PostbindMarker {
     owner_uid: u32,
     socket_device: u64,
     socket_inode: u64,
+    #[cfg(target_os = "linux")]
+    socket_creator_pid: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -122,12 +124,12 @@ pub(crate) async fn connect(establishment_deadline: Instant) -> Result<UdsConnec
         tokio::task::spawn_blocking(existing_app_namespace),
     )
     .await
-    .map_err(|_| ReadFailure::post("unavailable"))?
+    .map_err(|_| ReadFailure::pre("establishment_timeout"))?
     .map_err(|_| ReadFailure::post("unavailable"))?
     .map_err(trusted_path_failure)?;
     tokio::time::timeout_at(establishment_deadline, connect_admission(namespace))
         .await
-        .map_err(|_| ReadFailure::post("unavailable"))?
+        .map_err(|_| ReadFailure::pre("establishment_timeout"))?
 }
 
 fn trusted_path_failure(error: TrustedPathError) -> ReadFailure {
@@ -338,9 +340,9 @@ fn xattr_value(fd: RawFd, name: &[u8]) -> Result<Vec<u8>, TrustedPathError> {
 #[cfg(target_os = "linux")]
 fn validate_acl_value(
     value: &[u8],
-    owner: u32,
-    euid: u32,
-    mode: u32,
+    _owner: u32,
+    _euid: u32,
+    _mode: u32,
 ) -> Result<(), TrustedPathError> {
     if value.len() < 8 || u32::from_le_bytes(value[0..4].try_into().unwrap()) != 2 {
         return Err(TrustedPathError::Invalid);
@@ -349,58 +351,31 @@ fn validate_acl_value(
         return Err(TrustedPathError::Invalid);
     }
     let entry_count = (value.len() - 8) / 8;
-    let mut mask = ((mode & 0o070) >> 3) as u16;
     for index in 0..entry_count {
         let offset = 8 + index * 8;
         let tag = u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
         let permission = u16::from_le_bytes(value[offset + 2..offset + 4].try_into().unwrap());
-        let _id = u32::from_le_bytes(value[offset + 4..offset + 8].try_into().unwrap());
-        if tag == 0x10 {
-            mask = permission;
-        }
-    }
-    for index in 0..entry_count {
-        let offset = 8 + index * 8;
-        let tag = u16::from_le_bytes(value[offset..offset + 2].try_into().unwrap());
-        let permission = u16::from_le_bytes(value[offset + 2..offset + 4].try_into().unwrap());
-        let id = u32::from_le_bytes(value[offset + 4..offset + 8].try_into().unwrap());
-        let applies = match tag {
-            0x02 => id == euid,
-            0x04 => owner == euid,
-            0x08 => supplementary_group_ids().contains(&id),
-            _ => false,
-        };
-        if applies && (permission & mask & 0x2 != 0 || (tag == 0x08 && permission & 0x2 != 0)) {
+        if matches!(tag, 0x02 | 0x04 | 0x08) && permission & 0x2 != 0 {
             return Err(TrustedPathError::Invalid);
         }
     }
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn supplementary_group_ids() -> Vec<u32> {
-    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    if count <= 0 {
-        return Vec::new();
-    }
-    let mut groups = vec![0u32; count as usize];
-    let actual = unsafe { libc::getgroups(count as libc::c_int, groups.as_mut_ptr().cast()) };
-    if actual < 0 {
-        Vec::new()
-    } else {
-        groups.truncate(actual as usize);
-        groups
-    }
-}
-
 async fn connect_admission(namespace: OwnedNamespace) -> Result<UdsConnection, ReadFailure> {
     let dir = namespace.dir.as_raw_fd();
     let euid = unsafe { libc::geteuid() };
-    let (lock, lock_identity) =
-        open_entry(dir, LOCK_FILE, EntryKind::Regular).map_err(|error| match error {
-            EntryError::Missing => ReadFailure::pre("marker_missing"),
-            EntryError::Invalid => ReadFailure::pre("marker_invalid"),
-        })?;
+    // Structural and process-start validation precedes the lock and the
+    // marker_missing shortcut, so retained crash state is never hidden.
+    inspect_temporary_markers(dir)?;
+    let (lock, lock_identity) = match open_entry(dir, LOCK_FILE, EntryKind::Regular) {
+        Ok(value) => value,
+        Err(EntryError::Missing) if runtime_entry_present(dir) => {
+            return Err(ReadFailure::pre("marker_identity"));
+        }
+        Err(EntryError::Missing) => return Err(ReadFailure::pre("marker_missing")),
+        Err(EntryError::Invalid) => return Err(ReadFailure::pre("marker_invalid")),
+    };
     validate_regular_file(&lock, euid, &lock_identity)
         .map_err(|_| ReadFailure::pre("marker_invalid"))?;
 
@@ -417,7 +392,6 @@ async fn connect_admission(namespace: OwnedNamespace) -> Result<UdsConnection, R
         _lock: lock,
     };
 
-    inspect_temporary_markers(admission._namespace.dir.as_raw_fd())?;
     let prebind: Option<PrebindMarker> = match read_marker::<PrebindMarker>(dir, PREBIND_FILE) {
         Ok(value) => {
             validate_prebind(&value, &admission._namespace.name)?;
@@ -434,12 +408,9 @@ async fn connect_admission(namespace: OwnedNamespace) -> Result<UdsConnection, R
         Err(error) if error.code() == "marker_missing" => None,
         Err(error) => return Err(error),
     };
-
     let Some(postbind) = postbind else {
-        if let Some(prebind) = &prebind {
-            if process_state(prebind.pid, &prebind.process_start_identity)? != ProcessState::Dead {
-                return Err(ReadFailure::pre("marker_identity"));
-            }
+        if prebind.is_some() || runtime_entry_present(dir) {
+            return Err(ReadFailure::pre("marker_identity"));
         }
         return Err(ReadFailure::pre("marker_missing"));
     };
@@ -452,7 +423,7 @@ async fn connect_admission(namespace: OwnedNamespace) -> Result<UdsConnection, R
         }
     }
     if process_state(postbind.pid, &postbind.process_start_identity)? != ProcessState::Live {
-        return Err(ReadFailure::pre("marker_missing"));
+        return Err(ReadFailure::pre("marker_identity"));
     }
     validate_socket_entry(dir, &postbind, euid)?;
 
@@ -465,15 +436,21 @@ async fn connect_admission(namespace: OwnedNamespace) -> Result<UdsConnection, R
         stream,
         identity: UdsIdentity {
             namespace: admission._namespace.name.clone(),
-            prebind_instance_id: postbind.prebind_instance_id.clone(),
-            runtime_instance_id: postbind.runtime_instance_id.clone(),
-            runtime_epoch: postbind.runtime_epoch.clone(),
+            prebind_instance_id: postbind.prebind_instance_id,
+            runtime_instance_id: postbind.runtime_instance_id,
+            runtime_epoch: postbind.runtime_epoch,
             owner_uid: postbind.owner_uid,
         },
         home: admission._namespace.home.clone(),
         admission,
-        exchange_deadline: Instant::now() + std::time::Duration::from_secs(15),
+        exchange_deadline: Instant::now(),
     })
+}
+
+fn runtime_entry_present(dir: RawFd) -> bool {
+    [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE]
+        .iter()
+        .any(|name| fstatat(dir, name).is_ok())
 }
 
 fn validate_prebind(marker: &PrebindMarker, namespace: &str) -> Result<(), ReadFailure> {
@@ -559,7 +536,13 @@ fn scan_temporary_markers(entries: *mut libc::DIR) -> Result<(), ReadFailure> {
             .to_string_lossy()
             .into_owned();
         let Some(kind) = temporary_kind(&name) else {
-            if name.starts_with("runtime.") && name != SOCKET_FILE {
+            if name == PREBIND_FILE || name == POSTBIND_FILE || name == SOCKET_FILE {
+                continue;
+            }
+            if name.starts_with("runtime.prebind.json")
+                || name.starts_with("runtime.postbind.json")
+                || name.starts_with(SOCKET_FILE)
+            {
                 return Err(ReadFailure::pre("marker_invalid"));
             }
             continue;
@@ -620,9 +603,9 @@ enum TempKind {
 }
 
 fn temporary_kind(name: &str) -> Option<TempKind> {
-    if name.starts_with("runtime.prebind.tmp.") {
+    if name.starts_with("runtime.prebind.json.tmp.") {
         Some(TempKind::Prebind)
-    } else if name.starts_with("runtime.postbind.tmp.") {
+    } else if name.starts_with("runtime.postbind.json.tmp.") {
         Some(TempKind::Postbind)
     } else {
         None
@@ -675,10 +658,8 @@ fn validate_connected_socket(
     let current = fstatat(dir, SOCKET_FILE).map_err(|_| ReadFailure::post("socket_identity"))?;
     if !socket_stat(&connected)
         || !socket_stat(&current)
-        || connected.st_dev != current.st_dev
-        || connected.st_ino != current.st_ino
-        || connected.st_dev != marker.socket_device
-        || connected.st_ino != marker.socket_inode
+        || current.st_dev as u64 != marker.socket_device
+        || current.st_ino as u64 != marker.socket_inode
     {
         return Err(ReadFailure::post("socket_identity"));
     }
@@ -705,13 +686,53 @@ fn peer_credentials(stream: RawFd, marker: &PostbindMarker, euid: u32) -> Result
     if credentials.uid != marker.owner_uid
         || credentials.uid != euid
         || credentials.pid as u32 != marker.pid
+        || credentials.pid as u32 != marker.socket_creator_pid
     {
         return Err(ReadFailure::post("peer_identity"));
     }
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn peer_credentials(stream: RawFd, marker: &PostbindMarker, euid: u32) -> Result<(), ReadFailure> {
+    let mut credentials = std::mem::MaybeUninit::<libc::xucred>::uninit();
+    let mut length = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    if result != 0 || length < std::mem::size_of::<libc::xucred>() as libc::socklen_t {
+        return Err(ReadFailure::post("peer_identity"));
+    }
+    let credentials = unsafe { credentials.assume_init() };
+    let mut pid: libc::pid_t = 0;
+    let mut pid_len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEEREPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut pid_len,
+        )
+    };
+    if result != 0
+        || pid_len != std::mem::size_of::<libc::pid_t>() as libc::socklen_t
+        || credentials.cr_uid as u32 != marker.owner_uid
+        || credentials.cr_uid as u32 != euid
+        || pid as u32 != marker.pid
+    {
+        return Err(ReadFailure::post("peer_identity"));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn peer_credentials(_: RawFd, _: &PostbindMarker, _: u32) -> Result<(), ReadFailure> {
     Err(ReadFailure::post("peer_identity"))
 }
@@ -724,7 +745,7 @@ fn anchored_child_path(dir: RawFd, child: &str) -> Result<PathBuf, ReadFailure> 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let base = PathBuf::from(format!("/proc/self/fd/{dir}"));
     if !base.exists() {
-        return Err(ReadFailure::post("peer_identity"));
+        return Err(ReadFailure::pre("anchored_alias_unavailable"));
     }
     Ok(base.join(child))
 }
@@ -962,7 +983,7 @@ mod tests {
 
     #[test]
     fn temporary_name_requires_canonical_uuid() {
-        let name = "runtime.prebind.tmp.aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let name = "runtime.prebind.json.tmp.aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         assert!(temporary_kind(name).is_some());
         assert!(valid_uuid(name.rsplit_once(".tmp.").unwrap().1));
         assert!(!valid_uuid("AAAAAAAA-bbbb-cccc-dddd-eeeeeeeeeeee"));
@@ -975,5 +996,40 @@ mod tests {
         assert!(!path.exists());
         assert!(app_path_and_home().is_ok());
         assert!(!path.exists());
+    }
+    #[test]
+    fn connected_socket_identity_does_not_require_path_inode_equality() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let dir = tempfile::tempdir().expect("temp namespace");
+        let socket_path = dir.path().join(SOCKET_FILE);
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let client = UnixStream::connect(&socket_path).expect("connect socket");
+        let (server, _) = listener.accept().expect("accept socket");
+        let dir_file = File::open(dir.path()).expect("open namespace");
+        let path_stat = fstatat(dir_file.as_raw_fd(), SOCKET_FILE).expect("stat socket");
+        let marker = PostbindMarker {
+            schema: 1,
+            pid: std::process::id(),
+            process_start_identity: String::new(),
+            prebind_instance_id: String::new(),
+            runtime_instance_id: String::new(),
+            runtime_epoch: String::new(),
+            namespace: String::new(),
+            socket_path: SOCKET_FILE.into(),
+            owner_uid: unsafe { libc::geteuid() },
+            socket_device: path_stat.st_dev as u64,
+            socket_inode: path_stat.st_ino as u64,
+            socket_creator_pid: std::process::id(),
+        };
+
+        assert!(validate_connected_socket(
+            server.as_raw_fd(),
+            dir_file.as_raw_fd(),
+            &marker,
+            unsafe { libc::geteuid() },
+        )
+        .is_ok());
+        drop(client);
     }
 }

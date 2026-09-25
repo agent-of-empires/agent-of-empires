@@ -104,6 +104,15 @@ impl ReadFailure {
         }
     }
 
+    pub(crate) fn post_no_close(code: &'static str) -> Self {
+        Self {
+            code,
+            exit: 4,
+            exact: None,
+            attempt_close: false,
+        }
+    }
+
     pub(crate) fn exit(exit: i32, message: &'static str) -> Self {
         Self {
             code: "renderer_internal",
@@ -202,7 +211,7 @@ async fn execute_inner(
                 ),
             )
             .await
-            .map_err(|_| ReadFailure::post("unavailable"))?;
+            .map_err(|_| ReadFailure::pre("establishment_timeout"))?;
             let (stream, _) = connected.map_err(map_upgrade_error)?;
             let exchange_deadline = connection_deadline(Instant::now());
             exchange_stream(
@@ -269,30 +278,17 @@ where
 {
     let hello_bytes = match read_application(&mut stream).await {
         Ok(bytes) => bytes,
-        Err(error) if !error.attempt_close => return Err(error),
-        Err(error) => return finish_with_close(&mut stream, deadline, Err(error)).await,
+        Err(error) => return Err(error),
     };
     let hello = match parse_hello(&hello_bytes) {
         Ok(hello) => hello,
         Err(HelloParseError::ProtocolVersion) => {
-            return finish_with_close(
-                &mut stream,
-                deadline,
-                Err(ReadFailure::post("protocol_mismatch")),
-            )
-            .await
+            return Err(ReadFailure::post_no_close("protocol_mismatch"))
         }
-        Err(HelloParseError::Schema) => {
-            return finish_with_close(
-                &mut stream,
-                deadline,
-                Err(ReadFailure::post("schema_invalid")),
-            )
-            .await
-        }
+        Err(HelloParseError::Schema) => return Err(ReadFailure::post_no_close("schema_invalid")),
     };
     if let Err(code) = validate_hello(&hello) {
-        return finish_with_close(&mut stream, deadline, Err(ReadFailure::post(code))).await;
+        return Err(ReadFailure::post_no_close(code));
     }
     if let ExpectedPeer::Local(identity) = &expected {
         if hello.namespace != identity.namespace
@@ -301,19 +297,13 @@ where
             || hello.runtime_epoch != identity.runtime_epoch
             || hello.owner.uid != Some(identity.owner_uid)
         {
-            return finish_with_close(
-                &mut stream,
-                deadline,
-                Err(ReadFailure::post("peer_identity")),
-            )
-            .await;
+            return Err(ReadFailure::post_no_close("peer_identity"));
         }
     }
 
     let snapshot_bytes = match read_application(&mut stream).await {
         Ok(bytes) => bytes,
-        Err(error) if !error.attempt_close => return Err(error),
-        Err(error) => return finish_with_close(&mut stream, deadline, Err(error)).await,
+        Err(error) => return Err(error),
     };
     let snapshot = match parse_snapshot(&snapshot_bytes) {
         Ok(snapshot) => snapshot,

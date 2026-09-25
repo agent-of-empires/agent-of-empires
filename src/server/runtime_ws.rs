@@ -164,8 +164,6 @@ impl RuntimeState {
 /// minted once and reused by every Hello this process emits.
 static RUNTIME: LazyLock<RuntimeState> = LazyLock::new(RuntimeState::new);
 
-/// Commit one successful sample and project the freshness the client gates on.
-/// The counter is checked before any increment, so neither it nor the cursor wraps.
 fn publish_freshness(runtime: &RuntimeState) -> (StatusFreshness, u64) {
     let mut sampler = runtime
         .sampler
@@ -178,14 +176,17 @@ fn publish_freshness(runtime: &RuntimeState) -> (StatusFreshness, u64) {
         sampler.latched = true;
         return (unavailable(), 0);
     };
+    let Some(cursor) = next.checked_add(1) else {
+        sampler.latched = true;
+        return (unavailable(), 0);
+    };
     sampler.successes = next;
     (
-        // Assigned from the committing clock, truncated to whole UTC seconds.
         StatusFreshness::Observed {
             revision: next,
             observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         },
-        next + 1,
+        cursor,
     )
 }
 
@@ -458,10 +459,14 @@ fn add_session_projects(
 
 /// The one canonical absolute-path grammar the wire contract requires.
 fn canonical_absolute_path(value: &str) -> bool {
-    value.starts_with('/')
-        && value.split('/').skip(1).all(|component| {
-            !component.is_empty() && component != "." && component != ".." && valid_text(component)
-        })
+    value == "/"
+        || (value.starts_with('/')
+            && value.split('/').skip(1).all(|component| {
+                !component.is_empty()
+                    && component != "."
+                    && component != ".."
+                    && valid_text(component)
+            }))
 }
 
 /// Rejected everywhere a value can reach a rendered template: C0/C1 controls,

@@ -127,9 +127,15 @@ fn parse_endpoint(raw: &str) -> Result<(String, bool), ReadFailure> {
         return Err(invalid());
     }
 
-    let (rest, secure) = if raw.len() >= 7 && raw[..7].eq_ignore_ascii_case("http://") {
+    let (rest, secure) = if raw
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
         (&raw[7..], false)
-    } else if raw.len() >= 8 && raw[..8].eq_ignore_ascii_case("https://") {
+    } else if raw
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
         (&raw[8..], true)
     } else {
         return Err(invalid());
@@ -284,6 +290,9 @@ mod tests {
             "https://example.test/a/%2F/b",
             "https://example.test/a\\b",
             "https://example.test:99999/",
+            "http\u{1F600}",
+            "https\u{20AC}",
+            "http://ééé",
         ] {
             assert!(parse_endpoint(raw).is_err(), "{raw}");
         }

@@ -23,11 +23,11 @@ pub(crate) fn evaluate(
     match command {
         ScopedCommand::List(args) => render_list(args, snapshot, source, local_home),
         ScopedCommand::Status(args) => render_status(args, snapshot, source, local_home),
-        ScopedCommand::Show(args) => render_show(args, snapshot, source),
+        ScopedCommand::Show(args) => render_show(args, snapshot, source, local_home),
         ScopedCommand::ListTrash => render_trash(snapshot, source),
         ScopedCommand::GroupList(args) => render_groups(args, snapshot, source),
         ScopedCommand::Profile => render_profiles(snapshot),
-        ScopedCommand::ProjectList(args) => render_projects(args, snapshot, source),
+        ScopedCommand::ProjectList(args) => render_projects(args, snapshot, source, local_home),
     }
 }
 
@@ -128,7 +128,6 @@ fn render_list(
     for (session, depth) in tree_order(&sessions) {
         push_table_row(&mut output, session, depth, show_state, local_home);
     }
-    output.push_str(&format!("\nTotal: {} sessions\n", sessions.len()));
     Ok(output)
 }
 
@@ -429,18 +428,19 @@ fn render_show(
     args: &ShowArgs,
     snapshot: &SnapshotData,
     source: &super::endpoint::ReadRequestSource,
+    local_home: Option<&Path>,
 ) -> Result<String, ReadFailure> {
     let identifier = args
         .identifier()
         .ok_or_else(|| ReadFailure::exit(2, "identifier required in daemon read mode\n"))?;
     let profile_name = selected_profile(snapshot, source)?;
     let profile = profile(snapshot, profile_name)?;
-    let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, profile_name).collect();
-    let session = find_session(&sessions, identifier)?;
     require_selected_profile_health(snapshot, profile, true)?;
     if !freshness_observed(&snapshot.status_freshness) {
         return Err(ReadFailure::post("freshness_unavailable"));
     }
+    let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, profile_name).collect();
+    let session = find_session(&sessions, identifier)?;
 
     if args.json {
         #[derive(Serialize)]
@@ -490,7 +490,7 @@ fn render_show(
         "Session: {}\n  ID:      {}\n  Path:    {}\n  Group:   {}\n  Tool:    {}\n  Command: {}\n  Status:  {}\n",
         session.title,
         session.id,
-        session.project_path,
+        collapse_home(&session.project_path, local_home),
         session.group_path,
         session.tool,
         session.command,
@@ -690,9 +690,10 @@ fn render_projects(
     args: &ProjectListArgs,
     snapshot: &SnapshotData,
     source: &super::endpoint::ReadRequestSource,
+    local_home: Option<&Path>,
 ) -> Result<String, ReadFailure> {
     let scope = args.scope();
-    let (profile_name, projects) = match scope {
+    let (_profile_name, projects) = match scope {
         ScopeFilter::Global => {
             if !component_healthy(&snapshot.health.global_metadata) {
                 return Err(ReadFailure::post("health_degraded"));
@@ -728,7 +729,6 @@ fn render_projects(
             (Some(name), by_path.into_values().collect())
         }
     };
-    let _ = profile_name;
     let mut projects = projects;
     projects.sort_by(|left, right| (&left.name, &left.path).cmp(&(&right.name, &right.path)));
     if args.json() {
@@ -760,7 +760,7 @@ fn render_projects(
             "  • {} [{}]  {}\n",
             project.name,
             project.scope.as_str(),
-            project.path
+            collapse_home(&project.path, local_home)
         ));
         if let Some(branch) = &project.default_base_branch {
             output.push_str(&format!("      base branch: {branch}\n"));
