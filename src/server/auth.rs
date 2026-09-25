@@ -244,13 +244,6 @@ fn should_refresh_session_cookie(path: &str) -> bool {
     !is_login_session_exempt(path)
 }
 
-/// `/api/login` is the only route where a valid bootstrap credential is not
-/// the completed authentication result: the request still has to pass the
-/// passphrase check in `login_handler`, which alone may clear the IP budget.
-fn should_record_auth_success(path: &str) -> bool {
-    path != "/api/login"
-}
-
 /// Decision for the post-token branch of `auth_middleware`: a request
 /// validated its bearer token but did not present an `aoe_session`
 /// cookie + device binding. When passphrase login is on, that would
@@ -732,7 +725,7 @@ pub async fn auth_middleware(
     }
 
     // Rate limit check BEFORE token validation
-    if let Some(remaining_secs) = state.rate_limiter.check_locked(client_ip).await {
+    if let Some(remaining_secs) = state.rate_limiter.check_locked_any(client_ip).await {
         tracing::warn!(
             target: "auth.rate_limit",
             ip = %client_ip,
@@ -832,7 +825,10 @@ pub async fn auth_middleware(
         if !is_api_or_ws {
             return next.run(request).await;
         }
-        let locked = state.rate_limiter.record_failure(client_ip).await;
+        let locked = state
+            .rate_limiter
+            .record_failure(client_ip, super::rate_limit::AuthBudget::Token)
+            .await;
         let reason =
             if extract_tokens(&request).is_empty() && extract_ws_protocols(&request).is_empty() {
                 "missing"
@@ -858,9 +854,12 @@ pub async fn auth_middleware(
     };
 
     let path = request.uri().path().to_string();
-    if should_record_auth_success(&path) {
-        state.rate_limiter.record_success(client_ip).await;
-    }
+    // A valid token clears the token budget only; the passphrase budget is
+    // cleared by the passphrase check itself, never by carrying a token.
+    state
+        .rate_limiter
+        .record_success(client_ip, super::rate_limit::AuthBudget::Token)
+        .await;
     tracing::trace!(
         target: "auth.middleware",
         ip = %client_ip,
@@ -947,10 +946,11 @@ async fn handle_session_authenticated(
     next: Next,
     session_id: String,
 ) -> Response {
-    let path = request.uri().path();
-    if should_record_auth_success(path) {
-        state.rate_limiter.record_success(client_ip).await;
-    }
+    // A bound session is a token-budget success, not a passphrase one.
+    state
+        .rate_limiter
+        .record_success(client_ip, super::rate_limit::AuthBudget::Token)
+        .await;
     tracing::trace!(
         target: "auth.middleware",
         ip = %client_ip,

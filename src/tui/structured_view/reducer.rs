@@ -302,14 +302,19 @@ impl AcpTranscript {
         }
         self.last_seq = seq;
 
-        self.background_agent_active = state.has_active_background_agent();
+        let holds = |field: &str| unchanged.iter().any(|f| f == field);
+        // `background_agents` is a cold field: the server omits it while it
+        // is unchanged, so an omitted frame means "same as you hold", not
+        // "no sub-agent running". Read it before the moves below.
+        if !holds("background_agents") {
+            self.background_agent_active = state.has_active_background_agent();
+        }
         self.agent_name = Some(state.agent.0);
         self.turn_active = state.turn_active;
         self.steering = state.steering;
         self.cancelling = state.cancelling;
         self.compacting = state.compacting;
         self.usage = state.usage;
-        let holds = |field: &str| unchanged.iter().any(|f| f == field);
         if !holds("available_commands") {
             self.available_commands = state.available_commands;
         }
@@ -671,6 +676,36 @@ mod tests {
         t.apply_reduced_state(1, state, &[]);
         assert!(!t.turn_active);
         assert!(t.background_agent_active);
+    }
+
+    /// `background_agents` rides the same cold-field elision as the pickers:
+    /// a frame that omits it while it is unchanged must not read as "no
+    /// sub-agent running", or a still-busy shelf loses its indicator.
+    #[test]
+    fn an_omitted_background_agents_field_keeps_the_busy_signal() {
+        let mut t = AcpTranscript::new("s-1");
+        let launched = reduced(&[Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "map backend".into(),
+            prompt: "do the thing".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/a1.output".into(),
+            started_at: chrono::Utc::now(),
+        }]);
+        t.apply_reduced_state(1, launched, &[]);
+        assert!(t.background_agent_active);
+
+        // The sub-agent list is unchanged, so the server omits the field.
+        t.apply_reduced_state(2, reduced(&[]), &["background_agents".to_string()]);
+        assert!(
+            t.background_agent_active,
+            "an omitted cold field must keep the held value"
+        );
+
+        // A frame that does not name it is authoritative, including empty.
+        t.apply_reduced_state(3, reduced(&[]), &[]);
+        assert!(!t.background_agent_active);
     }
 
     /// A snapshot that races live deltas must not rewind the view.

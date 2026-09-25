@@ -525,18 +525,36 @@ pub(crate) async fn spawn_structured_session(
             return Err(error);
         }
 
-        let namespace = runtime.block_on(worker_state.profile_namespace.read());
-        let submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
-        let guard = lock.blocking_lock();
-        native.check_available()?;
-        let title_lock = crate::session::acquire_session_title_lock(&instance.id)?;
-        let lifecycle_lock = native.storage().acquire_instance_lifecycle_lock(&instance.id)?;
-        instance.prepare_reserved_launch_hooks(store, false, crate::session::LaunchReservation {
-            generation, title_lock, lifecycle_lock,
-        })?;
-        drop(guard);
-        drop(submission);
-        drop(namespace);
+        let launch_reservation = {
+            let namespace = runtime.block_on(worker_state.profile_namespace.read());
+            let submission =
+                runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
+            let guard = lock.blocking_lock();
+            let reservation = (|| -> anyhow::Result<()> {
+                native.check_available()?;
+                let title_lock = crate::session::acquire_session_title_lock(&instance.id)?;
+                let lifecycle_lock =
+                    native.storage().acquire_instance_lifecycle_lock(&instance.id)?;
+                instance.prepare_reserved_launch_hooks(
+                    store,
+                    false,
+                    crate::session::LaunchReservation {
+                        generation,
+                        title_lock,
+                        lifecycle_lock,
+                    },
+                )?;
+                Ok(())
+            })();
+            drop(guard);
+            drop(submission);
+            drop(namespace);
+            reservation
+        };
+        if let Err(error) = launch_reservation {
+            rollback(native, instance, false);
+            return Err(error);
+        }
 
         creation_guard.phase(CreationPhase::LaunchHooks);
         let hooks = instance.run_pre_launch_hooks(false, store, Some(&creation_progress));

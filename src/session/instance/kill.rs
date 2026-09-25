@@ -291,8 +291,19 @@ impl Instance {
     }
 
     fn kill_all_tmux_sessions_uncoordinated(&self) -> Result<()> {
-        self.kill_locked()?;
-        self.kill_ancillary_tmux_sessions_locked()
+        // The ancillary sessions run their own processes, so they are reaped
+        // even when the agent kill fails: short-circuiting leaks a shell per
+        // failed kill. The agent failure is what the caller reports.
+        let agent = self.kill_locked();
+        let ancillary = self.kill_ancillary_tmux_sessions_locked();
+        match (agent, ancillary) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(ancillary)) => Err(ancillary).context("ancillary tmux teardown failed"),
+            (Err(agent), Ok(())) => Err(agent),
+            (Err(agent), Err(ancillary)) => Err(agent.context(format!(
+                "ancillary tmux teardown also failed: {ancillary:#}"
+            ))),
+        }
     }
 
     pub(crate) fn kill_ancillary_tmux_sessions_locked(&self) -> Result<()> {
@@ -699,5 +710,47 @@ mod tests {
         assert_eq!(row.resume_intent, ResumeIntent::Use(pinned.into()));
         assert_eq!(row.status, Status::Stopped);
         assert!(!sidecar.exists());
+    }
+
+    /// The ancillary sessions (web terminal, container terminal, tool
+    /// sub-sessions) hold their own processes, so a failed agent kill must
+    /// still reap them: short-circuiting on that error leaks a shell per
+    /// failed kill. The agent failure is still what the caller is told.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn a_failed_agent_kill_still_reaps_ancillary_sessions() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env_read = crate::session::test_support::EnvGuard::read_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let inst = Instance::new("Ancillary teardown", temp.path().to_str().unwrap());
+        let terminal = crate::tmux::TerminalSession::generate_name(&inst.id, "web terminal");
+        let reaped = temp.path().join("ancillary-reaped");
+        let reaped_marker = reaped.display().to_string();
+        // A tmux that reports the web terminal as live, refuses the agent
+        // session with a real (not "absent") failure, and reaps the terminal.
+        let shim = temp.path().join("tmux");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\ncase \" $* \" in\n  *\" list-sessions \"*) printf '%s\\n' '{terminal}'; exit 0 ;;\nesac\ncase \" $* \" in\n  *\" kill-session \"*)\n    case \"$*\" in\n      *'={terminal}'*) : > '{reaped_marker}'; exit 0 ;;\n    esac\n    echo 'permission denied' >&2\n    exit 1\n    ;;\nesac\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            temp.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _guard = crate::session::test_support::EnvGuard::set(&[("PATH", path)]);
+
+        inst.kill_all_tmux_sessions_locked()
+            .expect_err("the refused agent kill is reported to the caller");
+        assert!(
+            reaped.exists(),
+            "the ancillary session must be reaped even when the agent kill fails"
+        );
     }
 }

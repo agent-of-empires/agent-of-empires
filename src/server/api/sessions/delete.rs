@@ -143,33 +143,45 @@ async fn finish_structured_purge(state: &AppState, id: &str) -> anyhow::Result<(
 
 /// Retry every committed purge whose row was removed before cleanup could be
 /// proven. The durable plan is removed only by `finish_recovered` after all
-/// resource stages succeed.
+/// resource stages succeed. A pass attempts each journal owner at most once,
+/// so a permanently failing owner cannot spin the loop; the periodic caller
+/// retries it, and the failing owner stays in the journal.
 pub(crate) async fn recover_pending_purges(state: &Arc<AppState>) {
     if state.read_only {
         return;
     }
     let _namespace = state.profile_namespace.read().await;
+    let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
     loop {
-        let committed = match tokio::task::spawn_blocking(
-            crate::session::deletion::recover_committed_purge,
-        )
+        let selection = match tokio::task::spawn_blocking(move || {
+            let mut attempted = attempted;
+            let committed = crate::session::deletion::recover_committed_purge(&mut attempted);
+            (committed, attempted)
+        })
         .await
         {
-            Ok(Ok(Some(committed))) => committed,
-            Ok(Ok(None)) => break,
-            Ok(Err(error)) => {
-                tracing::warn!(target: "session.purge_recovery", %error, "pending purge recovery retained");
-                break;
-            }
+            Ok(selection) => selection,
             Err(error) => {
                 tracing::warn!(target: "session.purge_recovery", %error, "pending purge recovery worker failed");
                 break;
             }
         };
+        let (selection, returned_attempts) = selection;
+        attempted = returned_attempts;
+        let committed = match selection {
+            Ok(Some(committed)) => committed,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(target: "session.purge_recovery", %error, "pending purge recovery retained");
+                break;
+            }
+        };
+        let token = committed.owner_token().to_owned();
         let id = committed.session_id().to_owned();
         let structured = committed.is_structured();
         if structured {
             if let Err(error) = finish_structured_purge(state, &id).await {
+                attempted.insert(token);
                 tracing::warn!(target: "session.purge_recovery", session_id = %id, %error, "structured shutdown unproven; purge retained");
                 continue;
             }
@@ -182,6 +194,7 @@ pub(crate) async fn recover_pending_purges(state: &Arc<AppState>) {
             }
         };
         if !result.success {
+            attempted.insert(token);
             tracing::warn!(target: "session.purge_recovery", session_id = %id, errors = ?result.errors, "purge cleanup incomplete; owner retained");
             continue;
         }

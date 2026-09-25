@@ -1,5 +1,6 @@
 //! Shared session deletion logic used by CLI, TUI, and web server.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -234,10 +235,8 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                         !selection.matches_location(stored, store.storage().profile())
                             || selection.lifecycle_generation != stored.lifecycle_generation
                     })
-                    || creation_generation.is_some_and(|generation| {
-                        !stored
-                            .lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation)
-                    })
+                    || creation_generation
+                        .is_some_and(|generation| !stored.creation_rollback_is_owned(generation))
                     || creation_generation.is_some_and(|_| {
                         stored.project_path != request.instance.project_path
                             || stored
@@ -813,13 +812,26 @@ impl<S: SessionStore> CommittedPurge<S> {
     pub(crate) fn is_structured(&self) -> bool {
         self.request.instance.is_structured()
     }
+
+    /// Durable journal token of the owner backing this purge, so a caller can
+    /// record that it already attempted this owner during a recovery pass.
+    pub(crate) fn owner_token(&self) -> &str {
+        self.owner.token()
+    }
 }
 
-/// Rebuild the first durable committed purge whose row is still absent. The
-/// caller retains the returned identity and lifecycle locks across any
-/// structured shutdown and the idempotent resource cleanup.
-pub(crate) fn recover_committed_purge() -> Result<Option<CommittedPurge<Storage>>> {
+/// Rebuild the first durable committed purge whose row is still absent and
+/// whose owner token is not in `attempted`. The caller retains the returned
+/// identity and lifecycle locks across any structured shutdown and the
+/// idempotent resource cleanup, and adds the selected token to `attempted` so
+/// a failing owner is never reselected within the same pass.
+pub(crate) fn recover_committed_purge(
+    attempted: &mut HashSet<String>,
+) -> Result<Option<CommittedPurge<Storage>>> {
     for plan in super::purge_owners::recovery_plans()? {
+        if attempted.contains(&plan.token) {
+            continue;
+        }
         let owner_token = plan.token.clone();
         let profile_name = plan.profile.clone();
         let request_plan = plan.request.clone();
@@ -852,12 +864,15 @@ pub(crate) fn recover_committed_purge() -> Result<Option<CommittedPurge<Storage>
         })();
         match attempt {
             Ok(committed) => return Ok(Some(committed)),
-            Err(error) => tracing::warn!(
-                target: "session.purge_recovery",
-                owner_token = %owner_token,
-                %error,
-                "pending purge owner is not currently recoverable; trying the next owner"
-            ),
+            Err(error) => {
+                attempted.insert(owner_token.clone());
+                tracing::warn!(
+                    target: "session.purge_recovery",
+                    owner_token = %owner_token,
+                    %error,
+                    "pending purge owner is not currently recoverable; trying the next owner"
+                );
+            }
         }
     }
     Ok(None)
@@ -2636,7 +2651,7 @@ mod tests {
         )
         .unwrap();
 
-        let committed = recover_committed_purge()
+        let committed = recover_committed_purge(&mut HashSet::new())
             .unwrap()
             .expect("the owner after the impossible legacy plan must be recovered");
         assert_eq!(committed.session_id(), recoverable_id);
@@ -2645,11 +2660,93 @@ mod tests {
             result.success,
             "the recoverable owner must finish: {result:?}"
         );
-        assert!(recover_committed_purge().unwrap().is_none());
+        assert!(recover_committed_purge(&mut HashSet::new())
+            .unwrap()
+            .is_none());
         assert_eq!(
             super::super::purge_owners::recovery_plans().unwrap().len(),
             1
         );
+    }
+    #[test]
+    #[serial_test::serial]
+    fn a_failed_owner_is_never_reselected_within_one_recovery_pass() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir().unwrap();
+        super::super::purge_owners::initialize(&root).unwrap();
+        let profile = "recovery-single-attempt-per-pass";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|instances, _| {
+                *instances = Vec::new();
+                Ok(())
+            })
+            .unwrap();
+
+        let mut blocked = create_test_instance();
+        blocked.title = "blocked owner".into();
+        blocked.project_path = "/tmp/blocked-single-attempt".into();
+        let _blocked_owner = super::super::purge_owners::PurgeOwner::record(
+            &storage,
+            &blocked,
+            super::super::purge_owners::PurgeCapture::new(&blocked).unwrap(),
+        )
+        .unwrap();
+
+        let mut pending = create_test_instance();
+        pending.title = "pending owner".into();
+        pending.project_path = "/tmp/pending-single-attempt".into();
+        let request = DeletionRequest {
+            session_id: pending.id.clone(),
+            instance: pending.clone(),
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: true,
+            detach_hooks: true,
+            keep_scratch: false,
+        };
+        let _pending_owner = super::super::purge_owners::PurgeOwner::record_plan(
+            &storage,
+            &pending,
+            pending.lifecycle_generation,
+            Some(&request),
+            None,
+            super::super::purge_owners::PurgeCapture::new(&pending).unwrap(),
+        )
+        .unwrap();
+
+        let mut attempted = HashSet::new();
+        let committed = recover_committed_purge(&mut attempted)
+            .unwrap()
+            .expect("the recoverable owner is selected on the first pass");
+        assert_eq!(committed.session_id(), request.session_id);
+        let pending_token = committed.owner_token().to_owned();
+        // Release the identity and lifecycle locks this selection took, so a
+        // later pass can take them again.
+        drop(committed);
+        // A caller whose cleanup stage fails records the attempt, exactly as the
+        // server recovery pass does, so the same owner is never reselected.
+        attempted.insert(pending_token.clone());
+        assert!(
+            recover_committed_purge(&mut attempted).unwrap().is_none(),
+            "an attempted owner must not be handed out again inside the same pass"
+        );
+        assert_eq!(
+            attempted.len(),
+            2,
+            "both durable owners were attempted exactly once"
+        );
+        assert_eq!(
+            super::super::purge_owners::recovery_plans().unwrap().len(),
+            2,
+            "a failed recovery attempt retains its durable owner"
+        );
+        // A later pass starts from a fresh attempt set and retries the owner.
+        let retried = recover_committed_purge(&mut HashSet::new())
+            .unwrap()
+            .expect("a later pass retries the retained owner");
+        assert_eq!(retried.owner_token(), pending_token);
     }
     #[test]
     #[serial_test::serial]
@@ -2732,7 +2829,9 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(recover_committed_purge().unwrap().is_none());
+        assert!(recover_committed_purge(&mut HashSet::new())
+            .unwrap()
+            .is_none());
         assert!(!super::super::purge_owners::protection(&storage, None)
             .unwrap()
             .is_empty());
@@ -2743,7 +2842,7 @@ mod tests {
             })
             .unwrap();
 
-        let recovered = recover_committed_purge()
+        let recovered = recover_committed_purge(&mut HashSet::new())
             .unwrap()
             .expect("durable purge retry");
         let result = recovered.finish_recovered();
@@ -2896,6 +2995,139 @@ mod tests {
         assert_eq!(result.disposition, DeletionDisposition::Removed);
         assert!(storage.load().unwrap().is_empty());
         assert!(!scratch.exists());
+    }
+
+    /// A post-launch failure releases the launch reservation before the
+    /// rollback runs, so requiring reservation ownership would reject the
+    /// rollback of the very row the creation published and strand every
+    /// resource it provisioned.
+    #[test]
+    #[serial_test::serial]
+    fn creation_rollback_survives_the_released_launch_reservation() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let profile = "creation-rollback-post-launch";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut instance = create_test_instance();
+        instance.source_profile = profile.into();
+        let scratch = crate::session::scratch::provision_scratch_dir(&instance.id).unwrap();
+        instance.project_path = scratch.to_string_lossy().into_owned();
+        instance.scratch = true;
+        instance.status = crate::session::Status::Starting;
+        let generation = instance
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Launch,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                Utc::now(),
+            )
+            .unwrap();
+        let marker = scratch.join("owned");
+        std::fs::write(&marker, "creation resource").unwrap();
+        let mut published = instance.clone();
+        assert!(published
+            .release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation));
+        storage
+            .update(|rows, _| {
+                rows.push(published.clone());
+                Ok(())
+            })
+            .unwrap();
+        let result = match PurgeTransaction::reserve_failed_creation(
+            Storage::open_unwatched(profile).unwrap(),
+            DeletionRequest {
+                session_id: published.id.clone(),
+                instance: published,
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: true,
+                detach_hooks: true,
+                keep_scratch: false,
+            },
+            generation,
+        )
+        .unwrap()
+        {
+            PurgeReservation::Reserved(transaction) => transaction.complete(),
+            PurgeReservation::Rejected(result) => panic!(
+                "a released launch reservation must not block the rollback: {:?}",
+                result.errors
+            ),
+        };
+        assert_eq!(result.disposition, DeletionDisposition::Removed);
+        assert!(storage.load().unwrap().is_empty());
+        assert!(
+            !scratch.exists(),
+            "the failed creation left no scratch behind"
+        );
+    }
+
+    /// The weaker proof must stay fail-closed: once another owner has taken
+    /// the row under a newer generation, the failing creation owns nothing
+    /// and its rollback is refused.
+    #[test]
+    #[serial_test::serial]
+    fn creation_rollback_refuses_a_row_a_later_owner_took() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let profile = "creation-rollback-later-owner";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut instance = create_test_instance();
+        instance.source_profile = profile.into();
+        let scratch = crate::session::scratch::provision_scratch_dir(&instance.id).unwrap();
+        instance.project_path = scratch.to_string_lossy().into_owned();
+        instance.scratch = true;
+        instance.status = crate::session::Status::Starting;
+        let generation = instance
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Launch,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                Utc::now(),
+            )
+            .unwrap();
+        let marker = scratch.join("owned");
+        std::fs::write(&marker, "creation resource").unwrap();
+        let mut taken = instance.clone();
+        taken.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
+        let foreign = taken
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Stop,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                Utc::now(),
+            )
+            .unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(taken.clone());
+                Ok(())
+            })
+            .unwrap();
+        let rejected = PurgeTransaction::reserve_failed_creation(
+            Storage::open_unwatched(profile).unwrap(),
+            DeletionRequest {
+                session_id: taken.id.clone(),
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: true,
+                instance,
+                detach_hooks: true,
+                keep_scratch: false,
+            },
+            generation,
+        )
+        .unwrap();
+        match rejected {
+            PurgeReservation::Rejected(result) => {
+                assert_eq!(result.disposition, DeletionDisposition::Busy)
+            }
+            PurgeReservation::Reserved(_) => {
+                panic!("a superseded creation took rollback ownership from generation {foreign}")
+            }
+        }
+        assert!(marker.exists());
+        assert!(storage.load().unwrap()[0]
+            .lifecycle_reservation_is_owned(LifecycleOperation::Stop, foreign));
     }
 
     #[test]

@@ -115,6 +115,20 @@ impl Instance {
             )
     }
 
+    /// Whether a failed creation still owns its durable row, so its rollback
+    /// may run. Launch reservation ownership is not usable as proof: every
+    /// post-launch failure releases that reservation first. The row is ours
+    /// when its durable generation is the one the creation published and any
+    /// reservation still present belongs to that same generation; a newer
+    /// generation means another owner took it, and the rollback is refused.
+    pub fn creation_rollback_is_owned(&self, generation: u64) -> bool {
+        self.lifecycle_generation == generation
+            && self
+                .lifecycle_reservation
+                .as_ref()
+                .is_none_or(|reservation| reservation.generation == generation)
+    }
+
     pub fn has_fresh_lifecycle_reservation(&self, now: DateTime<Utc>) -> bool {
         matches!(
             &self.lifecycle_reservation,

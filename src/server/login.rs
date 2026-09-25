@@ -793,7 +793,11 @@ pub async fn login_handler(
     }
 
     // Rate limit check
-    if let Some(remaining) = state.rate_limiter.check_locked(client_ip).await {
+    if let Some(remaining) = state
+        .rate_limiter
+        .check_locked(client_ip, super::rate_limit::AuthBudget::Passphrase)
+        .await
+    {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("Retry-After", remaining.to_string())],
@@ -842,7 +846,10 @@ pub async fn login_handler(
     );
 
     if state.login_manager.verify_passphrase(&login_req.passphrase) {
-        state.rate_limiter.record_success(client_ip).await;
+        state
+            .rate_limiter
+            .record_success(client_ip, super::rate_limit::AuthBudget::Passphrase)
+            .await;
 
         // Captured for the persisted session's connected-devices label
         // and reused for the new-login push below. Display-only.
@@ -878,7 +885,10 @@ pub async fn login_handler(
 
         response
     } else {
-        let locked = state.rate_limiter.record_failure(client_ip).await;
+        let locked = state
+            .rate_limiter
+            .record_failure(client_ip, super::rate_limit::AuthBudget::Passphrase)
+            .await;
         tracing::warn!(
             target: "auth.passphrase",
             ip = %client_ip,
@@ -957,7 +967,11 @@ pub async fn elevate_handler(
             .into_response();
     }
 
-    if let Some(remaining) = state.rate_limiter.check_locked(client_ip).await {
+    if let Some(remaining) = state
+        .rate_limiter
+        .check_locked(client_ip, super::rate_limit::AuthBudget::Passphrase)
+        .await
+    {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("Retry-After", remaining.to_string())],
@@ -988,7 +1002,10 @@ pub async fn elevate_handler(
         .login_manager
         .verify_passphrase(&elevate_req.passphrase)
     {
-        let ip_locked = state.rate_limiter.record_failure(client_ip).await;
+        let ip_locked = state
+            .rate_limiter
+            .record_failure(client_ip, super::rate_limit::AuthBudget::Passphrase)
+            .await;
         let session_locked = state
             .login_manager
             .record_elevation_failure(&session_id)
@@ -1011,7 +1028,10 @@ pub async fn elevate_handler(
             .into_response();
     }
 
-    state.rate_limiter.record_success(client_ip).await;
+    state
+        .rate_limiter
+        .record_success(client_ip, super::rate_limit::AuthBudget::Passphrase)
+        .await;
     let elevated = state.login_manager.elevate_session(&session_id).await;
     if !elevated {
         return (
