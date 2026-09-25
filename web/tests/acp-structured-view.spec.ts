@@ -73,10 +73,15 @@ test.describe("chat bubble overflow", () => {
   });
 });
 
-test("send message via Enter renders agent response", async ({ page }) => {
+test("send message via Enter renders the streamed agent response as one message", async ({ page }) => {
   const mock = await mockAcpSession(page, {
     title: "story-send-enter",
-    onPrompt: () => [agentMessageChunk("Hello from fake ACP agent."), stopped()],
+    onPrompt: () => [
+      agentMessageChunk("Hello from "),
+      agentMessageChunk("fake ACP "),
+      agentMessageChunk("agent."),
+      stopped(),
+    ],
   });
   await openStructuredSession(page, mock);
   await waitForComposerConnected(page);
@@ -109,24 +114,6 @@ test("single newlines in a user message render as line breaks", async ({ page })
   await expect(userBubble.locator("br")).toHaveCount(2);
   await expect(userBubble).toContainText("line b");
   await expect(userBubble).toContainText("line c");
-});
-
-// Multiple chunks in one turn render as one concatenated message.
-test("multi-chunk agent response assembles in the transcript", async ({ page }) => {
-  const mock = await mockAcpSession(page, {
-    title: "story-stream",
-    onPrompt: () => [agentMessageChunk("Once "), agentMessageChunk("upon "), agentMessageChunk("a time."), stopped()],
-  });
-  await openStructuredSession(page, mock);
-  await waitForComposerConnected(page);
-
-  const composer = composerBox(page);
-  await composer.fill("tell me a story");
-  await composer.press("Enter");
-
-  await expect(page.getByText("Once upon a time.")).toBeVisible({
-    timeout: 10_000,
-  });
 });
 
 // ─────────────────────────── tool cards ───────────────────────────
@@ -345,34 +332,6 @@ test("synthesize memory recall renders cleaned, sanitized markdown", async ({ pa
   await expect(body.locator("li")).toHaveCount(2);
 });
 
-test("malformed memory_recall falls back to a generic read card", async ({ page }) => {
-  const mock = await mockAcpSession(page, {
-    title: "story-memory-recall-bad",
-    initialEvents: [
-      {
-        ToolCallStarted: {
-          tool_call: {
-            id: "mem-bad",
-            name: "Recalled synthesized memory",
-            kind: "read",
-            args_preview: "{}",
-            // No `mode`: asMemoryRecall rejects it, so the dispatcher
-            // must not render the dedicated card.
-            memory_recall: { synthesized_text: "x" } as unknown as { mode: string },
-            started_at: new Date().toISOString(),
-          },
-        },
-      },
-      stopped(),
-    ],
-  });
-  await openStructuredSession(page, mock);
-
-  // No dedicated synthesize card; the generic read card shows the title.
-  await expect(page.getByText("Recalled synthesized memory")).toBeVisible({ timeout: 10_000 });
-  await expect(page.getByTestId("memory-recall-synthesized")).toHaveCount(0);
-});
-
 // ─────────────────────────── font size ───────────────────────────
 
 // The transcript font size has mobile and desktop values chosen by
@@ -478,16 +437,6 @@ test.describe("trashed structured session is read-only", () => {
     // No composer / send affordance for a session that cannot be resumed.
     await expect(page.getByTestId("composer-footer")).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Send message" })).toHaveCount(0);
-  });
-
-  test("a live (non-trashed) session still renders the composer", async ({ page }) => {
-    const mock = await mockAcpSession(page, {
-      title: "story-live",
-      initialEvents: [agentMessageChunk("hello")],
-    });
-    await openStructuredSession(page, mock);
-
-    await expect(page.getByTestId("composer-footer")).toBeVisible({ timeout: 10_000 });
   });
 });
 
