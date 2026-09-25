@@ -152,6 +152,7 @@ fn test_search_mode_enter_keeps_matches_for_cycling() {
     for expected in 1..n_matches {
         env.view.handle_key(key(KeyCode::Char('n')), None);
         assert_eq!(env.view.search_match_index, expected);
+        assert_eq!(env.view.cursor, env.view.search_matches[expected]);
     }
 
     env.view.handle_key(key(KeyCode::Char('n')), None);
@@ -268,22 +269,6 @@ fn test_search_matching_and_cursor() {
     env.view.search_query = Input::new("work".to_string());
     env.view.update_search();
     assert!(!env.view.search_matches.is_empty());
-}
-
-#[test]
-#[serial]
-fn test_search_n_cycles_forward() {
-    let mut env = create_test_env_with_sessions(5);
-    env.view.search_query = Input::new("session".to_string());
-    env.view.update_search();
-    let match_count = env.view.search_matches.len();
-    assert!(match_count > 1);
-
-    let first_cursor = env.view.cursor;
-    env.view.handle_key(key(KeyCode::Char('n')), None);
-    assert_eq!(env.view.search_match_index, 1);
-    // Cursor should have moved
-    assert_ne!(env.view.cursor, first_cursor);
 }
 
 #[test]

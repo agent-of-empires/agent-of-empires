@@ -383,6 +383,9 @@ mod tests {
             (&signed, json!("3"), false),
             (&lower_only, json!(1_000), true),
             (&lower_only, json!(-2), false),
+            (&K::Network, json!("egress-proxy"), true),
+            (&K::Network, json!("host"), false),
+            (&K::Network, json!(42), false),
             (&K::MemoryLimit, json!("512m"), true),
             (&K::MemoryLimit, json!(""), true),
             (&K::MemoryLimit, json!("512mb"), false),
@@ -454,14 +457,5 @@ mod tests {
         for (kind, value, ok) in cases {
             assert_eq!(validate_value(kind, &value).is_ok(), ok, "{kind:?} {value}");
         }
-    }
-
-    #[test]
-    fn network_grammar() {
-        assert!(validate_value(&ValidationKind::Network, &json!("")).is_ok());
-        assert!(validate_value(&ValidationKind::Network, &json!("none")).is_ok());
-        assert!(validate_value(&ValidationKind::Network, &json!("egress-proxy")).is_ok());
-        assert!(validate_value(&ValidationKind::Network, &json!("host")).is_err());
-        assert!(validate_value(&ValidationKind::Network, &json!(42)).is_err());
     }
 }

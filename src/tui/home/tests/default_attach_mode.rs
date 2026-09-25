@@ -91,11 +91,7 @@ fn enter_and_tab_route_by_default_attach_mode() {
             );
         }
         env.view.view_mode = view_mode.clone();
-        let action = if code == KeyCode::Enter {
-            env.view.activate_selected_session()
-        } else {
-            env.view.handle_key(key(code), None)
-        };
+        let action = env.view.handle_key(key(code), None);
         let ok = match expect {
             Expect::Attach => action == Some(Action::AttachSession(id.clone())),
             Expect::Live => action == Some(Action::EnterLiveSend(id.clone())),
