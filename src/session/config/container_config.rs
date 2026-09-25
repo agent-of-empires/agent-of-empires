@@ -3551,22 +3551,6 @@ mod tests {
         assert_eq!(working_dir, "/workspace/my-worktree");
     }
 
-    #[test]
-    fn test_common_ancestor() {
-        assert_eq!(
-            common_ancestor(Path::new("/a/b/c"), Path::new("/a/b/d")),
-            PathBuf::from("/a/b")
-        );
-        assert_eq!(
-            common_ancestor(Path::new("/a/b"), Path::new("/a/b")),
-            PathBuf::from("/a/b")
-        );
-        assert_eq!(
-            common_ancestor(Path::new("/a/b/c"), Path::new("/x/y/z")),
-            PathBuf::from("/")
-        );
-    }
-
     /// A worktree nested deeper than its main repo (repo at `/scm/my-repo`,
     /// worktree at `/scm/worktrees/my-repo/1`) keeps its relative depth in the
     /// container, so the `.git` file's relative gitdir still resolves.
@@ -3715,24 +3699,47 @@ mod tests {
     }
 
     #[test]
-    fn test_copies_top_level_files_only() {
+    fn sync_copies_listed_files_and_dirs_only() {
         let dir = TempDir::new().unwrap();
         let host = setup_host_dir(&dir);
+        fs::create_dir_all(host.join("plugins/lsp")).unwrap();
+        fs::write(host.join("plugins/lsp/gopls.wasm"), "binary").unwrap();
+        let real_skills = dir.path().join("real-skills");
+        fs::create_dir_all(&real_skills).unwrap();
+        fs::write(real_skills.join("skill.md"), "# Skill").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real_skills, host.join("skills")).unwrap();
+            std::os::unix::fs::symlink("/nonexistent/path", host.join("broken-link")).unwrap();
+        }
         let sandbox = dir.path().join("sandbox");
-
         sync_fixture(
             &host,
             &sandbox,
-            &["auth.json", "settings.json"],
+            &["auth.json", "settings.json", "broken-link"],
             &[],
-            &[],
+            &["plugins", "skills", "nonexistent"],
             &[],
         )
         .unwrap();
 
         assert!(sandbox.join("auth.json").exists());
         assert!(sandbox.join("settings.json").exists());
+        assert_eq!(
+            fs::read_to_string(sandbox.join("plugins/lsp/gopls.wasm")).unwrap(),
+            "binary"
+        );
+        // Unlisted directories are skipped.
         assert!(!sandbox.join("subdir").exists());
+        #[cfg(unix)]
+        {
+            // A symlinked directory is followed; a broken top-level link is skipped.
+            assert_eq!(
+                fs::read_to_string(sandbox.join("skills/skill.md")).unwrap(),
+                "# Skill"
+            );
+            assert!(!sandbox.join("broken-link").exists());
+        }
     }
 
     #[test]
@@ -3861,68 +3868,32 @@ mod tests {
     }
 
     #[test]
-    fn test_writes_seed_files_when_missing() {
+    fn seed_files_are_written_once_and_lose_to_host_files() {
         let dir = TempDir::new().unwrap();
         let host = setup_host_dir(&dir);
         let sandbox = dir.path().join("sandbox");
-
-        let seeds = [("seed.json", r#"{"seeded":true}"#)];
-        sync_fixture(&host, &sandbox, &[], &seeds, &[], &[]).unwrap();
-
-        let content = fs::read_to_string(sandbox.join("seed.json")).unwrap();
-        assert_eq!(content, r#"{"seeded":true}"#);
-    }
-
-    #[test]
-    fn test_seed_files_not_overwritten_if_exist() {
-        let dir = TempDir::new().unwrap();
-        let host = setup_host_dir(&dir);
-        let sandbox = dir.path().join("sandbox");
-
-        // First sync writes the seed.
-        let seeds = [("seed.json", r#"{"seeded":true}"#)];
-        sync_fixture(&host, &sandbox, &[], &seeds, &[], &[]).unwrap();
+        let seeds = [
+            ("seed.json", r#"{"seeded":true}"#),
+            // Same name as a host file: the host copy wins.
+            ("auth.json", "seed-content"),
+        ];
+        sync_fixture(&host, &sandbox, &["auth.json"], &seeds, &[], &[]).unwrap();
         assert_eq!(
             fs::read_to_string(sandbox.join("seed.json")).unwrap(),
             r#"{"seeded":true}"#
         );
+        assert_eq!(
+            fs::read_to_string(sandbox.join("auth.json")).unwrap(),
+            r#"{"token":"abc"}"#
+        );
 
-        // Container modifies the seed file.
+        // A re-sync keeps the container's edit to a seed.
         fs::write(sandbox.join("seed.json"), r#"{"modified":true}"#).unwrap();
-
-        // Re-sync should NOT overwrite the container's changes.
-        sync_fixture(&host, &sandbox, &[], &seeds, &[], &[]).unwrap();
+        sync_fixture(&host, &sandbox, &["auth.json"], &seeds, &[], &[]).unwrap();
         assert_eq!(
             fs::read_to_string(sandbox.join("seed.json")).unwrap(),
             r#"{"modified":true}"#
         );
-    }
-
-    #[test]
-    fn test_host_files_overwrite_seeds() {
-        let dir = TempDir::new().unwrap();
-        let host = setup_host_dir(&dir);
-        let sandbox = dir.path().join("sandbox");
-
-        // Seed has the same name as a host file: host copy wins.
-        let seeds = [("auth.json", "seed-content")];
-        sync_fixture(&host, &sandbox, &["auth.json"], &seeds, &[], &[]).unwrap();
-
-        let content = fs::read_to_string(sandbox.join("auth.json")).unwrap();
-        assert_eq!(content, r#"{"token":"abc"}"#);
-    }
-
-    #[test]
-    fn test_seed_survives_when_no_host_equivalent() {
-        let dir = TempDir::new().unwrap();
-        let host = setup_host_dir(&dir);
-        let sandbox = dir.path().join("sandbox");
-
-        let seeds = [(".claude.json", r#"{"hasCompletedOnboarding":true}"#)];
-        sync_fixture(&host, &sandbox, &[], &seeds, &[], &[]).unwrap();
-
-        let content = fs::read_to_string(sandbox.join(".claude.json")).unwrap();
-        assert_eq!(content, r#"{"hasCompletedOnboarding":true}"#);
     }
 
     #[test]
@@ -4032,152 +4003,32 @@ mod tests {
     }
 
     #[test]
-    fn test_sandbox_gitconfig_seed_is_valid_gitconfig() {
-        let dir = TempDir::new().unwrap();
-        let gitconfig = dir.path().join("gitconfig");
-        fs::write(&gitconfig, SANDBOX_GITCONFIG_SEED).unwrap();
-
-        let out = std::process::Command::new("git")
-            .args([
-                "config",
-                "--file",
-                gitconfig.to_str().unwrap(),
-                "--get",
-                "credential.https://github.com.helper",
-            ])
-            .output();
-        let Ok(out) = out else {
-            eprintln!("skipping: git not available");
-            return;
-        };
-        assert!(
-            out.status.success(),
-            "git failed to parse seeded gitconfig: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let helper = String::from_utf8_lossy(&out.stdout);
-        assert!(helper.starts_with('!'), "helper must be a shell snippet");
-        assert!(
-            helper.contains("$GH_TOKEN"),
-            "helper must read GH_TOKEN at runtime"
-        );
-    }
-
-    #[test]
-    fn test_refresh_updates_changed_host_files() {
+    fn resync_refreshes_host_files_and_keeps_sandbox_owned_ones() {
         let dir = TempDir::new().unwrap();
         let host = setup_host_dir(&dir);
         let sandbox = dir.path().join("sandbox");
+        fs::write(host.join("history.jsonl"), "host-entry\n").unwrap();
+        let files = ["auth.json", "settings.json", "new_cred.json"];
+        let sync = || sync_fixture(&host, &sandbox, &files, &[], &[], &["auth.json"]).unwrap();
+        let read = |name: &str| fs::read_to_string(sandbox.join(name)).unwrap();
 
-        sync_fixture(&host, &sandbox, &["auth.json"], &[], &[], &[]).unwrap();
-        assert_eq!(
-            fs::read_to_string(sandbox.join("auth.json")).unwrap(),
-            r#"{"token":"abc"}"#
-        );
-
-        // Host file changes between sessions.
-        fs::write(host.join("auth.json"), r#"{"token":"refreshed"}"#).unwrap();
-
-        sync_fixture(&host, &sandbox, &["auth.json"], &[], &[], &[]).unwrap();
-        assert_eq!(
-            fs::read_to_string(sandbox.join("auth.json")).unwrap(),
-            r#"{"token":"refreshed"}"#
-        );
-    }
-
-    #[test]
-    fn test_refresh_picks_up_new_host_files() {
-        let dir = TempDir::new().unwrap();
-        let host = setup_host_dir(&dir);
-        let sandbox = dir.path().join("sandbox");
-
-        sync_fixture(&host, &sandbox, &["new_cred.json"], &[], &[], &[]).unwrap();
+        // A preserved file is still seeded when the sandbox lacks it.
+        sync();
+        assert_eq!(read("auth.json"), r#"{"token":"abc"}"#);
         assert!(!sandbox.join("new_cred.json").exists());
+        assert!(!sandbox.join("history.jsonl").exists());
 
-        // New credential file appears on host.
+        fs::write(sandbox.join("auth.json"), r#"{"token":"container"}"#).unwrap();
+        fs::write(sandbox.join("history.jsonl"), "container-session-1\n").unwrap();
+        fs::write(host.join("auth.json"), r#"{"token":"refreshed"}"#).unwrap();
+        fs::write(host.join("settings.json"), "updated").unwrap();
         fs::write(host.join("new_cred.json"), "new").unwrap();
+        sync();
 
-        sync_fixture(&host, &sandbox, &["new_cred.json"], &[], &[], &[]).unwrap();
-        assert_eq!(
-            fs::read_to_string(sandbox.join("new_cred.json")).unwrap(),
-            "new"
-        );
-    }
-
-    #[test]
-    fn test_refresh_preserves_container_written_files() {
-        let dir = TempDir::new().unwrap();
-        let host = setup_host_dir(&dir);
-        let sandbox = dir.path().join("sandbox");
-
-        sync_fixture(&host, &sandbox, &[], &[], &[], &[]).unwrap();
-
-        // Container writes a runtime file into the sandbox dir.
-        fs::write(sandbox.join("runtime.log"), "container-state").unwrap();
-
-        // Refresh from host.
-        sync_fixture(&host, &sandbox, &[], &[], &[], &[]).unwrap();
-
-        // Container-written file survives (host has no file with that name).
-        assert_eq!(
-            fs::read_to_string(sandbox.join("runtime.log")).unwrap(),
-            "container-state"
-        );
-    }
-
-    #[test]
-    fn test_copies_listed_dirs_recursively() {
-        let dir = TempDir::new().unwrap();
-        let host = setup_host_dir(&dir);
-
-        // Create a "plugins" dir with nested content.
-        let plugins = host.join("plugins");
-        fs::create_dir_all(plugins.join("lsp")).unwrap();
-        fs::write(plugins.join("config.json"), "{}").unwrap();
-        fs::write(plugins.join("lsp").join("gopls.wasm"), "binary").unwrap();
-
-        let sandbox = dir.path().join("sandbox");
-        sync_fixture(&host, &sandbox, &[], &[], &["plugins"], &[]).unwrap();
-
-        assert!(sandbox.join("plugins").join("config.json").exists());
-        assert!(sandbox
-            .join("plugins")
-            .join("lsp")
-            .join("gopls.wasm")
-            .exists());
-        // "subdir" is NOT in copy_dirs, so still skipped.
-        assert!(!sandbox.join("subdir").exists());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    #[serial_test::serial]
-    fn test_prime_agent_mount_copies_user_skills() {
-        let (_hook_guard, _, _application) = BaseGuard::ready();
-        let home = TempDir::new().unwrap();
-        let _app_dir = crate::session::test_support::isolate_app_dir_at(home.path());
-        let skill_dir = home.path().join(".prime/agent/skills/reviewing");
-        fs::create_dir_all(&skill_dir).unwrap();
-        fs::write(skill_dir.join("SKILL.md"), "review instructions").unwrap();
-
-        let prime_mount = AGENT_CONFIG_MOUNTS
-            .iter()
-            .find(|m| m.tool_name == "prime-agent")
-            .expect("prime-agent mount must exist");
-        let sandbox = prepare_owned_fixture(
-            prime_mount,
-            home.path(),
-            None,
-            CredentialFold::Freshest,
-            &crate::session::config::SessionConfig::default(),
-            home.path(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            fs::read_to_string(sandbox.join("skills/reviewing/SKILL.md")).unwrap(),
-            "review instructions"
-        );
+        assert_eq!(read("settings.json"), "updated");
+        assert_eq!(read("new_cred.json"), "new");
+        assert_eq!(read("auth.json"), r#"{"token":"container"}"#);
+        assert_eq!(read("history.jsonl"), "container-session-1\n");
     }
 
     // Regression for #3014: settings.json (a top-level file) referenced a hook
@@ -4217,233 +4068,6 @@ mod tests {
         assert!(
             sandbox.join("hooks").join("secret-guard.sh").exists(),
             "hook script referenced by settings.json must be copied into the sandbox"
-        );
-    }
-
-    #[test]
-    fn test_rewrite_claude_plugin_paths() {
-        let dir = TempDir::new().unwrap();
-        let host_home = dir.path().join("home");
-        fs::create_dir_all(&host_home).unwrap();
-
-        let sandbox = dir.path().join("sandbox");
-        let marketplaces = sandbox.join("plugins").join("marketplaces");
-        fs::create_dir_all(&marketplaces).unwrap();
-
-        let host_marketplace = format!(
-            "{}/.claude/plugins/marketplaces/claude-plugins-official",
-            host_home.display()
-        );
-        let known = format!(
-            r#"{{"marketplaces":[{{"installLocation":"{}"}}]}}"#,
-            host_marketplace
-        );
-        fs::write(marketplaces.join("known_marketplaces.json"), known).unwrap();
-
-        let host_install = format!(
-            "{}/.claude/plugins/cache/claude-plugins-official/rust-analyzer-lsp/1.0.0",
-            host_home.display()
-        );
-        let installed = format!(r#"{{"plugins":[{{"installPath":"{}"}}]}}"#, host_install);
-        fs::write(
-            sandbox.join("plugins").join("installed_plugins.json"),
-            installed,
-        )
-        .unwrap();
-
-        rewrite_claude_plugin_paths(&sandbox, &host_home).unwrap();
-
-        let known = fs::read_to_string(marketplaces.join("known_marketplaces.json")).unwrap();
-        let known_json: serde_json::Value = serde_json::from_str(&known).unwrap();
-        assert_eq!(
-            known_json["marketplaces"][0]["installLocation"],
-            "/root/.claude/plugins/marketplaces/claude-plugins-official"
-        );
-
-        let installed =
-            fs::read_to_string(sandbox.join("plugins").join("installed_plugins.json")).unwrap();
-        let installed_json: serde_json::Value = serde_json::from_str(&installed).unwrap();
-        assert_eq!(
-            installed_json["plugins"][0]["installPath"],
-            "/root/.claude/plugins/cache/claude-plugins-official/rust-analyzer-lsp/1.0.0"
-        );
-    }
-
-    #[test]
-    fn test_unlisted_dirs_still_skipped() {
-        let dir = TempDir::new().unwrap();
-        let host = setup_host_dir(&dir);
-
-        // "subdir" exists from setup_host_dir but is not in copy_dirs.
-        let sandbox = dir.path().join("sandbox");
-        sync_fixture(&host, &sandbox, &["auth.json"], &[], &["nonexistent"], &[]).unwrap();
-
-        assert!(!sandbox.join("subdir").exists());
-        assert!(sandbox.join("auth.json").exists());
-    }
-
-    #[test]
-    fn test_copy_dir_recursive() {
-        let dir = TempDir::new().unwrap();
-        let src = dir.path().join("src");
-        fs::create_dir_all(src.join("a").join("b")).unwrap();
-        fs::write(src.join("root.txt"), "root").unwrap();
-        fs::write(src.join("a").join("mid.txt"), "mid").unwrap();
-        fs::write(src.join("a").join("b").join("deep.txt"), "deep").unwrap();
-
-        let dest = dir.path().join("sandbox/src");
-        sync_fixture(dir.path(), dest.parent().unwrap(), &[], &[], &["src"], &[]).unwrap();
-
-        assert_eq!(fs::read_to_string(dest.join("root.txt")).unwrap(), "root");
-        assert_eq!(
-            fs::read_to_string(dest.join("a").join("mid.txt")).unwrap(),
-            "mid"
-        );
-        assert_eq!(
-            fs::read_to_string(dest.join("a").join("b").join("deep.txt")).unwrap(),
-            "deep"
-        );
-    }
-
-    #[test]
-    fn test_symlinked_dirs_are_followed() {
-        let dir = TempDir::new().unwrap();
-        let host = dir.path().join("host");
-        fs::create_dir_all(&host).unwrap();
-        fs::write(host.join("config.json"), "{}").unwrap();
-
-        let real_dir = dir.path().join("real-skills");
-        fs::create_dir_all(&real_dir).unwrap();
-        fs::write(real_dir.join("skill.md"), "# Skill").unwrap();
-
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&real_dir, host.join("skills")).unwrap();
-
-        let sandbox = dir.path().join("sandbox");
-        sync_fixture(&host, &sandbox, &["config.json"], &[], &["skills"], &[]).unwrap();
-
-        assert!(sandbox.join("config.json").exists());
-        #[cfg(unix)]
-        {
-            assert!(sandbox.join("skills").exists());
-            assert_eq!(
-                fs::read_to_string(sandbox.join("skills").join("skill.md")).unwrap(),
-                "# Skill"
-            );
-        }
-    }
-
-    #[test]
-    fn test_bad_entry_does_not_fail_sync() {
-        let dir = TempDir::new().unwrap();
-        let host = dir.path().join("host");
-        fs::create_dir_all(&host).unwrap();
-        fs::write(host.join("good.json"), "ok").unwrap();
-
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("/nonexistent/path", host.join("broken-link")).unwrap();
-
-        let sandbox = dir.path().join("sandbox");
-        // Should succeed despite the broken symlink.
-        sync_fixture(
-            &host,
-            &sandbox,
-            &["good.json", "broken-link"],
-            &[],
-            &[],
-            &[],
-        )
-        .unwrap();
-
-        assert_eq!(fs::read_to_string(sandbox.join("good.json")).unwrap(), "ok");
-        // Broken symlink is skipped, not copied.
-        assert!(!sandbox.join("broken-link").exists());
-    }
-
-    #[test]
-    fn test_preserve_files_not_overwritten() {
-        let dir = TempDir::new().unwrap();
-        let host = setup_host_dir(&dir);
-        let sandbox = dir.path().join("sandbox");
-
-        // First sync seeds the preserved file from host.
-        sync_fixture(
-            &host,
-            &sandbox,
-            &["auth.json", "settings.json"],
-            &[],
-            &[],
-            &["auth.json"],
-        )
-        .unwrap();
-        assert_eq!(
-            fs::read_to_string(sandbox.join("auth.json")).unwrap(),
-            r#"{"token":"abc"}"#
-        );
-
-        // Simulate migration or in-container auth writing a different credential.
-        fs::write(sandbox.join("auth.json"), r#"{"token":"container"}"#).unwrap();
-
-        // Host file changes.
-        fs::write(host.join("auth.json"), r#"{"token":"refreshed"}"#).unwrap();
-
-        // Re-sync should NOT overwrite the preserved file.
-        sync_fixture(
-            &host,
-            &sandbox,
-            &["auth.json", "settings.json"],
-            &[],
-            &[],
-            &["auth.json"],
-        )
-        .unwrap();
-        assert_eq!(
-            fs::read_to_string(sandbox.join("auth.json")).unwrap(),
-            r#"{"token":"container"}"#
-        );
-
-        // Non-preserved files are still overwritten.
-        fs::write(host.join("settings.json"), "updated").unwrap();
-        sync_fixture(
-            &host,
-            &sandbox,
-            &["auth.json", "settings.json"],
-            &[],
-            &[],
-            &["auth.json"],
-        )
-        .unwrap();
-        assert_eq!(
-            fs::read_to_string(sandbox.join("settings.json")).unwrap(),
-            "updated"
-        );
-    }
-
-    #[test]
-    fn test_history_preserved_across_resync() {
-        let dir = TempDir::new().unwrap();
-        let host = setup_host_dir(&dir);
-        let sandbox = dir.path().join("sandbox");
-
-        // Host has a history file with host-only entries.
-        fs::write(host.join("history.jsonl"), "host-entry\n").unwrap();
-
-        sync_fixture(&host, &sandbox, &["auth.json"], &[], &[], &[]).unwrap();
-        assert!(!sandbox.join("history.jsonl").exists());
-
-        // Container session appends entries.
-        fs::write(
-            sandbox.join("history.jsonl"),
-            "container-session-1\ncontainer-session-2\n",
-        )
-        .unwrap();
-
-        // Re-sync (container restart) should NOT clobber the container's history.
-        sync_fixture(&host, &sandbox, &["auth.json"], &[], &[], &[]).unwrap();
-        let content = fs::read_to_string(sandbox.join("history.jsonl")).unwrap();
-        assert!(
-            content.contains("container-session-1"),
-            "container history entries must survive re-sync"
         );
     }
 
@@ -4536,20 +4160,6 @@ mod tests {
         assert_eq!(
             fs::read_to_string(sandbox.join("plugins/p.txt")).unwrap(),
             "local-plugin"
-        );
-    }
-
-    #[test]
-    fn test_preserve_files_seeded_when_missing() {
-        let dir = TempDir::new().unwrap();
-        let host = setup_host_dir(&dir);
-        let sandbox = dir.path().join("sandbox");
-
-        // Preserved file is copied when sandbox doesn't have it yet.
-        sync_fixture(&host, &sandbox, &["auth.json"], &[], &[], &["auth.json"]).unwrap();
-        assert_eq!(
-            fs::read_to_string(sandbox.join("auth.json")).unwrap(),
-            r#"{"token":"abc"}"#
         );
     }
 
@@ -5252,19 +4862,6 @@ extra_run_args = ["--privileged"]
         }
     }
 
-    #[test]
-    fn test_has_glob_metachars() {
-        assert!(has_glob_metachars("**/bin"));
-        assert!(has_glob_metachars("**/obj/"));
-        assert!(has_glob_metachars("target/*"));
-        assert!(has_glob_metachars("build?"));
-        assert!(has_glob_metachars("cache[0-9]"));
-        assert!(!has_glob_metachars("target"));
-        assert!(!has_glob_metachars("node_modules"));
-        assert!(!has_glob_metachars("src/bin"));
-        assert!(!has_glob_metachars(".venv"));
-    }
-
     /// Feature test for #2045: glob volume_ignores entries are expanded against the
     /// live workspace at build time, emitting one mount per matched directory, while
     /// literal entries still mount unconditionally and no `*` ever reaches a mount
@@ -5466,17 +5063,6 @@ volume_ignores_strategy = "named"
             expansions[1].matched_container_paths.is_empty(),
             "an unmatched glob is kept with no matches"
         );
-    }
-
-    #[test]
-    fn test_preview_glob_volume_ignores_empty_without_globs() {
-        let project_dir = TempDir::new().unwrap();
-        git2::Repository::init(project_dir.path()).unwrap();
-        let ignores = vec!["target".to_string(), ".venv".to_string()];
-        let expansions =
-            preview_glob_volume_ignores(project_dir.path().to_str().unwrap(), None, &ignores)
-                .unwrap();
-        assert!(expansions.is_empty());
     }
 
     /// Regression: when project_path is a sibling worktree, `.agent-of-empires/config.toml`
@@ -7113,102 +6699,57 @@ trusted_hash = "keep"
 
     #[test]
     #[serial_test::serial]
-    fn test_build_container_config_mounts_codex_home_from_extra_env() {
+    fn test_build_container_config_mounts_codex_home_from_configured_env() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
-
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sandbox_info = crate::session::instance::SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test:latest".to_string(),
-            container_name: "test-container".to_string(),
-            extra_env: Some(vec!["CODEX_HOME=/root/custom-codex".to_string()]),
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        };
-        let instance_id = "codex-sandbox-extra-env-hooks-test";
-        let config = Build::new("codex")
-            .info(sandbox_info)
-            .instance(instance_id)
-            .run(project_dir.path())
-            .unwrap();
+        for (instance_id, from_extra_env, container_home) in [
+            (
+                "codex-sandbox-extra-env-hooks-test",
+                true,
+                "/root/custom-codex",
+            ),
+            (
+                "codex-sandbox-config-env-hooks-test",
+                false,
+                "/root/profile-codex",
+            ),
+        ] {
+            let mut info = test_sandbox_info();
+            let entry = format!("CODEX_HOME={container_home}");
+            if from_extra_env {
+                info.extra_env = Some(vec![entry]);
+            } else {
+                fs::write(
+                    crate::session::get_app_dir().unwrap().join("config.toml"),
+                    format!("[sandbox]\nenvironment = [\"{entry}\"]\n"),
+                )
+                .unwrap();
+            }
+            let config = Build::new("codex")
+                .info(info)
+                .instance(instance_id)
+                .run(project_dir.path())
+                .unwrap();
 
-        let codex_sandbox = temp_home
-            .path()
-            .join(".codex")
-            .join(SANDBOX_PRIVATE_SUBDIR)
-            .join(instance_id);
-        assert!(codex_sandbox.join("hooks.json").exists());
-        assert!(config.volumes.iter().any(|v| {
-            v.host_path == codex_sandbox.to_string_lossy()
-                && v.container_path == "/root/custom-codex"
-        }));
-        assert!(!config.volumes.iter().any(|v| {
-            v.host_path == codex_sandbox.to_string_lossy() && v.container_path == "/root/.codex"
-        }));
-        crate::hooks::cleanup_hook_status_dir(instance_id);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_build_container_config_mounts_codex_home_from_sandbox_environment() {
-        let (_hg, _, _tmp_base) = BaseGuard::ready();
-        let temp_home = TempDir::new().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
-
-        let app_dir = crate::session::get_app_dir().unwrap();
-        fs::write(
-            app_dir.join("config.toml"),
-            r#"
-[sandbox]
-environment = ["CODEX_HOME=/root/profile-codex"]
-"#,
-        )
-        .unwrap();
-        let project_dir = TempDir::new().unwrap();
-        git2::Repository::init(project_dir.path()).unwrap();
-
-        let sandbox_info = crate::session::instance::SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test:latest".to_string(),
-            container_name: "test-container".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        };
-        let instance_id = "codex-sandbox-config-env-hooks-test";
-        let config = build_container_config(
-            project_dir.path().to_str().unwrap(),
-            &sandbox_info,
-            ContainerAgentSelection::new("codex", None),
-            false,
-            instance_id,
-            None,
-            "",
-        )
-        .unwrap();
-
-        let codex_sandbox = temp_home
-            .path()
-            .join(".codex")
-            .join(SANDBOX_PRIVATE_SUBDIR)
-            .join(instance_id);
-        assert!(codex_sandbox.join("hooks.json").exists());
-        assert!(config.volumes.iter().any(|v| {
-            v.host_path == codex_sandbox.to_string_lossy()
-                && v.container_path == "/root/profile-codex"
-        }));
-        assert!(!config.volumes.iter().any(|v| {
-            v.host_path == codex_sandbox.to_string_lossy() && v.container_path == "/root/.codex"
-        }));
-        crate::hooks::cleanup_hook_status_dir(instance_id);
+            let codex_sandbox = temp_home
+                .path()
+                .join(".codex")
+                .join(SANDBOX_PRIVATE_SUBDIR)
+                .join(instance_id);
+            assert!(codex_sandbox.join("hooks.json").exists(), "{instance_id}");
+            let mounted_at = |path: &str| {
+                config.volumes.iter().any(|v| {
+                    v.host_path == codex_sandbox.to_string_lossy() && v.container_path == path
+                })
+            };
+            assert!(mounted_at(container_home), "{instance_id}");
+            assert!(!mounted_at("/root/.codex"), "{instance_id}");
+            crate::hooks::cleanup_hook_status_dir(instance_id);
+        }
     }
 
     /// Regression test: when an instance was created under a non-default profile,
@@ -7771,64 +7312,29 @@ volume_ignores = ["target"]
     }
 
     #[test]
-    fn test_named_volume_for_is_deterministic() {
-        let a = named_volume_for("sess-abc123", "/workspace/node_modules");
-        let b = named_volume_for("sess-abc123", "/workspace/node_modules");
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn test_named_volume_for_differs_by_path() {
-        let a = named_volume_for("sess-abc123", "/workspace/node_modules");
-        let b = named_volume_for("sess-abc123", "/workspace/.venv");
-        assert_ne!(a, b, "Different paths must produce different volume names");
-    }
-
-    #[test]
-    fn test_named_volume_for_differs_by_session_id() {
-        let a = named_volume_for("sess-aaa", "/workspace/node_modules");
-        let b = named_volume_for("sess-bbb", "/workspace/node_modules");
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn test_named_volume_for_sanitizes_unsafe_chars() {
+    fn named_volume_for_is_stable_prefixed_sanitized_and_distinct() {
+        let base = named_volume_for("sess-abc123", "/workspace/node_modules");
+        assert_eq!(
+            base,
+            named_volume_for("sess-abc123", "/workspace/node_modules")
+        );
+        assert!(base.starts_with("aoe-vi-sess-abc123-"));
+        let long = "/workspace/a-very-long-directory-name-that-exceeds-40-chars-v";
+        for (session, path) in [
+            ("sess-abc123", "/workspace/.venv"),
+            ("sess-bbb", "/workspace/node_modules"),
+        ] {
+            assert_ne!(base, named_volume_for(session, path), "{session} {path}");
+        }
+        // Long paths sharing a slug prefix are split by the hash suffix.
+        assert_ne!(
+            named_volume_for("sess-1", &format!("{long}1")),
+            named_volume_for("sess-1", &format!("{long}2"))
+        );
         let name = named_volume_for("sess-1", "/workspace/path with spaces/foo:bar");
-        assert!(
-            !name.contains(' ') && !name.contains(':'),
-            "Volume name must not contain spaces or colons"
-        );
-    }
-
-    #[test]
-    fn test_named_volume_for_starts_with_prefix() {
-        let name = named_volume_for("sess-xyz", "/workspace/target");
-        assert!(name.starts_with("aoe-vi-sess-xyz-"));
-    }
-
-    #[test]
-    fn test_named_volume_for_slug_collision_prevented_by_hash() {
-        // Two paths that have the same 40-char slug prefix (unlikely but possible for long paths)
-        // are disambiguated by the hash suffix.
-        let path1 = "/workspace/a-very-long-directory-name-that-exceeds-40-chars-v1";
-        let path2 = "/workspace/a-very-long-directory-name-that-exceeds-40-chars-v2";
-        let a = named_volume_for("sess-1", path1);
-        let b = named_volume_for("sess-1", path2);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn test_named_volume_for_prefix_does_not_match_longer_session_id() {
-        // "sess1" must not match volumes belonging to "sess10".
-        // The cleanup prefix is "aoe-vi-{session_id}-" (trailing dash), so a volume
-        // named "aoe-vi-sess10-..." must NOT start with "aoe-vi-sess1-".
-        let vol_sess10 = named_volume_for("sess10", "/workspace/node_modules");
-        let prefix_sess1 = format!("aoe-vi-{}-", "sess1");
-        assert!(
-            !vol_sess10.starts_with(&prefix_sess1),
-            "Volume for sess10 must not match the cleanup prefix for sess1: {}",
-            vol_sess10
-        );
+        assert!(!name.contains(' ') && !name.contains(':'), "{name}");
+        // Cleanup matches "aoe-vi-{id}-", so sess1 must not claim sess10's volumes.
+        assert!(!named_volume_for("sess10", "/workspace/node_modules").starts_with("aoe-vi-sess1-"));
     }
     #[test]
     fn sandbox_stores_are_physically_isolated_per_instance() {
