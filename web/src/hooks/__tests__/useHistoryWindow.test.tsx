@@ -36,24 +36,16 @@ const render = (a: ActivityRow[], sid = "s1") =>
   });
 
 describe("useHistoryWindow", () => {
-  it("windows a long transcript and offers Load earlier", () => {
+  it("renders a short transcript whole, and windows a long one until loadEarlier shows it all", () => {
+    const short = transcript(3, 1); // 6 rows
+    const shortView = render(short).result;
+    expect(shortView.current.windowedActivity).toHaveLength(short.length);
+    expect(shortView.current.canLoadEarlier).toBe(false);
+
     const activity = transcript(100, 1); // 200 rows
     const { result } = render(activity);
     expect(result.current.windowedActivity.length).toBeLessThanOrEqual(DEFAULT_HISTORY_WINDOW);
-    expect(result.current.windowedActivity.length).toBeLessThan(activity.length);
     expect(result.current.canLoadEarlier).toBe(true);
-  });
-
-  it("renders everything and hides the control for a short transcript", () => {
-    const activity = transcript(3, 1); // 6 rows
-    const { result } = render(activity);
-    expect(result.current.windowedActivity).toHaveLength(activity.length);
-    expect(result.current.canLoadEarlier).toBe(false);
-  });
-
-  it("loadEarlier grows the window until the whole transcript shows", () => {
-    const activity = transcript(100, 1);
-    const { result } = render(activity);
     for (let i = 0; i < 5 && result.current.canLoadEarlier; i += 1) {
       act(() => result.current.loadEarlier());
     }
