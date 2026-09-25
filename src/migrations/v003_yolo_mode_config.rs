@@ -60,7 +60,7 @@ mod tests {
         let no_sandbox = "[session]\ndefault_tool = \"claude\"\n";
         assert_rewrites(
             "config.toml",
-            |path| migrate_config_file(&path.to_path_buf()),
+            migrate_config_file,
             &[
                 (
                     Some(

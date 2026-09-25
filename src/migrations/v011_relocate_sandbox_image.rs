@@ -59,7 +59,7 @@ mod tests {
         let unchanged = |toml: &'static str| (Some(toml), Some(toml));
         assert_rewrites(
             "config.toml",
-            |path| migrate_config_file(&path.to_path_buf()),
+            migrate_config_file,
             &[
                 (
                     Some("[sandbox]\ndefault_image = \"ghcr.io/njbrake/aoe-sandbox:latest\"\n"),

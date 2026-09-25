@@ -3338,7 +3338,8 @@ mod tests {
         let history = lines(0..10, "HL");
         let outgrown = format!("{}READY> \n{}", lines(0..3, "line-"), "\n".repeat(4));
         // (body, grid rows, pane height, cursor x/y/visible) -> (position, text kept on screen)
-        let cases: [(&str, u16, u16, (u16, u16, bool), (u16, u16), &str); 4] = [
+        type Case<'a> = (&'a str, u16, u16, (u16, u16, bool), (u16, u16), &'a str);
+        let cases: [Case; 4] = [
             (&full, 6, 6, (3, 1, true), (1, 3), "row-full-content-00"),
             (&history, 4, 4, (2, 1, true), (1, 2), "HL09"),
             (&outgrown, 6, 8, (7, 3, true), (1, 7), "READY>"),

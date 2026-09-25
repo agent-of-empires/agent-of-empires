@@ -1,9 +1,12 @@
 //! Shared helpers for integration tests, declared from `main.rs`.
 
+#[cfg(debug_assertions)]
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+#[cfg(debug_assertions)]
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+#[cfg(debug_assertions)]
 use tokio::process::Command;
 
 /// Hermetic tmux socket shared by the lib and by raw `tmux` calls, and set on
@@ -107,6 +110,7 @@ pub struct EnvGuard {
 }
 
 impl EnvGuard {
+    #[cfg(debug_assertions)]
     pub fn from_pairs(pairs: &[(&'static str, &'static str)]) -> Self {
         let mut guard = Self::new(&[]);
         for (key, value) in pairs {
@@ -164,6 +168,7 @@ impl TestHome {
 ///
 /// Returns the `--socket` path, from which `AcpClient::attach` derives the
 /// control sibling, and a guard holding the runner and its temp dir open.
+#[cfg(debug_assertions)]
 pub async fn spawn_runner_with_shim(
     session_id: &str,
     env: &[(&str, String)],
@@ -290,12 +295,14 @@ pub async fn spawn_runner_with_shim(
     )
 }
 
+#[cfg(debug_assertions)]
 /// Dropping this kills the runner, which takes the shim with it.
 pub struct RunnerGuard {
     _child: tokio::process::Child,
     _temp: tempfile::TempDir,
 }
 
+#[cfg(debug_assertions)]
 /// Bind ephemeral, drop, return the port. The TOCTOU window before the caller
 /// binds is acceptable under `#[serial]`.
 pub fn pick_free_port() -> u16 {
@@ -303,6 +310,7 @@ pub fn pick_free_port() -> u16 {
     l.local_addr().expect("local_addr").port()
 }
 
+#[cfg(debug_assertions)]
 /// Poll-connect `127.0.0.1:port` until it succeeds or `deadline` elapses.
 pub fn wait_for_port(port: u16, deadline: Duration) -> bool {
     let start = Instant::now();
