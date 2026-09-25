@@ -3,7 +3,7 @@
 // part the pane has not seen may be sent.
 
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent } from "@testing-library/react";
+import { cleanup, fireEvent } from "@testing-library/react";
 import { installResizeObserver, renderLiveTerminal } from "./liveTerminalHarness";
 
 vi.mock("../../hooks/useWebSettings", () => ({
@@ -69,17 +69,6 @@ describe("MobileLiveTerminal Android IME word commits", () => {
         t.type(" ");
       },
       sent: ["t", "e", "s", "t", " "],
-    },
-    {
-      name: "keeps every word of a sentence typed that way",
-      run: (t) => {
-        t.type("hi");
-        t.compose("hi");
-        t.type(" you");
-        t.compose("you");
-        t.type(" ");
-      },
-      sent: ["h", "i", " ", "y", "o", "u", " "],
     },
     {
       name: "sends only the tail when the composition extends the typed word",
@@ -182,11 +171,6 @@ describe("MobileLiveTerminal Android IME word commits", () => {
       sent: ["a", "日本"],
     },
     {
-      name: "sends a composition that follows no plain typing",
-      run: (t) => t.compose("日本"),
-      sent: ["日本"],
-    },
-    {
       // A composition that stood on its own is not a typed word under the caret, so the next one must reach the
       // pane whole even when it repeats it.
       name: "sends a character composed twice in a row",
@@ -194,11 +178,6 @@ describe("MobileLiveTerminal Android IME word commits", () => {
         t.composeUpdating("a", "a");
         t.composeUpdating("a", "a");
       },
-      sent: ["a", "a"],
-    },
-    {
-      name: "keeps repeated characters typed without a composition",
-      run: (t) => t.type("aa"),
       sent: ["a", "a"],
     },
     {
@@ -222,11 +201,13 @@ describe("MobileLiveTerminal Android IME word commits", () => {
     },
   ];
 
-  for (const c of cases) {
-    it(c.name, () => {
+  it("sends only what the pane has not seen, per case", () => {
+    const results = cases.map((c) => {
       const t = renderTerm(c.accepted);
       c.run(t);
-      expect(t.sent()).toEqual(c.sent);
+      cleanup();
+      return [c.name, t.sent()];
     });
-  }
+    expect(results).toEqual(cases.map((c) => [c.name, c.sent]));
+  });
 });

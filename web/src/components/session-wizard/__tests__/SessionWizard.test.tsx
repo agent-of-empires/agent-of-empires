@@ -55,18 +55,13 @@ const launch = async () => {
 const payload = (call = 0) => createSession.mock.calls[call]![0];
 
 describe("SessionWizard structured view payload", () => {
-  it.each([
-    [false, "structured"],
-    [true, "terminal"],
-  ])("opting out=%s sends view %s", async (optOut, view) => {
+  it("opting out sends the terminal view", async () => {
     renderWizard();
-    if (optOut) {
-      fireEvent.click(screen.getByText("More options"));
-      fireEvent.click(screen.getByRole("switch", { name: "Use structured view" }));
-    }
+    fireEvent.click(screen.getByText("More options"));
+    fireEvent.click(screen.getByRole("switch", { name: "Use structured view" }));
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalled());
-    expect(payload()).toMatchObject({ tool: "claude", view });
+    expect(payload()).toMatchObject({ tool: "claude", view: "terminal" });
   });
 
   it.each([

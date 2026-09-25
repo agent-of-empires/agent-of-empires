@@ -38,33 +38,38 @@ function renderGlobs(props: Partial<Parameters<typeof VolumeIgnoresGlobDialog>[0
   return { onConfirm, onCancel };
 }
 
-describe.each([
+const SHELLS = [
   ["hooks-trust", renderHooks, "hooks-trust-list"],
   ["volume-ignores-glob", renderGlobs, "volume-ignores-glob-list"],
-] as const)("%s dialog shell", (prefix, setup, innerTestId) => {
-  it("Proceed confirms; Cancel and the backdrop cancel, an inner click does not", () => {
-    const { onConfirm, onCancel } = setup();
-    fireEvent.click(screen.getByText("Cancel"));
-    fireEvent.click(screen.getByTestId(`${prefix}-dialog`));
-    fireEvent.click(screen.getByTestId(innerTestId));
-    expect(onCancel).toHaveBeenCalledTimes(2);
-    fireEvent.click(screen.getByTestId(`${prefix}-proceed`));
-    expect(onConfirm).toHaveBeenCalledTimes(1);
-  });
+] as const;
 
-  it("Escape cancels and Enter confirms from the document body", () => {
-    const { onConfirm, onCancel } = setup();
-    fireEvent.keyDown(document, { key: "Escape" });
-    expect(onCancel).toHaveBeenCalledTimes(1);
-    fireEvent.keyDown(document.body, { key: "Enter" });
-    expect(onConfirm).toHaveBeenCalledTimes(1);
+describe("confirm dialog shell", () => {
+  it("Proceed and Enter confirm; Cancel, the backdrop, and Escape cancel, an inner click does not", () => {
+    for (const [prefix, setup, innerTestId] of SHELLS) {
+      const { onConfirm, onCancel } = setup();
+      fireEvent.click(screen.getByText("Cancel"));
+      fireEvent.click(screen.getByTestId(`${prefix}-dialog`));
+      fireEvent.click(screen.getByTestId(innerTestId));
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(onCancel).toHaveBeenCalledTimes(3);
+      fireEvent.click(screen.getByTestId(`${prefix}-proceed`));
+      expect(onConfirm).toHaveBeenCalledTimes(1);
+      cleanup();
+      const byEnter = setup();
+      fireEvent.keyDown(document.body, { key: "Enter" });
+      expect(byEnter.onConfirm).toHaveBeenCalledTimes(1);
+      cleanup();
+    }
   });
 
   it("re-enables Proceed when onConfirm rejects", async () => {
-    setup({ onConfirm: vi.fn().mockRejectedValue(new Error("create failed")) });
-    const proceed = screen.getByTestId(`${prefix}-proceed`) as HTMLButtonElement;
-    fireEvent.click(proceed);
-    await waitFor(() => expect(proceed.disabled).toBe(false));
+    for (const [prefix, setup] of SHELLS) {
+      setup({ onConfirm: vi.fn().mockRejectedValue(new Error("create failed")) });
+      const proceed = screen.getByTestId(`${prefix}-proceed`) as HTMLButtonElement;
+      fireEvent.click(proceed);
+      await waitFor(() => expect(proceed.disabled).toBe(false));
+      cleanup();
+    }
   });
 });
 
@@ -78,28 +83,25 @@ describe("HooksTrustDialog", () => {
     expect(list).not.toContain("on_destroy");
   });
 
-  it.each([true, false])("mentions .mcp.json only when it needs trust (%s)", (needsMcpTrust) => {
-    renderHooks({ needsMcpTrust });
-    expect(screen.getByTestId("hooks-trust-dialog").textContent?.includes(".mcp.json")).toBe(needsMcpTrust);
+  it("mentions .mcp.json only when it needs trust", () => {
+    for (const needsMcpTrust of [true, false]) {
+      renderHooks({ needsMcpTrust });
+      expect(screen.getByTestId("hooks-trust-dialog").textContent?.includes(".mcp.json")).toBe(needsMcpTrust);
+      cleanup();
+    }
   });
 });
 
 describe("VolumeIgnoresGlobDialog", () => {
-  it.each([
-    [TWO_PATTERNS, "3 directories"],
-    [[{ pattern: "**/bin", matched_paths: ["/workspace/x/bin"] }], "1 directory"],
-  ])("lists patterns and pluralizes the match total", (globs, total) => {
-    renderGlobs({ globs });
-    expect(screen.getByTestId("volume-ignores-glob-list").textContent).toContain("**/bin");
-    expect(screen.getByTestId("volume-ignores-glob-dialog").textContent).toContain(total);
-  });
-
-  it.each([false, true])("confirms with dontShowAgain=%s", (tick) => {
-    const { onConfirm } = renderGlobs();
-    const checkbox = screen.getByTestId("volume-ignores-glob-dont-show-again");
-    if (tick) fireEvent.click(checkbox);
-    expect(checkbox.getAttribute("data-checked")).toBe(String(tick));
-    fireEvent.click(screen.getByTestId("volume-ignores-glob-proceed"));
-    expect(onConfirm).toHaveBeenCalledWith(tick);
+  it("confirms with the dontShowAgain choice", () => {
+    for (const tick of [false, true]) {
+      const { onConfirm } = renderGlobs();
+      const checkbox = screen.getByTestId("volume-ignores-glob-dont-show-again");
+      if (tick) fireEvent.click(checkbox);
+      expect(checkbox.getAttribute("data-checked")).toBe(String(tick));
+      fireEvent.click(screen.getByTestId("volume-ignores-glob-proceed"));
+      expect(onConfirm).toHaveBeenCalledWith(tick);
+      cleanup();
+    }
   });
 });

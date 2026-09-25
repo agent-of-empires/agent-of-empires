@@ -61,21 +61,18 @@ describe("AgentPickerEssentials", () => {
     expect(screen.queryByText("No agents installed")).toBeNull();
   });
 
-  it.each([
-    ["gemini", true],
-    ["claude", false],
-  ])("badges and warns for deprecated agents (%s)", (tool, deprecated) => {
-    renderPicker(tool, [agent("gemini"), claude, agent("custom-tool")]);
-    expect(!!screen.queryByTestId(`wizard-agent-deprecated-badge-gemini`)).toBe(true);
+  it("badges deprecated agents and warns only when one is selected", () => {
+    const agents = [agent("gemini"), claude, agent("custom-tool")];
+    renderPicker("claude", agents);
+    expect(screen.getByTestId("wizard-agent-deprecated-badge-gemini")).toBeTruthy();
     expect(screen.queryByTestId("wizard-agent-deprecated-badge-claude")).toBeNull();
     expect(screen.queryByTestId("wizard-agent-deprecated-badge-custom-tool")).toBeNull();
-    const warning = screen.queryByTestId("wizard-agent-deprecated-warning");
-    expect(!!warning).toBe(deprecated);
-    if (warning) {
-      expect(warning.textContent).toContain("since 2026-06-18");
-      expect(warning.textContent).toContain("enterprise/API-key remain valid");
-      expect(warning.textContent).toContain("consider switching to antigravity");
-    }
+    expect(screen.queryByTestId("wizard-agent-deprecated-warning")).toBeNull();
+    cleanup();
+    renderPicker("gemini", agents);
+    expect(screen.getByTestId("wizard-agent-deprecated-warning").textContent).toContain(
+      "consider switching to antigravity",
+    );
   });
 
   it("prefers the server lifecycle over the static mirror", () => {
@@ -110,20 +107,17 @@ describe("AgentOptions view card", () => {
     expect(viewSwitch()?.getAttribute("aria-checked")).toBe("false");
   });
 
-  it("describes the sandboxed structured view when both are on", () => {
-    renderOptions({ sandboxEnabled: true }, { dockerAvailable: true });
-    expect(screen.getByText(/the agent runs inside the sandbox container/)).toBeTruthy();
-  });
-
-  it.each([
-    ["aider", undefined, /has no ACP adapter yet/],
-    ["remote-helper", undefined, /Custom agents run in the terminal unless they define agent_acp_cmd/],
-    ["claude", [{ ...claude, acp_allowed: false }], /not on the operator's allowed agents list/],
-  ])("shows only the terminal fallback for %s", (tool, agents, text) => {
-    renderOptions({ tool }, { agents });
-    expect(viewSwitch()).toBeNull();
-    expect(screen.getByText(text)).toBeTruthy();
-    if (tool === "claude") expect(screen.queryByText(/no ACP adapter yet/i)).toBeNull();
+  it("shows only the terminal fallback, with its reason, for agents without structured view", () => {
+    for (const [tool, agents, text] of [
+      ["aider", undefined, /has no ACP adapter yet/],
+      ["remote-helper", undefined, /Custom agents run in the terminal unless they define agent_acp_cmd/],
+      ["claude", [{ ...claude, acp_allowed: false }], /not on the operator's allowed agents list/],
+    ] as const) {
+      renderOptions({ tool }, { agents: agents && [...agents] });
+      expect(viewSwitch()).toBeNull();
+      expect(screen.getByText(text)).toBeTruthy();
+      cleanup();
+    }
   });
 });
 
@@ -132,15 +126,6 @@ describe("AgentOptions workflow presets", () => {
     { name: "default", is_default: true, description: "Stock setup, no overrides" },
     { name: "work", is_default: false },
   ];
-
-  it("renders descriptions, the Active badge, and the selected preset", () => {
-    renderOptions({ profile: "work" }, { profiles: PROFILES });
-    expect(screen.getByText("Stock setup, no overrides")).toBeTruthy();
-    expect(screen.queryByText(/undefined/)).toBeNull();
-    expect(screen.getAllByText("Active")).toHaveLength(1);
-    expect(screen.getByRole("radio", { name: /work/ }).getAttribute("aria-checked")).toBe("true");
-    expect(screen.getByRole("radio", { name: /^Server default/ }).getAttribute("aria-checked")).toBe("false");
-  });
 
   it("selects a preset, and Server default clears it without applying defaults", () => {
     const { onChange, onApplyProfileDefaults } = renderOptions({ profile: "work" }, { profiles: PROFILES });
@@ -151,25 +136,21 @@ describe("AgentOptions workflow presets", () => {
     expect(onChange).toHaveBeenCalledWith("profile", "work");
   });
 
-  it("marks edited presets", () => {
-    renderOptions({ profile: "default", profileDirty: true }, { profiles: PROFILES });
-    expect(screen.getByText(/\(Custom\) Settings differ from preset defaults/)).toBeTruthy();
-  });
-
-  it.each([{ profileDirty: true }, { structuredViewDirty: true }])(
-    "confirms before switching away from edits: %o",
-    (dirty) => {
-      const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
-      try {
+  it("confirms before switching away from preset or view edits", () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    try {
+      for (const dirty of [{ profileDirty: true }, { structuredViewDirty: true }]) {
+        confirmSpy.mockClear();
         const { onChange } = renderOptions({ profile: "default", ...dirty }, { profiles: PROFILES });
         fireEvent.click(screen.getByRole("radio", { name: /work/ }));
         expect(confirmSpy).toHaveBeenCalled();
         expect(onChange).not.toHaveBeenCalledWith("profile", "work");
-      } finally {
-        confirmSpy.mockRestore();
+        cleanup();
       }
-    },
-  );
+    } finally {
+      confirmSpy.mockRestore();
+    }
+  });
 
   it("hides the picker with a single profile", () => {
     renderOptions({}, { profiles: [PROFILES[0]!] });

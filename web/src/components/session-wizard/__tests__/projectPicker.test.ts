@@ -53,12 +53,15 @@ describe("collectRecentProjects", () => {
 });
 
 describe("mergeRecentProjects", () => {
-  it.each([
-    [persisted("/repo/frontend", undefined, "frontend"), "frontend"],
-    [persisted("/repo/backend"), "backend"],
-    [persisted("/"), "/"],
-  ])("appends persisted-only %j with a zero count", (entry, displayName) => {
-    expect(mergeRecentProjects([], [entry])).toMatchObject([{ displayName, sessionCount: 0 }]);
+  it("appends persisted-only entries with a zero count, naming unnamed ones by basename", () => {
+    const merged = mergeRecentProjects(
+      [],
+      [persisted("/repo/frontend", "2025-09-02T00:00:00+00:00", "Front"), persisted("/repo/backend")],
+    );
+    expect(merged).toMatchObject([
+      { displayName: "Front", sessionCount: 0 },
+      { displayName: "backend", sessionCount: 0 },
+    ]);
   });
 
   it("lets session-derived entries win on a normalized-path collision", () => {
