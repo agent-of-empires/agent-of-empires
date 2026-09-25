@@ -2744,7 +2744,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn storage_round_trips_and_rewrites_groups_only_when_changed() -> Result<()> {
+    fn storage_round_trips_sessions_and_groups() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
         let storage = Storage::new_unwatched("test-profile")?;
@@ -2811,38 +2811,24 @@ mod tests {
         let (_, groups) = storage.load_with_groups()?;
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].path, "work/projects");
-
-        {
-            let temp = tempdir()?;
-            let _guard = setup_test_home(temp.path());
-            let storage = Storage::new_unwatched("test-skip-groups-write")?;
-            storage.update(|i, g| {
-                *i = vec![Instance::new("seed", "/tmp/seed")];
-                g.push(Group::new("seed-group", "seed-group"));
-                Ok(())
-            })?;
-
-            let groups_path = storage.sessions_path.with_file_name("groups.json");
-            let sentinel = std::time::UNIX_EPOCH + Duration::from_secs(946_684_800);
-            fs::File::options()
-                .write(true)
-                .open(&groups_path)?
-                .set_times(fs::FileTimes::new().set_modified(sentinel))?;
-            storage.update(|instances, _groups| {
-                instances.push(Instance::new("added", "/tmp/added"));
-                Ok(())
-            })?;
-            assert_eq!(fs::metadata(&groups_path)?.modified()?, sentinel);
-
-            storage.update(|_instances, groups| {
-                groups.push(Group::new("new-group", "work/new-group"));
-                Ok(())
-            })?;
-            let (_, groups) = storage.load_with_groups()?;
-            let paths: Vec<_> = groups.iter().map(|group| group.path.as_str()).collect();
-            assert_eq!(paths, ["seed-group", "work/new-group"]);
-        }
         Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn open_unwatched_requires_existing_profile() {
+        let temp = tempdir().unwrap();
+        let guard = setup_test_home(temp.path());
+        let profile_dir = guard.path().join("profiles").join("ghost");
+
+        let err = Storage::open_unwatched("ghost")
+            .err()
+            .expect("unknown profile");
+        assert!(err.to_string().contains("does not exist"), "got: {err}");
+        assert!(!profile_dir.exists(), "must not create the profile dir");
+
+        crate::session::create_profile("known").unwrap();
+        assert_eq!(Storage::open_unwatched("known").unwrap().profile(), "known");
     }
 
     #[test]
@@ -2903,7 +2889,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn profile_resolution_defaults_and_requires_an_existing_profile() -> Result<()> {
+    fn empty_profile_argument_resolves_default_profile() -> Result<()> {
         for (existing, configured, expected) in [
             (&[][..], None, "main"),
             (&["work", "personal"][..], None, "personal"),
@@ -2920,21 +2906,6 @@ mod tests {
                 })?;
             }
             assert_eq!(Storage::new_unwatched("")?.profile(), expected);
-        }
-
-        {
-            let temp = tempdir().unwrap();
-            let guard = setup_test_home(temp.path());
-            let profile_dir = guard.path().join("profiles").join("ghost");
-
-            let err = Storage::open_unwatched("ghost")
-                .err()
-                .expect("unknown profile");
-            assert!(err.to_string().contains("does not exist"), "got: {err}");
-            assert!(!profile_dir.exists(), "must not create the profile dir");
-
-            crate::session::create_profile("known").unwrap();
-            assert_eq!(Storage::open_unwatched("known").unwrap().profile(), "known");
         }
         Ok(())
     }
@@ -3038,7 +3009,44 @@ mod tests {
 
     #[test]
     #[serial]
-    fn update_locks_serialize_within_a_profile_only() -> Result<()> {
+    fn test_update_does_not_serialize_across_profiles() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage_a = Storage::new_unwatched("test-update-profile-a")?;
+        let storage_b = Storage::new_unwatched("test-update-profile-b")?;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (overlap_tx, overlap_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let storage_a = &storage_a;
+            let storage_b = &storage_b;
+            let a = scope.spawn(move || {
+                storage_a.update(|instances, _| {
+                    entered_tx.send(()).unwrap();
+                    let overlap = overlap_rx.recv_timeout(Duration::from_secs(2));
+                    instances.push(Instance::new("a1", "/tmp/a1"));
+                    overlap.context("profile B must enter while profile A owns its update locks")
+                })
+            });
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let b = scope.spawn(move || {
+                storage_b.update(|instances, _| {
+                    let _ = overlap_tx.send(());
+                    instances.push(Instance::new("b1", "/tmp/b1"));
+                    Ok(())
+                })
+            });
+            a.join().unwrap()?;
+            b.join().unwrap()?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        assert_eq!(storage_a.load()?[0].title, "a1");
+        assert_eq!(storage_b.load()?[0].title, "b1");
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_update_takes_same_lock_across_threads() -> Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
         let storage = Storage::new_unwatched("test-commit-lock")?;
@@ -3079,41 +3087,6 @@ mod tests {
                 "{layer}: mutation entered before lock release"
             );
             assert_eq!(storage.load()?[0].title, layer);
-        }
-
-        {
-            let temp = tempdir()?;
-            let _guard = setup_test_home(temp.path());
-            let storage_a = Storage::new_unwatched("test-update-profile-a")?;
-            let storage_b = Storage::new_unwatched("test-update-profile-b")?;
-            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-            let (overlap_tx, overlap_rx) = std::sync::mpsc::channel();
-            std::thread::scope(|scope| {
-                let storage_a = &storage_a;
-                let storage_b = &storage_b;
-                let a = scope.spawn(move || {
-                    storage_a.update(|instances, _| {
-                        entered_tx.send(()).unwrap();
-                        let overlap = overlap_rx.recv_timeout(Duration::from_secs(2));
-                        instances.push(Instance::new("a1", "/tmp/a1"));
-                        overlap
-                            .context("profile B must enter while profile A owns its update locks")
-                    })
-                });
-                entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-                let b = scope.spawn(move || {
-                    storage_b.update(|instances, _| {
-                        let _ = overlap_tx.send(());
-                        instances.push(Instance::new("b1", "/tmp/b1"));
-                        Ok(())
-                    })
-                });
-                a.join().unwrap()?;
-                b.join().unwrap()?;
-                Ok::<_, anyhow::Error>(())
-            })?;
-            assert_eq!(storage_a.load()?[0].title, "a1");
-            assert_eq!(storage_b.load()?[0].title, "b1");
         }
         Ok(())
     }
@@ -3231,6 +3204,40 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn update_rewrites_groups_only_when_changed() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("test-skip-groups-write")?;
+        storage.update(|i, g| {
+            *i = vec![Instance::new("seed", "/tmp/seed")];
+            g.push(Group::new("seed-group", "seed-group"));
+            Ok(())
+        })?;
+
+        let groups_path = storage.sessions_path.with_file_name("groups.json");
+        let sentinel = std::time::UNIX_EPOCH + Duration::from_secs(946_684_800);
+        fs::File::options()
+            .write(true)
+            .open(&groups_path)?
+            .set_times(fs::FileTimes::new().set_modified(sentinel))?;
+        storage.update(|instances, _groups| {
+            instances.push(Instance::new("added", "/tmp/added"));
+            Ok(())
+        })?;
+        assert_eq!(fs::metadata(&groups_path)?.modified()?, sentinel);
+
+        storage.update(|_instances, groups| {
+            groups.push(Group::new("new-group", "work/new-group"));
+            Ok(())
+        })?;
+        let (_, groups) = storage.load_with_groups()?;
+        let paths: Vec<_> = groups.iter().map(|group| group.path.as_str()).collect();
+        assert_eq!(paths, ["seed-group", "work/new-group"]);
         Ok(())
     }
 
@@ -3658,6 +3665,23 @@ mod tests {
     }
 
     #[test]
+    fn recent_project_entry_for_cases() {
+        let mut inst = Instance::new("s", "/home/me/projects/frontend/");
+        inst.tool = "claude".to_string();
+        let accessed = inst.created_at + chrono::Duration::hours(5);
+        inst.last_accessed_at = Some(accessed);
+        let e = recent_project_entry_for(&inst).expect("single-repo session recorded");
+        assert_eq!(
+            (&*e.path, &*e.display_name, &*e.tool),
+            ("/home/me/projects/frontend", "frontend", "claude")
+        );
+        assert_eq!(e.last_used_at, accessed.to_rfc3339());
+
+        inst.scratch = true;
+        assert!(recent_project_entry_for(&inst).is_none());
+    }
+
+    #[test]
     #[serial]
     fn record_recent_project_upserts_sorts_and_caps() -> Result<()> {
         let temp = tempdir()?;
@@ -3697,22 +3721,6 @@ mod tests {
             1,
             "no duplicate entry"
         );
-
-        {
-            let mut inst = Instance::new("s", "/home/me/projects/frontend/");
-            inst.tool = "claude".to_string();
-            let accessed = inst.created_at + chrono::Duration::hours(5);
-            inst.last_accessed_at = Some(accessed);
-            let e = recent_project_entry_for(&inst).expect("single-repo session recorded");
-            assert_eq!(
-                (&*e.path, &*e.display_name, &*e.tool),
-                ("/home/me/projects/frontend", "frontend", "claude")
-            );
-            assert_eq!(e.last_used_at, accessed.to_rfc3339());
-
-            inst.scratch = true;
-            assert!(recent_project_entry_for(&inst).is_none());
-        }
         Ok(())
     }
 
