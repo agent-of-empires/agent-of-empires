@@ -109,7 +109,9 @@ async function installCityHallMocks(page: Page) {
   );
 }
 
-test("Settings is curated to the CityHall subset", async ({ page }) => {
+test("Settings, its Sessions and Theme tabs, and settings search are curated to the CityHall subset", async ({
+  page,
+}) => {
   await installCityHallMocks(page);
   await page.goto("/settings");
 
@@ -121,44 +123,29 @@ test("Settings is curated to the CityHall subset", async ({ page }) => {
   await expect(page.getByText("Worktree")).toHaveCount(0);
   await expect(page.getByText("Security")).toHaveCount(0);
   await expect(page.getByText("Profiles")).toHaveCount(0);
-});
 
-test("CityHall Sessions tab shows only the trash options", async ({ page }) => {
-  await installCityHallMocks(page);
+  // Search must not reach uncurated fields either (a UX gate; the server 403s the write).
+  const search = page.getByPlaceholder("Search settings...");
+  await search.fill("yolo");
+  await expect(page.getByTestId("settings-search-hit-sandbox-yolo_mode")).toHaveCount(0);
+  await expect(page.getByText("No matching settings")).toBeVisible();
+  await search.fill("idle");
+  await expect(page.getByTestId("settings-search-hit-session-idle_auto_stop")).toHaveCount(0);
+  await expect(page.getByTestId("settings-search-hit-theme-idle_decay_minutes")).toHaveCount(0);
+  await search.fill("trash");
+  await expect(page.getByTestId("settings-search-hit-session-delete_to_trash")).toBeVisible();
+
   await page.goto("/settings/session");
-
   await expect(page.getByText("Delete to Trash")).toBeVisible();
   await expect(page.getByText("Confirm Before Delete")).toBeVisible();
   await expect(page.getByText("Trash Retention (days)")).toBeVisible();
   await expect(page.getByText("Idle auto-stop")).toHaveCount(0);
   await expect(page.getByText("Default profile")).toHaveCount(0);
-});
 
-test("CityHall Theme tab hides color-mode and idle-decay", async ({ page }) => {
-  await installCityHallMocks(page);
   await page.goto("/settings/theme");
-
   await expect(page.locator("button:visible", { hasText: "Theme" }).first()).toBeVisible();
   await expect(page.getByText("Color mode")).toHaveCount(0);
   await expect(page.getByText("Idle decay")).toHaveCount(0);
-});
-
-// Search must not reach uncurated fields either (a UX gate; the server 403s the write).
-test("CityHall settings search offers only curated fields", async ({ page }) => {
-  await installCityHallMocks(page);
-  await page.goto("/settings");
-
-  const search = page.getByPlaceholder("Search settings...");
-  await search.fill("yolo");
-  await expect(page.getByTestId("settings-search-hit-sandbox-yolo_mode")).toHaveCount(0);
-  await expect(page.getByText("No matching settings")).toBeVisible();
-
-  await search.fill("idle");
-  await expect(page.getByTestId("settings-search-hit-session-idle_auto_stop")).toHaveCount(0);
-  await expect(page.getByTestId("settings-search-hit-theme-idle_decay_minutes")).toHaveCount(0);
-
-  await search.fill("trash");
-  await expect(page.getByTestId("settings-search-hit-session-delete_to_trash")).toBeVisible();
 });
 
 test("CityHall MCP + Plugins tabs render read-only", async ({ page }) => {

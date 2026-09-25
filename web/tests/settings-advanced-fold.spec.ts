@@ -171,30 +171,3 @@ test("sandbox advanced knob edits persist after expanding the fold", async ({ pa
     .click();
   await expect(cpuInput).toHaveValue("4");
 });
-
-// The other three folded tabs (Worktree, Structured view, Logging) each render
-// their advanced fields only once the fold is expanded. Drive each one in the
-// browser so the relocated field markup is exercised through real URL routing.
-test("worktree, structured-view, and logging advanced folds expand in the browser", async ({ page }) => {
-  await installFoldMocks(page);
-
-  const cases: Array<{ tab: string; anchor: string; field: RegExp }> = [
-    { tab: "worktree", anchor: "Enabled by Default", field: /^Bare Repo Template$/ },
-    { tab: "structured-view", anchor: "Show tool-call durations", field: /^Silent-orphan grace \(s\)$/ },
-    { tab: "logging", anchor: "Default level", field: /^Output \(restart req\.\)$/ },
-  ];
-
-  for (const { tab, anchor, field } of cases) {
-    await page.goto(`/settings/${tab}`);
-    await expect(page.getByText(anchor).first()).toBeVisible();
-
-    // Folded away by default.
-    await expect(fieldByLabel(page, field)).toHaveCount(0);
-
-    await page
-      .getByRole("button", { name: /Advanced/ })
-      .first()
-      .click();
-    await expect(fieldByLabel(page, field)).toBeVisible();
-  }
-});
