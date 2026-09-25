@@ -20,6 +20,8 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+use clap::Parser as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -529,6 +531,67 @@ fn parse_wire(bytes: &[u8], case_id: &str) -> Result<Vec<WireRecord>> {
     Ok(records)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireJsonlRow {
+    direction: u8,
+    role: u8,
+    bytes_base64: String,
+}
+
+fn verify_wire_jsonl(root: &Path, case_id: &str, wire: &[WireRecord]) -> Result<()> {
+    let path = root.join(format!("cases/{case_id}/wire.jsonl"));
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return fail(format!("cannot read case {case_id} wire.jsonl: {error}")),
+    };
+    if bytes.is_empty() {
+        if wire.is_empty() {
+            return Ok(());
+        }
+        return fail(format!(
+            "case {case_id} has empty wire.jsonl for nonempty wire.raw"
+        ));
+    }
+    if !bytes.ends_with(b"\n") {
+        return fail(format!("case {case_id} wire.jsonl has no final LF"));
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| PackError(format!("case {case_id} wire.jsonl is not UTF-8")))?;
+    let mut rows = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let row: WireJsonlRow = serde_json::from_str(line).map_err(|error| {
+            PackError(format!(
+                "case {case_id} wire.jsonl line {}: {error}",
+                index + 1
+            ))
+        })?;
+        rows.push(row);
+    }
+    if rows.len() != wire.len() {
+        return fail(format!(
+            "case {case_id} wire.jsonl record count disagrees with wire.raw"
+        ));
+    }
+    for (index, (row, record)) in rows.iter().zip(wire).enumerate() {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&row.bytes_base64)
+            .map_err(|_| {
+                PackError(format!(
+                    "case {case_id} wire.jsonl line {} has invalid base64",
+                    index + 1
+                ))
+            })?;
+        if row.direction != record.direction || row.role != record.role || decoded != record.raw() {
+            return fail(format!(
+                "case {case_id} wire.jsonl disagrees with wire.raw at record {index}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Whether a record is an HTTP upgrade request/response rather than a
 /// WebSocket frame.
 fn is_http_record(payload: &[u8]) -> bool {
@@ -618,6 +681,9 @@ fn websocket_opcode(case_id: &str, direction: u8, payload: &[u8]) -> Result<u8> 
 /// Verify a whole pack: safe root, manifest universe and digests, canonical
 /// `CASES.json`, per-case layout, and the expected/error closure.
 pub fn verify(root: &Path) -> Result<VerifiedPack> {
+    if !cfg!(debug_assertions) {
+        return fail("expected_debug_profile");
+    }
     let metadata = fs::symlink_metadata(root)
         .map_err(|error| PackError(format!("cannot stat the pack root: {error}")))?;
     if !metadata.is_dir() {
@@ -669,6 +735,56 @@ pub fn verify(root: &Path) -> Result<VerifiedPack> {
     Ok(VerifiedPack { cases: verified })
 }
 
+fn verify_argv_contract(case_id: &str, row: &CaseRow) -> Result<()> {
+    let parsed = super::Cli::try_parse_from(row.argv.clone());
+    match row.parse.as_str() {
+        "ok" => {
+            let cli = parsed.map_err(|error| {
+                PackError(format!("case {case_id} parse=ok argv is invalid: {error}"))
+            })?;
+            if super::classify(cli.command.as_ref()).is_none() {
+                return fail(format!("case {case_id} parse=ok argv is not a scoped read"));
+            }
+            let expected = match (row.command.as_str(), row.alias.as_deref()) {
+                ("list", None) => "list",
+                ("list", Some("ls")) => "ls",
+                ("status", None) => "status",
+                ("session-show", None) => "show",
+                ("session-list-trash", None) => "list-trash",
+                ("group-list", None) => "list",
+                ("group-list", Some("group-ls")) => "ls",
+                ("profile-bare", None) => "profile",
+                ("profile-list", None) => "list",
+                ("profile-list", Some("profile-ls")) => "ls",
+                ("project-list", None) => "list",
+                ("project-list", Some("project-ls")) => "ls",
+                _ => return fail(format!("case {case_id} has no canonical argv spelling")),
+            };
+            if !row.argv.iter().skip(1).any(|token| token == expected) {
+                return fail(format!("case {case_id} argv does not contain {expected}"));
+            }
+        }
+        "parser_error" => {
+            let error = parsed.err().ok_or_else(|| {
+                PackError(format!(
+                    "case {case_id} parse=parser_error argv parsed successfully"
+                ))
+            })?;
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) || row.command != "unparsable"
+                || row.alias.is_some()
+                || row.transport != "uds"
+                || row.auth != "none"
+            {
+                return fail(format!("case {case_id} has an invalid parser_error row"));
+            }
+        }
+        _ => return fail(format!("case {case_id} has an unknown parse state")),
+    }
+    Ok(())
+}
 fn verify_case(root: &Path, physical: &[String], row: &CaseRow) -> Result<VerifiedCase> {
     let case_id = &row.case_id;
     if !COMMANDS.contains(&row.command.as_str())
@@ -696,6 +812,7 @@ fn verify_case(root: &Path, physical: &[String], row: &CaseRow) -> Result<Verifi
             "case {case_id} argv must start with the binary name"
         ));
     }
+    verify_argv_contract(case_id, row)?;
 
     let prefix = format!("cases/{case_id}/");
     // The per-case layout is read from the filesystem, not from the row, so a
@@ -844,6 +961,7 @@ fn verify_case(root: &Path, physical: &[String], row: &CaseRow) -> Result<Verifi
     }
 
     let wire = parse_wire(&read(root, &format!("{prefix}wire.raw"))?, case_id)?;
+    verify_wire_jsonl(root, case_id, &wire)?;
     let wire_frames = count_wire_frames(case_id, &wire, &row.replay_role)?;
     if wire_frames != expected.wire_frames {
         return fail(format!(

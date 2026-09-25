@@ -448,9 +448,41 @@ async fn connect_admission(namespace: OwnedNamespace) -> Result<UdsConnection, R
 }
 
 fn runtime_entry_present(dir: RawFd) -> bool {
-    [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE]
+    if [PREBIND_FILE, POSTBIND_FILE, SOCKET_FILE]
         .iter()
         .any(|name| fstatat(dir, name).is_ok())
+    {
+        return true;
+    }
+    directory_contains_temp_marker(dir)
+}
+
+fn directory_contains_temp_marker(dir: RawFd) -> bool {
+    let duplicate = unsafe { libc::dup(dir) };
+    let Ok(scan) = fd_to_owned(duplicate) else {
+        return true;
+    };
+    let entries = unsafe { libc::fdopendir(scan.into_raw_fd()) };
+    if entries.is_null() {
+        return true;
+    }
+    let mut found = false;
+    loop {
+        errno_reset();
+        let entry = unsafe { libc::readdir(entries) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_string_lossy();
+        if name.starts_with("runtime.prebind.json.tmp.")
+            || name.starts_with("runtime.postbind.json.tmp.")
+        {
+            found = true;
+            break;
+        }
+    }
+    unsafe { libc::closedir(entries) };
+    found
 }
 
 fn validate_prebind(marker: &PrebindMarker, namespace: &str) -> Result<(), ReadFailure> {

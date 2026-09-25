@@ -757,6 +757,17 @@ fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
     if !valid_timestamp(&session.created_at) {
         return Err("schema_invalid");
     }
+    if session
+        .archived_at
+        .as_deref()
+        .is_some_and(|value| value < session.created_at.as_str())
+        || session
+            .trashed_at
+            .as_deref()
+            .is_some_and(|value| value < session.created_at.as_str())
+    {
+        return Err("schema_invalid");
+    }
     match session.state {
         WireState::Live if session.archived_at.is_some() || session.trashed_at.is_some() => {
             return Err("schema_invalid")
