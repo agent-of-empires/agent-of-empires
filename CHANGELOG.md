@@ -4,6 +4,26 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.17.1](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.17.1) - 2026-09-25
+
+
+
+### Bug Fixes
+
+- Keep a shared worktree when its ownership check is incomplete or racing in [#4112](https://github.com/agent-of-empires/agent-of-empires/pull/4112) by [@njbrake](https://github.com/njbrake) ([`2ee625b`](https://github.com/agent-of-empires/agent-of-empires/commit/2ee625be315527c6e9b74697c20535bf26007b00))
+- Seed only declared configuration out of native agent stores in [#3981](https://github.com/agent-of-empires/agent-of-empires/pull/3981) by [@jerome-benoit](https://github.com/jerome-benoit) ([`f74ac60`](https://github.com/agent-of-empires/agent-of-empires/commit/f74ac60194dbcb5a3a0bc87bc2ae77919b27e8e9))
+- **sandbox:** Follow-ups to sandbox content isolation in [#4117](https://github.com/agent-of-empires/agent-of-empires/pull/4117) by [@njbrake](https://github.com/njbrake) ([`9721307`](https://github.com/agent-of-empires/agent-of-empires/commit/9721307ede4ebb02e767379d2cf0588fc38c851d))
+- **web:** Let plugin pane row text wrap in narrow columns in [#4090](https://github.com/agent-of-empires/agent-of-empires/pull/4090) by [@cwrau](https://github.com/cwrau) ([`a687c87`](https://github.com/agent-of-empires/agent-of-empires/commit/a687c87674a4e0981ed0a7abea808cbec588b2bf))
+- **session:** Don't export CLAUDE_CONFIG_DIR for the default Claude store in [#4122](https://github.com/agent-of-empires/agent-of-empires/pull/4122) by [@njbrake](https://github.com/njbrake) ([`9fe4ab4`](https://github.com/agent-of-empires/agent-of-empires/commit/9fe4ab4ad320d199f5360e8b1e1e7265ebcde74c))
+
+
+### Features
+
+- **web:** Show unread/waiting counts on the sidebar toggle in [#4099](https://github.com/agent-of-empires/agent-of-empires/pull/4099) by [@cwrau](https://github.com/cwrau) ([`17a3e95`](https://github.com/agent-of-empires/agent-of-empires/commit/17a3e9599b31c5b13a09412fe329ae46384ee7f1))
+- **plugin:** Allow relative UI-link hrefs, navigate same-origin links in-app in [#4089](https://github.com/agent-of-empires/agent-of-empires/pull/4089) by [@cwrau](https://github.com/cwrau) ([`e6f89c1`](https://github.com/agent-of-empires/agent-of-empires/commit/e6f89c1d04ef24d6e998e13bcd009f87d904aaee))
+
+
+**Full Changelog**: https://github.com/agent-of-empires/agent-of-empires/compare/v1.17.0...v1.17.1
 ## [1.17.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.17.0) - 2026-09-24
 
 

@@ -9,7 +9,7 @@ pub enum ForkSeed {
     /// Terminal fork: resume `parent_agent_session_id` with the agent's fork
     /// flag, writing to the pre-generated `child_session_id`.
     Terminal {
-        parent: crate::session::ConversationBinding,
+        parent: Box<crate::session::ConversationBinding>,
         child_session_id: String,
     },
     /// Structured fork: send ACP `session/fork` against
@@ -64,7 +64,7 @@ pub fn terminal_fork_seed(
         return Err(ForkDenied::AgentCannotFork);
     }
     Ok(ForkSeed::Terminal {
-        parent: parent.clone(),
+        parent: Box::new(parent.clone()),
         child_session_id,
     })
 }
@@ -82,6 +82,7 @@ mod tests {
                 agent: "claude".into(),
                 stores: vec!["/store".into()],
                 configuration: Vec::new(),
+                exported_default_store: false,
                 cwd: "/work".into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),

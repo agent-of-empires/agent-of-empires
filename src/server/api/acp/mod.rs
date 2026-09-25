@@ -125,7 +125,7 @@ fn spawn_request_for(
         seed_history_replay: instance.import_pending == Some(true),
         claude_store_pin: instance
             .selected_claude_conversation()
-            .and_then(|(_, execution)| execution.stores.first().cloned()),
+            .and_then(|(_, execution)| crate::session::capture::ClaudeStorePin::of(execution)),
     }
 }
 
