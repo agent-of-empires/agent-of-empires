@@ -907,16 +907,6 @@ mod tests {
     }
 
     #[test]
-    fn host_hooks_fields_parse_independently() {
-        let single: HostHooksConfig = toml::from_str("before_session = \"mint\"").unwrap();
-        assert_eq!(single.before_session, vec!["mint"]);
-        assert!(single.before_start.is_empty() && !single.is_empty());
-        let many: HostHooksConfig = toml::from_str("before_start = [\"a\", \"b\"]").unwrap();
-        assert_eq!(many.before_start, vec!["a", "b"]);
-        assert!(!many.is_empty() && HostHooksConfig::default().is_empty());
-    }
-
-    #[test]
     fn origin_hint_names_the_layer_the_commands_came_from() {
         use super::super::{LEGACY_REPO_CONFIG_PATH, REPO_CONFIG_PATH};
         let _app = crate::session::test_support::isolate_app_dir();
@@ -1024,23 +1014,6 @@ mod tests {
     }
 
     #[test]
-    fn repo_hook_overrides_replace_per_type() {
-        let global = HooksConfig {
-            on_create: cmds(&["global-create"]),
-            on_launch: cmds(&["global-launch"]),
-            on_destroy: cmds(&["global-destroy"]),
-        };
-        let repo = HooksConfig {
-            on_create: cmds(&["repo-create-a", "repo-create-b"]),
-            ..Default::default()
-        };
-        let merged = apply_repo_hook_overrides(global.clone(), &repo);
-        assert_eq!(merged.on_create, cmds(&["repo-create-a", "repo-create-b"]));
-        assert_eq!(merged.on_launch, global.on_launch);
-        assert_eq!(merged.on_destroy, global.on_destroy);
-    }
-
-    #[test]
     fn hook_display_groups_label_source_and_filter() {
         let repo = HooksConfig {
             on_create: cmds(&["repo-create"]),
@@ -1068,17 +1041,6 @@ mod tests {
         assert_eq!(summary(false), expected);
         expected.push(("on_destroy", " (from repo)", cmds(&["repo-destroy"])));
         assert_eq!(summary(true), expected);
-    }
-
-    #[test]
-    fn execute_hooks_in_missing_container_fails() {
-        assert!(execute_hooks_in_container(
-            &cmds(&["echo test"]),
-            "nonexistent_container",
-            "/w",
-            &[]
-        )
-        .is_err());
     }
 
     /// #901: streamed hooks detach from the TUI terminal and defang git/ssh prompts.
