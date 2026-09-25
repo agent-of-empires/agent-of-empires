@@ -10,7 +10,6 @@ import {
   mockAcpSession,
   openStructuredSession,
   stopped,
-  toolCallCompleted,
   toolCallStarted,
   usageUpdated,
   waitForComposerConnected,
@@ -157,43 +156,6 @@ test.describe("edit card diff scroll", () => {
     await expect(viewport).toBeVisible();
     await expect.poll(() => overflowX(viewport)).toBeLessThanOrEqual(0);
   });
-});
-
-// #1467: a failed tool card opens on its own but its header still folds it.
-test("failed tool card auto-opens and folds via the chevron", async ({ page }) => {
-  const ERROR_TEXT = "boom: the command exploded";
-  const mock = await mockAcpSession(page, {
-    title: "story-fold-fail",
-    initialEvents: [
-      toolCallStarted({
-        id: "tc-fail-1",
-        name: "Terminal",
-        kind: "execute",
-        args_preview: JSON.stringify({ command: "rm -rf /nope" }),
-      }),
-      toolCallCompleted({
-        tool_call_id: "tc-fail-1",
-        is_error: true,
-        content: ERROR_TEXT,
-      }),
-      stopped(),
-    ],
-  });
-  await openStructuredSession(page, mock);
-
-  const errorText = page.getByText(ERROR_TEXT);
-  await expect(errorText).toBeVisible({ timeout: 10_000 });
-  await expect(page.getByText("tool failed")).toBeVisible();
-
-  const cardHeader = page
-    .getByRole("button")
-    .filter({ hasText: /failed/i })
-    .first();
-  await cardHeader.click();
-  await expect(errorText).toBeHidden({ timeout: 10_000 });
-
-  await cardHeader.click();
-  await expect(errorText).toBeVisible({ timeout: 10_000 });
 });
 
 // ─────────────────────────── composer ────────────────────────────

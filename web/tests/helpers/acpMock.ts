@@ -319,12 +319,6 @@ export function toolCallStarted(tc: { id: string; name: string; kind: string; ar
   };
 }
 
-export function toolCallCompleted(fields: { tool_call_id: string; is_error: boolean; content: string }) {
-  return {
-    ToolCallCompleted: { ...fields, completed_at: new Date().toISOString() },
-  };
-}
-
 export function backgroundAgentLaunched(fields: {
   agent_id: string;
   tool_call_id: string;
