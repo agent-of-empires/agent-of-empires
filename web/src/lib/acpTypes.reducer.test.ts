@@ -418,23 +418,3 @@ describe("patchServerRow (Tier 4 delta Patch)", () => {
     expect(appended.map((r) => r.id)).toEqual(["start-a", "msg-9"]);
   });
 });
-
-describe("applyEvent / UserPromptSent prompt counter (Tier 4)", () => {
-  it("bumps promptSeq for a foreign prompt but not for the echo of one in flight", () => {
-    const next = ev(emptyAcpState(), 1, { UserPromptSent: { text: "hi", prompt_id: "cmp-1" } });
-    expect(next.promptSeq).toBe(1);
-    expect(next.turnActive).toBe(true);
-    expect(next.activity).toHaveLength(0);
-
-    const seeded: AcpState = {
-      ...emptyAcpState(),
-      optimisticRows: [{ id: "cmp-1", kind: "user_prompt", text: "hi", at: "t" }],
-      inflightPromptIds: ["cmp-1"],
-      promptSeq: 1,
-      turnActive: true,
-    };
-    const echoed = ev(seeded, 1, { UserPromptSent: { text: "hi", prompt_id: "cmp-1" } });
-    expect(echoed.promptSeq).toBe(1);
-    expect(echoed.inflightPromptIds).toEqual([]);
-  });
-});

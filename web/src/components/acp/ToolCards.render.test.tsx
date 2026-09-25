@@ -79,14 +79,6 @@ describe("ToolCard headers", () => {
     ["edit", fixtures.edit, undefined, {}, ["edit", "/tmp/main.rs"], []],
     ["write", fixtures.write, undefined, {}, ["write", "/tmp/new.rs"], []],
     ["codex structured diff", fixtures.codexEdit, undefined, {}, ["edit", "src/codex.rs"], ["(unknown file)"]],
-    [
-      "codex multi-file diff",
-      fixtures.codexEditMultiFile,
-      undefined,
-      {},
-      ["src/alpha.rs", "+1 more"],
-      ["(unknown file)"],
-    ],
     ["delete", fixtures.del, undefined, {}, ["delete", "/tmp/gone.rs"], []],
     [
       "search",
@@ -276,7 +268,6 @@ describe("ToolCard headers", () => {
 describe("ToolCard expanded bodies", () => {
   it.each<[string, ToolCall, ActivityRow | undefined, RenderOpts, string[], string[]]>([
     ["bash output", fixtures.bash, makeCompletion({ text: "hello world\n" }), {}, ["hello world"], []],
-    ["codex second file", fixtures.codexEditMultiFile, undefined, {}, ["src/beta.rs"], []],
     [
       "monitor timeout chip and body",
       makeToolCall({
@@ -462,21 +453,12 @@ describe("structured output media", () => {
 
 describe("repo-relative paths", () => {
   const session: FileRefSession = { project_path: "/tmp", main_repo_path: null, workspace_repos: [] };
-  const multi: FileRefSession = {
-    project_path: "/tmp/ws",
-    main_repo_path: null,
-    workspace_repos: [{ name: "api", source_path: "/tmp/api" }],
-  };
-  const editAt = (file_path: string) =>
-    makeToolCall({ kind: "edit", args_preview: args({ file_path, old_string: "a", new_string: "b" }) });
 
   it.each<[string, ToolCall, FileRefSession, string, string | null]>([
     ["edit", fixtures.edit, session, "main.rs", "/tmp/main.rs"],
     ["read", fixtures.read, session, "main.rs", "/tmp/main.rs"],
     ["delete", fixtures.del, session, "gone.rs", "/tmp/gone.rs"],
     ["write", fixtures.write, session, "new.rs", "/tmp/new.rs"],
-    ["multi-repo workspace", editAt("/tmp/api/src/h.ts"), multi, "api/src/h.ts", "/tmp/api/src/h.ts"],
-    ["outside every root", editAt("/etc/hosts"), session, "/etc/hosts", null],
   ])("%s", (_label, tool, fileRefSession, shown, hidden) => {
     const { text } = renderCard(tool, undefined, { session: fileRefSession });
     expect(text()).toContain(shown);

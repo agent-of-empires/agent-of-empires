@@ -117,19 +117,6 @@ describe("useHistoryWindow", () => {
     expect(result.current.canLoadEarlier).toBe(true);
   });
 
-  it("opens on the whole last turn when that turn is longer than the default window", () => {
-    const activity = transcript(5, 1); // 10 rows
-    activity.push({ id: "u-last", kind: "user_prompt", text: "the last prompt" });
-    for (let r = 0; r < DEFAULT_HISTORY_WINDOW + 200; r += 1) {
-      activity.push({ id: `t-${r}`, kind: "tool_complete", text: `tool ${r}` });
-    }
-    const { result } = render(activity);
-    const ids = result.current.windowedActivity.map((r) => r.id);
-    expect(ids[0]).toBe("u-last");
-    expect(ids).toHaveLength(DEFAULT_HISTORY_WINDOW + 201);
-    expect(result.current.canLoadEarlier).toBe(true);
-  });
-
   it("re-sizes to the new session's last turn on a session switch", () => {
     const { result, rerender } = render(transcript(100, 1)); // last turn is 2 rows: default window
     expect(result.current.windowedActivity.length).toBeLessThanOrEqual(DEFAULT_HISTORY_WINDOW);

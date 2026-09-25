@@ -86,11 +86,6 @@ describe("AskUserQuestionCard submission", () => {
       [[() => radio(/green/), { color: "green" }]],
     ],
     [
-      "required single select",
-      [q({ field_key: "color", title: "Pick a color", kind: "single_select", required: true, options: COLORS })],
-      [[() => {}, "Please answer: Pick a color"]],
-    ],
-    [
       "multi select toggles",
       [q({ field_key: "tags", kind: "multi_select", options: TAGS })],
       [

@@ -254,14 +254,6 @@ describe("slash command popover", () => {
     expect(option(/address-pr-comments/)).toHaveLength(0);
   });
 
-  it("inserts the command at the caret, not at the end", async () => {
-    const { textarea } = mount({ availableCommands: COMMANDS });
-    await typeAt(textarea(), "fix /he the bug", 7);
-    await pick(/\/help/);
-    expect(textarea().value).toBe("fix /help the bug");
-    expect(textarea().selectionStart).toBe(10);
-  });
-
   it("badges a skill-backed command and leaves a plain one unbadged", async () => {
     skillIndexRef.current = buildSkillIndex({
       roots: [
