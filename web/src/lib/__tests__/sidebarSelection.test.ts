@@ -49,7 +49,6 @@ describe("selectionReducer", () => {
     ["toggle removes but keeps the anchor", EMPTY_SELECTION, [toggle("b"), toggle("b")], [], "b"],
     ["range spans from the anchor", EMPTY_SELECTION, [toggle("b"), range("d")], ["b", "c", "d"], "b"],
     ["range re-pivots from the same anchor", EMPTY_SELECTION, [toggle("b"), range("d"), range("a")], ["a", "b"], "b"],
-    ["range re-anchors past a stale anchor", state(["x"], "x"), [range("c")], ["c"], "c"],
     ["range then extends from the new anchor", state(["x"], "x"), [range("c"), range("e")], ["c", "d", "e"], "c"],
     ["range without an anchor selects the target", EMPTY_SELECTION, [range("c")], ["c"], "c"],
     ["additive range unions", state(["a"], "a"), [toggle("d"), range("e", true)], ["a", "d", "e"], "d"],

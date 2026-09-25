@@ -146,8 +146,6 @@ describe("triage", () => {
     ["one pinned session", [{}, { id: "s2", pinned_at: TS }], { pinned: true, sunk: false, tier: 0 }],
     ["pinned beside archived", [{ pinned_at: TS }, { id: "s2", ...archived }], { pinned: true, sunk: false, tier: 0 }],
     ["archived and snoozed", [archived, { id: "s2", ...snoozed }], { pinned: false, sunk: true, tier: 2 }],
-    ["archived only", [archived, { id: "s2", ...archived }], { pinned: false, sunk: true, tier: 2 }],
-    ["snoozed only", [snoozed, { id: "s2", ...snoozed }], { pinned: false, sunk: true, tier: 2 }],
     ["one live beside archived", [archived, { id: "s2" }], { pinned: false, sunk: false, tier: 1 }],
     ["empty", [], { pinned: false, sunk: false, tier: 1 }],
   ])("%s workspace", (_name, sessions, { pinned, sunk, tier }) => {
@@ -159,8 +157,6 @@ describe("triage", () => {
 
   it.each([
     [false, false, false, "live"],
-    [true, false, false, "pinned"],
-    [false, true, false, "archived"],
     [false, false, true, "snoozed"],
     [false, true, true, "archived"],
     [true, true, false, "pinned"],

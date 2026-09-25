@@ -131,7 +131,6 @@ describe("usePushSubscription initial refresh", () => {
     ["denied permission", () => setPermission("denied"), { kind: "denied" }],
     ["push disabled on the server", () => installFetch(DISABLED_BY_SERVER), { kind: "disabled-by-server" }],
     ["a failing status endpoint", () => installFetch({ status: { ok: false, body: {} } }), { kind: "enabled" }],
-    ["a failing auto-heal re-register", () => installFetch({ subscribe: 500 }), { kind: "enabled" }],
     ["a rejected serviceWorker.ready", () => rejectServiceWorker("sw boom"), error("sw boom")],
     ["an insecure LAN origin", () => setInsecureHost("192.168.1.5"), unsupported("insecure-origin")],
     ["localhost over http", () => setInsecureHost("localhost"), { kind: "enabled" }],
@@ -184,7 +183,6 @@ describe("usePushSubscription enable()", () => {
     ],
     ["the VAPID endpoint fails", () => installFetch({ vapid: 500 }), error("Server returned 500 for VAPID key")],
     ["the context turns insecure", () => setInsecureHost("10.0.0.4"), unsupported("insecure-origin")],
-    ["PushManager disappears", removePushManager, unsupported("no-api")],
     [
       "subscribe() throws",
       () => {

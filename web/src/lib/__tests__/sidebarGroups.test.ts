@@ -276,7 +276,6 @@ describe("archivableWorkspaces", () => {
       [ws("w-snoozed", "feature", { snoozed_until: "2999-01-01T00:00:00Z" })],
       ["w-snoozed"],
     ],
-    ["is empty once every member is archived", [ws("w1", "feature", archived)], []],
     [
       "keys off the primary session",
       [

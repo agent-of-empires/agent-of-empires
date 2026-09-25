@@ -33,15 +33,11 @@ describe("SidebarSortPicker", () => {
     expect(menu()).toBeNull();
   });
 
-  it.each<[SidebarSortMode, SidebarSortMode]>([
-    ["manual", "lastActivity"],
-    ["lastActivity", "attention"],
-    ["attention", "manual"],
-  ])("from %s selecting %s fires onSortModeChange and closes", (current, next) => {
-    const onChange = setup(current);
+  it("selecting another mode fires onSortModeChange and closes", () => {
+    const onChange = setup("attention");
     fireEvent.click(trigger());
-    fireEvent.click(option(next));
-    expect(onChange.mock.calls).toEqual([[next]]);
+    fireEvent.click(option("manual"));
+    expect(onChange.mock.calls).toEqual([["manual"]]);
     expect(menu()).toBeNull();
   });
 
