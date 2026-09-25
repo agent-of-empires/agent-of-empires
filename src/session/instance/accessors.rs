@@ -831,6 +831,7 @@ mod tests {
         );
         assert!(!inst.backfill_claude_store_marker());
     }
+
     #[test]
     #[serial_test::serial]
     fn explicit_alias_of_default_store_derives_exported_routing() {
