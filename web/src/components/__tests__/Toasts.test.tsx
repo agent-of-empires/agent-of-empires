@@ -41,75 +41,35 @@ afterEach(() => {
   toastBus.handler = null;
 });
 
-describe("ToastProvider rendering", () => {
-  it("renders nothing in the toast region when there are no toasts", () => {
+describe("ToastProvider", () => {
+  it("renders info, push, and error toasts with their roles and dismisses on click", () => {
     const { container } = renderProvider();
-    const region = container.querySelector("div.fixed");
-    expect(region).not.toBeNull();
-    expect(region?.children.length).toBe(0);
-    expect(screen.queryByRole("status")).toBeNull();
-    expect(screen.queryByRole("alert")).toBeNull();
-  });
-
-  it("renders an info toast with role=status", () => {
-    renderProvider();
-    act(() => toastBus.handler?.info("hello info"));
-    const toast = screen.getByRole("status");
-    expect(toast.textContent).toContain("hello info");
-  });
-
-  it("renders an error toast with role=alert and error styling", () => {
-    renderProvider();
-    act(() => toastBus.handler?.error("boom"));
-    const toast = screen.getByRole("alert");
-    expect(toast.textContent).toContain("boom");
-    expect(toast.className).toContain("status-error");
-  });
-
-  it("renders a default-kind (info) toast via push()", () => {
-    renderProvider();
-    act(() => toastBus.handler?.push("plain push"));
-    expect(screen.getByRole("status").textContent).toContain("plain push");
-  });
-
-  it("renders multiple stacked toasts each with a dismiss button", () => {
-    renderProvider();
+    expect(container.querySelector("div.fixed")?.children.length).toBe(0);
     act(() => {
-      toastBus.handler?.info("first");
-      toastBus.handler?.error("second");
+      toastBus.handler?.info("hello info");
+      toastBus.handler?.push("plain push");
+      toastBus.handler?.error("boom");
     });
-    expect(screen.getByText("first")).toBeTruthy();
-    expect(screen.getByText("second")).toBeTruthy();
-    expect(screen.getAllByRole("button", { name: "Dismiss" }).length).toBe(2);
-  });
-});
+    const [info, push] = screen.getAllByRole("status");
+    expect(info!.textContent).toContain("hello info");
+    expect(push!.textContent).toContain("plain push");
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("boom");
+    expect(alert.className).toContain("status-error");
 
-describe("auto-dismiss timer", () => {
+    const dismiss = screen.getAllByRole("button", { name: "Dismiss" });
+    expect(dismiss.length).toBe(3);
+    act(() => fireEvent.click(dismiss[2]!));
+    expect(screen.queryByText("boom")).toBeNull();
+  });
+
   it("removes a toast after its 6s lifetime elapses", () => {
     renderProvider();
     act(() => toastBus.handler?.info("temporary"));
-    expect(screen.queryByText("temporary")).toBeTruthy();
-
-    act(() => vi.advanceTimersByTime(6000));
-    expect(screen.queryByText("temporary")).toBeNull();
-  });
-
-  it("keeps the toast visible before the lifetime elapses", () => {
-    renderProvider();
-    act(() => toastBus.handler?.info("still here"));
     act(() => vi.advanceTimersByTime(5999));
-    expect(screen.queryByText("still here")).toBeTruthy();
-  });
-});
-
-describe("manual dismiss", () => {
-  it("removes the toast when its dismiss button is clicked", () => {
-    renderProvider();
-    act(() => toastBus.handler?.error("dismiss me"));
-    const btn = screen.getByRole("button", { name: "Dismiss" });
-
-    act(() => fireEvent.click(btn));
-    expect(screen.queryByText("dismiss me")).toBeNull();
+    expect(screen.queryByText("temporary")).toBeTruthy();
+    act(() => vi.advanceTimersByTime(1));
+    expect(screen.queryByText("temporary")).toBeNull();
   });
 });
 
@@ -131,27 +91,20 @@ describe("service-worker push toasts", () => {
     window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
   });
 
-  it("falls back to the title when the push payload has no body", () => {
-    renderProvider();
-    dispatchPush({ type: "aoe-push", payload: { title: "Heads up", session_id: "s2" } });
-    expect(screen.getByText("Heads up")).toBeTruthy();
-  });
-
-  it("uses the default title and a plain info toast when payload omits title and session", () => {
-    renderProvider();
-    dispatchPush({ type: "aoe-push", payload: { body: "just a body" } });
-    const toast = screen.getByText("Agent of Empires: just a body").closest("div");
-    expect(toast?.getAttribute("role")).toBe("status");
-    expect(toast?.className).not.toContain("cursor-pointer");
-  });
-
-  it("ignores messages that are not aoe-push", () => {
+  it("falls back to the title or default title, and ignores non-aoe-push messages", () => {
     renderProvider();
     dispatchPush({ type: "something-else", payload: { title: "nope" } });
     dispatchPush(null);
     dispatchPush({ type: "aoe-push" });
     expect(screen.queryByRole("status")).toBeNull();
     expect(screen.queryByRole("alert")).toBeNull();
+
+    dispatchPush({ type: "aoe-push", payload: { title: "Heads up", session_id: "s2" } });
+    expect(screen.getByText("Heads up")).toBeTruthy();
+    dispatchPush({ type: "aoe-push", payload: { body: "just a body" } });
+    const toast = screen.getByText("Agent of Empires: just a body").closest("div");
+    expect(toast?.getAttribute("role")).toBe("status");
+    expect(toast?.className).not.toContain("cursor-pointer");
   });
 });
 
@@ -172,17 +125,13 @@ describe("click-to-open (ui.open_url) toast", () => {
 });
 
 describe("ToastBusBridge", () => {
-  it("wires and unwires the module-level toastBus handler", () => {
+  it("wires the bus only inside a provider and unwires on unmount", () => {
+    const outside = render(<ToastBusBridge />);
+    expect(toastBus.handler).toBeNull();
+    outside.unmount();
     const { unmount } = renderProvider();
     expect(toastBus.handler).not.toBeNull();
     unmount();
-    expect(toastBus.handler).toBeNull();
-  });
-
-  it("renders as a no-op without a surrounding provider", () => {
-    // Outside ToastProvider the context is null; the bridge must not touch
-    // the module-level bus.
-    render(<ToastBusBridge />);
     expect(toastBus.handler).toBeNull();
   });
 });

@@ -26,12 +26,15 @@ function setup({
 afterEach(cleanup);
 
 describe("SwitchViewDialog", () => {
-  it.each([
-    [false, true, /Switch to terminal[\s\S]*continues in the terminal/],
-    [true, true, /Switch to structured view[\s\S]*continues in structured view/],
-    [false, false, /fresh terminal pane/],
-  ])("toStructured=%s keepsContext=%s copy", (toStructured, keepsContext, copy) => {
-    expect(setup({ toStructured, keepsContext }).container.textContent).toMatch(copy);
+  it("describes the target view and whether context is kept", () => {
+    for (const [toStructured, keepsContext, copy] of [
+      [false, true, /Switch to terminal[\s\S]*continues in the terminal/],
+      [true, true, /Switch to structured view[\s\S]*continues in structured view/],
+      [false, false, /fresh terminal pane/],
+    ] as const) {
+      expect(setup({ toStructured, keepsContext }).container.textContent).toMatch(copy);
+      cleanup();
+    }
   });
 
   it("is a focused modal named by its title; Enter confirms and Escape cancels", () => {

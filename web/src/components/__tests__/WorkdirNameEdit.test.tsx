@@ -42,15 +42,18 @@ function editWorkdir(name: string, renameBranch = false) {
 }
 
 describe("sidebar Edit workdir name", () => {
-  it.each([
-    ["a managed, idle worktree", {}, true],
-    ["a non-managed worktree", { has_managed_worktree: false }, false],
-    ["a running session", { status: "Running" }, false],
-    // Tied mode folds naming into Rename (#1927).
-    ["a tied session", { tie_workdir_to_name: true }, false],
-  ] as [string, Partial<SessionResponse>, boolean][])("on %s: offered=%s", (_n, over, offered) => {
-    openRowMenu(managed(over));
-    expect(screen.queryByTestId("sidebar-context-menu-edit-workdir") != null).toBe(offered);
+  it("is offered only on a managed, idle, untied worktree (#1927)", () => {
+    for (const [name, over, offered] of [
+      ["a managed, idle worktree", {}, true],
+      ["a non-managed worktree", { has_managed_worktree: false }, false],
+      ["a running session", { status: "Running" }, false],
+      // Tied mode folds naming into Rename (#1927).
+      ["a tied session", { tie_workdir_to_name: true }, false],
+    ] as [string, Partial<SessionResponse>, boolean][]) {
+      openRowMenu(managed(over));
+      expect(screen.queryByTestId("sidebar-context-menu-edit-workdir") != null, name).toBe(offered);
+      cleanup();
+    }
   });
 
   it("PATCHes the worktree-name endpoint with name and rename_branch", async () => {
@@ -85,20 +88,24 @@ describe("sidebar inline rename", () => {
     expect(reportError).not.toHaveBeenCalled();
   });
 
-  it.each([
-    [
-      "the server message for a rejected tied rename (#1927)",
-      () => jsonResponse({ error: "session_running", message: "Stop the session before renaming it." }, 409),
-      "Stop the session before renaming it.",
-    ],
-    [
-      "a fallback without a server message",
-      () => Promise.reject(new Error("network unavailable")),
-      "Could not rename this session. Please try again.",
-    ],
-  ] as [string, () => Response | Promise<Response>, string][])("reports %s", async (_n, respond, message) => {
-    fetchSpy.mockImplementation(async () => respond());
-    rename("blocked", { tie_workdir_to_name: true });
-    await vi.waitFor(() => expect(reportError).toHaveBeenCalledWith(message));
+  it("reports the server message for a rejected tied rename (#1927), else a fallback", async () => {
+    for (const [name, respond, message] of [
+      [
+        "the server message for a rejected tied rename (#1927)",
+        () => jsonResponse({ error: "session_running", message: "Stop the session before renaming it." }, 409),
+        "Stop the session before renaming it.",
+      ],
+      [
+        "a fallback without a server message",
+        () => Promise.reject(new Error("network unavailable")),
+        "Could not rename this session. Please try again.",
+      ],
+    ] as [string, () => Response | Promise<Response>, string][]) {
+      vi.mocked(reportError).mockClear();
+      fetchSpy.mockImplementation(async () => respond());
+      rename("blocked", { tie_workdir_to_name: true });
+      await vi.waitFor(() => expect(reportError, name).toHaveBeenCalledWith(message));
+      cleanup();
+    }
   });
 });

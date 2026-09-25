@@ -188,18 +188,10 @@ describe("SkillsManager", () => {
     expect(createSkill).not.toHaveBeenCalled();
     expect((screen.getByLabelText("SKILL.md content") as HTMLTextAreaElement).value).toBe("unsaved work");
     confirm.mockRestore();
-  });
 
-  it("supports discarding an in-progress edit back to the loaded content", async () => {
-    render(<SkillsManager />);
-
-    const editor = (await screen.findByLabelText("SKILL.md content")) as HTMLTextAreaElement;
-    const original = editor.value;
-    fireEvent.change(editor, { target: { value: "scratch edit" } });
-    expect(screen.getByText("Unsaved changes")).toBeTruthy();
-
+    // Discard reverts the draft to the loaded content.
     fireEvent.click(screen.getByText("Discard"));
-    expect((screen.getByLabelText("SKILL.md content") as HTMLTextAreaElement).value).toBe(original);
+    expect((screen.getByLabelText("SKILL.md content") as HTMLTextAreaElement).value).toBe(detail(managed).content);
     expect(screen.getByText("All changes saved")).toBeTruthy();
   });
 
@@ -217,6 +209,10 @@ describe("SkillsManager", () => {
     fireEvent.change(screen.getByLabelText("New skill directory"), { target: { value: "mine" } });
     fireEvent.click(screen.getByText("Create"));
     expect(await screen.findByText("already exists")).toBeTruthy();
+
+    syncSkills.mockResolvedValue({ ok: false, outcomes: [], error: "read only" });
+    fireEvent.click(screen.getByText("Share with all agents"));
+    expect(await screen.findByText("read only")).toBeTruthy();
   });
 
   it("shares skills with all agents, showing conflicts but not unchanged outcomes", async () => {
@@ -237,14 +233,6 @@ describe("SkillsManager", () => {
     expect(screen.queryByText(/codex-user\/review/)).toBeNull();
     // load() re-runs after a successful sync.
     await waitFor(() => expect(fetchSkills).toHaveBeenCalledTimes(2));
-  });
-
-  it("surfaces a failed sync request through the existing error notice", async () => {
-    syncSkills.mockResolvedValue({ ok: false, outcomes: [], error: "read only" });
-    render(<SkillsManager />);
-
-    fireEvent.click(await screen.findByText("Share with all agents"));
-    expect(await screen.findByText("read only")).toBeTruthy();
   });
 
   it("replaces a conflicting row on request, re-issuing sync scoped to that root and directory", async () => {
@@ -292,19 +280,6 @@ describe("SkillsManager", () => {
     expect((screen.getByText("Share this skill").closest("button") as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it("switches to Preview and renders the draft as markdown instead of the raw textarea", async () => {
-    render(<SkillsManager />);
-
-    await screen.findByLabelText("SKILL.md content");
-    fireEvent.click(screen.getByText("Preview"));
-
-    expect(screen.queryByLabelText("SKILL.md content")).toBeNull();
-    expect(await screen.findByText(/body/)).toBeTruthy();
-
-    fireEvent.click(screen.getByText("Raw"));
-    expect(await screen.findByLabelText("SKILL.md content")).toBeTruthy();
-  });
-
   it("disables mutating controls in readOnly mode but leaves selection and Raw/Preview working", async () => {
     render(<SkillsManager readOnly />);
 
@@ -322,18 +297,23 @@ describe("SkillsManager", () => {
     expect(await screen.findByText("Adopt into AoE")).toBeTruthy();
     expect((screen.getByText("Adopt into AoE").closest("button") as HTMLButtonElement).disabled).toBe(true);
 
-    // Raw/Preview toggling still works.
+    // Raw/Preview toggling still works; Preview renders the body as markdown.
     fireEvent.click(screen.getByText("Preview"));
     expect(screen.queryByLabelText("SKILL.md content")).toBeNull();
+    expect(await screen.findByText(/body/)).toBeTruthy();
     fireEvent.click(screen.getByText("Raw"));
     expect(await screen.findByLabelText("SKILL.md content")).toBeTruthy();
   });
 
-  it("collapses a sidebar group to hide its rows without discarding the group", async () => {
+  it("tints managed rows and collapses a sidebar group without discarding it", async () => {
     render(<SkillsManager />);
 
     await screen.findByText("Managed (1)");
-    expect(skillButton("mine")).toBeTruthy();
+    // AoE's own skills are tinted so they stand out in a mixed list.
+    const toneFor = (directory: string) =>
+      skillButton(directory).querySelector("[data-tone]")?.getAttribute("data-tone");
+    expect(toneFor("mine")).toBe("primary");
+    expect(toneFor("review")).toBe("neutral");
 
     fireEvent.click(screen.getByText("Managed (1)"));
     expect(screen.queryByText("mine", { selector: "button span" })).toBeNull();
@@ -363,20 +343,5 @@ describe("skillBody", () => {
     for (const [label, input, expected] of cases) {
       expect(skillBody(input), label).toBe(expected);
     }
-  });
-});
-
-describe("SkillsManager provenance tint", () => {
-  it("brands AoE-managed rows and leaves external ones neutral", async () => {
-    render(<SkillsManager />);
-    await waitFor(() => expect(skillButton("mine")).toBeTruthy());
-
-    const toneFor = (directory: string) =>
-      skillButton(directory)?.querySelector("[data-tone]")?.getAttribute("data-tone");
-
-    // The whole point of the tint: AoE's own skills are pickable out of a
-    // mixed list without reading the label.
-    expect(toneFor("mine")).toBe("primary");
-    expect(toneFor("review")).toBe("neutral");
   });
 });

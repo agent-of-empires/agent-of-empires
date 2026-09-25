@@ -26,7 +26,7 @@ afterEach(() => {
 });
 
 describe("SessionRow chips", () => {
-  it.each([
+  const chipCases = [
     ["pinned", { pinned_at: PAST }, ["Pinned"], ["Archived", "Snoozed"]],
     ["archived", { archived_at: PAST }, ["Archived"], ["Pinned", "Snoozed"]],
     // Archive wins visually when both flags surface.
@@ -37,14 +37,15 @@ describe("SessionRow chips", () => {
     ["worker stopping", { view: "structured", acp_worker_state: "stopping" }, ["Stopping"], []],
     ["armed monitor", { monitor_active: true, monitor_description: "clippy passes" }, ["Monitoring clippy passes"], []],
     ["no monitor", {}, [], [/^Monitoring/]],
-  ] as [string, Partial<SessionResponse>, (string | RegExp)[], (string | RegExp)[]][])(
-    "%s",
-    (_name, over, present, absent) => {
+  ] as [string, Partial<SessionResponse>, (string | RegExp)[], (string | RegExp)[]][];
+  it("shows chips for row state", () => {
+    for (const [name, over, present, absent] of chipCases) {
       renderRow(ws(over));
-      for (const l of present) expect(label(l)).not.toBeNull();
-      for (const l of absent) expect(label(l)).toBeNull();
-    },
-  );
+      for (const l of present) expect(label(l), name).not.toBeNull();
+      for (const l of absent) expect(label(l), name).toBeNull();
+      cleanup();
+    }
+  });
 
   it("shows the snooze remaining time and the payload rate-limit park", () => {
     renderRow(ws({ snoozed_until: inMinutes(90) }));
@@ -70,13 +71,16 @@ describe("SessionRow row tags", () => {
     expect(screen.queryByText("feature/web-row-tag")).toBeNull();
   });
 
-  it.each([
-    ["profile", "[fb]"],
-    ["auto", "[fb]"],
-    ["sandbox", "[sb]"],
-  ] as const)("renders the %s tag from the first session", (mode, tag) => {
-    renderRow(ws({ profile: "forit-backup", is_sandboxed: true }), { rowTagMode: mode });
-    expect(testId("sidebar-session-row-tag")!.textContent).toBe(tag);
+  it("renders profile, auto, and sandbox tags from the first session", () => {
+    for (const [mode, tag] of [
+      ["profile", "[fb]"],
+      ["auto", "[fb]"],
+      ["sandbox", "[sb]"],
+    ] as const) {
+      renderRow(ws({ profile: "forit-backup", is_sandboxed: true }), { rowTagMode: mode });
+      expect(testId("sidebar-session-row-tag")!.textContent, mode).toBe(tag);
+      cleanup();
+    }
   });
 
   it("keeps repo chips beside a multi-repo branch tag", () => {
@@ -95,54 +99,58 @@ describe("SessionRow row tags", () => {
 });
 
 describe("SessionRow unread", () => {
-  it.each([
-    ["live idle unread row", {}, {}, true],
-    ["archived row (#2571)", { archived_at: PAST }, {}, false],
-    ["snoozed row (#2571)", { snoozed_until: inMinutes(90) }, {}, false],
-    ["active row", {}, { isActive: true }, false],
-    ["disabled feature", {}, { unread: false }, false],
-  ])("dot on a %s: %s", (_name, over, options, shown) => {
-    renderRow(ws({ unread: true, ...over }), { unread: true, ...options });
-    expect(testId("sidebar-unread-dot") != null).toBe(shown);
-  });
-
-  it("hides the menu item when the feature is disabled", () => {
+  it("shows the dot only on live, inactive rows with the feature on (#2571)", () => {
+    for (const [name, over, options, shown] of [
+      ["live idle unread row", {}, {}, true],
+      ["archived row (#2571)", { archived_at: PAST }, {}, false],
+      ["snoozed row (#2571)", { snoozed_until: inMinutes(90) }, {}, false],
+      ["active row", {}, { isActive: true }, false],
+      ["disabled feature", {}, { unread: false }, false],
+    ] as [string, Partial<SessionResponse>, object, boolean][]) {
+      renderRow(ws({ unread: true, ...over }), { unread: true, ...options });
+      expect(testId("sidebar-unread-dot") != null, name).toBe(shown);
+      cleanup();
+    }
     openRowMenu(ws({ unread: true }), { unread: false });
     expect(testId("sidebar-context-menu-unread")).toBeNull();
   });
 
-  it.each([
-    [false, "Mark as unread", true],
-    [true, "Mark as read", false],
-  ])("unread=%s offers %j and PATCHes { unread: %s }", async (unread, text, next) => {
-    openRowMenu(ws({ id: "sess-u", unread }));
-    expect(testId("sidebar-context-menu-unread")!.textContent).toContain(text);
-    click("sidebar-context-menu-unread");
-    // The dot flips optimistically before the PATCH lands.
-    await vi.waitFor(() => expect(testId("sidebar-unread-dot") != null).toBe(next));
-    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
-    expect(firstRequest(fetchSpy)).toEqual({
-      url: "/api/sessions/sess-u/unread",
-      method: "PATCH",
-      body: { unread: next },
-    });
+  it("toggles unread optimistically and PATCHes the new value", async () => {
+    for (const [unread, text, next] of [
+      [false, "Mark as unread", true],
+      [true, "Mark as read", false],
+    ] as const) {
+      fetchSpy.mockClear();
+      openRowMenu(ws({ id: "sess-u", unread }));
+      expect(testId("sidebar-context-menu-unread")!.textContent).toContain(text);
+      click("sidebar-context-menu-unread");
+      // The dot flips optimistically before the PATCH lands.
+      await vi.waitFor(() => expect(testId("sidebar-unread-dot") != null).toBe(next));
+      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+      expect(firstRequest(fetchSpy)).toEqual({
+        url: "/api/sessions/sess-u/unread",
+        method: "PATCH",
+        body: { unread: next },
+      });
+      cleanup();
+    }
   });
 });
 
 describe("SessionRow context menu", () => {
-  it.each([
-    // Archiving or snoozing a pinned session clears the pin server-side, as in the TUI.
-    ["pinned", { pinned_at: PAST }, ["Unpin", "Archive", "Snooze"], []],
-    ["archived", { archived_at: PAST }, ["Unarchive"], ["Pin", "Snooze"]],
-    ["snoozed", { snoozed_until: inMinutes(60) }, ["Unsnooze"], ["Pin", "Archive"]],
-    ["live", {}, ["Pin", "Archive", "Snooze…"], []],
-  ] as [string, Partial<SessionResponse>, string[], string[]][])("%s row triage items", (_n, over, has, lacks) => {
-    const text = openRowMenu(ws(over)).textContent;
-    for (const t of has) expect(text).toContain(t);
-    for (const t of lacks) expect(text).not.toContain(t);
-  });
-
-  it("offers Switch agent only on structured rows", () => {
+  it("offers triage items by row state and Switch agent only on structured rows", () => {
+    for (const [name, over, has, lacks] of [
+      // Archiving or snoozing a pinned session clears the pin server-side, as in the TUI.
+      ["pinned", { pinned_at: PAST }, ["Unpin", "Archive", "Snooze"], []],
+      ["archived", { archived_at: PAST }, ["Unarchive"], ["Pin", "Snooze"]],
+      ["snoozed", { snoozed_until: inMinutes(60) }, ["Unsnooze"], ["Pin", "Archive"]],
+      ["live", {}, ["Pin", "Archive", "Snooze…"], []],
+    ] as [string, Partial<SessionResponse>, string[], string[]][]) {
+      const text = openRowMenu(ws(over)).textContent;
+      for (const t of has) expect(text, name).toContain(t);
+      for (const t of lacks) expect(text, name).not.toContain(t);
+      cleanup();
+    }
     openRowMenu(ws({ view: "structured" }));
     expect(testId("sidebar-context-menu-switch-agent")).not.toBeNull();
     cleanup();
@@ -163,44 +171,48 @@ describe("SessionRow context menu", () => {
 });
 
 describe("SessionRow triage actions", () => {
-  it.each([
-    ["Pin", {}, "sidebar-context-menu-pin", "pin", { pinned: true }],
-    ["Unpin", { pinned_at: PAST }, "sidebar-context-menu-pin", "pin", { pinned: false }],
-    ["Archive", {}, "sidebar-context-menu-archive", "archive", { archived: true, kill_pane: true }],
-    [
-      "Unarchive",
-      { archived_at: PAST },
-      "sidebar-context-menu-archive",
-      "archive",
-      { archived: false, kill_pane: true },
-    ],
-    ["Unsnooze", { snoozed_until: inMinutes(60) }, "sidebar-context-menu-unsnooze", "snooze", { minutes: null }],
-    ["Color", {}, "sidebar-context-menu-color-red", "color", { color: "red" }],
-    ["Clear color", { color: "green" }, "sidebar-context-menu-color-clear", "color", { color: null }],
-  ] as [string, Partial<SessionResponse>, string, string, unknown][])(
-    "%s PATCHes its endpoint",
-    async (_n, over, item, path, body) => {
+  it("each triage action PATCHes its endpoint", async () => {
+    for (const [name, over, item, path, body] of [
+      ["Pin", {}, "sidebar-context-menu-pin", "pin", { pinned: true }],
+      ["Unpin", { pinned_at: PAST }, "sidebar-context-menu-pin", "pin", { pinned: false }],
+      ["Archive", {}, "sidebar-context-menu-archive", "archive", { archived: true, kill_pane: true }],
+      [
+        "Unarchive",
+        { archived_at: PAST },
+        "sidebar-context-menu-archive",
+        "archive",
+        { archived: false, kill_pane: true },
+      ],
+      ["Unsnooze", { snoozed_until: inMinutes(60) }, "sidebar-context-menu-unsnooze", "snooze", { minutes: null }],
+      ["Color", {}, "sidebar-context-menu-color-red", "color", { color: "red" }],
+      ["Clear color", { color: "green" }, "sidebar-context-menu-color-clear", "color", { color: null }],
+    ] as [string, Partial<SessionResponse>, string, string, unknown][]) {
+      fetchSpy.mockClear();
       openRowMenu(ws({ id: "sess-it", ...over }));
       click(item);
-      await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
-      expect(firstRequest(fetchSpy)).toEqual({ url: `/api/sessions/sess-it/${path}`, method: "PATCH", body });
-    },
-  );
+      await vi.waitFor(() => expect(fetchSpy, name).toHaveBeenCalled());
+      expect(firstRequest(fetchSpy), name).toEqual({ url: `/api/sessions/sess-it/${path}`, method: "PATCH", body });
+      cleanup();
+    }
+  });
 
-  it.each([
-    ["Pin", "sidebar-context-menu-pin", "Pinned"],
-    ["Archive", "sidebar-context-menu-archive", "Archived"],
-  ])("%s shows its chip optimistically and reverts it on failure", async (_n, item, chip) => {
+  it("Pin and Archive show their chip optimistically and revert it on failure", async () => {
     let fail = () => {};
     fetchSpy.mockImplementation(
       () => new Promise((resolve) => (fail = () => resolve(new Response("nope", { status: 500 })))),
     );
-    openRowMenu(ws({ id: "sess-fail" }));
-    click(item);
-    // Regression: the chip must read the optimistic state, not wait for the poll.
-    await vi.waitFor(() => expect(label(chip)).not.toBeNull());
-    fail();
-    await vi.waitFor(() => expect(label(chip)).toBeNull());
+    for (const [item, chip] of [
+      ["sidebar-context-menu-pin", "Pinned"],
+      ["sidebar-context-menu-archive", "Archived"],
+    ]) {
+      openRowMenu(ws({ id: "sess-fail" }));
+      click(item);
+      // Regression: the chip must read the optimistic state, not wait for the poll.
+      await vi.waitFor(() => expect(label(chip)).not.toBeNull());
+      fail();
+      await vi.waitFor(() => expect(label(chip)).toBeNull());
+      cleanup();
+    }
   });
 
   it("Snooze… opens the modal without a request", () => {
@@ -236,17 +248,20 @@ describe("SessionRow triage actions", () => {
 });
 
 describe("SessionRow color label (#2383)", () => {
-  it.each([
-    ["red", {}, "red"],
-    ["unset", {}, null],
-    ["unknown", {}, null],
-    // Disabling colors hides the stored value without clearing it (#3104).
-    ["red", { colorsEnabled: false }, null],
-  ] as const)("color %s with %o shows dot %s", (color, options, shown) => {
-    renderRow(ws({ color: color === "unset" ? undefined : color === "unknown" ? "chartreuse" : color }), options);
-    const dot = testId("sidebar-session-color-dot");
-    expect(dot?.getAttribute("data-color") ?? null).toBe(shown);
-    if (shown) expect(dot!.className).toContain("bg-red-500");
+  it("shows a dot only for a known color while colors are enabled (#3104)", () => {
+    for (const [color, options, shown] of [
+      ["red", {}, "red"],
+      [undefined, {}, null],
+      ["chartreuse", {}, null],
+      // Disabling colors hides the stored value without clearing it (#3104).
+      ["red", { colorsEnabled: false }, null],
+    ] as const) {
+      renderRow(ws({ color }), options);
+      const dot = testId("sidebar-session-color-dot");
+      expect(dot?.getAttribute("data-color") ?? null, `${color} ${JSON.stringify(options)}`).toBe(shown);
+      if (shown) expect(dot!.className).toContain("bg-red-500");
+      cleanup();
+    }
   });
 
   it("offers Clear only for a colored row and no color section when disabled", () => {
