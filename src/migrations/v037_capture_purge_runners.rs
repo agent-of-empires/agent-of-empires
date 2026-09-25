@@ -10,6 +10,10 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+pub(super) fn reconcile() -> Result<()> {
+    migrate(&crate::session::get_app_dir()?, false)
+}
+
 pub(super) fn migrate(root: &Path, initialize_missing: bool) -> Result<()> {
     let file = AnchoredDir::open(root)?.bind_file(purge_owners::FILE_NAME.as_ref())?;
     let (lock, path) = file.open_sidecar()?;
@@ -40,7 +44,12 @@ pub(super) fn migrate(root: &Path, initialize_missing: bool) -> Result<()> {
             !owner.contains_key("runner"),
             "Unexpected runner evidence in legacy journal"
         );
-        owner.insert("runner".into(), serde_json::json!({"state": "uncaptured"}));
+        let session_id = owner
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .context("Invalid pending purge owner session id")?;
+        let runner = purge_owners::capture_runner_json(session_id);
+        owner.insert("runner".into(), runner);
     }
     journal["version"] = 2.into();
     let content = serde_json::to_string(&journal)?;
@@ -54,8 +63,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial]
     fn legacy_migration_preserves_ownership_and_refuses_missing_evidence() -> Result<()> {
         let root = tempfile::tempdir()?;
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
         let path = root.path().join(purge_owners::FILE_NAME);
         let resource = root.path().join("owned");
         let legacy = serde_json::json!({

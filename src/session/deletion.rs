@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 
 use crate::containers::DockerContainer;
 use crate::git::cleanup::{remove_managed_worktree, WorktreeCleanupOptions};
@@ -12,7 +13,7 @@ use crate::session::config::repo_config;
 use crate::session::path_identity::CleanupProtection;
 use crate::session::storage::StorageFlock;
 use crate::session::{Instance, LifecycleOperation, SessionStore, Storage};
-
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DeletionRequest {
     pub session_id: String,
     pub instance: Instance,
@@ -112,7 +113,8 @@ pub(crate) struct CommittedPurge<S: SessionStore> {
     request: DeletionRequest,
     owner: super::purge_owners::PurgeOwner,
     additional_protection: Option<CleanupProtection>,
-    _lifecycle_lock: StorageFlock,
+    _lifecycle_lock: Option<StorageFlock>,
+    _identity_lock: Option<StorageFlock>,
 }
 
 #[derive(Clone, Copy)]
@@ -236,6 +238,39 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                         !stored
                             .lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation)
                     })
+                    || creation_generation.is_some_and(|_| {
+                        stored.project_path != request.instance.project_path
+                            || stored
+                                .worktree_info
+                                .as_ref()
+                                .is_some_and(|stored_worktree| {
+                                    request.instance.worktree_info.as_ref().is_none_or(|built| {
+                                        stored_worktree.branch != built.branch
+                                            || stored_worktree.main_repo_path
+                                                != built.main_repo_path
+                                    })
+                                })
+                            || stored.workspace_info.is_some()
+                                != request.instance.workspace_info.is_some()
+                            || stored.workspace_info.as_ref().is_some_and(|workspace| {
+                                request
+                                    .instance
+                                    .workspace_info
+                                    .as_ref()
+                                    .is_none_or(|built| {
+                                        workspace.workspace_dir != built.workspace_dir
+                                            || workspace.repos.len() != built.repos.len()
+                                            || workspace.repos.iter().zip(&built.repos).any(
+                                                |(stored, built)| {
+                                                    stored.worktree_path != built.worktree_path
+                                                        || stored.main_repo_path
+                                                            != built.main_repo_path
+                                                        || stored.branch != built.branch
+                                                },
+                                            )
+                                    })
+                            })
+                    })
                 {
                     rejected = Some((
                         DeletionDisposition::Busy,
@@ -304,7 +339,14 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         }
         let (generation, snapshot) =
             reserved.ok_or_else(|| anyhow::anyhow!("purge reservation produced no outcome"))?;
-        request.instance = snapshot;
+        if creation_generation.is_some() {
+            request.instance.lifecycle_generation = snapshot.lifecycle_generation;
+            request.instance.status = snapshot.status;
+            request.instance.lifecycle_reservation = snapshot.lifecycle_reservation.clone();
+            request.instance.source_profile = snapshot.source_profile;
+        } else {
+            request.instance = snapshot;
+        }
         let mut transaction = Self {
             store: Some(backend),
             request: Some(request),
@@ -458,6 +500,8 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
         let mut commit = None;
         let mut owner = None;
         let mut capture = self.capture.take();
+        let durable_request = self.request().clone();
+        let durable_additional_protection = self.additional_protection.clone();
         if let Err(error) = self.store().update(|instances, _groups| {
             let Some(index) = instances.iter().position(|instance| instance.id == id) else {
                 commit = Some((CompletionGate::AlreadyGone, None));
@@ -472,9 +516,12 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                 self.store().storage().profile(),
             );
             if matches!(gate, CompletionGate::Proceed) {
-                owner = Some(super::purge_owners::PurgeOwner::record(
+                owner = Some(super::purge_owners::PurgeOwner::record_plan(
                     self.store().storage(),
                     &instances[index],
+                    generation,
+                    Some(&durable_request),
+                    durable_additional_protection.as_ref(),
                     capture
                         .take()
                         .expect("reserved purge has captured ownership"),
@@ -514,10 +561,12 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                 .take()
                 .expect("committed purge owns its request"),
             additional_protection: self.additional_protection.take(),
-            _lifecycle_lock: self
-                .lifecycle_lock
-                .take()
-                .expect("active purge transaction must own its lifecycle lock"),
+            _lifecycle_lock: Some(
+                self.lifecycle_lock
+                    .take()
+                    .expect("active purge transaction must own its lifecycle lock"),
+            ),
+            _identity_lock: None,
         })
     }
 
@@ -685,9 +734,8 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
 }
 
 impl<S: SessionStore> CommittedPurge<S> {
-    /// Reacquire identity before lifecycle exclusion; a reused id forbids cleanup.
-    pub fn finish(self) -> DeletionResult {
-        drop(self._lifecycle_lock);
+    pub fn finish(mut self) -> DeletionResult {
+        drop(self._lifecycle_lock.take());
         let exclusion = (|| -> Result<_> {
             let identity = super::acquire_session_identity_lock()?;
             let lifecycle = self
@@ -716,6 +764,22 @@ impl<S: SessionStore> CommittedPurge<S> {
                 );
             }
         };
+        self.finish_with_exclusion()
+    }
+
+    pub(crate) fn finish_recovered(self) -> DeletionResult {
+        if self._identity_lock.is_none() {
+            return DeletionResult::rejected(
+                self.request.session_id,
+                DeletionDisposition::Removed,
+                "Recovered purge lacks identity authority",
+                None,
+            );
+        }
+        self.finish_with_exclusion()
+    }
+
+    fn finish_with_exclusion(self) -> DeletionResult {
         if let Err(error) = self.owner.ensure_captured_runner_stopped() {
             return DeletionResult::rejected(
                 self.request.session_id,
@@ -741,6 +805,48 @@ impl<S: SessionStore> CommittedPurge<S> {
         }
         result
     }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.request.session_id
+    }
+
+    pub(crate) fn is_structured(&self) -> bool {
+        self.request.instance.is_structured()
+    }
+}
+
+/// Rebuild the first durable committed purge whose row is still absent. The
+/// caller retains the returned identity and lifecycle locks across any
+/// structured shutdown and the idempotent resource cleanup.
+pub(crate) fn recover_committed_purge() -> Result<Option<CommittedPurge<Storage>>> {
+    let Some(plan) = super::purge_owners::recovery_plans()?.into_iter().next() else {
+        return Ok(None);
+    };
+    let request = plan
+        .request
+        .as_ref()
+        .context("legacy pending purge owner has no executable cleanup plan")?;
+    let store = Storage::open_unwatched(&plan.profile)?;
+    let identity = super::acquire_session_identity_lock()?;
+    let lifecycle = store.acquire_instance_lifecycle_lock(&request.session_id)?;
+    anyhow::ensure!(
+        !store.load()?.iter().any(|row| row.id == request.session_id),
+        "session identity was reused before pending purge recovery"
+    );
+    let owner = super::purge_owners::PurgeOwner::recover(&store, &plan.token)?;
+    let profile = store.profile().to_owned();
+    let mut request = plan
+        .request
+        .context("legacy pending purge owner has no executable cleanup plan")?;
+    request.instance.source_profile = profile;
+    Ok(Some(CommittedPurge {
+        store,
+        request,
+        owner,
+        additional_protection: plan.additional_protection,
+        _lifecycle_lock: Some(lifecycle),
+        _identity_lock: Some(identity),
+    }))
 }
 
 impl<S: SessionStore + 'static> Drop for PurgeTransaction<S> {
@@ -2494,6 +2600,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        let session_id = instance.id.clone();
         let request = DeletionRequest {
             session_id: instance.id.clone(),
             instance,
@@ -2536,6 +2643,110 @@ mod tests {
                 .any(|owner| owner.references_branch(&real, "retained-branch")),
             "an interrupted purge lost its branch ownership when the hook removed its alias"
         );
+
+        let mut reused = create_test_instance();
+        reused.id = session_id;
+        reused.source_profile = profile.into();
+        storage
+            .update(|rows, _| {
+                rows.push(reused.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert!(recover_committed_purge().is_err());
+        assert!(!super::super::purge_owners::protection(&storage, None)
+            .unwrap()
+            .is_empty());
+        storage
+            .update(|rows, _| {
+                rows.retain(|row| row.id != reused.id);
+                Ok(())
+            })
+            .unwrap();
+
+        let recovered = recover_committed_purge()
+            .unwrap()
+            .expect("durable purge retry");
+        let result = recovered.finish_recovered();
+        assert!(result.success);
+        assert!(super::super::purge_owners::protection(&storage, None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn creation_rollback_keeps_post_provision_cleanup_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "creation-provisioned-authority";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let workspace = temp.path().join("workspace");
+        let checkout = workspace.join("repo");
+        let mut stored = Instance::new("creation provisioned", workspace.to_str().unwrap());
+        stored.source_profile = profile.into();
+        stored.status = crate::session::Status::Starting;
+        stored.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "work".into(),
+            workspace_dir: workspace.to_string_lossy().into_owned(),
+            created_at: Utc::now(),
+            cleanup_on_delete: false,
+            repos: vec![crate::session::WorkspaceRepo {
+                source_path: repo.to_string_lossy().into_owned(),
+                name: "repo".into(),
+                worktree_path: checkout.to_string_lossy().into_owned(),
+                main_repo_path: repo.to_string_lossy().into_owned(),
+                branch: "work".into(),
+                managed_by_aoe: false,
+                branch_preexisting: true,
+                base_branch: None,
+                base_branch_override: None,
+            }],
+        });
+        let generation = stored
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Launch,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                Utc::now(),
+            )
+            .unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(stored.clone());
+                Ok(())
+            })
+            .unwrap();
+        let mut built = stored;
+        built.workspace_info.as_mut().unwrap().cleanup_on_delete = true;
+        built.workspace_info.as_mut().unwrap().repos[0].managed_by_aoe = true;
+        built.workspace_info.as_mut().unwrap().repos[0].branch_preexisting = false;
+        let request = DeletionRequest {
+            session_id: built.id.clone(),
+            instance: built,
+            delete_worktree: true,
+            delete_branch: true,
+            delete_sandbox: false,
+            force_delete: true,
+            detach_hooks: true,
+            keep_scratch: true,
+        };
+
+        let transaction = match PurgeTransaction::reserve_failed_creation(
+            Storage::open_unwatched(profile).unwrap(),
+            request,
+            generation,
+        )
+        .unwrap()
+        {
+            PurgeReservation::Reserved(transaction) => transaction,
+            PurgeReservation::Rejected(result) => panic!("rollback rejected: {:?}", result.errors),
+        };
+        let workspace = transaction.instance().workspace_info.as_ref().unwrap();
+        assert!(workspace.cleanup_on_delete);
+        assert!(workspace.repos[0].managed_by_aoe);
+        assert!(!workspace.repos[0].branch_preexisting);
     }
 
     #[test]

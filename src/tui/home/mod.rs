@@ -312,6 +312,8 @@ pub struct HomeView {
     pub(super) no_agents_dialog: Option<NoAgentsDialog>,
     pub(super) changelog_dialog: Option<ChangelogDialog>,
     pub(super) info_dialog: Option<InfoDialog>,
+    /// Unknown mutation selected for explicit, operator-confirmed resolution.
+    pub(super) pending_indeterminate_resolution: Option<String>,
     pub(super) snooze_duration_dialog: Option<SnoozeDurationDialog>,
     /// Session id the snooze duration picker targets. Set when the dialog
     /// opens, consumed on submit.

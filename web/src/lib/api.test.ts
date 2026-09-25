@@ -310,9 +310,20 @@ const requestCases: RequestCase[] = [
   ],
   [
     "POST /api/sessions",
-    () => api.createSession({ path: "/repo", tool: "claude", trust_hooks: true } as CreateSessionRequest),
+    () =>
+      api.createSession({
+        path: "/repo",
+        tool: "claude",
+        trust_hooks: true,
+        trust_review: { project_path: "/repo", base_hooks_hash: "base", hooks_hash: "repo", mcp_hash: null },
+      } as CreateSessionRequest),
     {
-      body: { path: "/repo", tool: "claude", trust_hooks: true },
+      body: {
+        path: "/repo",
+        tool: "claude",
+        trust_hooks: true,
+        trust_review: { project_path: "/repo", base_hooks_hash: "base", hooks_hash: "repo", mcp_hash: null },
+      },
       respond: json(session, 201),
       result: { ok: true, session },
     },
@@ -793,6 +804,40 @@ describe("createSession errors", () => {
   ])("surfaces %s", async (_name, payload, hooksNeedTrust) => {
     fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify(payload), { status: 403 }));
     expect(await api.createSession(body)).toEqual({ ok: false, error: "trust me", hooksNeedTrust });
+  });
+
+  it("classifies an empty creation_trust_changed 409 before parsing its body", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(null, {
+        status: 409,
+        headers: { "aoe-error-code": "creation_trust_changed" },
+      }),
+    );
+    expect(await api.createSession(body)).toEqual({
+      ok: false,
+      error: "Repository hook configuration changed; review it again",
+      trustChanged: true,
+    });
+  });
+
+  it("reviews the exact creation trust fingerprint", async () => {
+    const review = {
+      fingerprint: { project_path: "/repo", base_hooks_hash: "base", hooks_hash: "repo", mcp_hash: null },
+      merged_hooks: { on_create: ["setup"] },
+      repo_hooks: { on_create: ["setup"] },
+      mcp_summaries: [],
+      hooks_need_trust: true,
+      mcp_need_trust: false,
+    };
+    fetchSpy.mockResolvedValueOnce(json(review));
+    expect(await api.reviewCreationTrust({ path: "/repo", profile: "default", scratch: false })).toEqual({
+      ok: true,
+      review,
+    });
+    const { url, init } = lastCall();
+    expect(url).toBe("/api/sessions/creation-trust");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toEqual({ path: "/repo", profile: "default", scratch: false });
   });
 
   it("maps plain JSON, text, and network errors", async () => {

@@ -121,7 +121,7 @@ impl PathResolver<'_> {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct PathIdentity {
     lexical: PathBuf,
     // Components such as link/.. remain necessary to access the destination.
@@ -171,7 +171,7 @@ impl PathIdentity {
 }
 
 /// Freeze references before cleanup can remove their symlink spellings.
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CleanupProtection {
     paths: Vec<PathIdentity>,
     branches: Vec<(usize, String)>,

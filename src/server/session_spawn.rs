@@ -402,7 +402,44 @@ pub(crate) async fn spawn_structured_session(
             None
         };
 
-        {
+        let provisioning_failed = provision_error.is_some();
+        let rollback = |native: super::session_store::NativeSessionStore, instance: Instance, provisioning_failed: bool| { use crate::session::deletion::{DeletionDisposition, DeletionRequest, PurgeReservation, PurgeTransaction};
+        let _namespace = runtime.block_on(worker_state.profile_namespace.read());
+        let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
+        let _guard = lock.blocking_lock();
+        let request = DeletionRequest {
+            session_id: instance.id.clone(),
+            delete_worktree: created_worktree.as_ref().is_some_and(|worktree| worktree.checkout_created)
+                || created_workspace_worktrees.iter().any(|worktree| worktree.checkout_created)
+                || instance.workspace_info.as_ref().is_some_and(|workspace| workspace.cleanup_on_delete),
+            delete_branch: created_worktree.as_ref().is_some_and(|worktree| worktree.owned_branch.is_some())
+                || created_workspace_worktrees.iter().any(|worktree| worktree.owned_branch.is_some()),
+            delete_sandbox: instance.sandbox_info.as_ref().is_some_and(|sandbox| sandbox.enabled),
+            force_delete: true,
+            detach_hooks: true,
+            keep_scratch: provisioning_failed,
+            instance,
+        };
+        let rollback = PurgeTransaction::reserve_failed_creation(native, request, generation)
+            .map(|reservation| match reservation {
+                PurgeReservation::Reserved(transaction) => transaction.complete_creation_rollback(
+                    created_worktree.iter().chain(&created_workspace_worktrees),
+                ),
+                PurgeReservation::Rejected(result) => result,
+            });
+        match rollback {
+            Ok(result) => {
+                if matches!(result.disposition, DeletionDisposition::Removed | DeletionDisposition::AlreadyGone) {
+                    worker_state.instance_locks.blocking_write().remove(&result.session_id);
+                    runtime.block_on(worker_state.session_service.forget_prompt_lock(&result.session_id));
+                }
+                if !result.success {
+                    tracing::warn!(target: "session.create", errors = ?result.errors, "Creation rollback incomplete");
+                }
+            }
+            Err(rollback_error) => tracing::warn!(target: "session.create", %rollback_error, "Creation rollback could not acquire ownership"),
+        }};
+        let publication = {
             let _namespace = runtime.block_on(worker_state.profile_namespace.read());
             let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
             let _guard = lock.blocking_lock();
@@ -444,9 +481,12 @@ pub(crate) async fn spawn_structured_session(
                 row.import_pending = instance.import_pending;
                 instance = row.clone();
                 Ok(())
-            })?;
+            })
+        };
+        if let Err(error) = publication {
+            rollback(native, instance, provisioning_failed);
+            return Err(error);
         }
-        let provisioning_failed = provision_error.is_some();
         let creation = match provision_error {
             Some(error) => Err(error),
             None => creation_guard
@@ -475,42 +515,10 @@ pub(crate) async fn spawn_structured_session(
                 })
                 .and_then(|()| creation_guard.check().map_err(anyhow::Error::from)),
         };
-        let rollback = |native: super::session_store::NativeSessionStore, instance: Instance, provisioning_failed: bool| { use crate::session::deletion::{DeletionDisposition, DeletionRequest, PurgeReservation, PurgeTransaction};
-        let _namespace = runtime.block_on(worker_state.profile_namespace.read());
-        let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
-        let _guard = lock.blocking_lock();
-        let request = DeletionRequest {
-            session_id: instance.id.clone(),
-            delete_worktree: created_worktree.as_ref().is_some_and(|worktree| worktree.checkout_created)
-                || created_workspace_worktrees.iter().any(|worktree| worktree.checkout_created)
-                || instance.workspace_info.as_ref().is_some_and(|workspace| workspace.cleanup_on_delete),
-            delete_branch: created_worktree.as_ref().is_some_and(|worktree| worktree.owned_branch.is_some())
-                || created_workspace_worktrees.iter().any(|worktree| worktree.owned_branch.is_some()),
-            delete_sandbox: instance.sandbox_info.as_ref().is_some_and(|sandbox| sandbox.enabled),
-            force_delete: true,
-            detach_hooks: true,
-            keep_scratch: provisioning_failed,
-            instance,
-        };
-        let rollback = PurgeTransaction::reserve_failed_creation(native, request, generation)
-            .map(|reservation| match reservation {
-                PurgeReservation::Reserved(transaction) => transaction.complete_creation_rollback(
-                    created_worktree.iter().chain(&created_workspace_worktrees),
-                ),
-                PurgeReservation::Rejected(result) => result,
-            });
-        match rollback {
-            Ok(result) => {
-                if matches!(result.disposition, DeletionDisposition::Removed | DeletionDisposition::AlreadyGone) {
-                    worker_state.instance_locks.blocking_write().remove(&result.session_id);
-                    runtime.block_on(worker_state.session_service.forget_prompt_lock(&result.session_id));
-                }
-                if !result.success {
-                    tracing::warn!(target: "session.create", errors = ?result.errors, "Creation rollback incomplete");
-                }
-            }
-            Err(rollback_error) => tracing::warn!(target: "session.create", %rollback_error, "Creation rollback could not acquire ownership"),
-        } }; if let Err(error) = creation { rollback(native, instance, provisioning_failed); return Err(error); }
+        if let Err(error) = creation {
+            rollback(native, instance, provisioning_failed);
+            return Err(error);
+        }
 
         let namespace = runtime.block_on(worker_state.profile_namespace.read());
         let submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));

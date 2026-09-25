@@ -480,6 +480,29 @@ impl SessionFeed {
             && !self.bulk_queue.iter().any(|(queued, _)| queued == id)
     }
 
+    /// Operator-confirmed resolution of an unknown mutation outcome. The
+    /// current applied canonical snapshot proves the view is synchronized, but
+    /// deliberately does not infer the lost mutation's result.
+    pub(crate) fn resolve_indeterminate(&mut self, id: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.mutations_available(),
+            "Runtime disconnected, read-only or unhealthy; quarantine remains"
+        );
+        anyhow::ensure!(
+            self.applied.as_ref().is_some_and(|applied| {
+                matches!(&*self.sender.borrow(), Some(SessionFeedResult::Snapshot(latest))
+                    if latest.cursor.epoch == applied.cursor.epoch
+                        && latest.cursor.revision == applied.cursor.revision)
+            }),
+            "Current canonical runtime state has not been applied; quarantine remains"
+        );
+        anyhow::ensure!(
+            self.quarantined.remove(id),
+            "Session has no indeterminate mutation to resolve"
+        );
+        Ok(())
+    }
+
     pub(crate) fn submit(&mut self, id: String, mutation: SessionMutation) -> anyhow::Result<()> {
         self.enqueue(id, SessionRequest::Mutation(mutation), None, None)
     }
@@ -832,7 +855,7 @@ impl SessionFeed {
         );
         anyhow::ensure!(
             !self.quarantined.contains(&id),
-            "The previous runtime change has an unknown outcome; reconnect and verify before retrying"
+            "The previous runtime change has an unknown outcome; explicitly resolve its quarantine before retrying"
         );
         anyhow::ensure!(
             !self.pending.contains_key(&id),
@@ -1314,6 +1337,21 @@ mod tests {
         feed.task.take().unwrap().abort();
         set_grant(&feed.grant, true);
         assert!(!feed.can_submit("unknown"));
+        feed.publish_for_test(SessionFeedResult::Snapshot(snapshot("test", 2)));
+        assert!(feed.resolve_indeterminate("unknown").is_err());
+        feed.mark_snapshot_applied(snapshot("test", 2));
+        assert!(!feed.can_submit("unknown"));
+        feed.resolve_indeterminate("unknown").unwrap();
+        let mut driver = feed.command_driver_for_test();
+        feed.submit("unknown".into(), SessionMutation::Stop)
+            .unwrap();
+        let (id, mutation) = driver(Ok(RuntimeCursor {
+            epoch: "test".into(),
+            revision: 3,
+        }))
+        .expect("mutation submitted after explicit resolution");
+        assert_eq!(id, "unknown");
+        assert!(matches!(mutation, SessionMutation::Stop));
     }
 
     fn snapshot(epoch: &str, revision: u64) -> Arc<RuntimeSnapshot> {

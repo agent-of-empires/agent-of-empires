@@ -13,6 +13,7 @@ import type {
   ProjectOverrides,
   DockerStatusResponse,
   CreateSessionRequest,
+  CreationTrustFingerprint,
   ClaudeSessionSummary,
   SettingsFieldDescriptor,
 } from "./types";
@@ -1921,8 +1922,8 @@ export async function fetchDockerStatus(): Promise<DockerStatusResponse> {
 }
 
 /** The repo's hooks need approval before this session can be created
- *  (#2066). Surfaced from a `hooks_need_trust` 403 so the wizard can show
- *  the commands and resubmit with `trust_hooks: true`. */
+ *  (#2066). The `hooks_need_trust` 403 triggers a canonical review; approval
+ *  then carries that review's exact fingerprint. */
 export interface HooksNeedTrust {
   /** The `on_create` commands that will run once approved. */
   onCreate: string[];
@@ -1935,11 +1936,54 @@ export interface HooksNeedTrust {
   needsMcpTrust: boolean;
 }
 
+export interface CreationTrustRequest {
+  path: string;
+  profile?: string;
+  scratch?: boolean;
+}
+
+export interface CreationTrustReview {
+  fingerprint: CreationTrustFingerprint;
+  merged_hooks: {
+    on_create?: string[];
+    on_launch?: string[];
+    on_destroy?: string[];
+  };
+  repo_hooks: {
+    on_create?: string[];
+    on_launch?: string[];
+    on_destroy?: string[];
+  };
+  mcp_summaries: string[];
+  hooks_need_trust: boolean;
+  mcp_need_trust: boolean;
+}
+
+export async function reviewCreationTrust(
+  body: CreationTrustRequest,
+): Promise<{ ok: true; review: CreationTrustReview } | { ok: false; error: string }> {
+  try {
+    const res = await fetch("/api/sessions/creation-trust", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      return { ok: false, error: text || `Server error (${res.status})` };
+    }
+    return { ok: true, review: JSON.parse(text) as CreationTrustReview };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 export async function createSession(body: CreateSessionRequest): Promise<{
   ok: boolean;
   error?: string;
   session?: SessionResponse;
   hooksNeedTrust?: HooksNeedTrust;
+  trustChanged?: boolean;
 }> {
   try {
     const res = await fetch("/api/sessions", {
@@ -1947,6 +1991,13 @@ export async function createSession(body: CreateSessionRequest): Promise<{
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    if (res.status === 409 && res.headers.get("aoe-error-code") === "creation_trust_changed") {
+      return {
+        ok: false,
+        error: "Repository hook configuration changed; review it again",
+        trustChanged: true,
+      };
+    }
     if (!res.ok) {
       const text = await res.text();
       try {

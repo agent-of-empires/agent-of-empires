@@ -321,23 +321,29 @@ impl HomeView {
             }) {
                 self.manual_unread_hold = None;
             }
-            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-                "Runtime change",
-                &errors
-                    .into_iter()
-                    .map(|error| {
-                        if error.outcome_unknown {
-                            format!(
-                                "{}: outcome unknown; retry blocked until resolved: {}",
-                                error.id, error.message
-                            )
-                        } else {
-                            format!("{}: {}", error.id, error.message)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ));
+            let unresolved = errors
+                .iter()
+                .find(|error| error.outcome_unknown)
+                .map(|error| (error.id.clone(), error.message.clone()));
+            if let Some((id, message)) = unresolved {
+                self.pending_indeterminate_resolution = Some(id.clone());
+                self.confirm_dialog = Some(ConfirmDialog::new(
+                    "Resolve Unknown Outcome",
+                    &format!(
+                        "The previous runtime change for '{id}' has an unknown outcome: {message}\n\nVerify the current canonical state, then unlock this row for a new action. No mutation is submitted by this resolution."
+                    ),
+                    "resolve_indeterminate",
+                ).buttons("Unlock", "Keep Blocked"));
+            } else {
+                self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                    "Runtime change",
+                    &errors
+                        .into_iter()
+                        .map(|error| format!("{}: {}", error.id, error.message))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ));
+            }
         }
         if snapshot_applied {
             if let Some(id) = self

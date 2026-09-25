@@ -353,6 +353,7 @@ pub(super) async fn maintenance_loop(
         std::collections::HashSet::new();
     let mut last_container_check: Option<std::time::Instant> = None;
     let mut last_credential_refresh = std::time::Instant::now();
+    let mut last_purge_recovery = std::time::Instant::now() - std::time::Duration::from_secs(30);
     loop {
         tokio::select! {
             _ = state.shutdown.cancelled() => return,
@@ -374,6 +375,10 @@ pub(super) async fn maintenance_loop(
         {
             health.send_replace(sample_sandbox_health(&state).await);
             last_container_check = Some(std::time::Instant::now());
+        }
+        if last_purge_recovery.elapsed() >= std::time::Duration::from_secs(30) {
+            super::api::sessions::recover_pending_purges(&state).await;
+            last_purge_recovery = std::time::Instant::now();
         }
         if last_credential_refresh.elapsed() >= std::time::Duration::from_secs(1800) {
             refresh_sandbox_stores(&state).await;

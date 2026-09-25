@@ -43,13 +43,13 @@ mod v028_clear_archived_live_status;
 mod v029_fold_pending_initial_turn;
 mod v030_global_only_profile_settings;
 mod v031_conversation_provenance;
-mod v031_core_daemon_launch;
 mod v032_bound_capture_exclusions;
-mod v032_serve_passphrase_policy;
 pub(crate) mod v033_isolate_sandbox_content;
-mod v033_pending_purge_owners;
-mod v034_capture_purge_runners;
-mod v035_canonical_sidebar;
+mod v034_core_daemon_launch;
+mod v035_serve_passphrase_policy;
+mod v036_pending_purge_owners;
+mod v037_capture_purge_runners;
+mod v038_canonical_sidebar;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -252,43 +252,43 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 31,
-        name: "core_daemon_launch",
-        run: v031_core_daemon_launch::run,
-    },
-    Migration {
-        version: 32,
-        name: "serve_passphrase_policy",
-        run: v032_serve_passphrase_policy::run,
-    },
-    Migration {
-        version: 33,
-        name: "pending_purge_owners",
-        run: v033_pending_purge_owners::run,
-    },
-    Migration {
-        version: 34,
-        name: "capture_purge_runners",
-        run: v034_capture_purge_runners::run,
-    },
-    Migration {
-        version: 35,
-        name: "canonical_sidebar",
-        run: v035_canonical_sidebar::run,
-    },
-    Migration {
-        version: 36,
         name: "conversation_provenance",
         run: v031_conversation_provenance::run,
     },
     Migration {
-        version: 37,
+        version: 32,
         name: "bound_capture_exclusions",
         run: v032_bound_capture_exclusions::run,
     },
     Migration {
-        version: 38,
+        version: 33,
         name: "isolate_sandbox_content",
         run: v033_isolate_sandbox_content::run,
+    },
+    Migration {
+        version: 34,
+        name: "core_daemon_launch",
+        run: v034_core_daemon_launch::run,
+    },
+    Migration {
+        version: 35,
+        name: "serve_passphrase_policy",
+        run: v035_serve_passphrase_policy::run,
+    },
+    Migration {
+        version: 36,
+        name: "pending_purge_owners",
+        run: v036_pending_purge_owners::run,
+    },
+    Migration {
+        version: 37,
+        name: "capture_purge_runners",
+        run: v037_capture_purge_runners::run,
+    },
+    Migration {
+        version: 38,
+        name: "canonical_sidebar",
+        run: v038_canonical_sidebar::run,
     },
 ];
 
@@ -368,7 +368,8 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
     }
     if current == CURRENT_VERSION {
         v027_isolate_sandbox_stores::reconcile_pending(announce)?;
-        return v033_isolate_sandbox_content::reconcile_pending(announce);
+        v033_isolate_sandbox_content::reconcile_pending(announce)?;
+        return v037_capture_purge_runners::reconcile();
     }
 
     let pending: Vec<&Migration> = MIGRATIONS
@@ -491,5 +492,40 @@ mod tests {
             "old"
         );
         assert_eq!(get_current_version(), CURRENT_VERSION);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn schema_33_upgrade_initializes_then_captures_purge_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join(VERSION_FILE), "33").unwrap();
+
+        run_migrations().unwrap();
+
+        assert_eq!(get_current_version(), CURRENT_VERSION);
+        let journal: serde_json::Value = serde_json::from_slice(
+            &fs::read(app.join(crate::session::purge_owners::FILE_NAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(journal["version"], 2);
+        assert_eq!(journal["owners"], serde_json::json!([]));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn current_schema_never_recreates_a_lost_purge_journal() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join(VERSION_FILE), CURRENT_VERSION.to_string()).unwrap();
+
+        let error = run_migrations().unwrap_err().to_string();
+
+        assert!(error.contains("Pending purge ownership journal is missing"));
+        assert!(!app.join(crate::session::purge_owners::FILE_NAME).exists());
     }
 }

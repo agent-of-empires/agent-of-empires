@@ -141,6 +141,59 @@ async fn finish_structured_purge(state: &AppState, id: &str) -> anyhow::Result<(
     Ok(())
 }
 
+/// Retry every committed purge whose row was removed before cleanup could be
+/// proven. The durable plan is removed only by `finish_recovered` after all
+/// resource stages succeed.
+pub(crate) async fn recover_pending_purges(state: &Arc<AppState>) {
+    if state.read_only {
+        return;
+    }
+    let _namespace = state.profile_namespace.read().await;
+    loop {
+        let committed = match tokio::task::spawn_blocking(
+            crate::session::deletion::recover_committed_purge,
+        )
+        .await
+        {
+            Ok(Ok(Some(committed))) => committed,
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => {
+                tracing::warn!(target: "session.purge_recovery", %error, "pending purge recovery retained");
+                break;
+            }
+            Err(error) => {
+                tracing::warn!(target: "session.purge_recovery", %error, "pending purge recovery worker failed");
+                break;
+            }
+        };
+        let id = committed.session_id().to_owned();
+        let structured = committed.is_structured();
+        if structured {
+            if let Err(error) = finish_structured_purge(state, &id).await {
+                tracing::warn!(target: "session.purge_recovery", session_id = %id, %error, "structured shutdown unproven; purge retained");
+                break;
+            }
+        }
+        let result = match tokio::task::spawn_blocking(move || committed.finish_recovered()).await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(target: "session.purge_recovery", session_id = %id, %error, "purge cleanup worker failed");
+                break;
+            }
+        };
+        if !result.success {
+            tracing::warn!(target: "session.purge_recovery", session_id = %id, errors = ?result.errors, "purge cleanup incomplete; owner retained");
+            break;
+        }
+        state.instance_locks.write().await.remove(&id);
+        state.session_service.forget_prompt_lock(&id).await;
+    }
+    drop(_namespace);
+    if let Err(error) = state.runtime.publish(state).await {
+        tracing::warn!(target: "session.purge_recovery", %error, "publishing purge recovery state failed");
+    }
+}
+
 /// Repair moved worktree references through complete native profile publication.
 pub(crate) async fn reconcile_worktree_paths(state: &Arc<AppState>) {
     use crate::session::SessionStore;

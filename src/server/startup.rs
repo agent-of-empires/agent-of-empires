@@ -817,6 +817,9 @@ pub(crate) async fn start_server(
     // previous daemon died otherwise renders Idle until the next
     // lifecycle event arrives. See #1103.
     seed_acp_statuses(state.clone()).await;
+    if !state.read_only {
+        crate::server::api::sessions::recover_pending_purges(&state).await;
+    }
 
     // Two-phase startup recovery. Phase A runs synchronously (acquire
     // lock, snapshot candidates, mark them in `recently_restarted`) so

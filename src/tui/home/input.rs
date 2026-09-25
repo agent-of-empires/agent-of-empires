@@ -1168,6 +1168,15 @@ impl HomeView {
                 }
                 None
             }
+            "resolve_indeterminate" => {
+                if let Some(id) = self.pending_indeterminate_resolution.take() {
+                    if let Err(error) = self.session_feed.resolve_indeterminate(&id) {
+                        self.info_dialog =
+                            Some(InfoDialog::new("Quarantine Retained", &error.to_string()));
+                    }
+                }
+                None
+            }
             "trash_session" => {
                 if let Some(session_id) = self.pending_trash_session.take() {
                     self.trash_session_by_id(&session_id);

@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::anchored_fs::ResolvedDataFile;
+use super::deletion::DeletionRequest;
 use super::path_identity::CleanupProtection;
 use super::storage::{acquire_open_storage_flock, app_dir_for_profile_dir};
 use super::{AnchoredDir, Instance, Storage};
@@ -27,6 +28,7 @@ impl RunnerCapture {
             session_id,
             crate::process::worker_registry::load_strict,
             crate::process::worker::is_process_group_alive,
+            peer_pid_for,
         )
     }
 
@@ -35,50 +37,108 @@ impl RunnerCapture {
         session_id: Option<&str>,
         load: impl FnOnce(&str) -> Result<Option<crate::process::worker_registry::WorkerRecord>>,
         process_group_alive: impl Fn(u32) -> bool,
+        peer_pid: impl Fn(&str) -> Result<Option<u32>>,
     ) -> Result<()> {
-        let Self::Captured {
-            pid, generation, ..
-        } = self
-        else {
-            return match self {
-                Self::Uncaptured => Ok(()),
-                Self::Unresolved { error } => {
-                    anyhow::bail!("Runner ownership unresolved; purge resources retained: {error}")
-                }
-                Self::Captured { .. } => unreachable!(),
+        let Self::Unresolved { error } = self else {
+            let Some(session_id) = session_id else {
+                anyhow::bail!("Runner session identity is missing; purge resources retained");
             };
-        };
-        let Some(session_id) = session_id else {
-            anyhow::bail!("Captured runner session identity is missing; purge resources retained");
-        };
-        let record = load(session_id)
-            .map_err(|error| anyhow::anyhow!("worker registry is unreadable: {error:#}"))?;
-        let alive = process_group_alive(*pid);
-        match record {
-            None => anyhow::ensure!(
-                !alive,
-                "Captured runner {pid} has not exited; purge resources retained"
-            ),
-            Some(record) => {
-                let identity = crate::acp::runner_lifecycle::RunnerIdentity {
-                    pid: *pid,
-                    generation: *generation,
-                };
+            let record = load(session_id)
+                .map_err(|error| anyhow::anyhow!("worker registry is unreadable: {error:#}"))?;
+            let peer_pid = peer_pid(session_id).map_err(|error| {
+                anyhow::anyhow!("runner socket identity is unreadable: {error:#}")
+            })?;
+            let Self::Captured {
+                pid, generation, ..
+            } = self
+            else {
                 anyhow::ensure!(
-                    identity.matches_record(record.pid, record.generation)
-                        && identity.generation == record.generation,
-                    "Captured runner identity was replaced (pid {} generation {}); purge resources retained",
-                    record.pid,
-                    record.generation
+                    record.is_none() && peer_pid.is_none(),
+                    "Runner ownership changed after capture; purge resources retained"
                 );
-                anyhow::ensure!(
-                    !alive && !crate::process::worker_registry::is_record_live(&record),
-                    "Captured runner {pid} has not exited; purge resources retained"
-                );
+                return Ok(());
+            };
+            let alive = process_group_alive(*pid);
+            match record {
+                None => {
+                    anyhow::ensure!(
+                        !alive && peer_pid.is_none(),
+                        "Captured runner {pid} has not exited; purge resources retained"
+                    );
+                }
+                Some(record) => {
+                    let identity = crate::acp::runner_lifecycle::RunnerIdentity {
+                        pid: *pid,
+                        generation: *generation,
+                    };
+                    anyhow::ensure!(
+                        identity.matches_record(record.pid, record.generation)
+                            && identity.generation == record.generation,
+                        "Captured runner identity was replaced (pid {} generation {}); purge resources retained",
+                        record.pid,
+                        record.generation
+                    );
+                    anyhow::ensure!(
+                        !alive
+                            && !crate::process::worker_registry::is_record_live(&record)
+                            && peer_pid.is_none_or(|peer| peer == *pid),
+                        "Captured runner {pid} has not exited; purge resources retained"
+                    );
+                }
+            }
+            return Ok(());
+        };
+        anyhow::bail!("Runner ownership unresolved; purge resources retained: {error}")
+    }
+
+    fn serialized(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("runner capture is serializable")
+    }
+}
+
+fn peer_pid_for(session_id: &str) -> Result<Option<u32>> {
+    let base = crate::process::worker_registry::socket_path_for(session_id)?;
+    let control = crate::process::worker::control_socket_sibling(&base);
+    let peer_pid = crate::process::worker::peer_pid_from_socket(&control)
+        .or_else(|| crate::process::worker::peer_pid_from_socket(&base));
+    if peer_pid.is_none()
+        && [control.as_path(), base.as_path()]
+            .into_iter()
+            .any(|path| std::fs::symlink_metadata(path).is_ok())
+    {
+        anyhow::bail!("runner socket exists but its peer identity could not be proven");
+    }
+    Ok(peer_pid)
+}
+
+fn capture_runner(session_id: &str) -> RunnerCapture {
+    match crate::process::worker_registry::load_strict(session_id) {
+        Ok(Some(record)) if record.pid > 0 && i32::try_from(record.pid).is_ok() => {
+            RunnerCapture::Captured {
+                pid: record.pid,
+                generation: record.generation,
             }
         }
-        Ok(())
+        Ok(Some(_)) => RunnerCapture::Unresolved {
+            error: "Invalid captured runner pid".into(),
+        },
+        Ok(None) => match peer_pid_for(session_id) {
+            Ok(None) => RunnerCapture::Uncaptured,
+            Ok(Some(pid)) => RunnerCapture::Unresolved {
+                error: format!("registry absent but runner socket peer {pid} is active"),
+            },
+            Err(error) => RunnerCapture::Unresolved {
+                error: format!("runner socket probe failed: {error:#}"),
+            },
+        },
+        Err(error) => RunnerCapture::Unresolved {
+            error: format!("{error:#}"),
+        },
     }
+}
+
+pub(crate) fn capture_runner_json(session_id: &str) -> serde_json::Value {
+    capture_runner(session_id).serialized()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -89,6 +149,17 @@ struct Owner {
     generation: u64,
     protection: CleanupProtection,
     runner: RunnerCapture,
+    #[serde(default)]
+    request: Option<DeletionRequest>,
+    #[serde(default)]
+    additional_protection: Option<CleanupProtection>,
+}
+
+pub(super) struct RecoveryPlan {
+    pub(super) token: String,
+    pub(super) profile: String,
+    pub(super) request: Option<DeletionRequest>,
+    pub(super) additional_protection: Option<CleanupProtection>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -132,6 +203,20 @@ fn decode(content: Option<&str>) -> Result<Journal> {
                 *pid > 0 && i32::try_from(*pid).is_ok(),
                 "Invalid captured runner pid"
             );
+        }
+        if let Some(request) = &owner.request {
+            let source_profile_matches = request.instance.source_profile.is_empty()
+                || request.instance.source_profile == owner.profile;
+            anyhow::ensure!(
+                request.session_id == owner.session_id
+                    && request.instance.id == owner.session_id
+                    && request.instance.lifecycle_generation == owner.generation
+                    && source_profile_matches,
+                "Pending purge request identity does not match its owner"
+            );
+        }
+        if let Some(protection) = &owner.additional_protection {
+            protection.validate()?;
         }
     }
     Ok(journal)
@@ -182,21 +267,7 @@ pub(crate) struct PurgeCapture {
 
 impl PurgeCapture {
     pub(crate) fn new(row: &Instance) -> Result<Self> {
-        let runner = match crate::process::worker_registry::load(&row.id) {
-            Ok(Some(record)) if record.pid > 0 && i32::try_from(record.pid).is_ok() => {
-                RunnerCapture::Captured {
-                    pid: record.pid,
-                    generation: record.generation,
-                }
-            }
-            Ok(Some(_)) => RunnerCapture::Unresolved {
-                error: "Invalid captured runner pid".into(),
-            },
-            Ok(None) => RunnerCapture::Uncaptured,
-            Err(error) => RunnerCapture::Unresolved {
-                error: format!("{error:#}"),
-            },
-        };
+        let runner = capture_runner(&row.id);
         let protection = CleanupProtection::new([row])?;
         protection.validate()?;
         Ok(Self {
@@ -212,9 +283,17 @@ impl PurgeCapture {
 }
 
 impl PurgeOwner {
-    pub(crate) fn record(
+    #[cfg(test)]
+    pub(crate) fn record(storage: &Storage, row: &Instance, capture: PurgeCapture) -> Result<Self> {
+        Self::record_plan(storage, row, row.lifecycle_generation, None, None, capture)
+    }
+
+    pub(crate) fn record_plan(
         storage: &Storage,
         row: &Instance,
+        generation: u64,
+        request: Option<&DeletionRequest>,
+        additional_protection: Option<&CleanupProtection>,
         mut capture: PurgeCapture,
     ) -> Result<Self> {
         capture.protection.extend([row])?;
@@ -223,13 +302,23 @@ impl PurgeOwner {
         let (lock, path) = file.open_sidecar()?;
         let _guard = acquire_open_storage_flock(lock, &path)?;
         let mut journal = decode(file.read()?.as_deref())?;
+        let mut request = request.cloned();
+        if let Some(request) = &mut request {
+            request.session_id = row.id.clone();
+            request.instance.id = row.id.clone();
+            request.instance.source_profile = storage.profile().to_owned();
+            request.instance.lifecycle_generation = row.lifecycle_generation;
+            request.instance.lifecycle_reservation = row.lifecycle_reservation.clone();
+        }
         journal.owners.push(Owner {
             token: uuid::Uuid::new_v4().to_string(),
             session_id: row.id.clone(),
             profile: storage.profile().to_owned(),
-            generation: row.lifecycle_generation,
+            generation,
             protection: capture.protection,
             runner: capture.runner,
+            request,
+            additional_protection: additional_protection.cloned(),
         });
         save(&file, &journal)?;
         let recorded = journal.owners.pop().expect("recorded owner");
@@ -238,6 +327,24 @@ impl PurgeOwner {
             token: recorded.token,
             runner: recorded.runner,
             session_id: Some(row.id.clone()),
+        })
+    }
+
+    pub(super) fn recover(storage: &Storage, token: &str) -> Result<Self> {
+        let file = open_for(storage)?;
+        let (lock, path) = file.open_sidecar()?;
+        let _guard = acquire_open_storage_flock(lock, &path)?;
+        let journal = decode(file.read()?.as_deref())?;
+        let owner = journal
+            .owners
+            .into_iter()
+            .find(|owner| owner.token == token)
+            .context("Pending purge owner disappeared during recovery")?;
+        Ok(Self {
+            file,
+            token: owner.token,
+            runner: owner.runner,
+            session_id: Some(owner.session_id),
         })
     }
 
@@ -276,6 +383,20 @@ pub(super) fn session_ids(root: &Path) -> Result<impl Iterator<Item = String>> {
         .owners
         .into_iter()
         .map(|owner| owner.session_id))
+}
+
+pub(super) fn recovery_plans() -> Result<Vec<RecoveryPlan>> {
+    let root = crate::session::get_app_dir()?;
+    Ok(decode(open(&root)?.read()?.as_deref())?
+        .owners
+        .into_iter()
+        .map(|owner| RecoveryPlan {
+            token: owner.token,
+            profile: owner.profile,
+            request: owner.request,
+            additional_protection: owner.additional_protection,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -369,13 +490,19 @@ mod tests {
             generation: 7,
         };
         captured
-            .ensure_stopped_with(Some("session"), |_| Ok(Some(record(41, 7))), |_| false)
+            .ensure_stopped_with(
+                Some("session"),
+                |_| Ok(Some(record(41, 7))),
+                |_| false,
+                |_| Ok(None),
+            )
             .expect("an exact, reaped registry identity releases cleanup");
         let error = captured
             .ensure_stopped_with(
                 Some("session"),
                 |_| Ok(Some(record(std::process::id(), 8))),
                 |_| true,
+                |_| Ok(None),
             )
             .expect_err("a live replacement must retain purge resources");
         assert!(error.to_string().contains("identity was replaced"));
@@ -384,12 +511,16 @@ mod tests {
                 Some("session"),
                 |_| Err(anyhow::anyhow!("permission denied")),
                 |_| false,
+                |_| Ok(None),
             )
             .expect_err("an unreadable registry is ambiguous");
         assert!(error.to_string().contains("unreadable"));
         captured
-            .ensure_stopped_with(Some("session"), |_| Ok(None), |_| true)
+            .ensure_stopped_with(Some("session"), |_| Ok(None), |_| true, |_| Ok(None))
             .expect_err("a missing registry cannot prove a live captured process exited");
+        captured
+            .ensure_stopped_with(Some("session"), |_| Ok(None), |_| false, |_| Ok(Some(99)))
+            .expect_err("an active socket blocks a missing registry");
 
         RunnerCapture::Unresolved {
             error: "worker record unreadable".into(),
@@ -397,8 +528,56 @@ mod tests {
         .ensure_stopped(None)
         .expect_err("unresolved ownership blocks cleanup");
         RunnerCapture::Uncaptured
-            .ensure_stopped(None)
-            .expect("nothing was captured, so nothing blocks cleanup");
+            .ensure_stopped_with(Some("session"), |_| Ok(None), |_| false, |_| Ok(None))
+            .expect("a strict registry absence and inactive sockets prove no runner");
+        RunnerCapture::Uncaptured
+            .ensure_stopped_with(Some("session"), |_| Ok(None), |_| false, |_| Ok(Some(42)))
+            .expect_err("an active socket prevents an absent capture from authorizing cleanup");
+        RunnerCapture::Uncaptured
+            .ensure_stopped_with(
+                Some("session"),
+                |_| Ok(Some(record(42, 1))),
+                |_| false,
+                |_| Ok(None),
+            )
+            .expect_err("a runner published after capture is unresolved");
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn malformed_registry_is_unresolved_at_capture() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let row = Instance::new(
+            "malformed-registry",
+            root.path().join("checkout").to_str().unwrap(),
+        );
+        let record = crate::process::worker_registry::record_path(&row.id)?;
+        std::fs::write(record, b"{")?;
+
+        let capture = PurgeCapture::new(&row)?;
+
+        assert!(capture.ensure_captured_runner_stopped().is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn active_socket_without_registry_is_unresolved() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let row = Instance::new(
+            "socket-without-registry",
+            root.path().join("checkout").to_str().unwrap(),
+        );
+        let socket = crate::process::worker_registry::socket_path_for(&row.id)?;
+        let _listener = std::os::unix::net::UnixListener::bind(&socket)?;
+
+        let capture = PurgeCapture::new(&row)?;
+
+        assert!(capture.ensure_captured_runner_stopped().is_err());
         Ok(())
     }
 }

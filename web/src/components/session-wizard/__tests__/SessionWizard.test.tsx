@@ -7,6 +7,13 @@ import { SessionWizard, type WizardPrefill } from "../SessionWizard";
 import { fetchSettings } from "../../../lib/api";
 
 const createSession = vi.fn();
+const reviewCreationTrust = vi.fn();
+const FINGERPRINT = {
+  project_path: "/tmp/proj",
+  base_hooks_hash: "base",
+  hooks_hash: "repo",
+  mcp_hash: null,
+};
 
 vi.mock("../../../lib/api", () => ({
   fetchSettings: vi.fn().mockResolvedValue({}),
@@ -24,6 +31,7 @@ vi.mock("../../../lib/api", () => ({
   }),
   fetchProjects: vi.fn().mockResolvedValue([]),
   createSession: (...args: unknown[]) => createSession(...args),
+  reviewCreationTrust: (...args: unknown[]) => reviewCreationTrust(...args),
 }));
 
 const INSTRUCTION_KEY = "aoe-new-session-last-instruction";
@@ -33,6 +41,20 @@ beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
   createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
+  reviewCreationTrust.mockResolvedValue({
+    ok: true,
+    review: {
+      fingerprint: FINGERPRINT,
+      merged_hooks: {
+        on_create: ["bash scripts/setup-worktree.sh"],
+        on_launch: ["npm start"],
+      },
+      repo_hooks: {},
+      mcp_summaries: [],
+      hooks_need_trust: true,
+      mcp_need_trust: false,
+    },
+  });
 });
 
 afterEach(() => {
@@ -150,8 +172,56 @@ describe("SessionWizard hooks trust", () => {
     expect(payload()).not.toHaveProperty("trust_hooks", true);
     fireEvent.click(screen.getByTestId("hooks-trust-proceed"));
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
-    expect(payload(1)).toMatchObject({ trust_hooks: true });
+    expect(payload(1)).toMatchObject({ trust_hooks: true, trust_review: FINGERPRINT });
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith({ id: "s1" }));
+  });
+
+  it("re-reviews after creation_trust_changed instead of auto-approving", async () => {
+    const changed = {
+      ok: false,
+      error: "Repository hook configuration changed; review it again",
+      trustChanged: true,
+    };
+    createSession.mockResolvedValueOnce(REFUSAL).mockResolvedValueOnce(changed);
+    reviewCreationTrust
+      .mockResolvedValueOnce({
+        ok: true,
+        review: {
+          fingerprint: FINGERPRINT,
+          merged_hooks: { on_create: ["old"] },
+          repo_hooks: {},
+          mcp_summaries: [],
+          hooks_need_trust: true,
+          mcp_need_trust: false,
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        review: {
+          fingerprint: { ...FINGERPRINT, hooks_hash: "new" },
+          merged_hooks: { on_create: ["new reviewed command"] },
+          repo_hooks: {},
+          mcp_summaries: [],
+          hooks_need_trust: true,
+          mcp_need_trust: false,
+        },
+      });
+    renderWizard();
+    await openDialog();
+    fireEvent.click(screen.getByTestId("hooks-trust-proceed"));
+    await waitFor(() => expect(reviewCreationTrust).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByTestId("hooks-trust-list").textContent).toContain("new reviewed command"));
+    expect(createSession).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not submit an approval when the canonical review fails", async () => {
+    createSession.mockResolvedValueOnce(REFUSAL);
+    reviewCreationTrust.mockResolvedValueOnce({ ok: false, error: "review unavailable" });
+    renderWizard();
+    await launch();
+    await waitFor(() => expect(screen.getByText("review unavailable")).toBeTruthy());
+    expect(createSession).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("hooks-trust-dialog")).toBeNull();
   });
 
   it("Cancel dismisses the dialog without a second submit", async () => {
