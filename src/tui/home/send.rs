@@ -245,17 +245,12 @@ mod permission_response_tokens_tests {
             permission_response_tokens(&response, PermissionResponseChoice::Deny),
             Some(response.deny)
         );
-    }
-
-    #[test]
-    fn allow_always_none_maps_to_none() {
-        let response = PermissionResponse {
-            allow: &[KeyToken::Named("Enter")],
+        let without_always = PermissionResponse {
             allow_always: None,
-            deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
+            ..response
         };
         assert_eq!(
-            permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
+            permission_response_tokens(&without_always, PermissionResponseChoice::AllowAlways),
             None
         );
     }

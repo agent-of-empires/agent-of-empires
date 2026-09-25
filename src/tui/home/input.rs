@@ -6474,98 +6474,63 @@ mod tests {
     use super::*;
     use crate::session::config::{SessionConfig, ToolSessionConfig};
 
+    /// Wheel and button reports in both encodings: SGR is 1-based `<b;x;yM|m`, legacy X10
+    /// adds 32 to each byte and clamps coordinates at 223; cells clamp to the pane rect.
     #[test]
-    fn wheel_mouse_bytes_sgr_maps_cell_and_button() {
-        use ratatui::layout::Rect;
-        // Pane at (10,5), 80x24. Wheel up over screen cell (12,7) maps to
-        // 1-based pane cell (3,3): cx = 12-10+1, cy = 7-5+1.
-        let pane = Rect::new(10, 5, 80, 24);
-        assert_eq!(
-            wheel_mouse_bytes(true, true, pane, 12, 7),
-            b"\x1b[<64;3;3M".to_vec()
-        );
-        // Wheel down flips the button to 65.
-        assert_eq!(
-            wheel_mouse_bytes(false, true, pane, 12, 7),
-            b"\x1b[<65;3;3M".to_vec()
-        );
-        // A cell past the pane edge clamps to the last column/row.
-        assert_eq!(
-            wheel_mouse_bytes(true, true, pane, 999, 999),
-            b"\x1b[<64;80;24M".to_vec()
-        );
-        // An unpopulated rect falls back to the top-left cell.
-        assert_eq!(
-            wheel_mouse_bytes(true, true, Rect::new(0, 0, 0, 0), 40, 40),
-            b"\x1b[<64;1;1M".to_vec()
-        );
-    }
-
-    #[test]
-    fn wheel_mouse_bytes_legacy_encodes_x10() {
+    fn mouse_bytes_encode_sgr_and_x10() {
         use ratatui::layout::Rect;
         let pane = Rect::new(10, 5, 80, 24);
-        // Legacy X10: ESC [ M then (button+32, col+32, row+32). Cell (3,3),
-        // wheel up (button 64) => 0x60, 0x23, 0x23.
-        assert_eq!(
-            wheel_mouse_bytes(true, false, pane, 12, 7),
-            vec![0x1b, b'[', b'M', 64 + 32, 3 + 32, 3 + 32]
-        );
-        // Wheel down => button 65 => 0x61.
-        assert_eq!(
-            wheel_mouse_bytes(false, false, pane, 12, 7),
-            vec![0x1b, b'[', b'M', 65 + 32, 3 + 32, 3 + 32]
-        );
-        // Coordinates above 223 can't be encoded in one byte; clamp there.
-        let wide = Rect::new(0, 0, 400, 400);
-        assert_eq!(
-            wheel_mouse_bytes(true, false, wide, 300, 300),
-            vec![0x1b, b'[', b'M', 64 + 32, 223 + 32, 223 + 32]
-        );
-    }
+        let x10 = |b: u8, x: u8, y: u8| vec![0x1b, b'[', b'M', b + 32, x + 32, y + 32];
+        let wheel_cases: [(bool, bool, Rect, u16, u16, Vec<u8>); 7] = [
+            (true, true, pane, 12, 7, b"\x1b[<64;3;3M".to_vec()),
+            (false, true, pane, 12, 7, b"\x1b[<65;3;3M".to_vec()),
+            (true, true, pane, 999, 999, b"\x1b[<64;80;24M".to_vec()),
+            (
+                true,
+                true,
+                Rect::new(0, 0, 0, 0),
+                40,
+                40,
+                b"\x1b[<64;1;1M".to_vec(),
+            ),
+            (true, false, pane, 12, 7, x10(64, 3, 3)),
+            (false, false, pane, 12, 7, x10(65, 3, 3)),
+            (
+                true,
+                false,
+                Rect::new(0, 0, 400, 400),
+                300,
+                300,
+                x10(64, 223, 223),
+            ),
+        ];
+        for (up, sgr, rect, x, y, want) in wheel_cases {
+            assert_eq!(
+                wheel_mouse_bytes(up, sgr, rect, x, y),
+                want,
+                "wheel up={up} sgr={sgr} ({x},{y})"
+            );
+        }
 
-    #[test]
-    fn mouse_event_bytes_sgr_press_release_and_drag() {
-        use ratatui::layout::Rect;
+        // (button, release, drag, sgr): cell (10,5) is 1-based (11,6). SGR keeps the button
+        // on release; X10 releases are the button-agnostic 3. A drag adds motion bit 32.
         let pane = Rect::new(0, 0, 80, 24);
-        // Cell (10,5) maps to 1-based (11,6). SGR: press `M`, release `m`,
-        // keeping the button identity; a drag adds the motion bit (+32).
-        assert_eq!(
-            mouse_event_bytes(0, false, false, true, pane, 10, 5),
-            b"\x1b[<0;11;6M"
-        ); // left press
-        assert_eq!(
-            mouse_event_bytes(0, true, false, true, pane, 10, 5),
-            b"\x1b[<0;11;6m"
-        ); // left release
-        assert_eq!(
-            mouse_event_bytes(2, false, false, true, pane, 10, 5),
-            b"\x1b[<2;11;6M"
-        ); // right press
-        assert_eq!(
-            mouse_event_bytes(0, false, true, true, pane, 10, 5),
-            b"\x1b[<32;11;6M"
-        ); // left drag (0 + motion 32)
-    }
-
-    #[test]
-    fn mouse_event_bytes_x10_press_button_release_agnostic() {
-        use ratatui::layout::Rect;
-        let pane = Rect::new(0, 0, 80, 24);
-        // Legacy X10: ESC [ M then (button+32, cx+32, cy+32). Cell (10,5) =>
-        // (11,6). A release is the button-agnostic 3.
-        assert_eq!(
-            mouse_event_bytes(0, false, false, false, pane, 10, 5),
-            vec![0x1b, b'[', b'M', 32, 11 + 32, 6 + 32]
-        ); // left press
-        assert_eq!(
-            mouse_event_bytes(0, true, false, false, pane, 10, 5),
-            vec![0x1b, b'[', b'M', 3 + 32, 11 + 32, 6 + 32]
-        ); // release => button 3
-        assert_eq!(
-            mouse_event_bytes(0, false, true, false, pane, 10, 5),
-            vec![0x1b, b'[', b'M', 32 + 32, 11 + 32, 6 + 32]
-        ); // left drag => button 0 + motion bit 32
+        let event_cases: [(u16, bool, bool, bool, Vec<u8>); 7] = [
+            (0, false, false, true, b"\x1b[<0;11;6M".to_vec()),
+            (0, true, false, true, b"\x1b[<0;11;6m".to_vec()),
+            (2, false, false, true, b"\x1b[<2;11;6M".to_vec()),
+            (0, false, true, true, b"\x1b[<32;11;6M".to_vec()),
+            (0, false, false, false, x10(0, 11, 6)),
+            (0, true, false, false, x10(3, 11, 6)),
+            (0, false, true, false, x10(32, 11, 6)),
+        ];
+        for (button, release, drag, sgr, want) in event_cases {
+            assert_eq!(
+                mouse_event_bytes(button, release, drag, sgr, pane, 10, 5),
+                want,
+                "button={button} release={release} drag={drag} sgr={sgr}"
+            );
+        }
     }
 
     fn cursor_for(
@@ -6589,35 +6554,50 @@ mod tests {
         }
     }
 
-    /// `hover_forward_bytes` fires only for a full-screen app in any-event tracking
-    /// (1003) and then emits the no-button motion report in the app's encoding; everything
-    /// else, a button-tracking app included, gets `None`.
+    /// Forwarding needs a full-screen app: hover needs any-event tracking (1003) and is
+    /// encoded like the app's reports; a tracking app gets wheel bytes; a normal-screen
+    /// pane gets nothing, so the caller keeps its capture-window scroll.
     #[test]
-    fn hover_forward_bytes_requires_any_event_tracking() {
+    fn mouse_forwarding_requires_full_screen_tracking() {
         use ratatui::layout::Rect;
         let pane = Rect::new(0, 0, 80, 24);
         let mut all = cursor_for(true, true, true);
         all.mouse_all = true;
-        // Cell (10,5) maps to 1-based (11,6); no-button motion is 3 + 32.
+        // No-button motion is 3 + 32.
         assert_eq!(
             hover_forward_bytes(&all, pane, 10, 5).as_deref(),
             Some(b"\x1b[<35;11;6M".as_slice())
         );
-        // Legacy X10 encoding still gets the motion report.
         all.mouse_sgr = false;
         assert_eq!(
             hover_forward_bytes(&all, pane, 10, 5),
             Some(vec![0x1b, b'[', b'M', 35 + 32, 11 + 32, 6 + 32])
         );
-        // Button-only tracking: no bare motion.
         assert_eq!(
             hover_forward_bytes(&cursor_for(true, true, true), pane, 10, 5),
-            None
+            None,
+            "button-only tracking gets no bare motion"
         );
-        // Normal screen: never forwarded, even with 1003 set.
         let mut normal = cursor_for(false, true, true);
         normal.mouse_all = true;
         assert_eq!(hover_forward_bytes(&normal, pane, 10, 5), None);
+
+        match wheel_forward_key(&cursor_for(true, true, true), true, pane, 10, 10) {
+            Some(live_send::TmuxKey::HexBytes(b)) => assert_eq!(b[0], 0x1b),
+            other => panic!("expected SGR HexBytes, got {other:?}"),
+        }
+        match wheel_forward_key(&cursor_for(true, true, false), true, pane, 10, 10) {
+            Some(live_send::TmuxKey::HexBytes(b)) => {
+                assert_eq!(&b[..3], &[0x1b, b'[', b'M'])
+            }
+            other => panic!("expected legacy HexBytes, got {other:?}"),
+        }
+        for normal_screen in [
+            cursor_for(false, false, false),
+            cursor_for(false, true, true),
+        ] {
+            assert_eq!(wheel_forward_key(&normal_screen, true, pane, 10, 10), None);
+        }
     }
 
     /// On a composited preview the rect is the whole window while input goes to pane 0
@@ -6754,271 +6734,92 @@ mod tests {
         );
     }
 
-    /// A mouse-tracking full-screen pane still gets a forwarded mouse event
-    /// (SGR or legacy X10 bytes), never arrow keys.
     #[test]
-    fn wheel_forward_key_mouse_tracking_is_hex_bytes() {
-        use ratatui::layout::Rect;
-        let pane = Rect::new(0, 0, 80, 24);
-        match wheel_forward_key(&cursor_for(true, true, true), true, pane, 10, 10) {
-            Some(live_send::TmuxKey::HexBytes(b)) => assert_eq!(b[0], 0x1b),
-            other => panic!("expected SGR HexBytes, got {other:?}"),
+    fn hook_install_agent_resolves_detect_as_after_builtins() {
+        // (tool, detect_as target, resolved agent)
+        let cases = [
+            ("wrapped-codex", "codex", Some("codex")),
+            // A built-in name resolves as itself first, never via detect_as.
+            ("opencode", "codex", None),
+            ("wrapped-agent", "missing-agent", None),
+        ];
+        for (tool, target, want) in cases {
+            let mut config = SessionConfig::default();
+            config
+                .agent_detect_as
+                .insert(tool.to_string(), target.to_string());
+            assert_eq!(
+                resolve_hook_install_agent(tool, &config).map(|agent| agent.name),
+                want,
+                "{tool} -> {target}"
+            );
         }
-        match wheel_forward_key(&cursor_for(true, true, false), true, pane, 10, 10) {
-            Some(live_send::TmuxKey::HexBytes(b)) => {
-                assert_eq!(&b[..3], &[0x1b, b'[', b'M'])
-            }
-            other => panic!("expected legacy HexBytes, got {other:?}"),
+    }
+
+    #[test]
+    fn parse_hotkey_accepts_only_alt_plus_one_char() {
+        for (input, want) in [
+            ("Alt+g", 'g'),
+            ("alt+g", 'g'),
+            ("ALT+g", 'g'),
+            ("aLt+g", 'g'),
+            ("Alt+G", 'g'),
+            ("Alt+1", '1'),
+        ] {
+            assert_eq!(
+                parse_hotkey(input),
+                Some((KeyCode::Char(want), KeyModifiers::ALT)),
+                "{input}"
+            );
+        }
+        for input in [
+            "Ctrl+g", "Shift+g", "Cmd+g", "Alt+gg", "Alt+F1", "g", "Alt", "", "Alt-g", "Alt g",
+        ] {
+            assert!(parse_hotkey(input).is_none(), "{input} must be rejected");
         }
     }
 
-    /// A normal-screen pane is never forwarded; the caller keeps the
-    /// capture-window scroll, which can reach real scrollback there.
+    /// Invalid hotkeys are reported by name and skipped by the cache, which is sorted by
+    /// name so a shared chord goes to the alphabetically first tool.
     #[test]
-    fn wheel_forward_key_normal_screen_is_none() {
-        use ratatui::layout::Rect;
-        let pane = Rect::new(0, 0, 80, 24);
-        assert_eq!(
-            wheel_forward_key(&cursor_for(false, false, false), true, pane, 10, 10),
-            None
-        );
-        assert_eq!(
-            wheel_forward_key(&cursor_for(false, true, true), true, pane, 10, 10),
-            None
-        );
-    }
+    fn tool_hotkeys_validate_and_build_sorted_cache() {
+        let tools: std::collections::HashMap<_, _> = [
+            ("zoxide", Some("Alt+z")),
+            ("beta", Some("Alt+g")),
+            ("alpha", Some("Alt+g")),
+            ("broken", Some("Ctrl+x")),
+            ("tig", Some("Alt+too-long")),
+            ("no-hotkey", None),
+        ]
+        .into_iter()
+        .map(|(name, hotkey)| {
+            (
+                name.to_string(),
+                ToolSessionConfig {
+                    command: name.into(),
+                    hotkey: hotkey.map(Into::into),
+                    background: false,
+                },
+            )
+        })
+        .collect();
 
-    #[test]
-    fn format_target_label_distinguishes_terminal_panes() {
-        // Firing 'm' from Terminal view should show the target pane in the dialog title
-        // and the live banner, so agent prompts don't land in a shell. Both route through
-        // the same helper so the label can't drift.
-        use live_send::{format_target_label, LiveSendTarget};
-        assert_eq!(
-            format_target_label("my-session", &LiveSendTarget::Agent),
-            "my-session",
-        );
-        assert_eq!(
-            format_target_label("my-session", &LiveSendTarget::Terminal),
-            "my-session (terminal)",
-        );
-        assert_eq!(
-            format_target_label("my-session", &LiveSendTarget::ContainerTerminal),
-            "my-session (container)",
-        );
-    }
-
-    #[test]
-    fn hook_install_agent_uses_detect_as_for_custom_codex_wrapper() {
-        let mut config = SessionConfig::default();
-        config
-            .agent_detect_as
-            .insert("wrapped-codex".to_string(), "codex".to_string());
-
-        let agent = resolve_hook_install_agent("wrapped-codex", &config).unwrap();
-
-        assert_eq!(agent.name, "codex");
-    }
-
-    #[test]
-    fn hook_install_agent_keeps_builtin_agent_resolution_first() {
-        let mut config = SessionConfig::default();
-        config
-            .agent_detect_as
-            .insert("opencode".to_string(), "codex".to_string());
-
-        assert!(resolve_hook_install_agent("opencode", &config).is_none());
-    }
-
-    #[test]
-    fn hook_install_agent_ignores_unknown_detect_as_target() {
-        let mut config = SessionConfig::default();
-        config
-            .agent_detect_as
-            .insert("wrapped-agent".to_string(), "missing-agent".to_string());
-
-        assert!(resolve_hook_install_agent("wrapped-agent", &config).is_none());
-    }
-
-    #[test]
-    fn parse_hotkey_accepts_alt_letter() {
-        let (code, mods) = parse_hotkey("Alt+g").expect("valid");
-        assert_eq!(code, KeyCode::Char('g'));
-        assert_eq!(mods, KeyModifiers::ALT);
-    }
-
-    #[test]
-    fn parse_hotkey_is_case_insensitive_on_modifier() {
-        assert!(parse_hotkey("alt+g").is_some());
-        assert!(parse_hotkey("ALT+g").is_some());
-        assert!(parse_hotkey("aLt+g").is_some());
-    }
-
-    #[test]
-    fn parse_hotkey_normalizes_letter_to_lowercase() {
-        let (code, _) = parse_hotkey("Alt+G").expect("valid");
-        assert_eq!(code, KeyCode::Char('g'));
-    }
-
-    #[test]
-    fn parse_hotkey_accepts_digit() {
-        let (code, mods) = parse_hotkey("Alt+1").expect("valid");
-        assert_eq!(code, KeyCode::Char('1'));
-        assert_eq!(mods, KeyModifiers::ALT);
-    }
-
-    #[test]
-    fn parse_hotkey_rejects_non_alt_modifier() {
-        assert!(parse_hotkey("Ctrl+g").is_none());
-        assert!(parse_hotkey("Shift+g").is_none());
-        assert!(parse_hotkey("Cmd+g").is_none());
-    }
-
-    #[test]
-    fn parse_hotkey_rejects_multi_char_key() {
-        assert!(parse_hotkey("Alt+gg").is_none());
-        assert!(parse_hotkey("Alt+F1").is_none());
-    }
-
-    #[test]
-    fn parse_hotkey_rejects_missing_modifier() {
-        assert!(parse_hotkey("g").is_none());
-        assert!(parse_hotkey("Alt").is_none());
-        assert!(parse_hotkey("").is_none());
-    }
-
-    #[test]
-    fn parse_hotkey_rejects_wrong_separator() {
-        assert!(parse_hotkey("Alt-g").is_none());
-        assert!(parse_hotkey("Alt g").is_none());
-    }
-
-    #[test]
-    fn validate_tool_hotkeys_reports_each_invalid_entry() {
-        let mut tools = std::collections::HashMap::new();
-        tools.insert(
-            "lazygit".to_string(),
-            ToolSessionConfig {
-                command: "lazygit".into(),
-                hotkey: Some("Alt+g".into()),
-                background: false,
-            },
-        );
-        tools.insert(
-            "yazi".to_string(),
-            ToolSessionConfig {
-                command: "yazi".into(),
-                hotkey: Some("Ctrl+f".into()),
-                background: false,
-            },
-        );
-        tools.insert(
-            "tig".to_string(),
-            ToolSessionConfig {
-                command: "tig".into(),
-                hotkey: Some("Alt+too-long".into()),
-                background: false,
-            },
-        );
         let warnings = validate_tool_hotkeys(&tools);
-        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         let joined = warnings.join("|");
-        assert!(joined.contains("yazi"));
-        assert!(joined.contains("tig"));
-        assert!(!joined.contains("lazygit"));
-    }
-
-    #[test]
-    fn validate_tool_hotkeys_empty_when_all_valid_or_unset() {
-        let mut tools = std::collections::HashMap::new();
-        tools.insert(
-            "lazygit".to_string(),
-            ToolSessionConfig {
-                command: "lazygit".into(),
-                hotkey: Some("Alt+g".into()),
-                background: false,
-            },
-        );
-        tools.insert(
-            "rg".to_string(),
-            ToolSessionConfig {
-                command: "rg --files".into(),
-                hotkey: None,
-                background: false,
-            },
-        );
-        assert!(validate_tool_hotkeys(&tools).is_empty());
-    }
-
-    #[test]
-    fn build_tool_hotkey_cache_sorts_by_name_and_skips_invalid() {
-        let mut tools = std::collections::HashMap::new();
-        tools.insert(
-            "zoxide".to_string(),
-            ToolSessionConfig {
-                command: "z".into(),
-                hotkey: Some("Alt+z".into()),
-                background: false,
-            },
-        );
-        tools.insert(
-            "lazygit".to_string(),
-            ToolSessionConfig {
-                command: "lazygit".into(),
-                hotkey: Some("Alt+g".into()),
-                background: false,
-            },
-        );
-        tools.insert(
-            "broken".to_string(),
-            ToolSessionConfig {
-                command: "x".into(),
-                hotkey: Some("Ctrl+x".into()),
-                background: false,
-            },
-        );
-        tools.insert(
-            "no-hotkey".to_string(),
-            ToolSessionConfig {
-                command: "y".into(),
-                hotkey: None,
-                background: false,
-            },
-        );
+        assert!(joined.contains("broken") && joined.contains("tig"));
+        assert!(!joined.contains("alpha") && !joined.contains("no-hotkey"));
 
         let cache = build_tool_hotkey_cache(&tools);
-        // Two valid entries, sorted by name.
-        assert_eq!(cache.len(), 2);
-        assert_eq!(cache[0].0, "lazygit");
-        assert_eq!(cache[0].1, KeyCode::Char('g'));
-        assert_eq!(cache[0].2, KeyModifiers::ALT);
-        assert_eq!(cache[1].0, "zoxide");
-        assert_eq!(cache[1].1, KeyCode::Char('z'));
-    }
-
-    #[test]
-    fn build_tool_hotkey_cache_tie_break_favors_alphabetically_first_name() {
-        let mut tools = std::collections::HashMap::new();
-        // Both bind Alt+g; alphabetical winner is "alpha".
-        tools.insert(
-            "beta".to_string(),
-            ToolSessionConfig {
-                command: "b".into(),
-                hotkey: Some("Alt+g".into()),
-                background: false,
-            },
+        let g = KeyCode::Char('g');
+        assert_eq!(
+            cache,
+            vec![
+                ("alpha".to_string(), g, KeyModifiers::ALT),
+                ("beta".to_string(), g, KeyModifiers::ALT),
+                ("zoxide".to_string(), KeyCode::Char('z'), KeyModifiers::ALT),
+            ]
         );
-        tools.insert(
-            "alpha".to_string(),
-            ToolSessionConfig {
-                command: "a".into(),
-                hotkey: Some("Alt+g".into()),
-                background: false,
-            },
-        );
-        let cache = build_tool_hotkey_cache(&tools);
-        assert_eq!(cache[0].0, "alpha");
-        assert_eq!(cache[1].0, "beta");
     }
 
     fn glob_session_data(path: &str) -> NewSessionData {
