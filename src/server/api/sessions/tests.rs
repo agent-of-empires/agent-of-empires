@@ -899,7 +899,6 @@ fn fork_denial_message_distinguishes_every_refusal_state() {
     let preallocated = fork_denial_message(&crate::session::ForkDenied::UnqualifiedParent {
         provenance: crate::session::ConversationProvenance::Preallocated,
     });
-    assert!(!preallocated.contains("set-session-id"), "{preallocated}");
     assert_eq!(
         preallocated,
         "This session has no captured conversation to fork from. Send it at least one message first."

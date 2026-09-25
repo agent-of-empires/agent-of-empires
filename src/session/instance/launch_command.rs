@@ -481,7 +481,7 @@ impl Instance {
                 }
                 // A stored id no context can attest is a deviation, not routine: warn.
                 Err(error) if managed => {
-                    tracing::warn!(target: "session.store", error = %error, "no attestable execution context for recorded conversation '{}'; launching with the agent's own resume flags, re-pin it with aoe session set-session-id or restore the execution context it was captured in", self.agent_session_id.as_deref().unwrap_or_default());
+                    tracing::warn!(target: "session.store", error = %error, "no attestable execution context for recorded conversation '{}'; launching with the agent's own resume flags, restore the execution context it was captured in", self.agent_session_id.as_deref().unwrap_or_default());
                     None
                 }
                 Err(error) => {
@@ -1579,7 +1579,7 @@ mod tests {
         let carried = launch(Some(sid), ResumeIntent::Default);
         let warned = carried
             .lines()
-            .find(|line| line.contains("WARN") && line.contains("set-session-id"))
+            .find(|line| line.contains("WARN") && line.contains("no attestable execution context"))
             .unwrap_or_else(|| panic!("no warning for the carried conversation:\n{carried}"));
         assert!(warned.contains(sid), "the warning names the conversation");
         assert!(!carried.contains("native execution unavailable"));
@@ -1588,7 +1588,7 @@ mod tests {
         for (session_id, label) in [(Some(sid), "cleared with a stored id"), (None, "fresh")] {
             let quiet = launch(session_id, ResumeIntent::Cleared);
             assert!(
-                !quiet.contains("set-session-id"),
+                !quiet.contains("no attestable execution context"),
                 "a {label} launch must stay quiet:\n{quiet}"
             );
             assert!(

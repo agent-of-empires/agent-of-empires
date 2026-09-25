@@ -50,6 +50,48 @@ fn fork_from_selection_seeds_terminal_fork_and_inherits_parent_context() {
     assert_eq!(dialog.path_value(), "/tmp/repo-worktrees/feature");
 }
 
+/// A launch that pre-pins a child id still records the execution it resolved, so the Fork
+/// row shows before any conversation is captured and the action explains the refusal
+/// instead of offering a pin that cannot qualify a pre-pinned id.
+#[test]
+#[serial]
+fn fork_from_selection_offers_a_preallocated_parent_and_explains_the_refusal() {
+    let mut env = create_test_env_empty();
+    let mut inst = observed_fork_parent("claude");
+    inst.agent_session_binding.as_mut().unwrap().provenance =
+        crate::session::ConversationProvenance::Preallocated;
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id.clone());
+
+    assert!(
+        env.view.session_can_fork(&id),
+        "a preallocated parent records its launch execution, so the row must show"
+    );
+
+    let parent = env.view.get_instance(&id).unwrap().fork_parent_binding();
+    assert_eq!(
+        crate::session::fork::terminal_fork_seed(
+            parent.as_deref(),
+            "child-1111-2222-3333-444444444444".into()
+        ),
+        Err(crate::session::ForkDenied::UnqualifiedParent {
+            provenance: crate::session::ConversationProvenance::Preallocated,
+        })
+    );
+
+    env.view.open_fork_from_selection();
+
+    assert!(
+        env.view.new_dialog.is_none(),
+        "an unqualified pre-pinned parent must not open a fork dialog"
+    );
+    assert!(
+        env.view.info_dialog.is_some(),
+        "an explanatory info dialog is shown instead"
+    );
+}
+
 #[test]
 #[serial]
 fn fork_denied_for_resume_only_agent_shows_info() {

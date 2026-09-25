@@ -1055,7 +1055,7 @@ impl Instance {
     /// The conversation an explicit fork would carry. A recorded id with no
     /// binding at all, which a degraded launch leaves behind, is an unqualified
     /// recorded conversation, not nothing to fork.
-    pub(crate) fn fork_parent_binding(&self) -> Option<std::borrow::Cow<'_, ConversationBinding>> {
+    pub(crate) fn fork_parent_binding(&self) -> Option<Cow<'_, ConversationBinding>> {
         let (sid, binding) = match &self.resume_intent {
             ResumeIntent::Fork { .. } => return None,
             ResumeIntent::Use(sid) => (Some(sid), self.resume_binding.as_ref()),
