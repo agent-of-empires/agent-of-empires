@@ -813,6 +813,47 @@ impl SessionService {
         }
     }
 
+    pub(crate) async fn backfill_claude_store_marker(self: &Arc<Self>, id: &str) {
+        let profile = {
+            let mut instances = self.instances.write().await;
+            let Some(inst) = instances.iter_mut().find(|inst| inst.id == id) else {
+                return;
+            };
+            if !inst.backfill_claude_store_marker() {
+                return;
+            }
+            self.invalidate_disk_snapshots();
+            inst.source_profile.clone()
+        };
+        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+            Ok(storage) => {
+                let session_id = id.to_string();
+                let persisted = tokio::task::spawn_blocking(move || {
+                    storage.update(|instances, _groups| {
+                        if let Some(inst) = instances.iter_mut().find(|inst| inst.id == session_id)
+                        {
+                            let _ = inst.backfill_claude_store_marker();
+                        }
+                        Ok(())
+                    })
+                })
+                .await;
+                if !matches!(persisted, Ok(Ok(()))) {
+                    tracing::warn!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        "failed to persist Claude store routing provenance"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "acp.supervisor",
+                session = %id,
+                "failed to open storage for Claude store routing provenance: {e}"
+            ),
+        }
+    }
+
     /// Drop any disk reload that read `sessions.json` before this in-memory change. Call
     /// under the `instances` write lock; the persist that follows schedules a fresh reload.
     fn invalidate_disk_snapshots(&self) {

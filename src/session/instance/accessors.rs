@@ -616,6 +616,76 @@ impl Instance {
         let execution = binding.execution.as_ref()?;
         (execution.agent == "claude" && execution.filesystem == "host").then_some((sid, execution))
     }
+    pub(crate) fn selected_claude_store_pin(
+        &self,
+    ) -> Option<crate::session::capture::ClaudeStorePin> {
+        let (_, execution) = self.selected_claude_conversation()?;
+        let mut pin = crate::session::capture::ClaudeStorePin::of(execution)?;
+        if pin.exported_default_store.is_none() {
+            let home = super::hooks::host_home(&self.resolved_host_environment());
+            let default = home.as_deref().is_some_and(|home| {
+                crate::session::capture::is_default_claude_store(&pin.store, home)
+            });
+            let explicit_alias = home.as_deref().is_some_and(|home| {
+                self.declared_agent_config_dir_for(&self.tool)
+                    .is_some_and(|declared| {
+                        crate::session::capture::is_default_claude_store(&declared, home)
+                            && crate::git::template::lexical_normalize(&declared)
+                                != crate::git::template::lexical_normalize(&home.join(".claude"))
+                    })
+            });
+            pin.exported_default_store = Some(if default { explicit_alias } else { false });
+        }
+        Some(pin)
+    }
+
+    pub(crate) fn backfill_claude_store_marker(&mut self) -> bool {
+        let (sid, use_resume_binding) = match &self.resume_intent {
+            ResumeIntent::Use(sid) | ResumeIntent::Fork { from: sid } => (sid.as_str(), true),
+            ResumeIntent::Default => match self.agent_session_id.as_deref() {
+                Some(sid) => (sid, false),
+                None => return false,
+            },
+            ResumeIntent::Cleared => return false,
+        };
+        let home = super::hooks::host_home(&self.resolved_host_environment());
+        let explicit_alias = home.as_deref().is_some_and(|home| {
+            self.declared_agent_config_dir_for(&self.tool)
+                .is_some_and(|declared| {
+                    crate::session::capture::is_default_claude_store(&declared, home)
+                        && crate::git::template::lexical_normalize(&declared)
+                            != crate::git::template::lexical_normalize(&home.join(".claude"))
+                })
+        });
+        let binding = if use_resume_binding {
+            self.resume_binding.as_mut()
+        } else {
+            self.agent_session_binding.as_mut()
+        };
+        let Some(binding) = binding else {
+            return false;
+        };
+        if binding.session_id != sid {
+            return false;
+        }
+        let Some(execution) = binding.execution.as_mut() else {
+            return false;
+        };
+        if execution.agent != "claude" || execution.filesystem != "host" {
+            return false;
+        }
+        if execution.exported_default_store.is_some() {
+            return false;
+        }
+        let Some(store) = execution.stores.first() else {
+            return false;
+        };
+        let default = home
+            .as_deref()
+            .is_some_and(|home| crate::session::capture::is_default_claude_store(store, home));
+        execution.exported_default_store = Some(if default { explicit_alias } else { false });
+        true
+    }
 
     fn resolved_handoff_binding(
         &self,
@@ -702,6 +772,49 @@ mod tests {
             ),
             (None, None, None)
         );
+    }
+    #[test]
+    #[serial_test::serial]
+    fn legacy_claude_default_binding_backfills_implicit_routing() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let mut inst = Instance::new("legacy-acp-default", temp.path().to_str().unwrap());
+        inst.tool = "claude".into();
+        inst.resume_intent = ResumeIntent::Use(sid.into());
+        inst.resume_binding = Some(ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![temp.path().join(".claude")],
+                configuration: Vec::new(),
+                cwd: temp.path().to_path_buf(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            }),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+
+        assert!(inst.backfill_claude_store_marker());
+        assert_eq!(
+            inst.resume_binding
+                .as_ref()
+                .unwrap()
+                .execution
+                .as_ref()
+                .unwrap()
+                .exported_default_store,
+            Some(false)
+        );
+        assert_eq!(
+            inst.selected_claude_store_pin()
+                .unwrap()
+                .exported_default_store,
+            Some(false)
+        );
+        assert!(!inst.backfill_claude_store_marker());
     }
 
     #[test]

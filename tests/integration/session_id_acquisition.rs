@@ -232,6 +232,7 @@ fn restart_surfaces_a_pinned_fresh_launch_that_dies() {
             cwd: workdir.clone(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         }),
         transcript_path: None,
     });

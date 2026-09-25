@@ -311,6 +311,7 @@ async fn build_spawn_request(
     service: &Arc<SessionService>,
     target: &ResumeTarget,
 ) -> Result<SpawnRequest, ()> {
+    service.backfill_claude_store_marker(&target.id).await;
     let supervisor = &service.acp_supervisor;
     let inst_lock = service.instance_lock(&target.id).await;
     // Re-read under the session lock, for two reasons. A worktree rename holds
@@ -339,8 +340,7 @@ async fn build_spawn_request(
             inst.acp_mode_id.clone(),
             inst.acp_effort.clone(),
             inst.agent_model.clone(),
-            inst.selected_claude_conversation()
-                .and_then(|(_, execution)| crate::session::capture::ClaudeStorePin::of(execution)),
+            inst.selected_claude_store_pin(),
         )
     };
     let agent = supervisor
@@ -564,6 +564,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(req.model.as_deref(), Some("claude-opus-5"));
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_claude_store_provenance_is_persisted_before_resume() {
+        let (home, state, project) = test_state("s-legacy-routing");
+        let profile = "legacy-acp-routing";
+        let store = home.path().join(".claude");
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let mut instance = Instance::new("legacy", project.path().to_str().unwrap());
+        instance.id = "s-legacy-routing".into();
+        instance.view = crate::session::View::Structured;
+        instance.source_profile = profile.into();
+        instance.agent_session_id = Some(sid.into());
+        instance.agent_session_binding = Some(crate::session::ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![store],
+                configuration: Vec::new(),
+                cwd: project.path().to_path_buf(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            }),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = vec![instance.clone()];
+                Ok(())
+            })
+            .unwrap();
+        state.instances.write().await[0] = instance;
+
+        let target = {
+            let instances = state.instances.read().await;
+            ResumeTarget::from_instance(&instances[0])
+        };
+        let request = build_spawn_request(&state.session_service, &target)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            request
+                .claude_store_pin
+                .as_ref()
+                .unwrap()
+                .exported_default_store,
+            Some(false)
+        );
+        assert_eq!(
+            state.instances.read().await[0]
+                .agent_session_binding
+                .as_ref()
+                .unwrap()
+                .execution
+                .as_ref()
+                .unwrap()
+                .exported_default_store,
+            Some(false)
+        );
+        let persisted = storage.load().unwrap();
+        assert_eq!(
+            persisted[0]
+                .agent_session_binding
+                .as_ref()
+                .unwrap()
+                .execution
+                .as_ref()
+                .unwrap()
+                .exported_default_store,
+            Some(false)
+        );
     }
 
     /// A live stale worker must never be classified dead, which would lose its PID.

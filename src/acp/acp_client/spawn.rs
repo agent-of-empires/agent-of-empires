@@ -238,8 +238,10 @@ fn apply_claude_store_route(cmd: &mut std::process::Command, config: &SpawnConfi
         .iter()
         .rev()
         .find(|(key, _)| key == "HOME")
-        .map(|(_, value)| PathBuf::from(value))
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+        .map(|(_, value)| value.clone())
+        .or_else(|| effective_env_value(cmd, "HOME"))
+        .or_else(|| std::env::var("HOME").ok())
+        .map(PathBuf::from);
     let should_export = !home.is_some_and(|home| {
         crate::session::capture::is_default_claude_store(&pin.store, &home)
             && pin.exported_default_store == Some(false)
@@ -249,6 +251,13 @@ fn apply_claude_store_route(cmd: &mut std::process::Command, config: &SpawnConfi
     } else {
         cmd.env_remove("CLAUDE_CONFIG_DIR");
     }
+}
+
+fn effective_env_value(cmd: &std::process::Command, key: &str) -> Option<String> {
+    cmd.get_envs()
+        .filter_map(|(name, value)| (name == key).then_some(value))
+        .last()
+        .and_then(|value| value?.to_str().map(str::to_owned))
 }
 
 /// `dirs` first, then `path`, dropping any already present.
@@ -324,7 +333,12 @@ pub(super) fn native_store_snapshot(
         cwd.join(root)
     };
     let store = crate::session::capture::canonicalize_allowing_missing_leaf(&root)?;
-    let exported_default_store = Some(exported.is_some());
+    let exported_default_store = Some(
+        exported.is_some()
+            && home
+                .as_ref()
+                .is_some_and(|home| crate::session::capture::is_default_claude_store(&store, home)),
+    );
     Some(crate::session::ExecutionBinding {
         agent: "claude".into(),
         stores: vec![store],

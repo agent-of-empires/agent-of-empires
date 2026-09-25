@@ -809,6 +809,7 @@ mod tests {
                         cwd: app.path().to_path_buf(),
                         cwd_filesystem: "host".into(),
                         filesystem: "host".into(),
+                        exported_default_store: None,
                     },
                     "capture": { "Hooks": hooks.join(format!("session_id.{launch}")) },
                     "container": null,

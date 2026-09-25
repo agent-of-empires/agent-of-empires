@@ -390,7 +390,7 @@ impl<S: BroadcastSink> Drain<S> {
             return None;
         }
 
-        self.refresh_launch_env(&mut config).await;
+        Self::refresh_launch_env(&self.session_id, &mut config).await;
         if let Some((wrapper, base)) = &config.wrapper_substitution {
             log_wrapper_substitution(session_id, &config.tool, wrapper, base);
         }
@@ -480,8 +480,7 @@ impl<S: BroadcastSink> Drain<S> {
 
     /// Re-resolve what may have changed since the first launch: model pins,
     /// host hook env, and MCP servers.
-    async fn refresh_launch_env(&self, config: &mut SpawnConfig) {
-        let session_id = &self.session_id;
+    async fn refresh_launch_env(session_id: &str, config: &mut SpawnConfig) {
         let agent = config.agent_key.clone();
         let profile = config.source_profile.clone().unwrap_or_default();
         let cwd = config.cwd.clone();
@@ -999,6 +998,7 @@ mod tests {
         assert!(!events
             .iter()
             .any(|(_, _, event)| matches!(event, Event::AcpSessionAssigned { .. })));
+        drop(events);
         assert_eq!(supervisor.take_startup_failures(), vec![id.to_string()]);
         assert!(!supervisor.workers.lock().await.contains_key(id));
     }
@@ -1119,6 +1119,7 @@ mod tests {
 
         let (_home, temp) = isolate_home();
         let hook_store = temp.path().join("hook-store");
+        std::fs::create_dir_all(&hook_store).unwrap();
         std::fs::write(
             hook_store.join(".claude.json"),
             r#"{ "mcpServers": { "stale": { "command": "stale" } } }"#,
@@ -1142,7 +1143,6 @@ mod tests {
         )
         .unwrap();
 
-        let supervisor = Supervisor::new(VecSink::new());
         let mut config = runner_config(worker_registry::socket_path_for("s-withdraw").unwrap());
         config.base_host_environment = vec![("HOME".into(), temp.path().display().to_string())];
         config.host_environment = vec![
@@ -1154,7 +1154,7 @@ mod tests {
             exported_default_store: Some(false),
         });
 
-        supervisor.refresh_launch_env(&mut config).await;
+        Drain::<VecSink>::refresh_launch_env("s-withdraw", &mut config).await;
         assert!(!config
             .host_environment
             .iter()
