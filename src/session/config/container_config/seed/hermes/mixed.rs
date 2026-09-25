@@ -351,7 +351,11 @@ pub(in super::super) fn seed_skill_controls(
         let canonical = match fs::canonicalize(&lookup) {
             Ok(path) => path,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error).context("resolving native skill controls"),
+            Err(error) => {
+                tracing::warn!(target: "session.profile", path = %lookup.display(), %error,
+                    "Skipping unreadable configuration source");
+                continue;
+            }
         };
         let leaves = [canonical];
         let access = ReadAccess {
@@ -941,6 +945,34 @@ mod tests {
         assert_eq!(fs::read(destination.join("projects.db")).unwrap(), local);
     }
 
+    #[test]
+    fn unreadable_skill_control_does_not_skip_the_next_marker() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        fs::create_dir_all(source.join("skills")).unwrap();
+        symlink(".usage.json", source.join("skills/.usage.json")).unwrap();
+        fs::write(source.join("skills/.curator_state"), br#"{"paused":true}"#).unwrap();
+        let destination = temporary.path().join("active");
+        let boundary = boundary(&source, &destination);
+
+        seed_skill_controls(
+            &boundary,
+            boundary.hermes.source.unwrap(),
+            &boundary.source_root,
+            &AnchoredDir::open(&destination).unwrap(),
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        assert!(!destination.join("skills/.usage.json").exists());
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &fs::read(destination.join("skills/.curator_state")).unwrap()
+            )
+            .unwrap(),
+            serde_json::json!({ "paused": true })
+        );
+    }
     #[test]
     fn skill_controls_drop_activity_and_orphan_names_and_do_not_waive_atomic_remnants() {
         let temporary = tempfile::tempdir().unwrap();
