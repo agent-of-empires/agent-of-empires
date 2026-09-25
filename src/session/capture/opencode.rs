@@ -53,9 +53,9 @@ fn signal_serve_group(pid: u32, signal: Signal) {
 /// so both processes select the same store. Any failure leaves it unowned.
 pub(crate) fn preassign_opencode_session_id(
     project_path: &str,
-    environment: &[String],
+    command: std::process::Command,
 ) -> Option<String> {
-    preassign(project_path, environment)
+    preassign(project_path, command)
         .map_err(|e| {
             tracing::warn!(
                 target: "session.capture",
@@ -66,7 +66,7 @@ pub(crate) fn preassign_opencode_session_id(
         .and_then(super::validated_session_id)
 }
 
-fn preassign(project_path: &str, environment: &[String]) -> Result<String> {
+fn preassign(project_path: &str, mut cmd: std::process::Command) -> Result<String> {
     // The bind/drop/bind race is covered by the readiness deadline.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .context("failed to reserve a loopback port for opencode serve")?
@@ -75,10 +75,6 @@ fn preassign(project_path: &str, environment: &[String]) -> Result<String> {
         .port();
     let id = format!("ses_{}", Uuid::new_v4().simple());
 
-    let mut cmd = std::process::Command::new("opencode");
-    cmd.envs(crate::session::environment::resolve_host_environment_pairs(
-        environment,
-    ));
     cmd.args([
         "serve",
         "--hostname",

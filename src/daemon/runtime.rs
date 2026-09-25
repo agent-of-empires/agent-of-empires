@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::SessionResponse;
 
-pub const RUNTIME_PROTOCOL_VERSION: u16 = 1;
+pub const RUNTIME_PROTOCOL_VERSION: u16 = 2;
 pub const RUNTIME_EPOCH_HEADER: &str = "aoe-runtime-epoch";
 pub const RUNTIME_REVISION_HEADER: &str = "aoe-runtime-revision";
 
@@ -31,6 +31,7 @@ pub enum SessionMutation {
     Restore,
     AbandonPurge(super::AbandonPurgeBody),
     Archive(super::UpdateArchiveBody),
+    Access,
     Pin(super::UpdatePinBody),
     Favorite(super::UpdateFavoriteBody),
     Color(super::UpdateColorBody),
@@ -51,6 +52,7 @@ impl SessionMutation {
             Self::Restore => "restore",
             Self::AbandonPurge(_) => "purge/abandon",
             Self::Archive(_) => "archive",
+            Self::Access => "access",
             Self::Pin(_) => "pin",
             Self::Favorite(_) => "favorite",
             Self::Color(_) => "color",
@@ -169,8 +171,10 @@ pub struct ProfileSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreationProgress {
     pub session_id: String,
-    /// Title and profile let the requesting surface attribute progress to the
-    /// creation it submitted before the row appears in a snapshot.
+    /// Only this key or the known daemon id correlates progress to its caller.
+    /// The caller's idempotency key, when it supplied one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<String>,
     pub title: String,
     pub profile: String,
     pub phase: CreationPhase,
@@ -252,7 +256,10 @@ mod tests {
         });
         let json = serde_json::to_value(&hello).unwrap();
         assert_eq!(json["kind"], "hello");
-        assert_eq!(json["data"]["protocol_version"], 1);
+        assert_eq!(
+            json["data"]["protocol_version"],
+            u64::from(RUNTIME_PROTOCOL_VERSION)
+        );
         assert_eq!(json["data"]["epoch"], "e1");
 
         let creation = RuntimeFrame::<RuntimeSnapshot>::Creation(Vec::new());

@@ -47,6 +47,10 @@ export const HOST_STATE_VARS = new Set([
   "AOE_REMOTE_PASSPHRASE", // host credential `aoe remote` logs in with
   "AOE_SERVE_INSTANCE_ID", // identifies a host daemon process as this one
   "AOE_SERVE_PASSPHRASE", // host credential for the daemon's own auth
+  // Names one launch's publication. The launch routes its own value into the
+  // pane, so a host shell exporting it would only make a hook or an
+  // `extract-session-id` call read a launch that is not this run's.
+  "AOE_SESSION_SOURCE",
   // Host endpoints for the daemon's outbound calls.
   "AOE_TELEMETRY_ENDPOINT",
   "AOE_UPDATE_API_BASE",

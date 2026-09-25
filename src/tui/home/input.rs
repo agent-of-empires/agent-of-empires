@@ -12,7 +12,7 @@ use super::{
 };
 use crate::session::config::repo_config;
 use crate::session::config::{
-    load_config, update_app_state, update_config, GroupByMode, SortOrder,
+    load_config, update_app_state, update_config, GroupByMode, SidebarPosition, SortOrder,
 };
 use crate::session::{list_profiles_for_display, Item, Status};
 use crate::tui::app::Action;
@@ -593,14 +593,25 @@ impl HomeView {
         hit
     }
 
-    /// True when `(col, row)` lands on the side-by-side list/preview
-    /// divider. The divider is the preview's left border column (one
-    /// past `list_area.right()` is exclusive, so this *is* a valid hit
-    /// target that hit_list / hit_preview both miss by design). Returns
-    /// `false` in stacked mode, in the diff/settings/serve takeover
-    /// views (which clear `divider_col`), and while any modal dialog is
-    /// open, so a dialog over the divider swallows stray clicks rather
-    /// than starting a hidden drag.
+    /// Cancel gestures tied to old screen coordinates before moving the sidebar.
+    pub(super) fn set_sidebar_position(&mut self, position: SidebarPosition) {
+        if self.sidebar_position == position {
+            return;
+        }
+        match self.drag_state {
+            Some(DragKind::ListDivider) => {
+                self.handle_drag_end();
+            }
+            Some(DragKind::PreviewSelect) => {
+                self.clear_preview_selection();
+            }
+            _ => {}
+        }
+        self.sidebar_position = position;
+    }
+
+    /// Hit the preview border shared with the list, on either side.
+    /// Stacked and takeover views clear `divider_col`; modals block drags.
     pub fn hit_divider(&self, col: u16, row: u16) -> bool {
         if self.has_dialog() {
             return false;
@@ -629,10 +640,7 @@ impl HomeView {
     /// mobile clients where Shift-bypass does nothing.
     pub fn handle_drag_start(&mut self, col: u16, row: u16) -> bool {
         if self.hit_divider(col, row) {
-            self.drag_state = Some(DragKind::ListDivider {
-                start_col: col,
-                start_width: self.list_width,
-            });
+            self.drag_state = Some(DragKind::ListDivider);
             return true;
         }
         // Modals that aren't live-send sit over the preview, so a
@@ -662,13 +670,8 @@ impl HomeView {
         false
     }
 
-    /// Apply a drag-in-progress event. For the list divider, recompute
-    /// the requested width from `(start_width + delta)` and clamp to
-    /// `[10, main_area_width - PREVIEW_MIN_WIDTH]` so the preview keeps
-    /// its usability floor and the value never wraps `u16`. For a
-    /// preview-pane text selection, clamp the extent to the preview
-    /// area and stash it on `preview_selection`; the renderer reads it
-    /// each frame to paint the highlight.
+    /// Resize the list within the preview's minimum width, or update a
+    /// text selection within the preview's content bounds.
     ///
     /// Returns true when state actually changed (so the caller
     /// redraws). The drag does NOT persist on every tick; the divider
@@ -719,18 +722,17 @@ impl HomeView {
             return false;
         }
         match self.drag_state {
-            Some(DragKind::ListDivider {
-                start_col,
-                start_width,
-            }) => {
-                // i32 arithmetic so a leftward drag past the start column doesn't
-                // underflow u16 before the clamp.
-                let delta = col as i32 - start_col as i32;
-                let proposed = start_width as i32 + delta;
+            Some(DragKind::ListDivider) => {
+                if self.divider_col.is_none() {
+                    self.handle_drag_end();
+                    return false;
+                }
+                let proposed = match self.sidebar_position {
+                    SidebarPosition::Left => col as i32 - self.list_area.x as i32,
+                    SidebarPosition::Right => self.list_area.right() as i32 - 1 - col as i32,
+                };
 
-                // Clamp ceiling tracks the live viewport width; if the user
-                // resized the terminal mid-drag, the new width is honored. The
-                // floor of 10 matches the keyboard `<` shrink limit.
+                // Match the keyboard shrink limit and reserve preview space.
                 let ceiling = self
                     .main_area_width
                     .saturating_sub(responsive::PREVIEW_MIN_WIDTH);
@@ -908,7 +910,7 @@ impl HomeView {
         self.preview_drag_pos = None;
         self.preview_autoscroll_at = None;
         match state {
-            DragKind::ListDivider { .. } => {
+            DragKind::ListDivider => {
                 self.save_list_width();
             }
             DragKind::PreviewSelect => {
@@ -1648,7 +1650,7 @@ impl HomeView {
                                     }
                                     None
                                 }
-                                RepoTrustAction::Skip { .. } => {
+                                RepoTrustAction::Skip => {
                                     self.request_creation(data, Some(false));
                                     None
                                 }
@@ -2054,7 +2056,7 @@ impl HomeView {
                                 self.request_creation(data, Some(true));
                                 return None;
                             }
-                            RepoTrustAction::Skip { .. } => {
+                            RepoTrustAction::Skip => {
                                 self.request_creation(data, Some(false));
                                 return None;
                             }
@@ -2992,7 +2994,11 @@ impl HomeView {
         if inst.is_structured() {
             crate::session::fork::structured_fork_capable(&inst.tool, inst.agent_name.as_deref())
         } else {
-            crate::session::fork::terminal_agent_can_fork(&inst.tool)
+            inst.fork_parent_binding()
+                .and_then(|parent| parent.execution.as_ref())
+                .is_some_and(|execution| {
+                    crate::session::fork::terminal_agent_can_fork(&execution.agent)
+                })
         }
     }
 
@@ -3163,8 +3169,12 @@ impl HomeView {
             return;
         };
         let tool = parent.tool.clone();
-        let parent_agent_session_id = parent.agent_session_id.clone();
-        let repo_path = parent.repo_path().to_string();
+        let parent_binding = parent.fork_parent_binding().cloned();
+        let repo_path = if parent.is_structured() {
+            parent.repo_path().to_string()
+        } else {
+            parent.project_path.clone()
+        };
         let group_path = parent.group_path.clone();
         let title = parent.title.clone();
         let parent_is_structured = parent.is_structured();
@@ -3205,11 +3215,7 @@ impl HomeView {
             }
         } else {
             let child_id = crate::session::capture::generate_session_uuid();
-            match crate::session::fork::terminal_fork_seed(
-                &tool,
-                parent_agent_session_id.as_deref(),
-                child_id,
-            ) {
+            match crate::session::fork::terminal_fork_seed(parent_binding.as_ref(), child_id) {
                 Ok(s) => s,
                 Err(crate::session::ForkDenied::AgentCannotFork) => {
                     self.info_dialog = Some(InfoDialog::new(
@@ -6173,24 +6179,19 @@ impl HomeView {
         self.start_live_send()
     }
 
-    /// Translate one key event in live-send mode and hand the result to
-    /// the background worker. The worker owns the tmux Session and runs
-    /// `send-keys` off the UI thread so a slow fork+exec never blocks
-    /// the redraw loop; literal-key runs coalesce into a single tmux
-    /// call so fast typing isn't N forks. Ctrl+q clears `live_send`
-    /// and drops the worker (which closes its channel, exiting the
-    /// thread cleanly on the next iteration).
-    ///
-    /// Before dispatching we re-verify that the target session still
-    /// exists at the same tmux name as it had at entry time. If a peer
-    /// process deleted the session or a rename diverged the name from
-    /// what the worker is targeting, the user would otherwise type
-    /// into the void with only a `tracing::warn!` for company. Auto-
-    /// exit + info dialog instead.
+    /// Forward keys off the UI thread only while the daemon grants native
+    /// interaction and the pane still matches the entry target.
     fn handle_live_send_key(&mut self, key: KeyEvent) {
         let Some(state) = self.live_send.clone() else {
             return;
         };
+        // The gate is the local runtime's: a remote live-send carries its keys
+        // over that remote's live socket, so losing the local grant must not
+        // close it.
+        if state.remote.is_none() && !self.session_feed.native_interaction_available() {
+            self.teardown_live_send();
+            return;
+        }
 
         // Leader menu: a prior keystroke matched the configured leader
         // (tmux-style prefix, default Ctrl+B), so this key picks a
@@ -6356,8 +6357,11 @@ impl HomeView {
     /// re-asserting `window-size latest` would stomp it (the exact flap
     /// the size-owner lock exists to kill).
     pub(super) fn teardown_live_send(&mut self) {
+        let was_live = self.live_send.is_some();
         self.clear_live_send_state();
-        self.reseat_cursor_after_rebuild();
+        if was_live {
+            self.reseat_cursor_after_rebuild();
+        }
     }
 
     /// Teardown without moving the selection, for callers already reacting
@@ -6384,6 +6388,8 @@ impl HomeView {
         // visible again (and so the agent reflows back to the previewed size).
         if let Some(id) = &live_session_id {
             self.clear_preview_pane_sync(id);
+            // Live-mode highlights no longer match the resized preview.
+            self.clear_preview_selection();
         }
         // Preview selections also work outside live mode now, but a
         // live-mode highlight pins to the live-resized pane coords,
@@ -6972,21 +6978,6 @@ impl HomeView {
             TrustSurface::Absent => Vec::new(),
         };
 
-        // Hooks to run if approved (repo hooks, else global) vs skipped
-        // (already-trusted repo hooks still run; newly-prompted hooks fall back
-        // to the global set, matching the prior TUI skip behavior).
-        let repo_root = std::path::Path::new(&trust.project_path);
-        let hooks_on_trust = match &repo_hooks {
-            Some(h) => repo_config::ResolvedHooks::with_repo(&data.profile, repo_root, h.clone()),
-            None => repo_config::ResolvedHooks::global(&data.profile),
-        };
-        let hooks_on_skip = match &trust.hooks {
-            TrustSurface::Trusted(h) => {
-                repo_config::ResolvedHooks::with_repo(&data.profile, repo_root, h.clone())
-            }
-            _ => repo_config::ResolvedHooks::global(&data.profile),
-        };
-
         if !trust.needs_prompt() {
             // Already-trusted repository hooks are approved explicitly so the
             // daemon runs them; an absent repository surface approves nothing.
@@ -7007,8 +6998,6 @@ impl HomeView {
             merged_hooks,
             repo_hooks.unwrap_or_default(),
             mcp_servers,
-            hooks_on_trust,
-            hooks_on_skip,
             hooks_hash,
             mcp_hash,
             data.path.clone(),

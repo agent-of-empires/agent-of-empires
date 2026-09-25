@@ -40,12 +40,16 @@ mod v025_reenable_confirm_delete;
 mod v026_repoint_acp_default_agent;
 pub(crate) mod v027_isolate_sandbox_stores;
 mod v028_clear_archived_live_status;
-mod v029_core_daemon_launch;
-mod v030_serve_passphrase_policy;
-mod v031_pending_purge_owners;
-mod v032_capture_purge_runners;
-mod v033_canonical_sidebar;
-mod v034_fold_pending_initial_turn;
+mod v029_fold_pending_initial_turn;
+mod v030_global_only_profile_settings;
+mod v031_conversation_provenance;
+mod v031_core_daemon_launch;
+mod v032_bound_capture_exclusions;
+mod v032_serve_passphrase_policy;
+pub(crate) mod v033_isolate_sandbox_content;
+mod v033_pending_purge_owners;
+mod v034_capture_purge_runners;
+mod v035_canonical_sidebar;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -86,7 +90,7 @@ use anyhow::Result;
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 34;
+const CURRENT_VERSION: u32 = 38;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -238,33 +242,53 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 29,
-        name: "core_daemon_launch",
-        run: v029_core_daemon_launch::run,
+        name: "fold_pending_initial_turn",
+        run: v029_fold_pending_initial_turn::run,
     },
     Migration {
         version: 30,
-        name: "serve_passphrase_policy",
-        run: v030_serve_passphrase_policy::run,
+        name: "global_only_profile_settings",
+        run: v030_global_only_profile_settings::run,
     },
     Migration {
         version: 31,
-        name: "pending_purge_owners",
-        run: v031_pending_purge_owners::run,
+        name: "core_daemon_launch",
+        run: v031_core_daemon_launch::run,
     },
     Migration {
         version: 32,
-        name: "capture_purge_runners",
-        run: v032_capture_purge_runners::run,
+        name: "serve_passphrase_policy",
+        run: v032_serve_passphrase_policy::run,
     },
     Migration {
         version: 33,
-        name: "canonical_sidebar",
-        run: v033_canonical_sidebar::run,
+        name: "pending_purge_owners",
+        run: v033_pending_purge_owners::run,
     },
     Migration {
         version: 34,
-        name: "fold_pending_initial_turn",
-        run: v034_fold_pending_initial_turn::run,
+        name: "capture_purge_runners",
+        run: v034_capture_purge_runners::run,
+    },
+    Migration {
+        version: 35,
+        name: "canonical_sidebar",
+        run: v035_canonical_sidebar::run,
+    },
+    Migration {
+        version: 36,
+        name: "conversation_provenance",
+        run: v031_conversation_provenance::run,
+    },
+    Migration {
+        version: 37,
+        name: "bound_capture_exclusions",
+        run: v032_bound_capture_exclusions::run,
+    },
+    Migration {
+        version: 38,
+        name: "isolate_sandbox_content",
+        run: v033_isolate_sandbox_content::run,
     },
 ];
 
@@ -281,7 +305,8 @@ pub fn has_pending_migrations() -> bool {
     get_current_version() < CURRENT_VERSION
 }
 
-/// Move this session's shared sandbox store, reporting copy progress to the caller.
+/// Move this session's shared sandbox store and isolate its native content,
+/// reporting copy progress to the caller. Unproven content remains pending.
 pub(crate) fn migrate_sandbox_store_for_with(
     id: &str,
     reporter: Option<progress::Reporter>,
@@ -292,7 +317,8 @@ pub(crate) fn migrate_sandbox_store_for_with(
         return Ok(());
     }
     let _installed = progress::install(reporter);
-    v027_isolate_sandbox_stores::migrate_instance(id, store, runtime)
+    v027_isolate_sandbox_stores::migrate_instance(id, store, runtime)?;
+    v033_isolate_sandbox_content::migrate_instance(id)
 }
 
 /// [`migrate_sandbox_store_for_with`] with the container probes injected, for
@@ -331,6 +357,7 @@ pub fn run_migrations_announced(reporter: Option<progress::Reporter>) -> Result<
 
 fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) -> Result<()> {
     let _installed = progress::install(reporter);
+    let _announced = progress::install_announced(announce);
     let current = get_current_version();
     debug!("Current schema version: {}", current);
 
@@ -340,7 +367,8 @@ fn run_migrations_inner(reporter: Option<progress::Reporter>, announce: bool) ->
         );
     }
     if current == CURRENT_VERSION {
-        return v027_isolate_sandbox_stores::reconcile_pending(announce);
+        v027_isolate_sandbox_stores::reconcile_pending(announce)?;
+        return v033_isolate_sandbox_content::reconcile_pending(announce);
     }
 
     let pending: Vec<&Migration> = MIGRATIONS
@@ -434,5 +462,34 @@ mod tests {
         if let Some(last) = MIGRATIONS.last() {
             assert_eq!(CURRENT_VERSION, last.version);
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn schema_31_content_isolation_still_receives_upstream_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join(VERSION_FILE), "31").unwrap();
+        fs::write(
+            app.join("sessions.json"),
+            r#"[{"agent_session_id":"old","resume_intent":{"kind":"Use","value":"target"},"retroactive_capture_excludes":["old"]}]"#,
+        )
+        .unwrap();
+
+        run_migrations().unwrap();
+
+        let rows: serde_json::Value =
+            serde_json::from_slice(&fs::read(app.join("sessions.json")).unwrap()).unwrap();
+        assert_eq!(rows[0]["agent_session_id"], "old");
+        assert_eq!(rows[0]["agent_session_binding"]["provenance"], "unknown");
+        assert!(rows[0]["agent_session_binding"]["execution"].is_null());
+        assert_eq!(rows[0]["resume_binding"]["session_id"], "target");
+        assert_eq!(
+            rows[0]["retroactive_capture_excludes"][0]["session_id"],
+            "old"
+        );
+        assert_eq!(get_current_version(), CURRENT_VERSION);
     }
 }

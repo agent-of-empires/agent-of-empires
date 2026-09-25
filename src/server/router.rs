@@ -121,6 +121,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             patch(api::update_session_archive),
         )
         .route(
+            "/api/sessions/{id}/access",
+            patch(api::touch_session_access),
+        )
+        .route(
             "/api/sessions/{id}/snooze",
             patch(api::update_session_snooze),
         )

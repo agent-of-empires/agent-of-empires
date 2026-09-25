@@ -201,6 +201,19 @@ impl ResolvedHooks {
         })
     }
 
+    /// Attach source metadata to hooks captured from the canonical config snapshot.
+    pub(crate) fn from_merged(
+        profile: &str,
+        repo_root: Option<&Path>,
+        hooks: HooksConfig,
+    ) -> Option<Self> {
+        has_create_or_launch(hooks).map(|hooks| Self {
+            hooks,
+            profile: profile.to_string(),
+            repo_root: repo_root.map(Path::to_path_buf),
+        })
+    }
+
     /// Names the config file that declared this set's `hook_type` commands.
     /// Each layer's own declaration is matched against the commands, most
     /// specific first; `None` when none matches.
@@ -803,7 +816,6 @@ pub fn execute_hooks_in_container_streamed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tracing_test::traced_test;
 
     /// Pins `SHELL` to a resolvable `sh` (and takes the env lock) so local hooks
     /// cannot fail on an ambient or concurrently changing `SHELL` (#3449).
@@ -849,13 +861,20 @@ mod tests {
         );
     }
 
-    #[traced_test]
     #[test]
     fn parse_env_kv_lines_does_not_log_malformed_key() {
+        let logs = crate::session::test_support::LogCapture::start();
+        // Register the warning callsite before measuring; another test may have cached it disabled.
+        let _ = parse_env_kv_lines("9BAD=warmup\n");
         tracing::callsite::rebuild_interest_cache();
+        let before = logs.contents();
         assert!(parse_env_kv_lines("https://token:topsecret@example.test?x=ignored\n").is_empty());
-        assert!(logs_contain("invalid environment key"));
-        assert!(!logs_contain("topsecret"));
+        let captured = logs.contents();
+        let measured = captured
+            .strip_prefix(&before)
+            .expect("capture only appends");
+        assert!(measured.contains("invalid environment key"), "{captured}");
+        assert!(!measured.contains("topsecret"), "{captured}");
     }
 
     #[test]

@@ -2,6 +2,19 @@
 
 use super::*;
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct CreateHookFailed(String);
+
+impl CreateHookFailed {
+    pub(crate) fn new(error: anyhow::Error, origin_hint: Option<&str>) -> Self {
+        let hint = origin_hint
+            .map(|hint| format!("\n{hint}"))
+            .unwrap_or_default();
+        Self(format!("on_create hook failed: {error:#}{hint}"))
+    }
+}
+
 /// Hard cap on a single `idempotency_key`'s length, so one request cannot
 /// persist an arbitrarily large string onto its instance. This bounds key
 /// SIZE, not the number of distinct keys; entry count is bounded separately
@@ -30,20 +43,29 @@ pub(super) fn create_body_combines_scratch_and_worktree(body: &CreateSessionBody
     body.scratch && create_body_uses_worktree(body)
 }
 
-/// Build the provider fork seed after capability and source validation.
+/// Resolve a one-shot fork seed from a uniquely identified parent binding.
 pub(super) fn resolve_create_fork_seed(
-    tool: &str,
     parent_id: &str,
     structured: bool,
+    parents: &[crate::session::Instance],
 ) -> Result<crate::session::ForkSeed, crate::session::ForkDenied> {
     if structured {
         return Ok(crate::session::ForkSeed::Structured {
             parent_acp_session_id: parent_id.to_string(),
         });
     }
+    let mut candidates = parents
+        .iter()
+        .filter_map(|parent| parent.fork_parent_binding())
+        .filter(|binding| binding.session_id == parent_id);
+    let parent = candidates
+        .next()
+        .ok_or(crate::session::ForkDenied::NoParentSession)?;
+    if candidates.any(|candidate| candidate != parent) {
+        return Err(crate::session::ForkDenied::NoParentSession);
+    }
     crate::session::fork::terminal_fork_seed(
-        tool,
-        Some(parent_id),
+        Some(parent),
         crate::session::capture::generate_session_uuid(),
     )
 }
@@ -109,8 +131,12 @@ async fn resolve_canonical_fork_seed(
     }
     .filter(|id| crate::session::capture::is_valid_session_id(id))
     .ok_or_else(|| StatusCode::BAD_REQUEST.into_response())?;
-    resolve_create_fork_seed(&source.tool, parent_id, source.is_structured())
-        .map_err(|_| StatusCode::BAD_REQUEST.into_response())
+    resolve_create_fork_seed(
+        parent_id,
+        source.is_structured(),
+        std::slice::from_ref(source),
+    )
+    .map_err(|_| StatusCode::BAD_REQUEST.into_response())
 }
 
 /// The ACP registry key a create request resolves to: an explicit `agent_name`
@@ -355,8 +381,7 @@ pub async fn review_creation_trust(
 /// Creation hooks captured before worktree provisioning.
 #[derive(Debug)]
 pub(crate) struct CreateHookPlan {
-    /// Already merged (repo overrides global/profile per type), keeping the
-    /// layer each command came from so a failure can name its config file.
+    /// Already merged against the canonical config snapshot.
     pub(crate) hooks: Option<crate::session::config::repo_config::ResolvedHooks>,
     /// Approved hashes to persist before provisioning; absent when no new trust is needed.
     pub(crate) trust_write: Option<(Option<String>, Option<String>)>,
@@ -364,14 +389,16 @@ pub(crate) struct CreateHookPlan {
 
 impl CreateHookPlan {
     pub(crate) fn on_create(&self) -> &[String] {
-        self.hooks.as_ref().map_or(&[], |h| &h.hooks().on_create)
+        self.hooks
+            .as_ref()
+            .map_or(&[], |hooks| &hooks.hooks().on_create)
     }
 }
 
 /// Resolve hooks under the caller’s explicit approval or skip decision.
 pub(crate) fn resolve_create_hook_plan(
-    base: &crate::session::HooksConfig,
     profile: &str,
+    base: &crate::session::HooksConfig,
     project_path: &std::path::Path,
     scratch: bool,
     trust_hooks_requested: Option<bool>,
@@ -426,14 +453,11 @@ pub(crate) fn resolve_create_hook_plan(
     } else {
         None
     };
-    let hooks = match repo_hooks {
-        Some(h) => repo_config::ResolvedHooks::with_repo(
-            profile,
-            std::path::Path::new(&trust.project_path),
-            h.clone(),
-        ),
-        None => repo_config::ResolvedHooks::global(profile),
-    };
+    let repo_root = repo_hooks.map(|_| std::path::Path::new(&trust.project_path));
+    let merged = repo_hooks
+        .map(|hooks| repo_config::apply_repo_hook_overrides(base.clone(), hooks))
+        .unwrap_or_else(|| base.clone());
+    let hooks = repo_config::ResolvedHooks::from_merged(profile, repo_root, merged);
     Ok(CreateHookPlan { hooks, trust_write })
 }
 
@@ -596,8 +620,13 @@ pub(super) async fn wait_until_left_starting(
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<CreateSessionQuery>,
+    local: Option<axum::Extension<crate::server::auth::LocalAuthorization>>,
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    let local_owner = matches!(
+        local.as_deref(),
+        Some(crate::server::auth::LocalAuthorization::UnixOwner(_))
+    );
     if state.read_only {
         return crate::server::api::read_only_response();
     }
@@ -977,7 +1006,27 @@ pub async fn create_session(
                 )
                     .into_response();
             }
-            match resolve_create_fork_seed(&body.tool, parent_id, structured) {
+            let parents = if structured {
+                Vec::new()
+            } else {
+                let profile = validation_profile.to_string();
+                let file_watch = state.file_watch.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::session::Storage::new(&profile, file_watch)?.load()
+                })
+                .await
+                {
+                    Ok(Ok(parents)) => parents,
+                    _ => {
+                        return api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "storage_error",
+                            "Cannot load conversation provenance",
+                        );
+                    }
+                }
+            };
+            match resolve_create_fork_seed(parent_id, structured, &parents) {
                 Ok(seed) => Some(seed),
                 Err(_) => {
                     return (
@@ -1158,6 +1207,9 @@ pub async fn create_session(
                     .into_response();
             }
             tracing::warn!(target: "http.api.sessions", "Session creation failed: {}", e);
+            if let Some(response) = local_create_hook_error_response(&e, local_owner) {
+                return response;
+            }
             (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "create_failed", "message": public_create_session_error(&e)})),
@@ -1166,6 +1218,26 @@ pub async fn create_session(
         }
     }
 }
+pub(super) fn local_create_hook_error_response(
+    error: &anyhow::Error,
+    local_owner: bool,
+) -> Option<axum::response::Response> {
+    if !local_owner {
+        return None;
+    }
+    let hook_failed = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<CreateHookFailed>())?;
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            crate::daemon::ApiErrorCode::CreateHookFailed.header(),
+            hook_failed.to_string(),
+        )
+            .into_response(),
+    )
+}
+
 async fn created_session_response(
     state: &Arc<AppState>,
     id: &str,
@@ -1239,33 +1311,30 @@ pub(super) fn apply_post_restart_identity_sync(
     if started.lifecycle_generation < live.lifecycle_generation {
         return;
     }
-    // Treat the pre-restart snapshot as a CAS baseline for peer-writable
-    // identity fields. If a poller/CLI/TUI peer changed the sid while the
-    // restart clone was blocking, that newer sid and its marker stay
-    // authoritative.
+    // Treat the pre-restart snapshot as a CAS baseline for peer-writable identity
+    // fields. A same-SID publication can still replace the native store or transcript.
     let generation_can_merge = live.omp_capture_generation == before.omp_capture_generation
         || live.omp_capture_generation == started.omp_capture_generation;
-    let sid_unchanged = live.agent_session_id == before.agent_session_id;
+    let conversation_unchanged = before.conversation_state().matches(live);
     let marker_unchanged = live.resume_probe_failed_sid == before.resume_probe_failed_sid;
     if generation_can_merge {
         live.omp_capture_generation = started.omp_capture_generation.clone();
-        live.session_id_poller = started.session_id_poller.clone();
-        if sid_unchanged {
-            live.agent_session_id = started.agent_session_id.clone();
+        if conversation_unchanged {
+            live.adopt_conversation_state(started.conversation_state());
         }
-    } else if started.session_id_poller_is_running() {
-        // The worker follows the pane name and will rebind itself to the
-        // concurrently published generation on its next metadata refresh.
+    }
+    if live.active_execution == started.active_execution {
         live.session_id_poller = started.session_id_poller.clone();
+        live.session_id_poller_retry_after = started.session_id_poller_retry_after;
+        if started.session_id_poller_is_running() {
+            live.poller_repair.reset();
+        }
+    } else {
+        started.stop_poller();
     }
     if generation_can_merge && marker_unchanged && live.agent_session_id == started.agent_session_id
     {
         live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();
-    }
-    // A running restart poller means the working clone's repair schedule was
-    // cleared on start; the live row must not keep the stale backoff.
-    if started.session_id_poller_is_running() {
-        live.poller_repair.reset();
     }
     live.lifecycle_generation = started.lifecycle_generation;
 }

@@ -81,6 +81,20 @@ describe("plugin slots", () => {
     await waitFor(() => expect(container.querySelector("svg")).toBeTruthy());
   });
 
+  it("row-badge link click does not bubble to an ancestor's onClick", () => {
+    entriesRef.current = [
+      rowBadge({ text: "PR #12", icon: "git-pull-request-arrow", href: "https://github.com/o/r/pull/12" }),
+    ];
+    const rowClick = vi.fn();
+    render(
+      <div onClick={rowClick}>
+        <PluginRowBadges sessionId="s1" />
+      </div>,
+    );
+    fireEvent.click(screen.getByRole("link", { name: /PR #12/ }));
+    expect(rowClick).not.toHaveBeenCalled();
+  });
+
   it("row-badge with an unknown icon or unsafe href renders plain text", () => {
     entriesRef.current = [
       rowBadge({ items: [{ text: "evil", icon: "not-a-real-icon", href: "javascript:alert(1)" }] }),

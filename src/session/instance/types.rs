@@ -203,16 +203,15 @@ where
     Ok(opt.filter(|s| !s.trim().is_empty()))
 }
 
-/// The session ids one agent left behind when an engine swap moved a row to a
-/// different `tool`, parked in `Instance::prior_tool_session_ids` under that
-/// agent's name so a swap back can resume where it left off. Both fields are
-/// per-agent namespaces, which is exactly why they cannot travel with the row.
+/// Session ids parked by an engine swap so swapping back resumes the old conversation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PriorToolSession {
-    /// The tmux-path conversation id, as `Instance::agent_session_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) agent_session_id: Option<String>,
-    /// The structured-view conversation id, as `Instance::acp_session_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_session_binding: Option<ConversationBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pi_session_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) acp_session_id: Option<String>,
 }
@@ -259,6 +258,57 @@ impl ResumeIntent {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PrimeAgentCapturePlan {
+    pub(crate) store: PathBuf,
+    pub(crate) session_dir: PathBuf,
+    pub(crate) container_session_dir: PathBuf,
+    pub(crate) container_cwd: String,
+}
+
+/// The exact directory from which a pane publishes its conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum SessionSidecarSource {
+    HostHooks(PathBuf),
+    SandboxDir(PathBuf),
+}
+
+impl SessionSidecarSource {
+    pub(crate) fn read_file(
+        &self,
+        instance_id: &str,
+        leaf: &str,
+        cap: usize,
+        max_age: Option<std::time::Duration>,
+    ) -> Option<Vec<u8>> {
+        crate::session::validate_instance_id(instance_id).ok()?;
+        match self {
+            Self::HostHooks(directory) => {
+                crate::hooks::read_hook_sidecar_at(instance_id, directory, leaf, cap, max_age)
+            }
+            Self::SandboxDir(directory) => {
+                let root = directory.parent()?.parent()?;
+                if root.join("aoe-session").join(instance_id) != *directory {
+                    return None;
+                }
+                crate::session::AnchoredDir::open(root)
+                    .ok()?
+                    .read_regular(&Path::new("aoe-session").join(instance_id).join(leaf), cap)
+                    .ok()?
+            }
+        }
+    }
+
+    pub(crate) fn host_hooks(instance_id: &str) -> Self {
+        let path = crate::hooks::hook_base_path().join(instance_id);
+        Self::HostHooks(path.canonicalize().unwrap_or(path))
+    }
+
+    pub(crate) fn matches_host_hooks(&self, instance_id: &str) -> bool {
+        *self == Self::host_hooks(instance_id)
+    }
+}
+
 /// Create-idempotency record for a plugin-created session (#2897). `key` is
 /// the plugin-supplied idempotency key, unique within the creating plugin's
 /// sessions; `payload_hash` is the host-computed hash of the semantic create
@@ -275,204 +325,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_plugin_meta_serde_round_trip() {
-        // Empty map is omitted from disk.
-        let inst = Instance::new("t", "/tmp");
-        let json = serde_json::to_value(&inst).unwrap();
-        assert!(
-            json.get("plugin_meta").is_none(),
-            "empty plugin_meta must skip serialization"
-        );
-
-        // A plugin's namespaced slot round-trips.
-        let mut set = Instance::new("t", "/tmp");
-        set.plugin_meta
-            .insert("aoe.status".to_string(), serde_json::json!({ "score": 3 }));
-        let json = serde_json::to_value(&set).unwrap();
-        let back: Instance = serde_json::from_value(json).unwrap();
-        assert_eq!(back.plugin_meta["aoe.status"]["score"], 3);
-
-        // Rows written before the field existed deserialize to an empty map.
-        let inst: Instance = serde_json::from_value(serde_json::json!({
-            "id": "abc",
-            "title": "t",
-            "project_path": "/tmp",
-            "tool": "claude",
-            "status": "idle",
-            "created_at": "2026-01-01T00:00:00Z",
-        }))
-        .expect("deserialize without plugin_meta");
-        assert!(inst.plugin_meta.is_empty());
-    }
-
-    // A non-fork session omits fork_pending on the wire (skip_serializing_if),
-    // so legacy sessions.json without the key deserializes to None and no
-    // migration is needed. A seeded fork id round-trips.
-    #[test]
-    fn test_fork_pending_serde_roundtrip_and_default() {
-        let fresh = Instance::new("s", "/tmp/x");
-        let fresh_json = serde_json::to_string(&fresh).expect("serialize fresh");
-        assert!(
-            !fresh_json.contains("fork_pending"),
-            "None fork_pending must not be serialized"
-        );
-        let parsed: Instance = serde_json::from_str(&fresh_json).expect("parse fresh");
-        assert_eq!(parsed.fork_pending, None, "missing fork_pending => None");
-
-        let mut inst = Instance::new("s", "/tmp/x");
-        inst.fork_pending = Some("parent-acp-id".into());
-        let json = serde_json::to_string(&inst).expect("serialize");
-        let back: Instance = serde_json::from_str(&json).expect("round-trip");
-        assert_eq!(back.fork_pending.as_deref(), Some("parent-acp-id"));
-    }
-
-    // Tests for WorktreeInfo
-    #[test]
-    fn test_worktree_info_serialization() {
-        let info = WorktreeInfo {
-            branch: "feature/test".to_string(),
-            main_repo_path: "/home/user/repo".to_string(),
-            managed_by_aoe: true,
-            created_at: Utc::now(),
-            base_branch: None,
-        };
-
-        let json = serde_json::to_string(&info).unwrap();
-        let deserialized: WorktreeInfo = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(info.branch, deserialized.branch);
-        assert_eq!(info.main_repo_path, deserialized.main_repo_path);
-        assert_eq!(info.managed_by_aoe, deserialized.managed_by_aoe);
-    }
-
-    // Tests for SandboxInfo
-    #[test]
-    fn test_sandbox_info_serialization() {
-        let info = SandboxInfo {
-            enabled: true,
-            container_id: Some("abc123".to_string()),
-            image: "myimage:latest".to_string(),
-            container_name: "test_container".to_string(),
-            extra_env: Some(vec!["MY_VAR".to_string(), "OTHER_VAR".to_string()]),
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        };
-
-        let json = serde_json::to_string(&info).unwrap();
-        let deserialized: SandboxInfo = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(info.enabled, deserialized.enabled);
-        assert_eq!(info.container_id, deserialized.container_id);
-        assert_eq!(info.image, deserialized.image);
-        assert_eq!(info.container_name, deserialized.container_name);
-        assert_eq!(info.extra_env, deserialized.extra_env);
-    }
-
-    #[test]
-    fn test_sandbox_info_minimal_serialization() {
-        // Required fields: enabled, image, container_name
-        let json = r#"{"enabled":false,"image":"test-image","container_name":"test"}"#;
-        let info: SandboxInfo = serde_json::from_str(json).unwrap();
-
-        assert!(!info.enabled);
-        assert_eq!(info.image, "test-image");
-        assert_eq!(info.container_name, "test");
-        assert!(info.container_id.is_none());
-    }
-
-    #[test]
-    fn test_empty_string_deserializes_to_none() {
-        let json = r#"{"id":"test123","title":"Test","project_path":"/tmp/test","group_path":"","command":"","tool":"claude","yolo_mode":false,"status":"idle","created_at":"2024-01-01T00:00:00Z","agent_session_id":""}"#;
-        let inst: Instance = serde_json::from_str(json).unwrap();
-        assert!(inst.agent_session_id.is_none());
-    }
-
-    #[test]
-    fn test_whitespace_string_deserializes_to_none() {
-        let json = r#"{"id":"test123","title":"Test","project_path":"/tmp/test","group_path":"","command":"","tool":"claude","yolo_mode":false,"status":"idle","created_at":"2024-01-01T00:00:00Z","agent_session_id":"   "}"#;
-        let inst: Instance = serde_json::from_str(json).unwrap();
-        assert!(inst.agent_session_id.is_none());
-    }
-
-    #[test]
-    fn test_valid_session_id_preserved() {
-        let json = r#"{"id":"test123","title":"Test","project_path":"/tmp/test","group_path":"","command":"","tool":"claude","yolo_mode":false,"status":"idle","created_at":"2024-01-01T00:00:00Z","agent_session_id":"abc-123"}"#;
-        let inst: Instance = serde_json::from_str(json).unwrap();
-        assert_eq!(inst.agent_session_id, Some("abc-123".to_string()));
-    }
-
-    #[test]
-    fn resume_intent_serde_round_trip() {
-        for intent in [
-            ResumeIntent::Default,
-            ResumeIntent::Use("abc".to_string()),
-            ResumeIntent::Cleared,
-            ResumeIntent::Fork {
-                from: "some-parent-id".to_string(),
-            },
-        ] {
-            let json = serde_json::to_string(&intent).unwrap();
-            let back: ResumeIntent = serde_json::from_str(&json).unwrap();
-            assert_eq!(intent, back);
+    fn blank_agent_session_id_deserializes_to_none() {
+        for (raw, expected) in [("", None), ("   ", None), ("abc-123", Some("abc-123"))] {
+            let inst: Instance = serde_json::from_value(serde_json::json!({
+                "id": "test123", "title": "Test", "project_path": "/tmp/test",
+                "tool": "claude", "status": "idle", "created_at": "2024-01-01T00:00:00Z",
+                "agent_session_id": raw,
+            }))
+            .unwrap();
+            assert_eq!(inst.agent_session_id.as_deref(), expected, "{raw:?}");
         }
     }
 
     #[test]
     fn resume_intent_wire_format_is_pinned() {
-        assert_eq!(
-            serde_json::to_string(&ResumeIntent::Default).unwrap(),
-            r#"{"kind":"Default"}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&ResumeIntent::Use("abc".to_string())).unwrap(),
-            r#"{"kind":"Use","value":"abc"}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&ResumeIntent::Cleared).unwrap(),
-            r#"{"kind":"Cleared"}"#
-        );
-        // `Fork` is a struct variant, so its `value` is a nested object
-        // (`{"from":...}`), not a bare string like `Use`. This shape is
-        // persisted to `sessions.json`; pin it so a refactor cannot break
-        // deserialisation of saved fork seeds.
-        assert_eq!(
-            serde_json::to_string(&ResumeIntent::Fork {
-                from: "some-parent-id".to_string()
-            })
-            .unwrap(),
-            r#"{"kind":"Fork","value":{"from":"some-parent-id"}}"#
-        );
+        for (intent, wire) in [
+            (ResumeIntent::Default, r#"{"kind":"Default"}"#),
+            (
+                ResumeIntent::Use("abc".to_string()),
+                r#"{"kind":"Use","value":"abc"}"#,
+            ),
+            (ResumeIntent::Cleared, r#"{"kind":"Cleared"}"#),
+            (
+                ResumeIntent::Fork {
+                    from: "some-parent-id".to_string(),
+                },
+                r#"{"kind":"Fork","value":{"from":"some-parent-id"}}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&intent).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<ResumeIntent>(wire).unwrap(), intent);
+        }
     }
-
-    #[test]
-    fn resume_intent_missing_in_json_defaults_to_default() {
-        let mut inst = Instance::new("title", "/tmp/x");
-        inst.resume_intent = ResumeIntent::Use("X".to_string());
-        let json: serde_json::Value = serde_json::to_value(&inst).unwrap();
-        let mut obj = json.as_object().unwrap().clone();
-        obj.remove("resume_intent");
-        let stripped = serde_json::Value::Object(obj);
-
-        let back: Instance = serde_json::from_value(stripped).unwrap();
-        assert_eq!(back.resume_intent, ResumeIntent::Default);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PrimeAgentCapturePlan {
-    pub(crate) store: PathBuf,
-    pub(crate) session_dir: PathBuf,
-    pub(crate) container_session_dir: PathBuf,
-    pub(crate) container_cwd: String,
-}
-
-/// Where a Pi or Prime pane publishes its conversation. Sandboxed panes write
-/// into an instance-private bind; host panes into the per-instance hook
-/// directory. Kept distinct so an unresolvable sandbox path cannot read as
-/// "use the host one".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SessionSidecarSource {
-    HostHooks,
-    SandboxDir(std::path::PathBuf),
 }

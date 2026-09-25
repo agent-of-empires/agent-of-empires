@@ -444,7 +444,7 @@ export type SelectOption = { value: string, label: string, };
 /**
  * One session from the daemon. Only `id` is required when decoding.
  */
-export type SessionResponse = { id: string, title: string, project_path: string, 
+export type SessionResponse = { id: string, idempotency_key?: string | null, title: string, project_path: string, 
 /**
  * Absolute host path of the session's managed artifact directory. The
  * web transcript maps agent-emitted artifact paths under this root (or
@@ -658,13 +658,6 @@ rate_limit_auto_resume?: boolean | null,
  * available, replacing the hardcoded client-side tool list.
  */
 acp_capable: boolean, 
-/**
- * The session's server-owned prompt queue (follow-ups the user lined up
- * while a turn was busy), ordered by `seq`. The daemon owns it, so it is
- * visible across the user's devices and survives a client reload; the
- * structured view renders it and drains happen server-side.
- */
-queued_prompts?: Array<QueuedPromptEntry>, 
 /**
  * The session's captured ACP session id, present only once the
  * structured-view worker has minted one. The web dashboard passes this

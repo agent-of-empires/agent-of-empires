@@ -13,6 +13,7 @@ import {
   getSettingsSchema,
   setDefaultProfile,
   updateProfileSettings,
+  updateSettings,
   updateTheme,
 } from "../lib/api";
 import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
@@ -390,13 +391,13 @@ export function SettingsView({
   }, [loadSettings]);
 
   const sendSave = useCallback(
-    async (section: string, data: Record<string, unknown>): Promise<boolean> => {
+    async (section: string, field: string, value: unknown): Promise<boolean> => {
       if (!selectedProfile) return false;
       setSaving(true);
       setSaveError(null);
-      const ok = await updateProfileSettings(selectedProfile, {
-        [section]: data,
-      });
+      const patch = { [section]: { [field]: value } };
+      const saveGlobally = schema.some((d) => d.section === section && d.field === field && !d.profile_overridable);
+      const ok = saveGlobally ? await updateSettings(patch) : await updateProfileSettings(selectedProfile, patch);
       setSaving(false);
       if (!ok) {
         setSaveError("Failed to save, please try again");
@@ -404,7 +405,7 @@ export function SettingsView({
       }
       return ok;
     },
-    [selectedProfile, loadSettings],
+    [selectedProfile, loadSettings, schema],
   );
 
   const updateLocal = useCallback(
@@ -422,7 +423,7 @@ export function SettingsView({
   const saveField = useCallback(
     (section: string, sectionData: Record<string, unknown>, field: string, value: unknown): Promise<boolean> => {
       updateLocal({ [section]: { ...sectionData, [field]: value } });
-      return sendSave(section, { [field]: value });
+      return sendSave(section, field, value);
     },
     [updateLocal, sendSave],
   );

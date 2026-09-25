@@ -9,6 +9,7 @@ async fn purge_session_artifacts(
     instance: Instance,
     body: &DeleteSessionBody,
     recent_entry: Option<crate::session::RecentProjectEntry>,
+    additional_protection: Option<crate::session::path_identity::CleanupProtection>,
 ) -> anyhow::Result<PurgeOutcome> {
     use crate::session::deletion::{DeletionDisposition, PurgeReservation, PurgeTransaction};
     if state.cityhall_mode && !instance.is_structured() {
@@ -69,6 +70,10 @@ async fn purge_session_artifacts(
                 }
             }
         }
+    };
+    let transaction = match additional_protection {
+        Some(protection) => transaction.with_additional_protection(protection),
+        None => transaction,
     };
     let transaction = tokio::task::spawn_blocking(move || transaction.run_hooks()).await??;
     let transcript_purged = transaction.instance().is_structured();
@@ -333,7 +338,7 @@ pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
             force_delete: true,
             keep_scratch: false,
         };
-        match purge_session_artifacts(state, &id, instance, &body, recent_entry).await {
+        match purge_session_artifacts(state, &id, instance, &body, recent_entry, None).await {
             Ok(outcome) => {
                 tracing::info!(target: "http.api.sessions", session = %id, removed = matches!(outcome, PurgeOutcome::Deleted { .. }), "expired trash purge completed")
             }
@@ -352,60 +357,74 @@ pub async fn delete_session(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-    let namespace = state
-        .runtime
-        .purge_namespace_lease(&state.profile_namespace)
-        .await;
-    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
-        return response;
-    }
-    let body = body.map(|Json(body)| body).unwrap_or_default();
-    let Some(submission) = state
-        .session_service
-        .prompt_submission_for_session(&id)
-        .await
-    else {
-        return crate::server::api::session_not_found();
-    };
-    let lock = state.instance_lock(&id).await;
-    let guard = lock.lock().await;
-    let instance = state
-        .instances
-        .read()
-        .await
-        .iter()
-        .find(|row| row.id == id)
-        .cloned();
-    let Some(instance) = instance else {
-        return crate::server::api::session_not_found();
-    };
-    let recent_entry = crate::session::recent_project_entry_for(&instance);
-    let result = purge_session_artifacts(&state, &id, instance, &body, recent_entry).await;
-    drop(guard);
-    drop(submission);
-    drop(namespace);
-    let outcome = match result {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            if let Some(response) = super::lifecycle::lifecycle_rejection(&state, &error) {
-                return response;
-            }
-            if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
-            tracing::error!(target: "http.api.sessions", session = %id, %error, "purge failed");
-            return (
+    let join = tokio::spawn(async move {
+        let namespace = state
+            .runtime
+            .purge_namespace_lease(&state.profile_namespace)
+            .await;
+        if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+            return response;
+        }
+        let body = body.map(|Json(body)| body).unwrap_or_default();
+        let Some(submission) = state
+            .session_service
+            .prompt_submission_for_session(&id)
+            .await
+        else {
+            return crate::server::api::session_not_found();
+        };
+        let lock = state.instance_lock(&id).await;
+        let guard = lock.lock().await;
+        let instance = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .cloned();
+        let Some(instance) = instance else {
+            return crate::server::api::session_not_found();
+        };
+        let recent_entry = crate::session::recent_project_entry_for(&instance);
+        let result =
+            purge_session_artifacts(&state, &id, instance, &body, recent_entry, None).await;
+        drop(guard);
+        drop(submission);
+        drop(namespace);
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(response) = super::lifecycle::lifecycle_rejection(&state, &error) {
+                    return response;
+                }
+                if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                tracing::error!(target: "http.api.sessions", session = %id, %error, "purge failed");
+                return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "deletion_failed", "message": error.to_string()})),
             )
                 .into_response();
+            }
+        };
+        let snapshot = match state.runtime.publish(&state).await {
+            Ok(snapshot) => snapshot,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(outcome))
+    });
+    match join.await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", %error, "Deletion task failed");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "Deletion task failed",
+            )
         }
-    };
-    let snapshot = match state.runtime.publish(&state).await {
-        Ok(snapshot) => snapshot,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    crate::server::runtime::mutation_response(&snapshot.value.cursor, Json(outcome))
+    }
 }
 
 pub async fn abandon_purge(
@@ -508,12 +527,11 @@ pub async fn abandon_purge(
 
 // --- Delete workspace (atomic multi-session) ---
 
-/// Body for `DELETE /api/workspaces`. `session_ids` is the full set of
-/// sessions in one web-UI workspace, all sharing a single git worktree +
-/// branch, ordered so the first id is the worktree owner (the web
-/// `sessions[0]` primary). The cleanup flags mirror [`DeleteSessionBody`]:
-/// they apply to the whole workspace, and the shared worktree/branch is
-/// removed exactly once, on the owner.
+/// Body for `DELETE /api/workspaces`. `session_ids` are sessions of one web-UI
+/// workspace, sharing a git worktree and branch; they need not be all of them.
+/// The cleanup flags mirror [`DeleteSessionBody`]. The worktree and branch are
+/// cleaned up once, on the first listed session that manages a worktree, and
+/// kept with a message while any session outside the request still uses them.
 #[derive(Default, Deserialize)]
 pub struct DeleteWorkspaceBody {
     #[serde(default)]
@@ -590,21 +608,34 @@ pub(super) fn order_workspace_deletion(
     plan
 }
 
-/// Owner-worktree dirty preflight for a workspace delete. Mirrors the per-
-/// session dirty gate in `perform_deletion` so a non-force delete of a dirty
-/// shared worktree is refused before any session is torn down, keeping dirty +
-/// non-force all-or-nothing. Returns the first dirty message found.
-fn workspace_dirty_message(instance: &Instance) -> Option<String> {
+/// Owner-worktree dirty preflight for a workspace delete, mirroring the
+/// per-session gate in `perform_deletion` so dirty plus non-force stays
+/// all-or-nothing. A worktree kept for a session outside `session_ids` is not
+/// removed, so its dirtiness does not block. Returns the first dirty message.
+async fn workspace_dirty_message(instance: Instance, session_ids: Vec<String>) -> Option<String> {
+    tokio::task::spawn_blocking(move || {
+        let ids: Vec<&str> = session_ids.iter().map(String::as_str).collect();
+        let kept = crate::session::deletion::paths_in_use_except(&ids);
+        workspace_dirty_message_blocking(&instance, &kept)
+    })
+    .await
+    .unwrap_or_else(|error| Some(format!("dirty check failed: {error}")))
+}
+
+fn workspace_dirty_message_blocking(
+    instance: &Instance,
+    kept: &crate::session::deletion::PathsInUse,
+) -> Option<String> {
     if let Some(wt) = &instance.worktree_info {
-        if wt.managed_by_aoe {
-            let path = std::path::PathBuf::from(&instance.project_path);
+        let path = std::path::PathBuf::from(&instance.project_path);
+        if wt.managed_by_aoe && !kept.covers(&path) {
             if let Some(msg) = crate::git::cleanup::dirty_worktree_message(&path) {
                 return Some(msg);
             }
         }
     }
     if let Some(ws) = &instance.workspace_info {
-        if ws.cleanup_on_delete {
+        if ws.cleanup_on_delete && !kept.covers(std::path::Path::new(&ws.workspace_dir)) {
             for repo in &ws.repos {
                 if repo.managed_by_aoe {
                     let path = std::path::PathBuf::from(&repo.worktree_path);
@@ -632,6 +663,7 @@ pub(super) async fn purge_workspace_artifacts(
     Vec<String>,
     Vec<WorkspaceDeleteFailure>,
     Vec<String>,
+    Option<String>,
 ) {
     let _namespace = state
         .runtime
@@ -664,19 +696,47 @@ pub(super) async fn purge_workspace_artifacts(
         instance_guards.push(state.instance_lock(id).await.lock_owned().await);
     }
 
+    let mut owner_protection = None;
     if owner_needs_dirty_check {
-        let owner = {
+        let (owner, selected) = {
             let instances = state.instances.read().await;
-            instances.iter().find(|i| i.id == owner_id).cloned()
+            (
+                instances.iter().find(|i| i.id == owner_id).cloned(),
+                instances
+                    .iter()
+                    .filter(|instance| plan.iter().any(|(id, _)| id == &instance.id))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
         };
         if let Some(owner) = owner {
-            if let Some(msg) = workspace_dirty_message(&owner) {
+            let profile = owner.source_profile.clone();
+            let protection = tokio::task::spawn_blocking(move || {
+                crate::session::Storage::new_unwatched(&profile)?
+                    .cleanup_protection_excluding(&selected)
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(std::convert::identity);
+            let protection = match protection {
+                Ok(protection) => protection,
+                Err(error) => {
+                    failed.push(WorkspaceDeleteFailure {
+                        id: owner_id,
+                        error: format!("Resource ownership unavailable: {error:#}"),
+                    });
+                    return (deleted, kept, failed, messages, None);
+                }
+            };
+            let ids = plan.iter().map(|(id, _)| id.clone()).collect();
+            if let Some(msg) = workspace_dirty_message(owner, ids).await {
                 failed.push(WorkspaceDeleteFailure {
                     id: owner_id,
                     error: format!("Workspace: {msg}"),
                 });
-                return (deleted, kept, failed, messages);
+                return (deleted, kept, failed, messages, Some(msg));
             }
+            owner_protection = Some(protection);
         }
     }
 
@@ -693,7 +753,8 @@ pub(super) async fn purge_workspace_artifacts(
         };
 
         let recent_entry = crate::session::recent_project_entry_for(&instance);
-        match purge_session_artifacts(state, &id, instance, &body, recent_entry).await {
+        let protection = (id == owner_id).then(|| owner_protection.take()).flatten();
+        match purge_session_artifacts(state, &id, instance, &body, recent_entry, protection).await {
             Ok(PurgeOutcome::Deleted {
                 messages: mut msgs,
                 cleanup_errors,
@@ -727,7 +788,7 @@ pub(super) async fn purge_workspace_artifacts(
         }
     }
 
-    (deleted, kept, failed, messages)
+    (deleted, kept, failed, messages, None)
 }
 
 /// Delete siblings before their worktree owner under daemon-owned request execution.
@@ -742,22 +803,28 @@ pub async fn delete_workspace(
     let body = body.map(|Json(b)| b).unwrap_or_default();
     // Dedupe up front so a repeated id can't have the owner deleted with
     // sibling flags and then skipped (#2536 review).
-    let session_ids = dedupe_session_ids(&body.session_ids);
-    let Some(owner_id) = session_ids.first().cloned() else {
-        return (
+    let mut session_ids = dedupe_session_ids(&body.session_ids);
+    if session_ids.is_empty() {
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "invalid_request",
-                "message": "session_ids must not be empty",
-            })),
-        )
-            .into_response();
-    };
+            "invalid_request",
+            "session_ids must not be empty",
+        );
+    }
+    // The owner is whichever session manages the worktree, not the client's first id.
+    {
+        let instances = state.instances.read().await;
+        if let Some(index) = session_ids.iter().position(|id| {
+            instances
+                .iter()
+                .any(|i| &i.id == id && i.has_managed_worktree_or_workspace())
+        }) {
+            session_ids[..=index].rotate_right(1);
+        }
+    }
+    let owner_id = session_ids[0].clone();
 
-    // CityHall: `purge_workspace_artifacts` tears down EVERY id in the list, not
-    // just the owner, so every id (not only `session_ids.first()`) must be a
-    // structured session this mode created. Otherwise a client could smuggle a
-    // foreign plain session in as a sibling and have it destroyed. See #7.
+    // Structured mode must reject every foreign sibling before teardown.
     if let Some(resp) = cityhall_block_any_non_structured(&state, &session_ids).await {
         return resp;
     }
@@ -765,56 +832,65 @@ pub async fn delete_workspace(
     let owner_needs_dirty_check = body.delete_worktree && !body.force_delete;
 
     // Preflight: refuse a non-force delete of a dirty shared worktree before
-    // tearing down any session, so dirty + non-force stays all-or-nothing. The
-    // owner (session_ids[0]) is the session that carries the shared worktree.
-    // This is a fast early 409 for the common case; `purge_workspace_artifacts`
-    // re-checks authoritatively under the owner lock.
+    // tearing down any session. A fast early 409;
+    // `purge_workspace_artifacts` re-checks authoritatively under the owner lock.
     if owner_needs_dirty_check {
         let owner = {
             let instances = state.instances.read().await;
             instances.iter().find(|i| i.id == owner_id).cloned()
         };
         if let Some(owner) = owner {
-            if let Some(msg) = workspace_dirty_message(&owner) {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({
-                        "error": "dirty_worktree",
-                        "message": msg,
-                    })),
-                )
-                    .into_response();
+            if let Some(msg) = workspace_dirty_message(owner, session_ids.clone()).await {
+                return api_error(StatusCode::CONFLICT, "dirty_worktree", msg);
             }
         }
     }
-
     let plan = order_workspace_deletion(&session_ids, &body);
-
-    let (deleted, kept, failed, messages) =
-        purge_workspace_artifacts(&state, owner_id, plan, owner_needs_dirty_check).await;
-    if deleted.is_empty() && !failed.is_empty() {
-        let message = failed
-            .iter()
-            .map(|failure| failure.error.as_str())
-            .collect::<Vec<_>>()
-            .join("; ");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
+    let join = tokio::spawn(async move {
+        let (deleted, kept, failed, messages, dirty) =
+            purge_workspace_artifacts(&state, owner_id, plan, owner_needs_dirty_check).await;
+        if let Some(msg) = dirty {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "dirty_worktree", "message": msg })),
+            )
+                .into_response();
+        }
+        if deleted.is_empty() && !failed.is_empty() {
+            let message = failed
+                .iter()
+                .map(|failure| failure.error.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "deletion_failed", "message": message, "failed": failed,
+                })),
+            )
+                .into_response();
+        }
+        let snapshot = match state.runtime.publish(&state).await {
+            Ok(snapshot) => snapshot,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        crate::server::runtime::mutation_response(
+            &snapshot.value.cursor,
             Json(serde_json::json!({
-                "error": "deletion_failed", "message": message, "failed": failed,
+                "status": if !failed.is_empty() || (!deleted.is_empty() && !kept.is_empty()) { "partial" } else if !kept.is_empty() { "kept" } else { "deleted" },
+                "deleted": deleted, "kept": kept, "failed": failed, "messages": messages,
             })),
         )
-            .into_response();
+    });
+    match join.await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", %error, "Workspace deletion task failed");
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "Workspace deletion task failed",
+            )
+        }
     }
-    let snapshot = match state.runtime.publish(&state).await {
-        Ok(snapshot) => snapshot,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    crate::server::runtime::mutation_response(
-        &snapshot.value.cursor,
-        Json(serde_json::json!({
-            "status": if !failed.is_empty() || (!deleted.is_empty() && !kept.is_empty()) { "partial" } else if !kept.is_empty() { "kept" } else { "deleted" },
-            "deleted": deleted, "kept": kept, "failed": failed, "messages": messages,
-        })),
-    )
 }

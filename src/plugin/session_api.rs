@@ -622,8 +622,9 @@ async fn sessions_turn_send(
             .map_err(|e| map_send_error(e.into()))?;
         let woke_idle_dormant = deps
             .session_service
-            .touch_and_wake_on_prompt(&req.session_id)
-            .await;
+            .touch_and_wake_on_prompt(&req.session_id, false)
+            .await
+            .idle_dormant();
         let dispatch = deps
             .session_service
             .prompt_dispatch_under_submission(&req.session_id, woke_idle_dormant)
@@ -655,6 +656,7 @@ async fn sessions_turn_send(
                     woke_idle_dormant,
                     prompt_id: None,
                     synthesized: false,
+                    no_revive: false,
                 },
             )
             .await
@@ -703,6 +705,12 @@ fn map_send_error(e: SendTurnError) -> DispatchError {
             codes::SERVICE_UNAVAILABLE,
             "worker_not_ready",
             "worker not ready; retry",
+        ),
+        // Unreachable: this plugin surface never sets `no_revive`.
+        SendTurnError::RevivalRefused => DispatchError::with_kind(
+            codes::FAILED_PRECONDITION,
+            "no_revive",
+            "reviving a stopped worker is required",
         ),
         SendTurnError::Send(e) => DispatchError::internal(format!("prompt forward failed: {e}")),
     }
@@ -1194,7 +1202,7 @@ mod tests {
                     crate::acp::dispatch::WorkerLiveness {
                         running: true,
                         idle_dormant: false,
-                        rate_limit_exhausted: false,
+                        rate_limit_parked: false,
                     },
                 ),
                 expected,

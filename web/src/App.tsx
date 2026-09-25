@@ -58,6 +58,7 @@ import {
   restoreSessions,
   trashedWorkspaceRestoreIds,
   trashSessions,
+  sessionsSharingWorktree,
   workspaceCleanupDefaults,
 } from "./lib/trashActions";
 import {
@@ -1023,8 +1024,8 @@ function AppContent({
   }, [handleSelectSession]);
 
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
-  const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
-  const [stoppingWorkspaceId, setStoppingWorkspaceId] = useState<string | null>(null);
+  const [deletingSessionIds, setDeletingSessionIds] = useState<string[] | null>(null);
+  const [stoppingSessionId, setStoppingSessionId] = useState<string | null>(null);
   const [switchViewTarget, setSwitchViewTarget] = useState<{ sessionId: string; toStructured: boolean } | null>(null);
   // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
   // the tour gates auto-launch on an explicit loaded flag instead.
@@ -1091,10 +1092,17 @@ function AppContent({
     void setTelemetryConsent(enabled);
   }, []);
 
-  const deletingWorkspace = deletingWorkspaceId ? workspaces.find((w) => w.id === deletingWorkspaceId) : null;
-  const deletingSessions = deletingWorkspace?.sessions ?? [];
+  // Ids, not a workspace id: a sidebar group slice covers only some of its workspace's sessions.
+  const deletingSessions = useMemo(
+    () =>
+      (deletingSessionIds ?? []).flatMap((id) => {
+        const session = sessions.find((s) => s.id === id);
+        return session ? [session] : [];
+      }),
+    [deletingSessionIds, sessions],
+  );
   const liveDeletingSessions = deletingSessions.filter((session) => !session.trashed_at);
-  const deletingSession = deletingWorkspace?.sessions[0] ?? null;
+  const deletingSession = deletingSessions[0] ?? null;
   const deletingDefaultToTrash = liveDeletingSessions.some((session) => session.cleanup_defaults.delete_to_trash);
   const deletingCleanupDefaults = deletingSession
     ? {
@@ -1102,20 +1110,23 @@ function AppContent({
         ...workspaceCleanupDefaults(deletingSessions),
       }
     : null;
+  const deletingWorktreeSharedWith = useMemo(
+    () => sessionsSharingWorktree(deletingSessions, sessions).map((session) => session.title),
+    [deletingSessions, sessions],
+  );
   const deletingBranchName =
     deletingSessions.find((session) => session.branch)?.branch ?? deletingSession?.branch ?? null;
 
-  const handleDeleteSession = useCallback((workspaceId: string) => {
-    setDeletingWorkspaceId(workspaceId);
+  const handleDeleteSession = useCallback((sessionIds: string[]) => {
+    setDeletingSessionIds(sessionIds);
   }, []);
 
   const handleConfirmDelete = async (options: DeleteSessionOptions) => {
-    if (!deletingWorkspace) return;
-    const sessions = deletingWorkspace.sessions;
+    if (deletingSessions.length === 0) return;
     // Close the dialog immediately; the loop, ordering, and toast logic live
     // in deleteWorkspaceSessions so they are unit-testable without the bundle.
-    setDeletingWorkspaceId(null);
-    await deleteWorkspaceSessions(sessions, options, activeSessionId, {
+    setDeletingSessionIds(null);
+    await deleteWorkspaceSessions(deletingSessions, options, activeSessionId, {
       setStatus: setSessionStatus,
       // Drop a deleted session's local-only state (#1358 acp cache + draft,
       // #1842 diff comments). Cross-tab / cross-device deletes fall to the
@@ -1188,14 +1199,13 @@ function AppContent({
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
   // deliberately KEEPS the per-session acp cache, draft, and stored comments
   // so a restore is faithful; only purge clears them. Trashes every session
-  // in the workspace so a multi-session workspace sinks as a whole.
+  // in the row together.
   const handleConfirmTrash = async () => {
-    if (!deletingWorkspace) return;
-    const ids = deletingWorkspace.sessions.map((s) => s.id);
+    const ids = deletingSessions.map((s) => s.id);
     if (ids.length === 0) return;
     const wasActive = activeSessionId != null && ids.includes(activeSessionId);
 
-    setDeletingWorkspaceId(null);
+    setDeletingSessionIds(null);
     for (const id of ids) setSessionStatus(id, "Stopped");
     if (wasActive) {
       navigate("/");
@@ -1218,11 +1228,10 @@ function AppContent({
     [applySession],
   );
 
-  const stoppingWorkspace = stoppingWorkspaceId ? workspaces.find((w) => w.id === stoppingWorkspaceId) : null;
-  const stoppingSession = stoppingWorkspace?.sessions[0] ?? null;
+  const stoppingSession = stoppingSessionId ? (sessions.find((s) => s.id === stoppingSessionId) ?? null) : null;
 
-  const handleStopSession = useCallback((workspaceId: string) => {
-    setStoppingWorkspaceId(workspaceId);
+  const handleStopSession = useCallback((sessionId: string) => {
+    setStoppingSessionId(sessionId);
   }, []);
 
   const handleConfirmStop = useCallback(async () => {
@@ -1231,7 +1240,7 @@ function AppContent({
 
     // Close the dialog and show "Stopped" immediately; the 2s status poller
     // reconciles the true state and corrects this if the request fails.
-    setStoppingWorkspaceId(null);
+    setStoppingSessionId(null);
     setSessionStatus(sessionId, "Stopped");
 
     const result = await stopSession(sessionId);
@@ -1256,32 +1265,37 @@ function AppContent({
     const { sessionId, toStructured } = switchViewTarget;
     // Keep the dialog mounted through the request so its "Switching..." spinner
     // shows; close it once the switch resolves.
-    const result = toStructured ? await acpEnable(sessionId) : await acpDisable(sessionId);
-    setSwitchViewTarget(null);
-    if (!result) {
-      toastBus.handler?.error(`Failed to switch to ${toStructured ? "structured view" : "terminal"}`);
-      return;
+    if (toStructured) {
+      const enabled = await acpEnable(sessionId);
+      setSwitchViewTarget(null);
+      if (!enabled) {
+        toastBus.handler?.error("Failed to switch to structured view");
+        return;
+      }
+    } else {
+      const disabled = await acpDisable(sessionId);
+      setSwitchViewTarget(null);
+      if (!disabled.ok) {
+        toastBus.handler?.error(disabled.message ?? "Failed to switch to terminal");
+        return;
+      }
     }
     toastBus.handler?.info(`Switched to ${toStructured ? "structured view" : "terminal"}`);
   }, [switchViewTarget]);
 
   const handleStartSession = useCallback(
-    async (workspaceId: string) => {
-      const ws = workspaces.find((w) => w.id === workspaceId);
-      const session = ws?.sessions[0];
-      if (!session) return;
-
+    async (sessionId: string) => {
       // Optimistic Starting; the status poller reconciles to the real state.
-      setSessionStatus(session.id, "Starting");
-      const result = await startSession(session.id);
+      setSessionStatus(sessionId, "Starting");
+      const result = await startSession(sessionId);
       if (!result) {
-        setSessionStatus(session.id, "Error");
+        setSessionStatus(sessionId, "Error");
         toastBus.handler?.error("Failed to start session");
         return;
       }
       toastBus.handler?.info("Session started");
     },
-    [workspaces, setSessionStatus],
+    [setSessionStatus],
   );
 
   const handleCreateSession = useCallback(
@@ -1675,12 +1689,12 @@ function AppContent({
         // abort. Cancel/stop must stay behind an explicit gesture
         // (the assistant-ui Stop button in the composer).
         onEscape: () => {
-          if (deletingWorkspaceId) {
-            setDeletingWorkspaceId(null);
+          if (deletingSessionIds) {
+            setDeletingSessionIds(null);
             return;
           }
-          if (stoppingWorkspaceId) {
-            setStoppingWorkspaceId(null);
+          if (stoppingSessionId) {
+            setStoppingSessionId(null);
             return;
           }
           if (showPalette) {
@@ -1708,8 +1722,8 @@ function AppContent({
         toggleDiff,
         toggleRightDock,
         showPalette,
-        deletingWorkspaceId,
-        stoppingWorkspaceId,
+        deletingSessionIds,
+        stoppingSessionId,
         showSettings,
         handleCloseSettings,
         navigate,
@@ -2401,9 +2415,10 @@ function AppContent({
               title: session.title,
               isSandboxed: session.is_sandboxed,
             }))}
+            worktreeSharedWith={deletingWorktreeSharedWith}
             onConfirm={handleConfirmDelete}
             onTrash={handleConfirmTrash}
-            onCancel={() => setDeletingWorkspaceId(null)}
+            onCancel={() => setDeletingSessionIds(null)}
           />
         )}
 
@@ -2411,7 +2426,7 @@ function AppContent({
           <StopSessionDialog
             sessionTitle={stoppingSession.title}
             onConfirm={handleConfirmStop}
-            onCancel={() => setStoppingWorkspaceId(null)}
+            onCancel={() => setStoppingSessionId(null)}
           />
         )}
 

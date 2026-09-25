@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::io::{BufRead, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Result;
 
@@ -11,9 +11,23 @@ use super::canonicalize_or_raw;
 /// Strict launch floor: timestamp uncertainty fails closed.
 const PRIME_AGENT_MTIME_FLOOR_SLACK_MS: f64 = 0.0;
 /// Bounds the header allocation for one hostile line.
-const PRIME_AGENT_HEADER_SCAN_BYTES: u64 = 64 * 1024;
+pub(crate) const PRIME_AGENT_HEADER_SCAN_BYTES: u64 = 64 * 1024;
 /// A private store holds few files; above this the scan fails closed.
-const PRIME_AGENT_MAX_SESSION_FILES: usize = 256;
+pub(crate) const PRIME_AGENT_MAX_SESSION_FILES: usize = 256;
+
+pub(crate) fn root_session_header(bytes: &[u8]) -> Option<(String, String)> {
+    if bytes.is_empty() || u64::try_from(bytes.len()).ok()? > PRIME_AGENT_HEADER_SCAN_BYTES {
+        return None;
+    }
+    let header = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    if header.get("type")?.as_str()? != "session" || header.get("rlmDepth")?.as_u64()? != 0 {
+        return None;
+    }
+    Some((
+        header.get("id")?.as_str()?.to_owned(),
+        header.get("cwd")?.as_str()?.to_owned(),
+    ))
+}
 
 struct PrimeAgentSession {
     id: String,
@@ -52,22 +66,8 @@ fn scan_prime_agent_sessions(store: &Path, session_dir: &Path) -> Vec<PrimeAgent
                 .take(PRIME_AGENT_HEADER_SCAN_BYTES.saturating_add(1))
                 .read_until(b'\n', &mut header)
                 .ok()?;
-            if header.is_empty()
-                || u64::try_from(header.len()).unwrap_or(u64::MAX) > PRIME_AGENT_HEADER_SCAN_BYTES
-            {
-                return None;
-            }
-            let header = serde_json::from_slice::<serde_json::Value>(&header).ok()?;
-            if header.get("type").and_then(|value| value.as_str()) != Some("session")
-                || header.get("rlmDepth").and_then(|value| value.as_u64()) != Some(0)
-            {
-                return None;
-            }
-            Some(PrimeAgentSession {
-                id: header.get("id")?.as_str()?.to_string(),
-                cwd: header.get("cwd")?.as_str()?.to_string(),
-                mtime_ms,
-            })
+            let (id, cwd) = root_session_header(&header)?;
+            Some(PrimeAgentSession { id, cwd, mtime_ms })
         })
         .collect()
 }
@@ -105,21 +105,20 @@ pub(crate) enum PrimeRootPublication {
 /// A pending root preserves an empty-conversation boundary instead of scanning older history.
 pub(crate) fn prime_agent_poll_fn_sandboxed(
     preferred_sidecar: Box<dyn Fn() -> Option<PrimeRootPublication> + Send + 'static>,
-    store: PathBuf,
-    session_dir: PathBuf,
-    container_workdir: String,
+    plan: crate::session::instance::PrimeAgentCapturePlan,
     instance_id: String,
     launch_time_ms: f64,
-    extra_excludes: HashSet<String>,
+    extra_excludes: HashSet<crate::session::ConversationBinding>,
+    source: Option<crate::session::ExecutionBinding>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes, source.as_ref());
         match preferred_sidecar() {
             Some(PrimeRootPublication::Ready(id)) if !exclusion.contains(&id) => Some(id),
             Some(PrimeRootPublication::Pending(id)) if !exclusion.contains(&id) => None,
             _ => select_prime_agent_session(
-                scan_prime_agent_sessions(&store, &session_dir),
-                &container_workdir,
+                scan_prime_agent_sessions(&plan.store, &plan.session_dir),
+                &plan.container_cwd,
                 &exclusion,
                 launch_time_ms,
             )
@@ -136,6 +135,7 @@ pub(crate) fn prime_agent_poll_fn_sandboxed(
 mod tests {
     use super::super::test_support::set_mtime_ms;
     use super::*;
+    use std::path::PathBuf;
 
     fn write_prime_session(dir: &Path, name: &str, id: &str, cwd: &str) -> PathBuf {
         let path = dir.join(name);
@@ -236,12 +236,19 @@ mod tests {
         let poll = |preferred: Option<&'static str>, excluded: &[&str]| {
             prime_agent_poll_fn_sandboxed(
                 Box::new(move || preferred.map(|id| PrimeRootPublication::Ready(id.to_string()))),
-                tmp.path().to_path_buf(),
-                session_dir.clone(),
-                "/workspace".to_string(),
+                crate::session::instance::PrimeAgentCapturePlan {
+                    store: tmp.path().to_path_buf(),
+                    session_dir: session_dir.clone(),
+                    container_session_dir: "/root/.prime/agent/sessions".into(),
+                    container_cwd: "/workspace".into(),
+                },
                 "current".to_string(),
                 2_000_001.0,
-                excluded.iter().map(|id| id.to_string()).collect(),
+                excluded
+                    .iter()
+                    .map(|id| crate::session::ConversationBinding::unknown(*id))
+                    .collect(),
+                None,
             )()
         };
         assert_eq!(poll(None, &[]).as_deref(), Some("prime_fresh"));

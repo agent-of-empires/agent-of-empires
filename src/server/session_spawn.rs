@@ -160,8 +160,8 @@ pub(crate) async fn spawn_structured_session(
         // Persist approval against the source repository before provisioning can run Git hooks.
         let original_path = path.clone();
         let hook_plan = crate::server::api::sessions::resolve_create_hook_plan(
-            &config.hooks,
             &profile,
+            &config.hooks,
             std::path::Path::new(&original_path),
             scratch,
             trust_hooks,
@@ -258,6 +258,7 @@ pub(crate) async fn spawn_structured_session(
             &instance.id,
             &instance.title,
             &instance.source_profile,
+            instance.idempotency_key.as_deref(),
         )?;
         let creation_progress = |event| creation_guard.hook_event(event);
         let generation = {
@@ -460,14 +461,16 @@ pub(crate) async fn spawn_structured_session(
                         Some(&creation_progress),
                     )
                     .map_err(|error| {
-                        // #4063: name the config file the commands came from.
                         let hint = hook_plan
                             .hooks
                             .as_ref()
-                            .and_then(|hooks| hooks.origin_hint("on_create"))
-                            .map(|hint| format!("\n{hint}"))
-                            .unwrap_or_default();
-                        anyhow::anyhow!("on_create hook failed: {error:#}{hint}")
+                            .and_then(|hooks| hooks.origin_hint("on_create"));
+                        anyhow::Error::new(
+                            crate::server::api::sessions::CreateHookFailed::new(
+                                error,
+                                hint.as_deref(),
+                            ),
+                        )
                     })
                 })
                 .and_then(|()| creation_guard.check().map_err(anyhow::Error::from)),
@@ -701,12 +704,15 @@ pub(crate) async fn spawn_structured_session(
                                 effort_explicit,
                                 stored_acp_session_id,
                                 fork_from,
+                                sandbox_continuation:
+                                    crate::acp::supervisor::SandboxContinuation::Persisted,
                                 sandbox_info,
                                 source_profile: source_profile_for_spawn,
                                 yolo_mode,
                                 acp_mode_id,
                                 agent_command_override: command_override,
                                 seed_history_replay,
+                                claude_store_pin: None,
                             })
                             .await
                             .map_err(|error| {

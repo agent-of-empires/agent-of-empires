@@ -5,10 +5,17 @@ use super::*;
 pub(super) fn container_exec_command(
     container_name: &str,
     runtime_name: Option<crate::session::config::ContainerRuntimeName>,
+    snapshot: Option<&crate::containers::RuntimeExecutionSnapshot>,
     argv: &[&str],
 ) -> std::process::Command {
     use crate::session::config::ContainerRuntimeName;
-
+    let command_argv = argv
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    if let Some(snapshot) = snapshot {
+        return snapshot.exec(container_name, "", &command_argv);
+    }
     let runtime = match runtime_name {
         Some(ContainerRuntimeName::AppleContainer) => {
             crate::containers::ContainerRuntime::apple_container()
@@ -17,10 +24,6 @@ pub(super) fn container_exec_command(
         Some(ContainerRuntimeName::Podman) => crate::containers::ContainerRuntime::podman(),
         None => crate::containers::get_container_runtime(),
     };
-    let command_argv = argv
-        .iter()
-        .map(|value| (*value).to_string())
-        .collect::<Vec<_>>();
     let exec_argv = runtime.build_exec_argv(container_name, "", &command_argv);
     let mut command = std::process::Command::new(&exec_argv[0]);
     command.args(&exec_argv[1..]);
@@ -57,7 +60,30 @@ breadcrumb_bytes=$(head -c 16385 "$f" 2>/dev/null | wc -c) || exit 0
 # A CRLF breadcrumb keeps its CR here and fails closed below.
 cwd=$(head -c 16385 "$f" 2>/dev/null | sed -n '1p')
 session_path=$(head -c 16385 "$f" 2>/dev/null | sed -n '2p')
-marker=$(head -c 16385 "$f" 2>/dev/null | sed -n '3p')
+extra_1=$(head -c 16385 "$f" 2>/dev/null | sed -n '3p')
+extra_2=$(head -c 16385 "$f" 2>/dev/null | sed -n '4p')
+breadcrumb_lines=$(head -c 16385 "$f" 2>/dev/null | sed -n '$=') || exit 0
+case "$breadcrumb_lines" in 2|3|4) ;; *) exit 0 ;; esac
+[ -n "$cwd" ] && [ -n "$session_path" ] || exit 0
+marker=
+cwdstat_seen=
+validate_extra() {
+  case "$1" in
+    fresh) [ -z "$marker" ] || exit 0; marker=fresh ;;
+    'cwdstat '*)
+      [ -z "$cwdstat_seen" ] || exit 0
+      cwdstat_values=${1#cwdstat }
+      cwdstat_dev=${cwdstat_values%% *}
+      cwdstat_ino=${cwdstat_values#* }
+      [ "$cwdstat_ino" != "$cwdstat_values" ] && [ -n "$cwdstat_dev" ] && [ -n "$cwdstat_ino" ] || exit 0
+      case "$cwdstat_dev$cwdstat_ino" in *[!0-9]*) exit 0 ;; esac
+      cwdstat_seen=1
+      ;;
+    *) exit 0 ;;
+  esac
+}
+[ "$breadcrumb_lines" -lt 3 ] || validate_extra "$extra_1"
+[ "$breadcrumb_lines" -lt 4 ] || validate_extra "$extra_2"
 [ "$session_path" != "$marker_pending" ] || exit 0
 full_path=$session_path
 case "$full_path" in /*) ;; *) full_path="$cwd/$full_path" ;; esac
@@ -112,7 +138,8 @@ pub(super) fn select_omp_session_in_container(
     stdout: &[u8],
     metadata: &OmpCaptureMetadata,
     exclusion: &HashSet<String>,
-) -> Result<String> {
+    active: Option<&crate::session::instance::ActiveExecution>,
+) -> Result<crate::session::poller::SessionIdObservation> {
     let text = std::str::from_utf8(stdout).context("OMP container capture is not UTF-8")?;
     let body = text
         .strip_prefix("===OMP===\n")
@@ -162,7 +189,7 @@ pub(super) fn select_omp_session_in_container(
     };
     let session_path = lexical_store_session_path(&metadata.layout, &breadcrumb)?;
     let id = validate_breadcrumb(breadcrumb, &session_path, parsed_header, exclusion)?;
-    Ok(id)
+    omp_source_observation(metadata, id, &session_path, cwd, active)
 }
 
 pub(super) fn capture_omp_session_in_container(
@@ -170,7 +197,8 @@ pub(super) fn capture_omp_session_in_container(
     metadata: &OmpCaptureMetadata,
     exclusion: &HashSet<String>,
     launch_marker: &str,
-) -> Result<String> {
+    active_execution: Option<&crate::session::instance::ActiveExecution>,
+) -> Result<crate::session::poller::SessionIdObservation> {
     validate_omp_capture_metadata(metadata)?;
     let terminals = metadata
         .layout
@@ -197,6 +225,9 @@ pub(super) fn capture_omp_session_in_container(
     let command = container_exec_command(
         container_name,
         metadata.container_runtime,
+        active_execution
+            .and_then(|active| active.container.as_ref())
+            .map(|container| &container.runtime),
         &[
             "sh",
             "-c",
@@ -217,32 +248,31 @@ pub(super) fn capture_omp_session_in_container(
         "container exec (OMP breadcrumb capture)",
         MAX_CONTAINER_CAPTURE_BYTES,
     )?;
-    select_omp_session_in_container(&output, metadata, exclusion)
+    select_omp_session_in_container(&output, metadata, exclusion, active_execution)
 }
 
-/// One-shot sandbox capture bound exclusively by the launch marker.
 pub(crate) fn try_capture_omp_session_id_in_container(
     container_name: &str,
     metadata: &OmpCaptureMetadata,
     exclusion: &HashSet<String>,
     launch_marker: Option<&str>,
-) -> Result<String> {
+    active: Option<&crate::session::instance::ActiveExecution>,
+) -> Result<crate::session::poller::SessionIdObservation> {
     capture_omp_session_in_container(
         container_name,
         metadata,
         exclusion,
         launch_marker.context("OMP sandbox launch marker is unavailable")?,
+        active,
     )
 }
 
-/// Sandbox poller. Every tick reloads the tmux generation from the pane name
-/// resolved by the outer poller, then the marker selects the one and only
-/// terminal breadcrumb that this launch may own.
 pub(crate) fn omp_poll_fn_sandboxed(
     container_name: String,
     instance_id: String,
     launch_marker: Option<String>,
-    extra_excludes: HashSet<String>,
+    extra_excludes: HashSet<crate::session::ConversationBinding>,
+    active: Option<crate::session::instance::ActiveExecution>,
 ) -> impl Fn(&str) -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
     move |tmux_session_name| {
         let metadata = load_omp_capture_metadata(tmux_session_name)
@@ -251,18 +281,27 @@ pub(crate) fn omp_poll_fn_sandboxed(
             })
             .ok()?;
         let marker = launch_marker.as_deref()?;
-        let exclusion = super::super::compose_exclusion(&instance_id, &extra_excludes);
-        let captured =
-            capture_omp_session_in_container(&container_name, &metadata, &exclusion, marker)
-                .map_err(|error| {
-                    tracing::debug!(target: "session.capture", "OMP container poll capture failed: {}", error)
-                })
-                .ok()?;
+        let captured = capture_omp_session_in_container(
+            &container_name,
+            &metadata,
+            &HashSet::new(),
+            marker,
+            active.as_ref(),
+        )
+        .map_err(|error| {
+            tracing::debug!(target: "session.capture", "OMP container poll capture failed: {}", error)
+        })
+        .ok()?;
         let refreshed = load_omp_capture_metadata(tmux_session_name).ok()?;
         if refreshed != metadata {
             return None;
         }
-        super::super::validated_session_id(captured).map(|sid| metadata.session_observation(sid))
+        let exclusion = super::super::compose_exclusion(
+            &instance_id,
+            &extra_excludes,
+            captured.source.as_ref(),
+        );
+        (!exclusion.contains(&captured.sid)).then_some(captured)
     }
 }
 
@@ -270,6 +309,23 @@ pub(crate) fn omp_poll_fn_sandboxed(
 mod tests {
     use super::super::fixtures::*;
     use super::*;
+    fn select_sid(
+        output: &[u8],
+        metadata: &OmpCaptureMetadata,
+        exclusion: &HashSet<String>,
+    ) -> Result<String> {
+        select_omp_session_in_container(output, metadata, exclusion, None)
+            .map(|observation| observation.sid)
+    }
+
+    fn host_sid(
+        metadata: &OmpCaptureMetadata,
+        exclusion: &HashSet<String>,
+        terminal_id: &str,
+    ) -> Result<String> {
+        capture_omp_session_id_from_terminal(metadata, exclusion, terminal_id, None)
+            .map(|observation| observation.sid)
+    }
 
     #[test]
     fn container_probe_command_uses_selected_runtime() {
@@ -281,7 +337,7 @@ mod tests {
             (ContainerRuntimeName::AppleContainer, "container"),
         ];
         for (runtime, expected_binary) in cases {
-            let command = container_exec_command("aoe-test", Some(runtime), &["env"]);
+            let command = container_exec_command("aoe-test", Some(runtime), None, &["env"]);
             assert_eq!(command.get_program(), expected_binary, "{runtime:?}");
         }
     }
@@ -312,10 +368,32 @@ mod tests {
         .unwrap();
 
         let output = run_container_script(&meta, &marker);
-        assert_eq!(
-            select_omp_session_in_container(&output, &meta, &HashSet::new()).unwrap(),
-            ID
-        );
+        assert_eq!(select_sid(&output, &meta, &HashSet::new()).unwrap(), ID);
+        for (extras, accepted) in [
+            ("", true),
+            ("fresh\n", true),
+            ("cwdstat 12 34\n", true),
+            ("fresh\ncwdstat 12 34\n", true),
+            ("cwdstat 12 34\nfresh\n", true),
+            ("unknown\n", false),
+            ("cwdstat 12\n", false),
+            ("cwdstat 12 34 56\n", false),
+            ("fresh\nfresh\n", false),
+            ("cwdstat 12 34\ncwdstat 12 34\n", false),
+        ] {
+            std::fs::write(
+                &breadcrumb,
+                format!("{cwd}\n{}\n{extras}", session.display()),
+            )
+            .unwrap();
+            set_mtime_ms(&breadcrumb, 4_000_000_000_000);
+            let output = run_container_script(&meta, &marker);
+            assert_eq!(!output.is_empty(), accepted, "{extras:?}");
+        }
+        std::fs::write(&breadcrumb, format!("{cwd}\n{}\n", session.display())).unwrap();
+        set_mtime_ms(&breadcrumb, 4_000_000_000_000);
+        let output = run_container_script(&meta, &marker);
+        assert_eq!(select_sid(&output, &meta, &HashSet::new()).unwrap(), ID);
         for pending in ["", &*session.to_string_lossy()] {
             std::fs::write(&marker, launch_marker(&meta, "pts-9", pending)).unwrap();
             assert!(
@@ -382,9 +460,9 @@ mod tests {
         for (label, dirs, accepted) in cases {
             let tmp = tempfile::tempdir().unwrap();
             let meta = container_fixture(tmp.path(), dirs, "", 101_000);
-            let host = capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-7");
+            let host = host_sid(&meta, &HashSet::new(), "pts-7");
             let output = run_container_script(&meta, Path::new(&meta.launch_marker));
-            let container = select_omp_session_in_container(&output, &meta, &HashSet::new());
+            let container = select_sid(&output, &meta, &HashSet::new());
             assert_eq!(host.ok().as_deref(), accepted.then_some(ID), "{label}");
             assert_eq!(container.ok().as_deref(), accepted.then_some(ID), "{label}");
         }
@@ -406,7 +484,7 @@ mod tests {
         );
         let marker = PathBuf::from(&meta.launch_marker);
         let breadcrumb = meta.layout.terminal_sessions.join("pts-7");
-        assert!(select_omp_session_in_container(
+        assert!(select_sid(
             &run_container_script(&meta, &marker),
             &meta,
             &HashSet::new()
@@ -414,7 +492,7 @@ mod tests {
         .is_err());
         set_mtime_ms(&breadcrumb, 200_000);
         assert_eq!(
-            select_omp_session_in_container(
+            select_sid(
                 &run_container_script(&meta, &marker),
                 &meta,
                 &HashSet::new()
@@ -440,9 +518,7 @@ mod tests {
                 meta.launch_id
             )
         };
-        let select = |output: &str| {
-            select_omp_session_in_container(output.as_bytes(), &meta, &HashSet::new())
-        };
+        let select = |output: &str| select_sid(output.as_bytes(), &meta, &HashSet::new());
         assert!(select(&unmaterialized("pts-9", "launch-b", ID)).is_err());
         // No mtime proof is needed once the marker selected the breadcrumb, and a
         // later resume of a historical session is accepted.

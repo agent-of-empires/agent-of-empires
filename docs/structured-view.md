@@ -106,13 +106,13 @@ It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `-
 
 ## Choosing the view per session
 
-- **Web wizard**: structured view by default (set [`acp.default_new_session_view`](guides/configuration.md) to change it); turn off **Use structured view** for the terminal.
-- **CLI / TUI**: terminal view by default; opt in with `--structured-view` or `--agent`, or the **Structured** field in the TUI new-session dialog.
-- **An existing session** can switch either way from the web sidebar's right-click menu or the TUI context menu (which needs a running `aoe serve`). Both confirm first, and the worktree, files, and commits are always preserved. For a **claude** session the conversation is kept in both directions (`claude --resume` one way, the ACP adapter the other); every other agent restarts fresh on the target surface.
+- **Web wizard:** defaults to the structured view (set [`acp.default_new_session_view`](guides/configuration.md) to change it); turn off **Use structured view** to get the terminal view.
+- **CLI / TUI:** default to the terminal view. From the CLI, opt in with `--structured-view` or `--agent`; in the TUI new-session dialog, toggle the **Structured** field (shown for ACP-capable tools).
+- Either way, an existing active session can switch views: the web sidebar's right-click menu (**Switch to terminal** / **Switch to structured view**) or the TUI's right-click context menu (needs a running `aoe serve` daemon; archived, trashed, and still-creating rows are excluded until they leave that state). Both surfaces confirm first. The worktree, open files, and commits are always preserved. For a **claude** session, the conversation is kept in both directions only when AoE can resolve a shared native store. A terminal switch whose store cannot be resolved, or which the structured worker does not share, is refused with HTTP 409 and `set-session-id --store` recovery guidance. Every other agent starts fresh on the target surface.
 
 Non-ACP tools always run in the terminal view, with no toggle.
 
-The local TUI ensures a daemon at startup, listening on localhost only. It reuses an existing daemon and leaves it running on exit. Structured sidebar statuses arrive through the runtime WebSocket; disconnecting retains their last displayed values and reconnects to a daemon that comes back, but never starts one.
+The local TUI ensures a native core daemon at startup without opening a web listener. It reuses an existing daemon and leaves it running on exit. Structured sidebar statuses arrive through the runtime WebSocket; disconnecting retains their last displayed values and does not automatically restart the daemon.
 
 ### Launch command and session naming
 
@@ -152,18 +152,16 @@ Each session gets a managed artifact directory, exposed to the agent as `AOE_ART
 
 ## Cross-machine attach
 
-To work with sessions on another machine's daemon from the TUI, register it
-with `aoe remote add` or set `AOE_DAEMON_URL`; see
-[Remote Machines](guides/remotes.md). For one known structured session:
+Set `AOE_DAEMON_URL` (and optionally `AOE_DAEMON_TOKEN`) to point at a remote `aoe serve`:
 
 ```sh
+AOE_DAEMON_URL=https://aoe.example.com AOE_DAEMON_TOKEN=… aoe   # remote session picker
 aoe acp attach <session_id> --daemon-url https://aoe.example.com
 ```
 
-The `aoe acp *` verbs and `aoe serve --status` follow `AOE_DAEMON_URL` too.
-Credentials travel only over HTTPS or a loopback URL for the session list and
-live terminal socket; the remaining daemon requests do not apply this check yet
-(#3839), so use HTTPS or a tunnel for a remote daemon.
+When `AOE_DAEMON_URL` is set, the TUI swaps the local home view for a remote session picker, and `aoe serve --status` / the `aoe acp *` verbs retarget to the remote. Local-only operations (tmux attach, `aoe stop`, file edit) aren't available against a remote; use the web dashboard or SSH into the host. Unset the variable to fall back to local introspection.
+
+The session list is read with a bearer token only over HTTPS or a loopback URL. With `AOE_DAEMON_TOKEN` set and a plaintext `http://` URL on another host, the picker reports that refusal instead of listing sessions. The other daemon requests do not apply this check yet (#3839), so use HTTPS or a tunnel for a remote daemon.
 
 ## Headless CLI verbs
 

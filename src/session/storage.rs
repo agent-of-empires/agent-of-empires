@@ -1650,6 +1650,33 @@ impl Storage {
         &self,
         current: &Instance,
     ) -> Result<super::path_identity::CleanupProtection> {
+        self.cleanup_protection_inner(std::slice::from_ref(current), false)
+    }
+
+    pub(crate) fn cleanup_protection_excluding(
+        &self,
+        excluded: &[Instance],
+    ) -> Result<super::path_identity::CleanupProtection> {
+        self.cleanup_protection_inner(excluded, true)
+    }
+
+    fn cleanup_protection_inner(
+        &self,
+        excluded: &[Instance],
+        require_match: bool,
+    ) -> Result<super::path_identity::CleanupProtection> {
+        let exclusions = excluded
+            .iter()
+            .map(|row| {
+                let path = if row.source_profile.is_empty() {
+                    self.sessions_path.clone()
+                } else {
+                    get_profile_dir(&row.source_profile)?.join("sessions.json")
+                };
+                Ok((path, row.id.as_str(), row.lifecycle_generation))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut matched = require_match.then(|| vec![false; exclusions.len()]);
         let profile_dir = self
             .sessions_path
             .parent()
@@ -1675,13 +1702,20 @@ impl Storage {
             let rows: Vec<Instance> = serde_json::from_str(&content).with_context(|| {
                 format!("Reading complete resource owners in {}", path.display())
             })?;
-            let selected = path == self.sessions_path;
             protection.extend(rows.iter().filter(|row| {
-                !selected
-                    || row.id != current.id
-                    || row.lifecycle_generation != current.lifecycle_generation
+                let index = exclusions.iter().position(|(registry, id, generation)| {
+                    path == *registry && row.id == *id && row.lifecycle_generation == *generation
+                });
+                if let (Some(matched), Some(index)) = (&mut matched, index) {
+                    matched[index] = true;
+                }
+                index.is_none()
             }))?;
         }
+        anyhow::ensure!(
+            matched.is_none_or(|matched| matched.into_iter().all(|found| found)),
+            "Selected batch member changed before cleanup"
+        );
         protection.validate()?;
         Ok(protection)
     }
@@ -3144,6 +3178,51 @@ fn validate_recovery_journal(
         ));
     }
     Ok(None)
+}
+
+/// Run `f` while holding every store's save lock and storage flock, so no session row in any of
+/// them can change until it returns. Locks are taken in the canonical-directory order profile
+/// moves use.
+pub(crate) fn with_storages_locked<R>(storages: &[Storage], f: impl FnOnce() -> R) -> Result<R> {
+    let mut sorted = storages
+        .iter()
+        .map(|storage| {
+            let dir = storage
+                .sessions_path
+                .parent()
+                .ok_or_else(|| anyhow!("sessions path has no parent"))?;
+            fs::create_dir_all(dir)?;
+            Ok((dir.canonicalize()?, storage))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    sorted.sort_by(|(left, _), (right, _)| left.cmp(right));
+    sorted.dedup_by(|(left, _), (right, _)| left == right);
+
+    let dirs: Vec<&Path> = sorted.iter().map(|(dir, _)| dir.as_path()).collect();
+    let _transition_flocks = acquire_transition_flocks_for_profile_dirs(&dirs)?;
+    let _mutexes: Vec<_> = sorted
+        .iter()
+        .map(|(_, storage)| {
+            storage
+                .save_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        })
+        .collect();
+    let mut held: Vec<(fs::Metadata, StorageFlock)> = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        let (file, path) = open_storage_lock_file(dir, STORAGE_LOCK_FILENAME)?;
+        let metadata = file.metadata()?;
+        // A second flock on a shared lock file would wait on this thread forever.
+        if held
+            .iter()
+            .any(|(other, _)| same_filesystem_identity(other, &metadata))
+        {
+            continue;
+        }
+        held.push((metadata, acquire_open_storage_flock(file, &path)?));
+    }
+    Ok(f())
 }
 
 fn with_two_storage_locks<F, R>(source: &Storage, target: &Storage, f: F) -> Result<R>

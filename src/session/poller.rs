@@ -92,9 +92,8 @@ pub fn session_id_poller_max_threads() -> u32 {
     current_budget().max()
 }
 
-/// The configured ceiling for a process launched under `profile`: the global `[session]
-/// session_id_poller_max_threads` with that profile's override applied, the way every other
-/// global-only session field is consumed.
+/// Resolve the global ceiling for a process launched under `profile`.
+/// Applied once at startup; changes require a restart.
 pub fn configured_session_id_poller_max_threads(profile: &str) -> u32 {
     crate::session::resolve_config_or_warn(profile)
         .session
@@ -264,14 +263,21 @@ pub(crate) enum SessionIdGuard {
     OmpLegacy,
     OmpGeneration(String),
     /// Read from a per-instance sidecar the agent itself wrote (Pi's extension), so the observation
-    /// names this pane rather than being inferred from a store.
-    InstanceSidecar,
+    /// names this pane rather than being inferred from a store. The transcript path published
+    /// beside the id is part of it, so a path written after the id is reported too.
+    InstanceSidecar {
+        transcript: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SessionIdObservation {
     pub(crate) sid: String,
     pub(crate) guard: SessionIdGuard,
+    pub(crate) execution: Option<crate::session::instance::ActiveExecution>,
+    pub(crate) source: Option<crate::session::ExecutionBinding>,
+    pub(crate) transcript_path: Option<std::path::PathBuf>,
+    pub(crate) pi_session_path: Option<String>,
 }
 
 pub(crate) type SessionIdPollFn =
@@ -282,13 +288,21 @@ impl SessionIdObservation {
         Self {
             sid,
             guard: SessionIdGuard::Unguarded,
+            execution: None,
+            source: None,
+            transcript_path: None,
+            pi_session_path: None,
         }
     }
 
-    pub(crate) fn instance_sidecar(sid: String) -> Self {
+    pub(crate) fn instance_sidecar(sid: String, transcript: Option<String>) -> Self {
         Self {
             sid,
-            guard: SessionIdGuard::InstanceSidecar,
+            guard: SessionIdGuard::InstanceSidecar { transcript },
+            execution: None,
+            source: None,
+            transcript_path: None,
+            pi_session_path: None,
         }
     }
 
@@ -296,13 +310,42 @@ impl SessionIdObservation {
         Self {
             sid,
             guard: SessionIdGuard::OmpLegacy,
+            execution: None,
+            source: None,
+            transcript_path: None,
+            pi_session_path: None,
         }
     }
     pub(crate) fn omp(sid: String, generation: String) -> Self {
         Self {
             sid,
             guard: SessionIdGuard::OmpGeneration(generation),
+            execution: None,
+            source: None,
+            transcript_path: None,
+            pi_session_path: None,
         }
+    }
+    pub(crate) fn conversation_binding(&self) -> Option<crate::session::ConversationBinding> {
+        self.execution.as_ref()?;
+        self.source
+            .as_ref()
+            .map(|source| crate::session::ConversationBinding {
+                session_id: self.sid.clone(),
+                execution: Some(source.clone()),
+                provenance: crate::session::ConversationProvenance::Observed,
+                transcript_path: self.transcript_path.clone(),
+            })
+    }
+    pub(crate) fn confirms_omp_pin(&self, intent: &crate::session::ResumeIntent) -> bool {
+        self.execution.is_some()
+            && self.source.is_some()
+            && matches!(&self.guard, SessionIdGuard::OmpGeneration(_))
+            && matches!(intent, crate::session::ResumeIntent::Use(pinned) if pinned == &self.sid)
+    }
+
+    pub(crate) fn conversation_key(&self) -> Option<crate::session::instance::ConversationKey<'_>> {
+        self.source.as_ref().map(|source| source.key(&self.sid))
     }
 }
 
@@ -622,28 +665,32 @@ impl SessionPoller {
     }
 
     #[cfg(test)]
-    pub(crate) fn inject_test_sidecar_update(&self, instance_id: &str, session_id: &str) {
+    pub(crate) fn inject_test_sidecar_update(
+        &self,
+        instance_id: &str,
+        session_id: &str,
+        transcript: Option<&str>,
+    ) {
         self.result_tx
             .send((
                 instance_id.to_string(),
-                SessionIdObservation::instance_sidecar(session_id.to_string()),
+                SessionIdObservation::instance_sidecar(
+                    session_id.to_string(),
+                    transcript.map(str::to_owned),
+                ),
             ))
             .expect("inject_test_sidecar_update: result channel disconnected");
     }
 
     #[cfg(test)]
-    pub(crate) fn inject_test_omp_update(
+    pub(crate) fn inject_test_observation(
         &self,
         instance_id: &str,
-        session_id: &str,
-        generation: &str,
+        observation: SessionIdObservation,
     ) {
         self.result_tx
-            .send((
-                instance_id.to_string(),
-                SessionIdObservation::omp(session_id.to_string(), generation.to_string()),
-            ))
-            .expect("inject_test_omp_update: result channel disconnected");
+            .send((instance_id.to_owned(), observation))
+            .expect("inject_test_observation: result channel disconnected");
     }
 
     #[cfg(test)]
@@ -755,7 +802,6 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::sync::{Arc, Mutex, MutexGuard};
-    use tracing_test::traced_test;
 
     fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         mutex
@@ -804,7 +850,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn configured_ceiling_is_the_launch_profiles_effective_value() {
+    fn configured_ceiling_ignores_profile_overrides() {
         let home = tempfile::tempdir().unwrap();
         let _app_dir = crate::session::test_support::isolate_app_dir_at(home.path());
         let app = crate::session::get_app_dir().unwrap();
@@ -821,7 +867,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(configured_session_id_poller_max_threads("tuned"), 9);
+        assert_eq!(configured_session_id_poller_max_threads("tuned"), 7);
         assert_eq!(
             configured_session_id_poller_max_threads("untouched"),
             7,
@@ -1177,10 +1223,9 @@ mod tests {
         );
     }
 
-    #[traced_test]
     #[test]
     fn test_budget_exhaustion_leaves_the_warning_to_the_repair_path() {
-        tracing::callsite::rebuild_interest_cache();
+        let logs = crate::session::test_support::LogCapture::start();
         let _budget = test_support::IsolatedBudget::exhausted();
 
         let mut poller = SessionPoller::new("test-session".to_string());
@@ -1192,17 +1237,14 @@ mod tests {
         );
         assert_eq!(outcome, PollerSpawn::BudgetExhausted);
 
-        logs_assert(|lines: &[&str]| {
-            let warned = lines
-                .iter()
-                .filter(|l| l.contains("WARN"))
-                .filter(|l| l.contains("test-budget-quiet"))
-                .count();
-            match warned {
-                0 => Ok(()),
-                n => Err(format!("start warned {n} time(s) on an exhausted budget")),
-            }
-        });
+        let logs = logs.contents();
+        let lines = || logs.lines().filter(|l| l.contains("test-budget-quiet"));
+        assert_eq!(lines().filter(|l| l.contains("DEBUG")).count(), 1, "{logs}");
+        assert_eq!(
+            lines().filter(|l| l.contains("WARN")).count(),
+            0,
+            "start warned on an exhausted budget: {logs}"
+        );
     }
 
     #[test]

@@ -79,6 +79,8 @@ pub enum HttpError {
     ApprovalGone,
     #[error("daemon is read-only (started with --read-only); request refused")]
     ReadOnly,
+    #[error("reviving the session is required to accept this prompt; retry without --no-revive")]
+    RevivalRequired,
     // A 401 can mean token, passphrase or device authentication failed.
     #[error("daemon rejected the request (401); restart `aoe serve` or check `--auth` mode")]
     Unauthorized,
@@ -274,6 +276,7 @@ impl HttpClient {
         &self,
         session_id: &str,
         text: &str,
+        no_revive: bool,
     ) -> Result<PromptDispatchWire, HttpError> {
         let url = format!(
             "{}/api/sessions/{}/acp/prompt",
@@ -284,6 +287,7 @@ impl HttpClient {
             text: text.to_string(),
             attachments: Vec::new(),
             prompt_id: None,
+            no_revive,
         };
         let res = self.execute(self.http.post(&url).json(&body)).await?;
         let res = check_status(res, session_id)?;
@@ -400,7 +404,7 @@ impl HttpClient {
         );
         let res = self.execute(self.http.get(&url)).await?;
         let res = check_status(res, session_id)?;
-        Ok(crate::daemon::decode_json(res).await?)
+        Ok(crate::daemon::decode_json_bounded(res, 64 * 1024 * 1024).await?)
     }
 
     // No `queue_enqueue` here: since Tier 3 the native view never decides to
@@ -689,6 +693,7 @@ fn status_error(res: &reqwest::Response, session_id: Option<&str>, resolving: bo
     match (status, code) {
         (StatusCode::UNAUTHORIZED, _) => HttpError::Unauthorized,
         (_, Some(ApiErrorCode::ReadOnly)) => HttpError::ReadOnly,
+        (_, Some(ApiErrorCode::NoRevive)) => HttpError::RevivalRequired,
         (_, Some(ApiErrorCode::PendingTargetGone)) => HttpError::ApprovalGone,
         (StatusCode::NOT_FOUND, _) if session_id.is_some() && !resolving => {
             HttpError::SessionNotFound(session_id.unwrap().to_owned())
@@ -728,6 +733,37 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(1), client.health_check()).await;
         server.abort();
         assert!(matches!(result.unwrap(), Err(HttpError::ReadOnly)));
+    }
+
+    #[tokio::test]
+    async fn no_revive_refusal_explains_the_conflict_without_reading_its_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream.write_all(b"HTTP/1.1 409 Conflict\r\nAoE-Error-Code: no_revive\r\nContent-Length: 100\r\n\r\n").await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client =
+            HttpClient::new(endpoint(&format!("http://{address}"), Some("secret"))).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.prompt("session", "hello", true),
+        )
+        .await;
+        server.abort();
+        let error = result
+            .expect("classification must not wait for the stalled body")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reviving the session is required"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

@@ -191,6 +191,19 @@ impl HomeView {
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
     ) {
+        self.queue_launch_then_attach(id, size, Some(skip_on_launch));
+    }
+
+    pub fn start_then_attach(&mut self, id: &str, size: Option<(u16, u16)>) {
+        self.queue_launch_then_attach(id, size, None);
+    }
+
+    fn queue_launch_then_attach(
+        &mut self,
+        id: &str,
+        size: Option<(u16, u16)>,
+        restart_skip_on_launch: Option<bool>,
+    ) {
         if self.restart_in_flight.contains(id) {
             return;
         }
@@ -199,18 +212,23 @@ impl HomeView {
         };
         let source_profile = instance.source_profile.clone();
         self.cancel_native_attachment();
-        let body = crate::daemon::RestartSessionBody {
-            size: size.and_then(|(cols, rows)| {
-                Some(crate::daemon::TerminalSize {
-                    cols: std::num::NonZeroU16::new(cols)?,
-                    rows: std::num::NonZeroU16::new(rows)?,
-                })
-            }),
-            skip_on_launch,
-            wake_message: Some(String::new()),
-            ..Default::default()
+        let preparation = if let Some(skip_on_launch) = restart_skip_on_launch {
+            let body = crate::daemon::RestartSessionBody {
+                size: size.and_then(|(cols, rows)| {
+                    Some(crate::daemon::TerminalSize {
+                        cols: std::num::NonZeroU16::new(cols)?,
+                        rows: std::num::NonZeroU16::new(rows)?,
+                    })
+                }),
+                skip_on_launch,
+                wake_message: Some(String::new()),
+                ..Default::default()
+            };
+            self.session_feed.restart_agent(id.into(), body)
+        } else {
+            self.session_feed.start_agent(id.into(), size)
         };
-        match self.session_feed.restart_agent(id.into(), body) {
+        match preparation {
             Ok(preparation) => {
                 self.pending_native_attachment = Some(PendingNativeAttachment {
                     id: id.into(),
@@ -225,7 +243,11 @@ impl HomeView {
             }
             Err(error) => {
                 self.info_dialog = Some(InfoDialog::new(
-                    "Restart failed",
+                    if restart_skip_on_launch.is_some() {
+                        "Restart failed"
+                    } else {
+                        "Start failed"
+                    },
                     &format!("{error}\nReconnect the runtime and try again."),
                 ))
             }

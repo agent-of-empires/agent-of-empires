@@ -104,6 +104,8 @@ export function useProjectPicker(profile: string | undefined, excludePaths: stri
   const [recent, setRecent] = useState<RecentProject[]>([]);
   const [saved, setSaved] = useState<ProjectInfo[]>([]);
   const [loadedProfile, setLoadedProfile] = useState<string>();
+  const [failedProfile, setFailedProfile] = useState<string>();
+  const [retryAttempt, setRetryAttempt] = useState(0);
   const loading = !profile || loadedProfile !== profile;
   const [query, setQuery] = useState("");
 
@@ -112,20 +114,20 @@ export function useProjectPicker(profile: string | undefined, excludePaths: stri
     let cancelled = false;
     Promise.all([fetchSessions(), fetchRecentProjects(), fetchProjects({ profile })]).then(
       ([envelope, recentEnvelope, savedProjects]) => {
-        if (cancelled || savedProjects === null) return;
+        if (cancelled) return;
         const sessionDerived = envelope ? collectRecentProjects(envelope.sessions) : [];
         const merged = mergeRecentProjects(sessionDerived, recentEnvelope?.projects ?? []);
-        const split = splitSavedAndRecent(savedProjects, merged);
+        const split = splitSavedAndRecent(savedProjects ?? [], merged);
         setSaved(split.saved);
         setRecent(split.recent);
+        setFailedProfile(savedProjects === null ? profile : undefined);
         setLoadedProfile(profile);
       },
     );
     return () => {
       cancelled = true;
     };
-  }, [profile]);
-
+  }, [profile, retryAttempt]);
   const excluded = useMemo(() => new Set(excludePaths.map(normalizePath)), [excludePaths]);
   const visibleSaved = useMemo(
     () => (loading ? [] : saved.filter((s) => !excluded.has(normalizePath(s.path)))),
@@ -153,6 +155,12 @@ export function useProjectPicker(profile: string | undefined, excludePaths: stri
 
   return {
     loading,
+    error: failedProfile === profile,
+    retry: () => {
+      setFailedProfile(undefined);
+      setLoadedProfile(undefined);
+      setRetryAttempt((attempt) => attempt + 1);
+    },
     saved: visibleSaved,
     recent: visibleRecent,
     query,

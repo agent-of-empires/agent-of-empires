@@ -340,10 +340,10 @@ export function Composer(props: Props) {
                   pendingConfigOption={props.pendingConfigOption}
                   onSetConfigOption={props.setConfigOption}
                 />
+                <UsageHint usage={props.sessionUsage} />
               </div>
 
               <div data-testid="composer-actions" className="flex shrink-0 items-center gap-2">
-                <UsageHint usage={props.sessionUsage} />
                 <PluginComposerActions sessionId={sessionId} getSnapshot={() => pluginSnapshot(client, taRef)} />
                 {turnActive ? (
                   <>

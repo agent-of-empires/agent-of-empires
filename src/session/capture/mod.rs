@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -25,13 +26,36 @@ pub(crate) use claude::{
     claude_home_for_host_environment, claude_host_transcript_confirmed_absent,
 };
 pub(crate) use codex::codex_poll_fn_sandboxed_store;
-pub(crate) use gemini::gemini_poll_fn_sandboxed_store;
+pub(crate) use gemini::{
+    gemini_poll_fn_sandboxed_store, parse_gemini_session_json, project_hash,
+    GEMINI_SCAN_MAX_CANDIDATES, GEMINI_SESSION_MAX_BYTES,
+};
 pub(crate) use hermes::hermes_poll_fn_sandboxed_store;
-pub(crate) use kimi::kimi_poll_fn_sandboxed_store;
+pub(crate) use kimi::{kimi_poll_fn_sandboxed_store, selected_index_record, KIMI_INDEX_MAX_BYTES};
 pub(crate) use omp::*;
 pub(crate) use opencode::preassign_opencode_session_id;
-pub(crate) use pi::pi_sidecar_poll_fn;
-pub(crate) use prime::{prime_agent_poll_fn_sandboxed, PrimeRootPublication};
+pub(crate) use pi::{extract_pi_header_fields, pi_sidecar_poll_fn, read_pi_session_observation};
+pub(crate) use prime::{
+    prime_agent_poll_fn_sandboxed, root_session_header, PrimeRootPublication,
+    PRIME_AGENT_HEADER_SCAN_BYTES, PRIME_AGENT_MAX_SESSION_FILES,
+};
+
+pub(crate) fn canonicalize_allowing_missing_leaf(path: &Path) -> Option<PathBuf> {
+    let mut resolved = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(canonical) = resolved.canonicalize() {
+            let mut identity = canonical;
+            for component in missing.iter().rev() {
+                identity.push(component);
+            }
+            return Some(identity);
+        }
+        let name = resolved.file_name()?.to_os_string();
+        missing.push(name);
+        resolved = resolved.parent()?.to_path_buf();
+    }
+}
 
 /// The capture boundary check that keeps invalid ids out of storage.
 pub(crate) fn validated_session_id(id: String) -> Option<String> {
@@ -59,26 +83,32 @@ pub(crate) fn is_valid_session_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
 
-/// Ids claimed by other live instances plus `extra` ids this instance cleared
-/// but that may still be on disk.
 pub(crate) fn compose_exclusion(
     current_instance_id: &str,
-    extra: &HashSet<String>,
+    extra: &HashSet<crate::session::ConversationBinding>,
+    source: Option<&crate::session::ExecutionBinding>,
 ) -> HashSet<String> {
     compose_exclusion_in(
         current_instance_id,
         extra,
         &crate::tmux::LiveSessionSnapshot::new(),
+        source,
     )
 }
 
 fn compose_exclusion_in(
     current_instance_id: &str,
-    extra: &HashSet<String>,
+    extra: &HashSet<crate::session::ConversationBinding>,
     live: &crate::tmux::LiveSessionSnapshot,
+    source: Option<&crate::session::ExecutionBinding>,
 ) -> HashSet<String> {
-    let mut set = build_exclusion_set(current_instance_id, live);
-    set.extend(extra.iter().cloned());
+    let mut set = build_exclusion_set(current_instance_id, live, source);
+    set.extend(
+        extra
+            .iter()
+            .filter(|binding| binding.excludes_capture(&binding.session_id, source))
+            .map(|binding| binding.session_id.clone()),
+    );
     set
 }
 
@@ -88,10 +118,16 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
     instances: &[crate::session::Instance],
-    retroactive_capture_excludes: &HashSet<String>,
+    retroactive_capture_excludes: &HashSet<crate::session::ConversationBinding>,
+    source: Option<&crate::session::ExecutionBinding>,
 ) -> HashSet<String> {
     let live = crate::tmux::LiveSessionSnapshot::new();
-    let mut set = compose_exclusion_in(current_instance_id, retroactive_capture_excludes, &live);
+    let mut set = compose_exclusion_in(
+        current_instance_id,
+        retroactive_capture_excludes,
+        &live,
+        source,
+    );
     let canonical_current = canonicalize_or_raw(current_project_path);
     for inst in instances {
         if inst.id == current_instance_id
@@ -99,20 +135,25 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         {
             continue;
         }
-        set.extend(
-            inst.prior_tool_session_ids
-                .values()
-                .filter_map(|parked| parked.agent_session_id.clone())
-                .filter(|sid| !sid.is_empty()),
-        );
+        for parked in inst.prior_tool_session_ids.values() {
+            if let Some(sid) = parked
+                .agent_session_id
+                .as_deref()
+                .filter(|sid| !sid.is_empty())
+            {
+                if owner_excludes(source, parked.agent_session_binding.as_ref(), sid) {
+                    set.insert(sid.to_string());
+                }
+            }
+        }
     }
     set
 }
 
-/// Session ids captured by live AoE panes owned by other instances.
 fn build_exclusion_set(
     current_instance_id: &str,
     live: &crate::tmux::LiveSessionSnapshot,
+    source: Option<&crate::session::ExecutionBinding>,
 ) -> HashSet<String> {
     let Some(names) = live.names() else {
         return HashSet::new();
@@ -129,7 +170,9 @@ fn build_exclusion_set(
     let instance_ids = crate::tmux::env::get_hidden_env_batch(
         &aoe_sessions,
         crate::tmux::env::AOE_INSTANCE_ID_KEY,
-    );
+    )
+    .into_iter()
+    .collect::<std::collections::HashMap<_, _>>();
     let other_sessions: Vec<&str> = instance_ids
         .iter()
         .filter(|(_, owner)| {
@@ -142,13 +185,63 @@ fn build_exclusion_set(
     if other_sessions.is_empty() {
         return HashSet::new();
     }
-    crate::tmux::env::get_hidden_env_batch(
+    let captured_ids = crate::tmux::env::get_hidden_env_batch(
         &other_sessions,
         crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-    )
-    .into_iter()
-    .filter_map(|(_, id)| id)
-    .collect()
+    );
+    let mut owners = std::collections::HashMap::new();
+    if source.is_some() && captured_ids.iter().any(|(_, sid)| sid.is_some()) {
+        let owner_ids = instance_ids
+            .values()
+            .filter_map(Option::as_deref)
+            .collect::<HashSet<_>>();
+        let loaded = (|| -> Result<()> {
+            for profile in crate::session::list_profiles()? {
+                for instance in crate::session::Storage::open_unwatched(&profile)?.load()? {
+                    if !owner_ids.contains(instance.id.as_str()) {
+                        continue;
+                    }
+                    match owners.entry(instance.id) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(instance.agent_session_binding.filter(|binding| {
+                                instance.agent_session_id.as_deref()
+                                    == Some(binding.session_id.as_str())
+                            }));
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            entry.insert(None);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if loaded.is_err() {
+            owners.clear();
+        }
+    }
+    captured_ids
+        .into_iter()
+        .filter_map(|(name, sid)| {
+            let sid = sid?;
+            let owner = instance_ids
+                .get(&name)
+                .and_then(Option::as_ref)
+                .and_then(|id| owners.get(id))
+                .and_then(Option::as_ref);
+            owner_excludes(source, owner, &sid).then_some(sid)
+        })
+        .collect()
+}
+
+pub(crate) fn owner_excludes(
+    source: Option<&crate::session::ExecutionBinding>,
+    owner: Option<&crate::session::ConversationBinding>,
+    sid: &str,
+) -> bool {
+    owner
+        .filter(|binding| binding.session_id == sid)
+        .is_none_or(|binding| binding.excludes_capture(sid, source))
 }
 
 /// Runs `cmd` to completion with a deadline and a stdout byte cap, killing it on timeout.
@@ -295,6 +388,8 @@ mod tests {
             "claude-personal".to_string(),
             crate::session::instance::PriorToolSession {
                 agent_session_id: Some(parked_sid.to_string()),
+                agent_session_binding: None,
+                pi_session_path: None,
                 acp_session_id: None,
             },
         );
@@ -315,6 +410,7 @@ mod tests {
             project,
             &storage.load().unwrap(),
             &HashSet::new(),
+            None,
         );
         assert!(exclusions.contains(parked_sid));
     }

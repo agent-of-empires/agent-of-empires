@@ -72,7 +72,8 @@ interface Props {
 export function ProjectStep({ data, profile, onChange, initialTab, agents = [], onSelectSavedProject }: Props) {
   // Keep the user's tab choice while profile-scoped suggestions load.
   const [manualTab, setManualTab] = useState<Tab | null>(initialTab ?? null);
-  const { loading, saved, query, setQuery, filteredSaved, filteredRecent, hasPicks } = useProjectPicker(profile);
+  const { loading, error, retry, saved, query, setQuery, filteredSaved, filteredRecent, hasPicks } =
+    useProjectPicker(profile);
   const activeTab: Tab = manualTab ?? (!loading && !hasPicks ? "browse" : "recent");
   const setActiveTab = setManualTab;
 
@@ -201,6 +202,17 @@ export function ProjectStep({ data, profile, onChange, initialTab, agents = [], 
 
       {!data.scratch && (
         <>
+          {error && (
+            <div
+              role="alert"
+              className="mb-4 rounded-md border border-warning-600/40 bg-surface-900 px-3 py-2 text-sm text-text-secondary"
+            >
+              Saved projects could not be loaded. Browse and Clone are still available.
+              <button type="button" onClick={retry} className="ml-2 text-brand-400 hover:underline cursor-pointer">
+                Retry
+              </button>
+            </div>
+          )}
           {/* Tab bar */}
           {!loading && (
             <div className="flex gap-1 mb-4 border-b border-surface-700/30">

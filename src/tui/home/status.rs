@@ -280,6 +280,18 @@ impl HomeView {
                     }
                     metadata_changed |= self.apply_pending_archive_cursor();
                     metadata_changed |= self.session_feed.mark_snapshot_applied(snapshot);
+                    if !self.session_feed.native_interaction_available() {
+                        self.cancel_native_attachment();
+                        // A remote live-send does not run on this runtime.
+                        if self
+                            .live_send
+                            .as_ref()
+                            .is_none_or(|live| live.remote.is_none())
+                        {
+                            self.teardown_live_send();
+                        }
+                        self.pending_paste = None;
+                    }
                     if unknown_row {
                         match self.reload() {
                             Ok(()) => metadata_changed = true,

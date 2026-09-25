@@ -127,6 +127,16 @@ describe("applyEvent control state", () => {
       [stopped("rate_limit_exhausted_retries"), switched],
       { rateLimitRetriesExhausted: false },
     ],
+    // The armed park: the composer treats a worker-down 503 as re-queueable
+    // wherever the daemon would have sent, so this flag has to track the park
+    // the daemon actually sends into, not only the cap.
+    ["rate_limited", [stopped("rate_limited")], { rateLimitParked: true, rateLimitRetriesExhausted: false }],
+    ["a prompt landing ends the armed park", [stopped("rate_limited"), prompt()], { rateLimitParked: false }],
+    [
+      "an auto-resume attempt does not end the armed park, matching the daemon",
+      [stopped("rate_limited"), { RateLimitAutoResumed: { resets_at: future } }],
+      { rateLimitParked: true },
+    ],
     [
       "prompt_orphaned",
       [prompt(), stopped("prompt_orphaned")],

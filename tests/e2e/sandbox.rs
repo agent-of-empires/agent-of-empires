@@ -174,7 +174,14 @@ fn sandbox_reclaim_reports_before_it_removes() {
         "aoe sandbox reclaim --delete failed: {}",
         String::from_utf8_lossy(&deleted.stderr)
     );
-    assert!(!orphan.exists(), "the orphaned store was not removed");
+    // An orphan is reclaimed only when AoE can prove it wrote the store. This
+    // one has no content certificate, so the pass reports it and retains it.
+    let deleted_output = String::from_utf8_lossy(&deleted.stdout);
+    assert!(
+        deleted_output.contains("2222222222222222"),
+        "an unproven store must be reported.\nOutput:\n{deleted_output}"
+    );
+    assert!(orphan.exists(), "an unproven store must survive `--delete`");
     assert!(owned.exists(), "a claimed store must survive the pass");
     assert!(fresh.exists(), "a store being seeded right now was swept");
 }

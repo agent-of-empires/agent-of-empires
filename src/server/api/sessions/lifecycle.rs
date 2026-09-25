@@ -295,6 +295,62 @@ pub async fn update_session_archive(
     crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
 }
 
+/// Commit the engagement timestamp and unsink an archived or snoozed row together.
+pub async fn touch_session_access(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return crate::server::api::read_only_response();
+    }
+    let namespace = state.profile_namespace.read().await;
+    if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let Some(submission) = state
+        .session_service
+        .prompt_submission_for_session(&id)
+        .await
+    else {
+        return crate::server::api::session_not_found();
+    };
+    let lock = state.instance_lock(&id).await;
+    let guard = lock.lock().await;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(row) = instances.iter().find(|row| row.id == id) else {
+            return crate::server::api::session_not_found();
+        };
+        if row.is_trashed() || matches!(row.status, Status::Creating | Status::Deleting) {
+            return lifecycle_rejection(&state, &LifecycleTargetError::Busy.into())
+                .unwrap_or_else(|| StatusCode::CONFLICT.into_response());
+        }
+        row.source_profile.clone()
+    };
+    let persist_id = id.clone();
+    if let Err(response) = commit_profile_update(
+        &state,
+        profile,
+        "session access",
+        move |rows| {
+            if let Some(row) = rows.iter_mut().find(|row| row.id == persist_id) {
+                row.touch_last_accessed();
+            }
+        },
+        None,
+    )
+    .await
+    {
+        return response;
+    }
+    drop(guard);
+    drop(submission);
+    drop(namespace);
+    crate::server::runtime::session_mutation_response(&state, &id, None::<()>).await
+}
 /// Recheck ownership under identity and lifecycle exclusion before relocation.
 pub async fn trash_session(
     State(state): State<Arc<AppState>>,
@@ -1414,6 +1470,7 @@ pub(super) async fn prepare_agent_session(
                 }
                 let now = chrono::Utc::now();
                 if row.is_trashed()
+                    || row.is_archived()
                     || matches!(row.status, Status::Creating | Status::Deleting)
                     || row.has_fresh_lifecycle_reservation(now)
                 {
@@ -1482,6 +1539,7 @@ pub(super) async fn prepare_agent_session(
     drop(guard);
     drop(submission);
     drop(namespace);
+    let requested_wake_message = restart.as_ref().and_then(|body| body.wake_message.clone());
     let hooked = match result {
         Ok(Ok(Some((generation, mut started, native, conversation_carry)))) => {
             tokio::task::spawn_blocking(move || {
@@ -1647,6 +1705,31 @@ pub(super) async fn prepare_agent_session(
                 status: crate::daemon::TerminalTargetStatus::Restarted,
             })
         };
+        if matches!(
+            outcome,
+            Some(
+                crate::session::StartOutcome::Fresh
+                    | crate::session::StartOutcome::Resumed
+                    | crate::session::StartOutcome::FreshAfterFailedResume { .. }
+            )
+        ) {
+            let wake_message = requested_wake_message.unwrap_or_else(|| {
+                crate::session::resolve_config(&profile)
+                    .map(|config| config.session.restart_wake_message)
+                    .unwrap_or_else(|_| {
+                        crate::session::config::SessionConfig::default().restart_wake_message
+                    })
+            });
+            if !wake_message.is_empty() {
+                crate::session::restart::spawn_wake_worker(
+                    id.clone(),
+                    row.title.clone(),
+                    row.tool.clone(),
+                    wake_message,
+                    Some((profile.clone(), generation)),
+                );
+            }
+        }
         drop(rows);
         return crate::server::runtime::session_mutation_response(
             &state,

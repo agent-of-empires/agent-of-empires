@@ -43,7 +43,7 @@ const RESPAWN_BACKOFF: Duration = Duration::from_millis(500);
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Builds the client for a spawn; swapped in tests to drive lifecycles without a runner.
-type Launcher = Arc<
+pub(crate) type Launcher = Arc<
     dyn Fn(
             SpawnConfig,
             AcpSessionId,
@@ -105,6 +105,13 @@ enum WorkerKind {
     Stdio,
 }
 
+#[derive(Clone)]
+pub(super) struct PendingContextReset {
+    pub(super) profile: String,
+    pub(super) reason: String,
+    pub(super) transactions: Vec<String>,
+}
+
 struct WorkerHandle {
     client: Arc<AcpClient>,
     drain_task: JoinHandle<()>,
@@ -112,6 +119,7 @@ struct WorkerHandle {
     restart_history: Vec<Instant>,
     kind: WorkerKind,
     lease: Lease,
+    native_session_id: Option<String>,
 }
 
 impl From<WorkerPhase> for AcpWorkerState {
@@ -156,6 +164,8 @@ pub struct Supervisor<S: BroadcastSink> {
     force_respawn: SharedSet,
     /// Sessions whose worker failed before establishing a session.
     startup_failures: SharedSet,
+    /// Sessions whose isolated native identity is not durable yet.
+    pending_context_resets: SharedSet,
     /// Sessions whose crashed worker the drain task relaunched in place.
     respawned_in_place: SharedSet,
     max_concurrent_workers: u32,
@@ -191,6 +201,14 @@ pub struct AgentCommandOverride {
     pub command: String,
 }
 
+/// Which durable continuation lane a sandboxed spawn may consume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxContinuation {
+    Persisted,
+    ImportTerminal,
+    Fresh,
+}
+
 #[derive(Debug, Clone)]
 pub struct SpawnRequest {
     pub session_id: String,
@@ -209,6 +227,7 @@ pub struct SpawnRequest {
     pub stored_acp_session_id: Option<String>,
     /// Parent ACP session id to `session/fork` from.
     pub fork_from: Option<String>,
+    pub sandbox_continuation: SandboxContinuation,
     pub sandbox_info: Option<SandboxInfo>,
     pub source_profile: Option<String>,
     pub yolo_mode: bool,
@@ -217,6 +236,8 @@ pub struct SpawnRequest {
     pub agent_command_override: Option<AgentCommandOverride>,
     /// Let a `session/load` replay history into the (empty) event store for an import.
     pub seed_history_replay: bool,
+    /// Claude store selected by the conversation binding for a host Claude worker.
+    pub claude_store_pin: Option<PathBuf>,
 }
 
 impl<S: BroadcastSink> Supervisor<S> {
@@ -245,6 +266,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             incompatible_binaries: Arc::default(),
             force_respawn: Arc::default(),
             startup_failures: Arc::default(),
+            pending_context_resets: Arc::default(),
             respawned_in_place: Arc::default(),
             max_concurrent_workers,
         }
@@ -363,6 +385,23 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await
             .get(session_id)
             .is_some_and(|worker| worker.lease.epoch() == generation)
+    }
+
+    /// Return the native store owned by the current worker only when it still
+    /// owns the ACP identity being handed back to a terminal.
+    pub(crate) async fn native_handoff_store(
+        &self,
+        session_id: &str,
+        acp_session_id: &str,
+    ) -> Option<crate::session::ExecutionBinding> {
+        let workers = self.workers.lock().await;
+        let handle = workers.get(session_id)?;
+        if !lock_recover(&self.lifecycle).is_running(session_id)
+            || handle.native_session_id.as_deref() != Some(acp_session_id)
+        {
+            return None;
+        }
+        handle.client.native_store.clone()
     }
 
     /// Whether this daemon holds the session's lease in any phase, including stopping.

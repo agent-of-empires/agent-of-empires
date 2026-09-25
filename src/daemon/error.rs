@@ -13,10 +13,12 @@ pub enum ApiErrorCode {
     PendingTargetGone,
     RuntimeEpochMismatch,
     ResumeFailed,
+    NoRevive,
     CreationTrustChanged,
     CreationCancelled,
     CreationNotPending,
     AgentHooksNotAcknowledged,
+    CreateHookFailed,
 }
 
 impl ApiErrorCode {
@@ -29,10 +31,12 @@ impl ApiErrorCode {
             Self::PendingTargetGone => "pending_target_gone",
             Self::RuntimeEpochMismatch => "runtime_epoch_mismatch",
             Self::ResumeFailed => "resume_failed",
+            Self::NoRevive => "no_revive",
             Self::CreationTrustChanged => "creation_trust_changed",
             Self::CreationCancelled => "creation_cancelled",
             Self::CreationNotPending => "creation_not_pending",
             Self::AgentHooksNotAcknowledged => "agent_hooks_not_acknowledged",
+            Self::CreateHookFailed => "create_hook_failed",
         }
     }
 
@@ -42,11 +46,12 @@ impl ApiErrorCode {
             Self::LifecycleLocked
             | Self::RuntimeEpochMismatch
             | Self::ResumeFailed
+            | Self::NoRevive
             | Self::CreationTrustChanged
             | Self::CreationCancelled
             | Self::CreationNotPending => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
-            Self::AgentHooksNotAcknowledged => StatusCode::BAD_REQUEST,
+            Self::AgentHooksNotAcknowledged | Self::CreateHookFailed => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -73,10 +78,12 @@ impl ApiErrorCode {
             b"pending_target_gone" if resolving_pending_target => Self::PendingTargetGone,
             b"runtime_epoch_mismatch" => Self::RuntimeEpochMismatch,
             b"resume_failed" => Self::ResumeFailed,
+            b"no_revive" => Self::NoRevive,
             b"creation_trust_changed" => Self::CreationTrustChanged,
             b"creation_cancelled" => Self::CreationCancelled,
             b"creation_not_pending" => Self::CreationNotPending,
             b"agent_hooks_not_acknowledged" => Self::AgentHooksNotAcknowledged,
+            b"create_hook_failed" => Self::CreateHookFailed,
             _ => return None,
         };
         (status == code.status()).then_some(code)
@@ -129,6 +136,19 @@ mod tests {
                 "agent_hooks_not_acknowledged",
                 false,
                 None,
+            ),
+            (
+                StatusCode::CONFLICT,
+                "no_revive",
+                false,
+                Some(ApiErrorCode::NoRevive),
+            ),
+            (StatusCode::FORBIDDEN, "no_revive", false, None),
+            (
+                StatusCode::BAD_REQUEST,
+                "create_hook_failed",
+                false,
+                Some(ApiErrorCode::CreateHookFailed),
             ),
         ] {
             let mut headers = HeaderMap::new();

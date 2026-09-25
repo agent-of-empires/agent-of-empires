@@ -12,8 +12,8 @@ use super::agents::{
 use super::publish::collect_resumable_background_agent_launches;
 use super::teardown::tear_down_runner;
 use super::{
-    lock_recover, BroadcastSink, ResumeKind, ResumeReservation, ResumeReservationOutcome,
-    SpawnRequest, Supervisor, SupervisorError, WorkerHandle, WorkerKind,
+    lock_recover, BroadcastSink, PendingContextReset, ResumeKind, ResumeReservation,
+    ResumeReservationOutcome, SpawnRequest, Supervisor, SupervisorError, WorkerHandle, WorkerKind,
 };
 use crate::acp::acp_client::{AcpClient, AcpError, SpawnConfig};
 use crate::acp::agent_policy::AgentPolicy;
@@ -96,15 +96,15 @@ impl<S: BroadcastSink> Supervisor<S> {
         let lease = reservation.lease().clone();
         let session_id = req.session_id.as_str();
         let warmup_guard = self.warmup_guard(&req.agent).await;
-        let config = self.spawn_config(&req, lease.epoch()).await?;
+        let (config, context_reset) = self.spawn_config(&req, lease.epoch()).await?;
         debug!(
             target: "acp.supervisor",
             session = %session_id,
-            stored_id = ?req.stored_acp_session_id,
+            stored_id = ?config.stored_acp_session_id,
             "spawning structured view worker"
         );
         // Clear a partial replay from a failed import before session/load re-emits it.
-        if req.seed_history_replay {
+        if config.seed_history_replay {
             self.sink.clear_session_events(session_id);
         }
 
@@ -149,7 +149,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             spawn_config: Box::new(config),
         };
         let client = self
-            .install_worker(session_id, reservation, client, inbound, identity, kind)
+            .install_worker(
+                session_id,
+                reservation,
+                client,
+                inbound,
+                (identity, context_reset),
+                kind,
+            )
             .await?;
 
         if req.acp_mode_id.is_some() || req.yolo_mode {
@@ -178,7 +185,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         req: &SpawnRequest,
         generation: u64,
-    ) -> Result<SpawnConfig, SupervisorError> {
+    ) -> Result<(SpawnConfig, Option<PendingContextReset>), SupervisorError> {
         let profile = req.source_profile.clone().unwrap_or_default();
         let cwd = req.cwd.clone();
         let (resolved_cfg, policy) = tokio::task::spawn_blocking(move || {
@@ -248,6 +255,11 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         }
 
+        let claude_store_pin = req.claude_store_pin.clone().filter(|_| {
+            req.sandbox_info.is_none() && matches!(req.agent.as_str(), "claude" | "claude-code")
+        });
+        apply_claude_store_pin(&mut host_environment, claude_store_pin.as_deref());
+
         let mut provider_env = req.provider_env.clone();
         if let Some(model) = model.clone() {
             provider_env.push(("AOE_AGENT_MODEL".into(), model));
@@ -262,33 +274,95 @@ impl<S: BroadcastSink> Supervisor<S> {
             req.source_profile.clone(),
             req.cwd.clone(),
             host_environment.clone(),
+            claude_store_pin.clone(),
             "MCP resolution task failed",
         )
         .await;
 
-        Ok(SpawnConfig {
-            agent_key: req.agent.clone(),
-            tool: req.tool.clone(),
-            spec,
-            cwd: req.cwd.clone(),
-            additional_dirs: req.additional_dirs.clone(),
-            provider_env,
-            host_environment,
-            default_effort: effort,
-            default_effort_explicit: req.effort_explicit,
-            default_mode: acp_defaults.and_then(|defaults| defaults.mode()),
-            default_model: model,
-            socket_path: Some(socket_path),
-            stored_acp_session_id: req.stored_acp_session_id.clone(),
-            fork_from: req.fork_from.clone(),
-            sandbox_info: req.sandbox_info.clone(),
-            source_profile: req.source_profile.clone(),
-            mcp_servers,
-            seed_history_replay: req.seed_history_replay,
-            artifact_dir: crate::session::artifacts::session_artifact_dir(&req.session_id).ok(),
-            wrapper_substitution,
-            generation,
-        })
+        let (stored_acp_session_id, fork_from, seed_history_replay, context_reset, source_profile) =
+            if req.sandbox_info.as_ref().is_some_and(|info| info.enabled) {
+                let native_key = wrapper_substitution
+                    .as_ref()
+                    .map(|(_, base)| base.as_str())
+                    .unwrap_or(&req.agent);
+                let native_agent =
+                    crate::acp::agent_profiles::resolve(native_key).native_config_agent;
+                let profile = req.source_profile.clone().unwrap_or_default();
+                let id = req.session_id.clone();
+                let continuation = req.sandbox_continuation;
+                let context = tokio::task::spawn_blocking(move || {
+                    crate::migrations::v033_isolate_sandbox_content::prepare_acp_context(
+                        &profile,
+                        &id,
+                        native_agent,
+                        generation,
+                        crate::migrations::v033_isolate_sandbox_content::AcpContextUse::Launch,
+                        continuation,
+                    )
+                })
+                .await
+                .map_err(|error| {
+                    SupervisorError::Acp(AcpError::Spawn(format!(
+                        "sandbox context handoff task: {error}"
+                    )))
+                })?
+                .map_err(|error| {
+                    SupervisorError::Acp(AcpError::Spawn(format!(
+                        "sandbox context handoff: {error}"
+                    )))
+                })?;
+                let reset_profile = context.profile.clone();
+                let reset = context
+                    .notice
+                    .map(|(reason, transactions)| PendingContextReset {
+                        profile: reset_profile,
+                        reason,
+                        transactions,
+                    });
+                (
+                    context.stored_session_id,
+                    context.fork_from,
+                    context.seed_history_replay,
+                    reset,
+                    Some(context.profile),
+                )
+            } else {
+                (
+                    req.stored_acp_session_id.clone(),
+                    req.fork_from.clone(),
+                    req.seed_history_replay,
+                    None,
+                    req.source_profile.clone(),
+                )
+            };
+
+        Ok((
+            SpawnConfig {
+                agent_key: req.agent.clone(),
+                tool: req.tool.clone(),
+                spec,
+                cwd: req.cwd.clone(),
+                additional_dirs: req.additional_dirs.clone(),
+                provider_env,
+                host_environment,
+                default_effort: effort,
+                default_effort_explicit: req.effort_explicit,
+                default_mode: acp_defaults.and_then(|defaults| defaults.mode()),
+                default_model: model,
+                socket_path: Some(socket_path),
+                stored_acp_session_id,
+                fork_from,
+                sandbox_info: req.sandbox_info.clone(),
+                source_profile,
+                mcp_servers,
+                seed_history_replay,
+                artifact_dir: crate::session::artifacts::session_artifact_dir(&req.session_id).ok(),
+                wrapper_substitution,
+                generation,
+                claude_store_pin,
+            },
+            context_reset,
+        ))
     }
 
     /// Install a launched client under the reservation's lease, or retire it
@@ -299,9 +373,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         reservation: ResumeReservation,
         client: AcpClient,
         inbound: mpsc::Receiver<Event>,
-        identity: Option<RunnerIdentity>,
+        installation: (Option<RunnerIdentity>, Option<PendingContextReset>),
         kind: WorkerKind,
     ) -> Result<Arc<AcpClient>, SupervisorError> {
+        let (identity, context_reset) = installation;
         let lease = reservation.lease().clone();
         let client = Arc::new(client);
         let mut workers = self.workers.lock().await;
@@ -327,12 +402,21 @@ impl<S: BroadcastSink> Supervisor<S> {
             self.detach_orphaned_background_agents(session_id);
             Vec::new()
         };
-        let drain_task = self.start_drain_task(session_id.to_string(), lease.clone(), inbound);
+        if context_reset.is_some() {
+            lock_recover(&self.pending_context_resets).insert(session_id.to_string());
+        }
+        let drain_task = self.start_drain_task(
+            session_id.to_string(),
+            lease.clone(),
+            inbound,
+            context_reset,
+        );
         let client_for_resume = (!resumable.is_empty()).then(|| Arc::clone(&client));
         workers.insert(
             session_id.to_string(),
             WorkerHandle {
                 client: Arc::clone(&client),
+                native_session_id: None,
                 drain_task,
                 restart_history: vec![],
                 kind,
@@ -492,8 +576,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                 "runner registry has no stored_acp_session_id; need fresh spawn".into(),
             )));
         };
-        let sandbox_resources = match sandbox {
+        let sandbox_resources = match sandbox.as_ref() {
             Some(info) => {
+                let info = info.clone();
                 let cwd = cwd.clone();
                 let profile = record.source_profile.clone();
                 Some(
@@ -512,6 +597,41 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
             None => None,
         };
+        let context_reset = if sandbox.as_ref().is_some_and(|info| info.enabled) {
+            let profile = record.source_profile.clone().unwrap_or_default();
+            let id = session_id.clone();
+            let native_agent = crate::acp::agent_profiles::resolve(&agent_key).native_config_agent;
+            let generation = reservation.lease().epoch();
+            let context = tokio::task::spawn_blocking(move || {
+                crate::migrations::v033_isolate_sandbox_content::prepare_acp_context(
+                    &profile,
+                    &id,
+                    native_agent,
+                    generation,
+                    crate::migrations::v033_isolate_sandbox_content::AcpContextUse::Attach,
+                    super::SandboxContinuation::Persisted,
+                )
+            })
+            .await
+            .map_err(|error| {
+                SupervisorError::Acp(AcpError::Spawn(format!(
+                    "sandbox context handoff task: {error}"
+                )))
+            })?
+            .map_err(|error| {
+                SupervisorError::Acp(AcpError::Spawn(format!("sandbox context handoff: {error}")))
+            })?;
+            context
+                .notice
+                .map(|(reason, transactions)| PendingContextReset {
+                    profile: context.profile,
+                    reason,
+                    transactions,
+                })
+        } else {
+            None
+        };
+
         let mut client = AcpClient::attach(
             record.socket_path.clone(),
             cwd,
@@ -534,7 +654,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             reservation,
             client,
             inbound,
-            Some(identity),
+            (Some(identity), context_reset),
             WorkerKind::Attached,
         )
         .await?;
@@ -626,6 +746,18 @@ pub(super) fn overlay_env(env: &mut Vec<(String, String)>, minted: Vec<(String, 
         env.push((key, value));
     }
 }
+pub(super) fn apply_claude_store_pin(
+    environment: &mut Vec<(String, String)>,
+    store: Option<&std::path::Path>,
+) {
+    if let Some(store) = store {
+        environment.retain(|(key, _)| key != "CLAUDE_CONFIG_DIR");
+        environment.push((
+            "CLAUDE_CONFIG_DIR".into(),
+            store.to_string_lossy().into_owned(),
+        ));
+    }
+}
 
 pub(super) async fn resolve_mcp_servers(
     agent_key: &str,
@@ -633,12 +765,20 @@ pub(super) async fn resolve_mcp_servers(
     profile: Option<String>,
     cwd: PathBuf,
     session_env: Vec<(String, String)>,
+    native_config_override: Option<PathBuf>,
     failure: &'static str,
 ) -> Vec<agent_client_protocol::schema::v1::McpServer> {
     let agent_key = agent_key.to_string();
     let session = session_id.to_string();
     tokio::task::spawn_blocking(move || {
-        resolve_mcp_layers(&agent_key, &session, profile.as_deref(), &cwd, &session_env)
+        resolve_mcp_layers(
+            &agent_key,
+            &session,
+            profile.as_deref(),
+            &cwd,
+            &session_env,
+            native_config_override.as_deref(),
+        )
     })
     .await
     .unwrap_or_else(|e| {
@@ -658,10 +798,11 @@ fn resolve_mcp_layers(
     profile: Option<&str>,
     cwd: &std::path::Path,
     session_env: &[(String, String)],
+    native_config_override: Option<&std::path::Path>,
 ) -> Vec<agent_client_protocol::schema::v1::McpServer> {
     use crate::session::mcp::mcp_model::{resolve_effective, summarize};
 
-    let merged = resolve_effective(agent_key, profile, cwd, session_env);
+    let merged = resolve_effective(agent_key, profile, cwd, session_env, native_config_override);
     if !merged.is_empty() {
         info!(
             target: "acp.mcp",
@@ -715,6 +856,70 @@ mod tests {
     use crate::acp::approvals::{ApprovalDecision, Nonce};
     use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
     use crate::daemon::AcpWorkerState;
+
+    fn mcp_names(servers: &[agent_client_protocol::schema::v1::McpServer]) -> Vec<&str> {
+        use agent_client_protocol::schema::v1::McpServer;
+        servers
+            .iter()
+            .map(|server| match server {
+                McpServer::Stdio(server) => server.name.as_str(),
+                McpServer::Http(server) => server.name.as_str(),
+                McpServer::Sse(server) => server.name.as_str(),
+                _ => "unknown",
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn selected_claude_store_controls_spawn_environment_and_native_mcp() {
+        let (_home, temp) = isolate_home();
+        let declared = temp.path().join("declared");
+        let selected = temp.path().join("selected");
+        std::fs::create_dir_all(&declared).unwrap();
+        std::fs::create_dir_all(&selected).unwrap();
+        std::fs::write(
+            declared.join(".claude.json"),
+            r#"{ "mcpServers": { "declared": { "command": "declared" } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            selected.join(".claude.json"),
+            r#"{ "mcpServers": { "selected": { "command": "selected" } } }"#,
+        )
+        .unwrap();
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            format!(
+                "[host_hooks]\nbefore_session = \"printf 'CLAUDE_CONFIG_DIR={}\\nHOOK_VALUE=kept\\n'\"\n\
+                 [session.agent_config_dir]\nclaude-code = \"{}\"\n",
+                temp.path().join("hook").display(),
+                declared.display()
+            ),
+        )
+        .unwrap();
+
+        let supervisor = Supervisor::new(VecSink::new());
+        let mut request = spawn_request("selected-store");
+        request.claude_store_pin = Some(selected.clone());
+        let (config, context_reset) = supervisor.spawn_config(&request, 1).await.unwrap();
+        assert!(context_reset.is_none());
+
+        assert_eq!(mcp_names(&config.mcp_servers), ["selected"]);
+        assert_eq!(
+            config
+                .host_environment
+                .iter()
+                .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+                .map(|(_, value)| value.as_str()),
+            selected.to_str()
+        );
+        assert!(config
+            .host_environment
+            .contains(&("HOOK_VALUE".into(), "kept".into())));
+    }
 
     #[test]
     fn respawn_refreshes_the_model_pin_and_keeps_explicit_effort() {
@@ -934,7 +1139,7 @@ mod tests {
 
         let resolve = |profile: Option<&'static str>, cwd: std::path::PathBuf| async move {
             let merged = tokio::task::spawn_blocking(move || {
-                resolve_mcp_layers("claude", "resolve-test", profile, &cwd, &[])
+                resolve_mcp_layers("claude", "resolve-test", profile, &cwd, &[], None)
             })
             .await
             .unwrap();

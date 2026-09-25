@@ -32,6 +32,7 @@ function setup(overrides: Overrides = {}) {
   return { ...utils, onConfirm, onTrash, onCancel };
 }
 
+const defaults = { delete_worktree: true, delete_branch: false, delete_sandbox: false, delete_to_trash: false };
 const box = (id: string) => screen.queryByTestId(id) as HTMLLabelElement | null;
 const toggle = (id: string) => fireEvent.click(box(id)!.querySelector("span")!);
 const enter = () => fireEvent.keyDown(document, { key: "Enter" });
@@ -178,6 +179,21 @@ describe("DeleteSessionDialog confirm body", () => {
     toggle("delete-session-checkbox-keep-scratch");
     enter();
     expect(second.onConfirm).toHaveBeenCalledWith({ ...body({ delete_worktree: false }), keep_scratch: true });
+  });
+
+  it.each([
+    [["agent-beta"], '"agent-beta" still uses it'],
+    [["agent-beta", "agent-gamma"], "2 other sessions still use it"],
+  ])("says the worktree and branch are kept when %j still use them (#4084)", (sharedWith, text) => {
+    const { onConfirm } = setup({
+      worktreeSharedWith: sharedWith,
+      cleanupDefaults: { ...defaults, delete_branch: true },
+    });
+    expect(screen.getByTestId("delete-session-shared-worktree").textContent).toContain(text);
+    expect(box("delete-session-checkbox-worktree")).toBeNull();
+    expect(box("delete-session-checkbox-branch")).toBeNull();
+    enter();
+    expect(onConfirm).toHaveBeenCalledWith(body({ delete_worktree: false }));
   });
 });
 

@@ -402,84 +402,40 @@ fn test_delete_selected_group_updates_groups_field() {
     assert!(!group_paths.contains(&"work/projects"));
 }
 
-/// Archiving a manual group archives every session under it, including
-/// nested subgroups, and leaves sessions outside the group untouched.
+/// A group archive is admitted as one selection; only daemon receipts may
+/// change its members, and unrelated sessions are not submitted.
 #[test]
 #[serial]
-fn test_archive_selected_group_archives_all_members() {
+fn group_archive_submits_its_members_without_local_mutation() {
+    use crate::daemon::{RuntimeCursor, SessionMutation};
     let mut env = create_test_env_with_group_sessions();
-
-    // Select the "work" group.
-    for (i, item) in env.view.flat_items.iter().enumerate() {
-        if let Item::Group { path, .. } = item {
-            if path == "work" {
-                env.view.cursor = i;
-                env.view.update_selected();
-                break;
-            }
+    for (index, item) in env.view.flat_items.iter().enumerate() {
+        if matches!(item, Item::Group { path, .. } if path == "work") {
+            env.view.cursor = index;
+            env.view.update_selected();
+            break;
         }
     }
-    assert_eq!(env.view.selected_group.as_deref(), Some("work"));
-
-    // "work" holds two direct sessions plus one in the nested "work/projects".
-    assert_eq!(env.view.active_sessions_in_selected_group().len(), 3);
-
+    let members: std::collections::HashSet<_> = env
+        .view
+        .active_sessions_in_selected_group()
+        .into_iter()
+        .collect();
+    assert_eq!(members.len(), 3);
+    let mut respond = env.view.session_feed.command_driver_for_test();
     env.view.archive_selected_group().unwrap();
-
-    for inst in env.view.instances() {
-        let in_work = inst.group_path == "work" || inst.group_path.starts_with("work/");
-        assert_eq!(
-            inst.is_archived(),
-            in_work,
-            "session {} (group {:?}) archived state should match group membership",
-            inst.title,
-            inst.group_path
-        );
-    }
-}
-
-/// Locks #1868: bulk archive persists synchronously even though tmux teardown runs
-/// off-thread. Real tmux state is asserted in `tests/e2e/archive_restore.rs`.
-#[test]
-#[serial]
-fn test_archive_selected_group_widened_teardown_persists_synchronously() {
-    let mut env = create_test_env_with_group_sessions();
-
-    for (i, item) in env.view.flat_items.iter().enumerate() {
-        if let Item::Group { path, .. } = item {
-            if path == "work" {
-                env.view.cursor = i;
-                env.view.update_selected();
-                break;
-            }
-        }
-    }
-    assert_eq!(env.view.selected_group.as_deref(), Some("work"));
-    let work_ids: Vec<String> = env.view.active_sessions_in_selected_group();
-    assert_eq!(work_ids.len(), 3);
-
-    let result = env.view.archive_selected_group();
-    assert!(
-        result.is_ok(),
-        "archive_selected_group must return Ok even when the off-thread \
-         teardown is fire-and-forget; got {:?}",
-        result
-    );
-
-    for id in &work_ids {
-        let inst = env
-            .view
-            .instances()
-            .find(|i| &i.id == id)
-            .expect("group member must still exist after archive");
-        assert!(
-            inst.is_archived(),
-            "session {} ({}) must have archived_at set synchronously \
-             on the input thread before archive_selected_group returns",
-            inst.title,
-            id
-        );
-    }
+    assert!(env.view.instances().all(|row| !row.is_archived()));
+    let submitted: std::collections::HashSet<_> = (0..members.len()).map(|_| {
+        let (id, mutation) = respond(Ok(RuntimeCursor { epoch: "test".into(), revision: 2 })).unwrap();
+        assert!(matches!(mutation, SessionMutation::Archive(body) if body.archived && body.kill_pane));
+        id
+    }).collect();
+    assert_eq!(submitted, members);
+    assert!(respond(Ok(RuntimeCursor {
+        epoch: "test".into(),
+        revision: 2
+    }))
+    .is_none());
 }
 
 /// In project mode, archiving a project header archives every live session mapping to that
@@ -527,18 +483,27 @@ fn test_archive_selected_group_project_mode() {
     assert_eq!(view.selected_group.as_deref(), Some("alpha"));
     assert_eq!(view.active_sessions_in_selected_group().len(), 2);
 
+    let mut respond = view.session_feed.command_driver_for_test();
     view.archive_selected_group().unwrap();
-
-    for inst in view.instances() {
-        let in_alpha = inst.project_path == "/tmp/alpha";
-        assert_eq!(
-            inst.is_archived(),
-            in_alpha,
-            "session {} (repo {}) archived state should match project membership",
-            inst.title,
-            inst.project_path
-        );
-    }
+    let submitted: std::collections::HashSet<_> = (0..2)
+        .map(|_| {
+            let (id, mutation) = respond(Ok(crate::daemon::RuntimeCursor {
+                epoch: "test".into(),
+                revision: 2,
+            }))
+            .unwrap();
+            assert!(
+                matches!(mutation, crate::daemon::SessionMutation::Archive(body) if body.archived)
+            );
+            id
+        })
+        .collect();
+    let expected: std::collections::HashSet<_> = view
+        .instances()
+        .filter(|row| row.project_path == "/tmp/alpha")
+        .map(|row| row.id.clone())
+        .collect();
+    assert_eq!(submitted, expected);
 }
 
 /// The group-level prompt opens a confirmation carrying the `archive_group` action and
@@ -564,11 +529,14 @@ fn test_prompt_archive_selected_group() {
         Some("archive_group")
     );
 
-    // Confirm, which archives the group and clears the prompt.
+    // A confirmation submits to the daemon; only the published archive markers
+    // make a second prompt a no-op.
     env.view.confirm_dialog = None;
-    env.view.archive_selected_group().unwrap();
-
-    // With every member archived, a second prompt is a silent no-op.
+    with_canonical_group_archive(&mut env, |env| {
+        env.view.archive_selected_group().unwrap();
+    });
+    env.view.selected_group = Some("work".to_string());
+    assert!(env.view.active_sessions_in_selected_group().is_empty());
     env.view.prompt_archive_selected_group();
     assert!(env.view.confirm_dialog.is_none());
 }

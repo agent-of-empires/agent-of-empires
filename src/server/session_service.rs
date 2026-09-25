@@ -257,8 +257,32 @@ pub(crate) enum SendTurnError {
     /// coming; retryable, and nothing was published, so the transcript is
     /// not left with a prompt no agent ever received. See #1748 and #3172.
     WorkerNotReady,
+    /// Pre-publish: `no_revive` was set and delivering this turn would have
+    /// required resuming a worker that is not currently running.
+    RevivalRefused,
     /// Post-publish: the forward to the agent failed.
     Send(crate::acp::supervisor::SupervisorError),
+}
+
+/// Outcome of [`SessionService::touch_and_wake_on_prompt`].
+pub(crate) enum PromptTouch {
+    /// Touched (and woken, if archived/snoozed/idle-dormant); carries
+    /// whether this specifically was the idle-dormant wake, the flag
+    /// `prompt_dispatch_under_submission` and `send_turn` need.
+    Touched { idle_dormant: bool },
+    /// `no_revive` was set and the session needed archived/snoozed/
+    /// idle-dormant revival to accept this prompt; refused before any
+    /// mutation.
+    RevivalRefused,
+}
+
+impl PromptTouch {
+    /// The idle-dormant flag for a `Touched` outcome. Only meaningful when
+    /// the caller passed `no_revive: false`, which never produces
+    /// `RevivalRefused`.
+    pub(crate) fn idle_dormant(&self) -> bool {
+        matches!(self, PromptTouch::Touched { idle_dormant: true })
+    }
 }
 
 /// Everything [`SessionService::send_turn`] needs beyond the caller and
@@ -275,6 +299,13 @@ pub(crate) struct SendTurnRequest<'a> {
     /// continuation) rather than the user typing it just now, so the
     /// transcript model can skip rendering a duplicate row for it.
     pub synthesized: bool,
+    /// Refuse rather than resume a worker that is not currently running
+    /// (#4081 review: the `WorkerDown`-only check in `acp_prompt` misses a
+    /// rate-limit-exhausted park, where dispatch is `Sent` but no worker is
+    /// alive). Enforced here, at the same `is_running` check that decides
+    /// whether to resume, rather than by a separate liveness probe that
+    /// would race it.
+    pub no_revive: bool,
 }
 
 impl std::fmt::Display for SendTurnError {
@@ -285,6 +316,7 @@ impl std::fmt::Display for SendTurnError {
             Self::ModeApplication(e) => write!(f, "mode application failed: {e}"),
             Self::ResumeFailed(e) => write!(f, "worker resume failed: {e}"),
             Self::WorkerNotReady => write!(f, "worker not ready"),
+            Self::RevivalRefused => write!(f, "no_revive: reviving a stopped worker is required"),
             Self::Send(e) => write!(f, "prompt forward failed: {e}"),
         }
     }
@@ -372,6 +404,7 @@ impl SessionService {
         id: &str,
         title: &str,
         profile: &str,
+        request_key: Option<&str>,
     ) -> anyhow::Result<CreationGuard> {
         let entry = Arc::new(std::sync::Mutex::new(CreationEntry {
             lifecycle: CreationLifecycle::Running,
@@ -380,6 +413,7 @@ impl SessionService {
                 title: title.to_owned(),
                 profile: profile.to_owned(),
                 phase: CreationPhase::Reserving,
+                request_key: request_key.map(str::to_owned),
                 command: None,
                 output: Vec::new(),
                 cancelled: false,
@@ -623,23 +657,26 @@ impl SessionService {
         }
     }
 
-    /// Record that a prompt is arriving: bump `last_accessed_at` and clear
-    /// any archive, snooze or idle-dormant park, in memory and on disk,
-    /// under the instance lock so it serializes with other lifecycle edits.
-    /// Returns whether the session was idle-dormant, which callers pass to
-    /// `prompt_dispatch_under_submission` and `send_turn` so the wake forces a
-    /// resume. Shared by the user prompt handlers and the plugin turn path
-    /// (#3686), which all run it under their submission guard.
-    pub(crate) async fn touch_and_wake_on_prompt(&self, id: &str) -> bool {
+    /// Record that a prompt is arriving. `no_revive` refuses atomically,
+    /// under the same per-session lock, rather than waking an
+    /// archived/snoozed/idle-dormant session (#4081 review: a client-side
+    /// liveness check before this call would race a concurrent archive,
+    /// snooze, or wake).
+    pub(crate) async fn touch_and_wake_on_prompt(&self, id: &str, no_revive: bool) -> PromptTouch {
         let inst_lock = self.instance_lock(id).await;
         let _guard = inst_lock.lock().await;
         let (profile, wake, woke_idle_dormant) = {
             let mut instances = self.instances.write().await;
             let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-                return false;
+                return PromptTouch::Touched {
+                    idle_dormant: false,
+                };
             };
             let was_idle_dormant = inst.is_idle_dormant();
             let wake = inst.is_archived() || inst.is_snoozed() || was_idle_dormant;
+            if no_revive && wake {
+                return PromptTouch::RevivalRefused;
+            }
             inst.touch_last_accessed();
             self.invalidate_disk_snapshots();
             if was_idle_dormant {
@@ -676,7 +713,9 @@ impl SessionService {
                 ),
             }
         }
-        woke_idle_dormant
+        PromptTouch::Touched {
+            idle_dormant: woke_idle_dormant,
+        }
     }
 
     /// Deliver a turn to a structured session: resume a dead/dormant worker
@@ -697,6 +736,7 @@ impl SessionService {
             woke_idle_dormant,
             prompt_id,
             synthesized,
+            no_revive,
         } = turn;
         use crate::server::acp_reconciler::ResumeTrigger;
         // Ownership gate, before ANY side effect (no wake, resume, publish,
@@ -734,6 +774,9 @@ impl SessionService {
         // mid-respawn worker, so a healthy session never double-spawns. See
         // #1748.
         let needs_resume = woke_idle_dormant || !self.acp_supervisor.is_running(id).await;
+        if no_revive && needs_resume {
+            return Err(SendTurnError::RevivalRefused);
+        }
         if needs_resume {
             match crate::server::acp_reconciler::trigger_resume_background(self, id).await {
                 Ok(ResumeTrigger::NotFound) => return Err(SendTurnError::SessionNotFound),
@@ -919,6 +962,7 @@ impl SessionService {
                     woke_idle_dormant: false,
                     prompt_id: None,
                     synthesized,
+                    no_revive: false,
                 },
             )
             .await
@@ -1506,6 +1550,7 @@ impl SessionService {
                     woke_idle_dormant: false,
                     prompt_id: None,
                     synthesized: false,
+                    no_revive: false,
                 },
             )
             .await
@@ -1728,33 +1773,24 @@ impl SessionService {
         idle_dormant: bool,
     ) -> crate::acp::dispatch::PromptDispatch {
         let running = self.acp_supervisor.is_running(id).await;
-        // Settled here, under the guard, rather than probed by each handler
-        // before it claims one: a reconciler park landing between a handler's
-        // probe and its admission would otherwise decide `WorkerDown` for a
-        // session nothing is going to un-park. Only a worker-less session that
-        // is not already sendable pays the query.
-        let rate_limit_exhausted =
-            !running && !idle_dormant && self.is_rate_limit_exhausted_park(id).await;
+        // Settled here, under the guard, rather than probed by each handler before it
+        // claims one.
+        let rate_limit_parked = !running && !idle_dormant && self.is_rate_limit_parked(id).await;
         let liveness = crate::acp::dispatch::WorkerLiveness {
             running,
             idle_dormant,
-            rate_limit_exhausted,
+            rate_limit_parked,
         };
         crate::acp::dispatch::decide(&self.fold_control_state(id).await, liveness)
     }
 
-    /// Whether the session is parked on the redelivery cap (#3688). Off the
-    /// runtime: `rate_limit_park` takes the store's lock.
-    async fn is_rate_limit_exhausted_park(&self, id: &str) -> bool {
+    /// See [`crate::acp::dispatch::WorkerLiveness::rate_limit_parked`].
+    async fn is_rate_limit_parked(&self, id: &str) -> bool {
         let store = Arc::clone(&self.acp_event_store);
         let id = id.to_string();
-        tokio::task::spawn_blocking(move || {
-            store
-                .rate_limit_park(&id)
-                .is_some_and(|park| park.cap_reached)
-        })
-        .await
-        .unwrap_or(false)
+        tokio::task::spawn_blocking(move || store.rate_limit_park(&id).is_some())
+            .await
+            .unwrap_or(false)
     }
 
     /// Drop a deleted session's submission lock, mirroring the `instance_locks`
@@ -2393,6 +2429,7 @@ mod tests {
                         woke_idle_dormant: false,
                         prompt_id: None,
                         synthesized: false,
+                        no_revive: false,
                     },
                 )
                 .await,
@@ -2409,6 +2446,7 @@ mod tests {
                         woke_idle_dormant: false,
                         prompt_id: None,
                         synthesized: false,
+                        no_revive: false,
                     },
                 )
                 .await,
@@ -2425,6 +2463,7 @@ mod tests {
                         woke_idle_dormant: false,
                         prompt_id: None,
                         synthesized: false,
+                        no_revive: false,
                     },
                 )
                 .await,
@@ -2446,6 +2485,7 @@ mod tests {
                         woke_idle_dormant: false,
                         prompt_id: None,
                         synthesized: false,
+                        no_revive: false,
                     },
                 )
                 .await,
@@ -2462,6 +2502,7 @@ mod tests {
                         woke_idle_dormant: false,
                         prompt_id: None,
                         synthesized: false,
+                        no_revive: false,
                     },
                 )
                 .await,
@@ -3153,7 +3194,7 @@ mod tests {
                 true,
                 |s| {
                     Box::pin(async move {
-                        s.touch_and_wake_on_prompt("s").await;
+                        s.touch_and_wake_on_prompt("s", false).await;
                     })
                 },
                 |i| !i.is_idle_dormant(),
@@ -3169,6 +3210,7 @@ mod tests {
             let read_epoch = state
                 .mutation_epoch
                 .load(std::sync::atomic::Ordering::SeqCst);
+            let metadata = state.canonical_metadata.read().await.clone();
 
             mutate(Arc::clone(&state.session_service)).await;
             crate::server::reload::reload_state_instances_from_disk(
@@ -3177,8 +3219,8 @@ mod tests {
                 vec![],
                 crate::server::state::StatusSource::DiskOnly,
                 read_epoch,
-                state.canonical_metadata.read().await.clone(),
-                Default::default(),
+                metadata,
+                std::collections::HashMap::new(),
             )
             .await;
 

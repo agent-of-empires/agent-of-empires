@@ -457,7 +457,7 @@ function BlockColumns({ block, pluginId, sessionId }: BlockProps) {
   if (kids.length === 0) return null;
   return (
     <div
-      className={`grid gap-1.5 ${kids.length > 1 ? "grid-cols-2" : "grid-cols-1"}`}
+      className={`grid gap-1.5 ${kids.length > 1 ? "grid-cols-1 sm:grid-cols-2" : "grid-cols-1"}`}
       data-testid="plugin-pane-columns"
     >
       {kids.map((c, i) => (

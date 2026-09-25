@@ -12,6 +12,7 @@ import {
   stopped,
   toolCallCompleted,
   toolCallStarted,
+  usageUpdated,
   waitForComposerConnected,
 } from "./helpers/acpMock";
 import { iPhone13 } from "./helpers/viewports";
@@ -240,6 +241,8 @@ test("mobile composer footer keeps the Send action reachable when config control
           ],
         },
       ]),
+      // Usage shows at every width, so its hint competes for footer space (#3916).
+      usageUpdated({ used: 1_950_000, size: 2_000_000, cost: { amount: 1234.5678, currency: "EUR" } }),
     ],
   });
   await openStructuredSession(page, mock);
@@ -249,6 +252,7 @@ test("mobile composer footer keeps the Send action reachable when config control
   await expect(page.getByTestId("config-option-model")).toBeVisible({
     timeout: 15_000,
   });
+  await expect(page.getByTestId("composer-usage")).toBeVisible();
 
   // Core regression: the footer must not overflow horizontally, so the
   // right action cluster is never pushed past the clipped viewport edge.
@@ -271,6 +275,35 @@ test("mobile composer footer keeps the Send action reachable when config control
   await send.click();
   await expect.poll(() => mock.promptBodies.length).toBe(1);
   expect(mock.promptBodies[0]!.text).toBe("reachable on mobile");
+
+  // Mid-turn the cluster holds Stop and Queue, its widest state. An ancestor
+  // clips the composer, so the footer's own scroll width cannot see overflow.
+  for (const name of ["Stop", "Queue follow-up message"]) {
+    const button = page.getByRole("button", { name, exact: true });
+    await expect(button).toBeVisible();
+    const b = (await button.boundingBox())!;
+    expect(b.x + b.width, name).toBeLessThanOrEqual(page.viewportSize()!.width);
+  }
+});
+
+test("mobile composer shows a compact usage hint inside the viewport", async ({ page }) => {
+  const mock = await mockAcpSession(page, {
+    title: "story-usage-mobile",
+    initialEvents: [usageUpdated({ used: 120_000, size: 200_000, cost: { amount: 0.42, currency: "USD" } })],
+  });
+  await openStructuredSession(page, mock);
+
+  const usage = page.getByTestId("composer-usage");
+  await expect(usage).toBeVisible({ timeout: 15_000 });
+  await expect(usage).toHaveAccessibleName(/Context window: .* tokens used \(60%\)/);
+  await expect(usage).toContainText("60%");
+  await expect(usage).toContainText("0.42");
+  // Compact variant: token counts are desktop-only.
+  await expect(usage.getByText("120k/200k")).toBeHidden();
+
+  const box = (await usage.boundingBox())!;
+  expect(box.x).toBeGreaterThanOrEqual(0);
+  expect(box.x + box.width).toBeLessThanOrEqual(page.viewportSize()!.width);
 });
 
 // ────────────────────────── memory recall ─────────────────────────

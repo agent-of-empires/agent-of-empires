@@ -14,6 +14,31 @@ use serial_test::serial;
 use tempfile::TempDir;
 use tui_input::Input;
 
+fn observed_fork_parent(agent: &str) -> Instance {
+    let mut instance = Instance::new("parent", "/tmp/repo");
+    instance.source_profile = "test".into();
+    instance.tool = agent.into();
+    let sid = "parent-1111-2222-3333-444444444444";
+    instance.set_agent_conversation(
+        Some(sid.into()),
+        Some(crate::session::ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: agent.into(),
+                stores: vec!["/native-store".into()],
+                configuration: Vec::new(),
+                cwd: "/tmp/repo".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            }),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        }),
+        None,
+    );
+    instance
+}
+
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
@@ -43,6 +68,7 @@ mod scroll_pane_isolation;
 mod search;
 mod session_feed_tests;
 mod settings_scroll_wiring;
+mod sidebar_position;
 mod stacked_single_seam;
 mod status_rows_menu;
 mod store_move;
@@ -793,29 +819,61 @@ fn with_canonical_archive(env: &mut TestEnv, action: impl FnOnce(&mut TestEnv)) 
     use crate::daemon::{RuntimeCursor, SessionMutation};
     let mut respond = env.view.session_feed.command_driver_for_test();
     action(env);
+    let revision = env.view.session_feed.next_revision_for_test();
     let Some((id, SessionMutation::Archive(body))) = respond(Ok(RuntimeCursor {
         epoch: "test".into(),
-        revision: 2,
+        revision,
     })) else {
         return;
     };
-    publish_canonical_rows(env, &id, body.archived);
+    publish_canonical_rows(env, &[(id, body.archived)], revision);
 }
 
-/// Publish the view's rows as the daemon would report them, with `stamped`'s
-/// archive marker set to `archived`.
-fn publish_canonical_rows(env: &mut TestEnv, stamped: &str, archived: bool) {
+fn with_canonical_group_archive(env: &mut TestEnv, action: impl FnOnce(&mut TestEnv)) {
+    use crate::daemon::{RuntimeCursor, SessionMutation};
+    let expected: std::collections::HashSet<_> = env
+        .view
+        .active_sessions_in_selected_group()
+        .into_iter()
+        .collect();
+    assert!(!expected.is_empty());
+    let mut respond = env.view.session_feed.command_driver_for_test();
+    action(env);
+    assert!(expected.iter().all(|id| env
+        .view
+        .get_instance(id)
+        .is_some_and(|row| !row.is_archived())));
+    let first_revision = env.view.session_feed.next_revision_for_test();
+    let mut received = std::collections::HashSet::new();
+    let stamps: Vec<_> = (0..expected.len())
+        .map(|index| {
+            let (id, mutation) = respond(Ok(RuntimeCursor {
+                epoch: "test".into(),
+                revision: first_revision + index as u64,
+            }))
+            .expect("each selected group member submitted");
+            assert!(matches!(mutation, SessionMutation::Archive(body) if body.archived && body.kill_pane));
+            received.insert(id.clone());
+            (id, true)
+        })
+        .collect();
+    assert_eq!(received, expected);
+    publish_canonical_rows(env, &stamps, first_revision + stamps.len() as u64 - 1);
+}
+
+/// Publish the view's rows with the daemon's archive stamps for this commit.
+fn publish_canonical_rows(env: &mut TestEnv, stamps: &[(String, bool)], revision: u64) {
     use crate::tui::session_feed::SessionFeedResult;
     let now = chrono::Utc::now().to_rfc3339();
     let sessions: Vec<crate::daemon::SessionResponse> = env
         .view
         .instances()
         .map(|inst| {
-            let archived_at = if inst.id == stamped {
-                archived.then(|| now.clone())
-            } else {
-                inst.archived_at.map(|at| at.to_rfc3339())
-            };
+            let archived_at = stamps
+                .iter()
+                .find(|(id, _)| id == &inst.id)
+                .map(|(_, archived)| archived.then(|| now.clone()))
+                .unwrap_or_else(|| inst.archived_at.map(|at| at.to_rfc3339()));
             serde_json::from_value(serde_json::json!({
                 "id": inst.id,
                 "title": inst.title,
@@ -833,7 +891,7 @@ fn publish_canonical_rows(env: &mut TestEnv, stamped: &str, archived: bool) {
     let snapshot = crate::daemon::RuntimeSnapshot {
         cursor: crate::daemon::RuntimeCursor {
             epoch: "test".into(),
-            revision: 2,
+            revision,
         },
         contents: crate::daemon::RuntimeContents {
             health: crate::daemon::RuntimeHealth::Healthy,

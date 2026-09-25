@@ -85,36 +85,12 @@ pub async fn queue_enqueue(
     if req.text.trim().is_empty() && req.attachments.is_empty() {
         return (StatusCode::BAD_REQUEST, "empty prompt").into_response();
     }
-    if req.text.len() > MAX_QUEUED_TEXT_BYTES {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
-                "queued prompt text exceeds the {} KiB limit",
-                MAX_QUEUED_TEXT_BYTES / 1024
-            ),
-        )
-            .into_response();
+    if let Err((status, message)) = validate_queued_text(&req.text) {
+        return (status, message).into_response();
     }
-    // Re-enqueuing an existing id rewrites that row's text and replaces its
-    // blobs, so it is the same kind of mutation `edit_queued_prompt` and
-    // `remove_queued_prompt` serialize against: landing inside a drain's
-    // snapshot-to-send window sends the old text and then retires the row along
-    // with the freshly buffered bytes (#3621). Claimed here rather than in
-    // `buffer_and_enqueue`, which the prompt endpoint reaches already holding
-    // the guard and which is not reentrant.
+    // Serialize replacements with a concurrent drain (#3621). The prompt
+    // endpoint already holds this guard before calling buffer_and_enqueue.
     let _submission = state.session_service.prompt_submission(&id).await;
-    // Depth cap. Re-enqueuing an existing id replaces that row, so it must not
-    // count against a full queue.
-    {
-        let queue = state.session_service.queued_prompts_snapshot(&id).await;
-        if queue.len() >= MAX_QUEUED_PROMPTS_PER_SESSION && !queue.iter().any(|q| q.id == req.id) {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                format!("queue is full ({MAX_QUEUED_PROMPTS_PER_SESSION} prompts)"),
-            )
-                .into_response();
-        }
-    }
 
     // Decode, validate and capability-gate the attachments exactly as the live
     // prompt path does.
@@ -141,6 +117,19 @@ pub async fn queue_enqueue(
     }
 }
 
+fn validate_queued_text(text: &str) -> Result<(), (StatusCode, String)> {
+    if text.len() > MAX_QUEUED_TEXT_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "queued prompt text exceeds the {} KiB limit",
+                MAX_QUEUED_TEXT_BYTES / 1024
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Buffer already-validated attachment blobs under `prompt_id` and append the
 /// prompt to the session's server-owned queue.
 ///
@@ -157,6 +146,15 @@ pub(super) async fn buffer_and_enqueue(
     origin_device: Option<String>,
     created_at: String,
 ) -> Result<crate::daemon::QueuedPromptEntry, (StatusCode, String)> {
+    validate_queued_text(&text)?;
+    let queue = state.session_service.queued_prompts_snapshot(id).await;
+    if queue.len() >= MAX_QUEUED_PROMPTS_PER_SESSION && !queue.iter().any(|row| row.id == prompt_id)
+    {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("queue is full ({MAX_QUEUED_PROMPTS_PER_SESSION} prompts)"),
+        ));
+    }
     // Per-session buffer cap, so an undrained queue cannot grow without bound.
     // Re-enqueuing the same id replaces its blobs, so subtract what this prompt
     // already holds before checking headroom.

@@ -978,37 +978,42 @@ fn restore_all_from_trash_restores_every_row() {
     );
 }
 
-/// "Restore All" on the Archived section unarchives every archived session.
+/// Restore All queues every archived row without writing a local substitute.
 #[test]
 #[serial]
-fn unarchive_all_unarchives_every_row() {
+fn unarchive_all_submits_all_archived_rows() {
+    use crate::daemon::{RuntimeCursor, SessionMutation};
     let mut env = create_test_env_with_sessions(3);
     for i in 0..2 {
         env.view.cursor = i;
         env.view.update_selected();
-        with_canonical_archive(&mut env, |env| {
-            env.view.toggle_archive_at_cursor().unwrap();
-        });
+        with_canonical_archive(&mut env, |env| env.view.toggle_archive_at_cursor().unwrap());
     }
-    assert_eq!(
-        env.view
-            .instances
-            .values()
-            .filter(|i| i.is_archived())
-            .count(),
-        2
-    );
-
+    let expected: std::collections::HashSet<_> = env
+        .view
+        .instances()
+        .filter(|row| row.is_archived())
+        .map(|row| row.id.clone())
+        .collect();
+    assert_eq!(expected.len(), 2);
+    let mut respond = env.view.session_feed.command_driver_for_test();
     env.view.unarchive_all();
     assert_eq!(
-        env.view
-            .instances
-            .values()
-            .filter(|i| i.is_archived())
-            .count(),
-        0,
-        "Restore All (archived) must unarchive every row"
+        env.view.instances().filter(|row| row.is_archived()).count(),
+        2
     );
+    let submitted: std::collections::HashSet<_> = (0..2)
+        .map(|_| {
+            let (id, mutation) = respond(Ok(RuntimeCursor {
+                epoch: "test".into(),
+                revision: 3,
+            }))
+            .unwrap();
+            assert!(matches!(mutation, SessionMutation::Archive(body) if !body.archived));
+            id
+        })
+        .collect();
+    assert_eq!(submitted, expected);
 }
 
 /// The Trash section renders in the pinned shelf with its distinct type glyph,

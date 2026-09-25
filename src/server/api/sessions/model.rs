@@ -54,6 +54,7 @@ impl SessionResponse {
             agent_pane: inst.agent_pane.clone(),
             auxiliary: inst.auxiliary.clone(),
             id: inst.id.clone(),
+            idempotency_key: inst.idempotency_key.clone(),
             title: inst.title.clone(),
             project_path: inst.project_path.clone(),
             artifact_dir: crate::session::artifacts::artifact_dir_path(&inst.id)
@@ -139,11 +140,6 @@ impl SessionResponse {
             notify_on_error: inst.notify_on_error,
             view: inst.view,
             context_resume: Some(context_resume_for(inst)),
-            queued_prompts: {
-                let mut q = inst.queued_prompts.clone();
-                q.sort_by_key(|e| e.seq);
-                q
-            },
             acp_worker_state,
             pending_approvals: Vec::new(),
             rate_limit: None,

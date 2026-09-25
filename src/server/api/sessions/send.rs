@@ -154,6 +154,7 @@ pub async fn send_message(
 
     match send_result {
         Ok(Ok((outcome, started))) => {
+            let body = serde_json::json!({"sent": true});
             // ensure_pane_ready mutated `started` (status, agent_session_id,
             // last_start_time, last_error) on the clone. Sync those back to
             // the live entry so the next request sees a coherent view;
@@ -171,7 +172,7 @@ pub async fn send_message(
             } else {
                 // Session was deleted between the send and the stamp; nothing
                 // left to persist.
-                return (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response();
+                return (StatusCode::OK, Json(body)).into_response();
             };
             drop(instances);
             let outcome_already_alive = matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
@@ -197,7 +198,7 @@ pub async fn send_message(
             if let Err(error) = persisted {
                 tracing::warn!(target: "http.api.sessions", %error, "send_message persistence task failed");
             }
-            (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response()
+            (StatusCode::OK, Json(body)).into_response()
         }
         Ok(Err(boxed)) => {
             let (started, outcome, send_err) = *boxed;

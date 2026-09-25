@@ -19,8 +19,7 @@ use crate::containers::{self, DockerContainer};
 use crate::session::config::container_config;
 use crate::session::conversation_carry::ConversationCarry;
 use crate::session::environment::{
-    build_docker_env_args_with_managed_codex_home, resolved_sandbox_environment, shell_escape,
-    shell_escape_script_word,
+    build_docker_env_args_with_managed_codex_home, shell_escape, shell_escape_script_word,
 };
 use crate::session::poller::SessionPoller;
 use crate::tmux;
@@ -30,17 +29,23 @@ use crate::session::capture::{
     generate_session_uuid, hermes_poll_fn_sandboxed_store, is_valid_session_id,
     kimi_poll_fn_sandboxed_store, omp_host_routing_environment, omp_poll_fn, omp_poll_fn_sandboxed,
     omp_sandbox_launch_marker, prime_agent_poll_fn_sandboxed, reject_omp_secret_args,
-    resolve_omp_store_layout, resolve_omp_store_layout_in_container_with_environment,
-    resolve_omp_store_layout_with_environment, try_capture_omp_session_id_in_container,
+    resolve_omp_store_layout, try_capture_omp_session_id_in_container,
     validate_omp_capture_metadata, validated_session_id, OmpCaptureMetadata, OmpCapturePlan,
     OmpCliCaptureOptions, OmpStoreKind, PrimeRootPublication,
 };
 mod accessors;
 mod container;
+mod execution;
+pub(crate) use execution::{ActiveExecution, CaptureContext, ConversationKey, ConversationState};
+pub use execution::{
+    ConversationBinding, ConversationProvenance, ExecutionBinding, ExecutionLocation,
+};
 mod flags;
 mod hooks;
+mod identity_sidecar;
 mod kill;
 mod launch_command;
+mod prime_capture;
 
 /// Identity extension shared by supported agents. AoE writes it to the app
 /// directory for host launches and into the agent's private sandbox bind for
@@ -71,12 +76,13 @@ pub(crate) use accessors::resolved_agent_for;
 pub use flags::{is_valid_session_color, SessionBucket, SESSION_COLORS};
 pub(crate) use lifecycle::NEWER_GENERATION_BUSY_REASON;
 pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservationError};
+
+#[cfg(test)]
+pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome};
 pub(crate) use resume::{LaunchReservation, ResumeAttemptPolicy, ResumeLaunchOptions};
-pub(crate) use sid_persist::{
-    persist_session_to_storage, persist_session_to_store_guarded, SidPersistOutcome, SidWrite,
-};
+pub(crate) use sid_persist::{persist_session_to_storage, SidPersistOutcome, SidWrite};
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
 pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR};
@@ -127,7 +133,7 @@ use launch_command::{
 };
 use omp::{gate_omp_launch, wrap_omp_host_launch, wrap_omp_launch};
 use pane_status::{resolve_detected_status, summarize_error_from_pane};
-use sid_persist::override_if_distinct;
+
 use status::{UNKNOWN_ERROR_WINDOW_CONFIRMED_PRESENT, UNKNOWN_ERROR_WINDOW_NEVER_PRESENT};
 use tmux_session::tmux_env_session_name_for_instance_id;
 use types::{deserialize_session_id, is_zero_u64, is_zero_u8};
@@ -436,6 +442,13 @@ pub struct Instance {
     /// Immutable source and destination pairs while a v027 transition is pending.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) sandbox_store_transition_paths: Vec<SandboxStoreTransitionPath>,
+    /// Scheduling cache only; host-owned physical-root receipts authorize use.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub(crate) sandbox_content_policy: u8,
+    /// Retired native contexts and their transaction-owned fresh-start notices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) sandbox_content_resets:
+        Vec<crate::migrations::v033_isolate_sandbox_content::SandboxContentReset>,
 
     // Paired terminal session
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -448,8 +461,13 @@ pub struct Instance {
         deserialize_with = "deserialize_session_id"
     )]
     pub agent_session_id: Option<String>,
-    /// Active OMP launch generation. Poller observations must carry this
-    /// value through the storage CAS before they may update the durable sid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_binding: Option<ConversationBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resume_binding: Option<ConversationBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) active_execution: Option<ActiveExecution>,
+    /// Poller observations must carry this through the storage CAS to update the sid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) omp_capture_generation: Option<String>,
     /// Monotone token for pane lifecycle commits. Async/CLI result merges may
@@ -708,15 +726,7 @@ pub struct Instance {
     /// set prevents a process restart from resurrecting an abandoned ID from a
     /// still-present upstream artifact.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
-    pub(crate) retroactive_capture_excludes: HashSet<String>,
-
-    /// Cached `is_pane_dead()` reading from the most recent status_poller
-    /// tick. Lets the Attention comparator treat dead-pane rows as sunk
-    /// (tier 99) without re-querying tmux on every sort. Field name avoids
-    /// `pane_dead` to prevent shadowing `tmux::Session::is_pane_dead()` at
-    /// call sites that take both. Refreshed by status_poller; not persisted
-    /// (clears to false on TUI restart, which is correct; a fresh poll
-    /// will re-set it within one tick if the pane is genuinely dead).
+    pub(crate) retroactive_capture_excludes: HashSet<ConversationBinding>,
     #[serde(skip)]
     pub pane_dead_observed: bool,
 

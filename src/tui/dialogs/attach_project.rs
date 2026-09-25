@@ -163,10 +163,8 @@ impl AttachProjectDialog {
             frame.render_widget(Paragraph::new(lines), chunks[0]);
         }
 
-        // Attaching restarts the session's ACP worker on the same conversation,
-        // so say so before the key that does it.
         frame.render_widget(
-            Paragraph::new("Stops and restarts the agent (conversation is kept)")
+            Paragraph::new("May restart; resume not guaranteed")
                 .style(Style::default().fg(theme.waiting)),
             chunks[1],
         );

@@ -247,6 +247,25 @@ pub(crate) fn shell_escape_script_word(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// A pane-visible context notice. Data cannot inject terminal controls or shell
+/// syntax, and printf treats percent signs and backslashes as literal content.
+pub(crate) fn native_context_notice_command(message: &str) -> String {
+    let safe: std::borrow::Cow<'_, str> = if message.chars().any(char::is_control) {
+        let mut escaped = String::with_capacity(message.len());
+        for character in message.chars() {
+            if character.is_control() {
+                escaped.extend(character.escape_default());
+            } else {
+                escaped.push(character);
+            }
+        }
+        std::borrow::Cow::Owned(escaped)
+    } else {
+        std::borrow::Cow::Borrowed(message)
+    };
+    format!("printf '%s\\n' {}", shell_escape(&safe))
+}
+
 /// Resolve a session's sandbox environment entries to concrete `(KEY, VALUE)`
 /// pairs on the host, for feeding into a host-side hook's process environment
 /// (so a `before_start` hook can read a per-session `$TEST_VAR`).
@@ -689,11 +708,7 @@ pub(crate) fn resolved_sandbox_config(
     super::config::repo_config::resolve_config_with_repo_or_warn(&resolved, project_path).sandbox
 }
 
-/// Resolve the complete environment inherited by an in-container agent.
-///
-/// Capture resolution needs this transiently because Bun dotenv values may
-/// expand arbitrary launcher variables into one of OMP's routing keys. Callers
-/// must discard unrelated values after resolution.
+#[cfg(test)]
 pub(crate) fn resolved_sandbox_environment(
     profile: &str,
     sandbox: &SandboxInfo,
@@ -739,6 +754,14 @@ pub(crate) fn build_docker_env_args(
 pub(crate) fn build_docker_env_args_with_managed_codex_home(
     sandbox_config: &SandboxConfig,
     sandbox: &SandboxInfo,
+    managed_codex_home: Option<&str>,
+) -> DockerExecEnv {
+    docker_exec_environment(sandbox, sandbox_config, managed_codex_home)
+}
+
+pub(crate) fn docker_exec_environment(
+    sandbox: &SandboxInfo,
+    sandbox_config: &SandboxConfig,
     managed_codex_home: Option<&str>,
 ) -> DockerExecEnv {
     tracing::debug!(target: "session.create",

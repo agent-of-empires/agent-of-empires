@@ -99,7 +99,11 @@ impl HomeView {
         session_id: &str,
         tmux_name: &str,
         target: crate::tui::home::live_send::LiveSendTarget,
+        lease: crate::tui::session_feed::NativeLease,
     ) -> Result<(), ()> {
+        if !lease.is_valid() || !self.session_feed.native_interaction_available() {
+            return Err(());
+        }
         let inst = match self.get_instance(session_id) {
             Some(inst) => inst.clone(),
             None => {
@@ -181,7 +185,11 @@ impl HomeView {
         // pre-#1485 path; control-mode was tried as an optimization
         // but turned out to be unreliable on real-world tmux setups
         // and was removed in favor of this simpler model).
-        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(tmux_name, capture_wake));
+        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(
+            tmux_name,
+            capture_wake,
+            lease,
+        ));
         // Start every live-mode entry (including a switch from another
         // session) with a disarmed leader menu, so a half-entered chord
         // can't carry over from a prior target.

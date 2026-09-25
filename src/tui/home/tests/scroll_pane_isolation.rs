@@ -28,7 +28,11 @@ fn live_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
         leader: None,
         remote: None,
     });
-    env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
+    env.view.live_send_worker = Some(LiveSendWorker::spawn(
+        "fake".to_string(),
+        None,
+        crate::tui::session_feed::NativeLease::valid_for_test(),
+    ));
     env.view
         .sync_preview_capture_worker(Some("fake".to_string()));
     env.view.preview_cache.dimensions = (80, 24);
@@ -653,10 +657,13 @@ fn live_env_with_leader() -> TestEnv {
         Some(Item::Session { id, .. }) => id.clone(),
         _ => panic!("fixture should have a session at flat_items[1]"),
     };
+    let title = env.view.get_instance(&id).unwrap().title.clone();
+    let tmux_name = crate::tmux::Session::generate_name(&id, &title);
+    crate::tmux::test_inject_session_into_cache(&tmux_name);
     env.view.live_send = Some(LiveSendState {
         session_id: id,
-        title: "session".to_string(),
-        tmux_name: "fake".to_string(),
+        title,
+        tmux_name,
         target: crate::tui::home::live_send::LiveSendTarget::Agent,
         exit_chords: crate::tui::home::live_send::parse_chord_list(
             crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
@@ -679,6 +686,7 @@ fn ctrl(c: char) -> KeyEvent {
 #[serial]
 fn live_leader_b_toggles_sidebar() {
     let mut env = live_env_with_leader();
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     assert!(!env.view.sidebar_collapsed);
 
     env.view.handle_key(ctrl('b'), None);
@@ -706,6 +714,7 @@ fn live_leader_b_toggles_sidebar() {
 #[serial]
 fn live_leader_k_opens_palette() {
     let mut env = live_env_with_leader();
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     env.view.handle_key(ctrl('b'), None);
     env.view.handle_key(key(KeyCode::Char('k')), None);
     assert!(!env.view.live_send_pending_leader);
@@ -723,6 +732,7 @@ fn live_leader_k_opens_palette() {
 #[serial]
 fn live_leader_q_exits() {
     let mut env = live_env_with_leader();
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     env.view.sidebar_collapsed = true;
     env.view.handle_key(ctrl('b'), None);
     env.view.handle_key(key(KeyCode::Char('q')), None);
@@ -740,6 +750,7 @@ fn live_leader_q_exits() {
 #[serial]
 fn live_leader_unknown_key_cancels_menu() {
     let mut env = live_env_with_leader();
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     env.view.handle_key(ctrl('b'), None);
     env.view.handle_key(key(KeyCode::Char('z')), None);
     assert!(!env.view.live_send_pending_leader, "menu disarms");
@@ -754,6 +765,7 @@ fn live_leader_unknown_key_cancels_menu() {
 #[serial]
 fn live_ctrl_q_still_one_press_exit() {
     let mut env = live_env_with_leader();
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     env.view.handle_key(ctrl('q'), None);
     assert!(
         env.view.live_send.is_none(),
@@ -769,6 +781,7 @@ fn live_ctrl_q_still_one_press_exit() {
 #[serial]
 fn live_leader_then_modified_key_cancels() {
     let mut env = live_env_with_leader();
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     env.view.handle_key(ctrl('b'), None);
     env.view.handle_key(ctrl('k'), None);
     assert!(!env.view.live_send_pending_leader, "menu disarms");
@@ -786,6 +799,7 @@ fn live_leader_then_modified_key_cancels() {
 #[serial]
 fn palette_command_while_live_exits_live() {
     let mut env = live_env_with_leader();
+    let _native_driver = env.view.session_feed.terminal_driver_for_test();
     // Open the palette from within live mode via the leader.
     env.view.handle_key(ctrl('b'), None);
     env.view.handle_key(key(KeyCode::Char('k')), None);

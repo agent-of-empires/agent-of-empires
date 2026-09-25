@@ -631,6 +631,23 @@
       "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"]
     },
     {
+      "id": "settings.global-migration-and-persistence",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/settings-persistence.spec.ts"],
+      "components": ["web/src/components/SettingsView.tsx"]
+    },
+    {
+      "id": "settings.global-write-scope",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/settings/__tests__/SchemaFieldPatches.test.tsx",
+        "src/hooks/__tests__/useSettingsCommands.test.tsx"
+      ],
+      "components": ["web/src/components/SettingsView.tsx", "web/src/hooks/useSettingsCommands.ts"]
+    },
+    {
       "id": "settings.session-auto-stop-idle",
       "kind": "vitest",
       "risk": "medium",
@@ -1348,6 +1365,20 @@
       "components": ["web/src/lib/sidebarSort.ts", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.group-slice-row-actions",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx", "tests/session-trash.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/SessionRow.tsx"]
+    },
+    {
+      "id": "session.delete-shared-worktree-kept",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/session-trash.spec.ts", "src/components/__tests__/DeleteSessionDialog.test.tsx"],
+      "components": ["web/src/App.tsx", "web/src/components/DeleteSessionDialog.tsx", "web/src/lib/trashActions.ts"]
+    },
+    {
       "id": "sidebar.new-session-tooltips",
       "kind": "mocked-playwright",
       "risk": "low",
@@ -1531,6 +1562,13 @@
       "risk": "medium",
       "specs": ["tests/plugin-row-slots-mobile.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/plugin/PluginSlots.tsx"]
+    },
+    {
+      "id": "sidebar.plugin-row-badge-link",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/plugin/__tests__/PluginSlots.test.tsx"],
+      "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/plugin/SlotChrome.tsx"]
     },
     {
       "id": "sidebar.group-axis-pure",
@@ -2371,7 +2409,11 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/sidebar-context-menu.spec.ts", "src/components/__tests__/SwitchViewDialog.test.tsx"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/SwitchViewDialog.tsx"]
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/SwitchViewDialog.tsx",
+        "web/src/App.tsx"
+      ]
     },
     {
       "id": "acp.switch-view-api",
@@ -2739,7 +2781,12 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/session-lifecycle.spec.ts"],
-      "components": []
+      "components": [
+        "web/src/lib/api.ts",
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/App.tsx",
+        "web/src/lib/types.ts"
+      ]
     },
     {
       "id": "modals",
@@ -3265,6 +3312,13 @@
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/Markdown.tsx"]
     },
     {
+      "id": "acp.story.composer-mobile-usage",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-structured-view.spec.ts"],
+      "components": ["web/src/components/acp/ComposerControls.tsx"]
+    },
+    {
       "id": "acp.story.composer-mobile-footer-actions",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -3461,6 +3515,16 @@
       ]
     },
     {
+      "id": "story.wizard-project-registry-recovery",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/session-wizard/__tests__/ProjectStep.saved-projects.test.tsx"],
+      "components": [
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/projectPicker.ts"
+      ]
+    },
+    {
       "id": "story.wizard-browse-disk",
       "kind": "mocked-playwright",
       "risk": "low",
@@ -3648,6 +3712,7 @@
       "id": "sidebar.add-project",
       "kind": "vitest",
       "risk": "high",
+      "description": "Attach eligibility, request, and worker outcomes; native conversation continuation is best-effort, not a modal guarantee.",
       "specs": ["src/components/__tests__/AddProjectAction.test.tsx"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",

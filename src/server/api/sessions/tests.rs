@@ -28,6 +28,7 @@ async fn create_receipts_include_published_rows_and_idempotent_retries() -> anyh
         let response = create_session(
             State(state.clone()),
             axum::extract::Query(create::CreateSessionQuery { wait: None }),
+            None,
             Ok(Json(body)),
         )
         .await
@@ -91,6 +92,7 @@ async fn canonical_fork_refusals_do_not_create_sessions() -> anyhow::Result<()> 
         create_session(
             State(state),
             axum::extract::Query(create::CreateSessionQuery { wait: None }),
+            None,
             Ok(Json(create_body_from_json(body))),
         )
         .await
@@ -605,6 +607,102 @@ async fn running_restart_respawns_while_start_remains_idempotent() -> anyhow::Re
 
 #[tokio::test]
 #[serial_test::serial]
+async fn restart_delivers_requested_wake_message_to_new_pane() -> anyhow::Result<()> {
+    if !crate::tmux::is_tmux_available() {
+        return Ok(());
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })?;
+    let project = tempfile::tempdir()?;
+    let marker = project.path().join("wake-received");
+    let mut row = Instance::new("wake-on-restart", project.path().to_str().unwrap());
+    row.source_profile = "wake-profile".into();
+    row.status = Status::Running;
+    row.command = format!(
+        r#"sh -c 'read message; printf "%s" "$message" > {}; sleep 60'"#,
+        marker.display(),
+    );
+    let id = row.id.clone();
+    let name = crate::tmux::Session::generate_name(&id, &row.title);
+    let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name.clone());
+    row.tmux_session()?.create(
+        project.path().to_str().unwrap(),
+        Some("sleep 60"),
+        "wake-profile",
+    )?;
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("wake-profile", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+
+    let response = restart_session(
+        State(state.clone()),
+        Path(id),
+        Ok(Some(Json(crate::daemon::RestartSessionBody {
+            wake_message: Some("wake-message-verified".into()),
+            ..Default::default()
+        }))),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if std::fs::read_to_string(&marker).ok().as_deref() == Some("wake-message-verified") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restart wake did not reach the new pane; marker={:?}; pane={:?}",
+            std::fs::read_to_string(&marker),
+            crate::tmux::Session::from_name(&name).capture_pane(30),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn archived_session_cannot_be_started_or_ensured() -> anyhow::Result<()> {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut row = Instance::new("archived launch", "/tmp/archived-launch");
+    row.source_profile = "archive-guard".into();
+    row.status = Status::Stopped;
+    row.archived_at = Some(chrono::Utc::now());
+    let id = row.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("archive-guard", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+
+    let start = start_session(State(state.clone()), Path(id.clone()), Ok(None))
+        .await
+        .into_response();
+    let ensure = ensure_session(State(state.clone()), Path(id.clone()), Ok(None))
+        .await
+        .into_response();
+    assert_eq!(start.status(), StatusCode::CONFLICT);
+    assert_eq!(ensure.status(), StatusCode::CONFLICT);
+    let saved = storage.load()?;
+    let saved = saved.iter().find(|row| row.id == id).unwrap();
+    assert!(saved.is_archived());
+    assert_eq!(saved.status, Status::Stopped);
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn structured_stop_start_receipts_include_the_committed_peer_bundle() -> anyhow::Result<()> {
     let _guard = crate::session::test_support::isolate_app_dir();
     let mut row = Instance::new("lifecycle receipt", "/tmp/lifecycle-receipt");
@@ -750,6 +848,54 @@ async fn archive_receipts_publish_committed_status_and_peer_rows() -> anyhow::Re
     Ok(())
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn engagement_unsinks_archived_and_snoozed_row_in_one_canonical_commit() -> anyhow::Result<()>
+{
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut row = Instance::new("engagement", "/tmp/engagement");
+    row.source_profile = "receipt".into();
+    row.archive();
+    row.snooze(30);
+    row.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
+    let previous_access = row.last_accessed_at;
+    let id = row.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("receipt", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row);
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    state.runtime.publish(&state).await?;
+    let response = touch_session_access(State(state.clone()), Path(id.clone()))
+        .await
+        .into_response();
+    assert_eq!(response.status(), StatusCode::OK);
+    let snapshot = state.runtime.snapshot(&state).await?;
+    assert_eq!(
+        response.headers()[crate::daemon::RUNTIME_REVISION_HEADER]
+            .to_str()?
+            .parse::<u64>()?,
+        snapshot.value.cursor.revision
+    );
+    let disk = storage.load()?;
+    let stored = disk.iter().find(|row| row.id == id).unwrap();
+    assert!(!stored.is_archived());
+    assert!(stored.snoozed_until.is_none());
+    assert!(stored.last_accessed_at > previous_access);
+    let published = snapshot
+        .value
+        .contents
+        .sessions
+        .iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert!(published.archived_at.is_none());
+    assert!(published.snoozed_until.is_none());
+    Ok(())
+}
 #[tokio::test]
 #[serial_test::serial]
 async fn archive_and_trash_receipts_discard_killed_auxiliary_observations() -> anyhow::Result<()> {
@@ -1050,7 +1196,7 @@ async fn workspace_purge_retains_shared_files_when_structured_shutdown_is_unprov
         (sibling_id.clone(), DeleteSessionBody::default()),
         (owner_id.clone(), DeleteSessionBody::default()),
     ];
-    let (deleted, _, failed, _) =
+    let (deleted, _, failed, _, _) =
         purge_workspace_artifacts(&state, owner_id.clone(), plan, false).await;
     assert_eq!(std::fs::read(root.join("payload"))?, b"live workspace");
     assert_eq!(deleted, vec![sibling_id.clone()]);
@@ -1188,8 +1334,8 @@ async fn overlapping_workspace_purges_complete_without_lock_inversion() -> anyho
     }
     let (left, right) =
         completed.expect("overlapping purge commands must not hold each other indefinitely");
-    let (mut deleted, _, left_failed, _) = left?;
-    let (right_deleted, _, right_failed, _) = right?;
+    let (mut deleted, _, left_failed, _, _) = left?;
+    let (right_deleted, _, right_failed, _, _) = right?;
     assert!(left_failed.is_empty() && right_failed.is_empty());
     deleted.extend(right_deleted);
     deleted.sort();
@@ -2401,17 +2547,31 @@ fn find_by_idempotency_key_matches_trashed_but_not_missing() {
 
 #[test]
 fn fork_from_builds_terminal_seed_for_claude() {
-    // A non-structured (terminal) fork resolves through the shared
-    // `terminal_fork_seed` helper; a claude parent id yields a Terminal
-    // seed whose child id is a fresh, valid session id.
-    let seed = resolve_create_fork_seed("claude", "parent-uuid", false)
+    let parent_binding = crate::session::ConversationBinding {
+        session_id: "parent-uuid".into(),
+        execution: Some(crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec!["/tmp/claude-store".into()],
+            configuration: Vec::new(),
+            cwd: "/tmp".into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        }),
+        provenance: crate::session::ConversationProvenance::Observed,
+        transcript_path: None,
+    };
+    let mut parent = crate::session::Instance::new("parent", "/tmp");
+    parent.agent_session_id = Some(parent_binding.session_id.clone());
+    parent.agent_session_binding = Some(parent_binding.clone());
+
+    let seed = resolve_create_fork_seed("parent-uuid", false, &[parent])
         .expect("claude terminal fork allowed");
     match seed {
         crate::session::ForkSeed::Terminal {
-            parent_agent_session_id,
+            parent,
             child_session_id,
         } => {
-            assert_eq!(parent_agent_session_id, "parent-uuid");
+            assert_eq!(parent, parent_binding);
             assert!(crate::session::capture::is_valid_session_id(
                 &child_session_id
             ));
@@ -2422,11 +2582,7 @@ fn fork_from_builds_terminal_seed_for_claude() {
 
 #[test]
 fn fork_from_builds_structured_seed_when_view_is_structured() {
-    // A structured fork carries the parent's acp_session_id straight onto a
-    // Structured seed; the builder turns that into the one-shot
-    // fork_pending marker and the live session/fork handshake mints the
-    // child id. The terminal forkability check is intentionally skipped.
-    let seed = resolve_create_fork_seed("claude", "parent-acp-id", true)
+    let seed = resolve_create_fork_seed("parent-acp-id", true, &[])
         .expect("structured fork seed is always allowed at create time");
     assert_eq!(
         seed,
@@ -2434,6 +2590,38 @@ fn fork_from_builds_structured_seed_when_view_is_structured() {
             parent_acp_session_id: "parent-acp-id".into(),
         }
     );
+}
+
+#[test]
+fn fork_from_rejects_ambiguous_parent_session_id() {
+    let binding = |cwd: &str| crate::session::ConversationBinding {
+        session_id: "shared-parent-id".into(),
+        execution: Some(crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec!["/tmp/claude-store".into()],
+            configuration: Vec::new(),
+            cwd: cwd.into(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+        }),
+        provenance: crate::session::ConversationProvenance::Observed,
+        transcript_path: None,
+    };
+    let instance = |binding: crate::session::ConversationBinding| {
+        let mut instance = crate::session::Instance::new("parent", "/tmp");
+        instance.agent_session_id = Some(binding.session_id.clone());
+        instance.agent_session_binding = Some(binding);
+        instance
+    };
+
+    assert!(matches!(
+        resolve_create_fork_seed(
+            "shared-parent-id",
+            false,
+            &[instance(binding("/tmp/one")), instance(binding("/tmp/two"))],
+        ),
+        Err(crate::session::ForkDenied::NoParentSession)
+    ));
 }
 
 fn create_body_from_json(value: serde_json::Value) -> CreateSessionBody {
@@ -2600,6 +2788,29 @@ fn from_instance_surfaces_hook_urgent_flag() {
     assert!(
         !plain_resp.urgent,
         "session with no hook file must not be urgent"
+    );
+}
+
+#[tokio::test]
+async fn create_hook_failure_details_are_local_owner_only() {
+    let error = anyhow::Error::new(CreateHookFailed::new(
+        anyhow::anyhow!("command exited with status 1"),
+        Some("Defined in /tmp/project/.agent-of-empires.yml"),
+    ));
+    assert!(local_create_hook_error_response(&error, false).is_none());
+
+    let response = local_create_hook_error_response(&error, true).expect("local response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers().get(crate::daemon::ERROR_CODE_HEADER),
+        Some(&axum::http::HeaderValue::from_static("create_hook_failed"))
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        body,
+        "on_create hook failed: command exited with status 1\nDefined in /tmp/project/.agent-of-empires.yml"
     );
 }
 
@@ -3544,7 +3755,7 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
         live.omp_capture_generation.as_deref(),
         Some("omp-generation-restart")
     );
-    assert!(live.session_id_poller.is_some());
+    assert!(live.session_id_poller_is_running());
     assert_eq!(live.last_start_time, started.last_start_time);
 
     let mut generation_converged = before.clone();
@@ -3555,7 +3766,6 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
         generation_converged.agent_session_id.as_deref(),
         Some("peer-sid")
     );
-    assert!(generation_converged.session_id_poller.is_some());
 
     let mut peer_relaunched = before.clone();
     peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
@@ -3564,13 +3774,11 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
         peer_relaunched.omp_capture_generation.as_deref(),
         Some("peer-generation")
     );
-    assert!(std::sync::Arc::ptr_eq(
-        peer_relaunched
-            .session_id_poller
-            .as_ref()
-            .expect("running restart poller"),
-        &restarted_poller,
-    ));
+    let mut peer = before.clone();
+    peer.pi_session_path = Some("/peer/transcript.jsonl".into());
+    let expected = peer.conversation_state();
+    apply_post_restart_identity_sync(&mut peer, &before, &started);
+    assert_eq!(peer.conversation_state(), expected);
     restarted_poller
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3730,13 +3938,19 @@ fn restart_sync_rejects_an_older_lifecycle_generation() {
     let mut started = before.clone();
     started.status = Status::Error;
     started.agent_session_id = Some("stale-restart-sid".to_string());
-    started.retroactive_capture_excludes = ["stale-exclusion".to_string()].into();
+    started.retroactive_capture_excludes = [crate::session::ConversationBinding::unknown(
+        "stale-exclusion".to_string(),
+    )]
+    .into();
 
     let mut live = before.clone();
     live.lifecycle_generation = 5;
     live.status = Status::Running;
     live.agent_session_id = Some("newer-restart-sid".to_string());
-    live.retroactive_capture_excludes = ["newer-exclusion".to_string()].into();
+    live.retroactive_capture_excludes = [crate::session::ConversationBinding::unknown(
+        "newer-exclusion".to_string(),
+    )]
+    .into();
 
     assert!(!apply_post_restart_sync(&mut live, &before, &started));
     apply_cascade_state_sync(&mut live, &before, &started);
@@ -3746,7 +3960,10 @@ fn restart_sync_rejects_an_older_lifecycle_generation() {
     assert_eq!(live.agent_session_id.as_deref(), Some("newer-restart-sid"));
     assert_eq!(
         live.retroactive_capture_excludes,
-        ["newer-exclusion".to_string()].into()
+        [crate::session::ConversationBinding::unknown(
+            "newer-exclusion".to_string()
+        )]
+        .into()
     );
 }
 
@@ -4086,9 +4303,10 @@ async fn permanent_deletion_waits_for_an_in_flight_submission() {
         "a delete must not tear a session down under an in-flight submission"
     );
     assert_eq!(
-        claims
-            .try_recv()
-            .expect("contender reached submission claim"),
+        tokio::time::timeout(Duration::from_secs(10), claims.recv())
+            .await
+            .expect("contender must reach submission claim")
+            .expect("submission claim watcher must remain open"),
         "sess-3650-direct"
     );
     assert_eq!(
@@ -4967,8 +5185,8 @@ fn resolve_hook_plan_refuses_untrusted_repo_hooks() {
     .unwrap();
 
     let err = resolve_create_hook_plan(
-        &crate::session::resolve_config("default").unwrap().hooks,
         "default",
+        &crate::session::resolve_config("default").unwrap().hooks,
         project.path(),
         false,
         None,
@@ -4999,21 +5217,17 @@ fn resolve_hook_plan_distinguishes_approval_from_skip() {
     let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
     let _app_dir = crate::session::get_app_dir().expect("isolated app dir");
     let project = project_with_on_create_hooks(&["echo hi"]);
-    // The plan resolves the global layer from disk, so the fallback has to be
-    // declared there rather than handed in.
-    std::fs::write(
-        crate::session::get_app_dir().unwrap().join("config.toml"),
-        "[hooks]\non_create = [\"echo global\"]\n",
-    )
-    .unwrap();
-    let base = crate::session::resolve_config("default").unwrap().hooks;
+    let base = crate::session::HooksConfig {
+        on_create: vec!["echo global".into()],
+        ..Default::default()
+    };
     let skipped =
-        resolve_create_hook_plan(&base, "default", project.path(), false, Some(false), None)
+        resolve_create_hook_plan("default", &base, project.path(), false, Some(false), None)
             .unwrap();
     assert_eq!(skipped.on_create(), vec!["echo global"]);
     assert!(skipped.trust_write.is_none());
 
-    let plan = resolve_create_hook_plan(&base, "default", project.path(), false, Some(true), None)
+    let plan = resolve_create_hook_plan("default", &base, project.path(), false, Some(true), None)
         .expect("trust_hooks: true must approve");
     assert_eq!(plan.on_create(), vec!["echo hi".to_string()]);
     let (hooks_hash, mcp_hash) = plan
@@ -5029,7 +5243,7 @@ fn resolve_hook_plan_distinguishes_approval_from_skip() {
     )
     .unwrap();
     let plan2 =
-        resolve_create_hook_plan(&base, "default", project.path(), false, Some(false), None)
+        resolve_create_hook_plan("default", &base, project.path(), false, Some(false), None)
             .expect("already-trusted hooks must run without trust_hooks");
     assert_eq!(plan2.on_create(), vec!["echo hi".to_string()]);
     assert!(
@@ -5042,7 +5256,7 @@ fn resolve_hook_plan_distinguishes_approval_from_skip() {
     )
     .unwrap();
     let changed =
-        resolve_create_hook_plan(&base, "default", project.path(), false, Some(false), None)
+        resolve_create_hook_plan("default", &base, project.path(), false, Some(false), None)
             .unwrap();
     assert_eq!(changed.on_create(), vec!["echo global"]);
     assert!(changed.trust_write.is_none());
@@ -5058,8 +5272,8 @@ fn resolve_hook_plan_absent_hooks_is_ok() {
     let project = tempfile::tempdir().unwrap();
 
     let plan = resolve_create_hook_plan(
-        &crate::session::resolve_config("default").unwrap().hooks,
         "default",
+        &crate::session::resolve_config("default").unwrap().hooks,
         project.path(),
         false,
         None,
@@ -5081,8 +5295,8 @@ fn resolve_hook_plan_scratch_skips_repo_trust() {
     let project = project_with_on_create_hooks(&["echo nope"]);
 
     let plan = resolve_create_hook_plan(
-        &crate::session::resolve_config("default").unwrap().hooks,
         "default",
+        &crate::session::resolve_config("default").unwrap().hooks,
         project.path(),
         true,
         None,
@@ -5113,8 +5327,8 @@ fn resolve_hook_plan_does_not_block_on_untrusted_mcp_without_hooks() {
     .unwrap();
 
     let plan = resolve_create_hook_plan(
-        &crate::session::resolve_config("default").unwrap().hooks,
         "default",
+        &crate::session::resolve_config("default").unwrap().hooks,
         project.path(),
         false,
         None,
@@ -5179,8 +5393,8 @@ fn resolve_hook_plan_inherits_trust_across_worktrees() {
         .unwrap();
 
     let plan = resolve_create_hook_plan(
-        &crate::session::resolve_config("default").unwrap().hooks,
         "default",
+        &crate::session::resolve_config("default").unwrap().hooks,
         &wt_path,
         false,
         None,
@@ -5308,4 +5522,264 @@ async fn list_sessions_applies_project_smart_rename_override_to_worktree_session
         .map(|s| s["smart_rename"].as_str().unwrap())
         .collect();
     assert_eq!(states, ["inactive", "inactive", "pending"]);
+}
+
+#[test]
+fn native_runtime_frame_stays_readable_with_a_valid_full_text_queue() {
+    use crate::daemon::{
+        QueuedPromptEntry, RuntimeCapabilities, RuntimeContents, RuntimeCursor, RuntimeFrame,
+        RuntimeHealth, RuntimeSnapshot,
+    };
+
+    let mut instance = Instance::new("queued", "/tmp/queued");
+    instance.queued_prompts = (0..64)
+        .map(|seq| QueuedPromptEntry {
+            id: format!("prompt-{seq}"),
+            seq,
+            text: "a".repeat(256 * 1024),
+            attachments: Vec::new(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            origin_device: None,
+        })
+        .collect();
+    let snapshot = RuntimeSnapshot {
+        cursor: RuntimeCursor {
+            epoch: "epoch".into(),
+            revision: 1,
+        },
+        contents: RuntimeContents {
+            health: RuntimeHealth::Healthy,
+            capabilities: RuntimeCapabilities {
+                mutations: true,
+                native_interaction: true,
+            },
+            default_profile: "default".into(),
+            sessions: vec![SessionResponse::from_instance(&instance, false)],
+            profiles: Vec::new(),
+            workspace_ordering: Vec::new(),
+            global_projects: Vec::new(),
+        },
+    };
+    let frame = serde_json::to_vec(&RuntimeFrame::Snapshot(&snapshot)).unwrap();
+    assert!(
+        frame.len() < 16 * 1024 * 1024,
+        "native WS frame is {} bytes",
+        frame.len()
+    );
+}
+
+/// A dirty checkout survives while an outside session uses it; deleting all
+/// its users rejects the dirty owner before touching a sibling.
+#[tokio::test]
+#[serial_test::serial]
+async fn permanent_delete_keeps_a_worktree_a_surviving_session_uses() {
+    use axum::body::to_bytes;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    // (workspace endpoint, dirty, survivor also selected)
+    for (workspace_endpoint, dirty, both_selected) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (true, true, true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let main_repo = tmp.path().join("main");
+        let checkout = tmp.path().join("shared");
+        std::fs::create_dir_all(&main_repo).unwrap();
+        git(&main_repo, &["init", "-b", "main"]);
+        git(&main_repo, &["commit", "--allow-empty", "-m", "init"]);
+        git(
+            &main_repo,
+            &["worktree", "add", "-b", "feat", checkout.to_str().unwrap()],
+        );
+        std::fs::write(checkout.join("untracked.txt"), b"survivor data").unwrap();
+
+        let profile = "shared-worktree-4084";
+        let mk = |title: &str, managed: bool| {
+            let mut inst = Instance::new(title, checkout.to_str().unwrap());
+            inst.source_profile = profile.to_string();
+            inst.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "feat".into(),
+                main_repo_path: main_repo.to_string_lossy().into_owned(),
+                managed_by_aoe: managed,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+            inst
+        };
+        let owner = mk("owner", true);
+        let peer = mk("survivor", false);
+        let rows = vec![owner.clone(), peer.clone()];
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances.extend(rows.clone());
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(rows);
+        *state.canonical_metadata.write().await =
+            crate::server::reload::load_all_profiles(&state.file_watch)
+                .unwrap()
+                .metadata;
+        if dirty {
+            std::fs::write(checkout.join("wip.txt"), "unsaved").unwrap();
+        }
+        let mut session_ids = vec![owner.id.clone()];
+        if both_selected {
+            session_ids.push(peer.id.clone());
+        }
+
+        let resp = if workspace_endpoint {
+            delete_workspace(
+                State(state.clone()),
+                Some(Json(DeleteWorkspaceBody {
+                    session_ids,
+                    delete_worktree: true,
+                    delete_branch: true,
+                    ..Default::default()
+                })),
+            )
+            .await
+            .into_response()
+        } else {
+            delete_session(
+                State(state.clone()),
+                Path(owner.id.clone()),
+                Some(Json(DeleteSessionBody {
+                    delete_worktree: true,
+                    delete_branch: true,
+                    ..Default::default()
+                })),
+            )
+            .await
+            .into_response()
+        };
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let case = format!("endpoint {workspace_endpoint}, dirty {dirty}: {body}");
+        if both_selected {
+            assert_eq!(status, StatusCode::CONFLICT, "{case}");
+            assert_eq!(body["error"], "dirty_worktree", "{case}");
+            assert_eq!(storage.load().unwrap().len(), 2, "{case}");
+            continue;
+        }
+        assert_eq!(status, StatusCode::OK, "{case}");
+        assert!(
+            body["messages"].to_string().contains("another session"),
+            "the kept worktree must be reported: {body}"
+        );
+
+        assert!(
+            checkout.join(".git").exists(),
+            "shared worktree was removed: {case}"
+        );
+        assert_eq!(checkout.join("wip.txt").exists(), dirty, "{case}");
+        let branches = std::process::Command::new("git")
+            .args(["branch", "--list", "feat"])
+            .current_dir(&main_repo)
+            .output()
+            .unwrap();
+        assert!(!branches.stdout.is_empty(), "shared branch was deleted");
+        let stored: Vec<String> = storage.load().unwrap().into_iter().map(|i| i.id).collect();
+        assert_eq!(stored, vec![peer.id.clone()]);
+        assert!(state
+            .instances
+            .read()
+            .await
+            .iter()
+            .all(|i| i.id != owner.id));
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn purges_finish_when_request_is_cancelled() {
+    for workspace in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let profile = "workspace-disconnect";
+        let mut instance = Instance::new("cancelled-request", tmp.path().to_str().unwrap());
+        instance.source_profile = profile.to_string();
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![instance.clone()]);
+        *state.canonical_metadata.write().await =
+            crate::server::reload::load_all_profiles(&state.file_watch)
+                .unwrap()
+                .metadata;
+
+        let lease = state
+            .runtime
+            .purge_namespace_lease(&state.profile_namespace)
+            .await;
+        let mut request = Box::pin(async {
+            if workspace {
+                delete_workspace(
+                    State(state.clone()),
+                    Some(Json(DeleteWorkspaceBody {
+                        session_ids: vec![instance.id.clone()],
+                        ..Default::default()
+                    })),
+                )
+                .await
+                .into_response()
+            } else {
+                delete_session(
+                    State(state.clone()),
+                    Path(instance.id.clone()),
+                    Some(Json(DeleteSessionBody::default())),
+                )
+                .await
+                .into_response()
+            }
+        });
+        let first_poll = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(request.as_mut(), cx))
+        })
+        .await;
+        assert!(
+            first_poll.is_pending(),
+            "purge must wait for the namespace lease"
+        );
+        drop(request);
+        drop(lease);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if storage.load().unwrap().is_empty()
+                    && state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .all(|row| row.id != instance.id)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{workspace}: deletion must finish after request cancellation"));
+    }
 }

@@ -219,6 +219,8 @@ impl DaemonClientError {
                 ApiErrorCode::AgentHooksNotAcknowledged => {
                     "the daemon has not acknowledged its agent hook paths"
                 }
+                ApiErrorCode::NoRevive => "the session would have to be revived first",
+                ApiErrorCode::CreateHookFailed => "an on_create hook failed",
             }
             .to_string(),
             Self::Status {
@@ -526,6 +528,7 @@ impl DaemonClient {
             SessionMutation::AbandonPurge(body) => self.http.post(url).json(body),
             SessionMutation::StopAuxiliary(target) => self.http.post(url).json(target),
             SessionMutation::Stop | SessionMutation::Restore => self.http.post(url),
+            SessionMutation::Access => self.http.patch(url),
             _ => self.http.patch(url).json(mutation),
         })
     }
@@ -761,6 +764,14 @@ impl DaemonClient {
         Ok(MutationReceipt { cursor, outcome })
     }
 
+    /// A remote's body may carry a token, so only an unauthenticated client
+    /// reads one. A local socket reads the hook failure alone, which is where
+    /// the config file that declared the hook is named.
+    fn should_read_error_body(&self, code: Option<ApiErrorCode>) -> bool {
+        !self.is_authenticated()
+            && (self.unix_path.is_none() || code == Some(ApiErrorCode::CreateHookFailed))
+    }
+
     async fn request_response(
         &self,
         request: reqwest::RequestBuilder,
@@ -802,7 +813,7 @@ impl DaemonClient {
                     truncated: false,
                 });
             }
-            if self.is_authenticated() || self.unix_path.is_some() {
+            if !self.should_read_error_body(code) {
                 return Err(DaemonClientError::Status {
                     status,
                     code,
@@ -925,9 +936,16 @@ async fn discard_bounded_body(response: &mut reqwest::Response) -> Result<(), Da
 }
 
 pub(crate) async fn decode_json<T: serde::de::DeserializeOwned>(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
 ) -> Result<T, DaemonClientError> {
-    let body = read_bounded_body(&mut response, MAX_SUCCESS_BODY_BYTES).await?;
+    decode_json_bounded(response, MAX_SUCCESS_BODY_BYTES).await
+}
+
+pub(crate) async fn decode_json_bounded<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<T, DaemonClientError> {
+    let body = read_bounded_body(&mut response, limit).await?;
     serde_json::from_slice(&body).map_err(|_| DaemonClientError::AuthenticatedDecode)
 }
 
@@ -1125,6 +1143,17 @@ mod tests {
     }
 
     #[test]
+    fn error_body_policy_exposes_hook_failures_only_to_local_owner() {
+        let unix = DaemonClient::new_unix("/tmp/aoe-test.sock").expect("unix client");
+        let bearer = DaemonClient::new("http://localhost", Some("token")).expect("bearer client");
+        let anonymous = DaemonClient::new("http://localhost", None).expect("anonymous client");
+
+        assert!(unix.should_read_error_body(Some(ApiErrorCode::CreateHookFailed)));
+        assert!(!unix.should_read_error_body(None));
+        assert!(!bearer.should_read_error_body(Some(ApiErrorCode::CreateHookFailed)));
+        assert!(anonymous.should_read_error_body(None));
+    }
+    #[test]
     fn mutation_receipt_requires_an_unambiguous_current_cursor() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(RUNTIME_EPOCH_HEADER, HeaderValue::from_static("current"));
@@ -1300,6 +1329,28 @@ mod tests {
         assert_eq!(body, serde_json::json!({}));
     }
 
+    #[tokio::test]
+    async fn restart_request_encodes_the_session_id_as_one_path_segment() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let base = serve_mutation_once(
+            "/api/sessions/{id}/restart",
+            200,
+            vec![
+                (RUNTIME_EPOCH_HEADER, "epoch-1"),
+                (RUNTIME_REVISION_HEADER, "2"),
+            ],
+            r#"{"lifecycle_generation":1,"profile":"default","target":null}"#,
+            tx,
+        )
+        .await;
+        let client = DaemonClient::new(&base, None).unwrap();
+        client
+            .restart_session("sess/a?b", &RestartSessionBody::default(), "epoch-1")
+            .await
+            .unwrap();
+        let captured = next_request(rx).await;
+        assert_eq!(captured.path, "/api/sessions/sess%2Fa%3Fb/restart");
+    }
     #[tokio::test]
     async fn conflict_lifecycle_locked_maps_without_reading_body() {
         let (tx, rx) = tokio::sync::oneshot::channel();

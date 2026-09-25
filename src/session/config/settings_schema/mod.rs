@@ -18,7 +18,7 @@ pub use plugin::{
     PLUGIN_SECTION_PREFIX,
 };
 pub use policy::{strip_local_only, validate_patch, validate_patch_with, PatchRejection, Scope};
-pub use registry::{descriptor, runtime_schema, schema, section_in_schema};
+pub use registry::{descriptor, runtime_schema, schema, schema_ref, section_in_schema};
 pub use resolved::{resolve, resolve_all, Candidate, ResolvedSetting, SettingSource};
 pub use validate::{validate_value, ValidationError};
 

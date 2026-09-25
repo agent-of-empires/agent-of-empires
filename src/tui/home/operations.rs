@@ -1827,28 +1827,25 @@ impl HomeView {
         }
     }
 
-    /// Unarchive every archived session. The synthetic Archived section's
-    /// "Restore All" bulk action. Archived rows stay Stopped (archiving killed
-    /// their panes); the user restarts them with `e` when wanted, same as any
-    /// single unarchive. Reversible, so no confirmation upstream.
+    /// Restore every archived row through the daemon. The section updates from
+    /// receipts and canonical snapshots, not from local storage writes.
     pub(super) fn unarchive_all(&mut self) {
-        let ids: Vec<String> = self
+        let requests = self
             .instances
             .values()
-            .filter(|i| i.is_archived() && !i.is_trashed())
-            .map(|i| i.id.clone())
-            .collect();
-        if ids.is_empty() {
-            return;
+            .filter(|row| row.is_archived() && !row.is_trashed())
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    crate::daemon::SessionMutation::Archive(crate::daemon::UpdateArchiveBody {
+                        archived: false,
+                        kill_pane: true,
+                    }),
+                )
+            });
+        if let Err(error) = self.session_feed.submit_batch(requests) {
+            self.info_dialog = Some(InfoDialog::new("Restore Failed", &error.to_string()));
         }
-        if let Err(e) = self.bulk_apply_user_action(&ids, |inst| inst.unarchive()) {
-            tracing::error!(target: "tui.home", "unarchive_all failed: {e}");
-        }
-        self.rebuild_flat_items();
-        if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
-            self.cursor = self.flat_items.len() - 1;
-        }
-        self.update_selected();
     }
 
     /// Permanently purge every trashed session. The Trash section's "Empty
@@ -1971,43 +1968,23 @@ impl HomeView {
         }
     }
 
-    /// Archive every active session under the selected group: tmux teardown
-    /// runs off-thread, persist runs inline. Confirmation upstream. See #1868.
+    /// Queue the whole group's archive before submitting any row. The daemon
+    /// tears down each pane and publishes its committed state.
     pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
         let ids = self.active_sessions_in_selected_group();
         if ids.is_empty() {
             return Ok(());
         }
-        // Off-thread tmux teardown so N x 4 shellouts don't block the input
-        // thread. Mirrors `force_remove_session`.
-        let kill_targets: Vec<_> = ids
-            .iter()
-            .filter_map(|id| self.instances.get(id).cloned())
-            .collect();
-        std::thread::spawn(move || {
-            for inst in kill_targets {
-                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    inst.kill_all_tmux_sessions()
-                })) {
-                    tracing::error!(
-                        target: "session.tmux_cleanup",
-                        session_id = %inst.id,
-                        "archive_selected_group tmux teardown panicked: {:?}",
-                        panic
-                    );
-                }
-            }
-        });
-        self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
+        self.session_feed.submit_batch(ids.into_iter().map(|id| {
+            (
+                id,
+                crate::daemon::SessionMutation::Archive(crate::daemon::UpdateArchiveBody {
+                    archived: true,
+                    kill_pane: true,
+                }),
+            )
+        }))?;
         self.reveal_archived_section();
-        self.rebuild_flat_items();
-        // The project header vanishes once its last active member is archived
-        // (project headers are seeded from live sessions only), so the cursor's
-        // old index may now point past the list end; clamp and re-resolve.
-        if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
-            self.cursor = self.flat_items.len() - 1;
-        }
-        self.update_selected();
         Ok(())
     }
 }

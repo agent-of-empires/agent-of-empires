@@ -108,12 +108,7 @@ hold unrelated commits: pass `--attach-existing-branch` (or tick the box in the
 web modal) to check it out as-is. AoE then records that it did not create the
 branch and leaves it alone when the session is deleted.
 
-Unless the session is already a workspace, its working directory moves, so the
-session is stopped for the move and started again afterwards. A structured
-(ACP) session resumes the same conversation. Attaching is refused while the agent
-is mid-turn; wait for the turn to finish or cancel it. Everything that can refuse
-the attach is checked before anything is stopped, so a refusal never costs you a
-running session.
+Unless the session is already a workspace, its directory moves, so it is stopped for the move and restarted. A known conversation bound to the old directory blocks the move; other sessions may attempt to resume their stored ID, but continuity is not guaranteed. Attaching is refused mid-turn. Everything that can refuse the attach is checked before stopping; if conversion later fails, AoE attempts to restore the worker.
 
 Scratch sessions cannot be attached to: they have no repo of their own, only a
 throwaway directory that deletion removes.
@@ -206,7 +201,7 @@ Multi-repo sessions are bucketed into a single **Multi-repo** group at the botto
 ## Limitations
 
 - **One branch name per workspace**: every repo gets the same `-w <branch>` value.
-- **No agent-driven repo pull-in**: the agent cannot add a repo to its own session. You add one yourself, without losing the conversation, as described in [Add a repo to a session that already exists](#add-a-repo-to-a-session-that-already-exists).
+- **No agent-driven repo pull-in**: the agent cannot add a repo to its own session; attaching may restart the agent without resuming its conversation.
 - **No saved workspace templates**: each session picks the repo set fresh.
 - **No per-repo PR tracking**: coordinated PR workflow happens outside AoE.
 

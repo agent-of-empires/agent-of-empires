@@ -289,6 +289,7 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
             stored_acp_session_id: inst.acp_session_id.clone(),
             // Threaded for the same continuity reason as the stored session id.
             fork_from: inst.fork_pending.clone(),
+            sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
             sandbox_info: inst.sandbox_info.clone(),
             source_profile: Some(inst.source_profile.clone()),
             yolo_mode: inst.yolo_mode,
@@ -298,6 +299,9 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
                 &inst.command,
             ),
             seed_history_replay: false,
+            claude_store_pin: inst
+                .selected_claude_conversation()
+                .and_then(|(_, execution)| execution.stores.first().cloned()),
         }
     };
 

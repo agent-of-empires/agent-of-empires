@@ -10,6 +10,7 @@ import { deleteWorkspace, restoreSession, trashSession } from "../api";
 import {
   deleteWorkspaceSessions,
   restoreSessions,
+  sessionsSharingWorktree,
   trashedWorkspaceRestoreIds,
   trashSessions,
   workspaceCleanupDefaults,
@@ -206,5 +207,24 @@ describe("workspaceCleanupDefaults (#3167)", () => {
     ],
   ])("%s", (_name, sessions, expected) => {
     expect(workspaceCleanupDefaults(sessions)).toEqual(expected);
+  });
+});
+
+describe("sessionsSharingWorktree (#4084)", () => {
+  const at = (id: string, project_path: string, has_cleanable_worktree = false) =>
+    ({ id, project_path, has_cleanable_worktree }) as unknown as SessionResponse;
+
+  it("finds unselected sessions in or under a worktree the selection would clean up", () => {
+    const owner = at("owner", "/wt/feat/", true);
+    const all = [
+      owner,
+      at("same", "/wt/feat"),
+      at("nested", "/wt/feat/sub"),
+      at("prefix", "/wt/feature"),
+      at("other", "/repo"),
+    ];
+    expect(sessionsSharingWorktree([owner], all).map((s) => s.id)).toEqual(["same", "nested"]);
+    expect(sessionsSharingWorktree([owner, all[1]!, all[2]!], all)).toEqual([]);
+    expect(sessionsSharingWorktree([at("plain", "/wt/feat")], all)).toEqual([]);
   });
 });

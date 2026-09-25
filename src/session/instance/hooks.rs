@@ -104,17 +104,23 @@ impl Instance {
                 &self.extra_args,
             ))?;
         }
+        let agent = self.status_agent();
+        self.ensure_disclosed_host_hook_path(agent)?;
+        if self.is_sandboxed() {
+            self.install_agent_status_hooks(agent, None);
+        }
+        self.ensure_host_folder_trust(agent);
+        self.propagate_managed_skills();
         let on_launch_hooks = if skip_on_launch {
             None
         } else {
-            let config = store.configuration(Some(store.storage().profile()))?;
-            self.resolve_on_launch_hooks(config.hooks.on_launch)
+            self.resolve_on_launch_hooks(
+                store
+                    .configuration(Some(store.storage().profile()))?
+                    .hooks
+                    .on_launch,
+            )
         };
-        let agent = self.resolved_agent();
-        self.ensure_disclosed_host_hook_path(agent)?;
-        self.install_agent_status_hooks(agent);
-        self.ensure_host_folder_trust(agent);
-        self.propagate_managed_skills();
 
         if self.is_sandboxed() {
             self.ensure_container_in(store)?;
@@ -333,19 +339,20 @@ impl Instance {
     }
 
     /// Install optional status hooks and mandatory authoritative identity hooks.
-    ///
-    /// Sandboxed sessions install through build_container_config. Disabling
-    /// agent_status_hooks removes status writers but cannot disable identity
-    /// publication for a resume-capable pane.
-    fn install_agent_status_hooks(&mut self, agent: Option<&'static crate::agents::AgentDef>) {
+    pub(super) fn install_agent_status_hooks(
+        &mut self,
+        agent: Option<&'static crate::agents::AgentDef>,
+        execution: Option<&super::execution::NativeExecution>,
+    ) {
         self.identity_publisher_launched = false;
         let profile = self.effective_profile();
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         let status_hooks_enabled = config.session.agent_status_hooks;
+        let Some(agent) = agent else {
+            return;
+        };
         if !self.is_sandboxed()
-            && agent.is_some_and(|agent| {
-                crate::agents::hook_install_required(agent, status_hooks_enabled)
-            })
+            && crate::agents::hook_install_required(agent, status_hooks_enabled)
             && !crate::session::hook_disclosure::agent_hooks_acknowledged()
         {
             tracing::warn!(
@@ -355,75 +362,94 @@ impl Instance {
             );
             return;
         }
-        if let Some(agent) = agent {
-            if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
-                let mut events = match crate::agents::resolved_sidecar_hook_events(agent, &config) {
-                    Ok(events) => events,
-                    Err(e) => {
-                        tracing::warn!(target: "session.store", "Failed to resolve {} status hooks: {}", agent.name, e);
-                        return;
-                    }
-                };
-                if !status_hooks_enabled {
-                    events.retain(|event| event.identity_field.is_some());
-                    for event in &mut events {
-                        event.status = None;
+        let Some(events) = resolved_host_hook_events(agent, &config, status_hooks_enabled) else {
+            return;
+        };
+        if self.is_sandboxed() {
+            return;
+        }
+        // An empty event set installs nothing, so the profile's own environment resolves the path;
+        // a real install has to use what `before_session` left behind.
+        let environment = if events.is_empty() {
+            self.profile_host_environment()
+        } else {
+            self.resolved_host_environment()
+        };
+        let Some(home) = host_home(&environment) else {
+            return;
+        };
+        let installed = self.install_host_hooks(
+            agent,
+            &home,
+            &config.session,
+            &environment,
+            &events,
+            execution,
+        );
+        self.identity_publisher_launched =
+            events.iter().any(|event| event.identity_field.is_some())
+                && installed
+                && self.hook_session_publisher_allowed_by_argv();
+    }
+
+    /// Install this agent's hooks into its host config file; `true` when they landed.
+    fn install_host_hooks(
+        &self,
+        agent: &'static crate::agents::AgentDef,
+        home: &Path,
+        session_cfg: &crate::session::config::SessionConfig,
+        host_environment: &[String],
+        events: &[crate::agents::ResolvedHookEvent],
+        execution: Option<&super::execution::NativeExecution>,
+    ) -> bool {
+        if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
+            return self.install_sidecar_host_hooks(
+                sidecar,
+                home,
+                session_cfg,
+                host_environment,
+                events,
+            );
+        }
+        let Some(hook_cfg) = agent.hook_config.as_ref() else {
+            return false;
+        };
+        let selected_root = execution
+            .filter(|execution| execution.agent.name == "claude" && !events.is_empty())
+            .and_then(|execution| {
+                execution
+                    .routing
+                    .iter()
+                    .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+            })
+            .and_then(|(_, value)| value.as_deref());
+        let path = selected_root
+            .map(|root| Path::new(root).join("settings.json"))
+            .unwrap_or_else(|| {
+                generic_host_config_path_for(
+                    &self.tool,
+                    hook_cfg,
+                    home,
+                    session_cfg,
+                    host_environment,
+                )
+            });
+        match hook_cfg.format {
+            crate::agents::HookFormat::CodexJson => {
+                match crate::hooks::install_codex_json_hooks(
+                    &path,
+                    events,
+                    crate::hooks::HookInstallTarget::Host,
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(target: "session.store", "Failed to install Codex hooks: {}", error);
+                        false
                     }
                 }
-                let publishes_identity = events.iter().any(|event| event.identity_field.is_some());
-                self.identity_publisher_launched = if self.is_sandboxed() {
-                    false
-                } else {
-                    let environment = if events.is_empty() {
-                        self.profile_host_environment()
-                    } else {
-                        self.resolved_host_environment()
-                    };
-                    let home = crate::session::environment::resolve_host_environment_value(
-                        &environment,
-                        "HOME",
-                    )
-                    .map(std::path::PathBuf::from)
-                    .or_else(dirs::home_dir);
-                    let installed = home.is_some_and(|home| {
-                        self.install_sidecar_host_hooks(
-                            sidecar,
-                            &home,
-                            &config.session,
-                            &environment,
-                            &events,
-                        )
-                    });
-                    publishes_identity && installed && self.hook_session_publisher_allowed_by_argv()
-                };
-            } else if let Some(hook_cfg) = agent.hook_config.as_ref() {
-                let mut events = match crate::agents::resolved_hook_events(agent, &config) {
-                    Ok(events) => events,
-                    Err(e) => {
-                        tracing::warn!(target: "session.store", "Failed to resolve {} status hooks: {}", agent.name, e);
-                        return;
-                    }
-                };
-                if !status_hooks_enabled {
-                    events.retain(|event| event.identity_field.is_some());
-                    for event in &mut events {
-                        event.status = None;
-                    }
-                }
-                let publishes_identity = events.iter().any(|event| event.identity_field.is_some());
-                self.identity_publisher_launched = if self.is_sandboxed() {
-                    false
-                } else {
-                    let installed = match hook_cfg.format {
-                        crate::agents::HookFormat::CodexJson => {
-                            self.install_codex_host_hooks(&config.session, &events)
-                        }
-                        crate::agents::HookFormat::JsonSettings => {
-                            self.install_json_host_hooks(hook_cfg, &config.session, &events)
-                        }
-                    };
-                    publishes_identity && installed && self.hook_session_publisher_allowed_by_argv()
-                };
+            }
+            crate::agents::HookFormat::JsonSettings => {
+                self.install_json_host_hooks(hook_cfg, session_cfg, events)
             }
         }
     }
@@ -483,7 +509,7 @@ impl Instance {
                 if let Some(name) =
                     crate::agents::parse_selected_agent(&self.selected_agent_args(), selected.flag)
                 {
-                    let Some(agent) = self.resolved_agent() else {
+                    let Some(agent) = self.status_agent() else {
                         return false;
                     };
                     let config_path = sidecar_host_config_path_for(
@@ -516,7 +542,7 @@ impl Instance {
             }
         }
 
-        let Some(agent) = self.resolved_agent() else {
+        let Some(agent) = self.status_agent() else {
             return false;
         };
         let config_path = sidecar_host_config_path_for(
@@ -546,43 +572,6 @@ impl Instance {
         }
     }
 
-    fn install_codex_host_hooks(
-        &self,
-        session_cfg: &crate::session::config::SessionConfig,
-        events: &[crate::agents::ResolvedHookEvent],
-    ) -> bool {
-        let environment = if events.is_empty() {
-            self.profile_host_environment()
-        } else {
-            self.resolved_host_environment()
-        };
-        let home =
-            crate::session::environment::resolve_host_environment_value(&environment, "HOME")
-                .map(std::path::PathBuf::from)
-                .or_else(dirs::home_dir);
-        let Some(home) = home else {
-            return false;
-        };
-        let Some(agent) = self.resolved_agent() else {
-            return false;
-        };
-        let Some(hook_cfg) = agent.hook_config.as_ref() else {
-            return false;
-        };
-        let hooks_path =
-            generic_host_config_path_for(&self.tool, hook_cfg, &home, session_cfg, &environment);
-        match crate::hooks::install_codex_json_hooks(
-            &hooks_path,
-            events,
-            crate::hooks::HookInstallTarget::Host,
-        ) {
-            Ok(()) => true,
-            Err(error) => {
-                tracing::warn!(target: "session.store", "Failed to install Codex hooks: {}", error);
-                false
-            }
-        }
-    }
     fn install_json_host_hooks(
         &self,
         hook_cfg: &crate::agents::AgentHookConfig,
@@ -699,9 +688,43 @@ fn first_read_only_report(path: &std::path::Path) -> Option<std::path::PathBuf> 
         .then_some(key)
 }
 
+pub(super) fn host_home(host_environment: &[String]) -> Option<std::path::PathBuf> {
+    crate::session::environment::resolve_host_environment_value(host_environment, "HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)
+}
+
+fn resolved_host_hook_events(
+    agent: &'static crate::agents::AgentDef,
+    config: &crate::session::config::Config,
+    status_hooks_enabled: bool,
+) -> Option<Vec<crate::agents::ResolvedHookEvent>> {
+    let resolved = if agent.sidecar_hooks.is_some() {
+        crate::agents::resolved_sidecar_hook_events(agent, config)
+    } else if agent.hook_config.is_some() {
+        crate::agents::resolved_hook_events(agent, config)
+    } else {
+        return None;
+    };
+    let mut events = match resolved {
+        Ok(events) => events,
+        Err(error) => {
+            tracing::warn!(target: "session.store", "Failed to resolve {} status hooks: {}", agent.name, error);
+            return None;
+        }
+    };
+    if !status_hooks_enabled {
+        events.retain(|event| event.identity_field.is_some());
+        for event in &mut events {
+            event.status = None;
+        }
+    }
+    Some(events)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::instance::test_helpers::*;
 
     use crate::session::test_support::EnvGuard;
 
@@ -713,6 +736,25 @@ mod tests {
             shell_escape(&std::env::current_exe().unwrap().to_string_lossy()),
             shell_escape(crate::agents::get_agent(agent).unwrap().binary)
         )
+    }
+
+    fn hook_inst(tool: &str) -> Instance {
+        let mut inst = Instance::new(tool, "/tmp/test");
+        inst.tool = tool.to_string();
+        inst.detect_as = tool.to_string();
+        inst
+    }
+
+    fn write_profile(profile: &str, config: &str) {
+        let dir = crate::session::get_profile_dir(profile).unwrap();
+        std::fs::write(dir.join("config.toml"), config).unwrap();
+    }
+
+    fn assert_aoe_codex_hooks(path: &std::path::Path) {
+        let hooks = std::fs::read_to_string(path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&hooks).unwrap();
+        assert!(parsed["hooks"]["PreToolUse"].is_array());
+        assert!(hooks.contains("aoe-hooks"));
     }
 
     fn acknowledge_hooks() {
@@ -845,11 +887,9 @@ mod tests {
         }
     }
 
-    /// The cases above build their own errors, so they cannot show that a real
-    /// `install_hooks` failure carries a downcastable `io::Error` at all, which
-    /// is what the classification rests on. A genuinely read-only filesystem is
-    /// not portable to make, so this drives a failure any machine can produce
-    /// and asserts the chain is reachable and classified as not read-only.
+    /// The cases above build their own errors, so they cannot show that a real `install_hooks`
+    /// failure carries a downcastable `io::Error` at all, which is what the classification rests
+    /// on.
     #[test]
     fn a_real_install_hooks_error_keeps_its_io_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -886,8 +926,7 @@ mod tests {
         })
         .unwrap();
 
-        let mut inst = Instance::new("cursor", "/tmp/test");
-        inst.tool = "cursor".to_string();
+        let mut inst = tool_instance("cursor", "/tmp/test");
         inst.pending_host_env = vec![(
             "CURSOR_CONFIG_DIR".to_string(),
             temp.path()
@@ -930,8 +969,7 @@ mod tests {
         })
         .unwrap();
         acknowledge_hooks();
-        let mut inst = Instance::new("cursor", "/tmp/test");
-        inst.tool = "cursor".to_string();
+        let mut inst = tool_instance("cursor", "/tmp/test");
         inst.pending_host_env = vec![(
             "CURSOR_CONFIG_DIR".to_string(),
             launch_path.to_string_lossy().into_owned(),
@@ -967,10 +1005,10 @@ mod tests {
         inst.tool = "cursor".to_string();
 
         assert_eq!(
-            inst.resolved_host_home().as_deref(),
+            host_home(&inst.resolved_host_environment()).as_deref(),
             Some(profile_home.path())
         );
-        inst.install_agent_status_hooks(crate::agents::get_agent("cursor"));
+        inst.install_agent_status_hooks(crate::agents::get_agent("cursor"), None);
 
         assert!(profile_home.path().join(".cursor/hooks.json").is_file());
         assert!(!process_home.path().join(".cursor/hooks.json").exists());
@@ -984,29 +1022,14 @@ mod tests {
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let mut inst = Instance::new("sandbox cursor", "/tmp/test");
         inst.tool = "cursor".to_string();
-        inst.sandbox_info = Some(crate::session::SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test:latest".to_string(),
-            container_name: "sandbox-cursor".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: Vec::new(),
-            container_workdir: None,
-        });
+        inst.sandbox_info = Some(crate::session::instance::test_helpers::test_sandbox(
+            "sandbox-cursor",
+            None,
+        ));
         inst.pending_host_env = vec![("HOME".to_string(), "/tmp/runtime-home".to_string())];
 
         inst.ensure_disclosed_host_hook_path(crate::agents::get_agent("cursor"))
             .unwrap();
-    }
-
-    #[test]
-    fn test_codex_gets_status_hook_env_prefix() {
-        let agent = crate::agents::get_agent("codex");
-        assert_eq!(
-            status_hook_env_prefix("work", "abc123", agent),
-            expected_status_prefix("work", "abc123", "codex")
-        );
     }
 
     #[test]
@@ -1020,13 +1043,9 @@ mod tests {
         let mut inst = Instance::new("wrapped", "/tmp/test");
         inst.tool = "my-codex-wrapper".to_string();
         inst.detect_as = "codex".to_string();
-        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
+        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as), None);
 
-        let hooks_path = tmp.path().join(".codex").join("hooks.json");
-        let hooks = std::fs::read_to_string(hooks_path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&hooks).unwrap();
-        assert!(parsed["hooks"]["PreToolUse"].is_array());
-        assert!(hooks.contains("aoe-hooks"));
+        assert_aoe_codex_hooks(&tmp.path().join(".codex").join("hooks.json"));
         assert!(!tmp.path().join(".codex").join("config.toml").exists());
     }
 
@@ -1050,21 +1069,15 @@ mod tests {
         .unwrap();
 
         acknowledge_hooks();
-        let mut inst = Instance::new("codex", "/tmp/test");
-        inst.tool = "codex".to_string();
-        inst.detect_as = "codex".to_string();
+        let mut inst = hook_inst("codex");
         inst.source_profile = "codex-profile".to_string();
         inst.pending_host_env = vec![(
             "CODEX_HOME".to_string(),
             resolved_codex_home.to_string_lossy().into_owned(),
         )];
-        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
+        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as), None);
 
-        let hooks_path = resolved_codex_home.join("hooks.json");
-        let hooks = std::fs::read_to_string(hooks_path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&hooks).unwrap();
-        assert!(parsed["hooks"]["PreToolUse"].is_array());
-        assert!(hooks.contains("aoe-hooks"));
+        assert_aoe_codex_hooks(&resolved_codex_home.join("hooks.json"));
         assert!(!profile_codex_home.join("hooks.json").exists());
         assert!(!tmp.path().join(".codex").join("hooks.json").exists());
     }
@@ -1096,7 +1109,16 @@ mod tests {
                 "CODEX_HOME".to_string(),
                 codex_home.to_string_lossy().into_owned(),
             )];
-            inst.install_codex_host_hooks(&profile_config.session, &events);
+            let environment = inst.resolved_host_environment();
+            let home = host_home(&environment).unwrap();
+            inst.install_host_hooks(
+                agent,
+                &home,
+                &profile_config.session,
+                &environment,
+                &events,
+                None,
+            );
 
             codex_home.join("hooks.json").exists()
         });
@@ -1111,18 +1133,11 @@ mod tests {
         let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
         let _home_guard = crate::session::test_support::isolate_home(tmp.path());
 
-        let profile_dir = crate::session::get_profile_dir("hooks-disabled").unwrap();
-        std::fs::write(
-            profile_dir.join("config.toml"),
-            "[session]\nagent_status_hooks = false\n",
-        )
-        .unwrap();
+        write_profile("hooks-disabled", "[session]\nagent_status_hooks = false\n");
 
-        let mut inst = Instance::new("codex", "/tmp/test");
-        inst.tool = "codex".to_string();
-        inst.detect_as = "codex".to_string();
+        let mut inst = hook_inst("codex");
         inst.source_profile = "hooks-disabled".to_string();
-        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
+        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as), None);
 
         assert!(!tmp.path().join(".codex").join("hooks.json").exists());
     }
@@ -1133,14 +1148,12 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
         let _home_guard = crate::session::test_support::isolate_home(tmp.path());
-        let mut inst = Instance::new("cursor-unacknowledged", "/tmp/test");
-        inst.tool = "cursor".to_string();
-        inst.detect_as = "cursor".to_string();
+        let mut inst = hook_inst("cursor");
 
         let error = inst
             .ensure_disclosed_host_hook_path(crate::agents::get_agent("cursor"))
             .unwrap_err();
-        inst.install_agent_status_hooks(crate::agents::get_agent("cursor"));
+        inst.install_agent_status_hooks(crate::agents::get_agent("cursor"), None);
 
         // The marker type, not the text: the daemon maps it to an error code.
         assert!(error.is::<crate::session::hook_disclosure::AgentHooksNotAcknowledged>());
@@ -1153,22 +1166,18 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
         let _home_guard = crate::session::test_support::isolate_home(tmp.path());
-        let profile_dir = crate::session::get_profile_dir("status-hooks-disabled").unwrap();
-        std::fs::write(
-            profile_dir.join("config.toml"),
+        write_profile(
+            "status-hooks-disabled",
             "[session]
 agent_status_hooks = false
 ",
-        )
-        .unwrap();
-        let mut inst = Instance::new("gemini", "/tmp/test");
-        inst.tool = "gemini".to_string();
-        inst.detect_as = "gemini".to_string();
+        );
+        let mut inst = hook_inst("gemini");
         inst.source_profile = "status-hooks-disabled".to_string();
         let agent = crate::agents::get_agent("gemini");
 
         inst.ensure_disclosed_host_hook_path(agent).unwrap();
-        inst.install_agent_status_hooks(agent);
+        inst.install_agent_status_hooks(agent, None);
 
         assert!(!tmp.path().join(".gemini/settings.json").exists());
         assert!(!inst.identity_publisher_launched);
@@ -1192,11 +1201,9 @@ agent_status_hooks = false
         .unwrap();
 
         acknowledge_hooks();
-        let mut inst = Instance::new("cursor", "/tmp/test");
-        inst.tool = "cursor".to_string();
-        inst.detect_as = "cursor".to_string();
+        let mut inst = hook_inst("cursor");
         inst.source_profile = "identity-only-hooks".to_string();
-        inst.install_agent_status_hooks(crate::agents::get_agent("cursor"));
+        inst.install_agent_status_hooks(crate::agents::get_agent("cursor"), None);
 
         let hooks_path = custom_config.join("hooks.json");
         let hooks: serde_json::Value =
@@ -1235,21 +1242,14 @@ agent_status_hooks = false
 
             let project = tmp.path().join("repo");
             std::fs::create_dir_all(&project).unwrap();
-            let mut inst = Instance::new("claude", project.to_str().unwrap());
-            inst.tool = "claude".to_string();
+            let mut inst = tool_instance("claude", project.to_str().unwrap());
             inst.detect_as = "claude".to_string();
             inst.source_profile = profile.to_string();
             if sandboxed {
-                inst.sandbox_info = Some(crate::session::instance::SandboxInfo {
-                    enabled: true,
-                    container_id: None,
-                    image: "test:latest".to_string(),
-                    container_name: "test-container".to_string(),
-                    extra_env: None,
-                    custom_instruction: None,
-                    before_start_env: Vec::new(),
-                    container_workdir: None,
-                });
+                inst.sandbox_info = Some(crate::session::instance::test_helpers::test_sandbox(
+                    "test-container",
+                    None,
+                ));
             }
             inst.ensure_host_folder_trust(crate::agents::get_agent(&inst.detect_as));
 
@@ -1273,25 +1273,14 @@ agent_status_hooks = false
         })
         .unwrap();
 
-        let profile_dir = crate::session::get_profile_dir("hooks-enabled").unwrap();
-        std::fs::write(
-            profile_dir.join("config.toml"),
-            "[session]\nagent_status_hooks = true\n",
-        )
-        .unwrap();
+        write_profile("hooks-enabled", "[session]\nagent_status_hooks = true\n");
 
         acknowledge_hooks();
-        let mut inst = Instance::new("codex", "/tmp/test");
-        inst.tool = "codex".to_string();
-        inst.detect_as = "codex".to_string();
+        let mut inst = hook_inst("codex");
         inst.source_profile = "hooks-enabled".to_string();
-        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
+        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as), None);
 
-        let hooks_path = tmp.path().join(".codex").join("hooks.json");
-        let hooks = std::fs::read_to_string(hooks_path).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&hooks).unwrap();
-        assert!(parsed["hooks"]["PreToolUse"].is_array());
-        assert!(hooks.contains("aoe-hooks"));
+        assert_aoe_codex_hooks(&tmp.path().join(".codex").join("hooks.json"));
     }
 
     #[test]
@@ -1401,32 +1390,19 @@ agent_status_hooks = false
     }
 
     #[test]
-    fn test_status_hook_env_prefix_includes_hermes() {
-        assert_eq!(
-            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("hermes")),
-            expected_status_prefix("work", "abc123", "hermes")
-        );
-        assert_eq!(
-            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("settl")),
-            expected_status_prefix("work", "abc123", "settl")
-        );
-        assert_eq!(
-            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("claude")),
-            expected_status_prefix("work", "abc123", "claude")
-        );
+    fn status_hook_env_prefix_is_set_for_hook_agents_only() {
+        for agent in ["codex", "hermes", "settl", "claude", "kiro", "kimi"] {
+            assert_eq!(
+                status_hook_env_prefix("work", "abc123", crate::agents::get_agent(agent)),
+                expected_status_prefix("work", "abc123", agent)
+            );
+        }
         assert_eq!(
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("opencode")),
             ""
         );
-        assert_eq!(
-            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("kiro")),
-            expected_status_prefix("work", "abc123", "kiro")
-        );
-        assert_eq!(
-            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("kimi")),
-            expected_status_prefix("work", "abc123", "kimi")
-        );
     }
+
     #[test]
     #[serial_test::serial]
     fn disabling_status_hooks_removes_stale_aoe_entries_but_keeps_foreign_hooks() {
@@ -1435,10 +1411,8 @@ agent_status_hooks = false
         let _env = EnvGuard::set(&[("HOME", tmp.path().as_os_str())]);
         acknowledge_hooks();
 
-        let mut inst = Instance::new("gemini", "/tmp/test");
-        inst.tool = "gemini".to_string();
-        inst.detect_as = "gemini".to_string();
-        inst.install_agent_status_hooks(crate::agents::get_agent("gemini"));
+        let mut inst = hook_inst("gemini");
+        inst.install_agent_status_hooks(crate::agents::get_agent("gemini"), None);
         let path = tmp.path().join(".gemini/settings.json");
         let mut settings: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -1459,7 +1433,7 @@ agent_status_hooks = false
         inst.source_profile = profile.to_string();
         inst.ensure_disclosed_host_hook_path(crate::agents::get_agent("gemini"))
             .unwrap();
-        inst.install_agent_status_hooks(crate::agents::get_agent("gemini"));
+        inst.install_agent_status_hooks(crate::agents::get_agent("gemini"), None);
 
         let content = std::fs::read_to_string(path).unwrap();
         assert!(content.contains("printf foreign"));
@@ -1475,10 +1449,8 @@ agent_status_hooks = false
         let _home_guard = EnvGuard::set(&[("HOME", tmp.path())]);
         acknowledge_hooks();
 
-        let mut inst = Instance::new("codex", "/tmp/test");
-        inst.tool = "codex".to_string();
-        inst.detect_as = "codex".to_string();
-        inst.install_agent_status_hooks(crate::agents::get_agent("codex"));
+        let mut inst = hook_inst("codex");
+        inst.install_agent_status_hooks(crate::agents::get_agent("codex"), None);
         let path = tmp.path().join(".codex/hooks.json");
         let mut settings: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -1502,7 +1474,7 @@ agent_status_hooks = false
         inst.source_profile = profile.to_string();
         inst.ensure_disclosed_host_hook_path(crate::agents::get_agent("codex"))
             .unwrap();
-        inst.install_agent_status_hooks(crate::agents::get_agent("codex"));
+        inst.install_agent_status_hooks(crate::agents::get_agent("codex"), None);
 
         let content = std::fs::read_to_string(path).unwrap();
         assert!(content.contains("printf foreign"));
@@ -1547,7 +1519,7 @@ agent_status_hooks = false
             ];
             inst.ensure_disclosed_host_hook_path(crate::agents::get_agent(tool))
                 .unwrap();
-            inst.install_agent_status_hooks(crate::agents::get_agent(tool));
+            inst.install_agent_status_hooks(crate::agents::get_agent(tool), None);
 
             let path = root.join(filename);
             assert!(
@@ -1563,8 +1535,7 @@ agent_status_hooks = false
     fn agent_without_hooks_skips_host_path_disclosure_checks() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
-        let mut inst = Instance::new("opencode", "/tmp/test");
-        inst.tool = "opencode".to_string();
+        let mut inst = tool_instance("opencode", "/tmp/test");
         inst.pending_host_env = vec![("HOME".to_string(), "/undisclosed/home".to_string())];
         inst.ensure_disclosed_host_hook_path(crate::agents::get_agent("opencode"))
             .unwrap();

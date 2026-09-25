@@ -1,8 +1,71 @@
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VolumeMount {
     pub host_path: String,
     pub container_path: String,
     pub read_only: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InspectedMount {
+    pub(crate) kind: String,
+    pub(crate) name: Option<String>,
+    pub(crate) source: Option<String>,
+    pub(crate) container_path: std::path::PathBuf,
+    pub(crate) read_only: bool,
+}
+
+/// Actual runtime state, never inferred from the desired create configuration.
+#[derive(Clone, Debug)]
+pub(crate) struct InspectedContainer {
+    pub(crate) id: String,
+    pub(crate) running: bool,
+    pub(crate) bind_mounts: Vec<VolumeMount>,
+    pub(crate) ordinary_mounts: Vec<InspectedMount>,
+    pub(crate) opaque_mounts: Vec<InspectedMount>,
+    /// Apple runtime plugin name; absence on Docker/Podman is not a plugin guess.
+    pub(crate) runtime_handler: Option<String>,
+}
+
+pub(crate) fn host_path_for_mounts<'a>(
+    volumes: &[VolumeMount],
+    shadow_mounts: impl Iterator<Item = &'a str>,
+    container_path: &std::path::Path,
+    writable: bool,
+) -> Option<std::path::PathBuf> {
+    if container_path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let (volume, relative) = volumes
+        .iter()
+        .filter_map(|volume| {
+            container_path
+                .strip_prefix(std::path::Path::new(&volume.container_path))
+                .ok()
+                .map(|relative| (volume, relative))
+        })
+        .max_by_key(|(volume, _)| {
+            std::path::Path::new(&volume.container_path)
+                .components()
+                .count()
+        })?;
+    let bind_depth = std::path::Path::new(&volume.container_path)
+        .components()
+        .count();
+    let shadow_depth = shadow_mounts
+        .filter_map(|mounted| {
+            container_path
+                .strip_prefix(std::path::Path::new(mounted))
+                .ok()
+                .map(|_| std::path::Path::new(mounted).components().count())
+        })
+        .max();
+    if shadow_depth.is_some_and(|depth| depth >= bind_depth) || (writable && volume.read_only) {
+        return None;
+    }
+    Some(std::path::Path::new(&volume.host_path).join(relative))
 }
 
 pub struct NamedVolumeMount {
@@ -136,44 +199,16 @@ impl ContainerConfig {
         container_path: &std::path::Path,
         writable: bool,
     ) -> Option<std::path::PathBuf> {
-        let (volume, relative) = self
-            .volumes
-            .iter()
-            .filter_map(|volume| {
-                container_path
-                    .strip_prefix(std::path::Path::new(&volume.container_path))
-                    .ok()
-                    .map(|relative| (volume, relative))
-            })
-            .max_by_key(|(volume, _)| {
-                std::path::Path::new(&volume.container_path)
-                    .components()
-                    .count()
-            })?;
-        let bind_depth = std::path::Path::new(&volume.container_path)
-            .components()
-            .count();
-        let shadow_depth = self
-            .anonymous_volumes
-            .iter()
-            .map(String::as_str)
-            .chain(
+        host_path_for_mounts(
+            &self.volumes,
+            self.anonymous_volumes.iter().map(String::as_str).chain(
                 self.named_ignore_volumes
                     .iter()
                     .map(|volume| volume.container_path.as_str()),
-            )
-            .filter_map(|mounted| {
-                container_path
-                    .strip_prefix(std::path::Path::new(mounted))
-                    .ok()
-                    .map(|_| std::path::Path::new(mounted).components().count())
-            })
-            .max();
-        // Ignore volumes own their subtree and are emitted after equal bind destinations.
-        if shadow_depth.is_some_and(|depth| depth >= bind_depth) || (writable && volume.read_only) {
-            return None;
-        }
-        Some(std::path::Path::new(&volume.host_path).join(relative))
+            ),
+            container_path,
+            writable,
+        )
     }
 
     pub(crate) fn path_is_mounted(
@@ -301,6 +336,14 @@ mod tests {
         assert_eq!(
             config.host_path_for_container_path(source, false),
             Some(std::path::PathBuf::from("/host/project/src/lib.rs"))
+        );
+        assert_eq!(
+            config.host_path_for_container_path(
+                std::path::Path::new("/workspace/project/../other/file.jsonl"),
+                false
+            ),
+            None,
+            "a traversal component must not resolve outside the matched bind"
         );
 
         let settings = std::path::Path::new("/workspace/project/.prime/agent/settings.json");
