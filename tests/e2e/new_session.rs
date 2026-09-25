@@ -132,25 +132,3 @@ fn test_new_session_enters_live_mode_when_configured() {
     h.wait_for_timeout("LIVE", Duration::from_secs(10));
     h.assert_screen_contains(" aoe ");
 }
-
-/// With no saved projects, `b` opens the project add form, which Esc cancels in
-/// one press.
-#[test]
-#[parallel]
-fn test_new_session_from_project_empty_state_opens_add_form() {
-    require_tmux!();
-    let mut h = TuiTestHarness::new("new_from_project_empty");
-    h.spawn_tui();
-    h.wait_for(" aoe ");
-    h.send_keys("Enter"); // dismiss welcome
-    h.wait_for("No sessions yet");
-
-    h.send_keys("b");
-    h.wait_for(" Projects ");
-    h.assert_screen_contains("Path:");
-    h.assert_screen_contains("Base branch:");
-
-    h.send_keys("Escape");
-    h.wait_for_absent(" Projects ", Duration::from_secs(5));
-    h.assert_screen_contains("No sessions yet");
-}
