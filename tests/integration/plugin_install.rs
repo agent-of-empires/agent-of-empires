@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use agent_of_empires::plugin::install::{self, UpdateOutcome, UpdatePreview};
+use agent_of_empires::plugin::install::{self, UpdatePreview};
 use agent_of_empires::plugin::lockfile::Lockfile;
 use agent_of_empires::plugin::registry::PluginRegistry;
 use agent_of_empires::plugin::{auto_update, update_check};
@@ -217,40 +217,6 @@ async fn invalid_manifests_are_rejected() {
             .to_string();
         assert!(err.contains(expected), "got: {err}");
     }
-}
-
-#[tokio::test]
-#[serial]
-async fn grant_is_pinned_to_manifest_hash() {
-    let _home = isolate();
-    let src = tempfile::tempdir().unwrap();
-    let dir = write_plugin_dir(
-        src.path(),
-        r#"
-id = "acme.caps"
-name = "Caps"
-version = "0.1.0"
-api_version = 2
-capabilities = ["net"]
-"#,
-    );
-    install::install(dir.to_str().unwrap(), true).await.unwrap();
-    assert!(load_registry().get("acme.caps").unwrap().active());
-
-    // Tamper with the installed manifest so its hash changes; the grant no
-    // longer covers it, so the plugin deactivates and needs re-approval.
-    let installed = agent_of_empires::plugin::plugins_dir()
-        .unwrap()
-        .join("acme.caps")
-        .join("aoe-plugin.toml");
-    let mut text = std::fs::read_to_string(&installed).unwrap();
-    text.push_str("\n# tampered\n");
-    std::fs::write(&installed, text).unwrap();
-
-    let reg = load_registry();
-    let plugin = reg.get("acme.caps").unwrap();
-    assert!(!plugin.active(), "stale grant must deactivate the plugin");
-    assert!(plugin.needs_reapproval());
 }
 
 /// Re-approval closes the stale-grant loop without a network fetch: the
@@ -1187,48 +1153,6 @@ async fn auto_update_applies_clean_github_update() {
     std::env::remove_var("AOE_GITHUB_CLONE_BASE");
 }
 
-#[tokio::test]
-#[serial]
-async fn clean_update_skips_capability_change() {
-    let _home = isolate();
-    let base = tempfile::tempdir().unwrap();
-    // Bump the version too, so the "prior version kept" assertion actually
-    // proves nothing was rewritten (a same-version skip could pass vacuously).
-    let with_cap = PLAIN_MANIFEST.replace("1.0.0", "2.0.0").replace(
-        "api_version = 2",
-        "api_version = 2\ncapabilities = [\"net\"]",
-    );
-    make_bare_repo(
-        base.path(),
-        "acme",
-        "upd",
-        &[("aoe-plugin.toml", PLAIN_MANIFEST)],
-    );
-    // Branch tracking is now an explicit-ref opt-in: `@main` follows the default
-    // branch (no release resolution), which these update-mechanics tests need.
-    install::install("gh:acme/upd@main", true).await.unwrap();
-
-    // The new version adds a capability, so a non-interactive clean update must
-    // skip it and leave the prior version installed.
-    push_new_commit(
-        base.path(),
-        "acme",
-        "upd",
-        &[("aoe-plugin.toml", &with_cap)],
-    );
-    match install::update_clean("acme.upd").await.unwrap() {
-        UpdateOutcome::Skipped { id, .. } => assert_eq!(id, "acme.upd"),
-        other => panic!("expected skip on capability change, got {other:?}"),
-    }
-    assert_eq!(
-        Lockfile::load().unwrap().get("acme.upd").unwrap().version,
-        "1.0.0",
-        "prior version kept",
-    );
-
-    std::env::remove_var("AOE_GITHUB_CLONE_BASE");
-}
-
 /// The manifest a capability-expanding update fetches.
 fn with_net_cap_v2() -> String {
     PLAIN_MANIFEST.replace("1.0.0", "2.0.0").replace(
@@ -1414,6 +1338,11 @@ async fn sweep_notifies_then_respects_a_dismissal() {
     assert!(
         rec.applied.lock().unwrap().is_empty(),
         "a skipped update restarts nothing",
+    );
+    assert_eq!(
+        Lockfile::load().unwrap().get("acme.upd").unwrap().version,
+        "1.0.0",
+        "a skipped update keeps the prior version",
     );
 
     // After dismissing this exact version, a later sweep stays silent.

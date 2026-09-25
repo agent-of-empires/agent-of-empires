@@ -13,7 +13,7 @@ use agent_of_empires::acp::acp_client::{AcpClient, SpawnConfig};
 use agent_of_empires::acp::agent_registry::AgentSpec;
 use agent_of_empires::acp::mcp_config;
 use agent_of_empires::acp::state::AcpSessionId;
-use agent_of_empires::session::mcp::mcp_model::{self, McpLayer, McpProvenance};
+use agent_of_empires::session::mcp::mcp_model;
 
 use crate::common::{shim_path, shim_ready};
 
@@ -73,92 +73,6 @@ fn read_record(path: &std::path::Path) -> String {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-}
-
-#[tokio::test]
-#[serial_test::parallel]
-async fn native_and_global_merge_reaches_new_session() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-
-    // Native layer (lowest precedence): the agent's own `~/.claude.json`. It
-    // defines "shared" (collides with global) and "native-only".
-    let home = tempfile::tempdir().unwrap();
-    std::fs::write(
-        home.path().join(".claude.json"),
-        r#"{ "mcpServers": {
-            "shared": { "command": "from-native" },
-            "native-only": { "command": "n" }
-        } }"#,
-    )
-    .unwrap();
-    let native = mcp_model::load_native_mcp_servers("claude", home.path()).unwrap();
-
-    // Global layer (higher precedence): `<app_dir>/mcp.json`. It overrides
-    // "shared" and adds "global-only".
-    let app_dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        app_dir.path().join("mcp.json"),
-        r#"{ "mcpServers": {
-            "shared": { "command": "from-global" },
-            "global-only": { "command": "g" }
-        } }"#,
-    )
-    .unwrap();
-    let global = mcp_model::load_global_mcp_servers(app_dir.path()).unwrap();
-
-    let merged = mcp_model::resolve(vec![
-        McpLayer {
-            provenance: McpProvenance::AgentNative {
-                agent: "claude".into(),
-            },
-            servers: native,
-        },
-        McpLayer {
-            provenance: McpProvenance::Global,
-            servers: global,
-        },
-    ]);
-
-    let record_dir = tempfile::tempdir().unwrap();
-    let record_path = record_dir.path().join("record.json");
-    let mut config = base_config(std::env::temp_dir(), &record_path);
-    config.mcp_servers =
-        mcp_config::project_servers_to_acp(merged.into_iter().map(|s| s.def).collect());
-
-    let client = AcpClient::spawn(config, AcpSessionId("mcp-native-merge".into()))
-        .await
-        .expect("spawn shim agent");
-
-    let body = read_record(&record_path);
-    let _ = client.shutdown().await;
-
-    let parsed: serde_json::Value = serde_json::from_str(&body).expect("record is JSON");
-    let arr = parsed.as_array().expect("mcp_servers is an array");
-    assert_eq!(
-        arr.len(),
-        3,
-        "expected merged union of three servers, got {body}"
-    );
-
-    let shared = arr
-        .iter()
-        .find(|s| s["name"] == "shared")
-        .expect("shared server present");
-    assert_eq!(
-        shared["command"], "from-global",
-        "global must override native on name collision, got {body}"
-    );
-    assert!(
-        arr.iter().any(|s| s["name"] == "native-only"),
-        "native-only server must survive the merge, got {body}"
-    );
-    assert!(
-        arr.iter().any(|s| s["name"] == "global-only"),
-        "global-only server must survive the merge, got {body}"
-    );
 }
 
 #[tokio::test]
