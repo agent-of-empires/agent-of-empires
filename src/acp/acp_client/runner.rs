@@ -181,6 +181,7 @@ pub(super) fn spawn_runner_detached(
     cmd.env_clear();
     apply_env_filter(cmd.as_std_mut(), config, &[]);
     apply_claude_store_route(cmd.as_std_mut(), config);
+    #[cfg(debug_assertions)]
     if let Ok(interval) = std::env::var("AOE_ACP_WATCHDOG_POLL_MS") {
         cmd.env("AOE_ACP_WATCHDOG_POLL_MS", interval);
     }
