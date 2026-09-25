@@ -37,7 +37,7 @@ vi.mock("../../lib/api", () => ({
   fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(),
   getSettingsSchema: vi.fn(() => Promise.resolve(SESSION_SCHEMA)),
-  updateProfileSettings: vi.fn(() => Promise.resolve(true)),
+  updateSettings: vi.fn(() => Promise.resolve(true)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),
@@ -87,7 +87,7 @@ const autoStopInput = (container: HTMLElement) =>
     .parentElement!.querySelector('input[type="number"]') as HTMLInputElement;
 
 const expectSaved = (patch: Record<string, unknown>) =>
-  waitFor(() => expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", patch));
+  waitFor(() => expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({ profile: "main" }, patch));
 
 describe("Session tab", () => {
   beforeEach(() => vi.clearAllMocks());

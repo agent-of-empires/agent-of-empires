@@ -32,7 +32,7 @@ vi.mock("../../lib/api", () => ({
     let calls = 0;
     return vi.fn(() => Promise.resolve(calls++ === 0 ? null : WORKTREE_SCHEMA));
   })(),
-  updateProfileSettings: vi.fn(() => Promise.resolve(true)),
+  updateSettings: vi.fn(() => Promise.resolve(true)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),

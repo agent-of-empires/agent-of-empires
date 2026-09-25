@@ -285,8 +285,13 @@ export function fetchSystemHealth(): Promise<SystemHealth | null> {
   return fetchJson<SystemHealth>("/api/system/health");
 }
 
-export function fetchSettings(profile?: string): Promise<SettingsResponse | null> {
-  const params = profile ? `?profile=${encodeURIComponent(profile)}` : "";
+/** Which settings layer a read or write targets. Required on every call: an
+ *  omitted profile used to mean machine-wide, so a read that forgot it silently
+ *  ignored the profile value the settings page had saved (#4144). */
+export type SettingsScope = { profile: string } | "machine";
+
+export function fetchSettings(scope: SettingsScope): Promise<SettingsResponse | null> {
+  const params = scope === "machine" ? "" : `?profile=${encodeURIComponent(scope.profile)}`;
   return fetchJson<SettingsResponse>(`/api/settings${params}`);
 }
 
@@ -707,10 +712,6 @@ export function invokePluginCommand(fqid: string, sessionId: string): Promise<bo
   );
 }
 
-export function updateSettings(updates: Record<string, unknown>): Promise<boolean> {
-  return fetchOk("/api/settings", jsonInit("PATCH", updates));
-}
-
 // Theme, tour, tips and acknowledgement flags use dedicated endpoints so these
 // cosmetic writes stay off the passphrase/elevation wall of PATCH /api/settings.
 
@@ -818,18 +819,20 @@ export function profileWritableSections(schema: SettingsFieldDescriptor[]): Set<
   return sections;
 }
 
-/** PATCH profile settings, refusing blocked sections. Without a schema, defers to the server's guard. */
-export async function updateProfileSettings(name: string, updates: Record<string, unknown>): Promise<boolean> {
+/** PATCH settings in `scope`. A profile write refuses blocked sections; without
+ *  a schema it defers to the server's guard. */
+export async function updateSettings(scope: SettingsScope, updates: Record<string, unknown>): Promise<boolean> {
+  if (scope === "machine") return fetchOk("/api/settings", jsonInit("PATCH", updates));
   const schema = await getSettingsSchema();
   if (schema) {
     const writable = profileWritableSections(schema);
     const blocked = Object.keys(updates).find((key) => !writable.has(key));
     if (blocked !== undefined) {
-      console.error(`updateProfileSettings: refusing to send blocked profile section "${blocked}"`);
+      console.error(`updateSettings: refusing to send blocked profile section "${blocked}"`);
       return false;
     }
   }
-  return fetchOk(`/api/profiles/${encodeURIComponent(name)}/settings`, jsonInit("PATCH", updates));
+  return fetchOk(`/api/profiles/${encodeURIComponent(scope.profile)}/settings`, jsonInit("PATCH", updates));
 }
 
 // --- Themes & Sounds ---

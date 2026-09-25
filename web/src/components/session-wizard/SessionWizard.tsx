@@ -153,7 +153,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
       .then((p) => {
         dispatch({ type: "SET_PROFILES", profiles: p });
         const effectiveProfile = prefill?.profile || p.find((x) => x.is_default)?.name || "";
-        return fetchSettings(effectiveProfile || undefined);
+        return fetchSettings(effectiveProfile ? { profile: effectiveProfile } : "machine");
       })
       .then((s) => {
         if (!s) return;

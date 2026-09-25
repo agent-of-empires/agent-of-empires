@@ -1304,6 +1304,13 @@
       ]
     },
     {
+      "id": "settings.scope",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/__tests__/appSettings.test.ts", "src/lib/api.test.ts", "src/hooks/useApprovalSound.test.ts"],
+      "components": ["web/src/lib/api.ts", "web/src/lib/appSettings.ts", "web/src/hooks/useApprovalSound.ts"]
+    },
+    {
       "id": "sidebar.session-color-toggle",
       "kind": "vitest",
       "risk": "low",

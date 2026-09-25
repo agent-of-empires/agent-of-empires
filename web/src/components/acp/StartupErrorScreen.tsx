@@ -30,7 +30,7 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
 
   useEffect(() => {
     let alive = true;
-    fetchSettings().then((s) => {
+    fetchSettings("machine").then((s) => {
       if (alive) {
         setAllowInstall(Boolean((s as { acp?: { allow_agent_install?: boolean } } | null)?.acp?.allow_agent_install));
       }

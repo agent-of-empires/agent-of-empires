@@ -66,7 +66,7 @@ vi.mock("../../lib/api", () => ({
   fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(() => Promise.resolve({ acp: {}, sandbox: {}, worktree: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(MOCK_SCHEMA)),
-  updateProfileSettings: vi.fn(() => Promise.resolve(true)),
+  updateSettings: vi.fn(() => Promise.resolve(true)),
   setDefaultProfile: vi.fn(() => Promise.resolve(true)),
   createProfile: vi.fn(() => Promise.resolve(true)),
   renameProfile: vi.fn(() => Promise.resolve(true)),
@@ -191,16 +191,25 @@ describe("Settings Advanced fold", () => {
     commit(fieldInputByLabel(container, "Auto-stop idle workers (s)", "number"), "28800");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        acp: { max_concurrent_workers: 50 },
-      }),
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+        { profile: "main" },
+        {
+          acp: { max_concurrent_workers: 50 },
+        },
+      ),
     );
-    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      acp: { silent_orphan_grace_secs: 240 },
-    });
-    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      acp: { auto_stop_idle_secs: 28800 },
-    });
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+      { profile: "main" },
+      {
+        acp: { silent_orphan_grace_secs: 240 },
+      },
+    );
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+      { profile: "main" },
+      {
+        acp: { auto_stop_idle_secs: 28800 },
+      },
+    );
   });
 
   it("exercises the structured-view high-level controls outside the fold", async () => {
@@ -211,13 +220,19 @@ describe("Settings Advanced fold", () => {
     clickToggle(container, "Auto-resume after rate limit");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        acp: { replay_events: 500 },
-      }),
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+        { profile: "main" },
+        {
+          acp: { replay_events: 500 },
+        },
+      ),
     );
-    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      acp: { rate_limit_auto_resume: true },
-    });
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+      { profile: "main" },
+      {
+        acp: { rate_limit_auto_resume: true },
+      },
+    );
   });
 
   it("expands the worktree fold and saves every advanced field", async () => {
@@ -234,13 +249,19 @@ describe("Settings Advanced fold", () => {
     clickToggle(container, "Init Submodules");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        worktree: { workspace_path_template: "../wt-{branch}" },
-      }),
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+        { profile: "main" },
+        {
+          worktree: { workspace_path_template: "../wt-{branch}" },
+        },
+      ),
     );
-    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      worktree: { delete_branch_on_cleanup: true },
-    });
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+      { profile: "main" },
+      {
+        worktree: { delete_branch_on_cleanup: true },
+      },
+    );
   });
 
   it("saves sandbox advanced fields, including the derived list validators", async () => {
@@ -263,16 +284,25 @@ describe("Settings Advanced fold", () => {
     addListItem(container, "Volume ignores", "node_modules");
 
     await waitFor(() =>
-      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-        sandbox: { cpu_limit: "4" },
-      }),
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+        { profile: "main" },
+        {
+          sandbox: { cpu_limit: "4" },
+        },
+      ),
     );
-    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      sandbox: { environment: ["FOO=bar"] },
-    });
-    expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
-      sandbox: { port_mappings: ["3000:3000"] },
-    });
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+      { profile: "main" },
+      {
+        sandbox: { environment: ["FOO=bar"] },
+      },
+    );
+    expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith(
+      { profile: "main" },
+      {
+        sandbox: { port_mappings: ["3000:3000"] },
+      },
+    );
   });
 
   // Regression: the mount-time fetchProfiles resolution flips selectedProfile from its "" seed to the default.
@@ -297,7 +327,7 @@ describe("Settings Advanced fold", () => {
       resolveProfiles(PROFILES);
     });
 
-    await waitFor(() => expect(vi.mocked(api.fetchSettings)).toHaveBeenCalledWith("main"));
+    await waitFor(() => expect(vi.mocked(api.fetchSettings)).toHaveBeenCalledWith({ profile: "main" }));
     expect(screen.getByText("Silent-orphan grace (s)")).toBeTruthy();
   });
 

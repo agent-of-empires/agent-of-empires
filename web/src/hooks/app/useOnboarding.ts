@@ -38,7 +38,7 @@ export function useOnboarding({
   const tourSeenAtLoadRef = useRef<boolean | null>(null);
 
   useEffect(() => {
-    fetchSettings().then((settings) => {
+    fetchSettings("machine").then((settings) => {
       if (!settings) return;
       const backendSeen = settings.app_state?.has_seen_web_tour === true;
       const legacySeen = safeGetItem(LEGACY_TOUR_SEEN_KEY) === "1";
