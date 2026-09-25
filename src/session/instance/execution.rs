@@ -21,7 +21,7 @@ pub struct ExecutionLocation {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionBinding {
     pub agent: String,
     pub stores: Vec<PathBuf>,
@@ -32,9 +32,55 @@ pub struct ExecutionBinding {
     pub filesystem: String,
     /// The launch exported the store's routing variable although the store is the
     /// agent's implicit default, so later launches keep exporting it (Claude, #4119).
-    /// Routing only; not part of the execution identity.
+    /// Routing only: equality and hashing ignore it, so it never makes a binding
+    /// name a different conversation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exported_default_store: bool,
+}
+
+impl ExecutionBinding {
+    fn identity(
+        &self,
+    ) -> (
+        &str,
+        &[PathBuf],
+        &[ExecutionLocation],
+        &std::path::Path,
+        &str,
+        &str,
+    ) {
+        let Self {
+            agent,
+            stores,
+            configuration,
+            cwd,
+            cwd_filesystem,
+            filesystem,
+            exported_default_store: _,
+        } = self;
+        (
+            agent,
+            stores,
+            configuration,
+            cwd,
+            cwd_filesystem,
+            filesystem,
+        )
+    }
+}
+
+impl PartialEq for ExecutionBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+}
+
+impl Eq for ExecutionBinding {}
+
+impl std::hash::Hash for ExecutionBinding {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.identity().hash(state);
+    }
 }
 
 impl ExecutionBinding {
