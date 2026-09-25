@@ -58,8 +58,11 @@ impl Instance {
         if self.active_execution == src.active_execution {
             self.session_id_poller = src.session_id_poller.clone();
             self.session_id_poller_retry_after = src.session_id_poller_retry_after;
-            if src.session_id_poller_is_running() {
-                self.poller_repair.reset();
+            // A new capture floor is this launch's own stamp, and the launch stamps it only after
+            // the pane it replaced is gone. Without it `src` still carries the baseline's schedule,
+            // which is older than what the live row's own repair walk may have armed since.
+            if src.capture_started_at != before.capture_started_at {
+                self.poller_repair = src.poller_repair.clone();
             }
         } else {
             src.stop_poller();
@@ -666,6 +669,9 @@ mod tests {
         assert_eq!(before.poller_repair.deferrals(), 2);
         let mut restarted = before.clone();
         restarted.omp_capture_generation = Some("generation-b".to_string());
+        // What a relaunch leaves behind: a fresh capture floor, and no schedule.
+        restarted.capture_started_at =
+            Some(std::time::SystemTime::now() + std::time::Duration::from_secs(1));
         restarted.poller_repair.reset();
         let restarted_poller = running_poller(&before.id);
         restarted.session_id_poller = Some(restarted_poller.clone());
@@ -697,12 +703,33 @@ mod tests {
         ));
         assert_eq!(peer_relaunched.poller_repair.deferrals(), 0);
 
-        let mut not_started = restarted.clone();
-        not_started.session_id_poller = None;
+        // A stamped relaunch that recorded a "nothing to poll" schedule owns the row's schedule,
+        // even though it left no poller running.
+        let mut relaunch_with_a_schedule = restarted.clone();
+        relaunch_with_a_schedule.session_id_poller = None;
+        relaunch_with_a_schedule.poller_repair.reset();
+        relaunch_with_a_schedule.poller_repair.reprobe(now);
         let mut live = before.clone();
-        live.merge_post_restart_with_baseline(&before, &not_started);
-        assert_eq!(live.poller_repair.deferrals(), 2);
-        stop(&restarted_poller);
+        live.merge_post_restart_with_baseline(&before, &relaunch_with_a_schedule);
+        assert_eq!(
+            live.poller_repair.current_reprobe_delay(),
+            relaunch_with_a_schedule
+                .poller_repair
+                .current_reprobe_delay()
+        );
+
+        // An unstamped relaunch never reached the launch stamp, so it says nothing about the
+        // schedule: the live row keeps whatever its own walk armed in the meantime.
+        let stale = before.clone();
+        let mut live = before.clone();
+        live.poller_repair.reprobe(now);
+        live.poller_repair.reprobe(now);
+        live.merge_post_restart_with_baseline(&before, &stale);
+        assert_eq!(
+            live.poller_repair.current_reprobe_delay(),
+            Some(std::time::Duration::from_secs(10)),
+            "the baseline value is older than the live row's own schedule"
+        );
     }
 
     #[test]

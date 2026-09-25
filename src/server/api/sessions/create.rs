@@ -1079,8 +1079,8 @@ pub(super) fn apply_post_restart_identity_sync(
     if live.active_execution == started.active_execution {
         live.session_id_poller = started.session_id_poller.clone();
         live.session_id_poller_retry_after = started.session_id_poller_retry_after;
-        if started.session_id_poller_is_running() {
-            live.poller_repair.reset();
+        if started.capture_started_at != before.capture_started_at {
+            live.poller_repair = started.poller_repair.clone();
         }
     } else {
         started.stop_poller();

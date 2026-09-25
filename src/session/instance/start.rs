@@ -512,6 +512,9 @@ impl Instance {
             }
         }
 
+        // A launch re-evaluates the row: a schedule carried in from the previous incarnation
+        // describes a pane this launch replaced, and the capture lease it held.
+        self.poller_repair.reset();
         self.maybe_start_poller_since(omp_capture_metadata);
 
         self.status = Status::Starting;

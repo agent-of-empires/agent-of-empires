@@ -144,8 +144,8 @@ fn repair_backoffs(
         .collect()
 }
 
-/// Rows whose poller-repair schedule the walk changed (a deferral recorded,
-/// or a reset after a successful start), keyed by id.
+/// Rows whose poller-repair schedule the walk changed (a deferral, a re-probe, or a reset
+/// after a successful start), keyed by id.
 fn changed_repair_backoffs(
     before: &std::collections::HashMap<String, crate::session::poller::PollerRepairBackoff>,
     after: &[crate::session::Instance],

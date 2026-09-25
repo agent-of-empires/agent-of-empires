@@ -621,28 +621,35 @@ impl Instance {
         {
             return false;
         }
-        let now = std::time::Instant::now();
-        // A failed attempt schedules the next one (5 s doubling to 60 s), so an over-budget fleet
-        // is not re-probed — and re-warned — for every session on every 2 s tick.
-        if !self.poller_repair.due(now) {
+        // A scheduled attempt is not due, so a fleet that is over budget or has nothing to poll
+        // is not re-probed, and not re-warned, on every tick.
+        if !self.poller_repair.due(std::time::Instant::now()) {
             return false;
         }
         self.session_id_poller = None;
         match self.maybe_start_poller() {
             // `install_poller` cleared the schedule.
             PollerStart::Started => true,
-            // Nothing failed: the session has nothing to poll right now, or the managed store's own
-            // retry deadline governs.
-            PollerStart::NotApplicable | PollerStart::Deferred => {
+            // Not a failure, but reaching here usually cost a capture resolve and a `tmux`
+            // fork (the eligibility checks above are cheaper), so the row re-probes on a
+            // schedule of its own (#4137).
+            PollerStart::NotApplicable => {
+                // Stamped after the attempt: one that outran its own window must not come due
+                // again on the next tick.
+                self.poller_repair.reprobe(std::time::Instant::now());
+                false
+            }
+            // The managed store's own retry deadline governs this outcome.
+            PollerStart::Deferred => {
                 self.poller_repair.reset();
                 false
             }
             PollerStart::BudgetExhausted => {
-                self.defer_poller_repair(now, "budget exhausted");
+                self.defer_poller_repair(std::time::Instant::now(), "budget exhausted");
                 false
             }
             PollerStart::SpawnFailed => {
-                self.defer_poller_repair(now, "start failed");
+                self.defer_poller_repair(std::time::Instant::now(), "start failed");
                 false
             }
         }
@@ -816,9 +823,13 @@ mod tests {
     }
 
     /// A live pane with nothing to poll right now (here: an OMP pane whose capture metadata is not
-    /// resolvable) is not a failed spawn.
+    /// resolvable) is not a failed spawn, but the probe was not free either, so the next one
+    /// waits (#4137).
     #[test]
-    fn repair_does_not_defer_a_session_with_nothing_to_poll() {
+    #[serial_test::serial]
+    fn repair_reprobes_a_session_with_nothing_to_poll() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolated = crate::session::test_support::isolate_app_dir_at(home.path());
         let mut inst = Instance::new("omp-no-meta", "/tmp/omp-no-meta");
         inst.tool = "omp".to_string();
         inst.omp_capture_generation = Some("gen-1".to_string());
@@ -829,7 +840,7 @@ mod tests {
             )]),
             None,
         );
-        assert!(inst.has_live_tmux_pane_in(&live));
+        assert!(inst.has_live_agent_pane_in(&live));
         assert!(
             inst.supports_session_poller(),
             "OMP is pollable in principle, so repair walks the start path"
@@ -838,15 +849,34 @@ mod tests {
 
         assert!(!inst.repair_session_id_poller_if_needed(&live));
         assert!(inst.session_id_poller.is_none());
+        assert!(
+            !inst.poller_repair.due(std::time::Instant::now()),
+            "the next probe is scheduled, not the next tick"
+        );
         assert_eq!(
             inst.poller_repair.deferrals(),
             0,
-            "nothing to poll is not a failed repair"
+            "nothing to poll is not counted as a failed repair"
         );
         assert!(
-            inst.poller_repair.due(std::time::Instant::now()),
-            "the next tick may look again"
+            inst.session_id_poller_retry_after.is_none(),
+            "nothing to poll borrows no managed-store deadline"
         );
+
+        // Four more walks must leave the delay at its first value: a walk that reached the
+        // start path would have doubled it.
+        for _ in 0..4 {
+            assert!(!inst.repair_session_id_poller_if_needed(&live));
+        }
+        assert_eq!(
+            inst.poller_repair.current_reprobe_delay(),
+            Some(std::time::Duration::from_secs(5))
+        );
+
+        // Once the window closes, the row is probed again.
+        inst.poller_repair.expire();
+        assert!(!inst.repair_session_id_poller_if_needed(&live));
+        assert!(!inst.poller_repair.due(std::time::Instant::now()));
     }
 
     #[test]
@@ -881,8 +911,12 @@ mod tests {
         let settings = store.join("settings.json");
         std::fs::create_dir(&settings).unwrap();
         assert_eq!(inst.maybe_start_poller(), PollerStart::BudgetExhausted);
+        inst.poller_repair.expire();
         assert!(!inst.repair_session_id_poller_if_needed(&live));
-        assert!(!inst.poller_repair.due(std::time::Instant::now()));
+        assert!(
+            !inst.poller_repair.due(std::time::Instant::now()),
+            "an over-budget attempt schedules the next one"
+        );
         let lease = super::try_acquire_managed_capture_lease(backend, &store)
             .expect("budget rejection releases the store lease");
 
@@ -1411,7 +1445,10 @@ mod tests {
     /// The race #3880 describes: repair sees a live agent pane in its snapshot, the agent dies
     /// before `maybe_start_poller` re-queries tmux, and only the paired terminal answers.
     #[test]
+    #[serial_test::serial]
     fn repair_declines_when_the_agent_pane_dies_under_the_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let _isolated = crate::session::test_support::isolate_app_dir_at(home.path());
         let budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
         let mut inst = Instance::new("term rewriting", "/tmp/agent-died-under-snapshot");
         inst.tool = "claude".to_string();
@@ -1441,10 +1478,9 @@ mod tests {
             "no poller on the wrong pane"
         );
         assert_eq!(budget.active(), 0, "a declined start takes no budget slot");
-        assert_eq!(
-            inst.poller_repair,
-            Default::default(),
-            "nothing to poll is not a failed repair: the next tick looks again"
+        assert!(
+            !inst.poller_repair.due(std::time::Instant::now()),
+            "the decline is re-probed later: the live re-query that found no agent costs a fork"
         );
     }
 }

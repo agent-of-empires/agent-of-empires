@@ -113,14 +113,21 @@ const POLLER_REPAIR_MAX_DELAY: Duration = Duration::from_secs(60);
 /// At the capped delay, log a reminder every this many deferrals
 /// (60 s × 10 = one line per ten minutes per session).
 const POLLER_REPAIR_REMIND_EVERY: u32 = 10;
+/// First delay before re-probing a session that had nothing to poll.
+const POLLER_REPROBE_INITIAL_DELAY: Duration = Duration::from_secs(5);
+/// Ceiling for re-probing a session that has nothing to poll: the interval an unresolved
+/// managed capture store already waits before its own retry.
+const POLLER_REPROBE_MAX_DELAY: Duration = Duration::from_secs(30);
 
-/// Retry schedule for one session whose session-id poller could not be (re)started — typically
-/// because the process-wide thread budget is spent.
+/// Retry schedule for one session whose session-id poller was not (re)started: it could not be
+/// spawned, or the session had nothing to poll yet. One row carries one armed deadline; which
+/// delay it holds is the writer's business, and neither outcome inherits the other's.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PollerRepairBackoff {
     next_attempt: Option<Instant>,
     delay: Option<Duration>,
     deferrals: u32,
+    reprobe_delay: Option<Duration>,
 }
 
 impl PollerRepairBackoff {
@@ -133,8 +140,11 @@ impl PollerRepairBackoff {
     }
 
     /// Record a failed (or skipped-for-budget) attempt at `now` and schedule the next one: 5 s,
-    /// then doubling to a 60 s ceiling.
+    /// then doubling to a 60 s ceiling. `None` when the schedule neither escalated nor reached
+    /// its reminder cadence. A failure ends any run of "nothing to poll", so that streak starts
+    /// its own delay over if the row has nothing to poll again.
     pub fn defer(&mut self, now: Instant) -> Option<Duration> {
+        self.reprobe_delay = None;
         let previous = self.delay;
         let delay = match previous {
             None => POLLER_REPAIR_INITIAL_DELAY,
@@ -149,12 +159,33 @@ impl PollerRepairBackoff {
         (escalated || reminder).then_some(delay)
     }
 
-    /// Clear the schedule after a successful start.
+    /// Record an attempt at `now` that found nothing to poll: look again after 5 s, doubling to
+    /// 30 s. Nothing failed, so a past spawn failure stops governing the row and the next
+    /// failure starts its own delay over, counting and logging from its first deferral.
+    pub fn reprobe(&mut self, now: Instant) {
+        self.delay = None;
+        self.deferrals = 0;
+        let delay = match self.reprobe_delay {
+            None => POLLER_REPROBE_INITIAL_DELAY,
+            Some(d) => (d * 2).min(POLLER_REPROBE_MAX_DELAY),
+        };
+        self.reprobe_delay = Some(delay);
+        self.next_attempt = Some(now + delay);
+    }
+
+    /// The delay before the next re-probe of a session that had nothing to poll, if any.
+    #[cfg(test)]
+    pub(crate) fn current_reprobe_delay(&self) -> Option<Duration> {
+        self.reprobe_delay
+    }
+
+    /// Clear the schedule: a poller is running, a launch is re-evaluating the row, or another
+    /// deadline now governs it.
     pub fn reset(&mut self) {
         *self = Self::default();
     }
 
-    /// Number of consecutive deferrals since the last reset.
+    /// Consecutive deferrals since the last reset or "nothing to poll" answer.
     pub fn deferrals(&self) -> u32 {
         self.deferrals
     }
@@ -987,6 +1018,88 @@ mod tests {
         assert_eq!(b, PollerRepairBackoff::default());
         assert!(b.due(now));
         assert_eq!(b.defer(now), Some(Duration::from_secs(5)), "restarts at 5s");
+    }
+
+    #[test]
+    fn reprobe_doubles_to_its_own_ceiling_and_keeps_failures_logged() {
+        let mut b = PollerRepairBackoff::default();
+        let now = Instant::now();
+        assert!(b.due(now), "a fresh schedule is due immediately");
+
+        // A row whose failure schedule has already escalated.
+        for _ in 0..5 {
+            b.defer(now);
+        }
+        assert_eq!(b.deferrals(), 5);
+
+        let mut delays = Vec::new();
+        for _ in 0..4 {
+            b.reprobe(now);
+            delays.push(b.current_reprobe_delay().unwrap());
+        }
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(20),
+                POLLER_REPROBE_MAX_DELAY,
+            ],
+            "re-probes back off to their own ceiling, half the failure one"
+        );
+        assert!(
+            !b.due(now),
+            "a row with nothing to poll is not probed next tick"
+        );
+        assert_eq!(b.deferrals(), 0, "and it never counts as a failed repair");
+
+        // The next real failure restarts its own delay, so it logs on its first deferral
+        // instead of inheriting a silent ceiling from before the "nothing to poll" stretch.
+        assert_eq!(
+            b.defer(now),
+            Some(Duration::from_secs(5)),
+            "a failure after a stretch with nothing to poll starts over and warns"
+        );
+        assert_eq!(b.deferrals(), 1);
+
+        b.expire();
+        assert!(b.due(Instant::now()), "the schedule elapsed: due again");
+    }
+
+    #[test]
+    fn neither_outcome_inherits_the_others_delay() {
+        let mut b = PollerRepairBackoff::default();
+        let now = Instant::now();
+        for _ in 0..5 {
+            b.defer(now);
+        }
+        assert_eq!(b.current_delay(), Some(POLLER_REPAIR_MAX_DELAY));
+
+        // A row that fails hard and then has nothing to poll re-probes at the first delay.
+        b.reprobe(now);
+        assert_eq!(
+            b.current_reprobe_delay(),
+            Some(POLLER_REPROBE_INITIAL_DELAY)
+        );
+        assert_eq!(
+            b.current_delay(),
+            None,
+            "the failure delay it escaped no longer governs the row"
+        );
+
+        // And a row that goes quiet again after that failure starts over, rather than
+        // resuming at the ceiling the first stretch had reached.
+        for _ in 0..3 {
+            b.reprobe(now);
+        }
+        assert_eq!(b.current_reprobe_delay(), Some(POLLER_REPROBE_MAX_DELAY));
+        b.defer(now);
+        b.reprobe(now);
+        assert_eq!(
+            b.current_reprobe_delay(),
+            Some(POLLER_REPROBE_INITIAL_DELAY),
+            "a failure ends the quiet streak, so the next one starts at the first delay"
+        );
     }
 
     #[test]
