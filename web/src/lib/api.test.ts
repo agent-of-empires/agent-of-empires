@@ -298,6 +298,30 @@ const requestCases: RequestCase[] = [
     { body: { pinned: true }, respond: json({ pinned: true }), result: { ok: true, project: { pinned: true } } },
   ],
   [
+    "GET /api/projects/scratch/overrides",
+    () => api.fetchScratchOverrides(),
+    { respond: json({ scope: "merged", smart_rename: true }), result: { scope: "merged", smart_rename: true } },
+  ],
+  [
+    "GET /api/projects/scratch/overrides?scope=profile",
+    () => api.fetchScratchOverrides("profile"),
+    { respond: json({ scope: "profile" }), result: { scope: "profile" } },
+  ],
+  [
+    "PATCH /api/projects/scratch/overrides?scope=global",
+    () => api.updateScratchOverrides("global", true),
+    {
+      body: { smart_rename: true },
+      respond: json({ scope: "global", smart_rename: true }),
+      result: { ok: true, overrides: { scope: "global", smart_rename: true } },
+    },
+  ],
+  [
+    "PATCH /api/projects/scratch/overrides?scope=profile",
+    () => api.updateScratchOverrides("profile", null),
+    { body: { smart_rename: null }, respond: json({ scope: "profile" }) },
+  ],
+  [
     "POST /api/sessions",
     () => api.createSession({ path: "/repo", tool: "claude", trust_hooks: true } as CreateSessionRequest),
     {
@@ -613,6 +637,7 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["invokePluginAction", () => api.invokePluginAction("p", "m"), null],
   ["resolvePluginOptions", () => api.resolvePluginOptions("p", "s", []), []],
   ["fetchSoundBlob", () => api.fetchSoundBlob("x.wav"), null],
+  ["fetchScratchOverrides", () => api.fetchScratchOverrides(), null],
 ];
 
 describe("failure fallbacks", () => {
@@ -745,6 +770,7 @@ describe("project mutations", () => {
     ["deleteProject", () => api.deleteProject("p", "global")],
     ["updateProject", () => api.updateProject("p", "global", "x")],
     ["setProjectPinned", () => api.setProjectPinned("p", "global", true)],
+    ["updateScratchOverrides", () => api.updateScratchOverrides("global", true)],
   ];
 
   it.each(calls)("%s maps JSON, text, and network errors", async (_name, call) => {

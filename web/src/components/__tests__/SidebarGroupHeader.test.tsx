@@ -130,4 +130,26 @@ describe("SidebarGroupHeader", () => {
       vi.useRealTimers();
     }
   });
+
+  it("offers 'Edit settings' for the synthetic Scratch group despite capabilities.create being 'generic'", () => {
+    const onEditProjectSettings = vi.fn();
+    renderHeader({
+      group: group({ id: "__scratch__", capabilities: { appearance: true, reorder: true, create: "generic" } }),
+      onEditProject: onEditProjectSettings,
+    });
+
+    fireEvent.contextMenu(screen.getByTestId("sidebar-group-header"));
+    fireEvent.click(screen.getByTestId("sidebar-group-context-menu-settings"));
+    expect(onEditProjectSettings).toHaveBeenCalledWith(expect.objectContaining({ id: "__scratch__" }));
+  });
+
+  it("hides 'Edit settings' for an ordinary unregistered repo group ('generic' create, no repoPath match)", () => {
+    renderHeader({
+      group: group({ id: "other", capabilities: { appearance: true, reorder: true, create: "generic" } }),
+      onEditProject: vi.fn(),
+    });
+
+    fireEvent.contextMenu(screen.getByTestId("sidebar-group-header"));
+    expect(screen.queryByTestId("sidebar-group-context-menu-settings")).toBeNull();
+  });
 });

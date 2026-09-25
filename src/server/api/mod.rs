@@ -41,7 +41,10 @@ pub use plugins::{
     restart_plugin_worker, serve_plugin_icon, set_plugin_enabled, start_plugin_install,
     start_plugin_uninstall,
 };
-pub use projects::{create_project, delete_project, list_projects, update_project};
+pub use projects::{
+    create_project, delete_project, get_scratch_overrides, list_projects, update_project,
+    update_scratch_overrides,
+};
 pub use sessions::{
     attach_session_project, create_session, delete_session, delete_workspace,
     ensure_container_terminal, ensure_session, ensure_terminal, force_smart_rename,

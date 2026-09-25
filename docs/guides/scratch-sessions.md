@@ -28,3 +28,4 @@ If a process dies before you delete the session, the directory is left on disk. 
 - **Sandboxes**: supported; the container mounts the scratch directory like any project path.
 - **Worktrees**: not supported, since a scratch directory is not a git repo. Use a real project path with `-w`.
 - **Hooks**: a scratch directory has no `.agent-of-empires/config.toml`, so the repo trust prompt never fires. Global and profile `on_create` hooks still run, with the scratch directory as their `cwd`.
+- **Per-project settings**: each scratch directory is unique, so scratch sessions can't key a per-project override the way a registered repo does. Smart session rename still gets a dedicated override: the TUI's Projects panel has permanent "Scratch sessions" rows for the global and profile scopes, and the web dashboard's Scratch sidebar group has an "Edit settings" entry. Worktree-default has no equivalent here; see Worktrees above.

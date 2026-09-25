@@ -475,6 +475,87 @@ pub fn find_by_canonical_path(profile: &str, path: &Path) -> Option<Project> {
         .find(|p| canonical_key(&p.path) == target)
 }
 
+fn scratch_overrides_path(profile: &str, scope: ProjectScope) -> Result<PathBuf> {
+    match scope {
+        ProjectScope::Global => Ok(get_app_dir()?.join("scratch-overrides.json")),
+        ProjectScope::Profile => Ok(get_profile_dir_path(profile)?.join("scratch-overrides.json")),
+    }
+}
+
+fn parse_scratch_overrides(content: &str) -> Result<ProjectOverrides> {
+    Ok(serde_json::from_str(content)?)
+}
+
+/// Load one scope's override bundle for scratch sessions (see [`ProjectOverrides`]). Scratch
+/// sessions get a fresh, unique directory per instance, so they have no stable path to key a
+/// `projects.json` entry on; this dedicated single-object store stands in for that. Only
+/// `smart_rename` is meaningful here: `worktree_enabled` is inert, since scratch sessions never
+/// offer worktrees (not a git repo).
+pub fn load_scratch_overrides(profile: &str, scope: ProjectScope) -> Result<ProjectOverrides> {
+    let path = scratch_overrides_path(profile, scope)?;
+    if !path.exists() {
+        return Ok(ProjectOverrides::default());
+    }
+    let content = fs::read_to_string(&path)?;
+    if content.trim().is_empty() {
+        return Ok(ProjectOverrides::default());
+    }
+    parse_scratch_overrides(&content)
+}
+
+/// Load the merged scratch override bundle: each field takes the profile's value when set, else
+/// the global value.
+pub fn load_scratch_overrides_merged(profile: &str) -> Result<ProjectOverrides> {
+    let global = load_scratch_overrides(profile, ProjectScope::Global).unwrap_or_else(|e| {
+        warn!("Failed to load global scratch overrides: {}", e);
+        ProjectOverrides::default()
+    });
+    let profile_ov = load_scratch_overrides(profile, ProjectScope::Profile).unwrap_or_else(|e| {
+        warn!("Failed to load profile scratch overrides: {}", e);
+        ProjectOverrides::default()
+    });
+    Ok(ProjectOverrides {
+        worktree_enabled: profile_ov.worktree_enabled.or(global.worktree_enabled),
+        smart_rename: profile_ov.smart_rename.or(global.smart_rename),
+    })
+}
+
+/// Edit the scratch override bundle for one scope, under the same sidecar lock the project
+/// registry uses.
+pub fn update_scratch_overrides(
+    profile: &str,
+    scope: ProjectScope,
+    mutate: impl FnOnce(&mut ProjectOverrides),
+) -> std::result::Result<ProjectOverrides, RegistryError> {
+    let path = scratch_overrides_path(profile, scope)?;
+    super::storage::locked_update(
+        &path,
+        parse_scratch_overrides,
+        |overrides| Ok(serde_json::to_string_pretty(overrides)?),
+        |overrides| -> std::result::Result<ProjectOverrides, RegistryError> {
+            mutate(overrides);
+            Ok(overrides.clone())
+        },
+    )
+    .map_err(RegistryError::Other)?
+}
+
+/// Resolve the effective `smart_rename` override for a session: the scratch override bundle for
+/// scratch sessions (which have no stable path to key a registry entry on), otherwise the
+/// registered project's override at `repo_path`, if any.
+pub fn resolve_smart_rename_override(
+    profile: &str,
+    scratch: bool,
+    repo_path: &Path,
+) -> Option<bool> {
+    if scratch {
+        return load_scratch_overrides_merged(profile)
+            .unwrap_or_default()
+            .smart_rename;
+    }
+    find_by_canonical_path(profile, repo_path).and_then(|p| p.overrides.smart_rename)
+}
+
 /// Edit the override bundle on the entry matching `name_or_path` in the given scope, under the
 /// registry lock.
 pub fn update_overrides(
@@ -936,6 +1017,106 @@ mod tests {
         let found = find_by_canonical_path("default", repo.as_path());
         assert_eq!(found.map(|p| p.name), Some("demo".to_string()));
         assert!(find_by_canonical_path("default", Path::new("/nope")).is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn scratch_overrides_round_trip_through_update_and_load() -> Result<()> {
+        let temp = tempdir()?;
+        let _app_dir = isolate_app_dir_at(temp.path());
+
+        assert_eq!(
+            load_scratch_overrides("default", ProjectScope::Global)?,
+            ProjectOverrides::default(),
+            "missing file loads as default"
+        );
+
+        let updated = update_scratch_overrides("default", ProjectScope::Global, |ov| {
+            ov.smart_rename = Some(true);
+        })?;
+        assert_eq!(updated.smart_rename, Some(true));
+        assert_eq!(
+            load_scratch_overrides("default", ProjectScope::Global)?.smart_rename,
+            Some(true)
+        );
+
+        update_scratch_overrides("default", ProjectScope::Global, |ov| {
+            ov.smart_rename = None;
+        })?;
+        assert_eq!(
+            load_scratch_overrides("default", ProjectScope::Global)?.smart_rename,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn scratch_overrides_merged_prefers_profile_per_field() -> Result<()> {
+        let temp = tempdir()?;
+        let _app_dir = isolate_app_dir_at(temp.path());
+
+        update_scratch_overrides("default", ProjectScope::Global, |ov| {
+            ov.smart_rename = Some(false);
+        })?;
+        assert_eq!(
+            load_scratch_overrides_merged("default")?.smart_rename,
+            Some(false),
+            "no profile override: falls back to global"
+        );
+
+        update_scratch_overrides("default", ProjectScope::Profile, |ov| {
+            ov.smart_rename = Some(true);
+        })?;
+        assert_eq!(
+            load_scratch_overrides_merged("default")?.smart_rename,
+            Some(true),
+            "profile field shadows global"
+        );
+
+        update_scratch_overrides("default", ProjectScope::Profile, |ov| {
+            ov.smart_rename = None;
+        })?;
+        assert_eq!(
+            load_scratch_overrides_merged("default")?.smart_rename,
+            Some(false),
+            "clearing the profile field falls back to global again"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_smart_rename_override_uses_scratch_bundle_for_scratch_sessions() -> Result<()> {
+        let temp = tempdir()?;
+        let _app_dir = isolate_app_dir_at(temp.path());
+        let repo = temp.path().join("demo");
+        let _ = git2::Repository::init(&repo);
+
+        add(
+            "default",
+            ProjectScope::Global,
+            Project::new("demo", repo.to_string_lossy(), ProjectScope::Global),
+            false,
+        )?;
+        update_overrides("default", ProjectScope::Global, "demo", |ov| {
+            ov.smart_rename = Some(false);
+        })?;
+        update_scratch_overrides("default", ProjectScope::Global, |ov| {
+            ov.smart_rename = Some(true);
+        })?;
+
+        assert_eq!(
+            resolve_smart_rename_override("default", false, &repo),
+            Some(false),
+            "non-scratch session resolves the registered project's override"
+        );
+        assert_eq!(
+            resolve_smart_rename_override("default", true, &repo),
+            Some(true),
+            "scratch session ignores repo_path and resolves the scratch bundle instead"
+        );
         Ok(())
     }
 

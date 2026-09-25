@@ -2837,6 +2837,13 @@
       "components": ["web/src/components/ProjectFormModal.tsx"]
     },
     {
+      "id": "scratch-overrides-modal",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/ScratchOverridesModal.test.tsx"],
+      "components": ["web/src/components/ScratchOverridesModal.tsx"]
+    },
+    {
       "id": "projects-section-unit",
       "kind": "vitest",
       "risk": "low",
@@ -3665,7 +3672,8 @@
       "components": [
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
-        "web/src/components/ProjectFormModal.tsx"
+        "web/src/components/ProjectFormModal.tsx",
+        "web/src/components/ScratchOverridesModal.tsx"
       ]
     },
     {

@@ -27,7 +27,7 @@ export function useBusyAction(action: () => Promise<void>) {
   return [busy, run] as const;
 }
 
-const OWNS_ENTER = ["INPUT", "TEXTAREA", "BUTTON"];
+const OWNS_ENTER = ["INPUT", "TEXTAREA", "BUTTON", "SELECT"];
 
 /** Escape cancels; Enter confirms unless a focused control already handles Enter. */
 export function useConfirmKeys(onCancel: () => void, onConfirm: () => void, busy = false) {

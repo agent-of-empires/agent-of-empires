@@ -325,6 +325,7 @@ pub(super) const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/projects"),
     ("PATCH", "/api/projects/{name}"),
     ("DELETE", "/api/projects/{name}"),
+    ("PATCH", "/api/projects/scratch/overrides"),
     ("POST", "/api/profiles"),
     ("DELETE", "/api/profiles/{name}"),
     ("PATCH", "/api/profiles/{name}/rename"),
