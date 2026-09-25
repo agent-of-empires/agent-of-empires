@@ -36,6 +36,29 @@ enum SendKeysError {
 type SendKeysResult =
     Result<(EnsureReadyOutcome, Instance), Box<(Instance, EnsureReadyOutcome, SendKeysError)>>;
 
+async fn commit_send_success_to_live(
+    state: &Arc<AppState>,
+    id: &str,
+    sync_base: &Instance,
+    started: &Instance,
+    restarted: bool,
+) -> Option<String> {
+    let mut instances = state.instances.write().await;
+    let instance = instances.iter_mut().find(|instance| instance.id == id)?;
+    if restarted {
+        apply_post_restart_sync(instance, sync_base, started);
+    }
+    instance.touch_last_accessed();
+    // Keep the epoch transition inside the same critical section as the row
+    // mutation. A disk reload that captured the prior epoch either finishes
+    // before this lock or observes the bump while holding it and rejects its
+    // stale snapshot.
+    state
+        .mutation_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Some(instance.source_profile.clone())
+}
+
 pub async fn send_message(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -162,22 +185,24 @@ pub async fn send_message(
             // `agent_session_id` and orphan the prior Claude conversation.
             // See `apply_post_restart_sync`. Also stamp last_accessed_at so
             // the activity column reflects API-driven interaction.
-            let mut instances = state.instances.write().await;
-            let profile = if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                if !matches!(outcome, EnsureReadyOutcome::AlreadyAlive) {
-                    apply_post_restart_sync(i, &sync_base, &started);
-                }
-                i.touch_last_accessed();
-                i.source_profile.clone()
-            } else {
+            let outcome_already_alive = matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
+            let Some(profile) = commit_send_success_to_live(
+                &state,
+                &id,
+                &sync_base,
+                &started,
+                !outcome_already_alive,
+            )
+            .await
+            else {
                 // Session was deleted between the send and the stamp; nothing
                 // left to persist.
                 return (StatusCode::OK, Json(body)).into_response();
             };
-            drop(instances);
-            let outcome_already_alive = matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
+            let state_for_persist = Arc::clone(&state);
+
             let persisted = tokio::task::spawn_blocking(move || {
-                if let Ok(storage) = Storage::new(&profile, state.file_watch.clone()) {
+                if let Ok(storage) = Storage::new(&profile, state_for_persist.file_watch.clone()) {
                     if let Err(e) = storage.update(|all, _groups| {
                         if let Some(disk_inst) = all.iter_mut().find(|i| i.id == id) {
                             if !outcome_already_alive {
@@ -198,6 +223,7 @@ pub async fn send_message(
             if let Err(error) = persisted {
                 tracing::warn!(target: "http.api.sessions", %error, "send_message persistence task failed");
             }
+            state.runtime.request_publish();
             (StatusCode::OK, Json(body)).into_response()
         }
         Ok(Err(boxed)) => {
@@ -220,6 +246,10 @@ pub async fn send_message(
                         let mut instances = state.instances.write().await;
                         if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
                             apply_cascade_state_sync(i, &sync_base, &started);
+                            state
+                                .mutation_epoch
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            state.runtime.request_publish();
                         }
                     }
                     (
@@ -231,7 +261,12 @@ pub async fn send_message(
                 SendKeysError::ResumeFailed(sid) => {
                     let mut instances = state.instances.write().await;
                     if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                        apply_post_restart_sync(i, &sync_base, &started);
+                        if apply_post_restart_sync(i, &sync_base, &started) {
+                            state
+                                .mutation_epoch
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            state.runtime.request_publish();
+                        }
                     }
                     (
                         StatusCode::CONFLICT,
@@ -273,6 +308,10 @@ pub async fn send_message(
                         if apply_post_restart_sync(i, &sync_base, &started) {
                             i.status = crate::session::Status::Error;
                             i.last_error = Some(msg);
+                            state
+                                .mutation_epoch
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            state.runtime.request_publish();
                         }
                     }
                     (
@@ -616,6 +655,47 @@ mod send_output_tests {
     fn send_message_request_accepts_message() {
         let r: SendMessageRequest = serde_json::from_str("{\"message\":\"hello\"}").unwrap();
         assert_eq!(r.message, "hello");
+    }
+
+    #[tokio::test]
+    async fn send_success_invalidates_a_reload_snapshot_from_before_the_mutation() {
+        let live = Instance::new("send-race", "/tmp/send-race");
+        let state = crate::server::test_support::build_test_app_state(vec![live.clone()]);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let mut stale = live.clone();
+        stale.title = "stale disk row".into();
+        stale.last_accessed_at = None;
+
+        assert_eq!(
+            commit_send_success_to_live(&state, &live.id, &live, &live, false)
+                .await
+                .as_deref(),
+            Some(live.source_profile.as_str())
+        );
+        assert_eq!(
+            state
+                .mutation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst),
+            read_epoch + 1
+        );
+
+        let metadata = state.canonical_metadata.read().await.clone();
+        crate::server::reload::reload_state_instances_from_disk(
+            &state,
+            vec![stale],
+            Vec::new(),
+            crate::server::state::StatusSource::DiskOnly,
+            read_epoch,
+            metadata,
+            Default::default(),
+        )
+        .await;
+
+        let current = state.instances.read().await;
+        assert_eq!(current[0].title, live.title);
+        assert!(current[0].last_accessed_at.is_some());
     }
 }
 

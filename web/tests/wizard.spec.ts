@@ -2,6 +2,7 @@
 
 import { test, expect } from "./helpers/mockedTest";
 import {
+  CREATION_TRUST_FINGERPRINT,
   CLAUDE_AGENT,
   expandMoreOptions,
   launch,
@@ -376,6 +377,7 @@ test.describe("confirmations before create", () => {
     await expect(dialog).toBeVisible();
     await page.getByTestId("hooks-trust-proceed").click();
     await expect.poll(trusted).toBe(1);
+    expect(created.find((body) => body.trust_hooks === true)?.trust_review).toEqual(CREATION_TRUST_FINGERPRINT);
   });
 
   // #2045: glob volume_ignores expand once at create time, so a sandbox create confirms the snapshot first.

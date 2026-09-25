@@ -859,7 +859,7 @@ fn run_pass(
         })?,
     );
     let planned_paths = registry_paths(app_dir)?;
-    let registry_dirs = registry_dirs_of(&planned_paths);
+    let mut registry_dirs = registry_dirs_of(&planned_paths);
     let mut registry_locks = Some(lock_registry_dirs(&registry_dirs)?);
     let mut registries = load_registry_paths(app_dir, planned_paths)?;
     let journal = app_dir.join(JOURNAL);
@@ -1443,7 +1443,8 @@ fn run_pass(
         dirs.extend(registry_dirs.iter().cloned());
         dirs.sort();
         dirs.dedup();
-        registry_locks = Some(lock_registry_dirs(&dirs)?);
+        registry_dirs = dirs;
+        registry_locks = Some(lock_registry_dirs(&registry_dirs)?);
     }
     let _cohort_locks = cohort_locks;
     refresh_liveness();
@@ -4756,6 +4757,8 @@ gemini = "{}"
         fs::create_dir_all(&project).unwrap();
         let alpha = app.join("profiles/alpha/sessions.json");
         let beta = app.join("profiles/beta/sessions.json");
+        let gamma = app.join("profiles/gamma/sessions.json");
+        fs::create_dir_all(gamma.parent().unwrap()).unwrap();
         fs::create_dir_all(alpha.parent().unwrap()).unwrap();
         fs::create_dir_all(beta.parent().unwrap()).unwrap();
         fs::write(
@@ -4776,7 +4779,7 @@ gemini = "{}"
                 .expect("the pass reached its copy");
 
             let writes = {
-                let (alpha, beta) = (alpha.clone(), beta.clone());
+                let (alpha, beta, gamma) = (alpha.clone(), beta.clone(), gamma.clone());
                 let project = project.clone();
                 scope.spawn(move || {
                     let write = |profile: &str, path: PathBuf, title: &str| {
@@ -4796,13 +4799,15 @@ gemini = "{}"
                     (
                         write("alpha", alpha, "renamed mid-copy"),
                         write("beta", beta, "beta row"),
+                        write("gamma", gamma, "registry created mid-copy"),
                     )
                 })
             };
             wait_finished(&writes, "storage writes during the copy");
-            let (alpha_write, beta_write) = writes.join().unwrap();
+            let (alpha_write, beta_write, gamma_write) = writes.join().unwrap();
             alpha_write.unwrap();
             beta_write.unwrap();
+            gamma_write.unwrap();
 
             pass.finish().unwrap().unwrap();
         });
@@ -4815,6 +4820,8 @@ gemini = "{}"
             .is_none());
         let beta_rows: Value = serde_json::from_slice(&fs::read(&beta).unwrap()).unwrap();
         assert_eq!(beta_rows[0]["title"], "beta row");
+        let gamma_rows: Value = serde_json::from_slice(&fs::read(&gamma).unwrap()).unwrap();
+        assert_eq!(gamma_rows[0]["title"], "registry created mid-copy");
         assert_eq!(
             fs::read(home.join(".gemini/sandbox-v2/1111111111111111/history/id.json")).unwrap(),
             b"legacy"

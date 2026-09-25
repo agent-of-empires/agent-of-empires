@@ -8,7 +8,7 @@ The structured view renders in both the TUI and the web dashboard. This page cov
 
 Both surfaces consume the same `aoe serve` daemon over the same HTTP and WebSocket API, so the conversation log, pending approvals, and worker state stay in sync.
 
-- Structured sessions show a `[structured]` badge in the TUI session list, and Enter opens the native view. It needs a running daemon and says so, pointing at `aoe serve --daemon`, `--daemon --remote`, or `AOE_DAEMON_URL`; the TUI never starts one for you.
+- Structured sessions show a `[structured]` badge in the TUI session list, and Enter opens the native view. The local TUI ensures a same-host core daemon is running (reusing an existing daemon when present); an explicitly configured remote daemon is used instead. Without an available daemon it says so, pointing at `aoe serve --daemon`, `--daemon --remote`, or `AOE_DAEMON_URL`.
 - Terminal sessions work in both surfaces: the TUI attaches to the pane and the dashboard streams it (see [Terminal view](../guides/web/terminal.md)).
 - Switching views keeps the worktree, files, and commits. Claude can resume its native transcript in terminal view only when AoE can bind the ACP ID to a shared native store. An explicit [native-store assertion](../guides/session-resume.md#pinning-or-resetting-a-conversation) can name another store. An ACP ID alone is not store provenance: an unresolved or unshared store is refused before worker teardown. Switching back can reload the Claude transcript. Other agents start fresh under the new view.
 - A healthy structured session shows Idle or Active in the session list, observed through the ACP event stream rather than tmux pane probing.

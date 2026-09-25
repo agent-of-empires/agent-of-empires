@@ -5,30 +5,41 @@ interface Props {
   onLaunch: string[];
   onDestroy: string[];
   needsMcpTrust: boolean;
+  mcpSummaries: string[];
   onConfirm: () => Promise<void> | void;
   onCancel: () => void;
 }
 
 /** Shown when a create is refused until the repo's hooks are trusted; confirming resubmits with `trust_hooks`. */
-export function HooksTrustDialog({ onCreate, onLaunch, onDestroy, needsMcpTrust, onConfirm, onCancel }: Props) {
+export function HooksTrustDialog({
+  onCreate,
+  onLaunch,
+  onDestroy,
+  needsMcpTrust,
+  mcpSummaries,
+  onConfirm,
+  onCancel,
+}: Props) {
   // Approval trusts the whole hooks hash, so every covered hook type is listed.
   const groups = [
     { name: "on_create", commands: onCreate },
     { name: "on_launch", commands: onLaunch },
     { name: "on_destroy", commands: onDestroy },
+    { name: "mcp_servers_redacted", commands: mcpSummaries },
   ].filter((g) => g.commands.length > 0);
 
   return (
     <ConfirmCreateDialog
       id="hooks-trust"
-      title="Trust repository hooks"
+      title={needsMcpTrust ? "Trust repository hooks and MCP servers" : "Trust repository hooks"}
       confirmLabel="Trust and create"
       onConfirm={onConfirm}
       onCancel={onCancel}
     >
       <p className="text-[13px] text-text-secondary">
-        This repository defines lifecycle hooks. They run on your machine; approving trusts every hook type listed
-        below, not only the ones that run now. Review the commands before approving.
+        This repository defines lifecycle hooks{needsMcpTrust ? " and MCP servers" : ""}. They run on your machine;
+        approving trusts every hook type and redacted MCP server listed below, not only the ones that run now. Review
+        the commands before approving.
       </p>
 
       <div className="space-y-2 max-h-40 overflow-y-auto" data-testid="hooks-trust-list">
@@ -46,14 +57,15 @@ export function HooksTrustDialog({ onCreate, onLaunch, onDestroy, needsMcpTrust,
         ))}
       </div>
 
-      {needsMcpTrust && (
+      {needsMcpTrust && mcpSummaries.length === 0 && (
         <p className="text-[12px] text-text-dim">
           The repository's <span className="font-mono text-text-secondary">.mcp.json</span> will also be trusted.
         </p>
       )}
 
       <p className="text-[12px] text-text-dim">
-        Approving trusts this repository's hooks so future sessions (including worktrees) run them without prompting.
+        Approving trusts this repository's hooks{needsMcpTrust ? " and project MCP servers" : ""} so future sessions
+        (including worktrees) run them without prompting.
       </p>
     </ConfirmCreateDialog>
   );

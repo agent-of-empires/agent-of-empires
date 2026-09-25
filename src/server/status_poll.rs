@@ -48,8 +48,14 @@ pub(super) fn decide_passive_transition(
     old_status: Status,
     unread_enabled: bool,
 ) -> PassiveTransitionDecision {
-    let patch =
-        (!inst.is_structured()).then(|| crate::session::PassiveStatusPatch::from_instance(inst));
+    // Launch owns Starting until it commits or rolls back. A missing pane may
+    // make the sampled row look Error/Stopped, but the poller has no authority
+    // to overwrite either the pre-launch status or a row with a fresh durable
+    // lifecycle reservation.
+    let lifecycle_owned =
+        inst.status == Status::Starting || inst.has_fresh_lifecycle_reservation(chrono::Utc::now());
+    let patch = (!inst.is_structured() && !lifecycle_owned)
+        .then(|| crate::session::PassiveStatusPatch::from_instance(inst));
     // Structured rows are excluded for the same reason as the patch: the poll
     // loop has no authority over a paneless row, and since #3162 one never
     // reaches here anyway (it compares equal to `prev`, so `observed_transitions`
@@ -58,6 +64,7 @@ pub(super) fn decide_passive_transition(
     // later change to this loop from quietly re-marking from two daemon paths.
     let mark_unread = unread_enabled
         && !inst.is_structured()
+        && !lifecycle_owned
         && old_status == Status::Running
         && inst.status == Status::Idle
         && !inst.unread;
@@ -770,6 +777,29 @@ mod tests {
             decision.patch.is_none(),
             "structured sessions must never get a passive status patch"
         );
+    }
+
+    #[test]
+    fn decide_passive_transition_defers_starting_and_reserved_launches() {
+        let mut starting = Instance::new("starting-session", "/tmp/starting");
+        starting.status = Status::Starting;
+        let decision = decide_passive_transition(&starting, Status::Running, true);
+        assert!(decision.patch.is_none());
+        assert!(!decision.mark_unread);
+
+        starting
+            .try_acquire_lifecycle_reservation(
+                crate::session::LifecycleOperation::Launch,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        // Model the delayed pane-absent observation: the in-memory sample has
+        // moved away from Starting, but launch still owns the durable row.
+        starting.status = Status::Error;
+        let decision = decide_passive_transition(&starting, Status::Starting, true);
+        assert!(decision.patch.is_none());
+        assert!(!decision.mark_unread);
     }
 
     #[test]

@@ -404,6 +404,7 @@ pub(crate) async fn spawn_structured_session(
 
         let provisioning_failed = provision_error.is_some();
         let rollback = |native: super::session_store::NativeSessionStore, instance: Instance, provisioning_failed: bool| { use crate::session::deletion::{DeletionDisposition, DeletionRequest, PurgeReservation, PurgeTransaction};
+        let storage_profile = native.storage().profile().to_owned();
         let _namespace = runtime.block_on(worker_state.profile_namespace.read());
         let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
         let _guard = lock.blocking_lock();
@@ -418,7 +419,11 @@ pub(crate) async fn spawn_structured_session(
             force_delete: true,
             detach_hooks: true,
             keep_scratch: provisioning_failed,
-            instance,
+            instance: {
+                let mut instance = instance;
+                instance.source_profile = storage_profile.clone();
+                instance
+            },
         };
         let rollback = PurgeTransaction::reserve_failed_creation(native, request, generation)
             .map(|reservation| match reservation {
@@ -535,6 +540,10 @@ pub(crate) async fn spawn_structured_session(
 
         creation_guard.phase(CreationPhase::LaunchHooks);
         let hooks = instance.run_pre_launch_hooks(false, store, Some(&creation_progress));
+        if let Err(error) = hooks {
+            rollback(native, instance, false);
+            return Err(error);
+        }
         if let Err(error) = creation_guard.commit() {
             rollback(native, instance, false);
             return Err(error.into());
@@ -543,34 +552,41 @@ pub(crate) async fn spawn_structured_session(
         let _namespace = runtime.block_on(worker_state.profile_namespace.read());
         let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
         let _guard = lock.blocking_lock();
-        if instance.is_structured() {
-            let _ownership = instance.reacquire_launch_locks_after_hooks(store, generation, hooks)?;
-            store.update(|rows, _| {
-                let row = rows.iter_mut().find(|row| row.id == instance.id)
-                    .ok_or(crate::session::LifecycleReservationError::Superseded)?;
-                anyhow::ensure!(row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
-                    crate::session::LifecycleReservationError::Superseded);
-                row.sandbox_info = instance.sandbox_info.clone();
-                Ok(())
-            })?;
-            native.adopt_runtime_fields(&instance)?;
-        } else {
-            let outcome = instance.finish_reserved_launch(
-                store,
-                size.map(|size| (size.cols.get(), size.rows.get())),
-                crate::session::ResumeLaunchOptions {
-                    resume_policy: crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
-                    restart: false,
-                    conversation_carry: None,
-                },
-                generation,
-                hooks,
-            );
-            let _title = crate::session::acquire_session_title_lock(&instance.id)?;
-            let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&instance.id)?;
-            native.adopt_runtime_fields(&instance)?;
-            native.refresh_pane_observations(&instance)?;
-            outcome?;
+        let post_hooks: anyhow::Result<()> = (|| {
+            if instance.is_structured() {
+                let _ownership = instance.reacquire_launch_locks_after_hooks(store, generation, Ok(()))?;
+                store.update(|rows, _| {
+                    let row = rows.iter_mut().find(|row| row.id == instance.id)
+                        .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+                    anyhow::ensure!(row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                        crate::session::LifecycleReservationError::Superseded);
+                    row.sandbox_info = instance.sandbox_info.clone();
+                    Ok(())
+                })?;
+                native.adopt_runtime_fields(&instance)?;
+            } else {
+                let outcome = instance.finish_reserved_launch(
+                    store,
+                    size.map(|size| (size.cols.get(), size.rows.get())),
+                    crate::session::ResumeLaunchOptions {
+                        resume_policy: crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
+                        restart: false,
+                        conversation_carry: None,
+                    },
+                    generation,
+                    Ok(()),
+                );
+                let _title = crate::session::acquire_session_title_lock(&instance.id)?;
+                let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&instance.id)?;
+                native.adopt_runtime_fields(&instance)?;
+                native.refresh_pane_observations(&instance)?;
+                outcome?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = post_hooks {
+            rollback(native, instance, false);
+            return Err(error);
         }
 
         Ok::<_, anyhow::Error>((
@@ -801,4 +817,87 @@ async fn finish_created_structured_session(
     drop(namespace);
     state.runtime.publish(state).await?;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pre_launch_hook_failure_rolls_back_resources_and_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let app = crate::session::get_app_dir().unwrap();
+        crate::session::purge_owners::initialize(&app).unwrap();
+        let profile = "hook-rollback";
+        crate::session::config::profile_config::save_profile_config(profile, &Default::default())
+            .unwrap();
+        std::fs::write(
+            app.join("config.toml"),
+            "[hooks]\non_launch = [\"false\"]\n",
+        )
+        .unwrap();
+        crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|instances, _| {
+                *instances = Vec::new();
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let spec = StructuredSessionSpec {
+            title: Some("hook rollback".into()),
+            size: None,
+            path: "/unused".into(),
+            group: String::new(),
+            tool: "claude".into(),
+            worktree_enabled: false,
+            worktree_branch: None,
+            create_new_branch: false,
+            base_branch: None,
+            sandbox: false,
+            sandbox_image: None,
+            yolo_mode: false,
+            extra_env: Vec::new(),
+            extra_args: String::new(),
+            command_override: String::new(),
+            extra_repo_paths: Vec::new(),
+            repo_base_branches: Vec::new(),
+            scratch: true,
+            trust_hooks: None,
+            trust_review: None,
+            custom_instruction: None,
+            callback_url: None,
+            idempotency_key: None,
+            profile: profile.into(),
+            created_by_plugin: None,
+            plugin_create_idempotency: None,
+            pending_initial_turn: None,
+            acp_mode_id: None,
+            view: crate::session::View::Terminal,
+            agent_name: Some("claude".into()),
+            agent_model: None,
+            agent_effort: None,
+            import_acp_session_id: None,
+            fork_seed: None,
+        };
+
+        let result = spawn_structured_session(&state.session_service, spec).await;
+        assert!(
+            result.is_err(),
+            "the failing on_launch hook must abort creation"
+        );
+        let rows = crate::session::Storage::open_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(std::fs::read_dir(app.join("scratch")).unwrap().count(), 0);
+        let owners: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(app.join("pending-purge-owners.json")).unwrap())
+                .unwrap();
+        assert!(owners["owners"].as_array().unwrap().is_empty());
+    }
 }

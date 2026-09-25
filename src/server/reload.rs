@@ -373,6 +373,14 @@ pub(super) fn apply_tick_status_decisions(
         if skip_tmux_decision_for_structured(inst) {
             continue;
         }
+        // Launch owns the row until its reservation is committed or rolled
+        // back. In particular, a missing pane during provisioning must not
+        // overwrite Starting (or a reserved sampled status) with Error.
+        if inst.status == Status::Starting
+            || inst.has_fresh_lifecycle_reservation(chrono::Utc::now())
+        {
+            continue;
+        }
         if inst.is_sandboxed()
             && !matches!(
                 inst.status,
@@ -1221,6 +1229,47 @@ mod tests {
         // its own `StatusChange`, so `prev` already carries it next tick. See
         // `tick_forces_a_recently_restarted_row_to_starting` for the proof that
         // the tick still reports transitions it does own.
+    }
+
+    #[test]
+    fn tick_preserves_starting_and_fresh_launch_reservations_without_a_pane() {
+        for reserved in [false, true] {
+            let mut instance = Instance::new("launching", "/tmp/launching");
+            instance.status = if reserved {
+                Status::Error
+            } else {
+                Status::Starting
+            };
+            if reserved {
+                instance
+                    .try_acquire_lifecycle_reservation(
+                        crate::session::LifecycleOperation::Launch,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        chrono::Utc::now(),
+                    )
+                    .unwrap();
+            }
+            let id = instance.id.clone();
+            let prev = std::collections::HashMap::from([(id, Status::Running)]);
+            let mut instances = vec![instance];
+
+            apply_tick_status_decisions(
+                &mut instances,
+                &prev,
+                &std::collections::HashSet::new(),
+                Some(&std::collections::HashMap::new()),
+                &Default::default(),
+            );
+
+            assert_eq!(
+                instances[0].status,
+                if reserved {
+                    Status::Error
+                } else {
+                    Status::Starting
+                }
+            );
+        }
     }
 
     #[test]

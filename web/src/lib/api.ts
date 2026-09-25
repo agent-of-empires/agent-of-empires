@@ -1959,6 +1959,43 @@ export interface CreationTrustReview {
   mcp_need_trust: boolean;
 }
 
+function parseCreationTrustReview(value: unknown): CreationTrustReview {
+  const invalid = () => {
+    throw new Error("Invalid creation trust review");
+  };
+  if (!value || typeof value !== "object") invalid();
+  const review = value as Record<string, unknown>;
+  const fingerprint = review.fingerprint;
+  if (!fingerprint || typeof fingerprint !== "object") invalid();
+  const fp = fingerprint as Record<string, unknown>;
+  if (
+    typeof fp.project_path !== "string" ||
+    typeof fp.base_hooks_hash !== "string" ||
+    (fp.hooks_hash !== null && typeof fp.hooks_hash !== "string") ||
+    (fp.mcp_hash !== null && typeof fp.mcp_hash !== "string") ||
+    typeof review.hooks_need_trust !== "boolean" ||
+    typeof review.mcp_need_trust !== "boolean" ||
+    !Array.isArray(review.mcp_summaries) ||
+    !review.mcp_summaries.every((summary) => typeof summary === "string")
+  ) {
+    invalid();
+  }
+  for (const field of ["merged_hooks", "repo_hooks"]) {
+    const hooks = review[field];
+    if (!hooks || typeof hooks !== "object") invalid();
+    for (const hook of ["on_create", "on_launch", "on_destroy"]) {
+      const commands = (hooks as Record<string, unknown>)[hook];
+      if (
+        commands !== undefined &&
+        (!Array.isArray(commands) || !commands.every((command) => typeof command === "string"))
+      ) {
+        invalid();
+      }
+    }
+  }
+  return value as CreationTrustReview;
+}
+
 export async function reviewCreationTrust(
   body: CreationTrustRequest,
 ): Promise<{ ok: true; review: CreationTrustReview } | { ok: false; error: string }> {
@@ -1972,7 +2009,7 @@ export async function reviewCreationTrust(
     if (!res.ok) {
       return { ok: false, error: text || `Server error (${res.status})` };
     }
-    return { ok: true, review: JSON.parse(text) as CreationTrustReview };
+    return { ok: true, review: parseCreationTrustReview(JSON.parse(text) as unknown) };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }

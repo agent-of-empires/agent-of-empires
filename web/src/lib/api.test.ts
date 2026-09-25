@@ -840,6 +840,23 @@ describe("createSession errors", () => {
     expect(JSON.parse(String(init?.body))).toEqual({ path: "/repo", profile: "default", scratch: false });
   });
 
+  it("rejects malformed MCP summaries without exposing their payload", async () => {
+    const secret = "server-secret-mcp-command";
+    fetchSpy.mockResolvedValueOnce(
+      json({
+        fingerprint: { project_path: "/repo", base_hooks_hash: "base", hooks_hash: "repo", mcp_hash: null },
+        merged_hooks: {},
+        repo_hooks: {},
+        mcp_summaries: secret,
+        hooks_need_trust: false,
+        mcp_need_trust: true,
+      }),
+    );
+    const result = await api.reviewCreationTrust({ path: "/repo" });
+    expect(result).toEqual({ ok: false, error: "Invalid creation trust review" });
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
   it("maps plain JSON, text, and network errors", async () => {
     fetchSpy.mockResolvedValueOnce(
       new Response(JSON.stringify({ error: "create_failed", message: "nope" }), { status: 400 }),

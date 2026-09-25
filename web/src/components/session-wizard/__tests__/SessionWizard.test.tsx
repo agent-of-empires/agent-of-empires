@@ -163,6 +163,29 @@ describe("SessionWizard hooks trust", () => {
     await waitFor(() => expect(screen.getByTestId("hooks-trust-dialog")).toBeTruthy());
   };
 
+  it("renders redacted MCP summaries as inert review text", async () => {
+    const summary = 'project-search <img src=x onerror="window.__mcpXss=true">';
+    createSession.mockResolvedValueOnce(REFUSAL);
+    reviewCreationTrust.mockResolvedValueOnce({
+      ok: true,
+      review: {
+        fingerprint: FINGERPRINT,
+        merged_hooks: { on_create: [] },
+        repo_hooks: {},
+        mcp_summaries: [summary],
+        hooks_need_trust: false,
+        mcp_need_trust: true,
+      },
+    });
+    renderWizard();
+    await openDialog();
+
+    const list = screen.getByTestId("hooks-trust-list");
+    expect(list.textContent).toContain(summary);
+    expect(list.querySelector("img")).toBeNull();
+    expect((window as Window & { __mcpXss?: boolean }).__mcpXss).toBeUndefined();
+  });
+
   it("pauses on the trust dialog, then resubmits with trust_hooks on Proceed", async () => {
     createSession.mockResolvedValueOnce(REFUSAL).mockResolvedValueOnce({ ok: true, session: { id: "s1" } });
     const { onCreated } = renderWizard();

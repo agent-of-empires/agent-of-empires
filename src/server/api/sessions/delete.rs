@@ -171,7 +171,7 @@ pub(crate) async fn recover_pending_purges(state: &Arc<AppState>) {
         if structured {
             if let Err(error) = finish_structured_purge(state, &id).await {
                 tracing::warn!(target: "session.purge_recovery", session_id = %id, %error, "structured shutdown unproven; purge retained");
-                break;
+                continue;
             }
         }
         let result = match tokio::task::spawn_blocking(move || committed.finish_recovered()).await {
@@ -183,7 +183,7 @@ pub(crate) async fn recover_pending_purges(state: &Arc<AppState>) {
         };
         if !result.success {
             tracing::warn!(target: "session.purge_recovery", session_id = %id, errors = ?result.errors, "purge cleanup incomplete; owner retained");
-            break;
+            continue;
         }
         state.instance_locks.write().await.remove(&id);
         state.session_service.forget_prompt_lock(&id).await;

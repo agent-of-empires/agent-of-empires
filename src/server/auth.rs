@@ -244,6 +244,13 @@ fn should_refresh_session_cookie(path: &str) -> bool {
     !is_login_session_exempt(path)
 }
 
+/// `/api/login` is the only route where a valid bootstrap credential is not
+/// the completed authentication result: the request still has to pass the
+/// passphrase check in `login_handler`, which alone may clear the IP budget.
+fn should_record_auth_success(path: &str) -> bool {
+    path != "/api/login"
+}
+
 /// Decision for the post-token branch of `auth_middleware`: a request
 /// validated its bearer token but did not present an `aoe_session`
 /// cookie + device binding. When passphrase login is on, that would
@@ -850,8 +857,10 @@ pub async fn auth_middleware(
             .into_response();
     };
 
-    // Token valid: record success, stamp owner, record device.
-    state.rate_limiter.record_success(client_ip).await;
+    let path = request.uri().path().to_string();
+    if should_record_auth_success(&path) {
+        state.rate_limiter.record_success(client_ip).await;
+    }
     tracing::trace!(
         target: "auth.middleware",
         ip = %client_ip,
@@ -864,7 +873,7 @@ pub async fn auth_middleware(
             .extensions_mut()
             .insert(AuthenticatedTokenHash(hash));
     }
-    let path = request.uri().path().to_string();
+
     let should_attach_token =
         matches!(source, TokenSource::QueryParam | TokenSource::Bearer) || needs_upgrade;
 
@@ -938,7 +947,10 @@ async fn handle_session_authenticated(
     next: Next,
     session_id: String,
 ) -> Response {
-    state.rate_limiter.record_success(client_ip).await;
+    let path = request.uri().path();
+    if should_record_auth_success(path) {
+        state.rate_limiter.record_success(client_ip).await;
+    }
     tracing::trace!(
         target: "auth.middleware",
         ip = %client_ip,
@@ -1468,6 +1480,82 @@ mod tests {
         // /api/login/elevate is gated by the session check (not
         // exempt), so its response should slide the window.
         assert!(should_refresh_session_cookie("/api/login/elevate"));
+    }
+
+    #[tokio::test]
+    async fn valid_bearer_does_not_clear_repeated_bad_passphrase_budget() {
+        use super::super::login::LoginManager;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use std::net::SocketAddr;
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        let token = "valid-bootstrap-token".to_string();
+        let state = super::super::test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            Some(token.clone()),
+            |state| {
+                state.login_manager = Arc::new(LoginManager::new(Some("correct-passphrase")));
+            },
+        );
+        let peer: SocketAddr = "198.51.100.23:43123".parse().unwrap();
+        let body = serde_json::json!({
+            "passphrase": "wrong-passphrase",
+            "device_binding_secret": URL_SAFE_NO_PAD.encode([0xA5; 32]),
+        })
+        .to_string();
+
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(550)).await;
+            }
+            let request = Request::builder()
+                .method("POST")
+                .uri("http://localhost/api/login")
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::from(body.clone()))
+                .unwrap();
+            let mut request = request;
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+            let response = super::super::test_support::build_router_for_test(Arc::clone(&state))
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "bad passphrase attempt {attempt} was not counted"
+            );
+        }
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("http://localhost/api/login")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let mut request = request;
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        let response = super::super::test_support::build_router_for_test(state)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "a valid bearer must not reset the passphrase failure budget"
+        );
     }
 
     #[test]

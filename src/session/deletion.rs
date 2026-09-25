@@ -819,34 +819,48 @@ impl<S: SessionStore> CommittedPurge<S> {
 /// caller retains the returned identity and lifecycle locks across any
 /// structured shutdown and the idempotent resource cleanup.
 pub(crate) fn recover_committed_purge() -> Result<Option<CommittedPurge<Storage>>> {
-    let Some(plan) = super::purge_owners::recovery_plans()?.into_iter().next() else {
-        return Ok(None);
-    };
-    let request = plan
-        .request
-        .as_ref()
-        .context("legacy pending purge owner has no executable cleanup plan")?;
-    let store = Storage::open_unwatched(&plan.profile)?;
-    let identity = super::acquire_session_identity_lock()?;
-    let lifecycle = store.acquire_instance_lifecycle_lock(&request.session_id)?;
-    anyhow::ensure!(
-        !store.load()?.iter().any(|row| row.id == request.session_id),
-        "session identity was reused before pending purge recovery"
-    );
-    let owner = super::purge_owners::PurgeOwner::recover(&store, &plan.token)?;
-    let profile = store.profile().to_owned();
-    let mut request = plan
-        .request
-        .context("legacy pending purge owner has no executable cleanup plan")?;
-    request.instance.source_profile = profile;
-    Ok(Some(CommittedPurge {
-        store,
-        request,
-        owner,
-        additional_protection: plan.additional_protection,
-        _lifecycle_lock: Some(lifecycle),
-        _identity_lock: Some(identity),
-    }))
+    for plan in super::purge_owners::recovery_plans()? {
+        let owner_token = plan.token.clone();
+        let profile_name = plan.profile.clone();
+        let request_plan = plan.request.clone();
+        let additional_protection = plan.additional_protection.clone();
+        let attempt: Result<CommittedPurge<Storage>> = (|| {
+            let request = request_plan
+                .as_ref()
+                .context("legacy pending purge owner has no executable cleanup plan")?;
+            let store = Storage::open_unwatched(&profile_name)?;
+            let identity = super::acquire_session_identity_lock()?;
+            let lifecycle = store.acquire_instance_lifecycle_lock(&request.session_id)?;
+            anyhow::ensure!(
+                !store.load()?.iter().any(|row| row.id == request.session_id),
+                "session identity was reused before pending purge recovery"
+            );
+            let owner = super::purge_owners::PurgeOwner::recover(&store, &owner_token)?;
+            let profile = store.profile().to_owned();
+            let mut request = request_plan
+                .clone()
+                .context("legacy pending purge owner has no executable cleanup plan")?;
+            request.instance.source_profile = profile;
+            Ok(CommittedPurge {
+                store,
+                request,
+                owner,
+                additional_protection,
+                _lifecycle_lock: Some(lifecycle),
+                _identity_lock: Some(identity),
+            })
+        })();
+        match attempt {
+            Ok(committed) => return Ok(Some(committed)),
+            Err(error) => tracing::warn!(
+                target: "session.purge_recovery",
+                owner_token = %owner_token,
+                %error,
+                "pending purge owner is not currently recoverable; trying the next owner"
+            ),
+        }
+    }
+    Ok(None)
 }
 
 impl<S: SessionStore + 'static> Drop for PurgeTransaction<S> {
@@ -2572,6 +2586,71 @@ mod tests {
         assert_eq!(retained[0].status, crate::session::Status::Idle);
         assert!(!retained[0].has_fresh_lifecycle_reservation(Utc::now()));
     }
+
+    #[test]
+    #[serial_test::serial]
+    fn recovery_skips_an_impossible_owner_and_finishes_the_next_one() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir().unwrap();
+        super::super::purge_owners::initialize(&root).unwrap();
+        let profile = "recovery-head-of-line";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|instances, _| {
+                *instances = Vec::new();
+                Ok(())
+            })
+            .unwrap();
+
+        let mut blocked = create_test_instance();
+        blocked.title = "blocked owner".into();
+        blocked.project_path = "/tmp/blocked-owner".into();
+        let _blocked_owner = super::super::purge_owners::PurgeOwner::record(
+            &storage,
+            &blocked,
+            super::super::purge_owners::PurgeCapture::new(&blocked).unwrap(),
+        )
+        .unwrap();
+
+        let mut recoverable = create_test_instance();
+        recoverable.title = "recoverable owner".into();
+        recoverable.project_path = "/tmp/recoverable-owner".into();
+        let request = DeletionRequest {
+            session_id: recoverable.id.clone(),
+            instance: recoverable.clone(),
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: true,
+            detach_hooks: true,
+            keep_scratch: false,
+        };
+        let recoverable_id = recoverable.id.clone();
+        let _recoverable_owner = super::super::purge_owners::PurgeOwner::record_plan(
+            &storage,
+            &recoverable,
+            recoverable.lifecycle_generation,
+            Some(&request),
+            None,
+            super::super::purge_owners::PurgeCapture::new(&recoverable).unwrap(),
+        )
+        .unwrap();
+
+        let committed = recover_committed_purge()
+            .unwrap()
+            .expect("the owner after the impossible legacy plan must be recovered");
+        assert_eq!(committed.session_id(), recoverable_id);
+        let result = committed.finish_recovered();
+        assert!(
+            result.success,
+            "the recoverable owner must finish: {result:?}"
+        );
+        assert!(recover_committed_purge().unwrap().is_none());
+        assert_eq!(
+            super::super::purge_owners::recovery_plans().unwrap().len(),
+            1
+        );
+    }
     #[test]
     #[serial_test::serial]
     fn irreversible_purge_retains_references_removed_by_destroy_hook() {
@@ -2653,7 +2732,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(recover_committed_purge().is_err());
+        assert!(recover_committed_purge().unwrap().is_none());
         assert!(!super::super::purge_owners::protection(&storage, None)
             .unwrap()
             .is_empty());

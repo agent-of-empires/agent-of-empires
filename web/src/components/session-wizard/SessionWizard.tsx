@@ -124,6 +124,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
     body: CreateSessionRequest;
     tool: string;
     fingerprint: CreationTrustFingerprint;
+    mcpSummaries: string[];
   } | null>(null);
   // A remembered path satisfies the submit gate at mount, so Launch waits for
   // the defaults below rather than sending initialData's sandbox/worktree/yolo.
@@ -235,6 +236,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
       body,
       tool,
       fingerprint: review.review.fingerprint,
+      mcpSummaries: review.review.mcp_summaries,
     });
   };
 
@@ -416,6 +418,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
           onLaunch={hooksTrust.info.onLaunch}
           onDestroy={hooksTrust.info.onDestroy}
           needsMcpTrust={hooksTrust.info.needsMcpTrust}
+          mcpSummaries={hooksTrust.mcpSummaries}
           onConfirm={handleHooksTrustConfirm}
           onCancel={cancelPending}
         />

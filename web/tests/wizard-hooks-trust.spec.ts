@@ -12,7 +12,15 @@ import { openWizard, selectProject, launch, wizard } from "./helpers/wizard";
 interface Calls {
   createWithoutTrust: number;
   createWithTrust: number;
+  trustedFingerprints: unknown[];
 }
+
+const FINGERPRINT = {
+  project_path: "/tmp/example",
+  base_hooks_hash: "base-hooks",
+  hooks_hash: "repo-hooks",
+  mcp_hash: "project-mcp",
+};
 
 async function mockApis(page: Page, calls: Calls) {
   await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
@@ -29,6 +37,22 @@ async function mockApis(page: Page, calls: Calls) {
   await page.route("**/api/agents", (r) =>
     r.fulfill({
       json: [{ name: "claude", binary: "claude", host_only: false, installed: true, install_hint: "" }],
+    }),
+  );
+  await page.route("**/api/sessions/creation-trust", (r) =>
+    r.fulfill({
+      json: {
+        fingerprint: FINGERPRINT,
+        merged_hooks: {
+          on_create: ["bash scripts/setup-worktree.sh", "cp .env.example .env"],
+          on_launch: ["npm run dev-seed"],
+          on_destroy: [],
+        },
+        repo_hooks: {},
+        mcp_summaries: ["project-search (stdio)"],
+        hooks_need_trust: true,
+        mcp_need_trust: true,
+      },
     }),
   );
   await page.route("**/api/sessions", (r) => {
@@ -61,6 +85,7 @@ async function mockApis(page: Page, calls: Calls) {
     }
     const body = JSON.parse(r.request().postData() || "{}");
     if (body.trust_hooks === true) {
+      calls.trustedFingerprints.push(body.trust_review);
       calls.createWithTrust += 1;
       return r.fulfill({ json: { session: { id: "new-session" } } });
     }
@@ -90,7 +115,7 @@ async function launchSession(page: Page) {
 
 test.describe("Wizard on_create hooks-trust confirmation (#2066)", () => {
   test("modal shows the on_create commands before creating", async ({ page }) => {
-    const calls: Calls = { createWithoutTrust: 0, createWithTrust: 0 };
+    const calls: Calls = { createWithoutTrust: 0, createWithTrust: 0, trustedFingerprints: [] };
     await mockApis(page, calls);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -102,13 +127,14 @@ test.describe("Wizard on_create hooks-trust confirmation (#2066)", () => {
     await expect(dialog).toContainText("cp .env.example .env");
     // Approval trusts the whole hooks hash, so on_launch is listed too.
     await expect(dialog).toContainText("npm run dev-seed");
+    await expect(dialog).toContainText("project-search (stdio)");
     // The initial (untrusted) attempt was refused; nothing trusted yet.
     await expect.poll(() => calls.createWithoutTrust).toBe(1);
     expect(calls.createWithTrust).toBe(0);
   });
 
   test("Cancel aborts the create and returns to the wizard", async ({ page }) => {
-    const calls: Calls = { createWithoutTrust: 0, createWithTrust: 0 };
+    const calls: Calls = { createWithoutTrust: 0, createWithTrust: 0, trustedFingerprints: [] };
     await mockApis(page, calls);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -122,7 +148,7 @@ test.describe("Wizard on_create hooks-trust confirmation (#2066)", () => {
   });
 
   test("Proceed resubmits with trust_hooks and creates the session", async ({ page }) => {
-    const calls: Calls = { createWithoutTrust: 0, createWithTrust: 0 };
+    const calls: Calls = { createWithoutTrust: 0, createWithTrust: 0, trustedFingerprints: [] };
     await mockApis(page, calls);
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
@@ -131,5 +157,6 @@ test.describe("Wizard on_create hooks-trust confirmation (#2066)", () => {
     await expect(page.getByTestId("hooks-trust-dialog")).toBeVisible();
     await page.getByTestId("hooks-trust-proceed").click();
     await expect.poll(() => calls.createWithTrust).toBe(1);
+    expect(calls.trustedFingerprints).toEqual([FINGERPRINT]);
   });
 });

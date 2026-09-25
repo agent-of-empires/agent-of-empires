@@ -48,6 +48,26 @@ export async function launch(page: Page) {
 
 export const CLAUDE_AGENT = { name: "claude", binary: "claude", host_only: false, installed: true, install_hint: "" };
 
+export const CREATION_TRUST_FINGERPRINT = {
+  project_path: "/tmp/example",
+  base_hooks_hash: "base-hooks",
+  hooks_hash: "repo-hooks",
+  mcp_hash: null,
+};
+
+const DEFAULT_CREATION_TRUST_REVIEW = {
+  fingerprint: CREATION_TRUST_FINGERPRINT,
+  merged_hooks: {
+    on_create: ["bash scripts/setup-worktree.sh", "cp .env.example .env"],
+    on_launch: ["npm run dev-seed"],
+    on_destroy: [],
+  },
+  repo_hooks: {},
+  mcp_summaries: [],
+  hooks_need_trust: true,
+  mcp_need_trust: false,
+};
+
 export function sessionStub(overrides: Record<string, unknown> = {}) {
   return sessionResponse({
     id: "seed-session",
@@ -70,6 +90,8 @@ export interface WizardMockOptions {
   sessions?: unknown[];
   /** Handle the create POST; return undefined for the default success response. */
   onCreate?: (body: Record<string, unknown>, route: Route) => Promise<unknown> | unknown;
+  /** Canonical creation-trust review returned after an untrusted create. */
+  creationTrustReview?: unknown;
 }
 
 /** Mock every API the dashboard and wizard read. Returns the create-session POST bodies in order. */
@@ -95,6 +117,9 @@ export async function mockWizardApis(page: Page, opts: WizardMockOptions = {}) {
     r.fulfill({ json: { available: !!opts.docker, runtime: opts.docker ? "docker" : null } }),
   );
   await page.route("**/api/agents", (r) => r.fulfill({ json: opts.agents ?? [CLAUDE_AGENT] }));
+  await page.route("**/api/sessions/creation-trust", (r) =>
+    r.fulfill({ json: opts.creationTrustReview ?? DEFAULT_CREATION_TRUST_REVIEW }),
+  );
   await page.route("**/api/sessions", async (r) => {
     if (r.request().method() !== "POST") {
       return r.fulfill({ json: { sessions: opts.sessions ?? [sessionStub()], workspace_ordering: [] } });
