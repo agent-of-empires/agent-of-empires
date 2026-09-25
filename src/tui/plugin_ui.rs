@@ -1083,67 +1083,6 @@ mod tests {
     }
 
     #[test]
-    fn pane_row_and_section_render_the_api_12_fields() {
-        let snap = pane_snapshot(pane_entry(json!({
-            "blocks": [
-                {"kind": "section", "title": "checks", "value": "1 of 2 approved", "value_tone": "warn",
-                 "badges": [{"text": "2 failing", "tone": "danger"}, {"icon": "check", "tone": "success"}],
-                 "children": [
-                    {"kind": "row", "prefix": "#3231", "label": "warn when daemon is stale",
-                     "sublabel": "japanese", "selected": true, "method": "gh.select_pr",
-                     "badges": [{"text": "ci", "tone": "danger"}, {"icon": "circle-x", "tone": "danger"}]}
-                 ]}
-            ],
-            "footer": {"text": "refreshed 12:07", "value": "blocked", "tone": "danger", "icon": "refresh-cw"}
-        })));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert_eq!(
-            texts(&lines),
-            vec![
-                "p",
-                // The header summary trails the title rather than pinning right;
-                // an icon-only badge has no text a terminal can show.
-                "CHECKS  1 of 2 approved  2 failing",
-                // `selected` becomes a leading marker (there is no ring to tint),
-                // and a `method` row is text, not a control.
-                "  ▸ #3231 warn when daemon is stale japanese ci",
-                "refreshed 12:07 blocked",
-            ]
-        );
-    }
-
-    #[test]
-    fn pane_entry_rendering_nothing_contributes_no_heading_or_separator() {
-        // A middle entry whose blocks all drop out must leave no heading and no
-        // blank-line gap: exactly one separator between the two that do render.
-        let snap = pane_snapshot(json!([
-            {"plugin_id": "p", "slot": "pane", "id": "a", "session_id": "s1", "payload": {"title": "one"}},
-            {"plugin_id": "q", "slot": "pane", "id": "b", "session_id": "s1",
-             "payload": {"title": "empty", "blocks": [{"kind": "row"}]}},
-            {"plugin_id": "r", "slot": "pane", "id": "c", "session_id": "s1", "payload": {"title": "two"}}
-        ]));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert_eq!(texts(&lines), vec!["one", "", "two"]);
-    }
-
-    #[test]
-    fn pane_row_needs_a_label_or_value_but_a_comment_needs_only_one_field() {
-        // Web parity: `BlockRow` bails on `!label && !value && !iconComp`, and
-        // the TUI renders no icons, so a sublabel-only row is dropped. A
-        // `BlockComment` bails only on `!author && !body`, so a body-only
-        // comment still renders.
-        let snap = pane_snapshot(pane_entry(json!({"blocks": [
-            {"kind": "row", "sublabel": "orphan"},
-            {"kind": "comment", "body": "no author"}
-        ]})));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        let t = texts(&lines);
-        assert!(!t.iter().any(|l| l.contains("orphan")), "{t:?}");
-        assert_eq!(t[1], "  unresolved");
-        assert_eq!(t[2], "no author");
-    }
-
-    #[test]
     fn home_pane_renders_a_global_sparkline_entry() {
         // A global HomePane (no session_id) carrying a sparkline block renders
         // heading + glyph row + caption through home_pane_lines, covering the

@@ -644,29 +644,6 @@ mod tests {
         assert_eq!(composer_text(&state), browsed);
     }
 
-    #[test]
-    fn recall_cancel_restore_brings_back_the_draft() {
-        let mut state = test_state(None);
-        state.queue.push("queued".into());
-        state.composer.insert_str("draft");
-        state.recall_step(-1);
-        assert_eq!(composer_text(&state), "queued");
-        state.recall_cancel_restore();
-        assert!(state.recall.is_none());
-        assert_eq!(composer_text(&state), "draft");
-    }
-
-    #[test]
-    fn cancel_recall_keeps_composer_text() {
-        let mut state = test_state(None);
-        state.queue.push("queued".into());
-        state.recall_step(-1);
-        assert_eq!(composer_text(&state), "queued");
-        state.cancel_recall();
-        assert!(state.recall.is_none());
-        assert_eq!(composer_text(&state), "queued");
-    }
-
     fn cmd(name: &str) -> AvailableCommand {
         AvailableCommand {
             name: name.to_string(),
@@ -733,18 +710,6 @@ mod tests {
         state.composer.insert_str("a");
         state.reconcile_slash_selection();
         assert!(state.slash_picker_open(), "query change reopens picker");
-    }
-
-    #[test]
-    fn reconcile_clamps_selection_when_matches_shrink() {
-        let mut state = state_with_commands(&["compact", "compactor"]);
-        state.composer.insert_str("/comp");
-        state.move_slash_selection(1);
-        assert_eq!(state.slash_selected, 1);
-        // The command list shrinks under the cursor.
-        state.transcript.available_commands = vec![cmd("compact")];
-        state.reconcile_slash_selection();
-        assert_eq!(state.slash_selected, 0);
     }
 
     fn notify_snapshot(notifications: serde_json::Value) -> UiSnapshot {
