@@ -228,6 +228,13 @@ export function getSessionFileContents(
   return fetchJson<RichFileContentsResponse>(`/api/sessions/${id}/diff/file?${params.toString()}`);
 }
 
+/** URL of a diffed file's current worktree bytes, for opening in a new tab. */
+export function sessionDiffRawFileUrl(id: string, filePath: string, repoName?: string): string {
+  const params = new URLSearchParams({ path: filePath });
+  if (repoName) params.set("repo", repoName);
+  return `/api/sessions/${id}/diff/file/raw?${params.toString()}`;
+}
+
 export interface SessionFileResponse {
   content: string;
   is_binary: boolean;

@@ -1,5 +1,7 @@
 // Right panel against a real server (#1221): diff list and viewer, Files pane, paired terminal, comments.
 
+import { rmSync } from "node:fs";
+import { join } from "node:path";
 import type { Page } from "@playwright/test";
 import { test, expect, type ServeHandle } from "../helpers/liveTest";
 import { listSessions, seedSessionViaAoeAdd } from "../helpers/aoeServe";
@@ -134,6 +136,44 @@ test("right panel diff viewer: 1000-line file scrolls, binary file shows placeho
     .first()
     .click();
   await expect(first(page, "Binary file changed")).toBeVisible({ timeout: 10_000 });
+});
+
+test("right panel diff list: Open file shows the worktree copy, saves HTML, and is disabled for a deleted file", async ({
+  page,
+  spawnServe,
+}) => {
+  const serve = await spawnServe({
+    seedFn: seedSessionViaAoeAdd({
+      title: "rp-open-file",
+      committed: { "notes.txt": "committed copy\n", "gone.txt": "bye\n" },
+      files: { "notes.txt": "worktree copy\n", "page.html": "<script>document.title = 'ran';</script>\n" },
+      prepare: (dir) => {
+        writeBinaryFile(dir, "image.png", pngStubBytes());
+        rmSync(join(dir, "gone.txt"));
+      },
+    }),
+  });
+  await openSession(page, serve, "rp-open-file");
+  await expect(first(page, "4 files")).toBeVisible({ timeout: 15_000 });
+
+  const openFileFor = async (name: RegExp) => {
+    await page.getByRole("button", { name }).first().click({ button: "right" });
+    return page.getByRole("menuitem", { name: "Open file" });
+  };
+
+  const [textTab] = await Promise.all([page.waitForEvent("popup"), (await openFileFor(/notes\.txt/)).click()]);
+  await expect(textTab.locator("body")).toContainText("worktree copy", { timeout: 10_000 });
+  await textTab.close();
+
+  const [imageTab] = await Promise.all([page.waitForEvent("popup"), (await openFileFor(/image\.png/)).click()]);
+  await expect(imageTab.locator("img")).toHaveCount(1, { timeout: 10_000 });
+  await imageTab.close();
+
+  // Active content is saved under its own name rather than rendered in the dashboard's origin.
+  const [download] = await Promise.all([page.waitForEvent("download"), (await openFileFor(/page\.html/)).click()]);
+  expect(download.suggestedFilename()).toBe("page.html");
+
+  await expect(await openFileFor(/gone\.txt/)).toBeDisabled();
 });
 
 test("right panel paired terminal: Host shown, Container hidden on non-sandboxed session", async ({

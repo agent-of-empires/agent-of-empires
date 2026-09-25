@@ -1774,20 +1774,29 @@
       ]
     },
     {
-      "id": "right-panel.diff-copy-path",
+      "id": "right-panel.diff-file-menu",
       "kind": "vitest",
       "risk": "low",
       "specs": [
-        "src/components/diff/__tests__/CopyPathContextMenu.test.tsx",
-        "src/components/diff/__tests__/DiffFileList.test.tsx"
+        "src/components/diff/__tests__/DiffFileContextMenu.test.tsx",
+        "src/components/diff/__tests__/DiffFileList.test.tsx",
+        "src/components/acp/__tests__/artifactMedia.test.tsx"
       ],
       "components": [
-        "web/src/components/diff/CopyPathContextMenu.tsx",
+        "web/src/components/diff/DiffFileContextMenu.tsx",
         "web/src/components/diff/DiffFileList.tsx",
         "web/src/lib/clipboard.ts",
+        "web/src/lib/openInNewTab.ts",
         "web/src/components/diff/DiffFileRows.tsx",
         "web/src/components/diff/BasePicker.tsx"
       ]
+    },
+    {
+      "id": "right-panel.diff-open-file",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/right-panel.spec.ts"],
+      "components": ["web/src/components/diff/DiffFileContextMenu.tsx", "web/src/lib/openInNewTab.ts"]
     },
     {
       "id": "right-panel.diff",
