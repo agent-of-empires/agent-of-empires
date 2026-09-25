@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn relocation_and_restore_commits_require_the_exact_generation() {
+    fn relocation_commit_requires_exact_trash_generation() {
         let now = Utc::now();
         let mut row = trashed("session");
         let generation = row
@@ -250,7 +250,11 @@ mod tests {
         );
         assert_eq!(instances[0].project_path, "/tmp/.aoe-trash/session");
         assert_eq!(instances[0].lifecycle_reservation, None);
+    }
 
+    #[test]
+    fn restore_commit_requires_exact_generation() {
+        let now = Utc::now();
         let mut row = trashed("session");
         let generation = row
             .try_acquire_lifecycle_reservation(

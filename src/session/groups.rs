@@ -1159,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn collapse_and_trash_shape_group_counts() {
+    fn collapse_hides_descendants_but_not_the_group() {
         let instances = vec![
             inst("parent-session", "parent"),
             inst("child-session", "parent/child"),
@@ -1204,23 +1204,24 @@ mod tests {
 
         tree.toggle_collapsed("parent");
         assert!(!tree.groups_by_path["parent"].collapsed);
+    }
 
-        {
-            let mut instances = vec![inst("a", "work"), inst("b", "work")];
-            let group_count = |instances: &[Instance]| {
-                let tree = GroupTree::new_with_groups(instances, &[]);
-                let items = flatten_tree(&tree, instances, SortOrder::Oldest);
-                match group_item(&items, "work") {
-                    Item::Group { session_count, .. } => *session_count,
-                    _ => unreachable!(),
-                }
-            };
-            assert_eq!(group_count(&instances), 2);
-            instances[0].trash();
-            assert_eq!(group_count(&instances), 1);
-            instances[0].untrash();
-            assert_eq!(group_count(&instances), 2);
-        }
+    #[test]
+    fn session_count_excludes_trashed_and_restores_on_untrash() {
+        let mut instances = vec![inst("a", "work"), inst("b", "work")];
+        let group_count = |instances: &[Instance]| {
+            let tree = GroupTree::new_with_groups(instances, &[]);
+            let items = flatten_tree(&tree, instances, SortOrder::Oldest);
+            match group_item(&items, "work") {
+                Item::Group { session_count, .. } => *session_count,
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(group_count(&instances), 2);
+        instances[0].trash();
+        assert_eq!(group_count(&instances), 1);
+        instances[0].untrash();
+        assert_eq!(group_count(&instances), 2);
     }
 
     #[test]
@@ -1245,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    fn sort_orders_apply_to_groups_and_sessions() {
+    fn name_sorts_apply_to_groups_and_sessions() {
         let groups = vec![inst("z", "zebra"), inst("a", "apple"), inst("m", "Mango")];
         let tree = GroupTree::new_with_groups(&groups, &[]);
         let nested = vec![
@@ -1297,21 +1298,22 @@ mod tests {
                 );
             }
         }
+    }
 
-        {
-            let now = Utc::now();
-            let mut recent = inst("recent", "");
-            recent.last_accessed_at = Some(now);
-            let mut older = inst("older", "");
-            older.last_accessed_at = Some(now - Duration::hours(1));
-            let instances = vec![inst("never", ""), older, recent];
-            let tree = GroupTree::new_with_groups(&instances, &[]);
-            let items = flatten_tree(&tree, &instances, SortOrder::LastActivity);
-            assert_eq!(
-                session_titles(&items, &instances),
-                ["recent", "older", "never"]
-            );
-        }
+    #[test]
+    fn last_activity_sorts_descending_with_none_last() {
+        let now = Utc::now();
+        let mut recent = inst("recent", "");
+        recent.last_accessed_at = Some(now);
+        let mut older = inst("older", "");
+        older.last_accessed_at = Some(now - Duration::hours(1));
+        let instances = vec![inst("never", ""), older, recent];
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+        let items = flatten_tree(&tree, &instances, SortOrder::LastActivity);
+        assert_eq!(
+            session_titles(&items, &instances),
+            ["recent", "older", "never"]
+        );
     }
 
     #[test]
@@ -1513,7 +1515,7 @@ mod tests {
     }
 
     #[test]
-    fn favorites_first_sorts_sessions_and_groups() {
+    fn favorites_first_session_sorts() {
         let aged = |title: &str, days: i64, favorite: bool| {
             let mut i = inst(title, "");
             i.created_at = Utc::now() - Duration::days(days);
@@ -1544,41 +1546,42 @@ mod tests {
         let mut refs: Vec<&Instance> = pair.iter().collect();
         sort_sessions_inner(&mut refs, SortOrder::Newest, true);
         assert_eq!(refs[0].title, "new_plain", "snooze outranks the star");
+    }
 
-        {
-            let member = |title: &str, group: &str, days: i64| {
-                let mut i = inst(title, group);
-                i.created_at = Utc::now() - Duration::days(days);
-                i
-            };
-            let sorted_first = |instances: &[Instance], favorites_first: bool| {
-                let mut items = vec![Group::new("old", "old"), Group::new("new", "new")];
-                sort_groups_inner(
-                    &mut items,
-                    SortOrder::Newest,
-                    instances,
-                    |g: &Group| g.name.as_str(),
-                    |g: &Group| g.path.as_str(),
-                    |_: &Group| None,
-                    favorites_first,
-                );
-                items[0].path.clone()
-            };
-            let mut old_fav = member("old_fav", "old", 10);
-            old_fav.favorite();
-            let instances = vec![old_fav, member("new_plain", "new", 0)];
-            assert_eq!(sorted_first(&instances, false), "new");
-            assert_eq!(sorted_first(&instances, true), "old");
-
-            let mut archived = instances.clone();
-            archived[0].archive();
-            archived[0].favorited_at = Some(Utc::now());
-            assert_eq!(
-                sorted_first(&archived, true),
-                "new",
-                "archived favorite must not pin"
+    #[test]
+    fn favorites_first_group_sorts() {
+        let member = |title: &str, group: &str, days: i64| {
+            let mut i = inst(title, group);
+            i.created_at = Utc::now() - Duration::days(days);
+            i
+        };
+        let sorted_first = |instances: &[Instance], favorites_first: bool| {
+            let mut items = vec![Group::new("old", "old"), Group::new("new", "new")];
+            sort_groups_inner(
+                &mut items,
+                SortOrder::Newest,
+                instances,
+                |g: &Group| g.name.as_str(),
+                |g: &Group| g.path.as_str(),
+                |_: &Group| None,
+                favorites_first,
             );
-        }
+            items[0].path.clone()
+        };
+        let mut old_fav = member("old_fav", "old", 10);
+        old_fav.favorite();
+        let instances = vec![old_fav, member("new_plain", "new", 0)];
+        assert_eq!(sorted_first(&instances, false), "new");
+        assert_eq!(sorted_first(&instances, true), "old");
+
+        let mut archived = instances.clone();
+        archived[0].archive();
+        archived[0].favorited_at = Some(Utc::now());
+        assert_eq!(
+            sorted_first(&archived, true),
+            "new",
+            "archived favorite must not pin"
+        );
     }
 
     #[test]
