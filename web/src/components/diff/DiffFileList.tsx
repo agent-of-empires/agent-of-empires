@@ -3,7 +3,7 @@ import type { RepoBase, RichDiffFile } from "../../lib/types";
 import { buildDiffTree } from "../../lib/diffTree";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { BasePicker } from "./BasePicker";
-import { CopyPathContextMenu, type PathMenuState } from "./CopyPathContextMenu";
+import { DiffFileContextMenu, type PathMenuState } from "./DiffFileContextMenu";
 import { Chevron, FlatList, LineCounts, TreeView } from "./DiffFileRows";
 
 interface Props {
@@ -107,12 +107,19 @@ export function DiffFileList({
     }
   };
 
-  const handleContextMenu = useCallback((e: React.MouseEvent) => {
-    const path = (e.target as HTMLElement).closest<HTMLElement>("[data-path]")?.getAttribute("data-path");
-    if (!path) return; // Not on a row: keep the native menu.
-    e.preventDefault();
-    setPathMenu({ x: e.clientX, y: e.clientY, path });
-  }, []);
+  const handleContextMenu = useCallback(
+    (e: React.MouseEvent) => {
+      const row = (e.target as HTMLElement).closest<HTMLElement>("[data-path]");
+      const path = row?.getAttribute("data-path");
+      if (!row || !path) return; // Not on a row: keep the native menu.
+      e.preventDefault();
+      // Only file rows carry a repo, since workspace repos can share a path.
+      const repo = row.getAttribute("data-repo");
+      const file = repo === null ? undefined : files.find((f) => f.path === path && (f.repo_name ?? "") === repo);
+      setPathMenu({ x: e.clientX, y: e.clientY, path, file });
+    },
+    [files],
+  );
   const closePathMenu = useCallback(() => setPathMenu(null), []);
 
   const listProps = { selectedPath, selectedRepoName, onSelectFile };
@@ -163,7 +170,7 @@ export function DiffFileList({
 
   return (
     <div className="flex flex-col h-full bg-surface-900 overflow-hidden" onContextMenu={handleContextMenu}>
-      <CopyPathContextMenu menu={pathMenu} onClose={closePathMenu} />
+      <DiffFileContextMenu menu={pathMenu} sessionId={sessionId} onClose={closePathMenu} />
       <div className="px-3 py-2 border-b border-surface-700/20 shrink-0">
         <div className="flex items-center gap-2 flex-wrap">
           <span className="font-mono text-[11px] uppercase tracking-wider text-text-dim">Changes</span>

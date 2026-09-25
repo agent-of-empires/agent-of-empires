@@ -699,6 +699,7 @@ fn restart_tool_swap_refuses_a_foreign_pending_fork() {
             agent: "claude".into(),
             stores: vec![temp.path().join(".claude")],
             configuration: Vec::new(),
+            exported_default_store: false,
             cwd: temp.path().canonicalize().unwrap(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),

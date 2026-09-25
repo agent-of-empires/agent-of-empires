@@ -78,6 +78,7 @@ export function FileRow({ file, selected, onClick, withDir, padding, nav }: File
       type={nav ? undefined : "button"}
       data-index={nav?.index}
       data-path={file.path}
+      data-repo={file.repo_name ?? ""}
       onClick={onClick}
       onMouseEnter={nav?.onFocus}
       className={`w-full text-left ${padding.className ?? ""} py-1.5 cursor-pointer transition-colors flex items-center gap-2 ${

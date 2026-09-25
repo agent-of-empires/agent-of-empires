@@ -244,7 +244,7 @@ fn spawn_enabled_worker(
 ) {
     let claude_store_pin = selected_conversation
         .as_ref()
-        .and_then(|(_, execution)| execution.stores.first().cloned());
+        .and_then(|(_, execution)| crate::session::capture::ClaudeStorePin::of(execution));
     let resume_sid = selected_conversation
         .as_ref()
         .map(|(sid, _)| sid.as_str())
@@ -256,9 +256,12 @@ fn spawn_enabled_worker(
                     &instance.project_path,
                     sid,
                     &instance.resolved_host_environment(),
-                    claude_store_pin.as_deref().or(instance
-                        .declared_agent_config_dir_for(&instance.tool)
-                        .as_deref()),
+                    claude_store_pin
+                        .as_ref()
+                        .map(|pin| pin.store.as_path())
+                        .or(instance
+                            .declared_agent_config_dir_for(&instance.tool)
+                            .as_deref()),
                 )
             })
             .unwrap_or(false);

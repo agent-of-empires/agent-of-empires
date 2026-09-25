@@ -749,6 +749,25 @@
       "components": ["web/src/components/TopBar.tsx"]
     },
     {
+      "id": "app-shell.topbar-attention-badges",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/__tests__/TopBar.test.tsx",
+        "src/lib/__tests__/session.test.ts",
+        "src/hooks/useAttentionCounts.test.tsx",
+        "src/lib/__tests__/contrastColor.test.ts",
+        "src/lib/__tests__/attentionBadgeColors.test.ts"
+      ],
+      "components": [
+        "web/src/components/TopBar.tsx",
+        "web/src/lib/session.ts",
+        "web/src/hooks/useAttentionCounts.ts",
+        "web/src/lib/contrastColor.ts",
+        "web/src/lib/attentionBadgeColors.ts"
+      ]
+    },
+    {
       "id": "app-shell.activity-bar",
       "kind": "vitest",
       "risk": "low",
@@ -1554,6 +1573,18 @@
       ]
     },
     {
+      "id": "plugins.link-navigation",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/plugin-link-navigation.spec.ts"],
+      "components": [
+        "web/src/components/plugin/PluginSlots.tsx",
+        "web/src/components/plugin/SlotChrome.tsx",
+        "web/src/App.tsx"
+      ],
+      "notes": "A plugin-supplied UI link's internal/external classification and path resolution (src/lib/pluginHref.ts) is unit-tested in src/lib/__tests__/pluginHref.test.ts; this covers the browser-level click behavior: an internal relative href navigates via the router (no full page load), a session-shaped href goes through the same session-selection flow a sidebar click uses, an external href opens a new tab, and a modified click is not intercepted."
+    },
+    {
       "id": "sidebar.plugin-row-slots",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -1743,20 +1774,29 @@
       ]
     },
     {
-      "id": "right-panel.diff-copy-path",
+      "id": "right-panel.diff-file-menu",
       "kind": "vitest",
       "risk": "low",
       "specs": [
-        "src/components/diff/__tests__/CopyPathContextMenu.test.tsx",
-        "src/components/diff/__tests__/DiffFileList.test.tsx"
+        "src/components/diff/__tests__/DiffFileContextMenu.test.tsx",
+        "src/components/diff/__tests__/DiffFileList.test.tsx",
+        "src/components/acp/__tests__/artifactMedia.test.tsx"
       ],
       "components": [
-        "web/src/components/diff/CopyPathContextMenu.tsx",
+        "web/src/components/diff/DiffFileContextMenu.tsx",
         "web/src/components/diff/DiffFileList.tsx",
         "web/src/lib/clipboard.ts",
+        "web/src/lib/openInNewTab.ts",
         "web/src/components/diff/DiffFileRows.tsx",
         "web/src/components/diff/BasePicker.tsx"
       ]
+    },
+    {
+      "id": "right-panel.diff-open-file",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/right-panel.spec.ts"],
+      "components": ["web/src/components/diff/DiffFileContextMenu.tsx", "web/src/lib/openInNewTab.ts"]
     },
     {
       "id": "right-panel.diff",

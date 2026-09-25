@@ -856,6 +856,7 @@ fn parse_batch_states(stdout: &str, prefix: &str) -> HashMap<String, ContainerSt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::test_support::EnvGuard;
 
     #[test]
     fn batch_listing_states_keep_inspect_liveness() {
@@ -967,15 +968,18 @@ mod tests {
     }
 
     /// Every runtime installed and running on this host; empty in most CI images.
-    fn available_runtimes() -> Vec<ContainerRuntime> {
-        [
+    /// The guard keeps tests that put a fake `docker` on `PATH` from swapping the binary mid-probe.
+    fn available_runtimes() -> (EnvGuard, Vec<ContainerRuntime>) {
+        let env = EnvGuard::read_lock();
+        let runtimes = [
             ContainerRuntime::docker(),
             ContainerRuntime::apple_container(),
             ContainerRuntime::podman(),
         ]
         .into_iter()
         .filter(|rt| rt.is_available() && rt.is_daemon_running())
-        .collect()
+        .collect();
+        (env, runtimes)
     }
 
     const MISSING_IMAGE: &str = "nonexistent-image-that-does-not-exist:v999";
@@ -983,7 +987,8 @@ mod tests {
     #[test]
     #[ignore = "pulls hello-world from a live registry; run with --ignored"]
     fn image_exists_locally_and_ensure_image_accept_a_pulled_image() {
-        for rt in available_runtimes() {
+        let (_env, runtimes) = available_runtimes();
+        for rt in runtimes {
             rt.pull_image("hello-world").unwrap();
             assert!(rt.image_exists_locally("hello-world"));
             assert!(rt.ensure_image("hello-world").is_ok());
@@ -992,7 +997,8 @@ mod tests {
 
     #[test]
     fn image_exists_locally_and_ensure_image_reject_a_missing_image() {
-        for rt in available_runtimes() {
+        let (_env, runtimes) = available_runtimes();
+        for rt in runtimes {
             assert!(!rt.image_exists_locally(MISSING_IMAGE));
             assert!(rt.ensure_image(MISSING_IMAGE).is_err());
         }
