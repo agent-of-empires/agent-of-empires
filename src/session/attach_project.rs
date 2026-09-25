@@ -1032,22 +1032,26 @@ mod tests {
     }
 
     #[test]
-    fn plan_refuses_states_that_are_never_attachable() {
-        let mut scratch = Instance::new("Scratchpad", "/tmp/scratch/abc");
-        scratch.scratch = true;
+    fn plan_refuses_a_scratch_session() {
+        let mut inst = Instance::new("Scratchpad", "/tmp/scratch/abc");
+        inst.scratch = true;
         let Err(err) = plan(
-            &scratch,
+            &inst,
             "default",
             Path::new("/tmp/definitely-not-a-repo"),
             ExistingBranch::Refuse,
         ) else {
             panic!("a scratch session has no repo to attach to");
         };
+        let msg = format!("{err:#}");
         assert!(
-            format!("{err:#}").contains("scratch session"),
-            "the scratch refusal must win over the not-a-git-repo error: {err:#}"
+            msg.contains("scratch session"),
+            "the scratch refusal must win over the not-a-git-repo error: {msg}"
         );
+    }
 
+    #[test]
+    fn plan_refuses_states_that_are_never_attachable() {
         let attempt = |inst: &Instance| {
             let Err(err) = plan(
                 inst,
@@ -1351,10 +1355,13 @@ mod tests {
     }
 
     #[test]
-    fn reject_duplicate_cases() {
+    fn repo_leaf_name_uses_the_main_repo_directory() {
         assert_eq!(repo_leaf_name(Path::new("/tmp/src/frontend")), "frontend");
         assert_eq!(repo_leaf_name(Path::new("/")), "repo");
+    }
 
+    #[test]
+    fn reject_duplicate_cases() {
         let workspace = workspace_instance();
         let mut own = Instance::new("WT", "/tmp/worktrees/feature");
         own.worktree_info = Some(WorktreeInfo {
@@ -1364,34 +1371,50 @@ mod tests {
             created_at: Utc::now(),
             base_branch: None,
         });
-        // (session, repo, leaf, expected error fragment)
+        // (session, repo, leaf, expected error fragment; None = accepted)
         let cases = [
             (
                 &workspace,
                 "/tmp/src/backend",
                 "backend-alias",
-                "already attached",
+                Some("already attached"),
             ),
             (
                 &workspace,
                 "/other/src/BackEnd",
                 "BackEnd",
-                "collide on disk",
+                Some("collide on disk"),
             ),
             (
                 &own,
                 "/tmp/src/backend",
                 "backend",
-                "already this session's own repo",
+                Some("already this session's own repo"),
             ),
+            (&workspace, "/tmp/src/frontend", "frontend", None),
         ];
         for (inst, repo, leaf, want) in cases {
-            let err = reject_duplicate(inst, Path::new(repo), leaf)
-                .expect_err("duplicate must be rejected")
-                .to_string();
-            assert!(err.contains(want), "{repo} {leaf}: {err}");
+            let got = reject_duplicate(inst, Path::new(repo), leaf)
+                .err()
+                .map(|e| e.to_string());
+            match want {
+                Some(want) => assert!(
+                    got.as_deref().is_some_and(|e| e.contains(want)),
+                    "{repo} {leaf}: {got:?}"
+                ),
+                None => assert_eq!(got, None, "{repo} {leaf}"),
+            }
         }
-        reject_duplicate(&workspace, Path::new("/tmp/src/frontend"), "frontend").unwrap();
+    }
+
+    #[test]
+    fn plain_session_branch_comes_from_the_title() {
+        assert_eq!(
+            branch_for_plain_session("Fix the auth bug"),
+            "fix-the-auth-bug"
+        );
+        assert!(!branch_for_plain_session("").is_empty());
+        assert!(!branch_for_plain_session("///").is_empty());
     }
 
     #[test]
@@ -1409,12 +1432,5 @@ mod tests {
         assert_eq!(session_branch(&wt), Some("fix/xyz"));
 
         assert_eq!(session_branch(&Instance::new("Plain", "/tmp/plain")), None);
-
-        assert_eq!(
-            branch_for_plain_session("Fix the auth bug"),
-            "fix-the-auth-bug"
-        );
-        assert!(!branch_for_plain_session("").is_empty());
-        assert!(!branch_for_plain_session("///").is_empty());
     }
 }

@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn resolve_conflict_outcomes_and_stale_tokens() {
+    fn resolve_conflict_outcomes() {
         for (winner, token_ok, global) in [
             (ConflictWinner::Aoe, true, vec!["old"]),
             (ConflictWinner::Native, true, vec![]),
@@ -284,8 +284,11 @@ mod tests {
             let remaining = reconcile_agent("claude", &fs("new")).unwrap().conflicts;
             assert_eq!(remaining.len(), usize::from(!token_ok));
         }
+    }
 
-        // A token captured before the native side changed again is stale.
+    #[test]
+    #[serial_test::serial]
+    fn resolve_conflict_stale_when_native_changes_after_token_captured() {
         let _home = crate::session::test_support::isolate_app_dir();
         let token = make_conflict().fingerprint();
         let newer = reconcile_agent("claude", &fs("newer"))

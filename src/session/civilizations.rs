@@ -161,6 +161,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn to_roman_cases() {
+        for (n, want) in [
+            (1, "I"),
+            (4, "IV"),
+            (9, "IX"),
+            (49, "XLIX"),
+            (50, "L"),
+            (100, "C"),
+            (500, "D"),
+            (1000, "M"),
+        ] {
+            assert_eq!(to_roman(n), want);
+        }
+    }
+
+    #[test]
     fn generated_titles_avoid_taken_names_then_fall_back_to_suffixes() {
         let title = generate_random_title(&[]);
         assert!(CIVILIZATIONS.contains(&title.as_str()));
@@ -185,19 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn roman_suffixes_and_default_civ_names() {
-        for (n, want) in [
-            (1, "I"),
-            (4, "IV"),
-            (9, "IX"),
-            (49, "XLIX"),
-            (50, "L"),
-            (100, "C"),
-            (500, "D"),
-            (1000, "M"),
-        ] {
-            assert_eq!(to_roman(n), want);
-        }
+    fn is_default_civ_name_cases() {
         assert!(is_default_civ_name("Vikings"));
         assert!(is_default_civ_name("  Vikings  "));
         assert!(is_default_civ_name("Britons II"));

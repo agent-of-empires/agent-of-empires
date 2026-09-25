@@ -794,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_files_missing_malformed_and_valid() {
+    fn standard_layer_files() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_global_mcp_servers(dir.path()).unwrap().is_empty());
         std::fs::write(dir.path().join("mcp.json"), "{ not json").unwrap();
@@ -808,7 +808,10 @@ mod tests {
             names(&load_global_mcp_servers(dir.path()).unwrap()),
             vec!["fs"]
         );
+    }
 
+    #[test]
+    fn native_missing_malformed_and_unknown() {
         let home = tempfile::tempdir().unwrap();
         for agent in ["claude", "gemini", "codex", "opencode"] {
             assert!(load_native_mcp_servers(agent, home.path())

@@ -377,20 +377,23 @@ mod tests {
         let mut touched = inst();
         touched.touch_last_accessed();
         assert!(touched.last_accessed_at.is_some());
-        for (status, expected) in [
-            (Status::Running, Status::Idle),
-            (Status::Waiting, Status::Idle),
-            (Status::Starting, Status::Idle),
-            (Status::Idle, Status::Idle),
-            (Status::Stopped, Status::Stopped),
-            (Status::Error, Status::Error),
-            (Status::Unknown, Status::Unknown),
+    }
+
+    #[test]
+    fn dormancy_presents_only_on_an_idle_row() {
+        for (status, marked, shown) in [
+            (Status::Idle, true, true),
+            // A deliberate Stop also marks dormant but presents as stopped.
+            (Status::Stopped, true, false),
+            (Status::Idle, false, false),
+            (Status::Running, false, false),
         ] {
             let mut inst = inst();
             inst.status = status;
-            inst.archive();
-            assert!(inst.is_archived());
-            assert_eq!(inst.status, expected, "{status:?}");
+            if marked {
+                inst.mark_idle_dormant();
+            }
+            assert_eq!(inst.is_shown_dormant(), shown, "{status:?} {marked}");
         }
     }
 
@@ -423,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_age_recent_activity_and_dormancy_follow_status() {
+    fn idle_age_and_recent_activity() {
         let window = std::time::Duration::from_secs(15 * 60);
         let ago = |secs: i64| Some(Utc::now() - chrono::Duration::seconds(secs));
         // (status, idle_entered_at, idle age present, recent activity)
@@ -454,24 +457,29 @@ mod tests {
                 );
             }
         }
-        let mut fresh = inst();
-        fresh.status = Status::Idle;
-        fresh.idle_entered_at = ago(5);
-        let age = fresh.idle_age().unwrap().as_secs();
+        let mut inst = inst();
+        inst.status = Status::Idle;
+        inst.idle_entered_at = ago(5);
+        let age = inst.idle_age().unwrap().as_secs();
         assert!((4..=30).contains(&age));
-        for (status, marked, shown) in [
-            (Status::Idle, true, true),
-            // A deliberate Stop also marks dormant but presents as stopped.
-            (Status::Stopped, true, false),
-            (Status::Idle, false, false),
-            (Status::Running, false, false),
+    }
+
+    #[test]
+    fn archive_settles_only_live_interaction_statuses() {
+        for (status, expected) in [
+            (Status::Running, Status::Idle),
+            (Status::Waiting, Status::Idle),
+            (Status::Starting, Status::Idle),
+            (Status::Idle, Status::Idle),
+            (Status::Stopped, Status::Stopped),
+            (Status::Error, Status::Error),
+            (Status::Unknown, Status::Unknown),
         ] {
             let mut inst = inst();
             inst.status = status;
-            if marked {
-                inst.mark_idle_dormant();
-            }
-            assert_eq!(inst.is_shown_dormant(), shown, "{status:?} {marked}");
+            inst.archive();
+            assert!(inst.is_archived());
+            assert_eq!(inst.status, expected, "{status:?}");
         }
     }
 }

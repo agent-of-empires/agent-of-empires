@@ -777,7 +777,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn acquire_reuses_stored_and_pinned_ids_unless_cleared() {
+    fn stored_and_pinned_ids_are_reused() {
         for (tool, stored, intent, expected) in [
             (
                 "opencode",
@@ -809,19 +809,6 @@ mod tests {
             );
             assert_eq!(inst.agent_session_id.as_deref(), Some(expected));
         }
-        let mut claude = tool_instance("claude", "/tmp/x");
-        claude.agent_session_id = Some("observed".to_string());
-        claude.resume_intent = ResumeIntent::Cleared;
-        let (sid, is_existing) = claude.acquire_session_id(None);
-        assert!(sid.is_some() && !is_existing);
-        assert_ne!(sid.as_deref(), Some("observed"));
-        assert_eq!(claude.agent_session_id, sid);
-
-        let mut opencode = tool_instance("opencode", "/tmp/x");
-        opencode.agent_session_id = Some("observed".to_string());
-        opencode.resume_intent = ResumeIntent::Cleared;
-        assert_eq!(opencode.acquire_session_id(None), (None, false));
-        assert_eq!(opencode.agent_session_id, None);
     }
 
     #[test]
@@ -1066,6 +1053,22 @@ work-opencode = "opencode"
             shared.resolved_session_support().is_none(),
             "an unscoped store cannot be claimed through detect_as"
         );
+    }
+    #[test]
+    fn cleared_intent_launches_fresh() {
+        let mut claude = tool_instance("claude", "/tmp/x");
+        claude.agent_session_id = Some("observed".to_string());
+        claude.resume_intent = ResumeIntent::Cleared;
+        let (sid, is_existing) = claude.acquire_session_id(None);
+        assert!(sid.is_some() && !is_existing);
+        assert_ne!(sid.as_deref(), Some("observed"));
+        assert_eq!(claude.agent_session_id, sid);
+
+        let mut opencode = tool_instance("opencode", "/tmp/x");
+        opencode.agent_session_id = Some("observed".to_string());
+        opencode.resume_intent = ResumeIntent::Cleared;
+        assert_eq!(opencode.acquire_session_id(None), (None, false));
+        assert_eq!(opencode.agent_session_id, None);
     }
 
     #[test]

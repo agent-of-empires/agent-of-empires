@@ -198,7 +198,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_key_takes_last_segment_and_unknown_keys_resolve_to_none() {
+    fn split_key_takes_last_segment() {
         assert_eq!(
             split_key("acp.default_agent"),
             Some(("acp", "default_agent"))
@@ -208,6 +208,10 @@ mod tests {
             Some(("plugin:acme.kit", "retries"))
         );
         assert_eq!(split_key("nodot"), None);
+    }
+
+    #[test]
+    fn unknown_key_resolves_to_none() {
         assert!(resolve("acp.totally_made_up").is_none());
         assert!(resolve("nodot").is_none());
     }
