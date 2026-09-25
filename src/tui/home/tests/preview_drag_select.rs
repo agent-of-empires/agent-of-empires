@@ -404,15 +404,16 @@ fn extract_stays_locked_to_lines_when_capture_window_grows() {
 fn extract_preview_selection_text_cases() {
     let mut env = create_test_env_empty();
     // (label, pane width, first_line, lines, anchor (col, abs), extent (col, abs), expected)
-    let cases: [(
-        &str,
+    type Case = (
+        &'static str,
         u16,
         usize,
-        &[&str],
+        &'static [&'static str],
         (u16, usize),
         (u16, usize),
-        Option<&str>,
-    ); 5] = [
+        Option<&'static str>,
+    );
+    let cases: [Case; 5] = [
         (
             "spans lines above the fold",
             10,
