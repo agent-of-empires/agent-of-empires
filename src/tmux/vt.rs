@@ -3164,73 +3164,45 @@ mod tests {
 
     #[test]
     fn capture_rows_padded_fills_every_row_to_the_pane_width() {
-        let rows = capture_rows_padded(b"ab\nlonger\n", 8, 3);
-        assert_eq!(rows.len(), 3, "one entry per pane row, blanks included");
-        for (i, row) in rows.iter().enumerate() {
-            assert_eq!(visible_width(row), 8, "row {i} not padded: {row:?}");
+        // (capture, width, height, visible text per row when it is pinned)
+        let cases: [(&str, u16, u16, Option<&[&str]>); 8] = [
+            ("ab\nlonger\n", 8, 3, Some(&["ab", "longer", ""])),
+            ("line-1\nline-2\n", 10, 2, Some(&["line-1", "line-2"])),
+            ("\x1b[41mred", 8, 1, Some(&["red"])),
+            ("ab漢", 4, 1, Some(&["ab漢"])),
+            ("ab漢", 7, 1, Some(&["ab漢"])),
+            ("abc漢", 4, 2, None),
+            ("keep", 3, 1, None),
+            ("abcdefgh", 4, 2, None),
+        ];
+        for (capture, width, height, text) in cases {
+            let rows = capture_rows_padded(capture.as_bytes(), width, height);
+            assert_eq!(rows.len(), usize::from(height), "{capture:?}");
+            for row in &rows {
+                assert_eq!(
+                    visible_width(row),
+                    usize::from(width),
+                    "{capture:?}: {row:?}"
+                );
+            }
+            if let Some(text) = text {
+                let plain: Vec<String> = rows
+                    .iter()
+                    .map(|r| crate::tmux::utils::strip_ansi(r).trim_end().to_string())
+                    .collect();
+                assert_eq!(plain, text, "{capture:?}");
+            }
         }
-        assert!(rows[0].contains("ab"));
-        assert!(rows[1].contains("longer"));
-    }
-
-    #[test]
-    fn capture_rows_padded_unstaircases_bare_lf_input() {
-        let rows = capture_rows_padded(b"line-1\nline-2\n", 10, 2);
-        let plain: Vec<String> = rows
-            .iter()
-            .map(|r| crate::tmux::utils::strip_ansi(r))
-            .collect();
-        assert_eq!(plain[0].trim_end(), "line-1");
-        assert_eq!(plain[1].trim_end(), "line-2", "row 1 staircased");
-    }
-
-    #[test]
-    fn capture_rows_padded_resets_style_before_padding() {
-        let rows = capture_rows_padded(b"\x1b[41mred", 8, 1);
-        assert_eq!(visible_width(&rows[0]), 8);
+        let styled = &capture_rows_padded(b"\x1b[41mred", 8, 1)[0];
         assert!(
-            rows[0].ends_with("\x1b[0m     "),
-            "padding not reset: {:?}",
-            rows[0]
+            styled.ends_with("\x1b[0m     "),
+            "padding not reset: {styled:?}"
         );
-    }
-
-    #[test]
-    fn capture_rows_padded_counts_a_trailing_wide_glyph_as_two_columns() {
-        let rows = capture_rows_padded("ab漢".as_bytes(), 4, 1);
-        assert_eq!(
-            visible_width(&rows[0]),
-            4,
-            "row should exactly fill the pane: {:?}",
-            rows[0]
-        );
+        let full = &capture_rows_padded("ab漢".as_bytes(), 4, 1)[0];
         assert!(
-            !rows[0].ends_with(' '),
-            "no padding belongs on a row that already fills its width: {:?}",
-            rows[0]
+            !full.ends_with(' '),
+            "a full row takes no padding: {full:?}"
         );
-
-        let rows = capture_rows_padded("ab漢".as_bytes(), 7, 1);
-        assert_eq!(visible_width(&rows[0]), 7, "{:?}", rows[0]);
-
-        let rows = capture_rows_padded("abc漢".as_bytes(), 4, 2);
-        for (i, r) in rows.iter().enumerate() {
-            assert_eq!(visible_width(r), 4, "row {i}: {r:?}");
-        }
-    }
-
-    #[test]
-    fn capture_rows_padded_survives_a_one_row_pane_that_wraps() {
-        let rows = capture_rows_padded(b"keep", 3, 1);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(visible_width(&rows[0]), 3);
-    }
-
-    #[test]
-    fn capture_rows_padded_truncates_content_wider_than_the_pane() {
-        let rows = capture_rows_padded(b"abcdefgh", 4, 2);
-        assert_eq!(visible_width(&rows[0]), 4);
-        assert_eq!(visible_width(&rows[1]), 4);
     }
 
     #[test]
@@ -4706,21 +4678,35 @@ mod tests {
     }
 
     #[test]
-    fn osc52_scanner_extracts_bel_and_st_terminated_writes() {
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"before\x1b]52;c;aGVsbG8=\x07after"),
-            Some("hello".to_string())
-        );
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"\x1b]52;c;aGVsbG8=\x1b\\"),
-            Some("hello".to_string())
-        );
-        let mut s = Osc52Scanner::new();
-        assert_eq!(s.feed(b"\x1b]52;c;aGk\x07"), Some("hi".to_string()));
-        let mut s = Osc52Scanner::new();
-        assert_eq!(s.feed(b"\x1b]52;;aGVsbG8=\x07"), Some("hello".to_string()));
+    fn osc52_scanner_extracts_clipboard_writes() {
+        let hello = Some("hello");
+        let cases: [(&[u8], Option<&str>); 11] = [
+            (b"before\x1b]52;c;aGVsbG8=\x07after", hello),
+            (b"\x1b]52;c;aGVsbG8=\x1b\\", hello),
+            (b"\x1b]52;c;aGk\x07", Some("hi")),
+            (b"\x1b]52;;aGVsbG8=\x07", hello),
+            // Queries and empty writes are not copies.
+            (b"\x1b]52;c;?\x07", None),
+            (b"\x1b]52;c;\x07", None),
+            (b"\x1b]52;c;=====\x07", None),
+            // Other sequences are skipped and the latest write wins.
+            (
+                b"\x1b]0;title\x07\x1b[31m\x1b]521;x\x07\x1b]52;c;aGVsbG8=\x07",
+                hello,
+            ),
+            (b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;aGk=\x07", Some("hi")),
+            // tmux passthrough wrapping, with BEL and doubled-ESC ST.
+            (b"\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x07\x1b\\", hello),
+            (b"\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x1b\x1b\\\x1b\\", hello),
+        ];
+        for (chunk, expected) in cases {
+            assert_eq!(
+                Osc52Scanner::new().feed(chunk).as_deref(),
+                expected,
+                "{:?}",
+                String::from_utf8_lossy(chunk)
+            );
+        }
     }
 
     #[test]
@@ -4736,44 +4722,6 @@ mod tests {
                 "split at byte {split} lost the copy"
             );
         }
-    }
-
-    #[test]
-    fn osc52_scanner_skips_queries_and_empty_writes() {
-        let mut s = Osc52Scanner::new();
-        assert_eq!(s.feed(b"\x1b]52;c;?\x07"), None);
-        let mut s = Osc52Scanner::new();
-        assert_eq!(s.feed(b"\x1b]52;c;\x07"), None);
-        let mut s = Osc52Scanner::new();
-        assert_eq!(s.feed(b"\x1b]52;c;=====\x07"), None);
-    }
-
-    #[test]
-    fn osc52_scanner_ignores_other_sequences_and_recovers() {
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"\x1b]0;title\x07\x1b[31m\x1b]521;x\x07\x1b]52;c;aGVsbG8=\x07"),
-            Some("hello".to_string())
-        );
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"\x1b]52;c;aGVsbG8=\x07\x1b]52;c;aGk=\x07"),
-            Some("hi".to_string())
-        );
-    }
-
-    #[test]
-    fn osc52_scanner_unwraps_tmux_passthrough_wrapped_writes() {
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x07\x1b\\"),
-            Some("hello".to_string())
-        );
-        let mut s = Osc52Scanner::new();
-        assert_eq!(
-            s.feed(b"\x1bPtmux;\x1b\x1b]52;c;aGVsbG8=\x1b\x1b\\\x1b\\"),
-            Some("hello".to_string())
-        );
     }
 
     #[test]

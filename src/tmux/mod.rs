@@ -3081,53 +3081,52 @@ mod tests {
     const ID8: &str = "abc12345";
 
     #[test]
-    fn resolve_agent_session_name_prefers_the_derived_name_when_it_is_live() {
-        let derived = format!("{P}Refactor_billing_{ID8}");
-        let stale = format!("{P}Vikings_{ID8}");
-        let names = [derived.as_str(), stale.as_str()];
-        assert_eq!(
-            resolve_agent_session_name(names, ID, &derived),
-            derived,
-            "a live derived name is never overridden"
-        );
-    }
-
-    #[test]
-    fn resolve_agent_session_name_adopts_the_stale_name_after_a_retitle() {
-        let derived = format!("{P}Refactor_billing_mod_{ID8}");
-        let stale = format!("{P}Vikings_{ID8}");
-        assert_eq!(
-            resolve_agent_session_name([stale.as_str()], ID, &derived),
-            stale,
-            "lifecycle ops must follow the live session, not the derived name"
-        );
-    }
-
-    #[test]
-    fn resolve_agent_session_name_ignores_other_kinds_and_other_ids() {
-        let derived = format!("{P}Refactor_{ID8}");
-        let names = [
+    fn resolve_agent_session_name_follows_a_single_live_retitle() {
+        let agent = |title: &str| format!("{P}{title}_{ID8}");
+        let stale = agent("Vikings");
+        let others = [
             format!("{TERMINAL_PREFIX}Vikings_{ID8}"),
             format!("{CONTAINER_TERMINAL_PREFIX}Vikings_{ID8}"),
             format!("{TOOL_PREFIX}lazygit_Vikings_{ID8}"),
             format!("{P}Vikings_99999999"),
             "vim".to_string(),
         ];
-        assert_eq!(
-            resolve_agent_session_name(names.iter().map(String::as_str), ID, &derived),
-            derived,
-            "nothing here is this session's agent pane"
-        );
-    }
-
-    #[test]
-    fn resolve_agent_session_name_falls_back_when_two_candidates_are_ambiguous() {
-        let derived = format!("{P}Refactor_{ID8}");
-        let names = [format!("{P}Vikings_{ID8}"), format!("{P}Aztecs_{ID8}")];
-        assert_eq!(
-            resolve_agent_session_name(names.iter().map(String::as_str), ID, &derived),
-            derived,
-        );
+        // (derived, live names, expected)
+        let cases = [
+            // A live derived name is never overridden.
+            (
+                agent("Refactor_billing"),
+                vec![agent("Refactor_billing"), stale.clone()],
+                agent("Refactor_billing"),
+            ),
+            (
+                agent("Refactor_billing_mod"),
+                vec![stale.clone()],
+                stale.clone(),
+            ),
+            // Other kinds and other ids are not this session's agent pane.
+            (agent("Refactor"), others.to_vec(), agent("Refactor")),
+            // Two candidates are ambiguous.
+            (
+                agent("Refactor"),
+                vec![stale.clone(), agent("Aztecs")],
+                agent("Refactor"),
+            ),
+            // A title shaped like an aux prefix still resolves, and still wins when live.
+            (agent("term_rewriting"), vec![stale.clone()], stale.clone()),
+            (
+                agent("term_rewriting"),
+                vec![stale.clone(), agent("term_rewriting")],
+                agent("term_rewriting"),
+            ),
+        ];
+        for (derived, names, expected) in cases {
+            assert_eq!(
+                resolve_agent_session_name(names.iter().map(String::as_str), ID, &derived),
+                expected,
+                "{derived} among {names:?}"
+            );
+        }
     }
 
     #[test]
@@ -3167,22 +3166,6 @@ mod tests {
                 "fast path and scan disagree for {names:?}"
             );
         }
-    }
-
-    #[test]
-    fn resolve_agent_session_name_handles_a_title_shaped_like_an_aux_prefix() {
-        let derived = format!("{P}term_rewriting_{ID8}");
-        let stale = format!("{P}Vikings_{ID8}");
-        assert_eq!(
-            resolve_agent_session_name([stale.as_str()], ID, &derived),
-            stale,
-            "retitled INTO an aux-shaped title still resolves onto the live pane"
-        );
-        assert_eq!(
-            resolve_agent_session_name([stale.as_str(), derived.as_str()], ID, &derived),
-            derived,
-            "a live derived name wins even when the shape filter excludes it"
-        );
     }
 
     #[test]
@@ -3591,36 +3574,37 @@ mod tests {
     }
 
     #[test]
-    fn tmux_no_server_running_detects_empty_case() {
-        assert!(tmux_no_server_running(
-            b"no server running on /tmp/tmux-501/default\n"
-        ));
-        assert!(tmux_no_server_running(b"no server running on /path.sock"));
-        assert!(tmux_no_server_running(
-            b"error connecting to /path.sock (No such file or directory)"
-        ));
-        assert!(tmux_no_server_running(
-            b"error connecting to /tmp/No such file or directory.sock (No such file or directory)"
-        ));
-    }
-
-    #[test]
-    fn tmux_no_server_running_rejects_other_errors_and_empty() {
-        assert!(!tmux_no_server_running(b"can't find session: aoe_foo"));
-        assert!(!tmux_no_server_running(b"usage: list-sessions"));
-        assert!(!tmux_no_server_running(b""));
-        assert!(!tmux_no_server_running(
-            b"error connecting to /path.sock (Permission denied)"
-        ));
-        assert!(!tmux_no_server_running(
-            b"error connecting to /path.sock (Socket operation on non-socket)"
-        ));
-        assert!(!tmux_no_server_running(
-            b"error connecting to /tmp/No such file or directory.sock (Permission denied)"
-        ));
-        assert!(!tmux_no_server_running(
-            b"error connecting to /tmp/no server running.sock (Permission denied)"
-        ));
+    fn tmux_no_server_running_matches_only_a_missing_server() {
+        let cases: [(&[u8], bool); 11] = [
+            (b"no server running on /tmp/tmux-501/default\n", true),
+            (b"no server running on /path.sock", true),
+            (b"error connecting to /path.sock (No such file or directory)", true),
+            (
+                b"error connecting to /tmp/No such file or directory.sock (No such file or directory)",
+                true,
+            ),
+            (b"can't find session: aoe_foo", false),
+            (b"usage: list-sessions", false),
+            (b"", false),
+            (b"error connecting to /path.sock (Permission denied)", false),
+            (b"error connecting to /path.sock (Socket operation on non-socket)", false),
+            (
+                b"error connecting to /tmp/No such file or directory.sock (Permission denied)",
+                false,
+            ),
+            (
+                b"error connecting to /tmp/no server running.sock (Permission denied)",
+                false,
+            ),
+        ];
+        for (stderr, expected) in cases {
+            assert_eq!(
+                tmux_no_server_running(stderr),
+                expected,
+                "{:?}",
+                String::from_utf8_lossy(stderr)
+            );
+        }
     }
 
     #[test]

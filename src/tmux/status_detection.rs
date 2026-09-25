@@ -189,6 +189,151 @@ mod tests {
 
     #[test]
     fn pane_fixture_table() {
+        assert_all(detect_pi_status, Status::Running, &[PI_RUNNING_PANE]);
+        assert_all(
+            detect_pi_status,
+            Status::Idle,
+            &[PI_FINISHED_PANE_WITH_ACTIVITY_PROSE],
+        );
+        assert_all(detect_omp_status, Status::Idle, &[
+            // activity timer without interrupt row
+                "Completed response.\n⠸ 1s > historical timing\n╰─",
+            // indented prose is not an interrupt row
+                "  Completed response.\n⠸ 1s > historical timing\n╰─",
+            // interrupt row without activity timer
+                "⎋ Working…\nπ > idle status\n╰─",
+            // digitless timer
+                "⎋ Working…\n⠸ .s > model status\n╰─",
+            // multi-decimal timer
+                "⎋ Working…\n⠸ 1..2s > model status\n╰─",
+            // leading-zero timer
+                "⎋ Working…\n⠸ 01s > model status\n╰─",
+            // duration prose below interrupt row
+                "⎋ Working…\nThe probe took 1s > historical timing\n╰─",
+            // stale interrupt rows around completed output
+                "⎋ Working…\nDone. Wrote 3 files.\nesc Working...",
+            // duration prose with a single-cell prefix
+                "esc Working...\nx 30m saved per run",
+            // active band pushed above current composer
+                "⎋ Working…\n⠸ 1s > model status\nCompleted response.\n╭── π > idle ─╮\n╰─           ─╯",
+            // persistent elapsed segment
+                "⎋ Working…\nπ > RCA Slow Turn > ⏱ 5m\n╰─",
+            // clock-only first segment
+                "  ⎋ Working…\n\n❯\n ⏱ 5m · RCA Slow Turn",
+            // nerd clock-only first segment
+                "  󱊷 Working…\n\n❯\n  5m  RCA Slow Turn",
+            // ascii clock-only first segment
+                "  esc Working...\n\n>\n t: 5m > RCA Slow Turn",
+            // decorated nerd clock-only first segment
+                "  󱊷 Working…\n\n❯\n  5m  RCA Slow Turn",
+            // decorated unicode clock-only first segment
+                "  ⎋ Working…\n❯\n╭── ⏱ 5m ─╮\n╰─",
+            // stale band with parked pi footer
+                "─ Continue Autonomous · ⏱ 2h4m ─\n❯\n───────────────────────────────────\n π · 🖥 host",
+            // parked claude shape at prompt
+                "❯\n───────────────────────────────────\n π · 🖥 host",
+            // stale parked spinner with prose mentioning esc to cancel
+                "Some tool output: press (esc to cancel) to abort\n\
+                 ❯\n\
+                 ───────────────────────────────────\n\
+                  ⠏ 28s · 🖥 host",
+        ]);
+        // Selector hints without an approval panel are prose, not a prompt.
+        let box_ = "╭── π ─╮\n╰─ ─╯";
+        let selector_hints = [
+            format!("Quoted UI:\nApprove and execute\nRefine plan\nSave and quit\ntab regions · esc cancel\n{box_}"),
+            format!("The instructions said: Enter select · n note\n{box_}"),
+            "╭── π  > approve and execute the migration ─╮\n│ then refine plan wording                    │\n╰─                                           ─╯".to_string(),
+            format!("Options were:\n> Approve and execute\nor Refine plan\n{box_}"),
+            format!("| > Approve and execute |\n|   Refine plan |\n|   Save and quit |\nPlan approved.\nrunning step 1\ndone\n{box_}"),
+            format!("I approve and execute\nthen refine plan things\n{box_}"),
+            format!("│ up/down navigate  enter select  esc cancel │\n{box_}"),
+            format!("│ up/down navigate  enter select  esc cancel │\nI will approve or deny later\n{box_}"),
+            format!("I would approve and execute refine plan steps\n{box_}"),
+            "╭── π > GPT-5.6 Sol ─╮\n│ Enter select · n note while documenting the UI │\n│ second draft line │\n╰──────────────────╯"
+                .to_string(),
+            "│ Enter submit · ↑/↓ scroll · current prompt to answer │\n╭── \u{f0d57} > ─╮"
+                .to_string(),
+            format!("press enter to select an option\n{box_}"),
+        ];
+        assert_all(
+            detect_omp_status,
+            Status::Idle,
+            &selector_hints
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        assert_all(
+            detect_omp_status,
+            Status::Waiting,
+            &[
+                "\
+╭─ Ask ────────────────────────────────────────╮
+│                                              │
+│ Which database for the new service?          │
+│                                              │
+│  ❯ PostgreSQL                                │
+│    SQLite                                    │
+│    Other (type your own)                     │
+│                                              │
+│ Enter select · n note · ↑/↓ move · Esc       │
+│                                              │
+╰──────────────────────────────────────────────╯",
+                "\
+| Space toggle · Enter next · ↑/↓ move · Esc   |
++----------------------------------------------+",
+                "\
+│ Enter submit · ↑/↓ scroll · Esc              │
+╰──────────────────────────────────────────────╯",
+                "\
+│ Finish or clear the current prompt to answer · Esc cancel │
+╰──────────────────────────────────────────────╯",
+                "\
+╭─ Ask ────────────────────────────────────────╮
+│ Enter select · n note · ↑/↓ move · Esc       │
+╰──────────────────────────────────────────────╯
+╭── π > draft ─────────────────────────────────╮
+╰──────────────────────────────────────────────╯",
+                "\
+╭─ Ask ────────────────────────────────────────╮
+│ Finish or clear the current prompt to answer · Esc cancel │
+╰──────────────────────────────────────────────╯
+╭── π > draft ─────────────────────────────────╮
+╰──────────────────────────────────────────────╯",
+            ],
+        );
+        assert_all(
+            detect_claude_status,
+            Status::Waiting,
+            &[
+                CLAUDE_FOLDER_TRUST_PROMPT,
+                CLAUDE_FOLDER_TRUST_PROMPT_WRAPPED,
+                CLAUDE_FOLDER_TRUST_PROMPT_NARROW,
+            ],
+        );
+        // A trust prompt echoed during a live turn is not the dialog.
+        let bodies = [
+            " \u{276f} 1. Yes, I trust this folder\n   2. No, exit",
+            "     \u{276f} 1. Yes, I trust this folder\n       2. No, exit",
+            "  \u{276f} 1. Yes, I trust this folder\n    2. No, exit\n     test result: FAILED",
+            " 1. Yes, I trust this folder is what you pick, and then\n 2. the session starts",
+        ];
+        let mut echoed = Vec::new();
+        for body in bodies {
+            let pane = format!(
+                "\u{25cf} The first-run dialog reads:\n \
+                 Quick safety check: Is this a project you created or one you trust?\n\
+                 {body}\n \u{2736} Working\u{2026} (12s \u{b7} \u{2193} 431 tokens)\n   \
+                 esc to interrupt\n"
+            );
+            echoed.push(pane);
+        }
+        assert_all(
+            detect_claude_status,
+            Status::Running,
+            &echoed.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
         assert_all(
             detect_cursor_status,
             Status::Running,
@@ -1841,37 +1986,6 @@ I’ll inspect the status detection path first and then adjust the idle override
 ";
 
     #[test]
-    fn claude_folder_trust_prompt_is_waiting() {
-        let cases = [
-            ("default", CLAUDE_FOLDER_TRUST_PROMPT),
-            ("wrapped", CLAUDE_FOLDER_TRUST_PROMPT_WRAPPED),
-            ("narrow", CLAUDE_FOLDER_TRUST_PROMPT_NARROW),
-        ];
-        for (name, fixture) in cases {
-            assert_eq!(detect_claude_status(fixture), Status::Waiting, "{name}");
-        }
-    }
-
-    #[test]
-    fn claude_echoed_trust_prompt_during_a_turn_is_not_waiting() {
-        let bodies = [
-            " \u{276f} 1. Yes, I trust this folder\n   2. No, exit",
-            "     \u{276f} 1. Yes, I trust this folder\n       2. No, exit",
-            "  \u{276f} 1. Yes, I trust this folder\n    2. No, exit\n     test result: FAILED",
-            " 1. Yes, I trust this folder is what you pick, and then\n 2. the session starts",
-        ];
-        for body in bodies {
-            let pane = format!(
-                "\u{25cf} The first-run dialog reads:\n \
-                 Quick safety check: Is this a project you created or one you trust?\n\
-                 {body}\n \u{2736} Working\u{2026} (12s \u{b7} \u{2193} 431 tokens)\n   \
-                 esc to interrupt\n"
-            );
-            assert_eq!(detect_claude_status(&pane), Status::Running, "{body:?}");
-        }
-    }
-
-    #[test]
     fn test_reconcile_claude_idle_hook_parked_pane_keeps_idle() {
         let pane = "✻ Worked for 1m 52s\n❯\n  ? for shortcuts";
         assert_eq!(
@@ -2435,19 +2549,6 @@ Still more prose in the second section.\n\
 ────────────────────────────────────────\n\
 Closing prose line.\n\
 Final prose line.\n";
-
-    #[test]
-    fn test_detect_pi_status_running_spinner_footer() {
-        assert_eq!(detect_pi_status(PI_RUNNING_PANE), Status::Running);
-    }
-
-    #[test]
-    fn test_detect_pi_status_finished_with_activity_prose_is_not_running() {
-        assert_eq!(
-            detect_pi_status(PI_FINISHED_PANE_WITH_ACTIVITY_PROSE),
-            Status::Idle
-        );
-    }
 
     fn pane_with_line_at_depth(line: &str, depth: usize) -> String {
         let filler = "Footer filler line.\n".repeat(depth.saturating_sub(1));
@@ -3256,55 +3357,6 @@ Final prose line.\n";
     }
 
     #[test]
-    fn test_detect_omp_status_active_brand_near_misses_idle() {
-        for pane in [
-            // activity timer without interrupt row
-                "Completed response.\n⠸ 1s > historical timing\n╰─",
-            // indented prose is not an interrupt row
-                "  Completed response.\n⠸ 1s > historical timing\n╰─",
-            // interrupt row without activity timer
-                "⎋ Working…\nπ > idle status\n╰─",
-            // digitless timer
-                "⎋ Working…\n⠸ .s > model status\n╰─",
-            // multi-decimal timer
-                "⎋ Working…\n⠸ 1..2s > model status\n╰─",
-            // leading-zero timer
-                "⎋ Working…\n⠸ 01s > model status\n╰─",
-            // duration prose below interrupt row
-                "⎋ Working…\nThe probe took 1s > historical timing\n╰─",
-            // stale interrupt rows around completed output
-                "⎋ Working…\nDone. Wrote 3 files.\nesc Working...",
-            // duration prose with a single-cell prefix
-                "esc Working...\nx 30m saved per run",
-            // active band pushed above current composer
-                "⎋ Working…\n⠸ 1s > model status\nCompleted response.\n╭── π > idle ─╮\n╰─           ─╯",
-            // persistent elapsed segment
-                "⎋ Working…\nπ > RCA Slow Turn > ⏱ 5m\n╰─",
-            // clock-only first segment
-                "  ⎋ Working…\n\n❯\n ⏱ 5m · RCA Slow Turn",
-            // nerd clock-only first segment
-                "  󱊷 Working…\n\n❯\n  5m  RCA Slow Turn",
-            // ascii clock-only first segment
-                "  esc Working...\n\n>\n t: 5m > RCA Slow Turn",
-            // decorated nerd clock-only first segment
-                "  󱊷 Working…\n\n❯\n  5m  RCA Slow Turn",
-            // decorated unicode clock-only first segment
-                "  ⎋ Working…\n❯\n╭── ⏱ 5m ─╮\n╰─",
-            // stale band with parked pi footer
-                "─ Continue Autonomous · ⏱ 2h4m ─\n❯\n───────────────────────────────────\n π · 🖥 host",
-            // parked claude shape at prompt
-                "❯\n───────────────────────────────────\n π · 🖥 host",
-            // stale parked spinner with prose mentioning esc to cancel
-                "Some tool output: press (esc to cancel) to abort\n\
-                 ❯\n\
-                 ───────────────────────────────────\n\
-                  ⠏ 28s · 🖥 host",
-        ] {
-            assert_eq!(detect_omp_status(pane), Status::Idle, "{pane}");
-        }
-    }
-
-    #[test]
     fn test_detect_omp_status_active_brand_uses_lowest_marker() {
         let band = "⎋ Working…\n⠸ 1s > model status";
         let approval = "│ ❯ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc cancel │";
@@ -3332,48 +3384,6 @@ Final prose line.\n";
         ];
         for (name, pane, expected) in cases {
             assert_eq!(detect_omp_status(&pane), expected, "case: {name}");
-        }
-    }
-
-    #[test]
-    fn test_detect_omp_status_waiting_on_ask_dialog() {
-        let cases = [
-            "\
-╭─ Ask ────────────────────────────────────────╮
-│                                              │
-│ Which database for the new service?          │
-│                                              │
-│  ❯ PostgreSQL                                │
-│    SQLite                                    │
-│    Other (type your own)                     │
-│                                              │
-│ Enter select · n note · ↑/↓ move · Esc       │
-│                                              │
-╰──────────────────────────────────────────────╯",
-            "\
-| Space toggle · Enter next · ↑/↓ move · Esc   |
-+----------------------------------------------+",
-            "\
-│ Enter submit · ↑/↓ scroll · Esc              │
-╰──────────────────────────────────────────────╯",
-            "\
-│ Finish or clear the current prompt to answer · Esc cancel │
-╰──────────────────────────────────────────────╯",
-            "\
-╭─ Ask ────────────────────────────────────────╮
-│ Enter select · n note · ↑/↓ move · Esc       │
-╰──────────────────────────────────────────────╯
-╭── π > draft ─────────────────────────────────╮
-╰──────────────────────────────────────────────╯",
-            "\
-╭─ Ask ────────────────────────────────────────╮
-│ Finish or clear the current prompt to answer · Esc cancel │
-╰──────────────────────────────────────────────╯
-╭── π > draft ─────────────────────────────────╮
-╰──────────────────────────────────────────────╯",
-        ];
-        for (i, pane) in cases.iter().enumerate() {
-            assert_eq!(detect_omp_status(pane), Status::Waiting, "case {i}");
         }
     }
 
@@ -3422,30 +3432,6 @@ Final prose line.\n";
         ];
         for (name, pane) in cases {
             assert_eq!(detect_omp_status(pane), Status::Waiting, "case: {name}");
-        }
-    }
-
-    #[test]
-    fn test_detect_omp_status_selector_hint_without_approval() {
-        let box_ = "╭── π ─╮\n╰─ ─╯";
-        let cases = [
-            format!("Quoted UI:\nApprove and execute\nRefine plan\nSave and quit\ntab regions · esc cancel\n{box_}"),
-            format!("The instructions said: Enter select · n note\n{box_}"),
-            "╭── π  > approve and execute the migration ─╮\n│ then refine plan wording                    │\n╰─                                           ─╯".to_string(),
-            format!("Options were:\n> Approve and execute\nor Refine plan\n{box_}"),
-            format!("| > Approve and execute |\n|   Refine plan |\n|   Save and quit |\nPlan approved.\nrunning step 1\ndone\n{box_}"),
-            format!("I approve and execute\nthen refine plan things\n{box_}"),
-            format!("│ up/down navigate  enter select  esc cancel │\n{box_}"),
-            format!("│ up/down navigate  enter select  esc cancel │\nI will approve or deny later\n{box_}"),
-            format!("I would approve and execute refine plan steps\n{box_}"),
-            "╭── π > GPT-5.6 Sol ─╮\n│ Enter select · n note while documenting the UI │\n│ second draft line │\n╰──────────────────╯"
-                .to_string(),
-            "│ Enter submit · ↑/↓ scroll · current prompt to answer │\n╭── \u{f0d57} > ─╮"
-                .to_string(),
-            format!("press enter to select an option\n{box_}"),
-        ];
-        for pane in &cases {
-            assert_eq!(detect_omp_status(pane), Status::Idle, "case: {pane:?}");
         }
     }
 }

@@ -355,30 +355,25 @@ mod tests {
     }
 
     #[test]
-    fn parses_bearer_challenge_fields() {
-        let header = "Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\",scope=\"repository:agent-of-empires/aoe-sandbox:pull\"";
-        let c = parse_bearer_challenge(header).unwrap();
-        assert_eq!(c.realm, "https://ghcr.io/token");
-        assert_eq!(c.service.as_deref(), Some("ghcr.io"));
-        assert_eq!(
-            c.scope.as_deref(),
-            Some("repository:agent-of-empires/aoe-sandbox:pull")
-        );
-    }
-
-    #[test]
-    fn rejects_non_bearer_challenge() {
-        assert!(parse_bearer_challenge("Basic realm=\"x\"").is_none());
-    }
-
-    #[test]
-    fn strips_only_the_outer_quote_pair() {
-        let c = parse_bearer_challenge(
-            "Bearer realm=https://r.example/token,service=svc,scope=\"a\"b\"",
-        )
-        .unwrap();
-        assert_eq!(c.realm, "https://r.example/token");
-        assert_eq!(c.service.as_deref(), Some("svc"));
-        assert_eq!(c.scope.as_deref(), Some("a\"b"));
+    fn parses_only_bearer_challenges() {
+        let cases = [
+            (
+                "Bearer realm=\"https://ghcr.io/token\",service=\"ghcr.io\",scope=\"repository:agent-of-empires/aoe-sandbox:pull\"",
+                Some(("https://ghcr.io/token", Some("ghcr.io"), Some("repository:agent-of-empires/aoe-sandbox:pull"))),
+            ),
+            // Only the outer quote pair is stripped.
+            (
+                "Bearer realm=https://r.example/token,service=svc,scope=\"a\"b\"",
+                Some(("https://r.example/token", Some("svc"), Some("a\"b"))),
+            ),
+            ("Basic realm=\"x\"", None),
+        ];
+        for (header, expected) in cases {
+            let got = parse_bearer_challenge(header);
+            let got = got
+                .as_ref()
+                .map(|c| (c.realm.as_str(), c.service.as_deref(), c.scope.as_deref()));
+            assert_eq!(got, expected, "{header}");
+        }
     }
 }
