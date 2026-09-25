@@ -798,38 +798,23 @@ mod tests {
             .unwrap();
     }
 
+    /// Only tracked blobs are served: an untracked secret (#1810) and `.git`
+    /// internals both exist on disk but must 404.
     #[test]
-    fn unchanged_file_contents_serves_tracked_file() {
+    fn unchanged_file_contents_serves_only_tracked_blobs() {
         let (dir, _repo) = setup_test_repo();
-        let canonical = dir.path().join("test.txt").canonicalize().unwrap();
-        let out = compute_unchanged_file_contents(dir.path(), Path::new("test.txt"), &canonical)
-            .unwrap()
-            .expect("tracked file should be served");
-        assert_eq!(out.content, "line 1\nline 2\nline 3\n");
-        assert!(!out.is_binary);
-    }
-
-    #[test]
-    fn unchanged_file_contents_rejects_untracked_file() {
-        // A gitignored secret never committed: present on disk, not in HEAD, so
-        // the tracked-blob gate refuses it (returns None -> 404). See #1810.
-        let (dir, _repo) = setup_test_repo();
-        let secret = dir.path().join(".env");
-        fs::write(&secret, "API_KEY=supersecret\n").unwrap();
-        let canonical = secret.canonicalize().unwrap();
-        let out =
-            compute_unchanged_file_contents(dir.path(), Path::new(".env"), &canonical).unwrap();
-        assert!(out.is_none(), "untracked .env must not be served");
-    }
-
-    #[test]
-    fn unchanged_file_contents_rejects_git_internals() {
-        // `.git/config` lives inside the worktree but is not a tracked blob.
-        let (dir, _repo) = setup_test_repo();
-        let canonical = dir.path().join(".git/config").canonicalize().unwrap();
-        let out = compute_unchanged_file_contents(dir.path(), Path::new(".git/config"), &canonical)
-            .unwrap();
-        assert!(out.is_none(), ".git internals must not be served");
+        fs::write(dir.path().join(".env"), "API_KEY=supersecret\n").unwrap();
+        for (path, expected) in [
+            ("test.txt", Some("line 1\nline 2\nline 3\n")),
+            (".env", None),
+            (".git/config", None),
+        ] {
+            let canonical = dir.path().join(path).canonicalize().unwrap();
+            let out =
+                compute_unchanged_file_contents(dir.path(), Path::new(path), &canonical).unwrap();
+            assert_eq!(out.as_ref().map(|c| c.content.as_str()), expected, "{path}");
+            assert!(out.is_none_or(|c| !c.is_binary));
+        }
     }
 
     /// Pin a branch name, so `git init`'s default does not decide the test.
