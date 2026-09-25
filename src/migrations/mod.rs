@@ -5,6 +5,8 @@ mod config_file;
 pub mod progress;
 mod sessions_file;
 mod store_fs;
+#[cfg(test)]
+mod test_cases;
 mod v001_xdg_linux;
 mod v002_seed_sandbox_from_volumes;
 mod v003_yolo_mode_config;

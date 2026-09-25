@@ -50,7 +50,7 @@ async function installMocks(page: Page) {
   );
 }
 
-test("search jumps to a primary field on another tab and highlights it", async ({ page }) => {
+test("search jumps to a field on another tab, highlights it, and opens its Advanced fold", async ({ page }) => {
   await installMocks(page);
   await page.goto("/settings/sandbox");
 
@@ -70,12 +70,8 @@ test("search jumps to a primary field on another tab and highlights it", async (
   const target = page.locator('[data-settings-field="acp.show_tool_durations"]');
   await expect(target).toBeVisible();
   await expect(target).toHaveClass(/animate-settings-highlight/);
-});
 
-test("search opens the Advanced fold when the target field lives inside it", async ({ page }) => {
-  await installMocks(page);
-  await page.goto("/settings/sandbox");
-
+  // A target inside the Advanced fold opens it without a manual expand.
   await page.getByPlaceholder("Search settings...").fill("orphan");
   await page.getByTestId("settings-search-hit-acp-silent_orphan_grace_secs").click();
 

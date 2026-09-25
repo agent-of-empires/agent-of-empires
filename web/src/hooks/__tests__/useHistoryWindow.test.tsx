@@ -36,24 +36,16 @@ const render = (a: ActivityRow[], sid = "s1") =>
   });
 
 describe("useHistoryWindow", () => {
-  it("windows a long transcript and offers Load earlier", () => {
+  it("renders a short transcript whole, and windows a long one until loadEarlier shows it all", () => {
+    const short = transcript(3, 1); // 6 rows
+    const shortView = render(short).result;
+    expect(shortView.current.windowedActivity).toHaveLength(short.length);
+    expect(shortView.current.canLoadEarlier).toBe(false);
+
     const activity = transcript(100, 1); // 200 rows
     const { result } = render(activity);
     expect(result.current.windowedActivity.length).toBeLessThanOrEqual(DEFAULT_HISTORY_WINDOW);
-    expect(result.current.windowedActivity.length).toBeLessThan(activity.length);
     expect(result.current.canLoadEarlier).toBe(true);
-  });
-
-  it("renders everything and hides the control for a short transcript", () => {
-    const activity = transcript(3, 1); // 6 rows
-    const { result } = render(activity);
-    expect(result.current.windowedActivity).toHaveLength(activity.length);
-    expect(result.current.canLoadEarlier).toBe(false);
-  });
-
-  it("loadEarlier grows the window until the whole transcript shows", () => {
-    const activity = transcript(100, 1);
-    const { result } = render(activity);
     for (let i = 0; i < 5 && result.current.canLoadEarlier; i += 1) {
       act(() => result.current.loadEarlier());
     }
@@ -122,19 +114,6 @@ describe("useHistoryWindow", () => {
     const grown = result.current.windowedActivity.length;
     rerender({ sid: "s2", a: activity });
     expect(result.current.windowedActivity.length).toBeLessThan(grown);
-    expect(result.current.canLoadEarlier).toBe(true);
-  });
-
-  it("opens on the whole last turn when that turn is longer than the default window", () => {
-    const activity = transcript(5, 1); // 10 rows
-    activity.push({ id: "u-last", kind: "user_prompt", text: "the last prompt" });
-    for (let r = 0; r < DEFAULT_HISTORY_WINDOW + 200; r += 1) {
-      activity.push({ id: `t-${r}`, kind: "tool_complete", text: `tool ${r}` });
-    }
-    const { result } = render(activity);
-    const ids = result.current.windowedActivity.map((r) => r.id);
-    expect(ids[0]).toBe("u-last");
-    expect(ids).toHaveLength(DEFAULT_HISTORY_WINDOW + 201);
     expect(result.current.canLoadEarlier).toBe(true);
   });
 

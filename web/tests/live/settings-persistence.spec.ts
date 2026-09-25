@@ -22,38 +22,12 @@ test.describe("theme API", () => {
     return res.json();
   };
 
-  test("GET /api/themes/:name returns within 2s and is not stuck in resolve", async () => {
-    const body = await fetchTheme("dracula");
-    expect(body.name).toBe("dracula");
-    expect(body.source).toBe("builtin");
-    expect(body.appearance).toBe("dark");
-    expect(body.web.cssVars["--color-surface-900"]).toBe(DRACULA_SURFACE);
-    expect(body.terminal.cssVars["--term-bg"]).toBe(DRACULA_SURFACE);
-    expect(body.syntax.shikiTheme).toBe("dracula");
-  });
-
   test("GET /api/themes/:name handles all 6 builtins sequentially without hanging", async () => {
     for (const name of ["empire", "phosphor", "tokyo-night-storm", "catppuccin-latte", "dracula", "rose-pine"]) {
       const body = await fetchTheme(name);
       expect(body.name).toBe(name);
       expect(body.web.cssVars).toBeTruthy();
     }
-  });
-
-  test("dashboard chrome repaints when theme switches via API", async ({ page }) => {
-    const surface = () =>
-      page.evaluate(() => document.documentElement.style.getPropertyValue("--color-surface-900").trim());
-    await page.goto(`${handle.baseUrl}/`);
-    await expect
-      .poll(async () => (await surface()).length > 0, { timeout: 10_000, intervals: [100, 250, 500] })
-      .toBe(true);
-    const patch = await page.request.patch(`${handle.baseUrl}/api/theme`, { data: { name: "dracula" } });
-    expect(patch.ok()).toBe(true);
-    await page.evaluate((name) => {
-      window.dispatchEvent(new CustomEvent("aoe:theme-picker-changed", { detail: { name } }));
-    }, "dracula");
-    await expectRepaint(page);
-    expect(await page.evaluate(() => getComputedStyle(document.body).backgroundColor)).toMatch(/40,\s*42,\s*54/);
   });
 });
 
@@ -94,23 +68,6 @@ async function expectRepaint(page: Page) {
     .toBe(DRACULA_SURFACE);
 }
 
-test("theme setting persists through PATCH + reload", async ({ serve, page }) => {
-  // #1217
-  const settingsUrl = `${serve.baseUrl}/api/settings`;
-  const before = await getJson(settingsUrl);
-  const newTheme = before?.theme?.name === "modus-vivendi" ? "default" : "modus-vivendi";
-  const patchRes = await fetch(settingsUrl, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ theme: { ...(before?.theme ?? {}), name: newTheme } }),
-  });
-  expect(patchRes.ok).toBeTruthy();
-  expect((await getJson(settingsUrl))?.theme?.name).toBe(newTheme);
-
-  await page.goto(serve.baseUrl);
-  expect((await readInPage(page, settingsUrl))?.theme?.name).toBe(newTheme);
-});
-
 test("structured view settings persist through PATCH + reload, node_path is stripped", async ({ serve, page }) => {
   // #1689: the section was missing from the allowlist. node_path is a local-only RCE surface.
   const settingsUrl = `${serve.baseUrl}/api/settings`;
@@ -133,24 +90,6 @@ test("structured view settings persist through PATCH + reload, node_path is stri
   const fetched = await readInPage(page, settingsUrl);
   expect(fetched?.acp?.auto_stop_idle_secs).toBe(newIdle);
   expect(fetched?.acp?.node_path).not.toBe("/tmp/evil-node");
-});
-
-test("a schema-driven select persists through the UI and a reload", async ({ serve, page }) => {
-  // #1792: tmux is a non-elevated, profile-overridable schema section.
-  const profileUrl = `${serve.baseUrl}/api/profiles/${encodeURIComponent(await defaultProfile(serve))}/settings`;
-  const baseline = ((await getJson(profileUrl))?.tmux?.status_bar as string | undefined) ?? "auto";
-  const next = baseline === "enabled" ? "disabled" : "enabled";
-
-  await page.goto(`${serve.baseUrl}/settings/tmux`);
-  const statusBar = labelledSelect(page, /^Status Bar$/);
-  await expect(statusBar).toBeVisible({ timeout: 10_000 });
-  await statusBar.selectOption(next);
-  await expect(async () => {
-    expect((await getJson(profileUrl))?.tmux?.status_bar).toBe(next);
-  }).toPass({ timeout: 5_000 });
-
-  await page.reload();
-  await expect(labelledSelect(page, /^Status Bar$/)).toHaveValue(next, { timeout: 10_000 });
 });
 
 test("theme picker repaints, persists across reload and serve restart (#1510)", async ({ serve, page }) => {

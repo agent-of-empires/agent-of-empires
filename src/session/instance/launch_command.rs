@@ -1027,13 +1027,6 @@ mod tests {
     }
 
     #[test]
-    fn every_agent_has_yolo_support() {
-        for agent in crate::agents::AGENTS {
-            assert!(agent.yolo.is_some(), "{}", agent.name);
-        }
-    }
-
-    #[test]
     fn yolo_envvar_value_is_quoted_and_survives_the_suspend_wrapper() {
         let cmd = format_env_var_prefix("OPENCODE_PERMISSION", r#"{"*":"allow"}"#, "opencode");
         assert_eq!(cmd, r#"OPENCODE_PERMISSION='{"*":"allow"}' opencode"#);

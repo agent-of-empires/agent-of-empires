@@ -51,129 +51,33 @@ fn migrate_config_file(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-
-    fn write(content: &str) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(&path, content).unwrap();
-        (dir, path)
-    }
+    use crate::migrations::test_cases::assert_rewrites;
 
     #[test]
-    fn test_check_enabled_false_maps_to_off() {
-        let (_dir, path) = write(
-            r#"
-[updates]
-check_enabled = false
-check_interval_hours = 12
-"#,
+    fn maps_check_enabled_onto_update_check_mode() {
+        let no_updates = "[session]\ndefault_tool = \"claude\"\n";
+        let migrated = "[updates]\nupdate_check_mode = \"auto\"\n";
+        assert_rewrites(
+            "config.toml",
+            migrate_config_file,
+            &[
+                (
+                    Some("[updates]\ncheck_enabled = false\ncheck_interval_hours = 12\n"),
+                    Some("[updates]\ncheck_interval_hours = 12\nupdate_check_mode = \"off\"\n"),
+                ),
+                (
+                    Some("[updates]\ncheck_enabled = true\nauto_update = true\n"),
+                    Some("[updates]\nupdate_check_mode = \"notify\"\n"),
+                ),
+                (Some(migrated), Some(migrated)),
+                // An existing mode wins; the legacy flag is still dropped.
+                (
+                    Some("[updates]\nupdate_check_mode = \"auto\"\ncheck_enabled = false\n"),
+                    Some(migrated),
+                ),
+                (Some(no_updates), Some(no_updates)),
+                (None, None),
+            ],
         );
-        migrate_config_file(&path).unwrap();
-        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(result["updates"]["update_check_mode"].as_str(), Some("off"));
-        assert!(result["updates"]
-            .as_table()
-            .unwrap()
-            .get("check_enabled")
-            .is_none());
-        assert_eq!(
-            result["updates"]["check_interval_hours"].as_integer(),
-            Some(12)
-        );
-    }
-
-    #[test]
-    fn test_check_enabled_true_maps_to_notify() {
-        let (_dir, path) = write(
-            r#"
-[updates]
-check_enabled = true
-"#,
-        );
-        migrate_config_file(&path).unwrap();
-        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(
-            result["updates"]["update_check_mode"].as_str(),
-            Some("notify")
-        );
-    }
-
-    #[test]
-    fn test_auto_update_field_is_dropped() {
-        let (_dir, path) = write(
-            r#"
-[updates]
-check_enabled = true
-auto_update = true
-"#,
-        );
-        migrate_config_file(&path).unwrap();
-        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert!(result["updates"]
-            .as_table()
-            .unwrap()
-            .get("auto_update")
-            .is_none());
-    }
-
-    #[test]
-    fn test_already_migrated_is_idempotent() {
-        let (_dir, path) = write(
-            r#"
-[updates]
-update_check_mode = "auto"
-"#,
-        );
-        migrate_config_file(&path).unwrap();
-        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(
-            result["updates"]["update_check_mode"].as_str(),
-            Some("auto")
-        );
-    }
-
-    #[test]
-    fn test_existing_mode_wins_over_legacy_check_enabled() {
-        let (_dir, path) = write(
-            r#"
-[updates]
-update_check_mode = "auto"
-check_enabled = false
-"#,
-        );
-        migrate_config_file(&path).unwrap();
-        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(
-            result["updates"]["update_check_mode"].as_str(),
-            Some("auto")
-        );
-        assert!(result["updates"]
-            .as_table()
-            .unwrap()
-            .get("check_enabled")
-            .is_none());
-    }
-
-    #[test]
-    fn test_no_updates_section_is_noop() {
-        let (_dir, path) = write(
-            r#"
-[session]
-default_tool = "claude"
-"#,
-        );
-        migrate_config_file(&path).unwrap();
-        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(result["session"]["default_tool"].as_str(), Some("claude"));
-        assert!(result.get("updates").is_none());
-    }
-
-    #[test]
-    fn test_nonexistent_file_is_noop() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("nonexistent.toml");
-        migrate_config_file(&path).unwrap();
     }
 }

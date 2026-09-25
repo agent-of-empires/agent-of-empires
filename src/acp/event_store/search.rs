@@ -204,11 +204,8 @@ mod tests {
         let quick = store.search_content("QUICK", 10);
         assert_eq!(ids(&quick), ["s4"], "case-insensitive, one hit per session");
         assert_eq!(quick[0].match_count, 2);
-    }
 
-    #[test]
-    fn search_limit_caps_distinct_sessions_not_raw_rows() {
-        let (_tmp, store) = open_store(1000);
+        // The limit caps distinct sessions, not raw rows.
         record_from(
             &store,
             "s_busy",

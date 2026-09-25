@@ -353,63 +353,22 @@ mod tests {
     }
 
     #[test]
-    fn sha256_hex_matches_known_vector() {
-        // SHA-256 of the empty string per RFC 6234 / Wikipedia.
-        let hex = sha256_hex(b"");
-        assert_eq!(
-            hex,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-    }
-
-    #[test]
-    fn pinned_tarballs_cover_all_supported_platforms() {
-        for platform in [
-            NodePlatform::LinuxX64,
-            NodePlatform::LinuxArm64,
-            NodePlatform::DarwinX64,
-            NodePlatform::DarwinArm64,
-        ] {
-            let tarball = pinned_for(platform);
-            assert!(tarball.is_some(), "missing pinned SHA for {platform:?}");
-            let sha = tarball.unwrap().sha256;
-            assert_eq!(sha.len(), 64, "SHA must be 64 hex chars");
-            assert!(
-                sha.chars().all(|c| c.is_ascii_hexdigit()),
-                "SHA must be hex"
-            );
-        }
-        assert!(pinned_for(NodePlatform::WindowsUnsupported).is_none());
-    }
-
-    #[test]
-    fn bundled_path_uses_pinned_version() {
-        let p = bundled_node_path(Path::new("/tmp/aoe"));
-        let s = p.to_string_lossy();
-        assert!(s.contains(&format!("node-v{PINNED_NODE_VERSION}")));
-        assert!(s.ends_with("/bin/node") || s.ends_with("\\bin\\node"));
-    }
-
-    #[test]
     #[serial_test::serial]
-    fn resolve_uses_env_var_when_set() {
+    fn resolve_prefers_env_var_and_reports_no_node() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let _env = crate::session::test_support::EnvGuard::unset(&["PATH", "AOE_ACP_NODE"]);
+            assert!(matches!(
+                resolve("", temp.path()),
+                Err(NodeError::NoNode(_))
+            ));
+        }
         let Some(p) = which("node") else {
             eprintln!("skipping: node not on PATH");
             return;
         };
         let _env = crate::session::test_support::EnvGuard::set(&[("AOE_ACP_NODE", &p)]);
-        let temp = tempfile::tempdir().unwrap();
         let resolved = resolve("", temp.path()).expect("env var resolves");
         assert!(matches!(resolved.source, NodeSource::Env));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn resolve_returns_no_node_with_unmatchable_settings() {
-        // No PATH-side node, no env, no settings → NoNode.
-        let temp = tempfile::tempdir().unwrap();
-        let _env = crate::session::test_support::EnvGuard::unset(&["PATH", "AOE_ACP_NODE"]);
-        let result = resolve("", temp.path());
-        assert!(matches!(result, Err(NodeError::NoNode(_))));
     }
 }

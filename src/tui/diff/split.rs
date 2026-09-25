@@ -76,37 +76,32 @@ mod tests {
     }
 
     #[test]
-    fn context_appears_on_both_sides() {
-        let h = hunk(vec![dl(ChangeTag::Equal, Some(1), Some(1), "ctx")]);
-        let rows = build_split_rows(&h);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].left.unwrap().content, "ctx");
-        assert_eq!(rows[0].right.unwrap().content, "ctx");
-    }
-
-    #[test]
-    fn deletion_left_addition_right_when_paired() {
+    fn build_split_rows_pairs_changes_and_pads_the_shorter_side() {
+        use ChangeTag::{Delete, Equal, Insert};
+        // Context on both sides; a delete pairs with the insert beside it; an
+        // uneven block pads the shorter side with None.
         let h = hunk(vec![
-            dl(ChangeTag::Delete, Some(2), None, "old"),
-            dl(ChangeTag::Insert, None, Some(2), "new"),
+            dl(Equal, Some(1), Some(1), "ctx"),
+            dl(Delete, Some(2), None, "old"),
+            dl(Insert, None, Some(2), "new a"),
+            dl(Insert, None, Some(3), "new b"),
         ]);
-        let rows = build_split_rows(&h);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].left.unwrap().content, "old");
-        assert_eq!(rows[0].right.unwrap().content, "new");
-    }
-
-    #[test]
-    fn uneven_block_pads_shorter_side() {
-        let h = hunk(vec![
-            dl(ChangeTag::Delete, Some(2), None, "old"),
-            dl(ChangeTag::Insert, None, Some(2), "new a"),
-            dl(ChangeTag::Insert, None, Some(3), "new b"),
-        ]);
-        let rows = build_split_rows(&h);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].left.unwrap().content, "old");
-        assert!(rows[1].left.is_none());
-        assert_eq!(rows[1].right.unwrap().content, "new b");
+        let rows: Vec<(Option<&str>, Option<&str>)> = build_split_rows(&h)
+            .iter()
+            .map(|r| {
+                (
+                    r.left.map(|l| l.content.as_str()),
+                    r.right.map(|l| l.content.as_str()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (Some("ctx"), Some("ctx")),
+                (Some("old"), Some("new a")),
+                (None, Some("new b")),
+            ]
+        );
     }
 }

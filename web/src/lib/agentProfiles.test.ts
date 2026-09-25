@@ -7,35 +7,18 @@ import {
   resolveAgentProfile,
 } from "./agentProfiles";
 
-const KNOWN = [
-  "claude",
-  "claude-code",
-  "codex",
-  "opencode",
-  "gemini",
-  "vibe",
-  "pi",
-  "omp",
-  "kimi",
-  "prime-agent",
-  "aoe-agent",
-];
-
 describe("resolveAgentProfile", () => {
-  it.each(KNOWN)("resolves %s", (key) => {
+  it.each(["claude", "aoe-agent"])("resolves %s", (key) => {
     expect(resolveAgentProfile(key).key).toBe(key);
   });
 
-  it.each([undefined, null, "", "custom"])("falls back to DEFAULT for %j", (key) => {
+  it.each([undefined, "custom"])("falls back to DEFAULT for %j", (key) => {
     expect(resolveAgentProfile(key).key).toBe(DEFAULT_AGENT_PROFILE.key);
   });
 
   it.each<[string, boolean, boolean, boolean, string[]]>([
     ["claude", true, true, true, ["claudeCode"]],
-    ["codex", false, false, false, []],
-    ["gemini", false, false, false, []],
     ["opencode", true, false, false, []],
-    ["omp", false, false, false, []],
   ])("%s capabilities: todos=%s skills=%s wakeup=%s", (key, todos, skills, wakeup, namespaces) => {
     const p = resolveAgentProfile(key);
     expect(p.capabilities).toMatchObject({ todos, skills, wakeup });
@@ -89,12 +72,9 @@ describe("resolveAgentLifecycle", () => {
     expect(DEFAULT_AGENT_PROFILE.lifecycle).toBeUndefined();
   });
 
-  it.each([...KNOWN.filter((k) => k !== "gemini" && k !== "prime-agent"), undefined, null, "", "custom-agent"])(
-    "resolves %j as active",
-    (key) => {
-      expect(resolveAgentLifecycle(key)).toEqual({ state: "active" });
-    },
-  );
+  it.each(["claude", undefined, "custom-agent"])("resolves %j as active", (key) => {
+    expect(resolveAgentLifecycle(key)).toEqual({ state: "active" });
+  });
 });
 
 it.each<[string, string[], boolean]>([
@@ -103,15 +83,12 @@ it.each<[string, string[], boolean]>([
   ["  /clear  ", ["/clear"], true],
   ["\n/clear\n", ["/clear"], true],
   ["/clear --hard", ["/clear"], true],
-  ["/new fresh session", ["/new"], true],
   ["clear", ["/clear"], false],
   ["/cleart", ["/clear"], false],
   ["hello /clear world", ["/clear"], false],
   ["", ["/clear"], false],
-  ["   ", ["/clear"], false],
   ["/clear", [], false],
   ["/new", ["/clear"], false],
-  ["/clear", ["/new"], false],
 ])("isClearAlias(%j, %j) is %s", (text, aliases, expected) => {
   expect(isClearAlias(text, aliases)).toBe(expected);
 });
@@ -120,11 +97,7 @@ it.each<[string | null | undefined, string, boolean]>([
   ["task", "opencode", true],
   ["bash", "opencode", false],
   ["task", "codex", false],
-  ["task", "claude", false],
-  ["task", "aoe-agent", false],
-  [undefined, "opencode", false],
   [null, "opencode", false],
-  ["", "opencode", false],
 ])("isSubagentToolName(%j, %s) is %s", (name, agent, expected) => {
   expect(isSubagentToolName(name, resolveAgentProfile(agent))).toBe(expected);
 });

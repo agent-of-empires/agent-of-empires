@@ -571,24 +571,6 @@ mod tests {
         snap
     }
 
-    /// A transcript that never appears means different things per
-    /// [`TailerStart`]: the SDK failing to write one for a live launch is a
-    /// real error, while a launch resumed after a daemon restart whose
-    /// transcript has since been cleaned up is lost tracking, and reporting
-    /// that as `Error` would show a sub-agent that very likely finished fine
-    /// as failed.
-    #[test]
-    fn a_missing_transcript_is_an_error_only_for_a_live_launch() {
-        assert_eq!(
-            missing_transcript_outcome(TailerStart::Live).0,
-            BackgroundAgentStatus::Error
-        );
-        assert_eq!(
-            missing_transcript_outcome(TailerStart::Resumed).0,
-            BackgroundAgentStatus::Detached
-        );
-    }
-
     /// A second `spawn_tailer` for an id already in the active set must not
     /// spawn a competing tailer against the same transcript.
     #[tokio::test]
@@ -641,56 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_tracks_tools_results_text_and_end_turn() {
-        let snap = folded(&[
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls -la","description":"list"}}]}}"#,
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"src/main.rs"}}]}}"#,
-            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false}]}}"#,
-            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":true}]}}"#,
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working on it"}]}}"#,
-        ]);
-        let tools: Vec<_> = snapshot_tools(&snap)
-            .into_iter()
-            .map(|t| (t.name, t.title, t.ok))
-            .collect();
-        assert_eq!(
-            tools,
-            [
-                ("Bash".into(), Some("ls -la".into()), Some(true)),
-                ("Read".into(), Some("src/main.rs".into()), Some(false)),
-            ]
-        );
-        assert_eq!(snap.tool_count, 2);
-        assert_eq!(snap.last_tool.as_deref(), Some("Read"));
-        assert_eq!(snap.last_text.as_deref(), Some("working on it"));
-        assert!(!snap.done);
-
-        let snap = folded(&[
-            r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"final answer"}]}}"#,
-        ]);
-        assert!(snap.done);
-        assert_eq!(snap.result.as_deref(), Some("final answer"));
-
-        let snap = folded(&[
-            r#"{"type":"user","message":{"content":"prompt"}}"#,
-            r#"{"attachment":{"type":"skill_listing"}}"#,
-        ]);
-        assert!(snap.tool_count == 0 && !snap.done && !snap.parsed_any);
-        assert!(format_warning(&snap).is_none());
-
-        let snap = folded(&["not json at all"]);
-        assert_eq!(snap.parse_errors, 1);
-        assert!(
-            format_warning(&snap).is_some(),
-            "an unreadable format is surfaced"
-        );
-
-        let long = preview(&"x".repeat(TEXT_PREVIEW_CHARS + 50));
-        assert!(long.ends_with('…') && long.chars().count() <= TEXT_PREVIEW_CHARS + 1);
-    }
-
-    #[test]
-    fn infer_idle_outcome_distinguishes_finished_from_hung() {
+    fn fold_and_idle_outcome_track_transcript_progress() {
         // (lines, expected status, expected result, warning substring, case)
         let cases = vec![
             (
@@ -756,5 +689,61 @@ mod tests {
         assert!(snap.tools.iter().all(|t| t.ok.is_some()));
         assert_eq!(snap.tool_count as usize, MAX_TOOLS + 1);
         assert_eq!(infer_idle_outcome(&snap).0, BackgroundAgentStatus::Stalled);
+
+        // A missing transcript is an error only for a live launch; a resumed one lost tracking.
+        assert_eq!(
+            missing_transcript_outcome(TailerStart::Live).0,
+            BackgroundAgentStatus::Error
+        );
+        assert_eq!(
+            missing_transcript_outcome(TailerStart::Resumed).0,
+            BackgroundAgentStatus::Detached
+        );
+
+        let snap = folded(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls -la","description":"list"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"src/main.rs"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":false}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":true}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working on it"}]}}"#,
+        ]);
+        let tools: Vec<_> = snapshot_tools(&snap)
+            .into_iter()
+            .map(|t| (t.name, t.title, t.ok))
+            .collect();
+        assert_eq!(
+            tools,
+            [
+                ("Bash".into(), Some("ls -la".into()), Some(true)),
+                ("Read".into(), Some("src/main.rs".into()), Some(false)),
+            ]
+        );
+        assert_eq!(snap.tool_count, 2);
+        assert_eq!(snap.last_tool.as_deref(), Some("Read"));
+        assert_eq!(snap.last_text.as_deref(), Some("working on it"));
+        assert!(!snap.done);
+
+        let snap = folded(&[
+            r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"final answer"}]}}"#,
+        ]);
+        assert!(snap.done);
+        assert_eq!(snap.result.as_deref(), Some("final answer"));
+
+        let snap = folded(&[
+            r#"{"type":"user","message":{"content":"prompt"}}"#,
+            r#"{"attachment":{"type":"skill_listing"}}"#,
+        ]);
+        assert!(snap.tool_count == 0 && !snap.done && !snap.parsed_any);
+        assert!(format_warning(&snap).is_none());
+
+        let snap = folded(&["not json at all"]);
+        assert_eq!(snap.parse_errors, 1);
+        assert!(
+            format_warning(&snap).is_some(),
+            "an unreadable format is surfaced"
+        );
+
+        let long = preview(&"x".repeat(TEXT_PREVIEW_CHARS + 50));
+        assert!(long.ends_with('…') && long.chars().count() <= TEXT_PREVIEW_CHARS + 1);
     }
 }

@@ -777,50 +777,68 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn stored_and_pinned_ids_are_reused() {
-        for (tool, stored, intent, expected) in [
+    fn acquire_reuses_stored_and_pinned_ids_unless_cleared() {
+        // (tool, stored, intent, reused id, or whether a cleared launch mints a fresh one)
+        for (tool, stored, intent, reused, mints) in [
             (
                 "opencode",
                 Some("oc-session-42"),
                 ResumeIntent::Default,
-                "oc-session-42",
+                Some("oc-session-42"),
+                false,
             ),
-            ("codex", Some("sess-99"), ResumeIntent::Default, "sess-99"),
+            (
+                "codex",
+                Some("sess-99"),
+                ResumeIntent::Default,
+                Some("sess-99"),
+                false,
+            ),
             (
                 "claude",
                 None,
                 ResumeIntent::Use("user-pinned".into()),
-                "user-pinned",
+                Some("user-pinned"),
+                false,
             ),
             (
                 "claude",
                 Some("observed"),
                 ResumeIntent::Use("user-pinned".into()),
-                "user-pinned",
+                Some("user-pinned"),
+                false,
+            ),
+            (
+                "claude",
+                Some("observed"),
+                ResumeIntent::Cleared,
+                None,
+                true,
+            ),
+            (
+                "opencode",
+                Some("observed"),
+                ResumeIntent::Cleared,
+                None,
+                false,
             ),
         ] {
             let mut inst = tool_instance(tool, "/tmp/x");
             inst.agent_session_id = stored.map(str::to_string);
             inst.resume_intent = intent;
-            assert_eq!(
-                inst.acquire_session_id(None),
-                (Some(expected.to_string()), true),
-                "{tool}"
-            );
-            assert_eq!(inst.agent_session_id.as_deref(), Some(expected));
+            let (sid, existing) = inst.acquire_session_id(None);
+            match reused {
+                Some(id) => assert_eq!((sid.as_deref(), existing), (Some(id), true), "{tool}"),
+                None if mints => {
+                    assert!(
+                        sid.is_some() && sid.as_deref() != stored && !existing,
+                        "{tool}"
+                    )
+                }
+                None => assert_eq!((sid.as_deref(), existing), (None, false), "{tool}"),
+            }
+            assert_eq!(inst.agent_session_id, sid, "{tool}");
         }
-    }
-
-    #[test]
-    fn claude_resume_flags_follow_is_existing() {
-        assert_eq!(
-            build_resume_flags("claude", "some-id", true),
-            "--resume some-id"
-        );
-        assert_eq!(
-            build_resume_flags("claude", "some-id", false),
-            "--session-id some-id"
-        );
     }
 
     #[test]
@@ -1065,22 +1083,6 @@ work-opencode = "opencode"
             shared.resolved_session_support().is_none(),
             "an unscoped store cannot be claimed through detect_as"
         );
-    }
-    #[test]
-    fn cleared_intent_launches_fresh() {
-        let mut claude = tool_instance("claude", "/tmp/x");
-        claude.agent_session_id = Some("observed".to_string());
-        claude.resume_intent = ResumeIntent::Cleared;
-        let (sid, is_existing) = claude.acquire_session_id(None);
-        assert!(sid.is_some() && !is_existing);
-        assert_ne!(sid.as_deref(), Some("observed"));
-        assert_eq!(claude.agent_session_id, sid);
-
-        let mut opencode = tool_instance("opencode", "/tmp/x");
-        opencode.agent_session_id = Some("observed".to_string());
-        opencode.resume_intent = ResumeIntent::Cleared;
-        assert_eq!(opencode.acquire_session_id(None), (None, false));
-        assert_eq!(opencode.agent_session_id, None);
     }
 
     #[test]

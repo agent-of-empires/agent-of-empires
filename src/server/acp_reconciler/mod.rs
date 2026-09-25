@@ -485,6 +485,21 @@ mod tests {
         let msg = park_message(&std::env::temp_dir().to_string_lossy());
         assert!(!msg.contains("project path no longer exists"));
         assert!(msg.contains("Retry from the dashboard"));
+
+        use crate::acp::supervisor::SupervisorError;
+        use crate::server::api::structured_spawn_error_message;
+
+        let capacity = SupervisorError::CapacityFull {
+            current: 1,
+            limit: 1,
+        };
+        let msg = structured_spawn_error_message(&capacity, "claude-code");
+        assert!(msg.contains("capacity full") && msg.contains("max_concurrent_workers"));
+        assert!(!msg.contains("Failed to start structured view agent"));
+
+        let generic = SupervisorError::UnknownAgent("bogus".to_string());
+        assert!(structured_spawn_error_message(&generic, "bogus")
+            .contains("Failed to start structured view agent"));
     }
 
     #[test]
@@ -550,35 +565,25 @@ mod tests {
     }
 
     /// CapacityFull re-arms instead of pinning (a restart would hide a stuck
-    /// id), never parks, and publishes its banner once across ticks.
+    /// id), never parks, keeps prior crash history, and publishes its banner
+    /// once across ticks.
     #[tokio::test]
     #[serial_test::serial]
     async fn capacity_deferred_rearms_and_publishes_once() {
         let (_home, state, _project) = test_state("s-cap");
         state.acp_supervisor.test_insert_worker("occupant").await;
         let mut tick = Tick::default();
+        let now = Instant::now();
+        tick.respawn_history
+            .insert("s-cap".to_string(), vec![now, now]);
         for _ in 0..3 {
             tick.run(&state).await;
             assert!(!tick.attempted.contains("s-cap"));
             assert!(tick.capacity_deferred.contains("s-cap"));
             assert!(!tick.parked.contains("s-cap"));
         }
+        assert_eq!(tick.respawn_history.get("s-cap").map(Vec::len), Some(2));
         assert_eq!(capacity_startup_errors(&state, "s-cap"), 1);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn capacity_deferred_pop_preserves_prior_crash_history() {
-        let (_home, state, _project) = test_state("s-hist");
-        state.acp_supervisor.test_insert_worker("occupant").await;
-        let now = Instant::now();
-        let mut tick = Tick::default();
-        tick.respawn_history
-            .insert("s-hist".to_string(), vec![now, now]);
-
-        tick.run(&state).await;
-
-        assert_eq!(tick.respawn_history.get("s-hist").map(Vec::len), Some(2));
     }
 
     /// The capacity marker clears both when a slot frees (the SpawnFinished
@@ -606,24 +611,6 @@ mod tests {
             );
             assert_eq!(capacity_startup_errors(&state, id), 1);
         }
-    }
-
-    #[test]
-    fn structured_spawn_error_message_prefers_capacity_display_over_generic() {
-        use crate::acp::supervisor::SupervisorError;
-        use crate::server::api::structured_spawn_error_message;
-
-        let capacity = SupervisorError::CapacityFull {
-            current: 1,
-            limit: 1,
-        };
-        let msg = structured_spawn_error_message(&capacity, "claude-code");
-        assert!(msg.contains("capacity full") && msg.contains("max_concurrent_workers"));
-        assert!(!msg.contains("Failed to start structured view agent"));
-
-        let generic = SupervisorError::UnknownAgent("bogus".to_string());
-        assert!(structured_spawn_error_message(&generic, "bogus")
-            .contains("Failed to start structured view agent"));
     }
 
     /// Wake-on-drain: a dormant session with a queue must be woken, or its

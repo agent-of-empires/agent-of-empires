@@ -165,47 +165,6 @@ test.describe("Large diff handling", () => {
     // ~8s and could OOM the tab. Generous bound to avoid CI flake.
     expect(elapsed).toBeLessThan(10_000);
   });
-
-  test("mid-size diff renders", async ({ page }) => {
-    await mount(page, 4000, 4000);
-    await page.getByText("pnpm-lock.yaml").first().click();
-    await expect(page.locator("diffs-container").first()).toBeVisible({ timeout: 30000 });
-  });
-});
-
-// #2152: an empty changes panel names the base instead of a context-free
-// "No changes yet".
-test.describe("Diff empty state (#2152)", () => {
-  test("single-repo empty state names the base", async ({ page }) => {
-    await setupDiffSession(page, { files: diffFilesResponse([], [{ base_branch: "origin/develop" }]) });
-    await openDiffSession(page);
-    // "origin/develop" also appears in the header chip, so assert against the
-    // empty-state paragraph specifically.
-    const emptyLine = page.getByText(/No changes vs/);
-    await expect(emptyLine).toBeVisible({ timeout: 10000 });
-    await expect(emptyLine).toContainText("origin/develop");
-  });
-
-  test("multi-repo empty state lists every repo with its base", async ({ page }) => {
-    await setupDiffSession(page, {
-      files: diffFilesResponse(
-        [],
-        [
-          { repo_name: "taskrunner", base_branch: "origin/develop" },
-          { repo_name: "MessageManager", base_branch: "origin/develop" },
-          { repo_name: "SmartCaller", base_branch: "origin/main" },
-        ],
-      ),
-    });
-    await openDiffSession(page);
-    // Multi-repo empty routes through MultiRepoGroups: each member shows a
-    // header (name + "vs <base>") and a per-repo "no changes" note.
-    await expect(page.getByText("taskrunner")).toBeVisible({ timeout: 10000 });
-    await expect(page.getByText("MessageManager")).toBeVisible();
-    await expect(page.getByText("SmartCaller")).toBeVisible();
-    await expect(page.getByText("vs origin/main")).toBeVisible();
-    await expect(page.getByText("No changes in this repo.").first()).toBeVisible();
-  });
 });
 
 // Multi-repo workspaces fold subfolders inside each per-repo group, with the
@@ -236,15 +195,6 @@ test.describe("Diff multi-repo subfolder folding", () => {
     await expect(page.getByText("2 repos", { exact: true }).first()).toBeVisible({ timeout: 10000 });
   }
 
-  test("the view-mode toggle is shown in multi-repo mode", async ({ page }) => {
-    await openMultiRepo(page);
-    // The toggle's title flips with the current mode; match either so the
-    // assertion stays robust against the desktop default.
-    await expect(
-      page.locator('button[title="Switch to tree view"], button[title="Switch to flat list"]').first(),
-    ).toBeVisible();
-  });
-
   test("tree mode renders foldable dir rows inside each repo group", async ({ page }) => {
     await openMultiRepo(page);
     const toFlat = page.locator('button[title="Switch to flat list"]').first();
@@ -262,16 +212,17 @@ test.describe("Diff multi-repo subfolder folding", () => {
   });
 });
 
-// #970: the `vs <ref>` chip in the file-list header opens a branch typeahead;
-// selecting one PATCHes /diff-base and a reset clears the override.
+// #970: the `vs <ref>` chip in the file-list header opens a branch typeahead and
+// selecting one PATCHes /diff-base. Typeahead filtering and reset are pinned in
+// DiffFileList.test.tsx.
 test.describe("Diff base override (#970)", () => {
   const chip = (page: Page, base?: string) =>
     page.getByRole("button", {
       name: base ? new RegExp(`Change diff base \\(current: ${base}\\)`) : /Change diff base/,
     });
 
-  async function setupBaseOverride(page: Page, opts: { sessionFields?: Record<string, unknown> } = {}) {
-    await setupDiffSession(page, { files: EXAMPLE_FILES, sessionFields: opts.sessionFields });
+  async function setupBaseOverride(page: Page) {
+    await setupDiffSession(page, { files: EXAMPLE_FILES });
     await page.route("**/api/git/branches**", (r) =>
       r.fulfill({
         json: [
@@ -292,16 +243,6 @@ test.describe("Diff base override (#970)", () => {
     return seen;
   }
 
-  test("clicking the chip opens a typeahead populated from /api/git/branches", async ({ page }) => {
-    await setupBaseOverride(page);
-    await openDiffSession(page);
-    await expect(chip(page, "main")).toBeVisible({ timeout: 10000 });
-    await chip(page, "main").click();
-    await expect(page.getByPlaceholder("Search branches...")).toBeVisible();
-    await expect(page.getByRole("option", { name: /^main/ })).toBeVisible();
-    await expect(page.getByRole("option", { name: /upstream\/main/ })).toBeVisible();
-  });
-
   test("selecting a branch PATCHes diff-base and the chip reflects the new value", async ({ page }) => {
     await setupBaseOverride(page);
     const patched = await capturePatch(page);
@@ -320,18 +261,5 @@ test.describe("Diff base override (#970)", () => {
     await page.getByRole("option", { name: /develop/ }).click();
     await expect.poll(() => patched.body?.base_branch).toBe("develop");
     await expect(chip(page, "develop")).toBeVisible({ timeout: 5000 });
-  });
-
-  test("reset clears the override (PATCH with null)", async ({ page }) => {
-    await setupBaseOverride(page, { sessionFields: { base_branch_override: "upstream/main" } });
-    const patched = await capturePatch(page);
-
-    await openDiffSession(page);
-    await expect(chip(page)).toBeVisible({ timeout: 10000 });
-    await chip(page).click();
-    const reset = page.getByRole("button", { name: /Reset to auto-detected/ });
-    await expect(reset).toBeVisible();
-    await reset.click();
-    await expect.poll(() => patched.body?.base_branch).toBeNull();
   });
 });

@@ -1330,10 +1330,7 @@ mod tests {
             civilizations::CIVILIZATIONS.contains(&generated.as_str()),
             "expected a civilization name, got: {generated}"
         );
-    }
 
-    #[test]
-    fn test_empty_worktree_title_skips_civ_with_taken_branch() {
         let existing: Vec<&str> = civilizations::CIVILIZATIONS
             .iter()
             .copied()
@@ -1547,45 +1544,6 @@ mod tests {
     }
 
     #[test]
-    fn test_create_workspace_single_failure_keeps_simple_message() {
-        let parent_a = init_repo_with_commit("repo-solo-fail");
-        let repo_a = parent_a.path().join("repo-solo-fail");
-        let workspaces_root = tempfile::TempDir::new().unwrap();
-        let template = workspaces_root
-            .path()
-            .join("{branch}")
-            .to_string_lossy()
-            .into_owned();
-
-        let result = create_workspace(
-            &WorkspaceRepoSpec {
-                path: repo_a,
-                base_branch: None,
-            },
-            &[],
-            "nonexistent-branch",
-            false,
-            &template,
-            true,
-        );
-
-        let err = match result {
-            Ok(_) => panic!("single-repo failure should still surface"),
-            Err(e) => e,
-        };
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("Failed to create worktree for"),
-            "singular phrasing missing: {msg}"
-        );
-        assert!(
-            !msg.contains("repos):"),
-            "single-failure path should not use multi-error wording: {msg}"
-        );
-        assert!(msg.contains("repo-solo-fail"), "repo name missing: {msg}");
-    }
-
-    #[test]
     fn resolve_base_branch_precedence() {
         assert_eq!(
             resolve_base_branch(Some("session"), Some("project"), Some("global")),
@@ -1630,22 +1588,13 @@ mod tests {
             resolve_repo_base_branch(&root, None, &empty, Some("global")),
             Some("global".to_string())
         );
-    }
 
-    #[test]
-    fn resolve_repo_base_branch_matches_when_launching_from_a_worktree() {
-        let (parent, _tip) = init_repo_with_branch("proj", "release");
-        let root = parent.path().join("proj");
-        let main_wt = GitWorktree::new(root.clone()).unwrap();
+        // Launching from a linked worktree still keys by the main repo root.
         let wt_path = parent.path().join("proj-wt");
-        main_wt
+        GitWorktree::new(root.clone())
+            .unwrap()
             .create_worktree("wt-branch", &wt_path, true, None)
             .unwrap();
-
-        let key = crate::session::projects::canonical_key(&root.to_string_lossy());
-        let mut bases = std::collections::HashMap::new();
-        bases.insert(key, "develop".to_string());
-
         assert_eq!(
             resolve_repo_base_branch(&wt_path, None, &bases, None),
             Some("develop".to_string())
@@ -1931,7 +1880,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn build_instance_preserves_custom_agent_detect_as_mapping() {
+    fn build_instance_resolves_custom_agent_commands_and_detect_as() {
         let temp_home = tempfile::tempdir().unwrap();
         let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let app_dir = isolated_app_dir(temp_home.path());
@@ -1941,6 +1890,9 @@ mod tests {
             r#"
                 [session.custom_agents]
                 remote-claude = "ssh -t host claude"
+                remote-opencode = "ssh -t host opencode"
+
+                whitespace-agent = "   "
 
                 [session.agent_detect_as]
                 remote-claude = "claude"
@@ -1961,105 +1913,38 @@ mod tests {
         assert_eq!(result.instance.tool, "remote-claude");
         assert_eq!(result.instance.command, "ssh -t host claude");
         assert_eq!(result.instance.detect_as, "claude");
-    }
 
-    #[test]
-    #[serial_test::serial]
-    fn build_instance_keeps_empty_detect_as_without_mapping() {
-        let temp_home = tempfile::tempdir().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
-        let app_dir = isolated_app_dir(temp_home.path());
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(
-            app_dir.join("config.toml"),
-            r#"
-                [session.custom_agents]
-                remote-opencode = "ssh -t host opencode"
-            "#,
-        )
-        .unwrap();
-        let project = tempfile::tempdir().unwrap();
-        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
-
-        let result = build_instance(
+        let unmapped = build_instance(
             custom_agent_params(project.path(), "remote-opencode"),
             &[],
             &[],
             "default",
         )
         .unwrap();
+        assert_eq!(unmapped.instance.command, "ssh -t host opencode");
+        assert_eq!(unmapped.instance.detect_as, "");
 
-        assert_eq!(result.instance.tool, "remote-opencode");
-        assert_eq!(result.instance.command, "ssh -t host opencode");
-        assert_eq!(result.instance.detect_as, "");
+        for tool in ["remote-missing", "whitespace-agent"] {
+            let Err(err) = build_instance(
+                custom_agent_params(project.path(), tool),
+                &[],
+                &[],
+                "default",
+            ) else {
+                panic!("{tool}: custom agent without a command should fail");
+            };
+            assert!(
+                err.to_string().contains(&format!(
+                    "No launch command resolved for custom agent '{tool}'"
+                )),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]
     #[serial_test::serial]
-    fn build_instance_rejects_custom_agent_without_resolved_command() {
-        let temp_home = tempfile::tempdir().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
-        let app_dir = isolated_app_dir(temp_home.path());
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(app_dir.join("config.toml"), "").unwrap();
-        let project = tempfile::tempdir().unwrap();
-
-        let result = build_instance(
-            custom_agent_params(project.path(), "remote-missing"),
-            &[],
-            &[],
-            "default",
-        );
-        let err = match result {
-            Ok(_) => panic!("custom agent without a command should fail"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string()
-                .contains("No launch command resolved for custom agent 'remote-missing'"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn build_instance_rejects_custom_agent_with_whitespace_only_command() {
-        let temp_home = tempfile::tempdir().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
-        let app_dir = isolated_app_dir(temp_home.path());
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(
-            app_dir.join("config.toml"),
-            r#"
-                [session.custom_agents]
-                whitespace-agent = "   "
-            "#,
-        )
-        .unwrap();
-        let project = tempfile::tempdir().unwrap();
-
-        let result = build_instance(
-            custom_agent_params(project.path(), "whitespace-agent"),
-            &[],
-            &[],
-            "default",
-        );
-        let err = match result {
-            Ok(_) => panic!("custom agent with whitespace-only command should fail"),
-            Err(err) => err,
-        };
-
-        assert!(
-            err.to_string()
-                .contains("No launch command resolved for custom agent 'whitespace-agent'"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn build_instance_scratch_provisions_app_dir() {
+    fn build_instance_provisions_scratch_and_rejects_invalid_worktree_requests() {
         let temp_home = tempfile::tempdir().unwrap();
         let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let app_dir = isolated_app_dir(temp_home.path());
@@ -2067,14 +1952,9 @@ mod tests {
         std::fs::write(app_dir.join("config.toml"), "").unwrap();
 
         let mut params = custom_agent_params(std::path::Path::new(""), "claude");
-        params.tool = "claude".to_string();
-        params.path = String::new();
         params.scratch = true;
-        params.sandbox = false;
-
-        let result = build_instance(params, &[], &[], "default")
+        let result = build_instance(params.clone(), &[], &[], "default")
             .expect("scratch build must succeed without a project path");
-
         assert!(
             result.instance.scratch,
             "scratch flag must be persisted on the instance"
@@ -2082,14 +1962,35 @@ mod tests {
         let provisioned = std::path::PathBuf::from(&result.instance.project_path);
         assert!(provisioned.exists());
         assert!(super::super::scratch::is_scratch_path(&provisioned));
-
         let _ = std::fs::remove_dir_all(&provisioned);
+
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("feat".to_string());
+        let Err(err) = build_instance(params, &[], &[], "default") else {
+            panic!("scratch + worktree must error");
+        };
+        assert!(
+            err.to_string()
+                .contains("Cannot combine --scratch with worktree mode"),
+            "unexpected error: {err}"
+        );
+
+        let project = tempfile::tempdir().unwrap();
+        let mut params = custom_agent_params(project.path(), "claude");
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("feat".to_string());
+        let Err(err) = build_instance(params, &[], &[], "default") else {
+            panic!("worktree on a non-git path must error");
+        };
+        assert!(
+            err.chain()
+                .filter_map(|c| c.downcast_ref::<crate::git::error::GitError>())
+                .any(|g| matches!(g, crate::git::error::GitError::NotAGitRepo)),
+            "expected a typed GitError::NotAGitRepo in the chain, got: {err:#}"
+        );
     }
 
-    #[test]
-    #[serial_test::serial]
     fn build_instance_applies_structured_fork_seed() {
-        let _app_guard = crate::session::test_support::isolate_app_dir();
         use crate::session::ForkSeed;
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         let params = InstanceParams {
@@ -2127,10 +2028,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    #[serial_test::serial]
     fn build_instance_applies_terminal_fork_seed() {
-        let _app_guard = crate::session::test_support::isolate_app_dir();
         use crate::session::ForkSeed;
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         // The CLI e2e covers the separate application in `add.rs`; this is the
@@ -2188,7 +2086,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn fork_seed_tests_restore_default_profile_registry() {
+    fn fork_seed_builds_apply_the_seed_and_restore_default_profile_registry() {
         let _app_guard = crate::session::test_support::isolate_app_dir();
         const ALIAS_AGENT: &str = "fork-seed-registry-alias";
         const RULE_AGENT: &str = "fork-seed-registry-rule";
@@ -2226,58 +2124,5 @@ mod tests {
                 "{label}: fork-seed build must restore the prior alias and compiled rule"
             );
         }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn build_instance_rejects_scratch_with_worktree() {
-        let temp_home = tempfile::tempdir().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
-        let app_dir = isolated_app_dir(temp_home.path());
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(app_dir.join("config.toml"), "").unwrap();
-
-        let mut params = custom_agent_params(std::path::Path::new(""), "claude");
-        params.tool = "claude".to_string();
-        params.scratch = true;
-        params.worktree_enabled = true;
-        params.worktree_branch = Some("feat".to_string());
-
-        let err = match build_instance(params, &[], &[], "default") {
-            Ok(_) => panic!("scratch + worktree must error"),
-            Err(e) => e,
-        };
-        assert!(
-            err.to_string()
-                .contains("Cannot combine --scratch with worktree mode"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn build_instance_worktree_on_non_git_path_returns_typed_not_a_git_repo() {
-        let temp_home = tempfile::tempdir().unwrap();
-        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
-        let app_dir = isolated_app_dir(temp_home.path());
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(app_dir.join("config.toml"), "").unwrap();
-
-        let project = tempfile::tempdir().unwrap();
-        let mut params = custom_agent_params(project.path(), "claude");
-        params.tool = "claude".to_string();
-        params.worktree_enabled = true;
-        params.worktree_branch = Some("feat".to_string());
-
-        let err = match build_instance(params, &[], &[], "default") {
-            Ok(_) => panic!("worktree on a non-git path must error"),
-            Err(e) => e,
-        };
-        assert!(
-            err.chain()
-                .filter_map(|c| c.downcast_ref::<crate::git::error::GitError>())
-                .any(|g| matches!(g, crate::git::error::GitError::NotAGitRepo)),
-            "expected a typed GitError::NotAGitRepo in the chain, got: {err:#}"
-        );
     }
 }

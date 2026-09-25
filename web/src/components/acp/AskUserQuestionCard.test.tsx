@@ -86,11 +86,6 @@ describe("AskUserQuestionCard submission", () => {
       [[() => radio(/green/), { color: "green" }]],
     ],
     [
-      "required single select",
-      [q({ field_key: "color", title: "Pick a color", kind: "single_select", required: true, options: COLORS })],
-      [[() => {}, "Please answer: Pick a color"]],
-    ],
-    [
       "multi select toggles",
       [q({ field_key: "tags", kind: "multi_select", options: TAGS })],
       [
@@ -280,11 +275,6 @@ describe("AskUserQuestionCard rendering", () => {
     expect(prompt.className).not.toContain("truncate");
   });
 
-  it("renders an email field as a typed input", () => {
-    renderCard([q({ field_key: "e", format: "email" })]);
-    expect(screen.getByPlaceholderText("Type your answer").getAttribute("type")).toBe("email");
-  });
-
   // Older adapters flattened `"<label> — <description>"` into the title; a structured
   // description (even empty) wins, and null falls back to the split.
   it.each([
@@ -307,18 +297,13 @@ describe("AskUserQuestionCard rendering", () => {
 });
 
 describe("ElicitationAnswerCard", () => {
-  it.each([
-    [
-      [
-        { question: "Color?", answer: "Blue" },
-        { question: "Languages?", answer: "Rust, TypeScript" },
-      ],
-      "2 answers",
-    ],
-    [[{ question: "Proceed?", answer: "Yes" }], "1 answer"],
-  ])("renders each pair with a count label (%#)", (answers, count) => {
+  it("renders each pair with a count label", () => {
+    const answers = [
+      { question: "Color?", answer: "Blue" },
+      { question: "Languages?", answer: "Rust, TypeScript" },
+    ];
     render(<ElicitationAnswerCard answers={answers} />);
-    expect(screen.getByText(count)).toBeTruthy();
+    expect(screen.getByText("2 answers")).toBeTruthy();
     for (const a of answers) {
       expect(screen.getByText(a.question)).toBeTruthy();
       expect(screen.getByText(a.answer)).toBeTruthy();

@@ -366,10 +366,6 @@ mod tests {
                 "`{name}` is not an identifier-safe token"
             );
         }
-    }
-
-    #[test]
-    fn hidden_commands_are_not_named() {
         let cli = Cli::try_parse_from(["aoe", "__extract-session-id"]).expect("parse");
         assert_eq!(command_name(cli.command.as_ref().expect("command")), None);
     }

@@ -174,17 +174,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_href_leaves_an_absolute_url_unchanged() {
+    fn resolve_href_joins_only_relative_paths() {
+        let base = "http://127.0.0.1:8080";
         assert_eq!(
-            resolve_href("http://127.0.0.1:8080", "https://example.com/pr/1"),
+            resolve_href(base, "https://example.com/pr/1"),
             "https://example.com/pr/1"
         );
-    }
-
-    #[test]
-    fn resolve_href_joins_a_relative_path_with_the_daemon_base_url() {
         assert_eq!(
-            resolve_href("http://127.0.0.1:8080", "/session/xyz"),
+            resolve_href(base, "/session/xyz"),
             "http://127.0.0.1:8080/session/xyz"
         );
     }

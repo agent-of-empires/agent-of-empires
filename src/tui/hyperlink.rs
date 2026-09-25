@@ -332,28 +332,20 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_with_no_links_emits_no_osc8() {
+    fn frames_open_from_a_known_state_and_give_each_target_its_own_run() {
         let out = render(&[], &[(0, 0, "a"), (1, 0, "b")]);
         assert!(
             !out.contains("]8;"),
             "unlinked frame must stay clean: {out}"
         );
-    }
 
-    #[test]
-    fn resets_inherited_link_state_before_painting() {
-        let out = render(&[(0, 0, "https://example.com")], &[(0, 0, "a")]);
-        assert!(
-            out.starts_with("^[]8;;^[\\"),
-            "frame must open from a known OSC 8 state: {out}"
-        );
-    }
-
-    #[test]
-    fn adjacent_runs_with_different_targets_each_get_their_own_sequence() {
         let out = render(
             &[(0, 0, "https://a.example"), (1, 0, "https://b.example")],
             &[(0, 0, "a"), (1, 0, "b")],
+        );
+        assert!(
+            out.starts_with("^[]8;;^[\\"),
+            "frame must open from a known OSC 8 state: {out}"
         );
         assert!(out.contains("^[]8;;https://a.example^[\\"));
         assert!(out.contains("^[]8;;https://b.example^[\\"));

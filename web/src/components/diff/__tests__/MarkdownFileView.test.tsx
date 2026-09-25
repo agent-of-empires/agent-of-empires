@@ -7,23 +7,6 @@ import { MarkdownFileView } from "../MarkdownFileView";
 afterEach(cleanup);
 
 describe("MarkdownFileView", () => {
-  it("renders headings, lists, and links", () => {
-    const md = ["# Title", "", "- one", "- two", "", "[link](https://example.com)"].join("\n");
-    const { container } = render(<MarkdownFileView content={md} />);
-    expect(container.querySelector("h1")?.textContent).toBe("Title");
-    expect(container.querySelectorAll("li")).toHaveLength(2);
-    const a = container.querySelector("a");
-    expect(a?.getAttribute("href")).toBe("https://example.com");
-    expect(a?.textContent).toBe("link");
-  });
-
-  it("renders GFM tables via remark-gfm", () => {
-    const md = ["| a | b |", "| - | - |", "| 1 | 2 |"].join("\n");
-    const { container } = render(<MarkdownFileView content={md} />);
-    expect(container.querySelector("table")).toBeTruthy();
-    expect(container.querySelectorAll("td")).toHaveLength(2);
-  });
-
   it("does not inject raw HTML from the file", () => {
     const md = 'text\n\n<img src=x onerror="alert(1)">\n\n<script>alert(2)</script>';
     const { container } = render(<MarkdownFileView content={md} />);

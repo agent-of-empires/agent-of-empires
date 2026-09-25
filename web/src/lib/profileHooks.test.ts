@@ -1,44 +1,26 @@
-import { describe, expect, it } from "vitest";
+import { expect, it } from "vitest";
 import { buildEffectiveHooks } from "./profileHooks";
 
-describe("buildEffectiveHooks", () => {
-  it("returns the three lifecycle events in TUI order with parity labels", () => {
-    const groups = buildEffectiveHooks(undefined, undefined);
-    expect(groups.map((g) => g.key)).toEqual(["on_create", "on_launch", "on_destroy"]);
-    expect(groups.map((g) => g.label)).toEqual(["On Create", "On Launch", "On Destroy"]);
-  });
+it("returns the three lifecycle events in TUI order with parity labels, none when unset", () => {
+  const groups = buildEffectiveHooks({}, {});
+  expect(groups.map((g) => [g.key, g.label, g.source, g.commands])).toEqual([
+    ["on_create", "On Create", "none", []],
+    ["on_launch", "On Launch", "none", []],
+    ["on_destroy", "On Destroy", "none", []],
+  ]);
+  expect(buildEffectiveHooks(undefined, undefined).map((g) => g.source)).toEqual(["none", "none", "none"]);
+});
 
-  it("marks a non-empty profile override as `override`", () => {
-    const groups = buildEffectiveHooks({ on_create: ["echo hi"] }, { on_create: ["echo global"] });
-    const onCreate = groups.find((g) => g.key === "on_create")!;
-    expect(onCreate.source).toBe("override");
-    expect(onCreate.commands).toEqual(["echo hi"]);
-  });
-
-  it("marks an explicit empty array as `override-empty` (disables global)", () => {
-    const groups = buildEffectiveHooks({ on_launch: [] }, { on_launch: ["notify-send launch"] });
-    const onLaunch = groups.find((g) => g.key === "on_launch")!;
-    expect(onLaunch.source).toBe("override-empty");
-    expect(onLaunch.commands).toEqual([]);
-  });
-
-  it("inherits global commands when the profile has no override", () => {
-    const groups = buildEffectiveHooks({}, { on_create: ["docker compose up"] });
-    const onCreate = groups.find((g) => g.key === "on_create")!;
-    expect(onCreate.source).toBe("inherited");
-    expect(onCreate.commands).toEqual(["docker compose up"]);
-  });
-
-  it("reports `none` when neither profile nor global define the event", () => {
-    const groups = buildEffectiveHooks({}, {});
-    expect(groups.every((g) => g.source === "none")).toBe(true);
-    expect(groups.every((g) => g.commands.length === 0)).toBe(true);
-  });
-
-  it("treats a malformed (non-array) field as absent, not a crash", () => {
-    const groups = buildEffectiveHooks({ on_create: "echo hi" as unknown as string[] }, { on_create: ["echo global"] });
-    const onCreate = groups.find((g) => g.key === "on_create")!;
-    expect(onCreate.source).toBe("inherited");
-    expect(onCreate.commands).toEqual(["echo global"]);
-  });
+it("resolves each event's source from the profile override and global hooks", () => {
+  const global = { on_create: ["echo global"] };
+  const cases: [string, Record<string, unknown>, string, string[]][] = [
+    ["non-empty override", { on_create: ["echo hi"] }, "override", ["echo hi"]],
+    ["empty override disables global", { on_create: [] }, "override-empty", []],
+    ["no override inherits", {}, "inherited", ["echo global"]],
+    ["malformed override is absent", { on_create: "echo hi" }, "inherited", ["echo global"]],
+  ];
+  for (const [name, profile, source, commands] of cases) {
+    const onCreate = buildEffectiveHooks(profile as never, global).find((g) => g.key === "on_create")!;
+    expect({ source: onCreate.source, commands: onCreate.commands }, name).toEqual({ source, commands });
+  }
 });

@@ -145,90 +145,70 @@ pub(super) fn raw_input_for_tool_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn permission_raw_input_uses_cached_context_when_request_is_empty() {
-        let cached = serde_json::json!({ "command": "mkdir -p /tmp/opencode", "workdir": "/tmp" });
-        let enriched = permission_raw_input_with_context(None, Some(&cached))
-            .expect("cached context should be used");
-
-        assert_eq!(enriched.get("command"), cached.get("command"));
-        assert_eq!(enriched.get("workdir"), cached.get("workdir"));
-    }
-
-    #[test]
-    fn permission_raw_input_merges_cached_context_without_overwriting_request() {
-        let permission =
-            serde_json::json!({ "filepath": "/tmp/opencode", "command": "permission command" });
-        let cached = serde_json::json!({ "command": "mkdir -p /tmp/opencode", "workdir": "/tmp" });
-        let enriched = permission_raw_input_with_context(Some(&permission), Some(&cached))
-            .expect("non-empty permission args should remain present");
-
-        assert_eq!(enriched.get("command"), permission.get("command"));
-        assert_eq!(enriched.get("filepath"), permission.get("filepath"));
-        assert_eq!(enriched.get("workdir"), cached.get("workdir"));
-    }
-
-    #[test]
-    fn permission_raw_input_preserves_aoe_metadata_when_falling_back() {
-        let permission = serde_json::json!({ "_aoe_title": "external_directory" });
-        let cached = serde_json::json!({ "command": "mkdir -p /tmp/opencode" });
-        let enriched = permission_raw_input_with_context(Some(&permission), Some(&cached))
-            .expect("cached context should enrich bookkeeping-only requests");
-
-        assert_eq!(enriched.get("_aoe_title"), permission.get("_aoe_title"));
-        assert_eq!(enriched.get("command"), cached.get("command"));
-    }
-
-    #[test]
-    fn permission_raw_input_keeps_non_empty_non_object_request() {
-        let permission = serde_json::json!(["already", "specific"]);
-        let cached = serde_json::json!({ "command": "mkdir -p /tmp/opencode" });
-        let enriched = permission_raw_input_with_context(Some(&permission), Some(&cached))
-            .expect("non-empty permission args should remain present");
-
-        assert_eq!(enriched, permission);
-    }
-
-    #[test]
-    fn permission_raw_input_ignores_empty_cached_context() {
-        let cached = serde_json::json!({});
-        let enriched = permission_raw_input_with_context(None, Some(&cached));
-
-        assert!(enriched.is_none());
-    }
-
-    #[test]
-    fn tool_context_cache_ignores_empty_context_entries() {
-        let mut cache = ToolCallContextCache::default();
-        cache.record("tc-1".to_string(), serde_json::json!({}));
-
-        assert!(cache.get("tc-1").is_none());
-    }
-
-    #[test]
-    fn tool_context_cache_removes_completed_entries() {
-        let mut cache = ToolCallContextCache::default();
-        cache.record("tc-1".to_string(), serde_json::json!({ "command": "ls" }));
-        assert!(cache.get("tc-1").is_some());
-
-        cache.remove("tc-1");
-
-        assert!(cache.get("tc-1").is_none());
-        assert!(!cache.insertion_order.iter().any(|id| id == "tc-1"));
-    }
-
-    #[test]
-    fn tool_context_cache_enforces_bounded_size() {
-        let mut cache = ToolCallContextCache::default();
-        for idx in 0..=TOOL_CONTEXT_CACHE_LIMIT {
-            cache.record(format!("tc-{idx}"), serde_json::json!({ "idx": idx }));
+    fn tool_context_cases() {
+        let cached = json!({ "command": "mkdir -p /tmp/opencode", "workdir": "/tmp" });
+        // (request, cached, expected)
+        let cases = [
+            // An empty request falls back to the cached context.
+            (None, Some(cached.clone()), Some(cached.clone())),
+            // The request wins shared keys; cached fills the rest.
+            (
+                Some(json!({ "filepath": "/tmp/opencode", "command": "permission command" })),
+                Some(cached.clone()),
+                Some(json!({
+                    "filepath": "/tmp/opencode",
+                    "command": "permission command",
+                    "workdir": "/tmp",
+                })),
+            ),
+            // Bookkeeping-only requests keep their aoe metadata.
+            (
+                Some(json!({ "_aoe_title": "external_directory" })),
+                Some(cached.clone()),
+                Some(json!({
+                    "_aoe_title": "external_directory",
+                    "command": "mkdir -p /tmp/opencode",
+                    "workdir": "/tmp",
+                })),
+            ),
+            // A non-empty non-object request is left as is.
+            (
+                Some(json!(["already", "specific"])),
+                Some(cached.clone()),
+                Some(json!(["already", "specific"])),
+            ),
+            (None, Some(json!({})), None),
+        ];
+        for (request, cached, expected) in cases {
+            assert_eq!(
+                permission_raw_input_with_context(request.as_ref(), cached.as_ref()),
+                expected,
+                "{request:?}"
+            );
         }
 
-        assert_eq!(cache.raw_inputs.len(), TOOL_CONTEXT_CACHE_LIMIT);
-        assert!(cache.get("tc-0").is_none());
-        assert!(cache
-            .get(&format!("tc-{TOOL_CONTEXT_CACHE_LIMIT}"))
-            .is_some());
+        {
+            let mut cache = ToolCallContextCache::default();
+            cache.record("empty".to_string(), json!({}));
+            assert!(cache.get("empty").is_none());
+
+            cache.record("tc-1".to_string(), json!({ "command": "ls" }));
+            assert!(cache.get("tc-1").is_some());
+            cache.remove("tc-1");
+            assert!(cache.get("tc-1").is_none());
+            assert!(!cache.insertion_order.iter().any(|id| id == "tc-1"));
+
+            for idx in 0..=TOOL_CONTEXT_CACHE_LIMIT {
+                cache.record(format!("tc-{idx}"), json!({ "idx": idx }));
+            }
+            assert_eq!(cache.raw_inputs.len(), TOOL_CONTEXT_CACHE_LIMIT);
+            assert!(cache.get("tc-0").is_none());
+            assert!(cache
+                .get(&format!("tc-{TOOL_CONTEXT_CACHE_LIMIT}"))
+                .is_some());
+        }
     }
 }

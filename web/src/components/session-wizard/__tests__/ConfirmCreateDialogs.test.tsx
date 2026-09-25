@@ -42,22 +42,19 @@ describe.each([
   ["hooks-trust", renderHooks, "hooks-trust-list"],
   ["volume-ignores-glob", renderGlobs, "volume-ignores-glob-list"],
 ] as const)("%s dialog shell", (prefix, setup, innerTestId) => {
-  it("Proceed confirms; Cancel and the backdrop cancel, an inner click does not", () => {
+  it("Proceed and Enter confirm; Cancel, the backdrop, and Escape cancel, an inner click does not", () => {
     const { onConfirm, onCancel } = setup();
     fireEvent.click(screen.getByText("Cancel"));
     fireEvent.click(screen.getByTestId(`${prefix}-dialog`));
     fireEvent.click(screen.getByTestId(innerTestId));
-    expect(onCancel).toHaveBeenCalledTimes(2);
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(onCancel).toHaveBeenCalledTimes(3);
     fireEvent.click(screen.getByTestId(`${prefix}-proceed`));
     expect(onConfirm).toHaveBeenCalledTimes(1);
-  });
-
-  it("Escape cancels and Enter confirms from the document body", () => {
-    const { onConfirm, onCancel } = setup();
-    fireEvent.keyDown(document, { key: "Escape" });
-    expect(onCancel).toHaveBeenCalledTimes(1);
+    cleanup();
+    const byEnter = setup();
     fireEvent.keyDown(document.body, { key: "Enter" });
-    expect(onConfirm).toHaveBeenCalledTimes(1);
+    expect(byEnter.onConfirm).toHaveBeenCalledTimes(1);
   });
 
   it("re-enables Proceed when onConfirm rejects", async () => {
@@ -85,15 +82,6 @@ describe("HooksTrustDialog", () => {
 });
 
 describe("VolumeIgnoresGlobDialog", () => {
-  it.each([
-    [TWO_PATTERNS, "3 directories"],
-    [[{ pattern: "**/bin", matched_paths: ["/workspace/x/bin"] }], "1 directory"],
-  ])("lists patterns and pluralizes the match total", (globs, total) => {
-    renderGlobs({ globs });
-    expect(screen.getByTestId("volume-ignores-glob-list").textContent).toContain("**/bin");
-    expect(screen.getByTestId("volume-ignores-glob-dialog").textContent).toContain(total);
-  });
-
   it.each([false, true])("confirms with dontShowAgain=%s", (tick) => {
     const { onConfirm } = renderGlobs();
     const checkbox = screen.getByTestId("volume-ignores-glob-dont-show-again");

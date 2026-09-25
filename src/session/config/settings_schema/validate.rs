@@ -311,137 +311,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn range_rejects_below_min() {
-        let kind = ValidationKind::RangeU64 {
-            min: 1,
-            max: Some(128),
-        };
-        assert!(validate_value(&kind, &json!(0)).is_err());
-        assert!(validate_value(&kind, &json!(1)).is_ok());
-        assert!(validate_value(&kind, &json!(128)).is_ok());
-        assert!(validate_value(&kind, &json!(129)).is_err());
-    }
-
-    #[test]
-    fn range_rejects_non_integer() {
-        let kind = ValidationKind::RangeU64 { min: 0, max: None };
-        assert!(validate_value(&kind, &json!("nope")).is_err());
-        assert!(validate_value(&kind, &json!(-1)).is_err());
-    }
-
-    #[test]
-    fn non_empty_string_trims() {
-        assert!(validate_value(&ValidationKind::NonEmptyString, &json!("  ")).is_err());
-        assert!(validate_value(&ValidationKind::NonEmptyString, &json!("x")).is_ok());
-    }
-
-    #[test]
-    fn typed_values_reject_mismatched_json() {
-        // str: any string incl. empty, but never a number/object.
-        assert!(validate_value(&ValidationKind::StringValue, &json!("")).is_ok());
-        assert!(validate_value(&ValidationKind::StringValue, &json!("x")).is_ok());
-        assert!(validate_value(&ValidationKind::StringValue, &json!(1)).is_err());
-        assert!(validate_value(&ValidationKind::StringValue, &json!({})).is_err());
-        // bool: only true/false.
-        assert!(validate_value(&ValidationKind::BoolValue, &json!(true)).is_ok());
-        assert!(validate_value(&ValidationKind::BoolValue, &json!("true")).is_err());
-        // signed range, single- and double-sided.
-        let signed = ValidationKind::RangeI64 {
-            min: Some(-5),
-            max: Some(5),
-        };
-        assert!(validate_value(&signed, &json!(-5)).is_ok());
-        assert!(validate_value(&signed, &json!(6)).is_err());
-        assert!(validate_value(&signed, &json!("3")).is_err());
-        let lower_only = ValidationKind::RangeI64 {
-            min: Some(-1),
-            max: None,
-        };
-        assert!(validate_value(&lower_only, &json!(1_000)).is_ok());
-        assert!(validate_value(&lower_only, &json!(-2)).is_err());
-    }
-
-    #[test]
-    fn memory_limit_grammar() {
-        assert!(validate_value(&ValidationKind::MemoryLimit, &json!("512m")).is_ok());
-        assert!(validate_value(&ValidationKind::MemoryLimit, &json!("")).is_ok());
-        assert!(validate_value(&ValidationKind::MemoryLimit, &json!("512mb")).is_err());
-    }
-
-    #[test]
-    fn volume_list_grammar() {
-        assert!(validate_value(&ValidationKind::VolumeList, &json!(["/h:/c"])).is_ok());
-        assert!(validate_value(&ValidationKind::VolumeList, &json!(["bad"])).is_err());
-    }
-
-    #[test]
-    fn env_list_grammar() {
-        assert!(validate_value(&ValidationKind::EnvList, &json!(["KEY"])).is_ok());
-        assert!(validate_value(&ValidationKind::EnvList, &json!(["KEY=value"])).is_ok());
-        assert!(validate_value(&ValidationKind::EnvList, &json!(["_K=v", "A1=b"])).is_ok());
-        assert!(validate_value(&ValidationKind::EnvList, &json!(["1BAD=v"])).is_err());
-        assert!(validate_value(&ValidationKind::EnvList, &json!(["has space"])).is_err());
-        assert!(validate_value(&ValidationKind::EnvList, &json!("notalist")).is_err());
-    }
-
-    #[test]
-    fn one_of_membership() {
-        let kind = ValidationKind::OneOf {
-            options: vec!["fast".into(), "slow".into()],
-        };
-        assert!(validate_value(&kind, &json!("fast")).is_ok());
-        assert!(validate_value(&kind, &json!("turbo")).is_err());
-        assert!(validate_value(&kind, &json!(3)).is_err());
-    }
-
-    #[test]
-    fn port_mapping_list_grammar() {
-        assert!(validate_value(&ValidationKind::PortMappingList, &json!(["3000:3000"])).is_ok());
-        assert!(validate_value(&ValidationKind::PortMappingList, &json!(["8080:80"])).is_ok());
-        assert!(validate_value(&ValidationKind::PortMappingList, &json!(["3000"])).is_err());
-        assert!(validate_value(&ValidationKind::PortMappingList, &json!(["a:b"])).is_err());
-    }
-
-    #[test]
-    fn network_grammar() {
-        assert!(validate_value(&ValidationKind::Network, &json!("")).is_ok());
-        assert!(validate_value(&ValidationKind::Network, &json!("none")).is_ok());
-        assert!(validate_value(&ValidationKind::Network, &json!("egress-proxy")).is_ok());
-        assert!(validate_value(&ValidationKind::Network, &json!("host")).is_err());
-        assert!(validate_value(&ValidationKind::Network, &json!(42)).is_err());
-    }
-
-    #[test]
-    fn cron_grammar() {
-        let ok = ["0 9 * * 1-5", "*/15 * * * *", "0 0,12 1 */2 *", "* * * * *"];
-        for e in ok {
-            assert!(
-                validate_value(&ValidationKind::Cron, &json!(e)).is_ok(),
-                "{e}"
-            );
-        }
-        let bad = [
-            "0 9 * *",     // too few fields
-            "0 9 * * * *", // too many fields
-            "60 * * * *",  // minute out of range
-            "* 24 * * *",  // hour out of range
-            "* * 0 * *",   // dom below 1
-            "* * * 13 *",  // month out of range
-            "* * * * 8",   // dow out of range (0-7 valid, 8 not)
-            "5-1 * * * *", // reversed range
-            "*/0 * * * *", // zero step
-            "abc * * * *", // non-numeric
-        ];
-        for e in bad {
-            assert!(
-                validate_value(&ValidationKind::Cron, &json!(e)).is_err(),
-                "{e}"
-            );
-        }
-        assert!(validate_value(&ValidationKind::Cron, &json!(5)).is_err());
-    }
-
     fn jobs_validation() -> ValidationKind {
         ValidationKind::ObjectList {
             id_field: "id".into(),
@@ -474,54 +343,119 @@ mod tests {
     }
 
     #[test]
-    fn object_list_structural_rules() {
-        let kind = jobs_validation();
-        // Happy path.
-        assert!(validate_value(
-            &kind,
-            &json!([{"id": "a", "agent": "claude", "schedule": "0 9 * * 1-5"}])
-        )
-        .is_ok());
-        // Missing stable id.
-        assert!(validate_value(
-            &kind,
-            &json!([{"agent": "claude", "schedule": "* * * * *"}])
-        )
-        .is_err());
-        // Duplicate id.
-        assert!(validate_value(
-            &kind,
-            &json!([
-                {"id": "x", "agent": "a", "schedule": "* * * * *"},
-                {"id": "x", "agent": "b", "schedule": "* * * * *"}
-            ])
-        )
-        .is_err());
-        // Missing required field.
-        assert!(validate_value(&kind, &json!([{"id": "a", "agent": "claude"}])).is_err());
-        // Undeclared field.
-        assert!(validate_value(
-            &kind,
-            &json!([{"id": "a", "agent": "c", "schedule": "* * * * *", "bogus": 1}])
-        )
-        .is_err());
-        // Nested field validation runs (bad cron).
-        assert!(validate_value(
-            &kind,
-            &json!([{"id": "a", "agent": "c", "schedule": "bad"}])
-        )
-        .is_err());
-        // max_items.
-        assert!(validate_value(
-            &kind,
-            &json!([
-                {"id": "1", "agent": "a", "schedule": "* * * * *"},
-                {"id": "2", "agent": "b", "schedule": "* * * * *"},
-                {"id": "3", "agent": "c", "schedule": "* * * * *"}
-            ])
-        )
-        .is_err());
-        // Not an array.
-        assert!(validate_value(&kind, &json!({"id": "a"})).is_err());
+    fn validate_value_accepts_and_rejects_by_kind() {
+        use ValidationKind as K;
+        let bounded = K::RangeU64 {
+            min: 1,
+            max: Some(128),
+        };
+        let unbounded = K::RangeU64 { min: 0, max: None };
+        let signed = K::RangeI64 {
+            min: Some(-5),
+            max: Some(5),
+        };
+        let lower_only = K::RangeI64 {
+            min: Some(-1),
+            max: None,
+        };
+        let one_of = K::OneOf {
+            options: vec!["fast".into(), "slow".into()],
+        };
+        let jobs = jobs_validation();
+        let job = |id: &str, agent: &str, schedule: &str| json!({"id": id, "agent": agent, "schedule": schedule});
+        let cases = [
+            (&bounded, json!(0), false),
+            (&bounded, json!(1), true),
+            (&bounded, json!(128), true),
+            (&bounded, json!(129), false),
+            (&unbounded, json!("nope"), false),
+            (&unbounded, json!(-1), false),
+            (&K::NonEmptyString, json!("  "), false),
+            (&K::NonEmptyString, json!("x"), true),
+            // str: any string incl. empty, but never a number/object.
+            (&K::StringValue, json!(""), true),
+            (&K::StringValue, json!(1), false),
+            (&K::StringValue, json!({}), false),
+            (&K::BoolValue, json!(true), true),
+            (&K::BoolValue, json!("true"), false),
+            (&signed, json!(-5), true),
+            (&signed, json!(6), false),
+            (&signed, json!("3"), false),
+            (&lower_only, json!(1_000), true),
+            (&lower_only, json!(-2), false),
+            (&K::Network, json!("egress-proxy"), true),
+            (&K::Network, json!("host"), false),
+            (&K::Network, json!(42), false),
+            (&K::MemoryLimit, json!("512m"), true),
+            (&K::MemoryLimit, json!(""), true),
+            (&K::MemoryLimit, json!("512mb"), false),
+            (&K::VolumeList, json!(["/h:/c"]), true),
+            (&K::VolumeList, json!(["bad"]), false),
+            (
+                &K::EnvList,
+                json!(["KEY", "KEY=value", "_K=v", "A1=b"]),
+                true,
+            ),
+            (&K::EnvList, json!(["1BAD=v"]), false),
+            (&K::EnvList, json!(["has space"]), false),
+            (&K::EnvList, json!("notalist"), false),
+            (&one_of, json!("fast"), true),
+            (&one_of, json!("turbo"), false),
+            (&one_of, json!(3), false),
+            (&K::PortMappingList, json!(["3000:3000", "8080:80"]), true),
+            (&K::PortMappingList, json!(["3000"]), false),
+            (&K::PortMappingList, json!(["a:b"]), false),
+            (&K::Cron, json!("0 9 * * 1-5"), true),
+            (&K::Cron, json!("*/15 * * * *"), true),
+            (&K::Cron, json!("0 0,12 1 */2 *"), true),
+            (&K::Cron, json!("* * * * *"), true),
+            (&K::Cron, json!("0 9 * *"), false),
+            (&K::Cron, json!("0 9 * * * *"), false),
+            (&K::Cron, json!("60 * * * *"), false),
+            (&K::Cron, json!("* 24 * * *"), false),
+            (&K::Cron, json!("* * 0 * *"), false),
+            (&K::Cron, json!("* * * 13 *"), false),
+            // dow 0-7 is valid, 8 is not.
+            (&K::Cron, json!("* * * * 8"), false),
+            (&K::Cron, json!("5-1 * * * *"), false),
+            (&K::Cron, json!("*/0 * * * *"), false),
+            (&K::Cron, json!("abc * * * *"), false),
+            (&K::Cron, json!(5), false),
+            (&jobs, json!([job("a", "claude", "0 9 * * 1-5")]), true),
+            // Missing stable id.
+            (
+                &jobs,
+                json!([{"agent": "claude", "schedule": "* * * * *"}]),
+                false,
+            ),
+            (
+                &jobs,
+                json!([job("x", "a", "* * * * *"), job("x", "b", "* * * * *")]),
+                false,
+            ),
+            // Missing required field.
+            (&jobs, json!([{"id": "a", "agent": "claude"}]), false),
+            (
+                &jobs,
+                json!([{"id": "a", "agent": "c", "schedule": "* * * * *", "bogus": 1}]),
+                false,
+            ),
+            // Nested field validation runs.
+            (&jobs, json!([job("a", "c", "bad")]), false),
+            // Over max_items.
+            (
+                &jobs,
+                json!([
+                    job("1", "a", "* * * * *"),
+                    job("2", "b", "* * * * *"),
+                    job("3", "c", "* * * * *")
+                ]),
+                false,
+            ),
+            (&jobs, json!({"id": "a"}), false),
+        ];
+        for (kind, value, ok) in cases {
+            assert_eq!(validate_value(kind, &value).is_ok(), ok, "{kind:?} {value}");
+        }
     }
 }

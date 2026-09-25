@@ -2,7 +2,6 @@ import { test, expect } from "./helpers/mockedTest";
 
 const V1_KEY = "aoe-pane-layout"; // pre-#2437 per-pane {open, dock} shape
 const V2_KEY = "aoe-pane-layout-v2";
-const LEGACY_KEY = "aoe-right-collapsed";
 const SESSION = "pinch-test";
 
 // The v2 layout is per-session tab groups. These tests assert only whether the
@@ -22,23 +21,8 @@ async function getLayout(page: import("@playwright/test").Page) {
 }
 
 test.describe("Right dock pane-layout persistence", () => {
-  test("desktop with empty storage seeds both panes open", async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-    expect(await getLayout(page)).toEqual({ diff: true, terminal: true });
-  });
-
   test("mobile with empty storage seeds both panes closed", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-    expect(await getLayout(page)).toEqual({ diff: false, terminal: false });
-  });
-
-  test("migrates the legacy collapsed flag '1' to both panes closed", async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.addInitScript((k) => localStorage.setItem(k, "1"), LEGACY_KEY);
     await page.goto("/");
     await expect(page.locator("header")).toBeVisible();
     expect(await getLayout(page)).toEqual({ diff: false, terminal: false });
@@ -52,7 +36,9 @@ test.describe("Right dock pane-layout persistence", () => {
     expect(await getLayout(page)).toEqual({ diff: true, terminal: true });
   });
 
-  test("keyboard toggle flips the diff pane and survives reload", async ({ page }) => {
+  test("desktop seeds both panes open; the keyboard toggle flips the diff pane and survives reload", async ({
+    page,
+  }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     // Per-session layout: toggles need an active session, so open one directly.
     await page.goto(`/session/${SESSION}`);

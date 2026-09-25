@@ -214,10 +214,6 @@ pub async fn add_profile_disk_watch(state: &Arc<AppState>, profile: &str) {
     super::add_profile_disk_watch(state, profile).await
 }
 
-pub async fn remove_profile_disk_watch(state: &Arc<AppState>, profile: &str) {
-    super::remove_profile_disk_watch(state, profile).await
-}
-
 pub async fn rename_profile_disk_watch(state: &Arc<AppState>, old: &str, new: &str) {
     super::rename_profile_disk_watch(state, old, new).await
 }

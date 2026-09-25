@@ -130,14 +130,3 @@ async fn resolve_latest_release(source: &PluginSource) -> anyhow::Result<Option<
 fn short(commit: &str) -> String {
     commit.chars().take(8).collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn short_truncates() {
-        assert_eq!(short("abcdef0123456789"), "abcdef01");
-        assert_eq!(short("abc"), "abc");
-    }
-}

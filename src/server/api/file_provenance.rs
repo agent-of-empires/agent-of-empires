@@ -326,32 +326,28 @@ mod tests {
                     }]),
                 },
             ),
+            // A 16 KB-truncated args_preview may be invalid JSON; that must not
+            // panic or fabricate a path, and the diffs fallback still lands.
+            (
+                4,
+                Event::ToolCallStarted {
+                    tool_call: tool_call(r#"{"content":"unterminated"#, vec!["/tmp/x.rs"], vec![]),
+                },
+            ),
         ];
         let set = collect_touched_paths(&events);
-        for p in [
+        let expected: HashSet<PathBuf> = [
             "/tmp/plan.md",
             "/tmp/patched.rs",
             "/home/u/.claude/mem.md",
             "/tmp/late.txt",
             "/tmp/diff-late.rs",
-        ] {
-            assert!(set.contains(&PathBuf::from(p)), "missing {p}");
-        }
-    }
-
-    #[test]
-    fn unparseable_args_preview_is_ignored_not_denied() {
-        // A 16 KB-truncated args_preview may be invalid JSON; that must not
-        // panic or fabricate a path, and the diffs fallback still lands.
-        let events = vec![(
-            1u64,
-            Event::ToolCallStarted {
-                tool_call: tool_call(r#"{"content":"unterminated"#, vec!["/tmp/x.rs"], vec![]),
-            },
-        )];
-        let set = collect_touched_paths(&events);
-        assert_eq!(set.len(), 1);
-        assert!(set.contains(&PathBuf::from("/tmp/x.rs")));
+            "/tmp/x.rs",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(set, expected);
     }
 
     #[test]

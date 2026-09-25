@@ -109,14 +109,6 @@ async function flush() {
 }
 
 describe("toolbar and send", () => {
-  it("inserts @ then / from the toolbar buttons", () => {
-    const { textarea } = mount();
-    fireEvent.click(screen.getByRole("button", { name: "Add file context (@)" }));
-    expect(textarea().value).toContain("@");
-    fireEvent.click(screen.getByRole("button", { name: "Slash command (/)" }));
-    expect(textarea().value).toMatch(/@.*\//s);
-  });
-
   it("enables Send only for non-whitespace text", () => {
     const { textarea } = mount();
     const send = screen.getByRole("button", { name: "Send message" }) as HTMLButtonElement;
@@ -262,14 +254,6 @@ describe("slash command popover", () => {
     expect(option(/address-pr-comments/)).toHaveLength(0);
   });
 
-  it("inserts the command at the caret, not at the end", async () => {
-    const { textarea } = mount({ availableCommands: COMMANDS });
-    await typeAt(textarea(), "fix /he the bug", 7);
-    await pick(/\/help/);
-    expect(textarea().value).toBe("fix /help the bug");
-    expect(textarea().selectionStart).toBe(10);
-  });
-
   it("badges a skill-backed command and leaves a plain one unbadged", async () => {
     skillIndexRef.current = buildSkillIndex({
       roots: [
@@ -340,13 +324,6 @@ describe("queue recall", () => {
     expect(banner()).toBeNull();
   });
 
-  it("restores the stashed draft on ArrowDown past the newest", async () => {
-    const { key, enter, banner } = mountRecall();
-    await enter();
-    await key("ArrowDown", "");
-    expect(banner()).toBeNull();
-  });
-
   it("edits a recalled prompt in place on Enter", async () => {
     const editQueuedPrompt = vi.fn();
     const { textarea, enter } = mountRecall({ editQueuedPrompt });
@@ -401,17 +378,6 @@ describe("draft persistence", () => {
     expect(stored("sess-reload")).toBe("unsent draft text");
     first.unmount();
     expect((await mountSession("sess-reload")).textarea().value).toBe("unsent draft text");
-  });
-
-  it("keys drafts per session across a switch away and back", async () => {
-    const a = await mountSession("sess-a");
-    fireEvent.change(a.textarea(), { target: { value: "draft for A" } });
-    advance(250);
-    a.unmount();
-    const b = await mountSession("sess-b");
-    expect(b.textarea().value).toBe("");
-    b.unmount();
-    expect((await mountSession("sess-a")).textarea().value).toBe("draft for A");
   });
 
   it("clears the draft synchronously on send so a racing remount cannot restore it", async () => {

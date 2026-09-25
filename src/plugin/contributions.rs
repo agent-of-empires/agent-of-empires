@@ -84,7 +84,7 @@ api_version = 2
     }
 
     #[test]
-    fn rejects_escaping_and_builtin_paths() {
+    fn rejects_escaping_symlinked_and_builtin_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("acme.kit");
         std::fs::create_dir_all(&dir).unwrap();
@@ -100,21 +100,14 @@ api_version = 2
 
         let builtin = loaded(None, vec![theme("x", "x.toml")]);
         assert!(active_themes(&[&builtin]).is_empty());
-    }
 
-    #[cfg(unix)]
-    #[test]
-    fn rejects_symlink_escape() {
-        let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("acme.kit");
-        std::fs::create_dir_all(&dir).unwrap();
         let outside = tmp.path().join("outside.toml");
         std::fs::write(&outside, "background = \"#000000\"\n").unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("link.toml")).unwrap();
-
-        let p = loaded(Some(dir), vec![theme("esc", "link.toml")]);
+        let symlinked = loaded(Some(dir), vec![theme("esc", "link.toml")]);
         assert!(
-            active_themes(&[&p]).is_empty(),
+            active_themes(&[&symlinked]).is_empty(),
             "a symlink escaping the plugin dir must not resolve"
         );
     }

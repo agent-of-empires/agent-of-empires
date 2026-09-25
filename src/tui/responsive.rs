@@ -74,38 +74,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dialog_width_iphone_portrait() {
-        // ~50 cols (iPhone-portrait Mosh zoomed out): 80% of 50 = 40,
-        // above MIN_WIDTH 26 so the clamp is a no-op.
-        assert_eq!(dialog_width(50), 40);
-    }
-
-    #[test]
-    fn dialog_width_under_min_takes_full_viewport() {
-        // soft keyboard up on iPhone: 22 cols → 22 (truncate but visible).
-        assert_eq!(dialog_width(22), 22);
-        assert_eq!(dialog_width(DIALOG_MIN_WIDTH), DIALOG_MIN_WIDTH);
-    }
-
-    #[test]
-    fn dialog_width_caps_at_max() {
-        // Wide desktop: 80% of 200 = 160, capped to MAX_WIDTH 80.
-        assert_eq!(dialog_width(200), DIALOG_MAX_WIDTH);
-    }
-
-    #[test]
-    fn dialog_width_does_not_exceed_viewport() {
-        // Any viewport ≥ MIN; width never exceeds viewport.
+    fn dialog_width_and_stacked_height_clamp() {
+        // 80% of the viewport, capped at MAX; under MIN (soft keyboard up on
+        // an iPhone) it takes the whole viewport.
+        for (viewport, want) in [
+            (50, 40),
+            (22, 22),
+            (DIALOG_MIN_WIDTH, DIALOG_MIN_WIDTH),
+            (200, DIALOG_MAX_WIDTH),
+        ] {
+            assert_eq!(dialog_width(viewport), want, "{viewport}");
+        }
         for w in DIALOG_MIN_WIDTH..=DIALOG_MAX_WIDTH * 2 {
             assert!(dialog_width(w) <= w, "dialog_width({w}) > {w}");
         }
-    }
-
-    #[test]
-    fn stacked_list_height_clamped() {
-        assert_eq!(stacked_list_height(10), STACKED_LIST_HEIGHT_MIN);
-        assert_eq!(stacked_list_height(15), 5);
-        assert_eq!(stacked_list_height(30), 10);
-        assert_eq!(stacked_list_height(60), STACKED_LIST_HEIGHT_MAX);
+        for (height, want) in [
+            (10, STACKED_LIST_HEIGHT_MIN),
+            (15, 5),
+            (30, 10),
+            (60, STACKED_LIST_HEIGHT_MAX),
+        ] {
+            assert_eq!(stacked_list_height(height), want, "{height}");
+        }
     }
 }

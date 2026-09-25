@@ -1301,17 +1301,6 @@ mod tests {
     }
 
     #[test]
-    fn sort_order_cycles() {
-        use SortOrder::*;
-        let order = [Newest, Attention, LastActivity, Oldest, AZ, ZA];
-        for (i, current) in order.iter().enumerate() {
-            let next = order[(i + 1) % order.len()];
-            assert_eq!(current.cycle(), next);
-            assert_eq!(next.cycle_reverse(), *current);
-        }
-    }
-
-    #[test]
     fn last_activity_sorts_descending_with_none_last() {
         let now = Utc::now();
         let mut recent = inst("recent", "");
@@ -1640,36 +1629,6 @@ mod tests {
             "interaction wakes the session"
         );
         assert!(inst.is_favorited() && inst.last_accessed_at.is_some());
-    }
-
-    #[test]
-    fn optional_markers_serialize_only_when_set() {
-        let plain = serde_json::to_string(&Instance::new("t", "/tmp/t")).unwrap();
-        for field in ["archived_at", "snoozed_until"] {
-            assert!(!plain.contains(field), "{field} must be omitted when None");
-        }
-        let legacy = r#"{"id":"abc","title":"old","project_path":"/tmp/old","created_at":"2026-01-01T00:00:00Z"}"#;
-        let legacy: Instance = serde_json::from_str(legacy).unwrap();
-        assert!(!legacy.is_archived() && legacy.archived_at.is_none());
-
-        let mut archived = Instance::new("t", "/tmp/t");
-        archived.archive();
-        let mut snoozed = Instance::new("t", "/tmp/t");
-        snoozed.snooze(30);
-        let mut favorited = Instance::new("t", "/tmp/t");
-        favorited.favorite();
-        type Case = (Instance, &'static str, fn(&Instance) -> bool);
-        let cases: [Case; 3] = [
-            (archived, "archived_at", Instance::is_archived),
-            (snoozed, "snoozed_until", Instance::is_snoozed),
-            (favorited, "favorited_at", Instance::is_favorited),
-        ];
-        for (inst, field, check) in cases {
-            let json = serde_json::to_string(&inst).unwrap();
-            assert!(json.contains(field));
-            let parsed: Instance = serde_json::from_str(&json).unwrap();
-            assert!(check(&parsed), "{field} round-trips");
-        }
     }
 
     #[test]

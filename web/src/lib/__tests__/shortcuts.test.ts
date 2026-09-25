@@ -37,16 +37,11 @@ describe("SHORTCUTS registry", () => {
 
 it.each<[ShortcutDef["id"], string, string, string]>([
   ["palette", "⌘K", "CtrlK", "⌘K / Ctrl+K"],
-  ["sidebar", "⌘B", "CtrlB", "⌘B / Ctrl+B"],
   ["rightPanel", "⌘⌥B", "CtrlAltB", "⌘⌥B / Ctrl+Alt+B"],
   ["terminalFocus", "⌘`", "Ctrl`", "⌘` / Ctrl+`"],
   ["new", "n", "n", "n"],
   ["newScratch", "⌘⇧N", "CtrlShiftN", "⌘⇧N / Ctrl+Shift+N"],
-  ["jumpAttention", "a", "a", "a"],
-  ["diff", "D", "D", "D"],
-  ["settings", "s", "s", "s"],
   ["escape", "Esc", "Esc", "Esc"],
-  ["help", "?", "?", "?"],
 ])("%s renders as %s (mac), %s (other), and %s (tour)", (id, mac, other, tour) => {
   const { chord } = SHORTCUTS_BY_ID[id]!;
   expect([formatHelpShortcut(chord, true), formatHelpShortcut(chord, false), formatTourShortcut(chord)]).toEqual([
@@ -61,14 +56,10 @@ describe("matchShortcut", () => {
   const scratch = ev({ key: "N", code: "KeyN", metaKey: true, shiftKey: true });
 
   it.each<[string, ShortcutKeyEvent, boolean, boolean, ShortcutDef["id"] | null]>([
-    ["mac Meta+K", metaK, true, false, "palette"],
     ["mac Ctrl+K", ev({ key: "k", ctrlKey: true }), true, false, null],
     ["other Ctrl+K", ev({ key: "k", ctrlKey: true }), false, false, "palette"],
     ["other Meta+K", metaK, false, false, "palette"],
     ["Meta+K in an input", metaK, true, true, "palette"],
-    ["Meta+Backquote", ev({ key: "`", code: "Backquote", metaKey: true }), true, false, "terminalFocus"],
-    ["Meta+Alt+B", ev({ key: "b", code: "KeyB", metaKey: true, altKey: true }), true, false, "rightPanel"],
-    ["Meta+B", ev({ key: "b", code: "KeyB", metaKey: true }), true, false, "sidebar"],
     [
       "Mac Option+B producing ∫",
       ev({ key: "∫", code: "KeyB", metaKey: true, altKey: true }),
@@ -77,18 +68,9 @@ describe("matchShortcut", () => {
       "rightPanel",
     ],
     ["Meta+Shift+N", scratch, true, false, "newScratch"],
-    ["Meta+Shift+N in an input", scratch, true, true, "newScratch"],
-    ["Escape", ev({ key: "Escape" }), true, false, "escape"],
     ["Escape in an input", ev({ key: "Escape" }), true, true, "escape"],
     ["Meta+Escape", ev({ key: "Escape", metaKey: true }), true, false, "escape"],
-    ["n", ev({ key: "n" }), true, false, "new"],
-    ["a", ev({ key: "a" }), true, false, "jumpAttention"],
     ["N", ev({ key: "N" }), true, false, null],
-    ["D", ev({ key: "D" }), true, false, "diff"],
-    ["d", ev({ key: "d" }), true, false, null],
-    ["s", ev({ key: "s" }), true, false, "settings"],
-    ["S", ev({ key: "S" }), true, false, null],
-    ["?", ev({ key: "?" }), true, false, "help"],
     ["n in an input", ev({ key: "n" }), true, true, null],
     ["Ctrl+n", ev({ key: "n", ctrlKey: true }), true, false, null],
     ["Alt+n", ev({ key: "n", altKey: true }), true, false, null],

@@ -470,14 +470,26 @@ mod tests {
         );
     }
 
+    /// A native symlink inside the store onto a single-link nodes file denies its projection;
+    /// a symlink authored outside the store does not.
     #[test]
     #[serial_test::serial]
-    fn single_link_nodes_referenced_by_native_symlinks_are_not_projected() {
+    fn single_link_nodes_are_projected_only_without_a_native_alias() {
         use std::os::unix::fs::MetadataExt;
 
-        for (alias, target) in [
-            ("sessions/ref", "../workspace/meetings/nodes.json"),
-            ("workspace/meetings/other", "nodes.json"),
+        // (link relative to the temp root, link target, projected)
+        for (link, target, projected) in [
+            (
+                "source/sessions/ref",
+                "../workspace/meetings/nodes.json",
+                false,
+            ),
+            ("source/workspace/meetings/other", "nodes.json", false),
+            (
+                "authored-node-config",
+                "source/workspace/meetings/nodes.json",
+                true,
+            ),
         ] {
             let temporary = tempfile::tempdir().unwrap();
             let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
@@ -487,7 +499,13 @@ mod tests {
             let nodes = source.join("workspace/meetings/nodes.json");
             let content = br#"{"nodes":[{"id":"remote","token":"native-context"}]}"#;
             fs::write(&nodes, content).unwrap();
-            symlink(target, source.join(alias)).unwrap();
+            let link = temporary.path().join(link);
+            let target = if projected {
+                temporary.path().join(target)
+            } else {
+                PathBuf::from(target)
+            };
+            symlink(&target, &link).unwrap();
             assert_eq!(fs::metadata(&nodes).unwrap().nlink(), 1);
             let destination = temporary.path().join("active");
             let boundary = boundary(&source, &destination);
@@ -498,51 +516,22 @@ mod tests {
                 &AnchoredDir::open(&destination).unwrap(),
             )
             .unwrap();
-            assert!(
-                !destination.join("workspace").exists(),
-                "native alias {alias} must deny the projection"
+            assert_eq!(
+                destination.join("workspace").exists(),
+                projected,
+                "{link:?}"
+            );
+            let seeded = fs::read(destination.join("workspace/meetings/nodes.json")).ok();
+            assert_eq!(
+                seeded.as_deref(),
+                projected.then_some(&content[..]),
+                "{link:?}"
             );
             assert_eq!(fs::read(&nodes).unwrap(), content);
-            assert_eq!(fs::read(source.join(alias)).unwrap(), content);
-            assert_eq!(
-                fs::read_link(source.join(alias)).unwrap(),
-                Path::new(target)
-            );
+            assert_eq!(fs::read(&link).unwrap(), content);
+            assert_eq!(fs::read_link(&link).unwrap(), target);
         }
     }
-
-    #[test]
-    #[serial_test::serial]
-    fn single_link_nodes_with_only_an_authored_symlink_are_projected() {
-        use std::os::unix::fs::MetadataExt;
-
-        let temporary = tempfile::tempdir().unwrap();
-        let _environment = crate::session::test_support::isolate_app_dir_at(temporary.path());
-        let source = temporary.path().join("source");
-        fs::create_dir_all(source.join("workspace/meetings")).unwrap();
-        let nodes = source.join("workspace/meetings/nodes.json");
-        let content = br#"{"nodes":[{"id":"remote","token":"portable"}]}"#;
-        fs::write(&nodes, content).unwrap();
-        let authored = temporary.path().join("authored-node-config");
-        symlink(&nodes, &authored).unwrap();
-        assert_eq!(fs::metadata(&nodes).unwrap().nlink(), 1);
-        let destination = temporary.path().join("active");
-        let boundary = boundary(&source, &destination);
-        seed_nodes(
-            &boundary,
-            boundary.hermes.source.unwrap(),
-            &boundary.source_root,
-            &AnchoredDir::open(&destination).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            fs::read(destination.join("workspace/meetings/nodes.json")).unwrap(),
-            content
-        );
-        assert_eq!(fs::read(&nodes).unwrap(), content);
-        assert_eq!(fs::read_link(&authored).unwrap(), nodes);
-    }
-
     #[test]
     fn canonical_profile_aliases_cannot_borrow_each_others_mixed_exception() {
         let temporary = tempfile::tempdir().unwrap();

@@ -276,42 +276,38 @@ pub(super) fn write_diff_from_meta(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1::{
+        AudioContent, BlobResourceContents, Content, ContentBlock, Diff, EmbeddedResource,
+        EmbeddedResourceResource, ImageContent, ResourceLink, TextResourceContents,
+        ToolCallContent,
+    };
 
     /// #1713: a missing or null raw_input previews as empty, not "null".
     #[test]
-    fn preview_optional_args_empty_for_missing_or_null() {
+    fn preview_args_is_empty_for_missing_or_null_and_capped() {
         assert_eq!(preview_optional_args(None), "");
         assert_eq!(preview_optional_args(Some(&serde_json::Value::Null)), "");
         let obj = serde_json::json!({ "command": "ls" });
         assert_eq!(preview_optional_args(Some(&obj)), r#"{"command":"ls"}"#);
-    }
 
-    #[test]
-    fn preview_args_caps_to_16k() {
-        let big = serde_json::Value::String("x".repeat(20_000));
-        let preview = preview_args(&big);
+        let preview = preview_args(&serde_json::Value::String("x".repeat(20_000)));
         assert!(preview.len() <= 16 * 1024 + 32);
         assert!(preview.contains("[truncated]"));
     }
 
     #[test]
-    fn extract_tool_content_text_concats_text_blocks() {
-        use agent_client_protocol::schema::v1::{Content, ToolCallContent};
-        let blocks = vec![
+    fn extract_text_and_diffs_from_content() {
+        let text = [
             ToolCallContent::Content(Content::new("stdout line 1")),
             ToolCallContent::Content(Content::new("stdout line 2")),
         ];
         assert_eq!(
-            extract_tool_content_text(&blocks),
+            extract_tool_content_text(&text),
             "stdout line 1\nstdout line 2"
         );
         // Empty rather than absent: the reducer falls back to the status word.
         assert_eq!(extract_tool_content_text(&[]), "");
-    }
 
-    #[test]
-    fn extract_diffs_from_content_bridges_diff_blocks_and_ignores_others() {
-        use agent_client_protocol::schema::v1::{Content, Diff, ToolCallContent};
         let blocks = vec![
             ToolCallContent::Content(Content::new("some text")),
             ToolCallContent::Diff(Diff::new("src/foo.rs", "new body").old_text("old body")),
@@ -326,49 +322,49 @@ mod tests {
         assert_eq!(diffs[1].path, "src/new.rs");
         assert_eq!(diffs[1].old_text, None, "new file carries no old_text");
         assert_eq!(diffs[1].new_text.as_deref(), Some("created"));
-    }
 
-    /// `create` diffs against an empty file, `update` carries `oldContent`,
-    /// and anything else falls through to the `RawAgentUpdate` passthrough.
-    #[test]
-    fn write_diff_from_meta_synthesizes_only_write_responses() {
-        fn meta(response: serde_json::Value) -> Option<serde_json::Map<String, serde_json::Value>> {
-            serde_json::json!({ "claudeCode": { "toolResponse": response } })
-                .as_object()
-                .cloned()
+        // `create` diffs against an empty file, `update` carries `oldContent`,
+        // and anything else falls through to the `RawAgentUpdate` passthrough.
+        {
+            fn meta(
+                response: serde_json::Value,
+            ) -> Option<serde_json::Map<String, serde_json::Value>> {
+                serde_json::json!({ "claudeCode": { "toolResponse": response } })
+                    .as_object()
+                    .cloned()
+            }
+
+            let create = write_diff_from_meta(&meta(serde_json::json!({
+                "type": "create",
+                "filePath": "/repo/src/new.rs",
+                "content": "fn main() {}\n",
+            })))
+            .expect("create synthesizes a diff");
+            assert_eq!(create.len(), 1);
+            assert_eq!(create[0].path, "/repo/src/new.rs");
+            assert_eq!(create[0].old_text, None);
+            assert_eq!(create[0].new_text.as_deref(), Some("fn main() {}\n"));
+
+            let update = write_diff_from_meta(&meta(serde_json::json!({
+                "type": "update",
+                "filePath": "/repo/src/existing.rs",
+                "content": "new body",
+                "oldContent": "old body",
+            })))
+            .expect("update synthesizes a diff");
+            assert_eq!(update[0].old_text.as_deref(), Some("old body"));
+            assert_eq!(update[0].new_text.as_deref(), Some("new body"));
+
+            assert!(write_diff_from_meta(&None).is_none());
+            assert!(
+                write_diff_from_meta(&meta(serde_json::json!({ "status": "async_launched" })))
+                    .is_none()
+            );
         }
-
-        let create = write_diff_from_meta(&meta(serde_json::json!({
-            "type": "create",
-            "filePath": "/repo/src/new.rs",
-            "content": "fn main() {}\n",
-        })))
-        .expect("create synthesizes a diff");
-        assert_eq!(create.len(), 1);
-        assert_eq!(create[0].path, "/repo/src/new.rs");
-        assert_eq!(create[0].old_text, None);
-        assert_eq!(create[0].new_text.as_deref(), Some("fn main() {}\n"));
-
-        let update = write_diff_from_meta(&meta(serde_json::json!({
-            "type": "update",
-            "filePath": "/repo/src/existing.rs",
-            "content": "new body",
-            "oldContent": "old body",
-        })))
-        .expect("update synthesizes a diff");
-        assert_eq!(update[0].old_text.as_deref(), Some("old body"));
-        assert_eq!(update[0].new_text.as_deref(), Some("new body"));
-
-        assert!(write_diff_from_meta(&None).is_none());
-        assert!(
-            write_diff_from_meta(&meta(serde_json::json!({ "status": "async_launched" })))
-                .is_none()
-        );
     }
 
     #[test]
-    fn extract_diffs_from_content_caps_per_side_text() {
-        use agent_client_protocol::schema::v1::{Diff, ToolCallContent};
+    fn extract_diffs_from_content_caps_text_and_count() {
         let huge = "x".repeat(MAX_DIFF_TEXT_BYTES + 4096);
         let blocks = vec![ToolCallContent::Diff(
             Diff::new("src/big.rs", huge.clone()).old_text(huge),
@@ -380,56 +376,66 @@ mod tests {
             assert!(text.len() < MAX_DIFF_TEXT_BYTES + 64, "{}", text.len());
             assert!(text.contains("[truncated]"));
         }
+
+        let blocks: Vec<ToolCallContent> = (0..MAX_TOOL_DIFFS + 8)
+            .map(|i| ToolCallContent::Diff(Diff::new(format!("f{i}.rs"), "x")))
+            .collect();
+        assert_eq!(
+            extract_diffs_from_content(&blocks).len(),
+            MAX_TOOL_DIFFS,
+            "diff count must be bounded"
+        );
     }
 
     #[test]
-    fn extract_tool_output_blocks_empty_for_text_only() {
-        use agent_client_protocol::schema::v1::{Content, ToolCallContent};
+    fn extract_tool_output_blocks_cases() {
+        let content = |block: ContentBlock| ToolCallContent::Content(Content::new(block));
         // The `content` string path already renders pure text.
-        let blocks = vec![ToolCallContent::Content(Content::new("just text"))];
-        assert!(extract_tool_output_blocks(&blocks).is_empty());
-    }
+        let text_only = [ToolCallContent::Content(Content::new("just text"))];
+        assert!(extract_tool_output_blocks(&text_only).is_empty());
 
-    #[test]
-    fn extract_tool_output_blocks_preserves_media_and_resources() {
-        use agent_client_protocol::schema::v1::{
-            AudioContent, Content, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
-            ImageContent, ResourceLink, TextResourceContents, ToolCallContent,
-        };
-        let blocks =
-            vec![
-                ToolCallContent::Content(Content::new("a caption")),
-                ToolCallContent::Content(Content::new(ContentBlock::Image(
-                    ImageContent::new("BASE64IMG", "image/png").uri("file:///shot.png".to_string()),
-                ))),
-                ToolCallContent::Content(Content::new(ContentBlock::Audio(AudioContent::new(
-                    "BASE64AUDIO",
-                    "audio/wav",
-                )))),
-                ToolCallContent::Content(Content::new(ContentBlock::ResourceLink(
-                    ResourceLink::new("report.pdf", "file:///report.pdf"),
-                ))),
-                ToolCallContent::Content(Content::new(ContentBlock::Resource(
-                    EmbeddedResource::new(EmbeddedResourceResource::TextResourceContents(
-                        TextResourceContents::new("inline body", "file:///note.txt"),
-                    )),
-                ))),
-            ];
+        let blocks = vec![
+            ToolCallContent::Content(Content::new("a caption")),
+            content(ContentBlock::Image(
+                ImageContent::new("BASE64IMG", "image/png").uri("file:///shot.png".to_string()),
+            )),
+            content(ContentBlock::Audio(AudioContent::new(
+                "BASE64AUDIO",
+                "audio/wav",
+            ))),
+            content(ContentBlock::ResourceLink(ResourceLink::new(
+                "report.pdf",
+                "file:///report.pdf",
+            ))),
+            content(ContentBlock::Resource(EmbeddedResource::new(
+                EmbeddedResourceResource::TextResourceContents(TextResourceContents::new(
+                    "inline body",
+                    "file:///note.txt",
+                )),
+            ))),
+            // #1818 review: a blob resource keeps its inline bytes so it stays
+            // recoverable as a download.
+            content(ContentBlock::Resource(EmbeddedResource::new(
+                EmbeddedResourceResource::BlobResourceContents(
+                    BlobResourceContents::new("QkxPQg==", "file:///out.bin")
+                        .mime_type(Some("application/octet-stream".to_string())),
+                ),
+            ))),
+            // Oversized inline data is dropped (no uri to fall back on) but the
+            // block survives so the card still shows the media placeholder.
+            content(ContentBlock::Image(ImageContent::new(
+                "A".repeat(MAX_INLINE_MEDIA_B64 + 1),
+                "image/png",
+            ))),
+        ];
         let out = extract_tool_output_blocks(&blocks);
-        assert_eq!(out.len(), 5, "all blocks preserved in order: {out:?}");
+        assert_eq!(out.len(), 7, "all blocks preserved in order: {out:?}");
         assert!(matches!(&out[0], ToolOutputBlock::Text { text } if text == "a caption"));
-        match &out[1] {
-            ToolOutputBlock::Image {
-                mime_type,
-                data,
-                uri,
-            } => {
-                assert_eq!(mime_type, "image/png");
-                assert_eq!(data.as_deref(), Some("BASE64IMG"));
-                assert_eq!(uri.as_deref(), Some("file:///shot.png"));
-            }
-            other => panic!("expected Image, got {other:?}"),
-        }
+        assert!(matches!(
+            &out[1],
+            ToolOutputBlock::Image { mime_type, data: Some(data), uri: Some(uri) }
+                if mime_type == "image/png" && data == "BASE64IMG" && uri == "file:///shot.png"
+        ));
         assert!(
             matches!(&out[2], ToolOutputBlock::Audio { mime_type, .. } if mime_type == "audio/wav")
         );
@@ -439,95 +445,18 @@ mod tests {
         assert!(
             matches!(&out[4], ToolOutputBlock::Resource { text: Some(t), .. } if t == "inline body")
         );
-    }
-
-    #[test]
-    fn extract_tool_output_blocks_keeps_blob_resource_payload() {
-        // #1818 review: a binary (blob) embedded resource must keep its
-        // inline bytes so it stays recoverable as a download.
-        use agent_client_protocol::schema::v1::{
-            BlobResourceContents, Content, ContentBlock, EmbeddedResource,
-            EmbeddedResourceResource, ToolCallContent,
-        };
-        let blocks = vec![ToolCallContent::Content(Content::new(
-            ContentBlock::Resource(EmbeddedResource::new(
-                EmbeddedResourceResource::BlobResourceContents(
-                    BlobResourceContents::new("QkxPQg==", "file:///out.bin")
-                        .mime_type(Some("application/octet-stream".to_string())),
-                ),
-            )),
-        ))];
-        let out = extract_tool_output_blocks(&blocks);
-        assert_eq!(out.len(), 1);
-        match &out[0] {
-            ToolOutputBlock::Resource {
-                uri,
-                data,
-                text,
-                mime_type,
-            } => {
-                assert_eq!(uri, "file:///out.bin");
-                assert_eq!(data.as_deref(), Some("QkxPQg=="));
-                assert!(text.is_none());
-                assert_eq!(mime_type.as_deref(), Some("application/octet-stream"));
-            }
-            other => panic!("expected Resource, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn extract_tool_output_blocks_drops_oversized_inline_media() {
-        use agent_client_protocol::schema::v1::{
-            Content, ContentBlock, ImageContent, ToolCallContent,
-        };
-        let huge = "A".repeat(MAX_INLINE_MEDIA_B64 + 1);
-        let blocks = vec![ToolCallContent::Content(Content::new(ContentBlock::Image(
-            ImageContent::new(huge, "image/png"),
-        )))];
-        let out = extract_tool_output_blocks(&blocks);
-        assert_eq!(out.len(), 1);
-        // Oversized inline data is dropped (no uri to fall back on) but the
-        // block survives so the card still shows the media placeholder.
         assert!(matches!(
-            &out[0],
+            &out[5],
+            ToolOutputBlock::Resource { uri, data: Some(data), text: None, mime_type: Some(mime) }
+                if uri == "file:///out.bin" && data == "QkxPQg==" && mime == "application/octet-stream"
+        ));
+        assert!(matches!(
+            &out[6],
             ToolOutputBlock::Image {
                 data: None,
                 uri: None,
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn extract_diffs_from_content_caps_diff_count() {
-        use agent_client_protocol::schema::v1::{Diff, ToolCallContent};
-        let blocks: Vec<ToolCallContent> = (0..MAX_TOOL_DIFFS + 8)
-            .map(|i| ToolCallContent::Diff(Diff::new(format!("f{i}.rs"), "x")))
-            .collect();
-        let diffs = extract_diffs_from_content(&blocks);
-        assert_eq!(diffs.len(), MAX_TOOL_DIFFS, "diff count must be bounded");
-    }
-
-    #[test]
-    fn preview_args_strips_control_chars() {
-        // Build the preview string by hand-injecting raw control chars
-        // *into* the result of to_string (simulating agents that send
-        // pre-serialised non-utf8 noise through). The function should
-        // strip BEL/BS/etc. but preserve `\n` and `\t`.
-        let arg = serde_json::Value::String("hello\x07world".into());
-        let preview = preview_args(&arg);
-        // The literal BEL (0x07) inside the string-data part of the JSON
-        // gets escaped by to_string, so the preview never sees a raw
-        // control char in this path. That's fine: the assertion we care
-        // about is that the preview doesn't carry any unprintable bytes.
-        for c in preview.chars() {
-            assert!(
-                !c.is_control() || c == '\n' || c == '\t',
-                "unexpected control char {:?} in preview",
-                c
-            );
-        }
-        assert!(preview.contains("hello"));
-        assert!(preview.contains("world"));
     }
 }

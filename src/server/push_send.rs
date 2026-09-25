@@ -243,7 +243,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn endpoint_origin_strips_path_and_query() {
+    fn endpoint_origin_strips_path_and_query_and_rejects_garbage() {
         assert_eq!(
             endpoint_origin("https://fcm.googleapis.com/fcm/send/abc?x=1").unwrap(),
             "https://fcm.googleapis.com"
@@ -256,10 +256,6 @@ mod tests {
             endpoint_origin("http://localhost:8080/push/x").unwrap(),
             "http://localhost:8080"
         );
-    }
-
-    #[test]
-    fn endpoint_origin_rejects_garbage() {
         assert!(endpoint_origin("not-a-url").is_err());
         assert!(endpoint_origin("data:text/plain,hi").is_err());
     }

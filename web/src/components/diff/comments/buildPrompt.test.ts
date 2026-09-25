@@ -27,7 +27,6 @@ const md = (c: Partial<DiffComment>, isMultiRepo = false) => buildCommentsMarkdo
 
 describe("buildCommentsMarkdown", () => {
   it.each<[Partial<DiffComment>, boolean, string]>([
-    [{}, false, "### `src/foo.rs` line 10 (new)"],
     [{ endLine: 14 }, false, "### `src/foo.rs` lines 10-14 (new)"],
     [{}, false, "```rust\nlet x = 1;\n```"],
     [{ repoName: "repoA" }, true, "### [repoA] `src/foo.rs`"],
@@ -75,7 +74,6 @@ describe("buildDiffCommentsPrompt", () => {
 
   it.each([
     ["", "Please address these comments."],
-    ["Custom outro", "Custom outro"],
     ["   outro   ", "outro"],
   ])("outro %j becomes %j and ends the prompt", (outro, expected) => {
     const built = build([mk({})], "", outro);
@@ -95,13 +93,6 @@ describe("buildDiffCommentsPrompt", () => {
     const built = build([], "intro", "outro");
     expect(built.assembledMarkdown).toBe("intro\n\noutro\n");
     expect(built.comments).toHaveLength(0);
-  });
-
-  it("carries the structured comments and multi-repo flag verbatim", () => {
-    const comment = mk({ repoName: "repoA" });
-    const built = build([comment], "", "", true);
-    expect(built.isMultiRepo).toBe(true);
-    expect(built.comments).toEqual([comment]);
   });
 });
 

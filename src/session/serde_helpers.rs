@@ -44,14 +44,13 @@ mod tests {
     }
 
     #[test]
-    fn string_or_vec_with_string() {
-        let t: TestRequired = toml::from_str(r#"items = "hello""#).unwrap();
-        assert_eq!(t.items, vec!["hello"]);
-    }
-
-    #[test]
-    fn string_or_vec_with_array() {
-        let t: TestRequired = toml::from_str(r#"items = ["a", "b"]"#).unwrap();
-        assert_eq!(t.items, vec!["a", "b"]);
+    fn string_or_vec_accepts_a_string_or_an_array() {
+        for (raw, want) in [
+            (r#"items = "hello""#, vec!["hello"]),
+            (r#"items = ["a", "b"]"#, vec!["a", "b"]),
+        ] {
+            let t: TestRequired = toml::from_str(raw).unwrap();
+            assert_eq!(t.items, want);
+        }
     }
 }

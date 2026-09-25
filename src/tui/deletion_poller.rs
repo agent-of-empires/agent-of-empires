@@ -46,8 +46,9 @@ mod tests {
     }
 
     #[test]
-    fn test_deletion_poller_channel_communication() {
+    fn deletion_poller_round_trips_a_request() {
         let poller = DeletionPoller::new();
+        assert!(matches!(poller.try_recv_result(), Err(TryRecvError::Empty)));
         let instance = create_test_instance();
         let session_id = instance.id.clone();
 
@@ -74,11 +75,5 @@ mod tests {
 
         assert_eq!(result.session_id, session_id);
         assert!(!result.success);
-    }
-
-    #[test]
-    fn test_deletion_poller_try_recv_returns_empty_when_idle() {
-        let poller = DeletionPoller::new();
-        assert!(matches!(poller.try_recv_result(), Err(TryRecvError::Empty)));
     }
 }

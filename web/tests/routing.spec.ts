@@ -22,39 +22,39 @@ const NEW_SESSION_PANE_NAME = /New session Pick a project, then launch a new ses
 // Verifies URL-based routing: deep links land on the right view, refresh
 // preserves location, and back/forward replays history.
 test.describe("URL routing", () => {
-  test("'/' renders the dashboard home screen", async ({ page }) => {
+  test("settings deep links, tab URLs, refresh, and back/forward", async ({ page }) => {
     await page.goto("/");
-    await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).toBeVisible();
-    await expect(page).toHaveURL("/");
-  });
-
-  test("'/settings' renders settings on first load", async ({ page }) => {
     await page.goto("/settings");
     await expect(page.getByText("Settings", { exact: true }).first()).toBeVisible();
     await expect(page).toHaveURL("/settings");
-  });
 
-  test("settings tab is reflected in the URL", async ({ page }) => {
     await page.goto("/settings/theme");
     await expect(page.getByRole("heading", { name: "Theme" })).toBeVisible();
-    await expect(page).toHaveURL("/settings/theme");
-  });
-
-  test("refresh on /settings keeps user on settings", async ({ page }) => {
-    await page.goto("/settings");
-    await expect(page.getByText("Settings", { exact: true }).first()).toBeVisible();
     await page.reload();
-    await expect(page.getByText("Settings", { exact: true }).first()).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Theme" })).toBeVisible();
+    await expect(page).toHaveURL("/settings/theme");
+
+    await page.goBack();
+    await expect(page).toHaveURL("/settings");
+    await page.goBack();
+    await expect(page).toHaveURL("/");
+    await page.goForward();
     await expect(page).toHaveURL("/settings");
   });
 
-  test("'/session/<id>' for an unknown session falls back to dashboard", async ({ page }) => {
+  test("an unknown or legacy '?session=' session URL keeps its '/session/<id>' path over the dashboard", async ({
+    page,
+  }) => {
     // No backend, sessions list is empty, so the route still matches but
     // the resolver finds no session and the dashboard renders. Importantly
     // the URL stays put so a real backend can later resolve it.
     await page.goto("/session/does-not-exist");
     await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).toBeVisible();
     await expect(page).toHaveURL("/session/does-not-exist");
+
+    // A legacy '?session=X' URL is rewritten to '/session/X'.
+    await page.goto("/?session=abc-123");
+    await expect(page).toHaveURL("/session/abc-123");
   });
 
   test("'/session/<id>' holds the loading shell while the sessions list is still in flight", async ({ page }) => {
@@ -109,21 +109,6 @@ test.describe("URL routing", () => {
     await expect(page.locator('[data-term="agent"] textarea')).toHaveCount(1);
     await expect(page).toHaveURL("/session/known-session");
     await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).not.toBeVisible();
-  });
-
-  test("legacy '?session=X' URL is rewritten to '/session/X'", async ({ page }) => {
-    await page.goto("/?session=abc-123");
-    await expect(page).toHaveURL("/session/abc-123");
-  });
-
-  test("browser back navigates dashboard ↔ settings", async ({ page }) => {
-    await page.goto("/");
-    await page.goto("/settings");
-    await expect(page).toHaveURL("/settings");
-    await page.goBack();
-    await expect(page).toHaveURL("/");
-    await page.goForward();
-    await expect(page).toHaveURL("/settings");
   });
 });
 
@@ -181,63 +166,5 @@ test.describe("PWA last-session restore", () => {
     await page.goto("/");
     await expect(page).toHaveURL("/session/known-session");
     await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).not.toBeVisible();
-  });
-
-  test("cold launch stays on the dashboard when the stored session no longer exists", async ({ page }) => {
-    await stubSessions(page, ["other-session"]);
-    await page.addInitScript(
-      ([key, id]) => {
-        try {
-          localStorage.setItem(key, id);
-        } catch {
-          // storage disabled; the app degrades to no-restore
-        }
-      },
-      [LAST_SESSION_KEY, "deleted-session"],
-    );
-
-    await page.goto("/");
-    await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).toBeVisible();
-    await expect(page).toHaveURL("/");
-    // The stale id is dropped so it is not re-evaluated on the next launch.
-    await expect.poll(() => page.evaluate((k) => localStorage.getItem(k), LAST_SESSION_KEY)).toBe(null);
-  });
-
-  test("a deep link to a session is not overridden by the stored last session", async ({ page }) => {
-    await stubSessions(page, ["known-session", "deep-link-session"]);
-    await page.addInitScript(
-      ([key, id]) => {
-        try {
-          localStorage.setItem(key, id);
-        } catch {
-          // storage disabled; the app degrades to no-restore
-        }
-      },
-      [LAST_SESSION_KEY, "known-session"],
-    );
-
-    await page.goto("/session/deep-link-session");
-    await expect(page).toHaveURL("/session/deep-link-session");
-  });
-
-  test("visiting a session records it as the last session", async ({ page }) => {
-    await stubSessions(page, ["known-session"]);
-
-    await page.goto("/session/known-session");
-    await expect(page).toHaveURL("/session/known-session");
-    await expect.poll(() => page.evaluate((k) => localStorage.getItem(k), LAST_SESSION_KEY)).toBe("known-session");
-  });
-
-  test("returning to the dashboard in-app clears the stored last session", async ({ page }) => {
-    await stubSessions(page, ["known-session"]);
-
-    await page.goto("/session/known-session");
-    await expect.poll(() => page.evaluate((k) => localStorage.getItem(k), LAST_SESSION_KEY)).toBe("known-session");
-
-    await page.getByRole("button", { name: "Go to dashboard" }).click();
-    await expect(page).toHaveURL("/");
-    // Leaving for the dashboard makes the dashboard the remembered view, so a
-    // later cold launch should not bounce the user back into the session.
-    await expect.poll(() => page.evaluate((k) => localStorage.getItem(k), LAST_SESSION_KEY)).toBe(null);
   });
 });

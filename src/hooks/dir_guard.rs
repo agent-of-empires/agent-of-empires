@@ -639,25 +639,64 @@ mod tests {
 
     #[test]
     #[serial(hook_base)]
-    fn init_succeeds_on_fresh_dir() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
-        with_hook_base(|fd| {
+    fn init_accepts_fresh_or_correct_base_and_caches_the_fd() {
+        for precreate in [false, true] {
+            let (_g, base, _tmp) = BaseGuard::fresh();
+            if precreate {
+                make_correct_base(&base);
+            }
+            let raw1 = with_hook_base(|fd| {
+                let st = fstat(fd)?;
+                assert_eq!(st.st_mode & 0o7777, 0o700, "precreate={precreate}");
+                assert_eq!(st.st_uid, geteuid().as_raw());
+                Ok(fd.as_raw_fd())
+            })
+            .expect("init must succeed");
             assert!(base.is_dir());
-            let st = fstat(fd)?;
-            let mode = st.st_mode & 0o7777;
-            assert_eq!(mode, 0o700, "got mode {mode:o}");
-            assert_eq!(st.st_uid, geteuid().as_raw());
-            Ok(())
-        })
-        .expect("init must succeed on fresh path");
+            let after_first = open_calls();
+            let raw2 = with_hook_base(|fd| Ok(fd.as_raw_fd())).unwrap();
+            assert_eq!(raw1, raw2, "cached fd must be reused");
+            assert_eq!(open_calls(), after_first, "no new open on second call");
+        }
     }
 
     #[test]
     #[serial(hook_base)]
-    fn init_succeeds_when_base_already_correct() {
+    fn instance_subdir_creates_with_0o700_when_absent() {
         let (_g, base, _tmp) = BaseGuard::fresh();
         make_correct_base(&base);
-        with_hook_base(|_| Ok(())).expect("init must succeed when base already 0700 and ours");
+        let fd = open_instance_dir("test_inst_a").unwrap();
+        let st = fstat(&fd).unwrap();
+        assert_eq!(st.st_mode & 0o7777, 0o700);
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn read_file_at_returns_none_when_absent() {
+        let (_g, base, _tmp) = BaseGuard::fresh();
+        make_correct_base(&base);
+        let dir = open_instance_dir("ronone").unwrap();
+        let got = read_file_at(dir.as_fd(), "missing", 64).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn open_instance_dir_read_only_returns_none_for_absent() {
+        let (_g, base, _tmp) = BaseGuard::fresh();
+        make_correct_base(&base);
+        // Note: read_only does NOT mkdir; absent means None.
+        let got = open_instance_dir_read_only("missing_inst").unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn cleanup_handles_nonexistent_instance() {
+        let (_g, base, _tmp) = BaseGuard::fresh();
+        make_correct_base(&base);
+        // Must not panic, must not error.
+        remove_instance_dir("never_existed").unwrap();
     }
 
     #[test]
@@ -755,32 +794,6 @@ mod tests {
 
     #[test]
     #[serial(hook_base)]
-    fn init_caches_success() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
-        make_correct_base(&base);
-        let raw1 = with_hook_base(|fd| Ok(fd.as_raw_fd())).unwrap();
-        let after_first = open_calls();
-        let raw2 = with_hook_base(|fd| Ok(fd.as_raw_fd())).unwrap();
-        assert_eq!(raw1, raw2, "cached fd must be byte-equal across calls");
-        assert_eq!(
-            open_calls(),
-            after_first,
-            "no new open syscall on second call"
-        );
-    }
-
-    #[test]
-    #[serial(hook_base)]
-    fn instance_subdir_creates_with_0o700_when_absent() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
-        make_correct_base(&base);
-        let fd = open_instance_dir("test_inst_a").unwrap();
-        let st = fstat(&fd).unwrap();
-        assert_eq!(st.st_mode & 0o7777, 0o700);
-    }
-
-    #[test]
-    #[serial(hook_base)]
     fn instance_subdir_rejects_symlink_leaf() {
         let (_g, base, tmp) = BaseGuard::fresh();
         make_correct_base(&base);
@@ -793,31 +806,6 @@ mod tests {
             s.contains("symlink") || s.contains("ELOOP") || s.contains("Too many levels"),
             "expected ELOOP, got: {s}"
         );
-    }
-
-    #[test]
-    #[serial(hook_base)]
-    fn write_short_then_read_file_at_roundtrip() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
-        make_correct_base(&base);
-        let dir = open_instance_dir("rt").unwrap();
-        write_short(dir.as_fd(), "status", b"running").unwrap();
-        let bytes = read_file_at(dir.as_fd(), "status", 64).unwrap().unwrap();
-        assert_eq!(bytes, b"running");
-    }
-
-    #[test]
-    #[serial(hook_base)]
-    fn write_atomic_renames_atomically() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
-        make_correct_base(&base);
-        let dir = open_instance_dir("atomic_rt").unwrap();
-        let uuid = b"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        write_atomic(dir.as_fd(), "session_id", uuid).unwrap();
-        let bytes = read_file_at(dir.as_fd(), "session_id", 64)
-            .unwrap()
-            .unwrap();
-        assert_eq!(bytes, uuid);
     }
 
     #[test]
@@ -870,52 +858,26 @@ mod tests {
 
     #[test]
     #[serial(hook_base)]
-    fn cleanup_does_not_follow_leaf_symlink() {
-        let (_g, base, tmp) = BaseGuard::fresh();
-        make_correct_base(&base);
+    fn cleanup_does_not_follow_leaf_symlinks() {
+        let (_g, base, tmp) = BaseGuard::ready();
         let _ = open_instance_dir("cleanup_sym").unwrap();
         let canary = tmp.path().join("cleanup_canary");
         std::fs::write(&canary, b"keep").unwrap();
-        // Plant a symlink leaf inside the per-instance dir.
-        std::os::unix::fs::symlink(&canary, base.join("cleanup_sym").join("escape")).unwrap();
+        let decoy_dir = tmp.path().join("decoy_subdir");
+        std::fs::create_dir_all(&decoy_dir).unwrap();
+        std::fs::write(decoy_dir.join("witness"), b"keep").unwrap();
+        let instance = base.join("cleanup_sym");
+        std::os::unix::fs::symlink(&canary, instance.join("file_escape")).unwrap();
+        std::os::unix::fs::symlink(&decoy_dir, instance.join("dir_escape")).unwrap();
+
         remove_instance_dir("cleanup_sym").unwrap();
-        // The link is gone, the canary lives.
-        assert!(!base.join("cleanup_sym").exists(), "subdir must be removed");
-        let mut got = String::new();
-        std::fs::File::open(&canary)
-            .unwrap()
-            .read_to_string(&mut got)
-            .unwrap();
-        assert_eq!(got, "keep");
-    }
-
-    #[test]
-    #[serial(hook_base)]
-    fn cleanup_handles_nonexistent_instance() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
-        make_correct_base(&base);
-        // Must not panic, must not error.
-        remove_instance_dir("never_existed").unwrap();
-    }
-
-    #[test]
-    #[serial(hook_base)]
-    fn read_file_at_returns_none_when_absent() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
-        make_correct_base(&base);
-        let dir = open_instance_dir("ronone").unwrap();
-        let got = read_file_at(dir.as_fd(), "missing", 64).unwrap();
-        assert!(got.is_none());
-    }
-
-    #[test]
-    #[serial(hook_base)]
-    fn open_instance_dir_read_only_returns_none_for_absent() {
-        let (_g, base, _tmp) = BaseGuard::fresh();
-        make_correct_base(&base);
-        // Note: read_only does NOT mkdir; absent means None.
-        let got = open_instance_dir_read_only("missing_inst").unwrap();
-        assert!(got.is_none());
+        assert!(!instance.exists(), "subdir must be removed");
+        assert_eq!(std::fs::read_to_string(&canary).unwrap(), "keep");
+        assert_eq!(
+            std::fs::read_to_string(decoy_dir.join("witness")).unwrap(),
+            "keep",
+            "decoy directory contents must be intact"
+        );
     }
 
     #[test]
@@ -939,24 +901,6 @@ mod tests {
             Some("/tmp"),
             "production hook base must live under /tmp; got {}",
             path.display()
-        );
-    }
-
-    #[test]
-    #[serial(hook_base)]
-    fn cleanup_rejects_subdir_symlink_at_leaf() {
-        let (_g, base, tmp) = BaseGuard::ready();
-        let _ = open_instance_dir("subdir_sym").unwrap();
-        let target = tmp.path().join("decoy_subdir");
-        std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(target.join("witness"), b"keep").unwrap();
-        std::os::unix::fs::symlink(&target, base.join("subdir_sym").join("escape")).unwrap();
-        remove_instance_dir("subdir_sym").unwrap();
-        assert!(target.is_dir(), "decoy directory must survive cleanup");
-        assert_eq!(
-            std::fs::read_to_string(target.join("witness")).unwrap(),
-            "keep",
-            "decoy contents must be intact"
         );
     }
 

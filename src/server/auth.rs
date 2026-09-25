@@ -880,10 +880,7 @@ mod tests {
             ip("192.168.1.100"),
             "a remote peer cannot forge its own origin"
         );
-    }
 
-    #[test]
-    fn is_local_trusted_recognizes_loopback() {
         for local in ["127.0.0.1", "::1"] {
             assert!(is_local_trusted(ip(local)), "{local}");
         }
@@ -974,21 +971,6 @@ mod tests {
     }
 
     #[test]
-    fn build_cookie_carries_secure_only_over_tls() {
-        let insecure = build_cookie("mytoken", false, 14400);
-        for needle in [
-            "aoe_token=mytoken",
-            "HttpOnly",
-            "SameSite=Strict",
-            "Max-Age=14400",
-        ] {
-            assert!(insecure.contains(needle), "{insecure:?} lacks {needle}");
-        }
-        assert!(!insecure.contains("Secure"));
-        assert!(build_cookie("mytoken", true, 14400).contains("Secure"));
-    }
-
-    #[test]
     fn extract_tokens_prefers_the_cookie_and_ignores_other_schemes() {
         let cookie_and_bearer = build_request_with_headers(vec![
             ("cookie", "aoe_token=cookie_tok"),
@@ -1010,15 +992,6 @@ mod tests {
 
         let basic = build_request_with_headers(vec![("authorization", "Basic dXNlcjpwYXNz")]);
         assert!(extract_tokens(&basic).is_empty());
-    }
-
-    #[test]
-    fn strip_ws_prefix_requires_the_dot_separator() {
-        assert_eq!(strip_ws_prefix("aoe-token.abc", "aoe-token"), Some("abc"));
-        assert_eq!(strip_ws_prefix("aoe-device.xyz", "aoe-device"), Some("xyz"));
-        // No leading dot -> not a prefixed value, just a coincidentally matching string.
-        assert_eq!(strip_ws_prefix("aoe-tokenabc", "aoe-token"), None);
-        assert_eq!(strip_ws_prefix("graphql-ws", "aoe-token"), None);
     }
 
     #[test]
@@ -1050,6 +1023,12 @@ mod tests {
             "not-base64-and-wrong-length",
         )]);
         assert!(extract_device_binding(&malformed).is_none());
+
+        assert_eq!(strip_ws_prefix("aoe-token.abc", "aoe-token"), Some("abc"));
+        assert_eq!(strip_ws_prefix("aoe-device.xyz", "aoe-device"), Some("xyz"));
+        // No leading dot -> not a prefixed value, just a coincidentally matching string.
+        assert_eq!(strip_ws_prefix("aoe-tokenabc", "aoe-token"), None);
+        assert_eq!(strip_ws_prefix("graphql-ws", "aoe-token"), None);
     }
 
     /// Regression test for the token-cookie clobber bug: the middleware appends its
@@ -1085,6 +1064,18 @@ mod tests {
             headers.get("x-aoe-token").and_then(|v| v.to_str().ok()),
             Some("tok123")
         );
+
+        let insecure = build_cookie("mytoken", false, 14400);
+        for needle in [
+            "aoe_token=mytoken",
+            "HttpOnly",
+            "SameSite=Strict",
+            "Max-Age=14400",
+        ] {
+            assert!(insecure.contains(needle), "{insecure:?} lacks {needle}");
+        }
+        assert!(!insecure.contains("Secure"));
+        assert!(build_cookie("mytoken", true, 14400).contains("Secure"));
     }
 
     /// The login-bootstrap allow-list, and the sliding-window refresh that tracks it.

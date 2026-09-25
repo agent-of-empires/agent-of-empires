@@ -235,14 +235,22 @@ mod tests {
     }
 
     #[test]
-    fn catalog_ids_are_unique_and_nonempty() {
+    fn catalog_entries_are_complete_and_unique() {
         let ids: Vec<&str> = catalog().iter().map(|t| t.id).collect();
         assert!(!ids.is_empty());
         for tip in catalog() {
             assert!(!tip.id.is_empty(), "every tip needs an id");
             assert!(!tip.title.is_empty(), "every tip needs a title");
             assert!(!tip.body.is_empty(), "every tip needs a body");
+            assert!(!tip.surfaces.is_empty(), "{} lists no surface", tip.id);
+            // Web bodies render as-is, so a `{...}` placeholder would leak into the dashboard.
+            if tip.surfaces.contains(&TipSurface::Web) {
+                assert!(!tip.body.contains('{'), "{} has a placeholder", tip.id);
+            }
+            assert!(id_in_catalog(tip.id));
         }
+        assert!(!id_in_catalog("nope"));
+        assert!(!id_in_catalog(""));
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -313,24 +321,6 @@ mod tests {
     }
 
     #[test]
-    fn system_health_tip_requires_earned_and_undiscovered() {
-        let tip = by_id("system-health").unwrap();
-        let cases = [
-            (false, false, false),
-            (true, false, true),
-            (true, true, false),
-        ];
-        for (earned, used, expected) in cases {
-            let signals = TipSignals {
-                system_health_tip_earned: earned,
-                used_system_health: used,
-                ..TipSignals::default()
-            };
-            assert_eq!(tip.is_eligible(TipSurface::Tui, &signals), expected);
-        }
-    }
-
-    #[test]
     fn next_earned_pop_only_when_eligible_and_unseen() {
         assert!(next_earned_pop(TipSurface::Tui, &[], &signals(0)).is_none());
 
@@ -348,13 +338,6 @@ mod tests {
             &signals(NEW_FROM_SELECTION_TIP_THRESHOLD)
         )
         .is_none());
-    }
-
-    #[test]
-    fn every_tip_lists_at_least_one_surface() {
-        for tip in catalog() {
-            assert!(!tip.surfaces.is_empty(), "{} lists no surface", tip.id);
-        }
     }
 
     #[test]
@@ -381,20 +364,20 @@ mod tests {
     }
 
     #[test]
-    fn web_tips_carry_no_keybinding_placeholders() {
-        // Web bodies render as-is, so a `{...}` placeholder would leak into the dashboard.
-        for tip in catalog() {
-            if tip.surfaces.contains(&TipSurface::Web) {
-                assert!(!tip.body.contains('{'), "{} has a placeholder", tip.id);
-            }
+    fn system_health_tip_requires_earned_and_undiscovered() {
+        let tip = by_id("system-health").unwrap();
+        let cases = [
+            (false, false, false),
+            (true, false, true),
+            (true, true, false),
+        ];
+        for (earned, used, expected) in cases {
+            let signals = TipSignals {
+                system_health_tip_earned: earned,
+                used_system_health: used,
+                ..TipSignals::default()
+            };
+            assert_eq!(tip.is_eligible(TipSurface::Tui, &signals), expected);
         }
-    }
-
-    #[test]
-    fn id_in_catalog_matches_known_ids_only() {
-        assert!(id_in_catalog("new-from-selection"));
-        assert!(id_in_catalog("install-dashboard-pwa"));
-        assert!(!id_in_catalog("nope"));
-        assert!(!id_in_catalog(""));
     }
 }

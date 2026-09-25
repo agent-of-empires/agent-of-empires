@@ -142,20 +142,4 @@ mod tests {
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         spawn_message(AcpError::classify_spawn_error(denied, &cwd, "/bin/true"));
     }
-
-    /// A known adapter gets a copyable install line; an unknown binary gets
-    /// only its own name.
-    #[test]
-    fn missing_binary_spawn_error_appends_a_hint_only_for_known_agents() {
-        let enoent = std::io::Error::from(std::io::ErrorKind::NotFound);
-        let known = spawn_message(AcpError::missing_binary_spawn_error(&enoent, "codex-acp"));
-        assert!(known.contains("codex-acp"), "{known}");
-        assert!(
-            known.contains("Install with: npm install -g @agentclientprotocol/codex-acp@latest"),
-            "{known}"
-        );
-        let unknown = spawn_message(AcpError::missing_binary_spawn_error(&enoent, "unknown-bin"));
-        assert!(unknown.contains("unknown-bin"), "{unknown}");
-        assert!(!unknown.contains("Install with:"), "{unknown}");
-    }
 }

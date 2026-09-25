@@ -2,11 +2,8 @@
 
 use super::*;
 
-/// Default `RowTagMode::Branch` keeps worktree branch information visible.
-#[test]
-#[serial]
-fn test_default_row_tag_mode_renders_branch_tag() {
-    let mut inst = Instance::new("my-session", "/tmp/a");
+fn worktree_instance(title: &str) -> Instance {
+    let mut inst = Instance::new(title, "/tmp/a");
     inst.worktree_info = Some(crate::session::WorktreeInfo {
         branch: "feature/foo".to_string(),
         main_repo_path: "/tmp/a-main".to_string(),
@@ -14,389 +11,131 @@ fn test_default_row_tag_mode_renders_branch_tag() {
         created_at: chrono::Utc::now(),
         base_branch: None,
     });
-
-    let text = rendered_single_session_text(inst, crate::session::config::RowTagMode::default());
-    assert!(
-        text.contains("[foo         ]"),
-        "default row tag mode should show the compact branch tag: {text:?}"
-    );
+    inst
 }
 
-/// `RowTagMode::Auto` shows the profile short code in all-profiles view.
-#[test]
-#[serial]
-fn test_row_tag_auto_renders_profile_in_all_profiles_view() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-
-    let storage_a = Storage::new_unwatched("alpha").unwrap();
-    let instances_a = vec![Instance::new("A1", "/tmp/a")];
-    let group_tree_a = GroupTree::new_with_groups(&instances_a, &[]);
-    storage_a
-        .update(|i, g| {
-            *i = instances_a.to_vec();
-            *g = group_tree_a.get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let storage_b = Storage::new_unwatched("beta").unwrap();
-    let instances_b = vec![Instance::new("B1", "/tmp/b")];
-    let group_tree_b = GroupTree::new_with_groups(&instances_b, &[]);
-    storage_b
-        .update(|i, g| {
-            *i = instances_b.to_vec();
-            *g = group_tree_b.get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view =
-        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.row_tag_mode = crate::session::config::RowTagMode::Auto;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    let mut seen = 0;
-    for item in &view.flat_items {
-        if let Item::Session { id, .. } = item {
-            let profile = view.get_instance(id).unwrap().source_profile.clone();
-            let code = crate::tui::home::render::profile_short_code(&profile);
-            let rendered = crate::tui::home::render::RowTag {
-                content: code.clone(),
-                max_width: 4,
-            }
-            .rendered();
-            let text = rendered_row_text(&view, item);
-            assert!(
-                text.contains(&rendered),
-                "all-view row for profile {profile} missing tag {rendered}: {text:?}"
-            );
-            seen += 1;
-        }
-    }
-    assert_eq!(seen, 2, "expected both profile sessions to render");
-}
-
-/// `RowTagMode::Auto` does not render in a filtered view (profile already
-/// in the list title).
-#[test]
-#[serial]
-fn test_row_tag_auto_omits_tag_in_filtered_view() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-
-    let storage_a = Storage::new_unwatched("alpha").unwrap();
-    let instances_a = vec![Instance::new("A1", "/tmp/a")];
-    let group_tree_a = GroupTree::new_with_groups(&instances_a, &[]);
-    storage_a
-        .update(|i, g| {
-            *i = instances_a.to_vec();
-            *g = group_tree_a.get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("alpha".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.row_tag_mode = crate::session::config::RowTagMode::Auto;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    let code = crate::tui::home::render::profile_short_code("alpha");
-    let rendered = crate::tui::home::render::RowTag {
-        content: code,
-        max_width: 4,
-    }
-    .rendered();
-    for item in &view.flat_items {
-        if let Item::Session { .. } = item {
-            let text = rendered_row_text(&view, item);
-            assert!(
-                !text.contains(&rendered),
-                "Auto in filtered view should omit the tag: {text:?}"
-            );
-        }
-    }
-}
-
-/// `RowTagMode::Profile` renders the profile tag in BOTH views (unlike
-/// Auto which gates on all-profiles view).
-#[test]
-#[serial]
-fn test_row_tag_profile_renders_in_filtered_view() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-
-    let storage_a = Storage::new_unwatched("alpha").unwrap();
-    let instances_a = vec![Instance::new("A1", "/tmp/a")];
-    let group_tree_a = GroupTree::new_with_groups(&instances_a, &[]);
-    storage_a
-        .update(|i, g| {
-            *i = instances_a.to_vec();
-            *g = group_tree_a.get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("alpha".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.row_tag_mode = crate::session::config::RowTagMode::Profile;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    let code = crate::tui::home::render::profile_short_code("alpha");
-    let rendered = crate::tui::home::render::RowTag {
-        content: code,
-        max_width: 4,
-    }
-    .rendered();
-    let mut seen = 0;
-    for item in &view.flat_items {
-        if let Item::Session { .. } = item {
-            let text = rendered_row_text(&view, item);
-            assert!(
-                text.contains(&rendered),
-                "Profile mode should always render the tag: {text:?}"
-            );
-            seen += 1;
-        }
-    }
-    assert!(seen > 0);
-}
-
-/// `RowTagMode::Branch` owns the branch suffix. It renders a compact tag even
-/// when the title differs from the branch, with no raw hardcoded branch suffix.
-#[test]
-#[serial]
-fn test_row_tag_branch_renders_when_branch_differs_from_title() {
-    let mut inst = Instance::new("my-session", "/tmp/a");
-    inst.worktree_info = Some(crate::session::WorktreeInfo {
+fn workspace_instance() -> Instance {
+    let repo = |name: &str| crate::session::WorkspaceRepo {
+        name: name.to_string(),
+        source_path: format!("/src/{name}"),
         branch: "feature/foo".to_string(),
-        main_repo_path: "/tmp/a-main".to_string(),
+        worktree_path: format!("/tmp/workspace/{name}"),
+        main_repo_path: format!("/src/{name}"),
         managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
+        branch_preexisting: false,
         base_branch: None,
-    });
-
-    let text = rendered_single_session_text(inst, crate::session::config::RowTagMode::Branch);
-    assert!(
-        text.contains("[foo         ]"),
-        "Branch mode should render the compact branch tag: {text:?}"
-    );
-    assert!(
-        !text.contains("feature/foo"),
-        "Branch mode should not render the old raw branch suffix: {text:?}"
-    );
-}
-
-/// `RowTagMode::Branch` renders the tag when title matches branch.
-#[test]
-#[serial]
-fn test_row_tag_branch_renders_when_title_matches_branch() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-
-    let storage = Storage::new_unwatched("alpha").unwrap();
-    // Title and branch MATCH, so the divergence display stays quiet.
-    let mut inst = Instance::new("feature/foo", "/tmp/a");
-    inst.worktree_info = Some(crate::session::WorktreeInfo {
-        branch: "feature/foo".to_string(),
-        main_repo_path: "/tmp/a-main".to_string(),
-        managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
-        base_branch: None,
-    });
-    let instances = vec![inst];
-    let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = group_tree.get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view =
-        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.row_tag_mode = crate::session::config::RowTagMode::Branch;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    // The tag uses the last `/`-segment of the branch and pads to the branch
-    // tag width so the row layout stays stable.
-    let rendered = crate::tui::home::render::RowTag {
-        content: "foo".to_string(),
-        max_width: 12,
-    }
-    .rendered();
-    for item in &view.flat_items {
-        if let Item::Session { .. } = item {
-            let text = rendered_row_text(&view, item);
-            assert!(
-                text.contains(&rendered),
-                "Branch mode must render the tag when divergence display is quiet: {text:?}"
-            );
-        }
-    }
-}
-
-#[test]
-#[serial]
-fn test_row_tag_none_hides_worktree_branch_suffix() {
-    let mut inst = Instance::new("my-session", "/tmp/a");
-    inst.worktree_info = Some(crate::session::WorktreeInfo {
-        branch: "feature/foo".to_string(),
-        main_repo_path: "/tmp/a-main".to_string(),
-        managed_by_aoe: true,
-        created_at: chrono::Utc::now(),
-        base_branch: None,
-    });
-
-    let text = rendered_single_session_text(inst, crate::session::config::RowTagMode::None);
-    assert!(
-        !text.contains("feature/foo") && !text.contains("[foo") && !text.contains('['),
-        "None mode should hide all worktree suffix metadata: {text:?}"
-    );
-}
-
-#[test]
-#[serial]
-fn test_row_tag_none_hides_workspace_suffix() {
+        base_branch_override: None,
+    };
     let mut inst = Instance::new("workspace-session", "/tmp/workspace");
     inst.workspace_info = Some(crate::session::WorkspaceInfo {
         branch: "feature/foo".to_string(),
         workspace_dir: "/tmp/workspace".to_string(),
-        repos: vec![
-            crate::session::WorkspaceRepo {
-                name: "api".to_string(),
-                source_path: "/src/api".to_string(),
-                branch: "feature/foo".to_string(),
-                worktree_path: "/tmp/workspace/api".to_string(),
-                main_repo_path: "/src/api".to_string(),
-                managed_by_aoe: true,
-                branch_preexisting: false,
-                base_branch: None,
-                base_branch_override: None,
-            },
-            crate::session::WorkspaceRepo {
-                name: "web".to_string(),
-                source_path: "/src/web".to_string(),
-                branch: "feature/foo".to_string(),
-                worktree_path: "/tmp/workspace/web".to_string(),
-                main_repo_path: "/src/web".to_string(),
-                managed_by_aoe: true,
-                branch_preexisting: false,
-                base_branch: None,
-                base_branch_override: None,
-            },
-        ],
+        repos: vec![repo("api"), repo("web")],
         created_at: chrono::Utc::now(),
         cleanup_on_delete: true,
     });
-
-    let text = rendered_single_session_text(inst, crate::session::config::RowTagMode::None);
-    assert!(
-        !text.contains("feature/foo") && !text.contains("repos") && !text.contains('['),
-        "None mode should hide all workspace suffix metadata: {text:?}"
-    );
+    inst
 }
 
+/// Row tags in the all-profiles view. Branch (the default) owns the branch suffix: a compact
+/// last-segment tag, never the raw branch, whether or not the title matches it, and
+/// `branch+N` for workspaces. None hides every suffix; Auto shows the profile short code.
 #[test]
 #[serial]
-fn test_row_tag_branch_renders_workspace_branch_repo_count() {
-    let mut inst = Instance::new("workspace-session", "/tmp/workspace");
-    inst.workspace_info = Some(crate::session::WorkspaceInfo {
-        branch: "feature/foo".to_string(),
-        workspace_dir: "/tmp/workspace".to_string(),
-        repos: vec![
-            crate::session::WorkspaceRepo {
-                name: "api".to_string(),
-                source_path: "/src/api".to_string(),
-                branch: "feature/foo".to_string(),
-                worktree_path: "/tmp/workspace/api".to_string(),
-                main_repo_path: "/src/api".to_string(),
-                managed_by_aoe: true,
-                branch_preexisting: false,
-                base_branch: None,
-                base_branch_override: None,
-            },
-            crate::session::WorkspaceRepo {
-                name: "web".to_string(),
-                source_path: "/src/web".to_string(),
-                branch: "feature/foo".to_string(),
-                worktree_path: "/tmp/workspace/web".to_string(),
-                main_repo_path: "/src/web".to_string(),
-                managed_by_aoe: true,
-                branch_preexisting: false,
-                base_branch: None,
-                base_branch_override: None,
-            },
-        ],
-        created_at: chrono::Utc::now(),
-        cleanup_on_delete: true,
-    });
-
-    let text = rendered_single_session_text(inst, crate::session::config::RowTagMode::Branch);
-    assert!(
-        text.contains("[foo+2       ]"),
-        "Branch mode should render compact workspace branch and repo count: {text:?}"
-    );
-}
-
-/// Legacy `Instance::new` left `source_profile` empty before the per-profile plumbing
-/// landed, so the render branch must skip the tag rather than emit a literal `  []`.
-#[test]
-#[serial]
-fn test_row_tag_auto_skips_for_empty_source_profile() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-
-    let storage = Storage::new_unwatched("legacy").unwrap();
-    let mut inst = Instance::new("Legacy1", "/tmp/legacy");
-    inst.source_profile = String::new();
-    let instances = vec![inst];
-    let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = group_tree.get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view =
-        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.row_tag_mode = crate::session::config::RowTagMode::Auto;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    for item in &view.flat_items {
-        if let Item::Session { .. } = item {
-            let text = rendered_row_text(&view, item);
+fn test_row_tag_modes_in_all_profiles_view() {
+    use crate::session::config::RowTagMode;
+    let alpha_tag = crate::tui::home::render::RowTag {
+        content: crate::tui::home::render::profile_short_code("alpha"),
+        max_width: 4,
+    }
+    .rendered();
+    let alpha_needles = [alpha_tag.as_str()];
+    let cases: [(Instance, RowTagMode, &[&str], &[&str]); 7] = [
+        (
+            worktree_instance("my-session"),
+            RowTagMode::default(),
+            &["[foo         ]"],
+            &[],
+        ),
+        (
+            worktree_instance("my-session"),
+            RowTagMode::Branch,
+            &["[foo         ]"],
+            &["feature/foo"],
+        ),
+        (
+            worktree_instance("feature/foo"),
+            RowTagMode::Branch,
+            &["[foo         ]"],
+            &[],
+        ),
+        (
+            worktree_instance("my-session"),
+            RowTagMode::None,
+            &[],
+            &["feature/foo", "[foo", "["],
+        ),
+        (
+            workspace_instance(),
+            RowTagMode::None,
+            &[],
+            &["feature/foo", "repos", "["],
+        ),
+        (
+            workspace_instance(),
+            RowTagMode::Branch,
+            &["[foo+2       ]"],
+            &[],
+        ),
+        (
+            Instance::new("A1", "/tmp/a"),
+            RowTagMode::Auto,
+            &alpha_needles,
+            &[],
+        ),
+    ];
+    for (inst, mode, present, absent) in cases {
+        let text = rendered_single_session_text(inst, mode);
+        for needle in present {
             assert!(
-                !text.contains("[]"),
-                "row with empty source_profile must not render a literal []: {text:?}"
+                text.contains(*needle),
+                "{mode:?}: missing {needle:?} in {text:?}"
             );
         }
+        for needle in absent {
+            assert!(
+                !text.contains(*needle),
+                "{mode:?}: unexpected {needle:?} in {text:?}"
+            );
+        }
+    }
+}
+
+/// In a single-profile view Auto omits the profile tag (the list title already names it);
+/// Profile renders it anyway.
+#[test]
+#[serial]
+fn test_row_tag_profile_modes_in_filtered_view() {
+    use crate::session::config::RowTagMode;
+    let (_temp, _guard) = test_home();
+    seed_profile("alpha", &[Instance::new("A1", "/tmp/a")]);
+    let mut view = test_view(Some("alpha"));
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    let rendered = crate::tui::home::render::RowTag {
+        content: crate::tui::home::render::profile_short_code("alpha"),
+        max_width: 4,
+    }
+    .rendered();
+    for (mode, expect_tag) in [(RowTagMode::Auto, false), (RowTagMode::Profile, true)] {
+        view.row_tag_mode = mode;
+        view.flat_items = view.build_flat_items();
+        let row = view
+            .flat_items
+            .iter()
+            .find(|item| matches!(item, Item::Session { .. }))
+            .expect("session row");
+        let text = rendered_row_text(&view, row);
+        assert_eq!(text.contains(&rendered), expect_tag, "{mode:?}: {text:?}");
     }
 }
 
@@ -557,97 +296,63 @@ fn test_save_preserves_per_profile_collapsed_state() {
     );
 }
 
+/// Group delete is scoped to the selected group's profile when several profiles own a
+/// same-named group: an empty one opens the simple confirm rather than the "delete N
+/// sessions" dialog driven by a populated twin, and deleting a populated one leaves the
+/// other profiles' group and members alone.
 #[test]
 #[serial]
-fn test_create_profile_rejects_reserved_name_all() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _storage = Storage::new_unwatched("default").unwrap();
-
-    let result = crate::session::create_profile("all");
-    assert!(result.is_err());
-    assert!(
-        result.unwrap_err().to_string().contains("reserved"),
-        "error should mention 'reserved'"
-    );
-
-    // Case-insensitive
-    let result = crate::session::create_profile("ALL");
-    assert!(result.is_err());
-}
-
-#[test]
-#[serial]
-fn test_delete_group_scoped_to_owning_profile() {
-    use crate::session::GroupTree;
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-
-    // Create alpha with group "work"
-    let storage_a = Storage::new_unwatched("alpha").unwrap();
-    let mut inst_a = Instance::new("A1", "/tmp/a");
-    inst_a.group_path = "work".to_string();
-    let tree_a = GroupTree::new_with_groups(&[inst_a.clone()], &[]);
-    storage_a
-        .update(|i, g| {
-            *i = [inst_a].to_vec();
-            *g = tree_a.get_all_groups();
+fn test_group_delete_scoped_to_owning_profile() {
+    let (_temp, _guard) = test_home();
+    seed_profile("alpha", &[instance_in("A1", "/tmp/a", "work")]);
+    seed_profile("beta", &[instance_in("B1", "/tmp/b", "work")]);
+    Storage::new_unwatched("gamma")
+        .unwrap()
+        .update(|_instances, groups| {
+            groups.push(Group::new("work", "work"));
             Ok(())
         })
         .unwrap();
-
-    // Create beta with the same group name "work"
-    let storage_b = Storage::new_unwatched("beta").unwrap();
-    let mut inst_b = Instance::new("B1", "/tmp/b");
-    inst_b.group_path = "work".to_string();
-    let tree_b = GroupTree::new_with_groups(&[inst_b.clone()], &[]);
-    storage_b
-        .update(|i, g| {
-            *i = [inst_b].to_vec();
-            *g = tree_b.get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view =
-        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    let mut view = test_view(None);
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    // Both profiles should have a "work" group
-    assert!(view.group_trees.get("alpha").unwrap().group_exists("work"));
-    assert!(view.group_trees.get("beta").unwrap().group_exists("work"));
-
-    // Find a "work" group item that belongs to alpha and select it.
-    // Collect candidate indices first to avoid borrow conflicts.
-    let work_indices: Vec<usize> = view
-        .flat_items
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, item)| match item {
-            Item::Group { path, .. } if path == "work" => Some(idx),
-            _ => None,
-        })
-        .collect();
-
-    for idx in work_indices {
-        view.cursor = idx;
-        view.update_selected();
-        if view.selected_group_profile.as_deref() == Some("alpha") {
-            break;
+    let select_work = |view: &mut HomeView, profile: &str| {
+        let work_indices: Vec<usize> = view
+            .flat_items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| match item {
+                Item::Group { path, .. } if path == "work" => Some(idx),
+                _ => None,
+            })
+            .collect();
+        for idx in work_indices {
+            view.cursor = idx;
+            view.update_selected();
+            if view.selected_group_profile.as_deref() == Some(profile) {
+                break;
+            }
         }
-    }
+        assert_eq!(view.selected_group.as_deref(), Some("work"));
+        assert_eq!(view.selected_group_profile.as_deref(), Some(profile));
+    };
 
-    assert_eq!(view.selected_group.as_deref(), Some("work"));
-    assert_eq!(view.selected_group_profile.as_deref(), Some("alpha"));
+    select_work(&mut view, "gamma");
+    view.open_delete_for_selected();
+    assert!(
+        view.group_delete_options_dialog.is_none(),
+        "empty group must not trigger the with-sessions options dialog from a same-named group in another profile"
+    );
+    assert!(
+        view.confirm_dialog.is_some(),
+        "empty group should open the simple delete-group confirm"
+    );
+    view.confirm_dialog = None;
 
-    // Delete alpha's "work" group
+    select_work(&mut view, "alpha");
     view.delete_selected_group().unwrap();
-
-    // Alpha's "work" group should be gone, but beta's should remain
     assert!(
         !view.group_trees.get("alpha").unwrap().group_exists("work"),
         "alpha's 'work' group should be deleted"
@@ -656,97 +361,22 @@ fn test_delete_group_scoped_to_owning_profile() {
         view.group_trees.get("beta").unwrap().group_exists("work"),
         "beta's 'work' group should be untouched"
     );
-
-    // Alpha's instance should be ungrouped, beta's should still be in "work"
-    let alpha_inst = view
-        .instances()
-        .find(|i| i.source_profile == "alpha")
-        .unwrap();
+    let group_of = |profile: &str| {
+        view.instances()
+            .find(|i| i.source_profile == profile)
+            .unwrap()
+            .group_path
+            .clone()
+    };
     assert_eq!(
-        alpha_inst.group_path, "",
+        group_of("alpha"),
+        "",
         "alpha's instance should be ungrouped"
     );
-    let beta_inst = view
-        .instances()
-        .find(|i| i.source_profile == "beta")
-        .unwrap();
     assert_eq!(
-        beta_inst.group_path, "work",
-        "beta's instance should still be in 'work'"
-    );
-}
-
-/// The group-delete dialog must scope its session count to the selected group's profile:
-/// two profiles can own a same-named group, and an empty group should open the simple
-/// confirm rather than the "delete N sessions" dialog driven by its populated twin.
-#[test]
-#[serial]
-fn test_group_delete_dialog_scoped_to_owning_profile() {
-    use crate::session::GroupTree;
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-
-    // alpha owns an EMPTY "work" group (group exists, no sessions).
-    let storage_a = Storage::new_unwatched("alpha").unwrap();
-    let mut tree_a = GroupTree::new_with_groups(&[], &[]);
-    tree_a.create_group("work");
-    storage_a
-        .update(|i, g| {
-            *i = vec![];
-            *g = tree_a.get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    // beta owns a same-named "work" group that still has a session.
-    let storage_b = Storage::new_unwatched("beta").unwrap();
-    let mut inst_b = Instance::new("B1", "/tmp/b");
-    inst_b.group_path = "work".to_string();
-    let tree_b = GroupTree::new_with_groups(&[inst_b.clone()], &[]);
-    storage_b
-        .update(|i, g| {
-            *i = [inst_b].to_vec();
-            *g = tree_b.get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view =
-        HomeView::new_for_test(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    // Select alpha's (empty) "work" group.
-    let work_indices: Vec<usize> = view
-        .flat_items
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, item)| match item {
-            Item::Group { path, .. } if path == "work" => Some(idx),
-            _ => None,
-        })
-        .collect();
-    for idx in work_indices {
-        view.cursor = idx;
-        view.update_selected();
-        if view.selected_group_profile.as_deref() == Some("alpha") {
-            break;
-        }
-    }
-    assert_eq!(view.selected_group_profile.as_deref(), Some("alpha"));
-
-    view.open_delete_for_selected();
-
-    assert!(
-        view.group_delete_options_dialog.is_none(),
-        "empty group must not trigger the with-sessions options dialog from a same-named group in another profile"
-    );
-    assert!(
-        view.confirm_dialog.is_some(),
-        "empty group should open the simple delete-group confirm"
+        group_of("beta"),
+        "work",
+        "beta's instance should stay in 'work'"
     );
 }
 
@@ -1031,47 +661,18 @@ fn test_group_context_menu_new_session_prefills_path() {
     assert_eq!(dialog.group_value(), "work");
 }
 
+/// In project mode the group label is the repo basename, and the group menu's New Session
+/// still borrows the member repo path; with no agents installed it points at agent setup
+/// instead, like 'n'.
 #[test]
 #[serial]
-fn test_group_context_menu_new_session_shows_no_agents_without_tools() {
-    use crate::tui::dialogs::ContextMenuAction;
-
-    let mut env = create_test_env_with_groups();
-    env.view.available_tools = AvailableTools::with_tools(&[]);
-
-    let group_idx = env
-        .view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
-        .expect("work group should exist in flat_items");
-    env.view.cursor = group_idx;
-    env.view.update_selected();
-
-    env.view
-        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
-    assert!(
-        env.view.new_dialog.is_none(),
-        "no agents means the new-session form must not open"
-    );
-    assert!(
-        env.view.no_agents_dialog.is_some(),
-        "should point the user at agent setup instead, like 'n'"
-    );
-}
-
-#[test]
-#[serial]
-fn test_group_context_menu_new_session_prefills_path_in_project_mode() {
+fn test_group_context_menu_new_session_project_mode_and_no_agents() {
     use crate::session::config::GroupByMode;
     use crate::tui::dialogs::ContextMenuAction;
 
     let mut env = create_test_env_with_groups();
     env.view.group_by = GroupByMode::Project;
     env.view.flat_items = env.view.build_flat_items();
-
-    // In project mode the group label is the repo basename ("work" from
-    // "/tmp/work"), not the stored group_path.
     let group_idx = env
         .view
         .flat_items
@@ -1093,6 +694,16 @@ fn test_group_context_menu_new_session_prefills_path_in_project_mode() {
         "/tmp/work",
         "project-mode prefill should borrow the member repo path"
     );
+
+    env.view.new_dialog = None;
+    env.view.available_tools = AvailableTools::with_tools(&[]);
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
+    assert!(
+        env.view.new_dialog.is_none(),
+        "no agents means the new-session form must not open"
+    );
+    assert!(env.view.no_agents_dialog.is_some());
 }
 
 #[test]

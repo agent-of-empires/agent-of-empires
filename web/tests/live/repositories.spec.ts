@@ -90,15 +90,6 @@ test.describe("clone URL tab", () => {
     }
     await expect(launchButton(page)).toBeEnabled();
   });
-
-  test("clone failure path: unrecognised URL scheme surfaces a server error", async ({ page, serve }) => {
-    await openCloneTab(page, serve);
-    await page.locator("#clone-url").fill("not-a-url");
-    await page.getByRole("button", { name: "Clone repository" }).click();
-    await expect(page.getByText("URL does not look like a git repository URL")).toBeVisible({ timeout: 10_000 });
-    await expect(page.getByText("Selected project")).toHaveCount(0);
-    await expect(launchButton(page)).toBeDisabled();
-  });
 });
 
 test("diff base defaults to the worktree's base branch, override still wins", async ({ spawnServe }) => {

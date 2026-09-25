@@ -8,7 +8,7 @@ use crate::session::{
 };
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
-use crate::tui::dialogs::{InfoDialog, NewSessionData, NewSessionDialog};
+use crate::tui::dialogs::{InfoDialog, NewSessionData};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serial_test::serial;
 use tempfile::TempDir;
