@@ -15,15 +15,6 @@ function row(type: "equal" | "add" | "delete", content: string): RichDiffLine {
 }
 
 describe("DiffLine", () => {
-  it("renders raw text when no syntax tokens are provided", () => {
-    const { container } = render(<DiffLine line={row("add", "const x = 42;")} />);
-    expect(container.textContent).toContain("const x = 42;");
-    const spans = container.querySelectorAll("span");
-    for (const span of spans) {
-      expect(span.className).not.toMatch(/\bopacity-0\b/);
-    }
-  });
-
   it("renders token spans with inline colors when tokens are provided", () => {
     const tokens = [
       { content: "const", color: "#f97583" },

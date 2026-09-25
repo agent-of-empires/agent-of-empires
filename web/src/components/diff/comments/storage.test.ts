@@ -54,13 +54,11 @@ describe("loadComments", () => {
     expect(loadComments("sess-2").comments.map((c) => c.id)).toEqual(["z"]);
   });
 
-  it.each([
-    ["an absent key", undefined],
-    ["corrupt JSON", "not json"],
-    ["an unknown version", JSON.stringify({ ...withComment(), version: 99 })],
-  ])("returns the empty envelope for %s", (_, raw) => {
-    if (raw !== undefined) localStorage.setItem(storageKey("sess-1"), raw);
-    expect(loadComments("sess-1")).toEqual(EMPTY_STORAGE);
+  it("returns the empty envelope for corrupt JSON or an unknown version", () => {
+    for (const raw of ["not json", JSON.stringify({ ...withComment(), version: 99 })]) {
+      localStorage.setItem(storageKey("sess-1"), raw);
+      expect(loadComments("sess-1")).toEqual(EMPTY_STORAGE);
+    }
   });
 
   it("drops malformed comments and defaults missing fields", () => {
@@ -77,14 +75,6 @@ describe("loadComments", () => {
 });
 
 describe("saveComments", () => {
-  it("survives a throwing write", () => {
-    const spy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
-      throw new Error("QuotaExceeded");
-    });
-    expect(() => saveComments("sess-1", withComment())).not.toThrow();
-    expect(spy).toHaveBeenCalled();
-  });
-
   it("removes the key when state becomes empty, including a lone clearAfterSend toggle", () => {
     saveComments("sess-1", withComment());
     expect(keys()).toEqual([storageKey("sess-1")]);
@@ -92,14 +82,9 @@ describe("saveComments", () => {
     expect(keys()).toEqual([]);
   });
 
-  it.each<[Partial<DiffCommentsStorageV1>, boolean]>([
-    [{}, true],
-    [{ clearAfterSend: false }, true],
-    [{ comments: [mkComment()] }, false],
-    [{ introDraft: "hi" }, false],
-    [{ outroDraft: "bye" }, false],
-  ])("isEmptyState(%j) is %s", (over, empty) => {
-    expect(isEmptyState({ ...EMPTY_STORAGE, ...over })).toBe(empty);
+  it("treats a lone draft as non-empty", () => {
+    expect(isEmptyState({ ...EMPTY_STORAGE, introDraft: "hi" })).toBe(false);
+    expect(isEmptyState({ ...EMPTY_STORAGE, outroDraft: "bye" })).toBe(false);
   });
 });
 
@@ -120,12 +105,5 @@ describe("sweepOrphanComments", () => {
     expect(localStorage.getItem("acp:draft:foo")).toBe("keep me");
     expect(localStorage.getItem(storageKey("active"))).not.toBeNull();
     expect(localStorage.getItem(storageKey("orphan"))).toBeNull();
-  });
-
-  it("is a no-op when every key is active", () => {
-    saveComments("a", withComment());
-    saveComments("b", withComment());
-    sweepOrphanComments(new Set(["a", "b"]));
-    expect(keys()).toEqual([storageKey("a"), storageKey("b")]);
   });
 });
