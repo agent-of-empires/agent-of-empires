@@ -32,6 +32,7 @@ const bodyOf = (init: RequestInit | undefined) => JSON.parse(init!.body as strin
 type RequestCase = [string, () => Promise<unknown>, { body?: unknown; respond?: Response; result?: unknown }?];
 
 const session = { id: "s1" };
+const sessions = { sessions: [session], workspace_ordering: ["/repo::main"] };
 const plugins = { plugins: [], load_errors: [] };
 const hit = { session_id: "s1", seq: 3, kind: "agent", snippet: "hit", match_count: 2 };
 const switched = { session_id: "s-1", agent: "codex", before_seq: 41, switch_seq: 42, status: "ok" };
@@ -45,7 +46,7 @@ const skill = {
 const preview = { kind: "consent_required", dismissed: false, consent: { id: "p" } };
 
 const requestCases: RequestCase[] = [
-  ["GET /api/sessions", () => api.fetchSessions(), { respond: json(session), result: session }],
+  ["GET /api/sessions", () => api.fetchSessions(), { respond: json(sessions), result: sessions }],
   [
     "GET /api/sessions/search?q=foo%20bar",
     () => api.searchConversations("foo bar"),

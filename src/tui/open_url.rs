@@ -15,6 +15,49 @@ use std::io::Write;
 /// Unset in normal runs.
 const OPEN_URL_TO_ENV: &str = "AOE_OPEN_URL_TO";
 
+/// Resolve a plugin-supplied href to the absolute URL [`open_url`] needs.
+///
+/// Absolute HTTP(S) links are independent of aoe and pass through unchanged.
+/// A same-origin relative path needs an explicit browser-reachable dashboard
+/// origin; the daemon API transport is not a substitute because it may be a
+/// Unix socket or a different HTTP origin. Dashboard bootstrap query
+/// parameters (notably `token`) are retained while navigating.
+pub fn resolve_href(dashboard_url: Option<&str>, href: &str) -> std::io::Result<String> {
+    if crate::util::is_http_url(href) {
+        return Ok(href.to_string());
+    }
+    let dashboard_url = dashboard_url.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "this relative link needs a reachable dashboard; start `aoe serve` or set AOE_DASHBOARD_URL",
+        )
+    })?;
+    let mut base = reqwest::Url::parse(dashboard_url).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid dashboard origin: {error}"),
+        )
+    })?;
+    let (href_path, href_fragment) = match href.split_once('#') {
+        Some((path, fragment)) => (path, Some(fragment)),
+        None => (href, None),
+    };
+    let (href_path, href_query) = match href_path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (href_path, None),
+    };
+    let query = match (base.query(), href_query) {
+        (Some(base), Some(href)) => Some(format!("{base}&{href}")),
+        (Some(base), None) => Some(base.to_owned()),
+        (None, Some(href)) => Some(href.to_owned()),
+        (None, None) => None,
+    };
+    base.set_path(href_path);
+    base.set_query(query.as_deref());
+    base.set_fragment(href_fragment);
+    Ok(base.into())
+}
+
 /// Open `url` in the user's browser, or, when `AOE_OPEN_URL_TO` is set, append
 /// it to that file instead. Errors propagate so the caller can toast a failure.
 ///
@@ -155,6 +198,40 @@ mod tests {
         // before reaching `webbrowser`, which would spawn something.
         let err = open_url("https://example.com").expect_err("must not report success");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn resolve_href_leaves_an_absolute_url_unchanged() {
+        assert_eq!(
+            resolve_href(None, "https://example.com/pr/1").unwrap(),
+            "https://example.com/pr/1"
+        );
+    }
+
+    #[test]
+    fn resolve_href_uses_dashboard_not_api_transport() {
+        assert_eq!(
+            resolve_href(Some("http://127.0.0.1:8080"), "/session/xyz").unwrap(),
+            "http://127.0.0.1:8080/session/xyz"
+        );
+    }
+
+    #[test]
+    fn resolve_href_retains_dashboard_bootstrap_token() {
+        assert_eq!(
+            resolve_href(
+                Some("http://127.0.0.1:8080/?token=secret"),
+                "/session/xyz?tab=activity"
+            )
+            .unwrap(),
+            "http://127.0.0.1:8080/session/xyz?token=secret&tab=activity"
+        );
+    }
+
+    #[test]
+    fn relative_href_fails_closed_without_a_dashboard() {
+        let error = resolve_href(None, "/session/xyz").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]

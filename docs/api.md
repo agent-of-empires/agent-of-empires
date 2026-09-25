@@ -172,6 +172,25 @@ List sessions. Returns every session by default, including trashed and
 archived ones; pass `state` to filter server-side instead of fetching
 everything and filtering client-side.
 
+The response is an object, not a bare array:
+
+```json
+{
+  "sessions": [ { "id": "…", "status": "Running" } ],
+  "workspace_ordering": ["/path/to/repo::main"]
+}
+```
+
+- `sessions`: the session rows, in the daemon's canonical order.
+- `workspace_ordering`: the user's persisted manual workspace order, so a
+  client can render workspaces in place without a second request. Unknown
+  workspaces (present in `sessions`, absent from this list) follow the
+  list, newest first. A client that never issues
+  `PUT /api/workspace-ordering` always receives an empty array.
+
+Clients written against the historical bare-array response must be updated to
+read `sessions`; the array is never returned unwrapped.
+
 **Query parameters**
 
 | Name | Default | Notes |

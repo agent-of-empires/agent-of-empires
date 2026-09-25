@@ -603,7 +603,27 @@ fn drain_plugin_toast(state: &mut StructuredViewState, toast_deadline: &mut Opti
     // A notification carrying an href is a worker `ui.open_url`; the seq dedupe
     // in `next_plugin_toast` guarantees one open per notification.
     if let Some(href) = &n.href {
-        let _ = crate::tui::open_url::open_url(href);
+        let url = match crate::tui::open_url::resolve_href(state.endpoint.dashboard_url(), href) {
+            Ok(url) => url,
+            Err(error) => {
+                set_toast(
+                    state,
+                    toast_deadline,
+                    format!("open failed: {error}"),
+                    ToastKind::Error,
+                );
+                return;
+            }
+        };
+        if let Err(error) = crate::tui::open_url::open_url(&url) {
+            set_toast(
+                state,
+                toast_deadline,
+                format!("open failed: {error}"),
+                ToastKind::Error,
+            );
+            return;
+        }
     }
     let text = match &n.body {
         Some(body) => format!("{}: {body}", n.title),
@@ -961,10 +981,20 @@ async fn handle_terminal_event(
             Ok(false)
         }
         Intent::OpenInBrowser => {
-            let url = format!(
-                "{}/sessions/{}/acp",
-                state.endpoint.base_url, state.session_id
-            );
+            let href = format!("/sessions/{}/acp", state.session_id);
+            let url =
+                match crate::tui::open_url::resolve_href(state.endpoint.dashboard_url(), &href) {
+                    Ok(url) => url,
+                    Err(error) => {
+                        set_toast(
+                            state,
+                            toast_deadline,
+                            format!("open failed: {error}"),
+                            ToastKind::Error,
+                        );
+                        return Ok(false);
+                    }
+                };
             if let Err(e) = crate::tui::open_url::open_url(&url) {
                 set_toast(
                     state,
@@ -1361,7 +1391,19 @@ async fn handle_plugin_command(
 /// Open one resolved plugin link in the browser (through the test seam) and
 /// toast the outcome.
 fn open_link(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>, href: &str) {
-    if let Err(e) = crate::tui::open_url::open_url(href) {
+    let url = match crate::tui::open_url::resolve_href(state.endpoint.dashboard_url(), href) {
+        Ok(url) => url,
+        Err(error) => {
+            set_toast(
+                state,
+                toast_deadline,
+                format!("open failed: {error}"),
+                ToastKind::Error,
+            );
+            return;
+        }
+    };
+    if let Err(e) = crate::tui::open_url::open_url(&url) {
         set_toast(
             state,
             toast_deadline,

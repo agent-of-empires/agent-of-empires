@@ -34,6 +34,7 @@ const NON_SUFFIX_HOST_STATE: Record<string, string> = {
   AOE_DEFER_SANDBOX_MIGRATION: "1",
   AOE_DAEMON_TOKEN: "host-token",
   AOE_DAEMON_URL: "http://a-real-daemon.internal:8080",
+  AOE_DASHBOARD_URL: "https://host.invalid/dashboard",
   AOE_E2E_INPUT_BARRIER: `${HOST}/input-barrier`,
   AOE_E2E_PARTIAL_FRAME_FILE: `${HOST}/partial-frame`,
   AOE_E2E_PROMPT_COMPLETED_FILE: `${HOST}/prompt-completed`,

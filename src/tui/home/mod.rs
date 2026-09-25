@@ -206,6 +206,10 @@ pub struct HomeView {
     /// treated as peer-deleted (CLI/`aoe serve`) and dropped from the
     /// in-memory mirror. Drained on Ok save.
     pending_added: HashMap<String, HashSet<String>>,
+    /// The persisted manual workspace order as this view last observed it.
+    /// The runtime publishes a merged view of it (unknown workspaces
+    /// appended), so this is what detects a peer's reorder.
+    observed_workspace_ordering: Vec<String>,
     pub(super) group_trees: HashMap<String, GroupTree>,
     /// Duplicate session ids that remain ambiguous after journal-guided
     /// reconciliation (#3459): every copy is excluded from `instances` and

@@ -1095,3 +1095,180 @@ fn restart_attachment_waits_for_its_receipt_and_lifecycle_generation() {
         assert!(env.view.take_native_attachment().is_none());
     }
 }
+
+/// A runtime row carrying the full durable projection, as the daemon sends
+/// it. Minimal test rows (id/status only) deliberately skip metadata
+/// comparison in the view.
+fn canonical_row(
+    instance: &crate::session::Instance,
+    overrides: serde_json::Value,
+) -> crate::daemon::SessionResponse {
+    let mut value = serde_json::json!({
+        "id": instance.id,
+        "title": instance.title,
+        "project_path": instance.project_path,
+        "profile": instance.source_profile,
+        "group_path": instance.group_path,
+        "tool": instance.tool,
+        "view": instance.view,
+        "status": format!("{:?}", instance.status),
+        "has_managed_worktree": instance.worktree_info.is_some(),
+        "branch": instance.worktree_info.as_ref().map(|worktree| worktree.branch.clone()),
+        "base_branch_override": instance.base_branch_override,
+    });
+    let object = value.as_object_mut().expect("an object row");
+    for (key, item) in overrides.as_object().expect("object overrides") {
+        object.insert(key.clone(), item.clone());
+    }
+    serde_json::from_value(value).expect("a canonical row")
+}
+
+fn publish_canonical_snapshot(
+    env: &mut TestEnv,
+    rows: Vec<crate::daemon::SessionResponse>,
+    ordering: Vec<String>,
+    revision: u64,
+) {
+    let snapshot = crate::daemon::RuntimeSnapshot {
+        cursor: crate::daemon::RuntimeCursor {
+            epoch: "test".into(),
+            revision,
+        },
+        contents: crate::daemon::RuntimeContents {
+            health: crate::daemon::RuntimeHealth::Healthy,
+            capabilities: crate::daemon::RuntimeCapabilities {
+                mutations: true,
+                native_interaction: true,
+            },
+            default_profile: "test".into(),
+            sessions: rows,
+            profiles: vec![],
+            workspace_ordering: ordering,
+            global_projects: vec![],
+        },
+    };
+    env.view
+        .session_feed
+        .publish_for_test(SessionFeedResult::Snapshot(std::sync::Arc::new(snapshot)));
+    env.view.apply_session_feed();
+}
+
+#[test]
+#[serial]
+fn canonical_revision_reloads_renames_moves_and_view_changes() {
+    let mut env = create_test_env_empty();
+    let instance = local_row(&mut env, "alpha", "/tmp/repo");
+    let id = instance.id.clone();
+    env.view.save().expect("seed the durable row");
+
+    let mut renamed = instance.clone();
+    renamed.title = "renamed".into();
+    renamed.group_path = "moved/group".into();
+    renamed.tool = "codex".into();
+    renamed.view = crate::session::View::Terminal;
+    renamed.base_branch_override = Some("upstream/main".into());
+    renamed.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "feature".into(),
+        main_repo_path: "/tmp/repo".into(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: Some("main".into()),
+    });
+    Storage::new_unwatched("test")
+        .unwrap()
+        .update(|rows, _| {
+            *rows = vec![renamed.clone()];
+            Ok(())
+        })
+        .expect("publish the canonical row on disk");
+
+    let row = canonical_row(&renamed, serde_json::json!({}));
+    publish_canonical_snapshot(&mut env, vec![row], vec![], 1);
+
+    let applied = env.view.get_instance(&id).expect("row survives");
+    assert_eq!(applied.title, "renamed");
+    assert_eq!(applied.group_path, "moved/group");
+    assert_eq!(applied.tool, "codex");
+    assert!(applied.view.is_terminal(), "view change is absorbed");
+    assert_eq!(
+        applied.base_branch_override.as_deref(),
+        Some("upstream/main")
+    );
+    assert_eq!(
+        applied
+            .worktree_info
+            .as_ref()
+            .map(|worktree| worktree.branch.as_str()),
+        Some("feature")
+    );
+}
+
+#[test]
+#[serial]
+fn canonical_revision_drops_a_row_the_daemon_removed() {
+    let mut env = create_test_env_empty();
+    let kept = local_row(&mut env, "kept", "/tmp/kept");
+    let removed = local_row(&mut env, "removed", "/tmp/removed");
+    env.view.save().expect("seed both rows");
+    Storage::new_unwatched("test")
+        .unwrap()
+        .update(|rows, _| {
+            rows.retain(|row| row.id != removed.id);
+            Ok(())
+        })
+        .expect("delete the row a peer owns");
+
+    publish_canonical_snapshot(
+        &mut env,
+        vec![canonical_row(&kept, serde_json::json!({}))],
+        vec![],
+        1,
+    );
+
+    assert!(env.view.get_instance(&kept.id).is_some());
+    assert!(
+        env.view.get_instance(&removed.id).is_none(),
+        "a row absent from the canonical revision must not linger"
+    );
+}
+
+#[test]
+#[serial]
+fn canonical_revision_reconciles_metadata_across_workspace_reordering() {
+    let mut env = create_test_env_empty();
+    let instance = local_row(&mut env, "alpha", "/tmp/repo");
+    env.view.save().expect("seed the durable row");
+    crate::session::update_workspace_ordering(|ordering| {
+        ordering.order = vec!["/tmp/repo::feature".into()];
+        Ok(())
+    })
+    .expect("persist the peer ordering");
+
+    let stored_title = Storage::new_unwatched("test").unwrap().load().unwrap()[0]
+        .title
+        .clone();
+    assert_eq!(stored_title, "alpha");
+    let mut row = canonical_row(&instance, serde_json::json!({}));
+    row.title = "ordering-arrival".into();
+    Storage::new_unwatched("test")
+        .unwrap()
+        .update(|rows, _| {
+            rows[0].title = row.title.clone();
+            Ok(())
+        })
+        .expect("the ordering write landed together with a durable change");
+    publish_canonical_snapshot(
+        &mut env,
+        vec![canonical_row(
+            &Storage::new_unwatched("test").unwrap().load().unwrap()[0].clone(),
+            serde_json::json!({}),
+        )],
+        vec!["/tmp/repo::feature".into()],
+        1,
+    );
+
+    assert!(env
+        .view
+        .get_instance(&instance.id)
+        .is_some_and(|row| row.title == "ordering-arrival"));
+}

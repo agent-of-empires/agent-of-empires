@@ -35,6 +35,9 @@ export const HOST_STATE_VARS = new Set([
   // Discovery must not prefer a host endpoint over the private daemon.
   "AOE_DAEMON_TOKEN",
   "AOE_DAEMON_URL",
+  // Browser origin used to resolve plugin-relative links. A host value would
+  // point the private daemon's own navigation at a host dashboard.
+  "AOE_DASHBOARD_URL",
   // Private fixture files and subprocess controls cannot come from the host.
   "AOE_E2E_INPUT_BARRIER",
   "AOE_E2E_PARTIAL_FRAME_FILE",

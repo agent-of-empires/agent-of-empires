@@ -178,6 +178,72 @@ impl HomeView {
         true
     }
 
+    /// Whether applying this runtime revision would outrun the local storage
+    /// mirror. Status and pane observations are safe to apply in place, but
+    /// durable identity/layout fields and removals must come from the locked
+    /// storage load before the revision is marked applied.
+    fn snapshot_requires_storage_reload(
+        &mut self,
+        snapshot: &crate::daemon::RuntimeSnapshot,
+    ) -> bool {
+        // The published ordering is the daemon's merged view (unknown
+        // workspaces appended), so it cannot be compared to the persisted
+        // file directly. A change to the persisted manual order is the thing
+        // this view can still miss, so track what it last observed.
+        let persisted = crate::session::load_workspace_ordering()
+            .map(|ordering| ordering.order)
+            .unwrap_or_default();
+        if persisted != self.observed_workspace_ordering {
+            self.observed_workspace_ordering = persisted;
+            return true;
+        }
+
+        let row_ids: std::collections::HashSet<_> = snapshot
+            .contents
+            .sessions
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        if self
+            .in_flight_creation_id()
+            .is_none_or(|id| !row_ids.contains(id))
+            && self
+                .instances
+                .keys()
+                .any(|id| !row_ids.contains(id.as_str()))
+        {
+            return true;
+        }
+
+        snapshot.contents.sessions.iter().any(|row| {
+            // An unknown row in a tracked profile is handled by the caller's
+            // addition check; one outside this view's scope is not its row.
+            let Some(instance) = self.instances.get(&row.id) else {
+                return false;
+            };
+            // Older/minimal runtime rows may omit descriptive metadata. Do
+            // not manufacture changes from serde defaults on those rows.
+            if row.title.is_empty() && row.profile.is_empty() {
+                return false;
+            }
+            let expected_worktree = row
+                .has_managed_worktree
+                .then_some(row.branch.as_deref())
+                .flatten();
+            let actual_worktree = instance
+                .worktree_info
+                .as_ref()
+                .map(|worktree| worktree.branch.as_str());
+            instance.title != row.title
+                || instance.group_path != row.group_path
+                || (!row.profile.is_empty() && instance.source_profile != row.profile)
+                || instance.tool != row.tool
+                || instance.view != row.view
+                || instance.base_branch_override != row.base_branch_override
+                || actual_worktree != expected_worktree
+        })
+    }
+
     /// Apply a pending session-list result from the daemon. Returns true if
     /// the caller should redraw.
     pub fn apply_session_feed(&mut self) -> bool {
@@ -189,13 +255,11 @@ impl HomeView {
             Ok(result) => match result {
                 SessionFeedResult::Snapshot(snapshot) => {
                     let mut metadata_changed = false;
-                    // A row this view has never seen, in a profile it tracks,
-                    // was created by a peer. Rows load from storage rather than
-                    // from the wire projection, so reload instead of rebuilding
-                    // a lossy Instance from the response. Only additions
-                    // trigger it: the snapshot's row set can be narrower than
-                    // this view's (CityHall hides terminal rows), and reload
-                    // keeps a still-unpublished creating stub alive on its own.
+                    // Rows load from storage rather than from the wire
+                    // projection, so a revision that adds, renames, moves,
+                    // re-renders, or drops a row is reconciled from the locked
+                    // storage load before this revision is marked applied. A
+                    // reload also keeps a still-unpublished creating stub alive.
                     metadata_changed |=
                         self.reconcile_in_flight_creation(&snapshot.contents.sessions);
                     let in_flight = self.in_flight_creation_id();
@@ -204,6 +268,16 @@ impl HomeView {
                             && !self.instances.contains_key(&row.id)
                             && self.storages.contains_key(&row.profile)
                     });
+                    if unknown_row || self.snapshot_requires_storage_reload(&snapshot) {
+                        match self.reload() {
+                            Ok(()) => metadata_changed = true,
+                            Err(error) => tracing::warn!(
+                                target: "tui.session_feed",
+                                %error,
+                                "reload before applying a canonical runtime revision failed"
+                            ),
+                        }
+                    }
                     for row in &snapshot.contents.sessions {
                         metadata_changed |= self.apply_daemon_status_update(row);
                         let Some(instance) = self.instances.get_mut(&row.id) else {
@@ -283,16 +357,6 @@ impl HomeView {
                         self.cancel_native_attachment();
                         self.teardown_live_send();
                         self.pending_paste = None;
-                    }
-                    if unknown_row {
-                        match self.reload() {
-                            Ok(()) => metadata_changed = true,
-                            Err(error) => tracing::warn!(
-                                target: "tui.session_feed",
-                                %error,
-                                "reload after a peer-created session failed"
-                            ),
-                        }
                     }
                     snapshot_applied = true;
                     metadata_changed

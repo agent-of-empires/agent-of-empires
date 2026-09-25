@@ -237,7 +237,7 @@ pub struct SpawnRequest {
     /// Let a `session/load` replay history into the (empty) event store for an import.
     pub seed_history_replay: bool,
     /// Claude store selected by the conversation binding for a host Claude worker.
-    pub claude_store_pin: Option<PathBuf>,
+    pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
 }
 
 impl<S: BroadcastSink> Supervisor<S> {

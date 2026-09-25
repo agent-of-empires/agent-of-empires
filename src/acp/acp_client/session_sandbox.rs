@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use super::errors::AcpError;
 use super::spawn::{
-    allowlisted_env_pairs, is_host_only_path_env, provider_env_denyreason, SpawnConfig,
+    allowlisted_env_pairs, is_host_only_path_env, request_env_denyreason, SpawnConfig,
 };
 
 /// Sandbox handles a connection task needs to route ACP fs/* and
@@ -153,7 +153,7 @@ pub(super) fn build_sandbox_docker_argv(
     let request_auth = config
         .provider_env
         .iter()
-        .filter(|&(key, _)| provider_env_denyreason(key).is_none())
+        .filter(|&(key, _)| request_env_denyreason(key).is_none())
         .cloned();
     let adapter_allowlist = allowlisted_env_pairs(config)
         .into_iter()
