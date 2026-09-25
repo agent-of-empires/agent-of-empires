@@ -1260,6 +1260,7 @@ pub fn test_inject_session_into_cache(name: &str) {
         let map = cache.data.get_or_insert_with(HashMap::new);
         map.insert(name.to_string(), LiveSession::unmarked());
         cache.time = Some(Instant::now());
+        cache.outcome = SessionCacheRefresh::Populated;
     }
 }
 
