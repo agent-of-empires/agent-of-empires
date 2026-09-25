@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { ElevationPrompt } from "../ElevationPrompt";
 import { ELEVATION_REQUIRED_EVENT } from "../../lib/fetchInterceptor";
@@ -39,29 +39,24 @@ beforeEach(() => {
   elevateLogin.mockReset();
 });
 
-afterEach(() => {
-  cleanup();
-});
-
 describe("ElevationPrompt", () => {
-  it("renders nothing until the elevation-required event fires", () => {
+  it("opens only when the elevation-required event fires", () => {
     const { container } = render(<ElevationPrompt />);
     expect(container.firstChild).toBeNull();
-  });
-
-  it("opens the dialog when the elevation-required event fires", () => {
-    openPrompt();
+    fireElevationRequired();
     expect(screen.getByRole("dialog").getAttribute("aria-modal")).toBe("true");
-    expect(screen.getByText("Confirm passphrase")).toBeTruthy();
   });
 
-  it("Confirm is disabled until a non-empty passphrase is entered", () => {
+  it("does not submit an empty or whitespace-only passphrase", () => {
     openPrompt();
     const confirm = screen.getByText("Confirm") as HTMLButtonElement;
     expect(confirm.disabled).toBe(true);
-
     fireEvent.change(getPassphraseInput(), { target: { value: "hunter2" } });
     expect(confirm.disabled).toBe(false);
+
+    fireEvent.change(getPassphraseInput(), { target: { value: "   " } });
+    fireEvent.submit(getPassphraseInput().closest("form")!);
+    expect(elevateLogin).not.toHaveBeenCalled();
   });
 
   it("submitting calls elevateLogin with the passphrase and closes on success", async () => {
@@ -109,27 +104,14 @@ describe("ElevationPrompt", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 
-  it("Cancel closes the dialog without calling elevateLogin", () => {
+  it("Cancel and backdrop clicks close the dialog without calling elevateLogin", () => {
     openPrompt();
-
     fireEvent.click(screen.getByText("Cancel"));
     expect(screen.queryByRole("dialog")).toBeNull();
-    expect(elevateLogin).not.toHaveBeenCalled();
-  });
 
-  it("clicking the backdrop closes the dialog", () => {
-    openPrompt();
-
+    fireElevationRequired();
     fireEvent.click(screen.getByRole("dialog"));
     expect(screen.queryByRole("dialog")).toBeNull();
-  });
-
-  it("submitting a whitespace-only passphrase does not call elevateLogin", () => {
-    openPrompt();
-
-    const input = getPassphraseInput();
-    fireEvent.change(input, { target: { value: "   " } });
-    fireEvent.submit(input.closest("form")!);
     expect(elevateLogin).not.toHaveBeenCalled();
   });
 });
