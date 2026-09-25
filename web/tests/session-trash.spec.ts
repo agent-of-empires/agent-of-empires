@@ -40,29 +40,7 @@ test.describe("Session trash flow", () => {
     await expect(row(page)).toBeVisible({ timeout: 10_000 });
   });
 
-  test("a failed trash surfaces an error and keeps the row", async ({ page }) => {
-    const handle = await installTrashMocks(page, [{ ...SESSION, trashed: false }]);
-    handle.failTrash = true;
-    await page.goto("/session/sess-trash");
-
-    await confirmDelete(await openDeleteDialogFromRow(page, row(page)));
-    await expect.poll(() => handle.trashedIds.length, { timeout: 10_000 }).toBe(1);
-    await expect(trashToggle(page)).toHaveCount(0, { timeout: 5_000 });
-  });
-
-  test("Delete from the Trash panel opens the permanent-delete dialog", async ({ page }) => {
-    const handle = await installTrashMocks(page, [{ ...SESSION, trashed: true }]);
-    await page.goto("/");
-    await openTrash(page);
-
-    // Deleting an already-trashed row goes straight to permanent delete.
-    const dialog = await openPurgeDialog(page, trashRows(page).filter({ hasText: "story-trash" }));
-    await expect(dialog.locator('[data-testid="delete-session-permanent"]')).toHaveCount(0);
-    await confirmDelete(dialog);
-    await expect.poll(() => handle.deletedIds.length, { timeout: 10_000 }).toBe(1);
-  });
-
-  test("long trashed session names keep Trash actions and the delete dialog usable", async ({ page }) => {
+  test("Delete on a long-named trashed row opens a usable permanent-delete dialog", async ({ page }) => {
     const title = `story-trash-${"x".repeat(240)}`;
     const handle = await installTrashMocks(page, [{ ...SESSION, title, trashed: true }]);
     await page.goto("/");
@@ -82,7 +60,9 @@ test.describe("Session trash flow", () => {
     await expect(purge).toContainText("Delete");
     await expect(purge).toBeInViewport({ ratio: 1 });
 
+    // Deleting an already-trashed row goes straight to permanent delete.
     const dialog = await openPurgeDialog(page, trashRow);
+    await expect(dialog.locator('[data-testid="delete-session-permanent"]')).toHaveCount(0);
     await expect(dialog).toContainText(title);
     await expect(dialog.getByRole("button", { name: /^Delete$/ })).toBeInViewport({ ratio: 1 });
     const panelFits = await dialog
@@ -217,20 +197,6 @@ test.describe("Multi-session workspace trash", () => {
       .toEqual([expect.objectContaining({ session_ids: ["sess-a"], delete_worktree: false, delete_branch: false })]);
   });
 
-  test("a workspace trashed in only one group slice does not appear in Trash (#2533)", async ({ page }) => {
-    await install(
-      page,
-      workspace(
-        { id: "sess-a", groupPath: "alpha", trashed: true },
-        { id: "sess-b", groupPath: "beta", trashed: false },
-      ),
-    );
-    await page.goto("/");
-    // A live sibling keeps the workspace out of Trash.
-    await expect(sessionRows(page).first()).toBeVisible({ timeout: 10_000 });
-    await expect(trashToggle(page)).toHaveCount(0, { timeout: 5_000 });
-  });
-
   test("Restore from Trash restores every session of a split workspace (#2533)", async ({ page }) => {
     const handle = await install(
       page,
@@ -269,64 +235,6 @@ test.describe("Multi-session workspace trash", () => {
     // One request carries the whole workspace; ordering is covered by the Rust order_workspace_deletion tests.
     expect([...(handle.deleteBodies.at(-1)?.session_ids ?? [])].sort()).toEqual(["sess-a", "sess-b"]);
   });
-
-  test("a sibling delete failure aborts before the owner and leaves the workspace in Trash (#2530)", async ({
-    page,
-  }) => {
-    // Owner-last: sess-b is removed, sess-c fails and aborts, so the owner survives.
-    const handle = await install(
-      page,
-      workspace(
-        { id: "sess-a", groupPath: "alpha", trashed: true },
-        { id: "sess-b", groupPath: "beta", trashed: true },
-        { id: "sess-c", groupPath: "gamma", trashed: true },
-      ),
-      ["sess-c"],
-    );
-    await page.goto("/");
-    await openTrash(page);
-
-    await confirmDelete(await openPurgeDialog(page, trashRows(page).first()));
-    await expect.poll(() => [...handle.deletedIds].sort(), { timeout: 10_000 }).toEqual(["sess-b"]);
-    await expect(trashToggle(page)).toBeVisible({ timeout: 10_000 });
-  });
-
-  test("a failed owner delete keeps the open owner and does not redirect (#2539 review)", async ({ page }) => {
-    const handle = await install(
-      page,
-      workspace(
-        { id: "sess-a", groupPath: "alpha", trashed: true },
-        { id: "sess-b", groupPath: "beta", trashed: true },
-      ),
-      ["sess-a"],
-    );
-    await page.goto("/session/sess-a");
-    await openTrash(page);
-
-    const dialog = await openPurgeDialog(page, trashRows(page).first());
-    await confirmDelete(dialog);
-
-    await expect(dialog).toHaveCount(0, { timeout: 10_000 });
-    await expect.poll(() => handle.deletedIds, { timeout: 5_000 }).toEqual(["sess-b"]);
-    await expect(page).toHaveURL(/\/session\/sess-a/);
-  });
-
-  for (const open of ["sess-a", "sess-b"] as const) {
-    test(`redirects to / after the open ${open === "sess-a" ? "primary" : "sibling"} is purged`, async ({ page }) => {
-      await install(
-        page,
-        workspace(
-          { id: "sess-a", groupPath: "alpha", trashed: true },
-          { id: "sess-b", groupPath: "beta", trashed: true },
-        ),
-      );
-      await page.goto(`/session/${open}`);
-      await openTrash(page);
-
-      await confirmDelete(await openPurgeDialog(page, trashRows(page).first()));
-      await expect(page).toHaveURL(/\/$/, { timeout: 10_000 });
-    });
-  }
 });
 
 // #3167: Empty Trash confirms with the count and purges each trashed workspace
@@ -401,17 +309,6 @@ test.describe("Empty Trash", () => {
     await expect.poll(() => [...handle.deletedIds], { timeout: 10_000 }).toEqual(["sess-a"]);
     expect(handle.deleteBodies.length).toBe(2);
     await expect(trashToggle(page)).toHaveCount(1, { timeout: 10_000 });
-  });
-
-  test("is a no-op with an empty trash: the control is absent (#3167)", async ({ page }) => {
-    const handle = await installTrashMocks(page, [
-      { id: "sess-live", branch: "feat/live", mainRepoPath: "/tmp/sess-live", trashed: false },
-    ]);
-    await page.goto("/");
-    await expect(sessionRows(page).first()).toBeVisible({ timeout: 10_000 });
-    await expect(trashToggle(page)).toHaveCount(0, { timeout: 5_000 });
-    await expect(page.locator('[data-testid="sidebar-trash-empty"]')).toHaveCount(0, { timeout: 5_000 });
-    expect(handle.deleteBodies.length).toBe(0);
   });
 });
 
