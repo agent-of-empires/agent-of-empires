@@ -153,7 +153,7 @@ pub(super) fn build_sandbox_docker_argv(
     let request_auth = config
         .provider_env
         .iter()
-        .filter(|&(key, _)| request_env_denyreason(key).is_none())
+        .filter(|&(key, _)| request_env_denyreason(key).is_none() && !is_host_only_path_env(key))
         .cloned();
     let adapter_allowlist = allowlisted_env_pairs(config)
         .into_iter()
@@ -421,5 +421,22 @@ mod tests {
             vec!["sk-session-request"],
             "the request credential must win and be forwarded exactly once"
         );
+    }
+    #[test]
+    fn build_sandbox_docker_argv_rejects_host_only_provider_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = sandbox("aoe-sandbox-provider-host-only", None);
+        let mut config = sandbox_config(tmp.path(), &info);
+        config.provider_env = vec![
+            ("CODEX_HOME".into(), "/host/codex".into()),
+            ("AWS_CONFIG_FILE".into(), "/host/aws".into()),
+            ("ANTHROPIC_API_KEY".into(), "sk-request".into()),
+        ];
+
+        let argv = build_sandbox_docker_argv(&config, &info, "/workspace/proj").unwrap();
+
+        assert_absent(&argv, "CODEX_HOME");
+        assert_absent(&argv, "AWS_CONFIG_FILE");
+        assert_named_without_value(&argv, "ANTHROPIC_API_KEY", "sk-request");
     }
 }

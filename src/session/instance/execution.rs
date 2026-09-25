@@ -1241,11 +1241,7 @@ impl Instance {
                 let explicit = recorded_execution
                     .and_then(|execution| execution.exported_default_store)
                     .unwrap_or_else(|| {
-                        let selected_alias = declared.as_ref().is_some_and(|selected| {
-                            crate::session::capture::is_default_claude_store(selected, &home)
-                                && crate::git::template::lexical_normalize(selected)
-                                    != crate::git::template::lexical_normalize(&home.join(".claude"))
-                        });
+                        let selected_alias = self.is_explicit_claude_store_alias(&root, &home);
                         let exported_this_store = value("CLAUDE_CONFIG_DIR")
                             .filter(|value| !value.is_empty())
                             .is_some_and(|value| absolute(PathBuf::from(value)) == root);

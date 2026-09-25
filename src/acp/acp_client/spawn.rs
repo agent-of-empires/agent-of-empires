@@ -89,6 +89,10 @@ pub(super) fn request_env_denyreason(key: &str) -> Option<&'static str> {
     })
 }
 
+fn allowlist_env_denyreason(key: &str) -> Option<&'static str> {
+    provider_env_denyreason(key)
+}
+
 /// Trusted operator config may set infrastructure keys (as a terminal pane
 /// can); only aoe's token and the daemon to runner carrier are banned. Shared
 /// with the runner's spawn so the policies cannot drift.
@@ -166,7 +170,7 @@ pub(super) fn allowlisted_env_pairs(config: &SpawnConfig) -> Vec<(String, String
     };
     let mut pairs = Vec::new();
     for name in allowlist {
-        if let Some(reason) = request_env_denyreason(name) {
+        if let Some(reason) = allowlist_env_denyreason(name) {
             warn!(target: "acp", key = %name, reason, "ignoring env allowlist entry");
             continue;
         }
@@ -237,14 +241,14 @@ fn apply_claude_store_route(cmd: &mut std::process::Command, config: &SpawnConfi
         .host_environment
         .iter()
         .rev()
-        .find(|(key, _)| key == "HOME")
+        .find(|(key, value)| key == "HOME" && !value.is_empty())
         .map(|(_, value)| value.clone())
-        .or_else(|| effective_env_value(cmd, "HOME"))
-        .or_else(|| std::env::var("HOME").ok())
+        .or_else(|| effective_env_value(cmd, "HOME").filter(|value| !value.is_empty()))
+        .or_else(|| std::env::var("HOME").ok().filter(|value| !value.is_empty()))
         .map(PathBuf::from);
     let should_export = !home.is_some_and(|home| {
         crate::session::capture::is_default_claude_store(&pin.store, &home)
-            && pin.exported_default_store == Some(false)
+            && pin.exported_default_store != Some(true)
     });
     if should_export {
         cmd.env("CLAUDE_CONFIG_DIR", &pin.store);
@@ -254,10 +258,13 @@ fn apply_claude_store_route(cmd: &mut std::process::Command, config: &SpawnConfi
 }
 
 fn effective_env_value(cmd: &std::process::Command, key: &str) -> Option<String> {
-    cmd.get_envs()
-        .filter_map(|(name, value)| (name == key).then_some(value))
-        .last()
-        .and_then(|value| value?.to_str().map(str::to_owned))
+    let mut result = None;
+    for (name, value) in cmd.get_envs() {
+        if name == key {
+            result = value.and_then(|value| value.to_str().map(str::to_owned));
+        }
+    }
+    result
 }
 
 /// `dirs` first, then `path`, dropping any already present.
@@ -313,12 +320,7 @@ pub(super) fn native_store_snapshot(
             .rev()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.clone())
-            .or_else(|| {
-                command
-                    .get_envs()
-                    .find(|(key, _)| *key == name)
-                    .and_then(|(_, value)| value?.to_str().map(str::to_owned))
-            })
+            .or_else(|| effective_env_value(command, name))
             .filter(|value| !value.is_empty())
     };
     let cwd = crate::session::capture::canonicalize_allowing_missing_leaf(&config.cwd)?;
@@ -639,6 +641,25 @@ mod tests {
             }
         }
     }
+    #[test]
+    #[serial_test::serial]
+    fn unpinned_claude_allowlist_preserves_an_operator_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let other = tmp.path().join("other");
+        let _env = crate::session::test_support::EnvGuard::set(&[(
+            "CLAUDE_CONFIG_DIR",
+            other.to_str().unwrap(),
+        )]);
+        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        config.spec.env_allowlist = Some(vec!["CLAUDE_CONFIG_DIR".into()]);
+        config.claude_store_pin = None;
+
+        assert_eq!(
+            applied_env(&config).get("CLAUDE_CONFIG_DIR"),
+            Some(&other.display().to_string())
+        );
+    }
 
     #[test]
     #[serial_test::serial]
@@ -721,6 +742,29 @@ mod tests {
             ],
         )
         .unwrap();
+        assert_eq!(snapshot.exported_default_store, Some(false));
+    }
+    #[test]
+    fn native_snapshot_uses_the_last_route_after_removal() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let default = home.join(".claude");
+        let other = home.join("other");
+        let mut config = env_test_spawn_config(home.clone());
+        config.claude_store_pin = Some(crate::session::capture::ClaudeStorePin {
+            store: default.clone(),
+            exported_default_store: Some(false),
+        });
+        let mut command = std::process::Command::new("/bin/true");
+        command.env("CLAUDE_CONFIG_DIR", &other);
+        command.env_remove("CLAUDE_CONFIG_DIR");
+        let snapshot = native_store_snapshot(
+            &config,
+            &command,
+            &[("HOME".into(), home.display().to_string())],
+        )
+        .unwrap();
+        assert_eq!(snapshot.stores, vec![default]);
         assert_eq!(snapshot.exported_default_store, Some(false));
     }
 

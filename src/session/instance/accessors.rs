@@ -616,6 +616,20 @@ impl Instance {
         let execution = binding.execution.as_ref()?;
         (execution.agent == "claude" && execution.filesystem == "host").then_some((sid, execution))
     }
+    pub(crate) fn is_explicit_claude_store_alias(
+        &self,
+        store: &std::path::Path,
+        home: &std::path::Path,
+    ) -> bool {
+        self.declared_agent_config_dir_for(&self.tool)
+            .is_some_and(|declared| {
+                crate::session::capture::is_default_claude_store(&declared, home)
+                    && crate::git::template::lexical_normalize(&declared)
+                        != crate::git::template::lexical_normalize(&home.join(".claude"))
+                    && crate::session::capture::is_default_claude_store(store, home)
+            })
+    }
+
     pub(crate) fn selected_claude_store_pin(
         &self,
     ) -> Option<crate::session::capture::ClaudeStorePin> {
@@ -626,14 +640,9 @@ impl Instance {
             let default = home.as_deref().is_some_and(|home| {
                 crate::session::capture::is_default_claude_store(&pin.store, home)
             });
-            let explicit_alias = home.as_deref().is_some_and(|home| {
-                self.declared_agent_config_dir_for(&self.tool)
-                    .is_some_and(|declared| {
-                        crate::session::capture::is_default_claude_store(&declared, home)
-                            && crate::git::template::lexical_normalize(&declared)
-                                != crate::git::template::lexical_normalize(&home.join(".claude"))
-                    })
-            });
+            let explicit_alias = home
+                .as_deref()
+                .is_some_and(|home| self.is_explicit_claude_store_alias(&pin.store, home));
             pin.exported_default_store = Some(if default { explicit_alias } else { false });
         }
         Some(pin)
@@ -641,48 +650,54 @@ impl Instance {
 
     pub(crate) fn backfill_claude_store_marker(&mut self) -> bool {
         let (sid, use_resume_binding) = match &self.resume_intent {
-            ResumeIntent::Use(sid) | ResumeIntent::Fork { from: sid } => (sid.as_str(), true),
+            ResumeIntent::Use(sid) => (sid.as_str(), true),
             ResumeIntent::Default => match self.agent_session_id.as_deref() {
                 Some(sid) => (sid, false),
                 None => return false,
             },
-            ResumeIntent::Cleared => return false,
+            ResumeIntent::Fork { .. } | ResumeIntent::Cleared => return false,
+        };
+        let store = {
+            let binding = if use_resume_binding {
+                self.resume_binding.as_ref()
+            } else {
+                self.agent_session_binding.as_ref()
+            };
+            let Some(binding) = binding else {
+                return false;
+            };
+            if binding.session_id != sid {
+                return false;
+            }
+            let Some(execution) = binding.execution.as_ref() else {
+                return false;
+            };
+            if execution.agent != "claude" || execution.filesystem != "host" {
+                return false;
+            }
+            if execution.exported_default_store.is_some() {
+                return false;
+            }
+            let Some(store) = execution.stores.first().cloned() else {
+                return false;
+            };
+            store
         };
         let home = super::hooks::host_home(&self.resolved_host_environment());
-        let explicit_alias = home.as_deref().is_some_and(|home| {
-            self.declared_agent_config_dir_for(&self.tool)
-                .is_some_and(|declared| {
-                    crate::session::capture::is_default_claude_store(&declared, home)
-                        && crate::git::template::lexical_normalize(&declared)
-                            != crate::git::template::lexical_normalize(&home.join(".claude"))
-                })
-        });
+        let explicit_alias = home
+            .as_deref()
+            .is_some_and(|home| self.is_explicit_claude_store_alias(&store, home));
         let binding = if use_resume_binding {
             self.resume_binding.as_mut()
         } else {
             self.agent_session_binding.as_mut()
         };
-        let Some(binding) = binding else {
-            return false;
-        };
-        if binding.session_id != sid {
-            return false;
-        }
-        let Some(execution) = binding.execution.as_mut() else {
-            return false;
-        };
-        if execution.agent != "claude" || execution.filesystem != "host" {
-            return false;
-        }
-        if execution.exported_default_store.is_some() {
-            return false;
-        }
-        let Some(store) = execution.stores.first() else {
+        let Some(execution) = binding.and_then(|binding| binding.execution.as_mut()) else {
             return false;
         };
         let default = home
             .as_deref()
-            .is_some_and(|home| crate::session::capture::is_default_claude_store(store, home));
+            .is_some_and(|home| crate::session::capture::is_default_claude_store(&store, home));
         execution.exported_default_store = Some(if default { explicit_alias } else { false });
         true
     }

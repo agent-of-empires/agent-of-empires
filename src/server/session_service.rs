@@ -830,20 +830,38 @@ impl SessionService {
                 let session_id = id.to_string();
                 let persisted = tokio::task::spawn_blocking(move || {
                     storage.update(|instances, _groups| {
-                        if let Some(inst) = instances.iter_mut().find(|inst| inst.id == session_id)
-                        {
-                            let _ = inst.backfill_claude_store_marker();
-                        }
-                        Ok(())
+                        let Some(inst) = instances.iter_mut().find(|inst| inst.id == session_id)
+                        else {
+                            return Ok(None);
+                        };
+                        Ok(Some(inst.backfill_claude_store_marker()))
                     })
                 })
                 .await;
-                if !matches!(persisted, Ok(Ok(()))) {
-                    tracing::warn!(
+                match persisted {
+                    Ok(Ok(Some(true))) => {}
+                    Ok(Ok(Some(false))) => tracing::debug!(
                         target: "acp.supervisor",
                         session = %id,
+                        "Claude store routing provenance was already resolved on disk"
+                    ),
+                    Ok(Ok(None)) => tracing::warn!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        "session disappeared before Claude store routing provenance persisted"
+                    ),
+                    Ok(Err(error)) => tracing::warn!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        error = %error,
                         "failed to persist Claude store routing provenance"
-                    );
+                    ),
+                    Err(error) => tracing::warn!(
+                        target: "acp.supervisor",
+                        session = %id,
+                        error = %error,
+                        "Claude store routing provenance persist task failed"
+                    ),
                 }
             }
             Err(e) => tracing::warn!(

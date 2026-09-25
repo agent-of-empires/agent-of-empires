@@ -232,11 +232,24 @@ fn shared_account_roots_carry_the_selected_external_store() {
     assert_eq!(
         instance
             .agent_session_binding
+            .as_ref()
             .unwrap()
             .execution
+            .as_ref()
             .unwrap()
             .stores,
         vec![destination.canonicalize().unwrap()],
+    );
+    assert_eq!(
+        instance
+            .agent_session_binding
+            .as_ref()
+            .unwrap()
+            .execution
+            .as_ref()
+            .unwrap()
+            .exported_default_store,
+        Some(false),
     );
 }
 
@@ -499,6 +512,7 @@ impl ConversationCarry {
                 );
             }
             execution.stores[0] = target_root;
+            execution.exported_default_store = destination.exported_default_store;
             relocated = true;
         }
         if relocated {

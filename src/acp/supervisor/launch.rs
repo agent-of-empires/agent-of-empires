@@ -767,7 +767,7 @@ pub(super) fn apply_claude_store_pin(
     let default = home
         .as_deref()
         .is_some_and(|home| crate::session::capture::is_default_claude_store(&pin.store, home));
-    let export = !default || pin.exported_default_store != Some(false);
+    let export = !default || pin.exported_default_store == Some(true);
     environment.retain(|(key, _)| key != "CLAUDE_CONFIG_DIR");
     if export {
         environment.push((
@@ -979,10 +979,7 @@ mod tests {
             route(&default, Some(false), "/other"),
             (Some(home.clone()), None)
         );
-        assert_eq!(
-            route(&default, None, "/other"),
-            (Some(default.clone()), Some(default.clone()))
-        );
+        assert_eq!(route(&default, None, "/other"), (Some(home.clone()), None));
         assert_eq!(
             route(&default, Some(true), "/other"),
             (Some(default.clone()), Some(default.clone()))
