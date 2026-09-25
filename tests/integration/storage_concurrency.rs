@@ -9,8 +9,6 @@ use anyhow::Result;
 use serial_test::serial;
 use std::sync::{Arc, Barrier};
 
-#[cfg(unix)]
-use crate::common::running_as_root;
 use crate::common::setup_temp_home;
 
 /// Concurrent per-field updates on the same instance must not clobber each
@@ -84,64 +82,6 @@ fn test_concurrent_per_field_updates_no_clobber() -> Result<()> {
         loaded[0].notify_on_idle,
         Some(true),
         "thread B's notify_on_idle write must be preserved"
-    );
-    Ok(())
-}
-
-/// `Storage::update` must surface a disk-write failure as `Err` so the
-/// `delete_session` handler can return HTTP 500 instead of silently
-/// dropping the in-memory entry. Regression guard for review #7.
-#[cfg(unix)]
-#[test]
-#[serial]
-fn test_update_propagates_disk_write_failure() -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    // Root bypasses the Unix DAC permission bits, so the read-only dir below
-    // would not make the write fail and this regression guard would falsely
-    // fail. Skip cleanly rather than assert a failure that cannot be injected.
-    if running_as_root() {
-        eprintln!(
-            "test_update_propagates_disk_write_failure: skipping (running as root; \
-             uid 0 bypasses the read-only dir bit, so the write cannot be made to fail)"
-        );
-        return Ok(());
-    }
-
-    let _temp = setup_temp_home();
-
-    let storage = Storage::new_unwatched("default")?;
-    let seed = vec![Instance::new("session", "/tmp/s")];
-    storage.update(|i, g| {
-        *i = seed.to_vec();
-        *g = GroupTree::new_with_groups(&seed, &[]).get_all_groups();
-        Ok(())
-    })?;
-
-    let profile_dir = agent_of_empires::session::get_profile_dir("default")?;
-
-    let original_perms = std::fs::metadata(&profile_dir)?.permissions();
-    let mut readonly_perms = original_perms.clone();
-    readonly_perms.set_mode(0o555);
-    std::fs::set_permissions(&profile_dir, readonly_perms)?;
-
-    let result: Result<()> = storage.update(|instances, _groups| {
-        instances.clear();
-        Ok(())
-    });
-
-    std::fs::set_permissions(&profile_dir, original_perms)?;
-
-    assert!(
-        result.is_err(),
-        "update must Err when disk write fails (read-only parent dir)"
-    );
-
-    let reloaded = storage.load()?;
-    assert_eq!(
-        reloaded.len(),
-        1,
-        "disk state must be unchanged when atomic_write fails"
     );
     Ok(())
 }

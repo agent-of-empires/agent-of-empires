@@ -3183,6 +3183,11 @@ mod tests {
         fs::set_permissions(&profile_dir, restore)?;
 
         assert!(update_res.is_err(), "write failure must surface as Err");
+        assert_eq!(
+            storage.load()?.len(),
+            2,
+            "a failed write leaves disk unchanged"
+        );
 
         tokio::time::timeout(
             Duration::from_secs(2),

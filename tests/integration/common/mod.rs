@@ -67,14 +67,6 @@ pub fn shim_node() -> Result<&'static Path, String> {
     .map_err(Clone::clone)
 }
 
-/// True when the effective uid is 0. Root bypasses the Unix DAC permission
-/// bits, so a test that injects a write failure by making a dir read-only
-/// cannot make the write fail and must skip rather than assert `is_err()`.
-#[cfg(unix)]
-pub fn running_as_root() -> bool {
-    nix::unistd::geteuid().is_root()
-}
-
 /// Point `HOME` (and `XDG_CONFIG_HOME`) at a fresh temp dir; drop the guard to
 /// restore. `set_var` is not thread-safe, so callers must be `#[serial]`.
 pub fn setup_temp_home() -> TestHome {
