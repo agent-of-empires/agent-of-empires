@@ -832,9 +832,9 @@ fn find_by_idempotency_key_matches_trashed_but_not_missing() {
     assert!(find_by_idempotency_key(&instances, "never-seen").is_none());
 }
 
-#[test]
-fn fork_from_builds_terminal_seed_for_claude() {
-    let parent_binding = crate::session::ConversationBinding {
+/// A parent whose conversation is qualified, as a capture leaves it.
+fn qualified_parent_binding() -> crate::session::ConversationBinding {
+    crate::session::ConversationBinding {
         session_id: "parent-uuid".into(),
         execution: Some(crate::session::ExecutionBinding {
             agent: "claude".into(),
@@ -846,7 +846,12 @@ fn fork_from_builds_terminal_seed_for_claude() {
         }),
         provenance: crate::session::ConversationProvenance::Observed,
         transcript_path: None,
-    };
+    }
+}
+
+#[test]
+fn fork_from_builds_terminal_seed_for_claude() {
+    let parent_binding = qualified_parent_binding();
     let mut parent = crate::session::Instance::new("parent", "/tmp");
     parent.agent_session_id = Some(parent_binding.session_id.clone());
     parent.agent_session_binding = Some(parent_binding.clone());
@@ -891,17 +896,21 @@ fn fork_denial_message_distinguishes_every_refusal_state() {
     );
     assert_eq!(
         fork_denial_message(&crate::session::ForkDenied::UnqualifiedParent {
-            provenance: crate::session::ConversationProvenance::Unknown,
+            provenance: Some(crate::session::ConversationProvenance::Unknown),
         }),
-        "This session records a conversation id, but it was never verified against a native agent. Run 'aoe session set-session-id <session> <id>' on it to qualify it."
+        crate::session::fork::UNQUALIFIED_PARENT
     );
     // A pre-pinned id has no conversation to qualify, so the pin cannot be the remedy.
-    let preallocated = fork_denial_message(&crate::session::ForkDenied::UnqualifiedParent {
-        provenance: crate::session::ConversationProvenance::Preallocated,
-    });
     assert_eq!(
-        preallocated,
+        fork_denial_message(&crate::session::ForkDenied::UnqualifiedParent {
+            provenance: Some(crate::session::ConversationProvenance::Preallocated),
+        }),
         "This session has no captured conversation to fork from. Send it at least one message first."
+    );
+    // A binding-less id can be neither qualified nor cleared, so it gets its own text.
+    assert_eq!(
+        fork_denial_message(&crate::session::ForkDenied::UnqualifiedParent { provenance: None }),
+        crate::session::fork::UNBOUND_PARENT
     );
 }
 
@@ -915,8 +924,21 @@ fn fork_from_an_unqualified_parent_is_refused_as_unqualified() {
     assert_eq!(
         resolve_create_fork_seed("parent-uuid", false, &[parent]),
         Err(crate::session::ForkDenied::UnqualifiedParent {
-            provenance: crate::session::ConversationProvenance::Unknown
+            provenance: Some(crate::session::ConversationProvenance::Unknown)
         })
+    );
+}
+
+/// A degraded launch leaves the id with no binding, and no provenance can be
+/// read off what is gone, so the refusal must not claim one.
+#[test]
+fn fork_from_a_parent_with_no_binding_is_refused_without_provenance() {
+    let mut parent = crate::session::Instance::new("parent", "/tmp");
+    parent.agent_session_id = Some("parent-uuid".into());
+
+    assert_eq!(
+        resolve_create_fork_seed("parent-uuid", false, &[parent]),
+        Err(crate::session::ForkDenied::UnqualifiedParent { provenance: None })
     );
 }
 
@@ -924,19 +946,7 @@ fn fork_from_an_unqualified_parent_is_refused_as_unqualified() {
 /// fork, whatever order `Storage::load()` returned the rows in.
 #[test]
 fn fork_from_prefers_the_qualified_row_over_an_unqualified_one() {
-    let qualified = crate::session::ConversationBinding {
-        session_id: "parent-uuid".into(),
-        execution: Some(crate::session::ExecutionBinding {
-            agent: "claude".into(),
-            stores: vec!["/tmp/claude-store".into()],
-            configuration: Vec::new(),
-            cwd: "/tmp".into(),
-            cwd_filesystem: "host".into(),
-            filesystem: "host".into(),
-        }),
-        provenance: crate::session::ConversationProvenance::Observed,
-        transcript_path: None,
-    };
+    let qualified = qualified_parent_binding();
     let mut attested = crate::session::Instance::new("attested", "/tmp");
     attested.agent_session_id = Some("parent-uuid".into());
     attested.agent_session_binding = Some(qualified.clone());

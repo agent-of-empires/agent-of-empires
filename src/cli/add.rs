@@ -291,12 +291,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
         let parent_binding = source.fork_parent_binding();
         let parent_agent = parent_binding
-            .as_ref()
+            .and_then(crate::session::ForkParentRef::binding)
             .and_then(|binding| binding.execution.as_ref())
             .map(|execution| execution.agent.clone())
             .unwrap_or_else(|| source.tool.clone());
+        let recorded = parent_binding.map(|parent| parent.session_id());
         let seed = crate::session::fork::terminal_fork_seed(
-            parent_binding.as_deref(),
+            parent_binding,
             crate::session::capture::generate_session_uuid(),
         )
         .map_err(|denied| {
@@ -315,21 +316,30 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     parent_agent
                 ),
                 crate::session::ForkDenied::NoParentSession => no_parent_session(),
-                crate::session::ForkDenied::UnqualifiedParent { provenance } => {
-                    if matches!(provenance, crate::session::ConversationProvenance::Preallocated) {
-                        no_parent_session()
-                    } else {
-                        let recorded = parent_binding
-                            .as_ref()
-                            .map_or("", |binding| binding.session_id.as_str());
+                crate::session::ForkDenied::UnqualifiedParent { provenance } => match provenance {
+                    Some(crate::session::ConversationProvenance::Preallocated) => no_parent_session(),
+                    // Both arms read the id off the parent, which a recorded
+                    // conversation always has.
+                    Some(_) => {
+                        let recorded = recorded.expect("a bound provenance has a bound parent");
                         format!(
-                            "Nothing to fork: session '{}' records conversation '{}' but it was never verified against a native agent; run `aoe session set-session-id {} {}` to qualify it.",
-                            source.title, recorded, source.title, recorded
+                            "Nothing to fork: session '{}' records conversation '{}' but it was never qualified against a native agent; run `aoe session set-session-id {} {}` to qualify it.",
+                            source.title,
+                            recorded,
+                            shell_words::quote(&source.title),
+                            shell_words::quote(recorded)
                         )
                     }
-                }
+                    None => {
+                        let recorded = recorded.expect("an unqualified parent still records an id");
+                        format!(
+                            "Nothing to fork: session '{}' records conversation '{}' but no binding qualifies it: the id was pinned before the session ever ran, or its binding was lost at a degraded launch.",
+                            source.title, recorded
+                        )
+                    }
+                },
             };
-            anyhow::anyhow!("{}", message)
+            anyhow::Error::msg(message)
         })?;
         Some(seed)
     } else {

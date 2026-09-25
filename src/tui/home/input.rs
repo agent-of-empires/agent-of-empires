@@ -2864,9 +2864,12 @@ impl HomeView {
             crate::session::fork::structured_fork_capable(&inst.tool, inst.agent_name.as_deref())
         } else {
             inst.fork_parent_binding().is_some_and(|parent| {
-                parent.execution.as_ref().is_some_and(|execution| {
-                    crate::session::fork::terminal_agent_can_fork(&execution.agent)
-                })
+                parent
+                    .binding()
+                    .and_then(|binding| binding.execution.as_ref())
+                    .is_some_and(|execution| {
+                        crate::session::fork::terminal_agent_can_fork(&execution.agent)
+                    })
             })
         }
     }
@@ -3022,9 +3025,7 @@ impl HomeView {
             return;
         };
         let tool = parent.tool.clone();
-        let parent_binding = parent
-            .fork_parent_binding()
-            .map(std::borrow::Cow::into_owned);
+        let parent_binding = parent.fork_parent_binding();
         let repo_path = if parent.is_structured() {
             parent.repo_path().to_string()
         } else {
@@ -3063,7 +3064,7 @@ impl HomeView {
             }
         } else {
             let child_id = crate::session::capture::generate_session_uuid();
-            match crate::session::fork::terminal_fork_seed(parent_binding.as_ref(), child_id) {
+            match crate::session::fork::terminal_fork_seed(parent_binding, child_id) {
                 Ok(s) => s,
                 Err(crate::session::ForkDenied::AgentCannotFork) => {
                     self.info_dialog = Some(InfoDialog::new(
@@ -3080,19 +3081,19 @@ impl HomeView {
                     return;
                 }
                 Err(crate::session::ForkDenied::UnqualifiedParent { provenance }) => {
-                    self.info_dialog = Some(
-                        if matches!(
-                            provenance,
-                            crate::session::ConversationProvenance::Preallocated
-                        ) {
+                    self.info_dialog = Some(match provenance {
+                        Some(crate::session::ConversationProvenance::Preallocated) => {
                             no_captured_conversation_dialog()
-                        } else {
-                            InfoDialog::new(
-                                "Conversation not verified",
-                                "This session records a conversation id, but it was never verified against a native agent. Run 'aoe session set-session-id <session> <id>' on it to qualify it.",
-                            )
-                        },
-                    );
+                        }
+                        Some(_) => InfoDialog::new(
+                            "Conversation not qualified",
+                            crate::session::fork::UNQUALIFIED_PARENT,
+                        ),
+                        None => InfoDialog::new(
+                            "Conversation not qualified",
+                            crate::session::fork::UNBOUND_PARENT,
+                        ),
+                    });
                     return;
                 }
             }

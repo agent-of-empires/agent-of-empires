@@ -133,58 +133,52 @@ pub(super) fn resolve_create_fork_seed(
             parent_acp_session_id: parent_id.to_string(),
         });
     }
-    let candidates: Vec<crate::session::ConversationBinding> = parents
+    let candidates: Vec<crate::session::ForkParentRef<'_>> = parents
         .iter()
+        .filter(|parent| parent.agent_session_id.as_deref() == Some(parent_id))
         .filter_map(|parent| parent.fork_parent_binding())
-        .filter(|binding| binding.session_id == parent_id)
-        .map(std::borrow::Cow::into_owned)
         .collect();
     if candidates.is_empty() {
         return Err(crate::session::ForkDenied::NoParentSession);
     }
     // A qualified row wins over an unqualified one holding the same id, so a
-    // fork that resolved still resolves whatever order the rows loaded in. The
-    // ambiguity scan stays a qualified-row question, as it was when every
-    // candidate had to be qualified.
+    // fork that resolved resolves whatever order the rows loaded in; the
+    // ambiguity scan stays a qualified-row question.
     let qualified = candidates.iter().position(|candidate| candidate.is_known());
     if let Some(index) = qualified {
-        if candidates[index + 1..]
-            .iter()
-            .any(|candidate| candidate.is_known() && candidate.key() != candidates[index].key())
-        {
+        let chosen = candidates[index]
+            .binding()
+            .and_then(|binding| binding.key());
+        if candidates[index + 1..].iter().any(|candidate| {
+            candidate.is_known() && candidate.binding().and_then(|binding| binding.key()) != chosen
+        }) {
             return Err(crate::session::ForkDenied::NoParentSession);
         }
     }
-    // An unqualified row is only selected so the refusal can name the conversation.
+    // An unqualified row is only selected so the refusal can name its state.
     crate::session::fork::terminal_fork_seed(
-        Some(&candidates[qualified.unwrap_or(0)]),
+        Some(candidates[qualified.unwrap_or(0)]),
         crate::session::capture::generate_session_uuid(),
     )
 }
 
 /// User-facing text for each refusal state, so an unqualified parent does not
 /// read as an unforkable agent.
-pub(super) fn fork_denial_message(denied: &crate::session::ForkDenied) -> String {
+pub(super) fn fork_denial_message(denied: &crate::session::ForkDenied) -> &'static str {
     match denied {
         crate::session::ForkDenied::AgentCannotFork => {
             "This agent has no native fork capability. Forkable agents: claude, codex, opencode."
-                .to_string()
         }
         crate::session::ForkDenied::NoParentSession => {
-            "This session has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id.".to_string()
+            "This session has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id."
         }
-        crate::session::ForkDenied::UnqualifiedParent { provenance } => {
-            if matches!(
-                provenance,
-                crate::session::ConversationProvenance::Preallocated
-            ) {
+        crate::session::ForkDenied::UnqualifiedParent { provenance } => match provenance {
+            Some(crate::session::ConversationProvenance::Preallocated) => {
                 "This session has no captured conversation to fork from. Send it at least one message first."
-                    .to_string()
-            } else {
-                "This session records a conversation id, but it was never verified against a native agent. Run 'aoe session set-session-id <session> <id>' on it to qualify it."
-                    .to_string()
             }
-        }
+            Some(_) => crate::session::fork::UNQUALIFIED_PARENT,
+            None => crate::session::fork::UNBOUND_PARENT,
+        },
     }
 }
 

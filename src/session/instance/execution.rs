@@ -1,6 +1,5 @@
 //! Conversation identity is independent of status detection and command spelling.
 
-use std::borrow::Cow;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -136,6 +135,7 @@ pub(crate) enum CaptureContext {
 
 use super::{Instance, ResumeIntent};
 use crate::agents::{AgentDef, AGENTS};
+use crate::session::fork::ForkParentRef;
 use anyhow::{bail, Context, Result};
 
 #[cfg(test)]
@@ -1053,9 +1053,10 @@ impl Instance {
 
 impl Instance {
     /// The conversation an explicit fork would carry. A recorded id with no
-    /// binding at all, which a degraded launch leaves behind, is an unqualified
-    /// recorded conversation, not nothing to fork.
-    pub(crate) fn fork_parent_binding(&self) -> Option<Cow<'_, ConversationBinding>> {
+    /// binding at all, which a degraded launch leaves behind, is `Recorded`:
+    /// an unqualified recorded conversation, not nothing to fork, and not a
+    /// binding either, so nothing is invented for it.
+    pub(crate) fn fork_parent_binding(&self) -> Option<ForkParentRef<'_>> {
         let (sid, binding) = match &self.resume_intent {
             ResumeIntent::Fork { .. } => return None,
             ResumeIntent::Use(sid) => (Some(sid), self.resume_binding.as_ref()),
@@ -1066,11 +1067,11 @@ impl Instance {
         };
         let sid = sid?;
         match binding {
-            Some(binding) if binding.session_id == *sid => Some(Cow::Borrowed(binding)),
+            Some(binding) if binding.session_id == *sid => Some(ForkParentRef::Bound(binding)),
             // A binding naming a different conversation is an inconsistency,
             // not a recorded id awaiting proof.
             Some(_) => None,
-            None => Some(Cow::Owned(ConversationBinding::unknown(sid))),
+            None => Some(ForkParentRef::Recorded(sid)),
         }
     }
 
@@ -2510,17 +2511,18 @@ mod tests {
 
         assert_eq!(
             crate::session::fork::terminal_fork_seed(
-                instance.fork_parent_binding().as_deref(),
+                instance.fork_parent_binding(),
                 "child-uuid".into()
             ),
             Err(crate::session::ForkDenied::UnqualifiedParent {
-                provenance: ConversationProvenance::Unknown
+                provenance: Some(ConversationProvenance::Unknown)
             })
         );
     }
 
     /// A degraded launch drops the binding and leaves the id, so the fork must
-    /// still name that conversation rather than report nothing to fork.
+    /// still name that conversation, and must not read a provenance off a
+    /// binding that no longer exists.
     #[test]
     fn fork_parent_binding_reports_a_dropped_binding_for_a_recorded_id() {
         let mut instance = Instance::new("parent", "/tmp");
@@ -2529,12 +2531,10 @@ mod tests {
 
         assert_eq!(
             crate::session::fork::terminal_fork_seed(
-                instance.fork_parent_binding().as_deref(),
+                instance.fork_parent_binding(),
                 "child-uuid".into()
             ),
-            Err(crate::session::ForkDenied::UnqualifiedParent {
-                provenance: ConversationProvenance::Unknown
-            })
+            Err(crate::session::ForkDenied::UnqualifiedParent { provenance: None })
         );
         instance.agent_session_id = None;
         assert!(instance.fork_parent_binding().is_none());
