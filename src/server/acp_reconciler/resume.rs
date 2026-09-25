@@ -311,7 +311,6 @@ async fn build_spawn_request(
     service: &Arc<SessionService>,
     target: &ResumeTarget,
 ) -> Result<SpawnRequest, ()> {
-    service.backfill_claude_store_marker(&target.id).await;
     let supervisor = &service.acp_supervisor;
     let inst_lock = service.instance_lock(&target.id).await;
     // Re-read under the session lock, for two reasons. A worktree rename holds
@@ -567,7 +566,7 @@ mod tests {
     }
     #[tokio::test]
     #[serial_test::serial]
-    async fn legacy_claude_store_provenance_is_persisted_before_resume() {
+    async fn legacy_claude_store_provenance_is_derived_for_each_resume() {
         let (home, state, project) = test_state("s-legacy-routing");
         let profile = "legacy-acp-routing";
         let store = home.path().join(".claude");
@@ -616,29 +615,22 @@ mod tests {
                 .exported_default_store,
             Some(false)
         );
-        assert_eq!(
-            state.instances.read().await[0]
-                .agent_session_binding
+        // The resume request carries the derived route, and neither the
+        // in-memory row nor the persisted one is rewritten with a guess about
+        // the configuration as it stands: a later alias declaration still
+        // reaches the next launch.
+        let marker = |row: &Instance| {
+            row.agent_session_binding
                 .as_ref()
                 .unwrap()
                 .execution
                 .as_ref()
                 .unwrap()
-                .exported_default_store,
-            Some(false)
-        );
+                .exported_default_store
+        };
+        assert_eq!(marker(&state.instances.read().await[0]), None);
         let persisted = storage.load().unwrap();
-        assert_eq!(
-            persisted[0]
-                .agent_session_binding
-                .as_ref()
-                .unwrap()
-                .execution
-                .as_ref()
-                .unwrap()
-                .exported_default_store,
-            Some(false)
-        );
+        assert_eq!(marker(&persisted[0]), None);
     }
 
     /// A live stale worker must never be classified dead, which would lose its PID.

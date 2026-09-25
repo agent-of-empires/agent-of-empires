@@ -648,60 +648,6 @@ impl Instance {
         Some(pin)
     }
 
-    pub(crate) fn backfill_claude_store_marker(&mut self) -> bool {
-        let (sid, use_resume_binding) = match &self.resume_intent {
-            ResumeIntent::Use(sid) => (sid.as_str(), true),
-            ResumeIntent::Default => match self.agent_session_id.as_deref() {
-                Some(sid) => (sid, false),
-                None => return false,
-            },
-            ResumeIntent::Fork { .. } | ResumeIntent::Cleared => return false,
-        };
-        let store = {
-            let binding = if use_resume_binding {
-                self.resume_binding.as_ref()
-            } else {
-                self.agent_session_binding.as_ref()
-            };
-            let Some(binding) = binding else {
-                return false;
-            };
-            if binding.session_id != sid || !binding.is_known() {
-                return false;
-            }
-            let Some(execution) = binding.execution.as_ref() else {
-                return false;
-            };
-            if execution.agent != "claude" || execution.filesystem != "host" {
-                return false;
-            }
-            if execution.exported_default_store.is_some() {
-                return false;
-            }
-            let Some(store) = execution.stores.first().cloned() else {
-                return false;
-            };
-            store
-        };
-        let home = super::hooks::host_home(&self.resolved_host_environment());
-        let explicit_alias = home
-            .as_deref()
-            .is_some_and(|home| self.is_explicit_claude_store_alias(&store, home));
-        let binding = if use_resume_binding {
-            self.resume_binding.as_mut()
-        } else {
-            self.agent_session_binding.as_mut()
-        };
-        let Some(execution) = binding.and_then(|binding| binding.execution.as_mut()) else {
-            return false;
-        };
-        let default = home
-            .as_deref()
-            .is_some_and(|home| crate::session::capture::is_default_claude_store(&store, home));
-        execution.exported_default_store = Some(if default { explicit_alias } else { false });
-        true
-    }
-
     fn resolved_handoff_binding(
         &self,
         sid: &str,
@@ -788,9 +734,14 @@ mod tests {
             (None, None, None)
         );
     }
+
+    /// A legacy binding carries no route marker, and the marker it would be
+    /// given is a guess about the configuration as it stands right now. It
+    /// stays derived at every read instead, so a reconfigured alias is
+    /// observed rather than frozen into the row.
     #[test]
     #[serial_test::serial]
-    fn legacy_claude_default_binding_backfills_implicit_routing() {
+    fn legacy_claude_default_binding_derives_implicit_routing_without_freezing_it() {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let sid = "11111111-1111-4111-8111-111111111111";
@@ -812,7 +763,12 @@ mod tests {
             transcript_path: None,
         });
 
-        assert!(inst.backfill_claude_store_marker());
+        assert_eq!(
+            inst.selected_claude_store_pin()
+                .unwrap()
+                .exported_default_store,
+            Some(false)
+        );
         assert_eq!(
             inst.resume_binding
                 .as_ref()
@@ -821,15 +777,9 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .exported_default_store,
-            Some(false)
+            None,
+            "the derived route must not be persisted into the binding"
         );
-        assert_eq!(
-            inst.selected_claude_store_pin()
-                .unwrap()
-                .exported_default_store,
-            Some(false)
-        );
-        assert!(!inst.backfill_claude_store_marker());
     }
 
     #[test]
@@ -844,14 +794,17 @@ mod tests {
         let config_path =
             crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            config_path,
-            format!(
-                "[session.agent_config_dir]\nclaude = {:?}\n",
-                work.to_str().unwrap()
-            ),
-        )
-        .unwrap();
+        let declare = |directory: &std::path::Path| {
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[session.agent_config_dir]\nclaude = {:?}\n",
+                    directory.to_str().unwrap()
+                ),
+            )
+            .unwrap();
+        };
+        declare(&work);
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
         let sid = "11111111-1111-4111-8111-111111111111";
         let mut inst = Instance::new("alias", temp.path().to_str().unwrap());
@@ -873,12 +826,20 @@ mod tests {
             transcript_path: None,
         });
 
-        assert!(inst.backfill_claude_store_marker());
         assert_eq!(
             inst.selected_claude_store_pin()
                 .unwrap()
                 .exported_default_store,
             Some(true)
+        );
+        // Declaring the built-in store outright is no longer an alias, and the
+        // next read has to say so.
+        declare(&temp.path().join(".claude"));
+        assert_eq!(
+            inst.selected_claude_store_pin()
+                .unwrap()
+                .exported_default_store,
+            Some(false)
         );
     }
 

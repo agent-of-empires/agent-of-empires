@@ -813,65 +813,6 @@ impl SessionService {
         }
     }
 
-    pub(crate) async fn backfill_claude_store_marker(self: &Arc<Self>, id: &str) {
-        let profile = {
-            let mut instances = self.instances.write().await;
-            let Some(inst) = instances.iter_mut().find(|inst| inst.id == id) else {
-                return;
-            };
-            if !inst.backfill_claude_store_marker() {
-                return;
-            }
-            self.invalidate_disk_snapshots();
-            inst.source_profile.clone()
-        };
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
-            Ok(storage) => {
-                let session_id = id.to_string();
-                let persisted = tokio::task::spawn_blocking(move || {
-                    storage.update(|instances, _groups| {
-                        let Some(inst) = instances.iter_mut().find(|inst| inst.id == session_id)
-                        else {
-                            return Ok(None);
-                        };
-                        Ok(Some(inst.backfill_claude_store_marker()))
-                    })
-                })
-                .await;
-                match persisted {
-                    Ok(Ok(Some(true))) => {}
-                    Ok(Ok(Some(false))) => tracing::debug!(
-                        target: "acp.supervisor",
-                        session = %id,
-                        "Claude store routing provenance was already resolved on disk"
-                    ),
-                    Ok(Ok(None)) => tracing::warn!(
-                        target: "acp.supervisor",
-                        session = %id,
-                        "session disappeared before Claude store routing provenance persisted"
-                    ),
-                    Ok(Err(error)) => tracing::warn!(
-                        target: "acp.supervisor",
-                        session = %id,
-                        error = %error,
-                        "failed to persist Claude store routing provenance"
-                    ),
-                    Err(error) => tracing::warn!(
-                        target: "acp.supervisor",
-                        session = %id,
-                        error = %error,
-                        "Claude store routing provenance persist task failed"
-                    ),
-                }
-            }
-            Err(e) => tracing::warn!(
-                target: "acp.supervisor",
-                session = %id,
-                "failed to open storage for Claude store routing provenance: {e}"
-            ),
-        }
-    }
-
     /// Drop any disk reload that read `sessions.json` before this in-memory change. Call
     /// under the `instances` write lock; the persist that follows schedules a fresh reload.
     fn invalidate_disk_snapshots(&self) {
