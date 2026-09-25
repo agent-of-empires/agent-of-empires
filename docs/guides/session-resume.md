@@ -46,6 +46,18 @@ Disabling `agent_status_hooks` removes status writers only; identity hooks decla
 
 **Prime Agent** captures depth-zero roots, not the child sessions its recursive runtime spawns, and requires `-e <extension>` plus a numeric `rlmDepth: 0` in native root headers. If a root publishes a conversation whose transcript is confirmed absent, a restart starts an empty conversation rather than resuming. Capture also needs a session directory mapped into its writable managed store, with bounded regular settings files: symlinked settings are refused, since their container-visible target cannot be inferred from the host path, and the refusal is logged under `session.capture` and retried after 30 seconds. Pass an explicit `--session-dir` inside `/root/.prime/agent` to select a verified directory.
 
+## Where explicit resume and fork are refused
+
+Every row below refuses the explicit operation only: a plain start or restart in the same context is degraded, not refused. A running session can still be pinned against the context it was last attested in, and the refusal re-arms on the next launch.
+
+| Context | `set-session-id` | Fork | Remedy |
+|---------|------------------|------|--------|
+| Codex on a macOS host | Refused | Refused | None yet; run Codex in a managed container |
+| Codex signed in with a ChatGPT login | Refused | Refused | A local OpenAI API key, per [Codex](#supported-managed-contexts) |
+| Host OpenCode with neither `OPENCODE_DB` nor `OPENCODE_DISABLE_CHANNEL_DB` set to `1`/`true` | Refused | Refused | [OpenCode](#supported-managed-contexts): set `OPENCODE_DB`, or set `OPENCODE_DISABLE_CHANNEL_DB` to `1` or `true` |
+| Any agent in an Apple Container sandbox | Refused | Refused | None; use the Docker runtime |
+| An opaque wrapper with no `session.agent_execution_as` | Refused | Refused | Declare the wrapper contract, per [Execution identity and wrappers](#execution-identity-and-wrappers) |
+
 ## Pinning or resetting a conversation
 
 Pin a terminal session to a specific native conversation:
