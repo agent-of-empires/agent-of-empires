@@ -1463,9 +1463,10 @@ mod tests {
         poller.inject_test_sidecar_update(&inst.id, sid, Some(&path));
         let poller = Arc::new(Mutex::new(poller));
         inst.session_id_poller = Some(poller.clone());
-        let _fail_next = Instance::fail_next_pi_path_write_for_test();
+        let fail_next = Instance::fail_next_pi_path_write_for_test();
 
         inst.stop_and_flush_poller();
+        assert!(fail_next.was_consumed());
 
         assert!(inst.session_id_poller.is_none());
         let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
