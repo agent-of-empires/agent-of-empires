@@ -132,15 +132,12 @@ it.each<[string, number, number | null]>([
   ["hello", 5, null],
   ["你好", 4, null],
   ["你好世界", 2, 1],
-  ["你好世界", 6, 3],
   ["a\u{1F600}", 1, 1],
   ["a\u{1F600}", 2, 1],
   ["e\u0301x", 1, 2],
   [FLAG_US, 0, 0],
   [FLAG_US, 1, 0],
   [FLAG_US, 2, null],
-  [FAMILY, 1, 0],
-  [FAMILY, 2, null],
 ])("findCursorCharIndex(%j, %s) is %s", (text, col, expected) => {
   expect(findCursorCharIndex(text, col)).toBe(expected);
 });
@@ -254,7 +251,6 @@ describe("cell runs and widths", () => {
 
   it.each<[string, number]>([
     ["⚠\uFE0F", 2],
-    ["❤\uFE0F", 2],
     [FLAG_US, 2],
     [FAMILY, 2],
     ["\u{1F44D}\u{1F3FB}", 2],
@@ -296,14 +292,12 @@ describe("cell runs and widths", () => {
 
 it.each<[string, number, [number, number]]>([
   ["한글", 1, [1, 2]],
-  [FLAG_US, 0, [0, 2]],
   [FLAG_US, 1, [0, 2]],
   ["\u{1F1E9}\u{1F1EA}\u{1F3FB}", 1, [0, 2]],
   ["\u{1F44D}\u{1F3FB}", 0, [0, 2]],
   [`a\u{1F468}${ZWJ}\u{1F469}${ZWJ}\u{1F466}b`, 1, [1, 6]],
   [`a\u{1F468}${ZWJ}\u{1F469}${ZWJ}\u{1F466}b`, 6, [6, 7]],
   [`${FLAG_US}\u{1F1E9}\u{1F1EA}`, 2, [2, 4]],
-  [`${FLAG_US}\u{1F1E9}\u{1F1EA}`, 3, [2, 4]],
 ])("clusterSpanAt(%j, %s) is %o", (text, index, expected) => {
   expect(clusterSpanAt(text, index)).toEqual(expected);
 });

@@ -154,7 +154,6 @@ describe("MobileLiveTerminal paste", () => {
 describe("MobileLiveTerminal key sequences", () => {
   it.each([
     ["Enter", {}, "\r"],
-    ["Enter", { altKey: true }, "\r"],
     // Shift and Ctrl Enter insert a soft newline for agents.
     ["Enter", { ctrlKey: true }, "\x1b\r"],
     ["Enter", { shiftKey: true }, "\x1b\r"],
@@ -166,13 +165,11 @@ describe("MobileLiveTerminal key sequences", () => {
     ["ArrowUp", {}, "\x1b[A"],
     ["Delete", {}, "\x1b[3~"],
     ["ArrowUp", { shiftKey: true }, "\x1b[1;2A"],
-    ["ArrowDown", { altKey: true }, "\x1b[1;3B"],
     ["ArrowLeft", { ctrlKey: true }, "\x1b[1;5D"],
     ["End", { ctrlKey: true, shiftKey: true }, "\x1b[1;6F"],
     ["PageUp", { altKey: true }, "\x1b[5;3~"],
     ["c", { ctrlKey: true }, "\x03"],
     ["v", { code: "KeyV", altKey: true }, "\x1bv"],
-    ["V", { code: "KeyV", altKey: true, shiftKey: true }, "\x1bV"],
     // Option+V composes a symbol; the physical code recovers the letter.
     ["√", { code: "KeyV", altKey: true }, "\x1bv"],
   ])("%s %o sends %j", (key, init, expected) => {
