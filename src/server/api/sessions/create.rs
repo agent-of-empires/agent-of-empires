@@ -143,8 +143,7 @@ pub(super) fn resolve_create_fork_seed(
     // read off the candidate. Lazy: a row carrying another id, or none of its
     // own, is dropped without materialising anything.
     let mut first = None;
-    let mut bound = None;
-    let mut chosen = None;
+    let mut qualified = None;
     let mut ambiguous = false;
     for (index, parent) in parents.iter().enumerate() {
         let Some(candidate) = parent
@@ -156,14 +155,14 @@ pub(super) fn resolve_create_fork_seed(
         if first.is_none() {
             first = Some((index, candidate));
         }
-        if bound.is_none() && candidate.binding().is_some() {
-            bound = Some((index, candidate));
-        }
         if !candidate.is_known() {
             continue;
         }
-        match chosen {
-            None => chosen = Some((index, candidate)),
+        // A qualified row wins over an unqualified one carrying the same id,
+        // and the scan compares qualified rows only, so neither the seed nor
+        // the scan depends on the order `Storage::load()` returned.
+        match qualified {
+            None => qualified = Some((index, candidate)),
             Some((_, previous))
                 if candidate.binding().and_then(|binding| binding.key())
                     != previous.binding().and_then(|binding| binding.key()) =>
@@ -173,8 +172,7 @@ pub(super) fn resolve_create_fork_seed(
             Some(_) => {}
         }
     }
-    let (index, parent) = chosen
-        .or(bound)
+    let (index, parent) = qualified
         .or(first)
         .ok_or((crate::session::ForkDenied::NoParentSession, None))?;
     if ambiguous {
