@@ -330,10 +330,12 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
             // #4127: the worker's own store is the only observation of the
             // route this launch applied. Read it for the id the worker just
             // assigned — the drain published the worker's handle before the
-            // frame reached here, so a fresh spawn, a respawn and a reattach
-            // all answer, and a worker that never assigned an id attests
-            // nothing. Read before the save so the closure and the in-memory
-            // mirror attest the same observation.
+            // frame reached here, so a fresh spawn and a respawn both
+            // answer, and a worker that never assigned an id attests nothing.
+            // A reattach answers nothing: `AcpClient::attach` has no native
+            // store to report, so such a session stays unattested until its
+            // next spawn. Read before the save so the closure and the
+            // in-memory mirror attest the same observation.
             let observed = match acp_change.as_ref() {
                 Some(AcpSessionChange::Assigned(new_id)) => {
                     state

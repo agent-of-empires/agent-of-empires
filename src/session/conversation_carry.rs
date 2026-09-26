@@ -403,14 +403,15 @@ fn carry_refuses_unproven_destination_before_writing() {
     );
 }
 
-/// A carry whose source and destination are the same directory moves no
-/// transcript, but the launch it attests still observed the route. A legacy
-/// binding that skipped the marker would send the next launch through the
-/// derived default and drop the alias the operator selected.
+/// The marker records what a launch observed, not what the configuration
+/// derives. A same-store carry moves no transcript, so it must leave the
+/// marker exactly as it found it: an attested `Some(true)` survives, and a
+/// binding with no observation stays unobserved until the launch that follows
+/// stamps it.
 #[cfg(test)]
 #[test]
 #[serial_test::serial]
-fn same_store_carry_records_the_attested_route_marker() {
+fn same_store_carry_leaves_the_route_marker_to_the_launch() {
     let _app = crate::session::test_support::isolate_app_dir();
     let stub = tempfile::tempdir().unwrap();
     let _claude = crate::session::test_support::install_login_shell_path_command(
@@ -438,52 +439,63 @@ fn same_store_carry_records_the_attested_route_marker() {
     let project = home.join("project");
     std::fs::create_dir_all(&project).unwrap();
     let sid = "11111111-2222-3333-4444-555555555555";
-    let mut instance = Instance::new("carry", project.to_str().unwrap());
-    instance.source_profile = profile.clone();
-    instance.tool = "a".into();
-    instance.command = "claude".into();
-    instance.detect_as = "claude".into();
-    instance.agent_session_id = Some(sid.into());
-    instance.agent_session_binding = Some(crate::session::ConversationBinding {
+    let binding = |exported_default_store: Option<bool>| crate::session::ConversationBinding {
         session_id: sid.into(),
         provenance: crate::session::ConversationProvenance::Asserted,
         transcript_path: None,
         execution: Some(crate::session::ExecutionBinding {
             agent: "claude".into(),
-            stores: vec![store],
+            stores: vec![store.clone()],
             configuration: vec![],
-            cwd: project,
+            cwd: project.clone(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
-            exported_default_store: None,
+            exported_default_store,
         }),
-    });
-    let ToolSwap::KeepConversation(Some(carry)) = classify(&instance, &profile, "b") else {
-        panic!("a known conversation still requires a route decision");
     };
-    assert_eq!(carry.source_root, carry.target_root);
-    instance.swap_account("b");
+    let instance = |exported_default_store: Option<bool>| {
+        let mut instance = Instance::new("carry", project.to_str().unwrap());
+        instance.source_profile = profile.clone();
+        instance.tool = "a".into();
+        instance.command = "claude".into();
+        instance.detect_as = "claude".into();
+        instance.agent_session_id = Some(sid.into());
+        instance.agent_session_binding = Some(binding(exported_default_store));
+        instance
+    };
+    let marker = |instance: &Instance| {
+        instance
+            .agent_session_binding
+            .as_ref()
+            .unwrap()
+            .execution
+            .as_ref()
+            .unwrap()
+            .exported_default_store
+    };
+    for start in [Some(true), Some(false), None] {
+        let mut instance = instance(start);
+        let ToolSwap::KeepConversation(Some(carry)) = classify(&instance, &profile, "b") else {
+            panic!("a known conversation still requires a route decision");
+        };
+        assert_eq!(carry.source_root, carry.target_root);
+        instance.swap_account("b");
 
-    assert!(!carry.run_for(&mut instance).unwrap());
+        assert!(!carry.run_for(&mut instance).unwrap());
 
-    let marker = instance
-        .agent_session_binding
-        .as_ref()
-        .unwrap()
-        .execution
-        .as_ref()
-        .unwrap()
-        .exported_default_store;
-    assert_eq!(
-        marker,
-        Some(true),
-        "the attested alias route must survive a same-store carry"
-    );
-    let pin = instance.selected_claude_store_pin().unwrap();
-    assert!(crate::session::capture::exports_claude_store(
-        &pin,
-        Some(&home)
-    ));
+        assert_eq!(
+            marker(&instance),
+            start,
+            "a carry must not write a marker no launch observed"
+        );
+        if start == Some(true) {
+            let pin = instance.selected_claude_store_pin().unwrap();
+            assert!(crate::session::capture::exports_claude_store(
+                &pin,
+                Some(&home)
+            ));
+        }
+    }
 }
 
 impl ConversationCarry {
@@ -563,7 +575,6 @@ impl ConversationCarry {
             );
         }
         let mut relocated = false;
-        let mut marker_refreshed = false;
         for binding in bindings.iter_mut().flatten() {
             if !binding.is_known() {
                 continue;
@@ -572,14 +583,9 @@ impl ConversationCarry {
             let source_root = execution.stores[0].canonicalize()?;
             let target_root = destination.stores[0].clone();
             if source_root == target_root {
-                // No transcript moves, but the destination still observed the
-                // route at the launch it attested, and a legacy binding
-                // carries no marker of its own. Skipping the update would send
-                // the next launch back through the derived default.
-                if execution.exported_default_store != destination.exported_default_store {
-                    execution.exported_default_store = destination.exported_default_store;
-                    marker_refreshed = true;
-                }
+                // Nothing moves, and the marker is not ours to write: the
+                // route is only observed by a launch, which stamps it from
+                // the store it really routed to.
                 continue;
             }
             std::fs::create_dir_all(&target_root)?;
@@ -604,10 +610,9 @@ impl ConversationCarry {
                 );
             }
             execution.stores[0] = target_root;
-            execution.exported_default_store = destination.exported_default_store;
             relocated = true;
         }
-        if relocated || marker_refreshed {
+        if relocated {
             let [agent, resume] = bindings;
             instance.agent_session_binding = agent;
             instance.resume_binding = resume;
