@@ -828,6 +828,7 @@ mod tests {
             resolved_target_session_id: None,
             pi_pinnable: false,
             opencode_preassign: false,
+            store_override: None,
         };
 
         // The host launch stamps the binding it actually applied...
