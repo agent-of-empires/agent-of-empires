@@ -1346,27 +1346,35 @@ impl Instance {
                 // as the sibling namespaces already do.
                 // A new session takes that chain without the recorded store,
                 // so the difference between the two is exactly the override
-                // this launch reports. Both sides are resolved, so the
-                // comparison is plain equality.
+                // this launch reports. The comparison is a diagnostic: a
+                // selector that cannot be resolved must not fail a launch the
+                // recorded store already decides, so it reports nothing
+                // rather than erroring.
                 let ambient = value("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty());
-                let for_new_session = inputs.canonical_path(&absolute(declared
+                let new_session = inputs.canonical_path(&absolute(declared
                     .clone()
                     .or_else(|| ambient.clone().map(PathBuf::from))
-                    .unwrap_or_else(|| home.join(".claude"))))?;
-                let source = if declared.is_some() {
-                    "agent_config_dir"
-                } else if ambient.is_some() {
-                    "environment"
-                } else {
-                    "default"
-                };
+                    .unwrap_or_else(|| home.join(".claude"))));
                 let root = match recorded.as_ref() {
                     Some(recorded) => inputs.canonical_path(&absolute(recorded.clone()))?,
-                    None => for_new_session.clone(),
+                    None => new_session
+                        .as_ref()
+                        .ok()
+                        .cloned()
+                        .context("the configured Claude store cannot be resolved")?,
                 };
-                store_override = recorded
-                    .filter(|_| root != for_new_session)
-                    .map(|_| (root.clone(), for_new_session, source));
+                store_override = recorded.and_then(|_| {
+                    let new_session = new_session.ok()?;
+                    let source = if declared.is_some() {
+                        "agent_config_dir"
+                    } else if ambient.is_some() {
+                        "environment"
+                    } else {
+                        "default"
+                    };
+                    (root != new_session)
+                        .then_some((root.clone(), new_session, source))
+                });
                 let default = crate::session::capture::is_default_claude_store(&root, &home);
                 let explicit = recorded_execution
                     .and_then(|execution| execution.exported_default_store)

@@ -1841,6 +1841,33 @@ mod tests {
             assert!(line.contains(&expected), "{expected} missing from: {line}");
         }
 
+        // A selector that cannot be resolved must not fail a launch the
+        // recorded store already decides, so the resume still goes through
+        // and nothing is reported.
+        let broken = home.join("broken");
+        std::os::unix::fs::symlink(home.join("absent"), &broken).unwrap();
+        std::fs::write(
+            app.join("config.toml"),
+            "[session.agent_config_dir]\nclaude = \"~/broken\"\n",
+        )
+        .unwrap();
+        let (unresolved, _) = resumed(&mut instance(), attested.binding.clone());
+        assert!(
+            unresolved
+                .command
+                .as_deref()
+                .is_some_and(|command| command.contains(&format!("--resume {sid}"))),
+            "a dangling selector must not block a recorded-store resume"
+        );
+        assert!(
+            unresolved
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.store_override.as_ref())
+                .is_none(),
+            "an unresolvable selector is not a divergence to report"
+        );
+
         // Same declaration as the recorded store: the common launch stays quiet.
         declare("source");
         let (uncontested, _) = resumed(&mut instance(), attested.binding.clone());
