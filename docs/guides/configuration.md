@@ -102,7 +102,7 @@ sidebar_position = "left" # left | right; TUI session list
 | `agent_detect_as` | `{}` | Built-in status detection and ACP adapter inheritance for a custom agent. This is not authority for terminal resume or fork. |
 | `agent_execution_as` | `{}` | Explicit native-agent contract for an opaque terminal wrapper. Requires `agent_config_dir` naming its store. Trusted global/profile configuration only; repository overrides are refused. |
 | `agent_acp_cmd` | `{}` | ACP launch command that makes a custom agent structured-view capable, e.g. `{ "oc-superpowers" = "ocp run sp acp" }`. Split into argv and run with no shell. |
-| `agent_config_dir` | `{}` | Config directory an agent reads instead of its built-in default, keyed by agent name. Wins over the agent's config-dir environment variable. Two names pointing at the same agent are two accounts of it; a restart that swaps between them carries the conversation across, see [Session Resume](session-resume.md#swapping-the-engine-on-a-restart). Global/profile only. |
+| `agent_config_dir` | `{}` | Config directory an agent reads instead of its built-in default, keyed by agent name. Wins over the agent's config-dir environment variable. Two names pointing at the same agent are two accounts of it; a restart that swaps between them carries the conversation across. A resumed host or structured Claude conversation keeps the store it recorded, which outranks this entry; a sandboxed one follows it, see [Session Resume](session-resume.md#swapping-the-engine-on-a-restart). Global/profile only. |
 | `agents.<name>.status_map` | `{}` | Trusted hook-event to status mapping (`running`, `waiting`, `idle`, `error`), applied on the next hook install. Hooks receive `AOE_PROFILE`, so a script can read the resolved map with `aoe -p "$AOE_PROFILE" profile show --status-map <agent> --json`. Global/profile only. |
 | `agents.<name>.status_rules` | `[]` | Declarative pane status rules. See [Status rules](#status-rules-for-custom-agents). Global/profile only. |
 
@@ -160,7 +160,7 @@ Custom agents remain selectable even for remote or unmanaged commands. Profile m
 
 ### One CLI, two accounts
 
-A wrapper that runs the same CLI against a second login usually exports the agent's config-dir variable, which AoE cannot see: the wrapper sets it after AoE has chosen which file to write. Name the directory in `agent_config_dir` so folder-trust records and [native MCP discovery](mcp-servers.md) land on the config the agent actually reads.
+A wrapper that runs the same CLI against a second login usually exports the agent's config-dir variable, which AoE cannot see: the wrapper sets it after AoE has chosen which file to write. Name the directory in `agent_config_dir` so folder-trust records and [native MCP discovery](mcp-servers.md) land on the config the agent actually reads, for as long as the conversation has not recorded a store of its own.
 
 ```toml
 [session.custom_agents]
@@ -176,7 +176,7 @@ claude-personal = "claude"
 claude-personal = "~/.claude-personal"
 ```
 
-The value is a host path. Host sessions use the directory itself; each sandboxed session gets a private `sandbox-v2/<instance-id>` child mounted at the agent's canonical container config path, so do not mount that tree through `sandbox.extra_volumes` and keep the config-dir variables AoE sets inside the container.
+The value is a host path. Host sessions use the directory itself; each sandboxed session gets a private `sandbox-v2/<instance-id>` child mounted at the agent's canonical container config path, so do not mount that tree through `sandbox.extra_volumes` and keep the config-dir variables AoE sets inside the container. Once a host Claude conversation has recorded a store, repointing the entry moves new sessions only: the folder-trust record still lands in the directory named here, and a host terminal launch logs a warning naming both stores. See [Native Session Resume](session-resume.md#swapping-the-engine-on-a-restart) for the account swap that carries a conversation across.
 
 ### Status rules for custom agents
 

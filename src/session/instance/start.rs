@@ -223,6 +223,7 @@ impl Instance {
         if !self.is_sandboxed() {
             self.install_agent_status_hooks(self.status_agent(), prepared.execution.as_ref());
         }
+        self.report_store_override(prepared.execution.as_ref());
         let canonicalized = prepared.canonical_conversation.is_some();
         let launch_sid = if prepared.is_existing {
             Some(
@@ -426,6 +427,26 @@ impl Instance {
             Some(sid) => LaunchSidOutcome::Existing { sid },
             None => LaunchSidOutcome::Fresh { pinned_prior_sid },
         })
+    }
+
+    /// Name both stores when a recorded one outranks what a new session would
+    /// use. Reported at the launch, not in the resolver, because a restart
+    /// resolves twice and only the launch is one event.
+    pub(super) fn report_store_override(
+        &self,
+        execution: Option<&super::execution::NativeExecution>,
+    ) {
+        if let Some((launch, new_session, source)) =
+            execution.and_then(|execution| execution.store_override.as_ref())
+        {
+            tracing::warn!(target: "session.store",
+                session = %self.id,
+                launch_store = %launch.display(),
+                new_session_store = %new_session.display(),
+                new_session_store_source = %source,
+                "the recorded Claude store overrides the store a new session would use here, so this launch runs on the account it recorded"
+            );
+        }
     }
 
     /// Post-launch setup: persist state, start pollers, and apply tmux options.
@@ -807,6 +828,7 @@ mod tests {
             resolved_target_session_id: None,
             pi_pinnable: false,
             opencode_preassign: false,
+            store_override: None,
         };
 
         // The host launch stamps the binding it actually applied...
