@@ -1867,5 +1867,50 @@ mod tests {
                 .is_none(),
             "a symlinked spelling of the recorded store must not be reported"
         );
+
+        // The other two sources, which the guide tells a reader to key on:
+        // the session environment, then the default with nothing declared.
+        std::fs::write(app.join("config.toml"), "[session]\n").unwrap();
+        let env = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", home.join("source"))]);
+        let (unreported, _) = resumed(&mut instance(), attested.binding.clone());
+        assert!(
+            unreported
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.store_override.as_ref())
+                .is_none(),
+            "the environment naming the recorded store is not a divergence"
+        );
+        drop(env);
+        let other = home.join("elsewhere");
+        std::fs::create_dir_all(&other).unwrap();
+        let env = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", &other)]);
+        let (from_env, _) = resumed(&mut instance(), attested.binding.clone());
+        assert_eq!(
+            from_env
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.store_override.as_ref()),
+            Some(&(
+                crate::session::instance::test_helpers::path_identity(&source),
+                crate::session::instance::test_helpers::path_identity(&other),
+                "environment"
+            )),
+            "a session environment store must be named as the source"
+        );
+        drop(env);
+        let (from_default, _) = resumed(&mut instance(), attested.binding.clone());
+        assert_eq!(
+            from_default
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.store_override.as_ref()),
+            Some(&(
+                crate::session::instance::test_helpers::path_identity(&source),
+                crate::session::instance::test_helpers::path_identity(&home.join(".claude")),
+                "default"
+            )),
+            "with no declaration the default store is the source"
+        );
     }
 }

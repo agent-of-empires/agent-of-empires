@@ -1210,10 +1210,12 @@ pub struct SessionConfig {
     /// use a per-session `sandbox-v2/<instance id>` child of it, which AoE
     /// mounts at the resolved built-in config path and uses for hooks,
     /// credentials, and native-session capture. Every agent but Claude
-    /// re-reads this entry on the next launch, so repointing it moves a
-    /// running session. A Claude conversation keeps the store its own binding
-    /// recorded and resumes there, in the host and structured views alike;
-    /// this entry still owns that conversation's folder-trust records.
+    /// re-reads this entry on the next launch, so a repointed entry moves the
+    /// session, except where an OMP profile or dotenv pins its own directory,
+    /// which refuses the launch instead. A Claude conversation keeps the store
+    /// its own binding recorded and resumes there, in the host and structured
+    /// views alike; this entry still owns that conversation's folder-trust
+    /// records.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
         label = "Agent Config Dir",
