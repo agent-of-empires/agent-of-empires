@@ -248,7 +248,7 @@ List all sessions
 
 * `--json` — Output as JSON
 * `--all` — List sessions from all profiles
-* `--state <STATE>` — Filter by session state. Defaults to `all`, every persisted session, which is what `aoe list` has always shown. Pass `--state=live` to skip trashed and archived rows; the vocabulary matches the REST API's `GET /api/sessions?state=`
+* `--state <STATE>` — Filter by session state
 
   Default value: `all`
 
@@ -353,6 +353,8 @@ Send a message to a running agent session
 ## `aoe status`
 
 Show session status summary
+
+`--verbose`, `--quiet` and `--json` each replace the default summary instead of composing with it, so they exclude one another.
 
 **Usage:** `aoe status [OPTIONS]`
 

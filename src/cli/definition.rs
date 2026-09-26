@@ -105,6 +105,9 @@ pub enum Commands {
     Send(SendArgs),
 
     /// Show session status summary
+    ///
+    /// `--verbose`, `--quiet` and `--json` each replace the default summary
+    /// instead of composing with it, so they exclude one another.
     Status(StatusArgs),
 
     /// Force-stop everything aoe is running: the serve daemon, all agent

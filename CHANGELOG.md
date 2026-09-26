@@ -4,6 +4,16 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Unreleased
+
+
+### Features
+
+- **cli:** Serve the read-only commands (`list`, `status`, `session show`, `session list-trash`, `group list`, `profile`, `project list`) from the daemon when it publishes a runtime read, and from the local store when it does not
+- **cli:** Detect the current session from tmux when `session show` is given no identifier
+- **cli:** Reject `--verbose`, `--quiet` and `--json` together on `aoe status`, since each replaces the default summary instead of composing with it
+
+
 ## [1.17.2](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.17.2) - 2026-09-25
 
 
