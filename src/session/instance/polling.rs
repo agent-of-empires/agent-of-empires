@@ -1173,6 +1173,20 @@ mod tests {
         inst
     }
 
+    /// A refusal can only name a peer when the enumeration that finds peers worked.
+    fn assert_enumerable(profiles: &[&str]) {
+        let enumerated = crate::session::list_profiles().expect("profile enumeration");
+        for profile in profiles {
+            assert!(
+                enumerated.iter().any(|name| name.as_str() == *profile)
+                    && crate::session::Storage::new_unwatched(profile)
+                        .and_then(|storage| storage.load())
+                        .is_ok(),
+                "profile {profile} is not enumerable and readable, so a refusal cannot name its peer"
+            );
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn managed_capture_exclusivity_is_store_based_across_profiles() {
@@ -1222,6 +1236,14 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        assert_enumerable(&["capture-owner-a", "capture-owner-b"]);
+        {
+            let _fail_guard = crate::session::FailNextListProfilesGuard::new();
+            assert!(
+                !current.managed_capture_store_is_exclusive(backend),
+                "an unresolvable profile list fails closed rather than granting exclusivity"
+            );
+        }
         assert!(
             !current.managed_capture_store_is_exclusive(backend),
             "inspected mounts override predicted private stores"
@@ -1275,8 +1297,8 @@ mod tests {
             current.managed_capture_store_is_exclusive(backend),
             "a peer without an execution context falls back to its own predicted private store"
         );
-        // The legacy root only matters once the generation gate lets the peer through:
-        // without it, a removed gate would be indistinguishable from a missing store.
+        // A generation-1 peer's store is the legacy shared root, so the fixture
+        // materializes it: only the generation gate can refuse, not a missing path.
         let legacy = crate::session::config::container_config::sandbox_store_migration_paths(
             "gemini",
             &dirs::home_dir().unwrap(),
@@ -1298,7 +1320,7 @@ mod tests {
             .unwrap();
         assert!(
             !current.managed_capture_store_is_exclusive(backend),
-            "a peer still on the legacy shared store cannot prove exclusivity"
+            "a peer below the current store generation cannot prove exclusivity"
         );
 
         let mut unadmitted = sandboxed_gemini("unadmitted", "/repos/unadmitted", "/workspace/u");
@@ -1319,8 +1341,6 @@ mod tests {
         );
 
         let missing_store = app.path().join("missing-store");
-        peer.sandbox_store_generation =
-            crate::session::config::container_config::CURRENT_SANDBOX_STORE_GENERATION;
         bind(&mut peer, &missing_store);
         peer_storage
             .update(|instances, _| {
@@ -1382,13 +1402,14 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        assert_enumerable(&["codex-owner-a", "codex-owner-b"]);
         assert!(
             current.managed_capture_store_is_exclusive(backend),
             "a peer on another profile owns a distinct physical store"
         );
 
-        // The self row is skipped in its own profile only, so the same id under another
-        // profile is still compared.
+        // The self row is skipped only in its own profile, so the same id under
+        // another profile is still compared.
         let mut shadow = current.clone();
         shadow.source_profile = "codex-owner-b".into();
         let current_store = current
