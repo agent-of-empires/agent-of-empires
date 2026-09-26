@@ -249,7 +249,8 @@ fn shared_account_roots_carry_the_selected_external_store() {
             .as_ref()
             .unwrap()
             .exported_default_store,
-        Some(false),
+        None,
+        "a carry must not decide store export; only an attested launch may",
     );
 }
 
