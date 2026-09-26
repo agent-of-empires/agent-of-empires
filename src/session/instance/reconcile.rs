@@ -70,13 +70,7 @@ impl Instance {
             self.absorb_published_pi_session();
             return;
         }
-        if !matches!(
-            self.source_capture_backend(),
-            Some(
-                crate::agents::SessionCaptureBackend::Claude
-                    | crate::agents::SessionCaptureBackend::HookSidecar
-            )
-        ) {
+        if !self.capture_reads_hook_sidecar() {
             return;
         }
         if !matches!(self.resume_intent, ResumeIntent::Default) {

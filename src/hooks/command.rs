@@ -139,34 +139,55 @@ fn hook_command_with_write(write: &str, base: &str, target: HookInstallTarget) -
 /// Command extracting the top-level session id from the hook's stdin JSON into
 /// the `session_id` sidecar. The host calls the pinned `aoe` binary; the
 /// sandbox image has no `aoe`, so it uses `jq` and silently skips without it.
+///
+/// `publisher` is the binary of the agent whose config fires the hook. A nested agent of another
+/// kind inherits the pane's `AOE_*` environment, so its hooks must not publish into the pane's
+/// sidecar: both commands skip when `AOE_AGENT_BIN` names a different agent.
 pub(crate) fn hook_command_session_id(
     target: HookInstallTarget,
     field: HookIdentityField,
+    publisher: Option<&str>,
 ) -> String {
+    // The command is a single-quoted `sh -c` body; a publisher outside this alphabet would need
+    // quoting there, and every built-in agent binary fits it.
+    let publisher = publisher.filter(|name| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    });
     match target {
-        HookInstallTarget::Host => hook_command_session_id_host(field),
+        HookInstallTarget::Host => hook_command_session_id_host(field, publisher),
         HookInstallTarget::Sandbox => {
-            hook_command_session_id_sandbox(HOOK_STATUS_BASE_IN_CONTAINER, field)
+            hook_command_session_id_sandbox(HOOK_STATUS_BASE_IN_CONTAINER, field, publisher)
         }
     }
 }
 
-fn hook_command_session_id_host(field: HookIdentityField) -> String {
+fn hook_command_session_id_host(field: HookIdentityField, publisher: Option<&str>) -> String {
     let field = match field {
         HookIdentityField::SessionId => "session-id",
         HookIdentityField::ConversationIdOrSessionId => "conversation-id-or-session-id",
     };
+    let agent = publisher.map_or_else(String::new, |name| format!(" --agent {name}"));
     format!(
         "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
          [ -n \"$AOE_HOOK_BIN\" ] || exit 0; \
          [ -x \"$AOE_HOOK_BIN\" ] || exit 0; \
-         \"$AOE_HOOK_BIN\" __extract-session-id --field {field} 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
+         \"$AOE_HOOK_BIN\" __extract-session-id --field {field}{agent} 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
     )
 }
 
 /// A second `AOE_AGENT_BIN` ancestor marks a nested agent, whose id must not
 /// replace the pane's; with no launch pid in the container the walk runs to root.
-fn hook_command_session_id_sandbox(base: &str, field: HookIdentityField) -> String {
+fn hook_command_session_id_sandbox(
+    base: &str,
+    field: HookIdentityField,
+    publisher: Option<&str>,
+) -> String {
+    let publisher_guard = publisher.map_or_else(String::new, |name| {
+        format!("[ -z \"${{AOE_AGENT_BIN:-}}\" ] || [ \"$AOE_AGENT_BIN\" = {name} ] || exit 0; ")
+    });
     let selector = match field {
         HookIdentityField::SessionId => {
             r#"if (.session_id|type)=="string" then .session_id else empty end"#
@@ -183,7 +204,7 @@ fn hook_command_session_id_sandbox(base: &str, field: HookIdentityField) -> Stri
          LS=$(LC_ALL=C ls -ldn \"$D\" 2>/dev/null) || exit 0; \
          set -- $LS; M=\"$1\"; \
          case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
-         B=\"${{AOE_AGENT_BIN:-}}\"; N=0; P=$PPID; \
+         {publisher_guard}B=\"${{AOE_AGENT_BIN:-}}\"; N=0; P=$PPID; \
          while [ -n \"$B\" ] && [ \"${{P:-0}}\" -gt 0 ]; do \
          A=$(tr \"\\0\" \"\\n\" < /proc/$P/cmdline 2>/dev/null | head -n 1); \
          [ \"${{A##*/}}\" = \"$B\" ] && N=$((N + 1)); \
@@ -273,9 +294,9 @@ mod tests {
         let host = hook_command_with_base("running", "/tmp/aoe-hooks", HookInstallTarget::Host);
         let sandbox = hook_command("running", HookInstallTarget::Sandbox);
         let sid_host =
-            hook_command_session_id(HookInstallTarget::Host, HookIdentityField::SessionId);
+            hook_command_session_id(HookInstallTarget::Host, HookIdentityField::SessionId, None);
         let sid_sandbox =
-            hook_command_session_id_sandbox("/tmp/aoe-hooks", HookIdentityField::SessionId);
+            hook_command_session_id_sandbox("/tmp/aoe-hooks", HookIdentityField::SessionId, None);
         let common = [
             "unset IFS",
             "set -f",
@@ -358,11 +379,13 @@ mod tests {
         let host = hook_command_session_id(
             HookInstallTarget::Host,
             HookIdentityField::ConversationIdOrSessionId,
+            None,
         );
         assert!(host.contains("--field conversation-id-or-session-id"));
         let sandbox = hook_command_session_id(
             HookInstallTarget::Sandbox,
             HookIdentityField::ConversationIdOrSessionId,
+            None,
         );
         for token in [".conversation_id", ".session_id", "elif"] {
             assert!(sandbox.contains(token), "{sandbox}");
@@ -388,8 +411,12 @@ mod tests {
             hook_command("running", HookInstallTarget::Host),
             hook_command("idle", HookInstallTarget::Host),
             hook_command("waiting", HookInstallTarget::Sandbox),
-            hook_command_session_id(HookInstallTarget::Host, HookIdentityField::SessionId),
-            hook_command_session_id(HookInstallTarget::Sandbox, HookIdentityField::SessionId),
+            hook_command_session_id(HookInstallTarget::Host, HookIdentityField::SessionId, None),
+            hook_command_session_id(
+                HookInstallTarget::Sandbox,
+                HookIdentityField::SessionId,
+                Some("codex"),
+            ),
             // Legacy forms without the trailing marker match via the path sentinel.
             "sh -c 'unset IFS; set -f; umask 077; \
              [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
@@ -665,6 +692,7 @@ mod tests {
             let cmd = hook_command_session_id_sandbox(
                 tmp.path().to_str().unwrap(),
                 HookIdentityField::SessionId,
+                None,
             );
             run_hook("sh", &cmd, "sid", &payload, |_| {});
             let got = std::fs::read_to_string(tmp.path().join("sid/session_id")).ok();
@@ -683,6 +711,7 @@ mod tests {
         let hook = hook_command_session_id_sandbox(
             tmp.path().to_str().unwrap(),
             HookIdentityField::SessionId,
+            None,
         );
         let payload = r#"{"session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"#;
         for (id, script, writes) in [
@@ -702,6 +731,82 @@ mod tests {
                 tmp.path().join(id).join("session_id").exists(),
                 writes,
                 "{id}"
+            );
+        }
+    }
+
+    /// Claude's Bash tool running `codex exec` (or Codex running `claude -p`) fires the nested
+    /// agent's identity hook with the pane's inherited `AOE_*` environment. A publisher that names
+    /// its agent must only write from that agent's pane.
+    #[test]
+    fn sandbox_session_id_command_skips_a_different_agents_publisher() {
+        if !jq_available() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let payload = r#"{"session_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"#;
+        for (id, publisher, pane_agent, writes) in [
+            ("same_agent", Some("codex"), Some("codex"), true),
+            ("nested_other_agent", Some("codex"), Some("claude"), false),
+            ("pane_without_agent_bin", Some("codex"), None, true),
+            ("unnamed_publisher", None, Some("claude"), true),
+        ] {
+            let cmd = hook_command_session_id_sandbox(
+                tmp.path().to_str().unwrap(),
+                HookIdentityField::SessionId,
+                publisher,
+            );
+            run_hook("sh", &cmd, id, payload, |c| {
+                c.env_remove("AOE_AGENT_BIN");
+                if let Some(agent) = pane_agent {
+                    c.env("AOE_AGENT_BIN", agent);
+                }
+            });
+            assert_eq!(
+                tmp.path().join(id).join("session_id").exists(),
+                writes,
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_commands_name_their_publisher() {
+        let host = hook_command_session_id(
+            HookInstallTarget::Host,
+            HookIdentityField::SessionId,
+            Some("codex"),
+        );
+        assert!(
+            host.contains("__extract-session-id --field session-id --agent codex"),
+            "{host}"
+        );
+        let sandbox = hook_command_session_id(
+            HookInstallTarget::Sandbox,
+            HookIdentityField::SessionId,
+            Some("codex"),
+        );
+        assert!(
+            sandbox.contains("[ \"$AOE_AGENT_BIN\" = codex ] || exit 0"),
+            "{sandbox}"
+        );
+        // A name that would need quoting inside the `sh -c` body is dropped, not interpolated.
+        let unsafe_name = hook_command_session_id(
+            HookInstallTarget::Host,
+            HookIdentityField::SessionId,
+            Some("co'dex"),
+        );
+        assert!(!unsafe_name.contains("--agent"), "{unsafe_name}");
+        for agent in crate::agents::AGENTS {
+            let command = hook_command_session_id(
+                HookInstallTarget::Host,
+                HookIdentityField::SessionId,
+                Some(agent.binary),
+            );
+            assert!(
+                command.contains(&format!("--agent {}", agent.binary)),
+                "{} binary must be bakeable: {command}",
+                agent.name
             );
         }
     }

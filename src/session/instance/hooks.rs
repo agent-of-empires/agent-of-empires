@@ -361,7 +361,7 @@ impl Instance {
                     events,
                     crate::hooks::HookInstallTarget::Host,
                 ) {
-                    Ok(()) => true,
+                    Ok(installed) => installed,
                     Err(error) => {
                         tracing::warn!(target: "session.store", "Failed to install Codex hooks: {}", error);
                         false
@@ -934,8 +934,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn codex_hook_installer_follows_detect_as_and_profile_hook_setting() {
-        // (tool, profile config, global hooks off, expect hooks.json)
-        for (tool, profile, global_off, installed) in [
+        // (tool, profile config, global hooks off, expect status hooks)
+        for (tool, profile, global_off, status_hooks) in [
             ("my-codex-wrapper", None, false, true),
             (
                 "codex",
@@ -969,10 +969,29 @@ mod tests {
             inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as), None);
 
             let hooks = tmp.path().join(".codex").join("hooks.json");
-            if installed {
+            // The publisher names Codex, the pane's `AOE_AGENT_BIN`, even under a wrapper.
+            assert!(
+                std::fs::read_to_string(&hooks)
+                    .unwrap()
+                    .contains("__extract-session-id --field session-id --agent codex"),
+                "{tool} {profile:?}"
+            );
+            if status_hooks {
                 assert_aoe_codex_hooks(&hooks);
             } else {
-                assert!(!hooks.exists(), "{tool} {profile:?}");
+                // The `SessionStart` identity publisher is not optional; only it remains.
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&hooks).unwrap()).unwrap();
+                assert!(
+                    parsed["hooks"]["PreToolUse"].is_null(),
+                    "{tool} {profile:?}"
+                );
+                assert!(
+                    parsed["hooks"]["SessionStart"]
+                        .to_string()
+                        .contains("__extract-session-id"),
+                    "{tool} {profile:?}"
+                );
             }
             assert!(!tmp.path().join(".codex").join("config.toml").exists());
         }

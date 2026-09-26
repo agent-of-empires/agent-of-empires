@@ -294,29 +294,31 @@ impl Instance {
         } else {
             None
         };
+        let reads_sidecar = capture.reads_hook_sidecar(context);
         // Prime argv eligibility is in-memory; resolving its store/settings stays behind the budget gate.
-        let eligible = match backend {
-            crate::agents::SessionCaptureBackend::Codex
-            | crate::agents::SessionCaptureBackend::Gemini
-            | crate::agents::SessionCaptureBackend::Hermes
-            | crate::agents::SessionCaptureBackend::Kimi => self.capture_store_dir().is_some(),
-            crate::agents::SessionCaptureBackend::PrimeAgent => self
-                .active_execution
-                .as_ref()
-                .map_or(prime_options.is_some(), |active| {
-                    matches!(active.capture, Some(CaptureContext::Prime { .. }))
-                }),
-            crate::agents::SessionCaptureBackend::Omp => {
-                self.active_execution.as_ref().map_or_else(
-                    || self.omp_capture_options().is_some(),
-                    |active| matches!(active.capture, Some(CaptureContext::Omp(_))),
-                )
-            }
-            crate::agents::SessionCaptureBackend::Pi => self.pi_sidecar_source().is_some(),
-            crate::agents::SessionCaptureBackend::Claude
-            | crate::agents::SessionCaptureBackend::HookSidecar => true,
-            crate::agents::SessionCaptureBackend::OpenCode => false,
-        };
+        let eligible = reads_sidecar
+            || match backend {
+                crate::agents::SessionCaptureBackend::Codex
+                | crate::agents::SessionCaptureBackend::Gemini
+                | crate::agents::SessionCaptureBackend::Hermes
+                | crate::agents::SessionCaptureBackend::Kimi => self.capture_store_dir().is_some(),
+                crate::agents::SessionCaptureBackend::PrimeAgent => self
+                    .active_execution
+                    .as_ref()
+                    .map_or(prime_options.is_some(), |active| {
+                        matches!(active.capture, Some(CaptureContext::Prime { .. }))
+                    }),
+                crate::agents::SessionCaptureBackend::Omp => {
+                    self.active_execution.as_ref().map_or_else(
+                        || self.omp_capture_options().is_some(),
+                        |active| matches!(active.capture, Some(CaptureContext::Omp(_))),
+                    )
+                }
+                crate::agents::SessionCaptureBackend::Pi => self.pi_sidecar_source().is_some(),
+                crate::agents::SessionCaptureBackend::Claude
+                | crate::agents::SessionCaptureBackend::HookSidecar => true,
+                crate::agents::SessionCaptureBackend::OpenCode => false,
+            };
         if !eligible {
             return PollerStart::NotApplicable;
         }
@@ -481,11 +483,7 @@ impl Instance {
             return self.install_poller(poller, spawn);
         }
 
-        if matches!(
-            backend,
-            crate::agents::SessionCaptureBackend::Claude
-                | crate::agents::SessionCaptureBackend::HookSidecar
-        ) {
+        if reads_sidecar {
             let sidecar_id = self.id.clone();
             let active = self.active_execution.clone();
             let poll_fn: crate::session::poller::SessionIdPollFn = Box::new(move |_| {
@@ -1068,6 +1066,185 @@ mod tests {
             stored(),
             Some(published),
             "the path must be durable while the pane lives, not only at teardown"
+        );
+    }
+
+    const CODEX_PUBLISHED: &str = "01a0cfe1-7a89-7e01-b9c0-f57b5f6f86f0";
+
+    /// A host Codex pane publishes its conversation from `SessionStart` into the AoE hook
+    /// sidecar, and the capture pipeline has to *adopt* it. Asserting the hook is declared is
+    /// not enough: that was true while host capture stayed `Unsupported` and nothing read the id.
+    #[test]
+    #[serial_test::serial]
+    fn codex_host_pane_adopts_the_id_its_session_start_hook_published() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
+
+        let mut inst = Instance::new("codex-host-adopt", "/tmp/codex-host-adopt");
+        inst.tool = "codex".to_string();
+
+        let (_, context) = inst
+            .source_session_support()
+            .expect("a host Codex pane has a capture source");
+        assert_eq!(context, crate::agents::SessionCaptureContext::PaneScoped);
+        assert!(inst.capture_reads_hook_sidecar());
+        assert!(inst.supports_session_poller());
+
+        crate::hooks::write_session_id_via_guard(&inst.id, CODEX_PUBLISHED, None).unwrap();
+        assert_eq!(
+            inst.capture_freshest_conversation()
+                .map(|observation| observation.sid)
+                .as_deref(),
+            Some(CODEX_PUBLISHED),
+            "the id the hook published must be the one the pane adopts"
+        );
+    }
+
+    /// A host Codex launch must carry a hook capture context, so its observations bind to this
+    /// launch and teardown flushes the final publication the way it does for Claude.
+    #[test]
+    #[serial_test::serial]
+    fn codex_host_execution_captures_through_the_pane_hook() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let codex_home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        // The file-backed API-key login is the Codex namespace a managed execution can attest.
+        std::fs::write(
+            codex_home.join("auth.json"),
+            r#"{"OPENAI_API_KEY":"sk-test"}"#,
+        )
+        .unwrap();
+        let _codex = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "codex",
+            "#!/bin/sh\nexit 0\n",
+        )
+        .and_set("CODEX_HOME", &codex_home);
+
+        let mut inst = Instance::new("codex-host-exec", "/tmp");
+        inst.tool = "codex".to_string();
+
+        let execution = inst.resolve_native_execution(None).unwrap();
+        assert!(
+            matches!(execution.capture, Some(super::CaptureContext::Hooks(_))),
+            "a host Codex launch must capture through its pane hook"
+        );
+    }
+
+    /// The restart that follows a `cx bind` relaunches the pane with whatever id the launch
+    /// acquires. With a stale id on the row and a fresher one published by `SessionStart`, the
+    /// launch has to persist the published conversation and resume it, not the stale one and not
+    /// a fresh conversation.
+    #[test]
+    #[serial_test::serial]
+    fn codex_host_restart_resumes_the_conversation_its_hook_published() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
+
+        let profile = "codex-restart-resume";
+        let mut inst = Instance::new("codex-restart", "/tmp/codex-restart");
+        inst.source_profile = profile.to_string();
+        inst.tool = "codex".to_string();
+        inst.agent_session_id = Some("0199aaaa-0000-7000-8000-000000000000".to_string());
+
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _| {
+                *instances = vec![seed.clone()];
+                Ok(())
+            })
+            .unwrap();
+
+        crate::hooks::write_session_id_via_guard(&inst.id, CODEX_PUBLISHED, None).unwrap();
+        // The launch order `start` follows: flush the publication, then acquire.
+        inst.reconcile_sidecar_into_disk();
+        let _expected = inst.apply_fresh_launch_intent();
+
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(CODEX_PUBLISHED),
+            "the launch must persist what the pane last published"
+        );
+        assert_eq!(
+            inst.acquire_session_id_with(None, &|_| None),
+            (Some(CODEX_PUBLISHED.to_string()), true),
+            "and resume it rather than the stale row or a fresh conversation"
+        );
+    }
+
+    /// Wiring the host sidecar must leave the sandbox exactly as it was: a sandboxed Codex pane
+    /// keeps its isolated managed-store scan and never adopts a hook sidecar, even one present.
+    #[test]
+    #[serial_test::serial]
+    fn sandboxed_codex_keeps_the_managed_store_and_ignores_the_sidecar() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+
+        let mut inst = Instance::new("codexsandboxcap01", "/tmp/codex-sandbox-cap");
+        inst.tool = "codex".to_string();
+        inst.sandbox_info = Some(test_sandbox("aoe-codex-cap", None));
+
+        let (capture, context) = inst
+            .source_session_support()
+            .expect("a sandboxed Codex pane still has its managed store");
+        assert_eq!(
+            context,
+            crate::agents::SessionCaptureContext::ManagedExclusiveStore
+        );
+        assert!(!capture.reads_hook_sidecar(context));
+        assert!(!inst.capture_reads_hook_sidecar());
+
+        crate::hooks::write_session_id_via_guard(&inst.id, CODEX_PUBLISHED, None).unwrap();
+        assert_ne!(
+            inst.capture_freshest_conversation()
+                .map(|observation| observation.sid)
+                .as_deref(),
+            Some(CODEX_PUBLISHED),
+            "a sandboxed pane must not adopt a host-side sidecar"
+        );
+    }
+
+    /// A host Codex pane publishes under its own `AOE_INSTANCE_ID`, so a renamed bare-token
+    /// wrapper can carry resume the way a Claude wrapper does. The widening is host-only: the
+    /// sandbox managed store still requires the exact Codex binary, and a launch that is not a
+    /// single bare token fails closed.
+    #[test]
+    #[serial_test::serial]
+    fn codex_wrapper_attribution_is_host_scoped_and_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+
+        let context_for = |command: &str, sandboxed: bool| {
+            let mut inst = Instance::new("codexwrapper0001", "/tmp/codex-wrapper");
+            inst.tool = "company-codex".to_string();
+            inst.detect_as = "codex".to_string();
+            inst.command = command.to_string();
+            if sandboxed {
+                inst.sandbox_info = Some(test_sandbox("aoe-codex-wrap", None));
+            }
+            inst.resolved_session_support().map(|(_, context)| context)
+        };
+
+        assert_eq!(
+            context_for("company-codex", false),
+            Some(crate::agents::SessionCaptureContext::PaneScoped),
+            "a renamed bare-token wrapper resumes on the host"
+        );
+        assert_eq!(
+            context_for("echo not-codex", false),
+            None,
+            "a launch that is not a single bare token fails closed"
+        );
+        assert_eq!(
+            context_for("company-codex", true),
+            None,
+            "the sandbox store still needs the exact codex binary token"
         );
     }
 

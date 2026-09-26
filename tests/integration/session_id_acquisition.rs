@@ -385,3 +385,54 @@ fn wait_until(check: impl Fn() -> bool) -> bool {
     }
     check()
 }
+
+/// Claude's Bash tool running `codex exec` fires Codex's `SessionStart` identity hook with the
+/// Claude pane's inherited `AOE_*` environment. The real `aoe __extract-session-id` must refuse a
+/// publisher that names another agent, or the pane would later resume a foreign conversation.
+#[test]
+#[serial]
+fn extract_session_id_refuses_a_different_agents_publisher() {
+    let _temp = setup_temp_home();
+    let aoe = env!("CARGO_BIN_EXE_aoe");
+    let euid = Command::new("id").arg("-u").output().unwrap();
+    let base = std::path::PathBuf::from(format!(
+        "/tmp/aoe-hooks-{}",
+        String::from_utf8_lossy(&euid.stdout).trim()
+    ));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let sid = "019342ab-1234-7def-8901-abcdef0cafe1";
+    for (case, publisher, pane_agent, writes) in [
+        ("nested", "codex", "claude", false),
+        ("reverse", "claude", "codex", false),
+        ("own", "codex", "codex", true),
+    ] {
+        let id = format!("xagent-{case}-{nonce}");
+        let mut child = Command::new(aoe)
+            .args(["__extract-session-id", "--field", "session-id"])
+            .args(["--agent", publisher])
+            .env("AOE_INSTANCE_ID", &id)
+            .env("AOE_AGENT_BIN", pane_agent)
+            .env_remove("AOE_AGENT_PID")
+            .env_remove("AOE_SESSION_SOURCE")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(
+            &mut child.stdin.take().unwrap(),
+            format!(r#"{{"session_id":"{sid}"}}"#).as_bytes(),
+        )
+        .unwrap();
+        assert!(child.wait().unwrap().success(), "{case}");
+        let sidecar = base.join(&id).join("session_id");
+        let written = std::fs::read_to_string(&sidecar).ok();
+        let _ = std::fs::remove_dir_all(base.join(&id));
+        assert_eq!(
+            written.as_deref(),
+            writes.then_some(sid),
+            "{case}: {publisher} hook in a {pane_agent} pane"
+        );
+    }
+}

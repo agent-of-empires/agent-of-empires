@@ -9,11 +9,12 @@ Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fres
 | Agent | Host terminal | Sandboxed terminal | Authoritative source |
 |-------|---------------|--------------------|----------------------|
 | Claude Code | Yes | Yes | Pane-scoped native hook |
+| Codex | Yes | Yes | Pane-scoped native hook (host), isolated managed store (sandbox) |
 | Cursor Agent | Yes | Yes | `beforeSubmitPrompt` hook `conversation_id` |
 | Pi | Yes | Yes | Pane-scoped AoE extension |
 | OMP | Yes | Yes | Pane-scoped routed terminal store |
 | OpenCode | Opt-in | No | AoE-preassigned native id |
-| Codex, Gemini CLI, Hermes, Kimi CLI | No | Yes | Isolated managed store |
+| Gemini CLI, Hermes, Kimi CLI | No | Yes | Isolated managed store |
 | Prime Agent | No | Yes | Root-only publication and isolated managed store |
 | Vibe, Droid, Copilot CLI, Settl, Qwen Code, Kiro CLI, Antigravity | No | No | None verified |
 
@@ -27,7 +28,7 @@ Sandbox config and conversation stores are staged per AoE instance, including cu
 
 A conflicting built-in tool and command, such as tool `claude` with command `codex`, is rejected for managed resume and fork. An opaque wrapper requires both `session.agent_execution_as` and `session.agent_config_dir` in trusted global or profile configuration. This asserts that the wrapper invokes that native agent, forwards native arguments unchanged, and uses only the declared store and working-directory/filesystem context. Repository overrides are refused because a repository must not grant itself access to another native conversation store.
 
-A Default start or restart can pass native resume flags to a bare, non-path wrapper mapped by `agent_detect_as` and capture its pane-scoped published ID (for example Claude, Cursor, or Pi), even without the execution contract. If a failed-resume marker or disabled `auto_resume_on_restart` selects a fresh launch, Cleared intent starts fresh through the same wrapper, minting an ID and passing fresh-session flags where supported, then capturing its pane-scoped publication. The failed-resume marker applies to the next automatic attempt for that ID; a subsequent restart follows the resulting durable conversation state. Neither path proves the wrapper's execution identity or store. Shared-store capture, explicit resume, and fork still require the contract; shell-active commands, remote launchers, paths, and different built-in commands do not gain the exception. A known conversation can also be tried after an external working-directory or store move on Default; its old binding stays authoritative until a qualified observation updates it. Explicit operations still require a matching known binding before launch.
+A Default start or restart can pass native resume flags to a bare, non-path wrapper mapped by `agent_detect_as` and capture its pane-scoped published ID (for example Claude, Codex, Cursor, or Pi), even without the execution contract. If a failed-resume marker or disabled `auto_resume_on_restart` selects a fresh launch, Cleared intent starts fresh through the same wrapper, minting an ID and passing fresh-session flags where supported, then capturing its pane-scoped publication. The failed-resume marker applies to the next automatic attempt for that ID; a subsequent restart follows the resulting durable conversation state. Neither path proves the wrapper's execution identity or store. Shared-store capture, explicit resume, and fork still require the contract; shell-active commands, remote launchers, paths, and different built-in commands do not gain the exception. A known conversation can also be tried after an external working-directory or store move on Default; its old binding stays authoritative until a qualified observation updates it. Explicit operations still require a matching known binding before launch.
 
 Shell pipelines, remote launchers, redirections, expansion, and unrecognized context-changing arguments are not supported managed invocations. The program, routing environment, and native namespace arguments are fixed from one validated launch snapshot and restored after the login shell. If shell startup changes a pinned routing value, AoE refuses the launch instead of dispatching against the wrong store.
 

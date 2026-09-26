@@ -1693,17 +1693,17 @@ impl Instance {
             inputs.cwd.clone()
         };
         let cwd = inputs.physical_location(&cwd);
-        let capture = if matches!(
-            agent
-                .session_support
-                .as_ref()
-                .and_then(|support| support.capture.as_ref())
-                .map(|capture| capture.backend),
-            Some(
-                crate::agents::SessionCaptureBackend::Claude
-                    | crate::agents::SessionCaptureBackend::HookSidecar
-            )
-        ) {
+        let capture = if agent
+            .session_support
+            .as_ref()
+            .and_then(|support| support.capture.as_ref())
+            .is_some_and(|capture| {
+                capture.reads_hook_sidecar(if inputs.container.is_some() {
+                    capture.sandbox
+                } else {
+                    capture.host
+                })
+            }) {
             inputs.hook_capture_context(&self.id)?
         } else if let Some(plan) = prime
             .take()

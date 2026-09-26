@@ -2885,6 +2885,8 @@ pub(crate) fn build_container_config(
                                 .map(|relative| sandbox_dir.join(relative))
                         });
                 if let Some(settings_file) = settings_file {
+                    // `false` means nothing landed (Codex's `hooks` feature is off), so no
+                    // publisher may be reported for this launch.
                     let result = match hook_cfg.format {
                         crate::agents::HookFormat::CodexJson => {
                             crate::hooks::install_codex_json_hooks(
@@ -2897,12 +2899,13 @@ pub(crate) fn build_container_config(
                             &settings_file,
                             &events,
                             crate::hooks::HookInstallTarget::Sandbox,
-                        ),
+                        )
+                        .map(|()| true),
                     };
                     match result {
-                        Ok(()) => {
-                            let publishes_identity =
-                                events.iter().any(|event| event.identity_field.is_some());
+                        Ok(installed) => {
+                            let publishes_identity = installed
+                                && events.iter().any(|event| event.identity_field.is_some());
                             identity_publisher_installed |= publishes_identity;
                             if publishes_identity {
                                 if let Some((mount, sandbox_dir)) = active_sandbox_config.as_ref() {
@@ -6241,13 +6244,15 @@ codex-work = "{}"
         );
     }
 
-    /// The profile decides codex sandbox hooks: disabling them installs nothing, and a custom
-    /// wrapper detected as codex gets them even when the global setting is off.
+    /// The profile decides codex sandbox status hooks: disabling them drops the status writers,
+    /// and a custom wrapper detected as codex gets them even when the global setting is off. The
+    /// `SessionStart` identity publisher is not optional, so `hooks.json` and the hook directory
+    /// mount exist either way.
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_codex_hooks_follow_the_profile() {
-        // (profile, profile config, global hooks, tool, hooks installed)
-        for (profile, profile_config, global_hooks, tool, installed) in [
+        // (profile, profile config, global hooks, tool, status hooks installed)
+        for (profile, profile_config, global_hooks, tool, status_hooks) in [
             (
                 "sandbox-hooks-disabled",
                 "[session]\nagent_status_hooks = false\n",
@@ -6294,27 +6299,29 @@ codex-work = "{}"
                 .join(SANDBOX_PRIVATE_SUBDIR)
                 .join(&instance_id);
             assert!(!codex_sandbox.join("config.toml").exists(), "{profile}");
-            assert_eq!(codex_sandbox.join("hooks.json").exists(), installed, "{profile}");
-            if installed {
-                let codex_hooks = fs::read_to_string(codex_sandbox.join("hooks.json")).unwrap();
-                let parsed: serde_json::Value = serde_json::from_str(&codex_hooks).unwrap();
-                assert!(parsed["hooks"]["PreToolUse"].is_array());
-                assert!(codex_hooks.contains("aoe-hooks"));
-                assert!(config.volumes.iter().any(|v| {
-                    v.host_path == codex_sandbox.to_string_lossy()
-                        && v.container_path == format!("/root/.codex/{instance_id}")
-                }));
-            }
-            let hook_dir = crate::hooks::hook_status_dir(&instance_id).unwrap();
-            // Without hooks the directory is never created, so compare lexically.
-            let hook_dir = hook_dir.canonicalize().unwrap_or(hook_dir);
+            let codex_hooks = fs::read_to_string(codex_sandbox.join("hooks.json")).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&codex_hooks).unwrap();
             assert_eq!(
+                parsed["hooks"]["PreToolUse"].is_array(),
+                status_hooks,
+                "{profile}: status writers"
+            );
+            assert!(
+                parsed["hooks"]["SessionStart"].to_string().contains("aoe-hooks"),
+                "{profile}: the identity publisher is installed regardless"
+            );
+            assert!(config.volumes.iter().any(|v| {
+                v.host_path == codex_sandbox.to_string_lossy()
+                    && v.container_path == format!("/root/.codex/{instance_id}")
+            }));
+            let hook_dir = crate::hooks::hook_status_dir(&instance_id).unwrap();
+            let hook_dir = hook_dir.canonicalize().unwrap_or(hook_dir);
+            assert!(
                 config
                     .volumes
                     .iter()
                     .any(|v| v.host_path == hook_dir.to_string_lossy()),
-                installed,
-                "{profile}: status hook directory mount"
+                "{profile}: the identity publisher writes into the hook directory, so it is mounted"
             );
             crate::hooks::cleanup_hook_status_dir(&instance_id);
         }
@@ -6422,6 +6429,70 @@ trusted_hash = "keep"
         });
 
         assert_eq!(writes, [false, false, true]);
+    }
+
+    /// A sandboxed Codex whose `hooks` feature is off installs no hooks, so the launch must not
+    /// report an identity publisher it never had.
+    #[test]
+    #[serial_test::serial]
+    fn test_sandbox_codex_with_hooks_disabled_reports_no_identity_publisher() {
+        let tmp_base = TempDir::new().unwrap();
+        let _hg = BaseGuard::with_base(tmp_base.path().join("aoe-hooks"));
+        let temp_home = TempDir::new().unwrap();
+        let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let sandbox_info = crate::session::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let build = |instance_id: &str| {
+            build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("codex", None),
+                false,
+                instance_id,
+                None,
+                "",
+            )
+            .unwrap()
+        };
+        let sandbox_dir = |instance_id: &str| {
+            temp_home
+                .path()
+                .join(".codex")
+                .join(SANDBOX_PRIVATE_SUBDIR)
+                .join(instance_id)
+        };
+
+        let disabled = "codex-publisher-off";
+        assert!(
+            build(disabled).identity_publisher_installed,
+            "fixture: an enabled Codex sandbox reports its SessionStart publisher"
+        );
+
+        // The user turns the feature off in the sandbox's own Codex config, then relaunches.
+        fs::write(
+            sandbox_dir(disabled).join("config.toml"),
+            "[features]\nhooks = false\n",
+        )
+        .unwrap();
+        let config = build(disabled);
+
+        let hooks =
+            fs::read_to_string(sandbox_dir(disabled).join("hooks.json")).unwrap_or_default();
+        assert!(
+            !hooks.contains("aoe-hooks"),
+            "a disabled feature installs no AoE hooks"
+        );
+        assert!(!config.identity_publisher_installed);
     }
 
     #[test]

@@ -406,7 +406,7 @@ impl Instance {
     pub(super) fn clear_pane_identity_sidecar(&self) {
         // Prime's root_session survives failed launches and is replaced only by a root.
         let host_sidecar = match self.resolved_capture_backend() {
-            Some(SessionCaptureBackend::Claude | SessionCaptureBackend::HookSidecar) => true,
+            _ if self.capture_reads_hook_sidecar() => true,
             Some(SessionCaptureBackend::Pi) => match self.extension_sidecar_source() {
                 Some(source @ SessionSidecarSource::HostHooks(_)) => {
                     source.matches_host_hooks(&self.id)

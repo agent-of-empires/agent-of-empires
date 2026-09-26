@@ -203,6 +203,7 @@ mod tests {
                             canonical_set.push(hook_command_session_id(
                                 HookInstallTarget::Host,
                                 crate::agents::HookIdentityField::SessionId,
+                                crate::agents::get_agent("claude").map(|agent| agent.binary),
                             ));
                         }
                         if let Some(status) = event_def.status {
@@ -659,12 +660,34 @@ mod tests {
             let parsed: Value =
                 serde_json::from_str(&fs::read_to_string(override_dir.join(file)).unwrap())
                     .unwrap();
-            let cmd = parsed["hooks"][event][0]["hooks"][0]["command"]
-                .as_str()
-                .expect("AoE command must be present at the override path");
+            // An event can carry more than one AoE command: Codex's
+            // `SessionStart` publishes its native id alongside the status
+            // writer. Search the group rather than pinning index 0, so the
+            // assertion tracks "the legacy string was rewritten" rather than
+            // how many commands the event happens to install.
+            let commands: Vec<&str> = parsed["hooks"][event][0]["hooks"]
+                .as_array()
+                .expect("AoE commands must be present at the override path")
+                .iter()
+                .filter_map(|entry| entry["command"].as_str())
+                .collect();
             assert!(
-                cmd.contains("case \"$AOE_INSTANCE_ID\""),
-                "{var} override must be reached and rewritten; got: {cmd}"
+                !commands.contains(&LEGACY_STATUS_CMD),
+                "{var} override must not keep the legacy status writer; got: {commands:?}"
+            );
+            assert!(
+                commands.iter().any(|cmd| {
+                    cmd.contains("case \"$AOE_INSTANCE_ID\"") && cmd.contains("/status")
+                }),
+                "{var} override must carry the hardened status writer; got: {commands:?}"
+            );
+            // Only Codex's `SessionStart` also publishes the pane's native id.
+            assert_eq!(
+                commands
+                    .iter()
+                    .any(|cmd| cmd.contains("__extract-session-id")),
+                var == "CODEX_HOME",
+                "{var} identity publisher; got: {commands:?}"
             );
             assert!(
                 !home.join(default).exists(),

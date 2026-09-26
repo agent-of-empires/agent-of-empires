@@ -336,12 +336,8 @@ impl Instance {
             return None;
         }
         // Pane-scoped publishers confine Default/Cleared wrapper capture to this pane.
-        let self_attributing = matches!(
-            capture.backend,
-            crate::agents::SessionCaptureBackend::Claude
-                | crate::agents::SessionCaptureBackend::HookSidecar
-                | crate::agents::SessionCaptureBackend::Pi
-        );
+        let self_attributing = capture.reads_hook_sidecar(context)
+            || capture.backend == crate::agents::SessionCaptureBackend::Pi;
         let authorized = if self_attributing {
             native.is_none() || self.launch_can_carry_resume_selector(agent)
         } else {
@@ -369,6 +365,13 @@ impl Instance {
             capture.host
         };
         (context != crate::agents::SessionCaptureContext::Unsupported).then_some((capture, context))
+    }
+
+    /// Whether this pane's conversation id is published into its AoE hook sidecar. See
+    /// [`crate::agents::SessionCaptureSpec::reads_hook_sidecar`].
+    pub(super) fn capture_reads_hook_sidecar(&self) -> bool {
+        self.source_session_support()
+            .is_some_and(|(capture, context)| capture.reads_hook_sidecar(context))
     }
 
     pub(super) fn source_capture_backend(&self) -> Option<crate::agents::SessionCaptureBackend> {
