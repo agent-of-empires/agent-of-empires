@@ -209,33 +209,40 @@ mod tests {
         }
     }
 
-    /// A recorded id is refused as unqualified whatever the evidence, and the
-    /// refusal keeps the evidence: a bound parent names its provenance, a
-    /// binding-less one names none because none is left to read.
+    /// A recorded id is refused as unqualified whatever the evidence behind it,
+    /// and only a pre-pinned one is told to send a message, while a fork whose
+    /// launch has not happened is refused as itself.
     #[test]
     fn fork_reports_a_recorded_but_unqualified_parent_separately() {
-        for provenance in [
-            ConversationProvenance::Unknown,
-            ConversationProvenance::Preallocated,
+        for (provenance, pre_pinned) in [
+            (ConversationProvenance::Preallocated, true),
+            (ConversationProvenance::Unknown, false),
         ] {
             let parent = bound(provenance.clone());
             assert_eq!(
                 terminal_fork_seed(Some(ForkParentRef::Bound(&parent)), "child-uuid".into()),
                 Err(ForkDenied::UnqualifiedParent {
-                    provenance: Some(provenance),
+                    pre_pinned,
                     recorded: "parent-uuid".into(),
-                })
+                }),
+                "{provenance:?}"
             );
         }
+        // A binding nothing qualified and no binding at all are one refusal:
+        // neither proves the id was reserved by a launch that never ran.
         assert_eq!(
             terminal_fork_seed(
                 Some(ForkParentRef::Recorded("legacy-uuid")),
                 "child-uuid".into()
             ),
             Err(ForkDenied::UnqualifiedParent {
-                provenance: None,
+                pre_pinned: false,
                 recorded: "legacy-uuid".into(),
             })
+        );
+        assert_eq!(
+            terminal_fork_seed(Some(ForkParentRef::Unlaunched), "child-uuid".into()),
+            Err(ForkDenied::UnlaunchedFork)
         );
         assert_eq!(
             terminal_fork_seed(None, "child-uuid".into()),
@@ -253,19 +260,23 @@ mod tests {
         parent.execution.as_mut().unwrap().agent = "gemini".into();
         assert_eq!(
             terminal_fork_seed(Some(ForkParentRef::Bound(&parent)), "child-uuid".into()),
-            Err(ForkDenied::AgentCannotFork)
+            Err(ForkDenied::AgentCannotFork {
+                agent: "gemini".into()
+            })
         );
     }
 
     /// Every refusal state carries its own wording, and each names the remedy
-    /// that state admits: a preallocated id has no conversation to qualify, and
-    /// a binding-less one no provenance to assert.
+    /// that state admits: a pre-pinned id has no conversation to qualify, so
+    /// it is told to send a message, and the rest are told to re-assert one.
     #[test]
     fn user_message_distinguishes_every_refusal_state() {
         let cases = [
             (
-                ForkDenied::AgentCannotFork,
-                "Nothing to fork: session 'Legacy Parent' runs an agent with no native fork capability. Forkable agents: claude, codex, opencode.",
+                ForkDenied::AgentCannotFork {
+                    agent: "gemini".into(),
+                },
+                "Nothing to fork: session 'Legacy Parent' runs agent 'gemini', which has no native fork capability. Forkable agents: claude, codex, opencode.",
             ),
             (
                 ForkDenied::NoParentSession,
@@ -273,60 +284,55 @@ mod tests {
             ),
             (
                 ForkDenied::UnqualifiedParent {
-                    provenance: Some(ConversationProvenance::Preallocated),
+                    pre_pinned: true,
                     recorded: "parent-uuid".into(),
                 },
                 "Nothing to fork: session 'Legacy Parent' has no captured conversation to fork from. Send it at least one message first.",
             ),
             (
                 ForkDenied::UnqualifiedParent {
-                    provenance: Some(ConversationProvenance::Unknown),
+                    pre_pinned: false,
                     recorded: "parent-uuid".into(),
                 },
-                "Nothing to fork: session 'Legacy Parent' records conversation 'parent-uuid', which was never qualified against a native agent. Qualify it with 'aoe session set-session-id 'Legacy Parent' parent-uuid', and for a pi or omp session add '--store /absolute/transcript/file' naming its transcript.",
+                "Nothing to fork: session 'Legacy Parent' records conversation 'parent-uuid', which nothing qualifies, so which conversation it names is unknown. Qualify it with `aoe session set-session-id 4f2a8c10 parent-uuid`, and for a pi or omp session add a --store flag naming the absolute path of its transcript.",
             ),
             (
-                ForkDenied::UnqualifiedParent {
-                    provenance: None,
-                    recorded: "parent-uuid".into(),
-                },
-                "Nothing to fork: session 'Legacy Parent' records conversation 'parent-uuid', which nothing qualifies: no record says which agent, store or directory it belongs to, so which conversation it names is unknown. Re-assert it with 'aoe session set-session-id 'Legacy Parent' parent-uuid', and for a pi or omp session add '--store /absolute/transcript/file' naming its transcript.",
+                ForkDenied::UnlaunchedFork,
+                "Nothing to fork: session 'Legacy Parent' is a fork that has not launched yet. Start it once, then fork from the child conversation.",
             ),
         ];
         for (denied, expected) in cases {
-            assert_eq!(denied.user_message("Legacy Parent"), expected);
+            assert_eq!(denied.user_message("Legacy Parent", "4f2a8c10"), expected);
         }
     }
 
-    /// A printed remedy has to run as printed, so a title or an id holding a
-    /// space is quoted and no placeholder survives into the message.
+    /// A printed remedy has to run as printed, so both values are quoted and
+    /// the printed span is one command line. Tokenising it is what a shell
+    /// hands to `execve`, and the binary cannot be run from here: this test
+    /// binary is not the `aoe` binary.
     #[test]
-    fn the_printed_remedy_is_a_runnable_command() {
-        for provenance in [None, Some(ConversationProvenance::Unknown)] {
-            let denied = ForkDenied::UnqualifiedParent {
-                provenance,
-                recorded: "parent uuid".into(),
-            };
-            let message = denied.user_message("Legacy Parent");
-            assert!(
-                message.contains("'aoe session set-session-id 'Legacy Parent' 'parent uuid''"),
-                "{message}"
-            );
-            assert!(!message.contains('<'), "{message}");
-            assert!(!message.contains('>'), "{message}");
-        }
-    }
-
-    /// A preallocated id names no conversation yet, so the remedy cannot be a
-    /// qualification command that would be refused anyway.
-    #[test]
-    fn a_preallocated_id_gets_no_qualification_command() {
+    fn the_printed_remedy_tokenizes_to_one_runnable_command() {
         let message = ForkDenied::UnqualifiedParent {
-            provenance: Some(ConversationProvenance::Preallocated),
-            recorded: "parent-uuid".into(),
+            pre_pinned: false,
+            recorded: "parent uuid".into(),
         }
-        .user_message("Legacy Parent");
-        assert!(!message.contains("set-session-id"), "{message}");
-        assert!(!message.contains("--store"), "{message}");
+        .user_message("Legacy Parent", "4f2a 8c10");
+        let command = message
+            .split_once('`')
+            .and_then(|(_, rest)| rest.split_once('`'))
+            .map_or_else(
+                || panic!("one quoted remedy in: {message}"),
+                |(span, _)| span,
+            );
+        assert_eq!(
+            shell_words::split(command).expect("the remedy tokenizes"),
+            [
+                "aoe",
+                "session",
+                "set-session-id",
+                "4f2a 8c10",
+                "parent uuid"
+            ]
+        );
     }
 }

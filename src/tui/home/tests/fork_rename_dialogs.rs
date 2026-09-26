@@ -69,66 +69,38 @@ fn fork_row_offers_a_preallocated_parent() {
     );
 }
 
-/// A recorded conversation AoE cannot fork is refused three ways, and the
-/// dialog carries the shared wording, so each state shows the remedy its own
-/// evidence admits: a pre-pinned id has no conversation to qualify, a
-/// never-qualified one can be re-asserted, and a binding-less one names no
-/// conversation to assert.
+/// A recorded conversation AoE cannot fork is refused in two ways, and the
+/// dialog carries the shared wording: a pre-pinned id names no conversation to
+/// qualify, while a binding that never qualified, or one a degraded launch
+/// dropped, names a conversation to re-assert.
 #[test]
 #[serial]
 fn fork_from_selection_reports_why_the_conversation_cannot_be_forked() {
-    /// The three ways a recorded conversation fails to qualify.
-    enum Binding {
-        /// Recorded by a launch that pre-pinned the id, which never ran.
-        Preallocated,
-        /// A binding that never got qualified.
-        Unknown,
-        /// No binding at all.
-        Absent,
-    }
     let recorded = "parent-1111-2222-3333-444444444444".to_string();
     let cases = [
         (
-            Binding::Preallocated,
+            crate::session::ConversationProvenance::Preallocated,
             crate::session::ForkDenied::UnqualifiedParent {
-                provenance: Some(crate::session::ConversationProvenance::Preallocated),
+                pre_pinned: true,
                 recorded: recorded.clone(),
             },
         ),
         (
-            Binding::Unknown,
+            crate::session::ConversationProvenance::Unknown,
             crate::session::ForkDenied::UnqualifiedParent {
-                provenance: Some(crate::session::ConversationProvenance::Unknown),
-                recorded: recorded.clone(),
-            },
-        ),
-        (
-            Binding::Absent,
-            crate::session::ForkDenied::UnqualifiedParent {
-                provenance: None,
+                pre_pinned: false,
                 recorded: recorded.clone(),
             },
         ),
     ];
-    for (binding, denied) in cases {
+    for (provenance, denied) in cases {
         let mut env = create_test_env_empty();
         let mut inst = observed_fork_parent("claude");
-        match binding {
-            Binding::Preallocated => {
-                inst.agent_session_binding.as_mut().unwrap().provenance =
-                    crate::session::ConversationProvenance::Preallocated;
-            }
-            Binding::Unknown => {
-                inst.agent_session_binding = Some(crate::session::ConversationBinding::unknown(
-                    recorded.as_str(),
-                ));
-            }
-            Binding::Absent => inst.agent_session_binding = None,
-        }
+        inst.agent_session_binding.as_mut().unwrap().provenance = provenance;
         let title = inst.title.clone();
         let id = inst.id.clone();
         env.view.add_instance(inst);
-        env.view.selected_session = Some(id);
+        env.view.selected_session = Some(id.clone());
 
         env.view.open_fork_from_selection();
 
@@ -138,7 +110,7 @@ fn fork_from_selection_reports_why_the_conversation_cannot_be_forked() {
         );
         let dialog = env.view.info_dialog.as_ref().expect("info dialog");
         assert_eq!(dialog.title(), "Conversation not qualified");
-        assert_eq!(dialog.message(), denied.user_message(&title));
+        assert_eq!(dialog.message(), denied.user_message(&title, &id));
     }
 }
 

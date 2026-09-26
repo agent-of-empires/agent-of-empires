@@ -8,7 +8,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 use serial_test::parallel;
 
-use crate::harness::{app_dir_in, session_by_title, TuiTestHarness};
+use crate::harness::{app_dir_in, parse_session_id, session_by_title, TuiTestHarness};
 
 const PARENT_AGENT_ID: &str = "11111111-2222-3333-4444-555555555555";
 
@@ -308,18 +308,14 @@ fn fork_from_refusals_persist_nothing() {
             parent: Parent::UnlaunchedFork,
             title: "Parent",
             args: &[],
-            expect: "its own fork has not launched yet".into(),
+            expect: "is a fork that has not launched yet".into(),
         },
         Case {
             parent: Parent::LegacyUnqualified,
-            // The title holds a space, so the remedy must quote it.
             title: "Legacy Parent",
             args: &[],
-            expect: format!(
-                "aoe session set-session-id {} {}",
-                shell_words::quote("Legacy Parent"),
-                PARENT_AGENT_ID
-            ),
+            // Filled in below: the remedy names the id the harness generated.
+            expect: String::new(),
         },
     ];
 
@@ -327,6 +323,7 @@ fn fork_from_refusals_persist_nothing() {
         let mut h = TuiTestHarness::new("fork_cli_refusal");
         h.install_path_command("gemini");
         let project = h.project_path();
+        let mut expect = case.expect;
         match case.parent {
             Parent::Seeded(tool) => seed_parent(&h, &project, case.title, tool),
             Parent::Bare => {
@@ -340,7 +337,7 @@ fn fork_from_refusals_persist_nothing() {
                 ]);
             }
             Parent::LegacyUnqualified => {
-                h.run_cli_ok(&[
+                let added = h.run_cli_ok(&[
                     "add",
                     project.to_str().unwrap(),
                     "--cmd",
@@ -356,6 +353,13 @@ fn fork_from_refusals_persist_nothing() {
                         "provenance": "unknown",
                     });
                 });
+                // The remedy names the session id, not its title, so the
+                // expectation needs the id `aoe add` printed.
+                expect = format!(
+                    "aoe session set-session-id {} {}",
+                    parse_session_id(&added),
+                    PARENT_AGENT_ID,
+                );
             }
             Parent::UnlaunchedFork => {
                 h.run_cli_ok(&[
@@ -384,9 +388,8 @@ fn fork_from_refusals_persist_nothing() {
 
         let stderr = h.run_cli_err(&args);
         assert!(
-            stderr.contains(&case.expect),
-            "{args:?}: expected {:?} in:\n{stderr}",
-            case.expect
+            stderr.contains(&expect),
+            "{args:?}: expected {expect:?} in:\n{stderr}"
         );
         assert_not_persisted(&h, "Child");
         assert_no_scratch_dirs(&h);

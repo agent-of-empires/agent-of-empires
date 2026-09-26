@@ -2798,50 +2798,32 @@ mod tests {
     }
 
     /// A recorded id must reach `terminal_fork_seed` even unqualified, so the
-    /// fork can say which state it is in instead of claiming nothing to fork.
+    /// fork can name the conversation instead of claiming nothing to fork,
+    /// whether a degraded launch kept its binding or dropped it.
     #[test]
     fn fork_parent_ref_keeps_a_recorded_but_unqualified_conversation() {
         let mut instance = Instance::new("parent", "/tmp");
         instance.agent_session_id = Some("legacy-uuid".into());
-        instance.agent_session_binding = Some(ConversationBinding::unknown("legacy-uuid"));
 
-        assert_eq!(
-            crate::session::fork::terminal_fork_seed(
-                instance.fork_parent_ref(),
-                "child-uuid".into()
-            ),
-            Err(crate::session::ForkDenied::UnqualifiedParent {
-                provenance: Some(ConversationProvenance::Unknown),
-                recorded: "legacy-uuid".into(),
-            })
-        );
+        for binding in [Some(ConversationBinding::unknown("legacy-uuid")), None] {
+            instance.agent_session_binding = binding;
+            assert_eq!(
+                crate::session::fork::terminal_fork_seed(
+                    instance.fork_parent_ref(),
+                    "child-uuid".into()
+                ),
+                Err(crate::session::ForkDenied::UnqualifiedParent {
+                    pre_pinned: false,
+                    recorded: "legacy-uuid".into(),
+                })
+            );
+        }
     }
 
-    /// A degraded launch drops the binding and leaves the id, so the fork must
-    /// still name that conversation, and must not read a provenance off a
-    /// binding that no longer exists.
+    /// A row whose own fork intent has not launched holds the parent's
+    /// conversation, not one of its own, so it is refused as the fork it is.
     #[test]
-    fn fork_parent_ref_reports_a_dropped_binding_for_a_recorded_id() {
-        let mut instance = Instance::new("parent", "/tmp");
-        instance.agent_session_id = Some("legacy-uuid".into());
-        instance.agent_session_binding = None;
-
-        assert_eq!(
-            crate::session::fork::terminal_fork_seed(
-                instance.fork_parent_ref(),
-                "child-uuid".into()
-            ),
-            Err(crate::session::ForkDenied::UnqualifiedParent {
-                provenance: None,
-                recorded: "legacy-uuid".into(),
-            })
-        );
-    }
-
-    /// A row whose own fork intent has not launched yet holds the parent's
-    /// conversation, not one of its own, so it has nothing to fork from.
-    #[test]
-    fn fork_parent_ref_excludes_a_child_whose_fork_has_not_launched() {
+    fn fork_parent_ref_reports_a_child_whose_fork_has_not_launched() {
         let mut instance = Instance::new("child", "/tmp");
         instance.agent_session_id = Some("parent-uuid".into());
         instance.agent_session_binding = Some(ConversationBinding {
@@ -2867,7 +2849,7 @@ mod tests {
                 instance.fork_parent_ref(),
                 "child-uuid".into()
             ),
-            Err(crate::session::ForkDenied::NoParentSession)
+            Err(crate::session::ForkDenied::UnlaunchedFork)
         );
     }
 
