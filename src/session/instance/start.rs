@@ -520,6 +520,11 @@ impl Instance {
             }
         }
 
+        // A launch re-evaluates the row: the schedule paced the poller the previous relaunch
+        // left, over a pane this launch replaces and a capture lease it still holds. Clearing it
+        // here voids this launch's own copy; the live row's is cleared by the relaunch merges,
+        // which key on the start-time stamp below and so only fire once the launch got this far.
+        self.poller_repair.reset();
         self.maybe_start_poller_since(omp_capture_metadata);
 
         self.status = Status::Starting;

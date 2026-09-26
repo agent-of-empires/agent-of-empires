@@ -1070,20 +1070,30 @@ pub(super) fn apply_post_restart_identity_sync(
         || live.omp_capture_generation == started.omp_capture_generation;
     let conversation_unchanged = before.conversation_state().matches(live);
     let marker_unchanged = live.resume_probe_failed_sid == before.resume_probe_failed_sid;
+    // Read before the adopt below rewrites it; see `merge_post_restart_with_baseline`.
+    let execution_adopted =
+        generation_can_merge || live.active_execution == started.active_execution;
     if generation_can_merge {
         live.omp_capture_generation = started.omp_capture_generation.clone();
         if conversation_unchanged {
             live.adopt_conversation_state(started.conversation_state());
+        } else {
+            live.adopt_active_execution(started);
         }
     }
-    if live.active_execution == started.active_execution {
+    // A poller only serves the execution it was installed for, so the row takes what the launch
+    // brought unless a peer published a different OMP capture generation. A poller it merely
+    // carried over is taken as it is: that one is the row's own watcher.
+    if execution_adopted {
         live.session_id_poller = started.session_id_poller.clone();
         live.session_id_poller_retry_after = started.session_id_poller_retry_after;
-        if started.session_id_poller_is_running() {
-            live.poller_repair.reset();
-        }
     } else {
         started.stop_poller();
+    }
+    // Same signal as `merge_post_restart_with_baseline`: a new start time means the relaunch
+    // replaced the pane this schedule paced.
+    if started.last_start_time != before.last_start_time {
+        live.poller_repair.reset();
     }
     if generation_can_merge && marker_unchanged && live.agent_session_id == started.agent_session_id
     {
