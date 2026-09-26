@@ -653,22 +653,21 @@ impl Instance {
         {
             return false;
         }
-        // Support resolution reads and merges the profile config, so it comes after the checks
-        // above that a parked, already-polled or not-yet-due row answers from memory.
         if !self.supports_session_poller() {
             return false;
         }
         self.session_id_poller = None;
-        match self.maybe_start_poller() {
+        let outcome = self.maybe_start_poller();
+        // Sampled after the attempt: a probe can outlast its own delay, and a deadline stamped
+        // from before it would already be due on the next tick.
+        let after = std::time::Instant::now();
+        match outcome {
             // `install_poller` cleared the schedule.
             PollerStart::Started => true,
-            // Not a failure, but reaching here usually cost a capture resolve and a `tmux`
-            // fork (the eligibility checks above are cheaper), so the row re-probes on a
-            // schedule of its own (#4137).
+            // Not a failure, but the probe is not free, so the row re-probes on a schedule of
+            // its own rather than every tick (#4137).
             PollerStart::NotApplicable => {
-                // Stamped after the attempt: one that outran its own window must not come due
-                // again on the next tick.
-                self.poller_repair.reprobe(std::time::Instant::now());
+                self.poller_repair.reprobe(after);
                 false
             }
             // The managed store's own retry deadline governs this outcome.
@@ -677,11 +676,11 @@ impl Instance {
                 false
             }
             PollerStart::BudgetExhausted => {
-                self.defer_poller_repair(std::time::Instant::now(), "budget exhausted");
+                self.defer_poller_repair(after, "budget exhausted");
                 false
             }
             PollerStart::SpawnFailed => {
-                self.defer_poller_repair(std::time::Instant::now(), "start failed");
+                self.defer_poller_repair(after, "start failed");
                 false
             }
         }
@@ -887,8 +886,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn repair_reprobes_a_session_with_nothing_to_poll() {
-        let home = tempfile::tempdir().unwrap();
-        let _isolated = crate::session::test_support::isolate_app_dir_at(home.path());
+        let _isolated = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("omp-no-meta", "/tmp/omp-no-meta");
         inst.tool = "omp".to_string();
         inst.omp_capture_generation = Some("gen-1".to_string());
@@ -1644,8 +1642,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn repair_declines_when_the_agent_pane_dies_under_the_snapshot() {
-        let home = tempfile::tempdir().unwrap();
-        let _isolated = crate::session::test_support::isolate_app_dir_at(home.path());
+        let _isolated = crate::session::test_support::isolate_app_dir();
         let budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
         let mut inst = Instance::new("term rewriting", "/tmp/agent-died-under-snapshot");
         inst.tool = "claude".to_string();

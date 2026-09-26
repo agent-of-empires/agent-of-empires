@@ -512,8 +512,10 @@ impl Instance {
             }
         }
 
-        // A launch re-evaluates the row: a schedule carried in from the previous incarnation
-        // describes a pane this launch replaced, and the capture lease it held.
+        // A launch re-evaluates the row: the schedule paced the poller the previous relaunch
+        // left, over a pane this launch replaces and a capture lease it still holds. The relaunch
+        // merges detect that launch by the `last_start_time` stamp below, so the two statements
+        // must stay adjacent and in this order.
         self.poller_repair.reset();
         self.maybe_start_poller_since(omp_capture_metadata);
 

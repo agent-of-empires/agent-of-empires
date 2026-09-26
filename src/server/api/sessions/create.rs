@@ -1074,16 +1074,22 @@ pub(super) fn apply_post_restart_identity_sync(
         live.omp_capture_generation = started.omp_capture_generation.clone();
         if conversation_unchanged {
             live.adopt_conversation_state(started.conversation_state());
+        } else {
+            // The pane is the relaunch's whatever became of the conversation; see
+            // `merge_post_restart_with_baseline`.
+            live.active_execution = started.active_execution.clone();
         }
     }
     if live.active_execution == started.active_execution {
         live.session_id_poller = started.session_id_poller.clone();
         live.session_id_poller_retry_after = started.session_id_poller_retry_after;
-        if started.capture_started_at != before.capture_started_at {
-            live.poller_repair = started.poller_repair.clone();
-        }
     } else {
         started.stop_poller();
+    }
+    // Same signal as `merge_post_restart_with_baseline`: a new start time means the relaunch
+    // replaced the pane this schedule paced, whether or not the branch above took it.
+    if started.last_start_time != before.last_start_time {
+        live.poller_repair.reset();
     }
     if generation_can_merge && marker_unchanged && live.agent_session_id == started.agent_session_id
     {

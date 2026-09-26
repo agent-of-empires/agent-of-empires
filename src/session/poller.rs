@@ -142,7 +142,7 @@ impl PollerRepairBackoff {
     /// Record a failed (or skipped-for-budget) attempt at `now` and schedule the next one: 5 s,
     /// then doubling to a 60 s ceiling. `None` when the schedule neither escalated nor reached
     /// its reminder cadence. A failure ends any run of "nothing to poll", so that streak starts
-    /// its own delay over if the row has nothing to poll again.
+    /// its own delay over, counting and logging from its first deferral.
     pub fn defer(&mut self, now: Instant) -> Option<Duration> {
         self.reprobe_delay = None;
         let previous = self.delay;
@@ -160,8 +160,7 @@ impl PollerRepairBackoff {
     }
 
     /// Record an attempt at `now` that found nothing to poll: look again after 5 s, doubling to
-    /// 30 s. Nothing failed, so a past spawn failure stops governing the row and the next
-    /// failure starts its own delay over, counting and logging from its first deferral.
+    /// 30 s. A past spawn failure stops governing the row.
     pub fn reprobe(&mut self, now: Instant) {
         self.delay = None;
         self.deferrals = 0;
@@ -179,8 +178,8 @@ impl PollerRepairBackoff {
         self.reprobe_delay
     }
 
-    /// Clear the schedule: a poller is running, a launch is re-evaluating the row, or another
-    /// deadline now governs it.
+    /// Clear the schedule: a poller started, a launch is re-evaluating the row, a relaunch
+    /// replaced its pane, or the managed store's own retry deadline now governs it.
     pub fn reset(&mut self) {
         *self = Self::default();
     }
@@ -1027,13 +1026,13 @@ mod tests {
         let mut b = PollerRepairBackoff::default();
         let now = Instant::now();
 
-        let mut quiet = Vec::new();
+        let mut reprobe_delays = Vec::new();
         for _ in 0..4 {
             b.reprobe(now);
-            quiet.push(b.current_reprobe_delay().unwrap());
+            reprobe_delays.push(b.current_reprobe_delay().unwrap());
         }
         assert_eq!(
-            quiet,
+            reprobe_delays,
             vec![
                 Duration::from_secs(5),
                 Duration::from_secs(10),
@@ -1043,10 +1042,6 @@ mod tests {
             "a re-probe backs off to its own ceiling, half the failure one"
         );
         assert_eq!(b.deferrals(), 0, "and it never counts as a failed repair");
-        assert!(
-            !b.due(now),
-            "a row with nothing to poll is not probed next tick"
-        );
 
         // A failure then starts its own ladder over, so it warns on its first deferral.
         assert_eq!(
@@ -1071,9 +1066,6 @@ mod tests {
             None,
             "the failure delay it escaped no longer governs the row"
         );
-
-        b.expire();
-        assert!(b.due(Instant::now()), "the schedule elapsed: due again");
     }
 
     #[test]

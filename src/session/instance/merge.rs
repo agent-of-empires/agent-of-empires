@@ -53,19 +53,27 @@ impl Instance {
             self.omp_capture_generation = src.omp_capture_generation.clone();
             if conversation_unchanged {
                 self.adopt_conversation_state(src.conversation_state());
+            } else {
+                // The pane is the relaunch's whatever became of the conversation, and a poller
+                // is only usable by a row holding the execution it was installed for: its
+                // observations are dropped otherwise (`sync.rs`), and a launch-id-scoped one
+                // reads the other launch's file. Without this the branch below stays closed.
+                self.active_execution = src.active_execution.clone();
             }
         }
         if self.active_execution == src.active_execution {
             self.session_id_poller = src.session_id_poller.clone();
             self.session_id_poller_retry_after = src.session_id_poller_retry_after;
-            // A new capture floor is this launch's own stamp, and the launch stamps it only after
-            // the pane it replaced is gone. Without it `src` still carries the baseline's schedule,
-            // which is older than what the live row's own repair walk may have armed since.
-            if src.capture_started_at != before.capture_started_at {
-                self.poller_repair = src.poller_repair.clone();
-            }
         } else {
             src.stop_poller();
+        }
+        // A relaunch stamps a new start time right after it clears the schedule (start.rs), so a
+        // difference here means it replaced the pane this schedule paced, and the walk that
+        // installs the next poller follows that pane. Keyed on the stamp alone: the branch above
+        // can decline, when the relaunch also moved the conversation. A relaunch that died before
+        // the stamp says nothing, and the live row keeps what its own walk armed.
+        if src.last_start_time != before.last_start_time {
+            self.poller_repair.reset();
         }
         if generation_can_merge && marker_unchanged && self.agent_session_id == src.agent_session_id
         {
@@ -663,15 +671,16 @@ mod tests {
         let mut before = Instance::new("omp-session", "/tmp/test");
         before.agent_session_id = Some("old-sid".to_string());
         before.omp_capture_generation = Some("generation-a".to_string());
+        before.last_start_time =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
         let now = std::time::Instant::now();
         before.poller_repair.defer(now);
         before.poller_repair.defer(now);
         assert_eq!(before.poller_repair.deferrals(), 2);
         let mut restarted = before.clone();
         restarted.omp_capture_generation = Some("generation-b".to_string());
-        // What a relaunch leaves behind: a fresh capture floor, and no schedule.
-        restarted.capture_started_at =
-            Some(std::time::SystemTime::now() + std::time::Duration::from_secs(1));
+        // A relaunch stamps its start time next to the schedule it clears (start.rs).
+        restarted.last_start_time = Some(std::time::Instant::now());
         restarted.poller_repair.reset();
         let restarted_poller = running_poller(&before.id);
         restarted.session_id_poller = Some(restarted_poller.clone());
@@ -703,32 +712,63 @@ mod tests {
         ));
         assert_eq!(peer_relaunched.poller_repair.deferrals(), 0);
 
-        // A stamped relaunch that recorded a "nothing to poll" schedule owns the row's schedule,
-        // even though it left no poller running.
-        let mut relaunch_with_a_schedule = restarted.clone();
-        relaunch_with_a_schedule.session_id_poller = None;
-        relaunch_with_a_schedule.poller_repair.reset();
-        relaunch_with_a_schedule.poller_repair.reprobe(now);
+        // A relaunch that reached the launch stamp replaced the poller, so the schedule that
+        // paced it goes with it, even though the live row's own walk had gone deeper since.
+        let mut relaunched = restarted.clone();
+        relaunched.last_start_time = Some(std::time::Instant::now());
         let mut live = before.clone();
-        live.merge_post_restart_with_baseline(&before, &relaunch_with_a_schedule);
+        live.poller_repair.reprobe(now);
+        live.poller_repair.reprobe(now);
+        live.merge_post_restart_with_baseline(&before, &relaunched);
         assert_eq!(
             live.poller_repair.current_reprobe_delay(),
-            relaunch_with_a_schedule
-                .poller_repair
-                .current_reprobe_delay()
+            None,
+            "the re-probe schedule is not carried across the relaunch that replaced the poller"
         );
 
-        // An unstamped relaunch never reached the launch stamp, so it says nothing about the
-        // schedule: the live row keeps whatever its own walk armed in the meantime.
-        let stale = before.clone();
+        // A relaunch whose conversation moved under it still replaced the pane, so the row must
+        // take its execution and its poller: a poller is only usable by a row holding the
+        // execution it was installed for.
+        let mut relaunched = restarted.clone();
+        relaunched.active_execution = Some(ActiveExecution {
+            launch_id: "launch-2".into(),
+            binding: crate::session::instance::ExecutionBinding {
+                agent: "claude".into(),
+                stores: Vec::new(),
+                configuration: Vec::new(),
+                cwd: PathBuf::from("/tmp"),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: false,
+            },
+            capture: None,
+            container: None,
+        });
+        let mut live = before.clone();
+        live.agent_session_id = Some("peer-sid".to_string());
+        live.merge_post_restart_with_baseline(&before, &relaunched);
+        assert_eq!(
+            live.active_execution.as_ref().map(|e| e.launch_id.as_str()),
+            Some("launch-2"),
+            "the pane the relaunch created is the row's, whatever became of the conversation"
+        );
+        assert!(
+            Arc::ptr_eq(live.session_id_poller.as_ref().unwrap(), &restarted_poller),
+            "and its poller comes with it"
+        );
+
+        // A relaunch that died before the launch stamp says nothing about the schedule, and the
+        // live row keeps what its own walk armed.
+        let mut died_early = restarted.clone();
+        died_early.last_start_time = before.last_start_time;
         let mut live = before.clone();
         live.poller_repair.reprobe(now);
         live.poller_repair.reprobe(now);
-        live.merge_post_restart_with_baseline(&before, &stale);
+        live.merge_post_restart_with_baseline(&before, &died_early);
         assert_eq!(
             live.poller_repair.current_reprobe_delay(),
             Some(std::time::Duration::from_secs(10)),
-            "the baseline value is older than the live row's own schedule"
+            "an unstamped relaunch leaves the live row's own schedule alone"
         );
         stop(&restarted_poller);
     }

@@ -31,6 +31,19 @@ pub(super) fn apply_drained_identity_if_unchanged(
     }
 }
 
+/// Whether the row's lifecycle still matches the walk's baseline. A relaunch that lands while the
+/// walk runs on its clone moves the lifecycle, and the walk's schedule verdict is then dropped:
+/// a cleared row is due at once, which costs at most one extra repair walk on the next tick.
+fn apply_poller_repair_if_lifecycle_unchanged(
+    live: &mut Instance,
+    backoff: &crate::session::poller::PollerRepairBackoff,
+    baseline: &SessionIdentityBaseline,
+) {
+    if live.lifecycle_generation == baseline.5 {
+        live.poller_repair = backoff.clone();
+    }
+}
+
 fn apply_poller_runtime_if_unchanged(
     live: &mut Instance,
     repaired: &Instance,
@@ -110,12 +123,12 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                 let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) else {
                     continue;
                 };
-                if let Some(backoff) = deferred.get(&src.id) {
-                    dst.poller_repair = backoff.clone();
-                }
                 let Some(identity_baseline) = baseline.get(&src.id) else {
                     continue;
                 };
+                if let Some(backoff) = deferred.get(&src.id) {
+                    apply_poller_repair_if_lifecycle_unchanged(dst, backoff, identity_baseline);
+                }
                 if touched.contains(src.id.as_str()) {
                     apply_drained_identity_if_unchanged(dst, src, identity_baseline);
                 }
@@ -144,8 +157,8 @@ fn repair_backoffs(
         .collect()
 }
 
-/// Rows whose poller-repair schedule the walk changed (a deferral, a re-probe, or a reset
-/// after a successful start), keyed by id.
+/// Rows whose poller-repair schedule the walk changed (a deferral, a re-probe, or a reset),
+/// keyed by id.
 fn changed_repair_backoffs(
     before: &std::collections::HashMap<String, crate::session::poller::PollerRepairBackoff>,
     after: &[crate::session::Instance],
@@ -211,6 +224,46 @@ mod tests {
         let expected = peer.conversation_state();
         apply_drained_identity_if_unchanged(&mut peer, &drained, &baseline);
         assert_eq!(peer.conversation_state(), expected);
+    }
+
+    #[test]
+    fn a_relaunch_during_the_walk_keeps_its_schedule_clear() {
+        let mut live = Instance::new("session", "/tmp/project");
+        live.lifecycle_generation = 7;
+        let baseline: SessionIdentityBaseline = (
+            live.conversation_state(),
+            None,
+            None,
+            None,
+            None,
+            7,
+            crate::session::Status::Idle,
+        );
+        let mut walked = live.clone();
+        let now = std::time::Instant::now();
+        walked.poller_repair.reprobe(now);
+
+        // Same lifecycle: the walk's schedule lands.
+        live.poller_repair = Default::default();
+        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        assert_eq!(
+            live.poller_repair.current_reprobe_delay(),
+            Some(std::time::Duration::from_secs(5))
+        );
+
+        // A relaunch landed: its clear stands, and the walk's schedule is dropped.
+        live.lifecycle_generation = 8;
+        let mut relaunched = live.clone();
+        // A relaunch that reached the launch stamp: new start time, cleared schedule.
+        relaunched.last_start_time = Some(std::time::Instant::now());
+        relaunched.poller_repair.reset();
+        live.merge_post_restart_with_baseline(&live.clone(), &relaunched);
+        apply_poller_repair_if_lifecycle_unchanged(&mut live, &walked.poller_repair, &baseline);
+        assert_eq!(
+            live.poller_repair.current_reprobe_delay(),
+            None,
+            "the relaunch replaced the poller this schedule paced"
+        );
     }
 
     #[test]

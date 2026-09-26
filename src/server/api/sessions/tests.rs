@@ -1699,9 +1699,10 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
 }
 
 #[test]
-fn apply_post_restart_identity_sync_adopts_the_relaunch_schedule() {
+fn apply_post_restart_identity_sync_clears_the_live_poller_schedule() {
     let mut before = make_test_instance();
     before.omp_capture_generation = Some("generation-a".to_string());
+    before.last_start_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
     let now = std::time::Instant::now();
     before.poller_repair.defer(now);
     before.poller_repair.defer(now);
@@ -1709,9 +1710,8 @@ fn apply_post_restart_identity_sync_adopts_the_relaunch_schedule() {
 
     let mut started = before.clone();
     started.omp_capture_generation = Some("generation-b".to_string());
-    // What a relaunch leaves behind: a fresh capture floor, and no schedule.
-    started.capture_started_at =
-        Some(std::time::SystemTime::now() + std::time::Duration::from_secs(1));
+    // A relaunch stamps its start time next to the schedule it clears (start.rs).
+    started.last_start_time = Some(std::time::Instant::now());
     started.poller_repair.reset();
     let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
     assert_eq!(
@@ -1734,33 +1734,33 @@ fn apply_post_restart_identity_sync_adopts_the_relaunch_schedule() {
     apply_post_restart_identity_sync(&mut peer_relaunched, &before, &started);
     assert_eq!(peer_relaunched.poller_repair.deferrals(), 0);
 
-    // A stamped relaunch that recorded a "nothing to poll" schedule owns the row's schedule, even
-    // though it left no poller running.
-    let mut relaunch_with_a_schedule = started.clone();
-    relaunch_with_a_schedule.session_id_poller = None;
-    relaunch_with_a_schedule.poller_repair.reset();
-    relaunch_with_a_schedule.poller_repair.reprobe(now);
+    // A relaunch that reached the launch stamp replaced the poller, so the schedule that paced it
+    // goes with it, even though the live row's own walk had gone deeper since.
+    let mut relaunched = started.clone();
+    relaunched.last_start_time = Some(std::time::Instant::now());
     let mut live = before.clone();
-    apply_post_restart_identity_sync(&mut live, &before, &relaunch_with_a_schedule);
+    live.poller_repair.reprobe(now);
+    live.poller_repair.reprobe(now);
+    apply_post_restart_identity_sync(&mut live, &before, &relaunched);
     assert_eq!(
         live.poller_repair.current_reprobe_delay(),
-        relaunch_with_a_schedule
-            .poller_repair
-            .current_reprobe_delay(),
-        "the live row is governed by the schedule this relaunch left behind"
+        None,
+        "the re-probe schedule is not carried across the relaunch that replaced the poller"
     );
 
-    // An unstamped relaunch never reached the launch stamp, so it says nothing about the schedule.
-    let unstamped = before.clone();
+    // A relaunch that died before the launch stamp says nothing about the schedule.
+    let mut died_early = started.clone();
+    died_early.last_start_time = before.last_start_time;
     let mut live = before.clone();
     live.poller_repair.reprobe(now);
     live.poller_repair.reprobe(now);
-    apply_post_restart_identity_sync(&mut live, &before, &unstamped);
+    apply_post_restart_identity_sync(&mut live, &before, &died_early);
     assert_eq!(
         live.poller_repair.current_reprobe_delay(),
         Some(std::time::Duration::from_secs(10)),
-        "the baseline value is older than the live row's own schedule"
+        "an unstamped relaunch leaves the live row's own schedule alone"
     );
+
     restarted_poller
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
