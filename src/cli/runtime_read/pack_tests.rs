@@ -190,7 +190,7 @@ fn the_frozen_list_golden_matches_the_renderer() {
         None,
     )
     .expect("the list renders");
-    assert_eq!(rendered.as_bytes(), case.stdout);
+    assert_eq!(rendered.stdout.as_bytes(), case.stdout);
 }
 
 /// The frozen golden for `aoe status --json` likewise.
@@ -215,7 +215,7 @@ fn the_frozen_status_golden_matches_the_renderer() {
         None,
     )
     .expect("the status renders");
-    assert_eq!(rendered.as_bytes(), case.stdout);
+    assert_eq!(rendered.stdout.as_bytes(), case.stdout);
 }
 
 /// The frozen frame counts are the static evidence the verifier checks, and
@@ -239,23 +239,6 @@ fn frozen_frame_counts_match_the_transcripts() {
     assert!(application_frames(denied).is_empty());
     assert_eq!(denied.exit, 4);
     assert_eq!(denied.stderr, b"daemon read: unauthorized\n");
-}
-
-/// The identifier-required pre-dispatch result wins over every runtime error and
-/// exits 2 with its own message, not the uniform `daemon read:` line.
-#[tokio::test]
-#[serial_test::parallel]
-async fn a_show_without_an_identifier_exits_two_before_transport() {
-    let cli = Cli::try_parse_from(["aoe", "session", "show"]).expect("show parses");
-    let command = super::classify(cli.command.as_ref()).expect("session show is a scoped read");
-    let source = super::read_request_source(&cli);
-    let outcome = super::execute(command, &source).await;
-    assert_eq!(outcome.stdout, None);
-    assert_eq!(
-        outcome.stderr.as_deref(),
-        Some("identifier required in daemon read mode\n")
-    );
-    assert_eq!(outcome.exit, 2);
 }
 
 /// Every frozen argv row reaches the scoped reader, and none of them is a

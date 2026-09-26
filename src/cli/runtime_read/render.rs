@@ -14,20 +14,41 @@ use crate::cli::list::{ListArgs, StateFilter};
 use crate::cli::project::{ProjectListArgs, ScopeFilter};
 use crate::cli::session::ShowArgs;
 
+/// One rendered read: the text the command prints, and whether it printed the
+/// human session table, which is the only place the update notice belongs.
+#[derive(Debug)]
+pub(crate) struct Projection {
+    pub stdout: String,
+    pub session_table: bool,
+}
+
+impl Projection {
+    fn text(stdout: String) -> Self {
+        Self {
+            stdout,
+            session_table: false,
+        }
+    }
+}
+
 pub(crate) fn evaluate(
     command: &ScopedCommand<'_>,
     snapshot: &SnapshotData,
     source: &super::endpoint::ReadRequestSource,
     local_home: Option<&Path>,
-) -> Result<String, ReadFailure> {
+) -> Result<Projection, ReadFailure> {
     match command {
         ScopedCommand::List(args) => render_list(args, snapshot, source, local_home),
         ScopedCommand::Status(args) => render_status(args, snapshot, source, local_home),
         ScopedCommand::Show(args) => render_show(args, snapshot, source, local_home),
-        ScopedCommand::ListTrash => render_trash(snapshot, source),
-        ScopedCommand::GroupList(args) => render_groups(args, snapshot, source),
-        ScopedCommand::Profile => render_profiles(snapshot),
-        ScopedCommand::ProjectList(args) => render_projects(args, snapshot, source, local_home),
+        ScopedCommand::ListTrash => render_trash(snapshot, source).map(Projection::text),
+        ScopedCommand::GroupList(args) => {
+            render_groups(args, snapshot, source).map(Projection::text)
+        }
+        ScopedCommand::Profile => render_profiles(snapshot).map(Projection::text),
+        ScopedCommand::ProjectList(args) => {
+            render_projects(args, snapshot, source, local_home).map(Projection::text)
+        }
     }
 }
 
@@ -64,7 +85,7 @@ fn render_list(
     snapshot: &SnapshotData,
     source: &super::endpoint::ReadRequestSource,
     local_home: Option<&Path>,
-) -> Result<String, ReadFailure> {
+) -> Result<Projection, ReadFailure> {
     let state = args.state;
     if args.all {
         require_list_all_health(snapshot)?;
@@ -78,10 +99,10 @@ fn render_list(
                 }
             }
             rows.sort_by(|left, right| left.id.cmp(&right.id));
-            return json_lines(&rows);
+            return json_lines(&rows).map(Projection::text);
         }
         if snapshot.profiles.is_empty() {
-            return Ok("No profiles found.\n".into());
+            return Ok(Projection::text("No profiles found.\n".into()));
         }
         let show_state = state == StateFilter::All;
         let mut output = String::new();
@@ -102,7 +123,7 @@ fn render_list(
             "\n═══════════════════════════════════════\nTotal: {total} sessions across {} profiles\n",
             snapshot.profiles.len()
         ));
-        return Ok(output);
+        return Ok(Projection::text(output));
     }
 
     let profile_name = selected_profile(snapshot, source)?;
@@ -117,10 +138,12 @@ fn render_list(
             .iter()
             .map(|session| ListJson::from_session(session, profile_name))
             .collect();
-        return json_lines(&rows);
+        return json_lines(&rows).map(Projection::text);
     }
     if sessions.is_empty() {
-        return Ok(format!("No sessions found in profile '{profile_name}'.\n"));
+        return Ok(Projection::text(format!(
+            "No sessions found in profile '{profile_name}'.\n"
+        )));
     }
     let show_state = state == StateFilter::All;
     let mut output = format!("Profile: {profile_name}\n\n");
@@ -128,7 +151,13 @@ fn render_list(
     for (session, depth) in tree_order(&sessions) {
         push_table_row(&mut output, session, depth, show_state, local_home);
     }
-    Ok(output)
+    // The per-profile listing has always closed on its own count, the way the
+    // all-profiles listing closes on its own.
+    output.push_str(&format!("\nTotal: {} sessions\n", sessions.len()));
+    Ok(Projection {
+        stdout: output,
+        session_table: true,
+    })
 }
 
 fn matches_state(state: WireState, filter: StateFilter) -> bool {
@@ -284,7 +313,7 @@ impl ListJson {
             tool: session.tool.clone(),
             command: session.command.clone(),
             profile: profile.to_string(),
-            status: session.status.as_str(),
+            status: session.status.json_str(),
             state: session.state.as_str(),
             created_at: session.created_at.clone(),
             trashed_at: session.trashed_at.clone(),
@@ -316,7 +345,7 @@ fn render_status(
     snapshot: &SnapshotData,
     source: &super::endpoint::ReadRequestSource,
     local_home: Option<&Path>,
-) -> Result<String, ReadFailure> {
+) -> Result<Projection, ReadFailure> {
     let profile_name = selected_profile(snapshot, source)?;
     let profile = profile(snapshot, profile_name)?;
     let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, profile_name).collect();
@@ -326,21 +355,15 @@ fn render_status(
     }
     let counts = StatusCounts::new(&sessions);
     if args.json {
-        return Ok(format!(
-            "{{\"waiting\":{},\"running\":{},\"idle\":{},\"stopped\":{},\"error\":{},\"total\":{}}}\n",
-            counts.waiting,
-            counts.running,
-            counts.idle,
-            counts.stopped,
-            counts.error,
-            counts.total
-        ));
+        return json_compact(&StatusJson::from(&counts)).map(Projection::text);
     }
     if args.quiet {
-        return Ok(format!("{}\n", counts.waiting));
+        return Ok(Projection::text(format!("{}\n", counts.waiting)));
     }
     if sessions.is_empty() {
-        return Ok(format!("No sessions in profile '{profile_name}'.\n"));
+        return Ok(Projection::text(format!(
+            "No sessions in profile '{profile_name}'.\n"
+        )));
     }
     if args.verbose {
         let mut output = String::new();
@@ -376,19 +399,26 @@ fn render_status(
             "Total: {} sessions in profile '{profile_name}'\n",
             counts.total
         ));
-        return Ok(output);
+        return Ok(Projection {
+            stdout: output,
+            session_table: true,
+        });
     }
-    if counts.stopped > 0 {
-        Ok(format!(
+    let summary = if counts.stopped > 0 {
+        format!(
             "{} waiting • {} running • {} idle • {} stopped\n",
             counts.waiting, counts.running, counts.idle, counts.stopped
-        ))
+        )
     } else {
-        Ok(format!(
+        format!(
             "{} waiting • {} running • {} idle\n",
             counts.waiting, counts.running, counts.idle
-        ))
-    }
+        )
+    };
+    Ok(Projection {
+        stdout: summary,
+        session_table: true,
+    })
 }
 
 struct StatusCounts {
@@ -424,15 +454,37 @@ impl StatusCounts {
     }
 }
 
+/// `aoe status --json`, serialized rather than formatted by hand: the key order
+/// and the absence of whitespace are then the serializer's, not a template's.
+#[derive(Serialize)]
+struct StatusJson {
+    waiting: usize,
+    running: usize,
+    idle: usize,
+    stopped: usize,
+    error: usize,
+    total: usize,
+}
+
+impl From<&StatusCounts> for StatusJson {
+    fn from(counts: &StatusCounts) -> Self {
+        Self {
+            waiting: counts.waiting,
+            running: counts.running,
+            idle: counts.idle,
+            stopped: counts.stopped,
+            error: counts.error,
+            total: counts.total,
+        }
+    }
+}
+
 fn render_show(
     args: &ShowArgs,
     snapshot: &SnapshotData,
     source: &super::endpoint::ReadRequestSource,
     local_home: Option<&Path>,
-) -> Result<String, ReadFailure> {
-    let identifier = args
-        .identifier()
-        .ok_or_else(|| ReadFailure::exit(2, "identifier required in daemon read mode\n"))?;
+) -> Result<Projection, ReadFailure> {
     let profile_name = selected_profile(snapshot, source)?;
     let profile = profile(snapshot, profile_name)?;
     require_selected_profile_health(snapshot, profile, true)?;
@@ -440,7 +492,11 @@ fn render_show(
         return Err(ReadFailure::post("freshness_unavailable"));
     }
     let sessions: Vec<&SessionRead> = sessions_for_profile(snapshot, profile_name).collect();
-    let session = find_session(&sessions, identifier)?;
+    let identifier = match args.identifier() {
+        Some(identifier) => identifier.to_string(),
+        None => tmux_session_id(&sessions)?,
+    };
+    let session = find_session(&sessions, &identifier)?;
 
     if args.json {
         #[derive(Serialize)]
@@ -474,7 +530,7 @@ fn render_show(
             group: session.group_path.clone(),
             tool: session.tool.clone(),
             command: session.command.clone(),
-            status: session.status.as_str(),
+            status: session.status.json_str(),
             state: session.state.as_str(),
             trashed_at: session.trashed_at.clone(),
             archived_at: session.archived_at.clone(),
@@ -483,7 +539,8 @@ fn render_show(
             agent_session_id: session.agent_session_id.clone(),
             parent_session_id: session.parent_session_id.clone(),
             profile: profile_name.to_string(),
-        }]);
+        }])
+        .map(Projection::text);
     }
 
     let mut output = format!(
@@ -532,7 +589,34 @@ fn render_show(
             output.push_str(&format!("    {} ({})\n", child.title, child.id));
         }
     }
-    Ok(output)
+    Ok(Projection::text(output))
+}
+
+/// `aoe session show` with no identifier names the session whose agent pane is
+/// the one this command runs in, as the local path has always done. The
+/// refusals are the operator's own sentences, not internal codes: either the
+/// command is not running inside tmux, or the tmux session it is in belongs to
+/// no session this profile knows.
+fn tmux_session_id(sessions: &[&SessionRead]) -> Result<String, ReadFailure> {
+    let name = std::env::var("TMUX_PANE")
+        .ok()
+        .and_then(|_| crate::tmux::get_current_session_name())
+        .ok_or_else(|| {
+            ReadFailure::exit(
+                2,
+                "Not in a tmux session. Specify a session ID or run inside tmux.\n",
+            )
+        })?;
+    sessions
+        .iter()
+        .find(|session| crate::tmux::agent_session_belongs_to(&name, &session.id))
+        .map(|session| session.id.clone())
+        .ok_or_else(|| {
+            ReadFailure::exit(
+                2,
+                "Current tmux session is not an Agent of Empires session\n",
+            )
+        })
 }
 
 fn find_session<'a>(
@@ -834,7 +918,17 @@ fn require_profile_components(
 }
 
 fn json_lines<T: Serialize>(value: &T) -> Result<String, ReadFailure> {
-    serde_json::to_string_pretty(value)
+    render_json(serde_json::to_string_pretty(value))
+}
+
+/// The status counts are one compact object, not a pretty array: the scripts
+/// that read them have always seen a single line.
+fn json_compact<T: Serialize>(value: &T) -> Result<String, ReadFailure> {
+    render_json(serde_json::to_string(value))
+}
+
+fn render_json(rendered: serde_json::Result<String>) -> Result<String, ReadFailure> {
+    rendered
         .map(|value| format!("{value}\n"))
         .map_err(|_| ReadFailure::exit(1, "daemon read: renderer_internal\n"))
 }
@@ -982,7 +1076,9 @@ mod tests {
             session("b", WireStatus::Creating),
         ]);
         let args = crate::cli::status::StatusArgs::test_json();
-        let output = render_status(&args, &value, &source(), None).unwrap();
+        let output = render_status(&args, &value, &source(), None)
+            .unwrap()
+            .stdout;
         assert_eq!(
             output,
             "{\"waiting\":1,\"running\":0,\"idle\":0,\"stopped\":0,\"error\":0,\"total\":2}\n"
@@ -990,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn list_json_preserves_v73_key_order_and_status_case() {
+    fn list_json_keeps_key_order_and_spells_status_for_a_machine() {
         let value = snapshot(vec![session("a", WireStatus::Waiting)]);
         let output = render_list(
             &crate::cli::list::ListArgs::test_json(),
@@ -998,7 +1094,8 @@ mod tests {
             &source(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .stdout;
         let keys = [
             "id",
             "title",
@@ -1018,8 +1115,91 @@ mod tests {
             assert!(position >= previous, "{key} out of order in {output}");
             previous = position;
         }
-        assert!(output.contains("\"status\": \"Waiting\""));
-        assert!(output.contains("\"state\": \"live\""));
+        assert!(output.contains("\"status\": \"waiting\""), "{output}");
+        assert!(output.contains("\"state\": \"live\""), "{output}");
+    }
+
+    /// The human `Status:` line and the machine JSON disagree on purpose: one
+    /// is read by a person, the other by a script that has always seen the
+    /// lowercase spelling.
+    #[test]
+    fn show_json_spells_status_lowercase_while_the_human_line_keeps_the_wire_form() {
+        let value = snapshot(vec![session("a", WireStatus::Waiting)]);
+        let json = render_show(
+            &ShowArgs {
+                identifier: Some("a".into()),
+                json: true,
+            },
+            &value,
+            &source(),
+            None,
+        )
+        .unwrap()
+        .stdout;
+        assert!(json.contains("\"status\": \"waiting\""), "{json}");
+
+        let human = render_show(
+            &ShowArgs {
+                identifier: Some("a".into()),
+                json: false,
+            },
+            &value,
+            &source(),
+            None,
+        )
+        .unwrap()
+        .stdout;
+        assert!(human.contains("  Status:  Waiting\n"), "{human}");
+    }
+
+    /// `aoe session show` with no identifier still auto-detects inside tmux and
+    /// still refuses, in the operator's own words, when it is not.
+    #[test]
+    fn show_without_an_identifier_refuses_outside_tmux_in_plain_words() {
+        let value = snapshot(vec![session("a", WireStatus::Waiting)]);
+        let error = render_show(
+            &ShowArgs {
+                identifier: None,
+                json: false,
+            },
+            &value,
+            &source(),
+            None,
+        )
+        .unwrap_err();
+        let outcome = crate::cli::runtime_read::ReadOutcome::from(error);
+        assert_eq!(outcome.stdout, None);
+        assert_eq!(outcome.exit, 2);
+        assert_eq!(
+            outcome.stderr.as_deref(),
+            Some("Not in a tmux session. Specify a session ID or run inside tmux.\n")
+        );
+    }
+
+    /// The per-profile listing closes on its own count, the way it always did,
+    /// and only the human listing is the kind of output a notice follows.
+    #[test]
+    fn the_human_listing_closes_on_its_count_and_asks_for_a_notice() {
+        let value = snapshot(vec![
+            session("a", WireStatus::Waiting),
+            session("b", WireStatus::Idle),
+        ]);
+        let args = crate::cli::list::ListArgs {
+            json: false,
+            all: false,
+            state: StateFilter::All,
+        };
+        let projection = render_list(&args, &value, &source(), None).unwrap();
+        assert!(projection.session_table);
+        assert!(
+            projection.stdout.ends_with("\nTotal: 2 sessions\n"),
+            "{}",
+            projection.stdout
+        );
+
+        let empty = snapshot(vec![]);
+        let empty_projection = render_list(&args, &empty, &source(), None).unwrap();
+        assert!(!empty_projection.session_table);
     }
 
     #[test]
@@ -1029,7 +1209,7 @@ mod tests {
         value.default_profile = None;
         value.health.profiles.clear();
         let args = crate::cli::list::ListArgs::test_all();
-        let output = render_list(&args, &value, &source(), None).unwrap();
+        let output = render_list(&args, &value, &source(), None).unwrap().stdout;
         assert_eq!(output, "No profiles found.\n");
     }
 
@@ -1070,7 +1250,7 @@ mod tests {
             all: false,
             state: StateFilter::All,
         };
-        let output = render_list(&args, &value, &source(), None).unwrap();
+        let output = render_list(&args, &value, &source(), None).unwrap().stdout;
         let row = output
             .lines()
             .find(|line| line.ends_with(long_id))
@@ -1091,7 +1271,9 @@ mod tests {
             quiet: false,
             json: false,
         };
-        let output = render_status(&args, &value, &source(), None).unwrap();
+        let output = render_status(&args, &value, &source(), None)
+            .unwrap()
+            .stdout;
         let row = |symbol: &str, id: &str| {
             format!(
                 "  {symbol} {} {} {}\n",

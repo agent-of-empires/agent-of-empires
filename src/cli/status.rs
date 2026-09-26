@@ -52,6 +52,22 @@ struct StatusJson {
     total: usize,
 }
 
+/// One spelling for both JSON branches. The empty-profile answer used to be a
+/// hand-written literal while the populated one was serialized, so the same
+/// command emitted different bytes depending on whether the profile held a
+/// session.
+impl From<&StatusCounts> for StatusJson {
+    fn from(counts: &StatusCounts) -> Self {
+        Self {
+            waiting: counts.waiting,
+            running: counts.running,
+            idle: counts.idle,
+            stopped: counts.stopped,
+            error: counts.error,
+            total: counts.total,
+        }
+    }
+}
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
@@ -63,7 +79,8 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
     if instances.is_empty() {
         if args.json {
             println!(
-                r#"{{"waiting": 0, "running": 0, "idle": 0, "stopped": 0, "error": 0, "total": 0}}"#
+                "{}",
+                serde_json::to_string(&StatusJson::from(&StatusCounts::default()))?
             );
         } else if args.quiet {
             println!("0");
@@ -86,14 +103,7 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
     let counts = count_by_status(&instances);
 
     if args.json {
-        let status_json = StatusJson {
-            waiting: counts.waiting,
-            running: counts.running,
-            idle: counts.idle,
-            stopped: counts.stopped,
-            error: counts.error,
-            total: counts.total,
-        };
+        let status_json = StatusJson::from(&counts);
         println!("{}", serde_json::to_string(&status_json)?);
     } else if args.quiet {
         println!("{}", counts.waiting);
@@ -163,4 +173,31 @@ fn print_status_group(
         println!("  {} {:<16} {:<10} {}", symbol, inst.title, inst.tool, path);
     }
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The empty-profile answer is the same bytes the daemon read emits for the
+    /// same profile, so `--json` is one shape whatever the transport and
+    /// whatever the profile holds.
+    #[test]
+    fn the_empty_profile_json_is_the_same_compact_bytes_everywhere() {
+        let empty =
+            serde_json::to_string(&StatusJson::from(&StatusCounts::default())).expect("serializes");
+        assert_eq!(
+            empty,
+            r#"{"waiting":0,"running":0,"idle":0,"stopped":0,"error":0,"total":0}"#
+        );
+        let counts = StatusCounts {
+            waiting: 1,
+            ..StatusCounts::default()
+        };
+        let populated = serde_json::to_string(&StatusJson::from(&counts)).expect("serializes");
+        assert_eq!(
+            populated,
+            r#"{"waiting":1,"running":0,"idle":0,"stopped":0,"error":0,"total":0}"#
+        );
+    }
 }

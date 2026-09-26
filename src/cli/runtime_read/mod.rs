@@ -152,29 +152,49 @@ pub fn read_request_source(cli: &Cli) -> ReadRequestSource {
     endpoint::read_request_source(cli)
 }
 
-pub async fn execute(command: ScopedCommand<'_>, source: &ReadRequestSource) -> ReadOutcome {
+/// What a scoped read found: either the daemon's answer, or the fact that no
+/// daemon publishes a local read here, which leaves the command to the caller.
+pub enum ScopedRead {
+    /// The daemon rendered the command, or refused it. This is the final result.
+    Answered(ReadOutcome),
+    /// No local daemon has published a runtime read. Only ever returned for the
+    /// local transport, so the caller runs the command against the local store
+    /// exactly as it did before the read existed.
+    NoLocalPublication,
+}
+
+pub async fn attempt(command: ScopedCommand<'_>, source: &ReadRequestSource) -> ScopedRead {
     match execute_inner(command, source).await {
-        Ok(stdout) => ReadOutcome {
-            stdout: Some(stdout),
-            stderr: None,
-            exit: 0,
-        },
-        Err(error) => error.into(),
+        Ok(projection) => {
+            let stderr = if projection.session_table {
+                crate::update::update_notice().await
+            } else {
+                None
+            };
+            ScopedRead::Answered(ReadOutcome {
+                stdout: Some(projection.stdout),
+                stderr,
+                exit: 0,
+            })
+        }
+        Err(error) if absent_local_publication(&error, source) => ScopedRead::NoLocalPublication,
+        Err(error) => ScopedRead::Answered(error.into()),
     }
+}
+
+/// Whether this failure means no daemon has ever published here, which is the
+/// one pre-admission refusal the local command path may take over. A named
+/// endpoint, and every refusal that says the artifacts are present but not
+/// trustworthy, are the daemon's answer to keep: falling back on those would
+/// quietly serve data the admission was built to withhold.
+fn absent_local_publication(error: &ReadFailure, source: &ReadRequestSource) -> bool {
+    error.code() == "marker_missing" && source.explicit_url.is_none() && source.env_url.is_none()
 }
 
 async fn execute_inner(
     command: ScopedCommand<'_>,
     source: &ReadRequestSource,
-) -> Result<String, ReadFailure> {
-    if let ScopedCommand::Show(args) = command {
-        if args.identifier().is_none() {
-            return Err(ReadFailure::exit(
-                2,
-                "identifier required in daemon read mode\n",
-            ));
-        }
-    }
+) -> Result<render::Projection, ReadFailure> {
     let endpoint = endpoint::select_endpoint(source)?;
     let establishment_deadline = Instant::now() + ESTABLISHMENT_BUDGET;
     match endpoint {
@@ -250,7 +270,7 @@ async fn exchange_stream<S>(
     local_home: Option<&std::path::Path>,
     command: ScopedCommand<'_>,
     source: &ReadRequestSource,
-) -> Result<String, ReadFailure>
+) -> Result<render::Projection, ReadFailure>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -272,7 +292,7 @@ async fn exchange_inner<S>(
     local_home: Option<&std::path::Path>,
     command: ScopedCommand<'_>,
     source: &ReadRequestSource,
-) -> Result<String, ReadFailure>
+) -> Result<render::Projection, ReadFailure>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -384,8 +404,8 @@ where
 async fn finish_with_close<S>(
     stream: &mut tokio_tungstenite::WebSocketStream<S>,
     deadline: Instant,
-    result: Result<String, ReadFailure>,
-) -> Result<String, ReadFailure>
+    result: Result<render::Projection, ReadFailure>,
+) -> Result<render::Projection, ReadFailure>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {

@@ -204,6 +204,24 @@ impl WireStatus {
             Self::Creating => "Creating",
         }
     }
+
+    /// The machine-readable spelling every JSON projection uses. The human
+    /// `Status:` line keeps the PascalCase wire form; a consumer parsing this
+    /// output has always seen lowercase, as `aoe session show --json` did
+    /// before the read existed.
+    pub(crate) fn json_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Idle => "idle",
+            Self::Unknown => "unknown",
+            Self::Stopped => "stopped",
+            Self::Error => "error",
+            Self::Starting => "starting",
+            Self::Deleting => "deleting",
+            Self::Creating => "creating",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
