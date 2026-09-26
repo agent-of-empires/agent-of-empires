@@ -10,18 +10,6 @@ use crate::tui::dialogs::NewSessionData;
 use std::sync::mpsc;
 use std::thread;
 
-pub(in crate::tui) struct IdentityGuard {
-    /// Held from before the failed-create cleanup snapshot until the caller
-    /// finishes persisting, so a peer's claim cannot slip between the two.
-    _locks: crate::session::builder::CleanupOwnershipLocks,
-}
-
-impl std::fmt::Debug for IdentityGuard {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("IdentityGuard")
-    }
-}
-
 pub struct CreationRequest {
     pub data: NewSessionData,
     pub existing_instances: Vec<Instance>,
@@ -41,7 +29,6 @@ pub enum CreationResult {
         /// Non-fatal warnings from worktree creation (e.g. post-checkout hook
         /// failures). Surfaced as a transient toast in the UI.
         warnings: Vec<String>,
-        identity_guard: Option<IdentityGuard>,
     },
     Error(String),
 }
@@ -292,7 +279,7 @@ impl CreationPoller {
                 return CreationResult::Error(format!("{error:#}"));
             }
         };
-        let identity_guard = match crate::session::acquire_session_identity_lock() {
+        match crate::session::acquire_session_identity_lock() {
             Ok(lock) => {
                 let locks = builder::CleanupOwnershipLocks::from_held(workspace_claim_lock, lock);
                 if let Err(error) = crate::session::validate_managed_workspace(&instance) {
@@ -307,7 +294,12 @@ impl CreationPoller {
                         "Managed workspace validation failed before persistence: {error}"
                     ));
                 }
-                Some(IdentityGuard { _locks: locks })
+                // The ownership flocks are released before the result crosses
+                // the channel. Carrying them would have the worker thread hold
+                // global flocks the UI thread cannot take, and
+                // `HomeView::apply_creation_results` re-validates and persists
+                // under its own window, so no peer claim can slip in between.
+                drop(locks);
             }
             Err(error) => {
                 // Only the workspace-claim lock is held; release it so the
@@ -321,7 +313,7 @@ impl CreationPoller {
                 );
                 return CreationResult::Error(format!("{error:#}"));
             }
-        };
+        }
         let created_worktree_info = created_worktree.as_ref().map(CreatedWorktreeInfo::from);
         let created_workspace_worktree_info = created_workspace_worktrees
             .iter()
@@ -335,7 +327,6 @@ impl CreationPoller {
             created_workspace_worktrees: created_workspace_worktree_info,
             on_launch_hooks_ran: has_on_launch,
             warnings,
-            identity_guard,
         }
     }
 

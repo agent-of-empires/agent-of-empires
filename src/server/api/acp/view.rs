@@ -423,9 +423,12 @@ pub async fn acp_disable(
     }
 
     // Committed before shutdown so the reconciler cannot respawn a worker in
-    // the teardown window.
+    // the teardown window. A kept-context switch still deletes the ACP
+    // projection below, so it must not report success from an ungated stop:
+    // `shutdown_and_require_dead` surfaces `TeardownPending` while the runner
+    // is not proven dead.
     let shutdown_result = if keep_context {
-        state.acp_supervisor.shutdown(&id).await
+        state.acp_supervisor.shutdown_and_require_dead(&id).await
     } else {
         state.acp_supervisor.shutdown_and_delete(&id).await
     };
@@ -438,12 +441,15 @@ pub async fn acp_disable(
         }
     };
     if !acp_teardown_proven {
-        // The ACP transcript and the runner's worktree both outlive an
-        // unproven teardown, so the switch stops here and the retry pass
-        // settles it.
+        // The view switch is already committed, so the only thing left to
+        // settle is the runner: the client gets a retryable conflict rather
+        // than a success it cannot rely on.
         return (
             StatusCode::CONFLICT,
-            format!("Session {id} is still being torn down; the structured view was left in place"),
+            format!(
+                "Session {id} is still being torn down; the switch to the terminal view is \
+                 already committed, retry after the runner exits"
+            ),
         )
             .into_response();
     }

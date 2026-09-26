@@ -1622,6 +1622,10 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        // The cross-profile inventory is unverifiable because a peer profile
+        // cannot be read at all, which is what makes the ownership verdict
+        // `Unknown` and the trash refuse.
+        std::fs::write(other.sessions_path(), b"{ not json").unwrap();
         let generation = owner
             .update(|instances, _groups| {
                 let row = instances

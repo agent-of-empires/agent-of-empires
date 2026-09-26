@@ -698,6 +698,13 @@ fn other_sessions_paths(instances: &[Instance], except_ids: &[&str]) -> Vec<Path
         .collect()
 }
 
+/// Whether `right` (the candidate) sits at or under `left` (a path another
+/// session owns).
+///
+/// A recorded peer path that no longer exists cannot be shown to contain
+/// anything, so it never conflicts. A *candidate* that does not exist yet is
+/// still compared lexically, which is what catches a fresh directory created
+/// underneath an existing peer parent.
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
@@ -706,9 +713,14 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
     let right_canonical = right.canonicalize().ok();
     match (left_canonical, right_canonical) {
         (Some(left), Some(right)) => left.starts_with(&right),
-        _ if !right.exists() => false,
-        // An existing path with an unresolved alias is not proof of separation.
-        _ => true,
+        // The recorded peer path is gone, so there is nothing it can contain.
+        (None, _) => false,
+        // The candidate is not on disk yet, so canonicalization proved nothing
+        // either way. Lexical containment still resolves the case that matters:
+        // a missing candidate under an existing peer parent. An existing path
+        // with an unresolved alias is not proof of separation, so the reverse
+        // direction counts too.
+        (Some(_), None) => left.starts_with(right) || right.starts_with(left),
     }
 }
 fn paths_overlap_destructive(left: &Path, right: &Path) -> bool {
@@ -769,18 +781,9 @@ fn all_profile_storages() -> std::result::Result<(Vec<String>, Vec<Storage>), St
 
 fn scan_paths_in_use(storages: &[Storage], except_ids: &[&str]) -> PathsInUse {
     let mut paths = Vec::new();
-    let mut ids = std::collections::HashSet::new();
     for storage in storages {
         match storage.load_strict_for_worktree_ownership_locked() {
             Ok(instances) => {
-                if instances
-                    .iter()
-                    .any(|instance| !ids.insert(instance.id.clone()))
-                {
-                    return PathsInUse::Unknown(
-                        "duplicate session id in cross-profile inventory".to_string(),
-                    );
-                }
                 paths.extend(other_sessions_paths(&instances, except_ids));
             }
             Err(error) => {
@@ -1691,6 +1694,71 @@ mod tests {
         assert!(paths_overlap(&child, &parent));
     }
 
+    /// A peer path that no longer exists on disk cannot contain anything, so it
+    /// must not read as a global conflict.
+    #[test]
+    fn missing_recorded_peer_path_is_not_a_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let gone = temp.path().join("already-deleted");
+        let candidate = temp.path().join("candidate");
+        std::fs::create_dir_all(&candidate).unwrap();
+
+        assert!(!paths_overlap(&gone, &candidate));
+        assert!(!paths_overlap(&gone, temp.path()));
+    }
+
+    /// The mirror case: a candidate that does not exist yet still has to be
+    /// caught lexically when it would land under a live peer parent, otherwise
+    /// the post-create check would wave it through.
+    #[test]
+    fn missing_candidate_under_an_existing_peer_parent_still_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("peer");
+        std::fs::create_dir_all(&parent).unwrap();
+        let candidate = parent.join("not-created-yet");
+
+        assert!(!candidate.exists());
+        assert!(paths_overlap(&parent, &candidate));
+    }
+
+    /// Two profiles holding the same session id used to make the whole
+    /// cross-profile inventory `Unknown`, so every path in every profile read
+    /// as claimed. The id is not an ownership claim: only the recorded paths
+    /// are, and they must still be enforced.
+    #[test]
+    #[serial_test::serial]
+    fn duplicate_session_ids_do_not_poison_every_ownership_check() {
+        let _app_guard = isolate_app_dir();
+        for profile in ["dup-a", "dup-b"] {
+            crate::session::create_profile(profile).unwrap();
+            let storage = Storage::open_unwatched(profile).unwrap();
+            let mut instance = Instance::new("Dup", &format!("/tmp/{profile}"));
+            instance.id = "dup-shared-id".to_string();
+            instance.source_profile = profile.to_string();
+            storage
+                .update(|instances, _groups| {
+                    instances.push(instance);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        // A caller with a different id: the duplicate rows are real peers, so
+        // their recorded paths are enforced.
+        let caller = "unrelated-caller";
+        assert!(
+            ensure_unclaimed_paths(caller, &[PathBuf::from("/tmp/dup-a")]).is_err(),
+            "a candidate colliding with a recorded peer path is still refused"
+        );
+        assert!(
+            ensure_unclaimed_paths(caller, &[PathBuf::from("/tmp/dup-b")]).is_err(),
+            "the second profile's recorded path is enforced too"
+        );
+        assert!(
+            ensure_unclaimed_paths(caller, &[PathBuf::from("/tmp/unrelated")]).is_ok(),
+            "a duplicate id elsewhere must not make unrelated candidates look claimed"
+        );
+    }
+
     fn init_repo(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
         let repo = git2::Repository::init(path).unwrap();
@@ -1975,6 +2043,9 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        // The inventory is unverifiable because a peer profile cannot be read
+        // at all, which is the surviving way to reach an `Unknown` verdict.
+        std::fs::write(other.sessions_path(), b"{ not json").unwrap();
         let hook_dir = crate::hooks::hook_status_dir(&owner.id).unwrap();
         std::fs::create_dir_all(&hook_dir).unwrap();
         std::fs::write(hook_dir.join("sentinel"), b"keep").unwrap();
@@ -2029,6 +2100,9 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        // The inventory is unverifiable because a peer profile cannot be read
+        // at all, which is the surviving way to reach an `Unknown` verdict.
+        std::fs::write(other.sessions_path(), b"{ not json").unwrap();
         let transaction = match PurgeTransaction::reserve(
             owner_storage,
             DeletionRequest {

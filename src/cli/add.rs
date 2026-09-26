@@ -1270,6 +1270,22 @@ fn cleanup_partial_session_under_locks(
                 .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
         );
     }
+
+    // Teardown keyed on the session id, not on any path, so it is safe even when
+    // a peer has since claimed a candidate path. Done before the ownership
+    // check so a partially created session never leaks its container; the
+    // path-ownership gate below is unchanged.
+    if let Some(session_id) = container_session_id {
+        let container = crate::containers::DockerContainer::from_session_id(session_id);
+        if let crate::containers::Teardown::Failed(e) = container.teardown(session_id) {
+            tracing::warn!(
+                target: "cli.add",
+                "failed to remove sandbox container during partial cleanup for {}: {}",
+                session_id,
+                e
+            );
+        }
+    }
     let peer_claimed = match crate::session::deletion::paths_in_use_except(&[]) {
         crate::session::deletion::PathsInUse::Unknown(_) => true,
         crate::session::deletion::PathsInUse::Known(paths) => {
@@ -1281,17 +1297,6 @@ fn cleanup_partial_session_under_locks(
     };
     if peer_claimed {
         return;
-    }
-    if let Some(session_id) = container_session_id {
-        let container = crate::containers::DockerContainer::from_session_id(session_id);
-        if let crate::containers::Teardown::Failed(e) = container.teardown(session_id) {
-            tracing::warn!(
-                target: "cli.add",
-                "failed to remove sandbox container during partial cleanup for {}: {}",
-                session_id,
-                e
-            );
-        }
     }
     if let Some(wt) = worktree_info {
         if wt.managed_by_aoe {

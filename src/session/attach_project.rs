@@ -754,10 +754,15 @@ pub fn attach_planned(
 ) -> Result<AttachOutcome> {
     let mut workspace_claim_lock = Some(crate::session::acquire_session_workspace_claim_lock()?);
     let identity_lock = crate::session::acquire_session_identity_lock()?;
-    let profile_namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
     let profile = storage.profile().to_string();
     let storage = Storage::open_unwatched(&profile)?;
+    // Lock order: workspace claim -> identity -> lifecycle -> profile
+    // namespace. Lifecycle sits under identity everywhere else (deletion,
+    // rename, group repair), and the profile namespace is only ever taken by
+    // callers already holding identity, so nesting it last introduces no
+    // second ordering.
     let mut lifecycle_lock = Some(storage.acquire_instance_lifecycle_lock(session_id)?);
+    let profile_namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
 
     if plan.moves_session {
         match instance.flush_published_conversation(&storage) {
@@ -812,8 +817,8 @@ pub fn attach_planned(
         anyhow::bail!("Attach path is already claimed by another session: {error}");
     }
     drop(workspace_claim_lock.take());
-    drop(lifecycle_lock.take());
     drop(identity_lock);
+    drop(lifecycle_lock.take());
     let prepared = match execute_for_session(instance, plan, Some(session_id)) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -868,6 +873,14 @@ pub fn attach_planned(
             return Err(error).context("could not reacquire identity lock to publish attach");
         }
     };
+    let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(session_id) {
+        Ok(lock) => lock,
+        Err(error) => {
+            prepared.rollback_preserving_claimed_locked(session_id);
+            release_reservation();
+            return Err(error).context("could not reacquire lifecycle lock to publish attach");
+        }
+    };
     let _profile_namespace_lock = match crate::session::storage::acquire_profile_namespace_lock() {
         Ok(lock) => lock,
         Err(error) => {
@@ -875,14 +888,6 @@ pub fn attach_planned(
             release_reservation();
             return Err(error)
                 .context("could not reacquire profile namespace lock to publish attach");
-        }
-    };
-    let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(session_id) {
-        Ok(lock) => lock,
-        Err(error) => {
-            prepared.rollback_preserving_claimed_locked(session_id);
-            release_reservation();
-            return Err(error).context("could not reacquire lifecycle lock to publish attach");
         }
     };
 

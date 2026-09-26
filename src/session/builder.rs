@@ -999,6 +999,26 @@ fn cleanup_instance_core(
                 .map(|repo| std::path::PathBuf::from(&repo.worktree_path)),
         );
     }
+
+    // Teardown keyed on the session id, not on any path, so it is safe even when
+    // a peer has since claimed a candidate path: no other session can own this
+    // id's tmux sessions or container. Doing it before the ownership check
+    // keeps a failed create from leaking them, and does not weaken the
+    // path-ownership gate that follows.
+    // The loser may never have reached storage, so lifecycle-coordinated stop cannot reserve its
+    // row.
+    instance.kill_all_tmux_sessions_without_lifecycle_row();
+
+    if let Some(sandbox) = &instance.sandbox_info {
+        if sandbox.enabled {
+            // Direct idempotent teardown, never gated on a separate existence probe.
+            let container = containers::DockerContainer::from_session_id(&instance.id);
+            if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
+                tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
+            }
+        }
+    }
+
     let peer_claimed = match crate::session::deletion::paths_in_use_except(&[instance.id.as_str()])
     {
         crate::session::deletion::PathsInUse::Unknown(_) => true,
@@ -1013,19 +1033,6 @@ fn cleanup_instance_core(
     let protection = CleanupProtection {
         owner: protected_owner,
     };
-    // The loser may never have reached storage, so lifecycle-coordinated stop cannot reserve its
-    // row.
-    instance.kill_all_tmux_sessions_without_lifecycle_row();
-
-    if let Some(sandbox) = &instance.sandbox_info {
-        if sandbox.enabled {
-            // Direct idempotent teardown, never gated on a separate existence probe.
-            let container = containers::DockerContainer::from_session_id(&instance.id);
-            if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
-                tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
-            }
-        }
-    }
 
     // Scratch dirs are provisioned eagerly inside `build_instance` (well before this helper's
     // other cleanup targets exist), so an abort between provisioning and the caller finishing the
@@ -1994,6 +2001,67 @@ mod tests {
         assert!(
             !scratch_path.exists(),
             "once the locks are free the failed create's scratch dir is removed"
+        );
+    }
+
+    /// An unresolved ownership verdict (`Unknown`) keeps every *path* in place,
+    /// because a peer may have claimed one. The failed create's own tmux
+    /// sessions and container are keyed on the session id instead, so no other
+    /// session can own them: they must still be torn down or they leak for the
+    /// life of the process.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_tears_down_id_keyed_resources_when_ownership_is_unknown() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _app_guard = crate::session::test_support::isolate_app_dir();
+        let temp = tempfile::TempDir::new().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let log = temp.path().join("docker.log");
+        let docker = bin.join("docker");
+        std::fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _path = crate::session::test_support::path_prepended(&bin);
+
+        let id = format!("cleanup-unknown-{}", uuid::Uuid::new_v4());
+        let scratch_path = crate::session::scratch::provision_scratch_dir(&id).unwrap();
+        let container_name = containers::DockerContainer::generate_name(&id);
+        let mut instance = Instance::new("Unknown", &scratch_path.to_string_lossy());
+        instance.id = id.clone();
+        instance.scratch = true;
+        instance.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine".to_string(),
+            container_name: container_name.clone(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+        });
+
+        // A failed profile listing is the cheapest way to force the ownership
+        // scan to answer `Unknown`.
+        let _fail_listing = crate::session::FailNextListProfilesGuard::new();
+        cleanup_instance_locked(&instance, None, &[], None);
+
+        let invocations = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            invocations.contains(&format!("rm -f -v {container_name}")),
+            "the failed create's container must be torn down even when path ownership is \
+             unknown; runtime invocations were {invocations:?}"
+        );
+        assert!(
+            scratch_path.exists(),
+            "an unknown ownership verdict must still leave the candidate paths in place"
         );
     }
 
