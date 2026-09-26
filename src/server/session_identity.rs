@@ -51,6 +51,18 @@ fn apply_poller_runtime_if_unchanged(
     }
 }
 
+fn apply_drained_lifecycle_if_unchanged(
+    live: &mut Instance,
+    drained: &Instance,
+    baseline: &SessionIdentityBaseline,
+) {
+    let (_, _, _, _, _, baseline_generation, _) = baseline;
+    if live.lifecycle_generation == *baseline_generation {
+        live.lifecycle_generation = drained.lifecycle_generation;
+        live.lifecycle_reservation = drained.lifecycle_reservation.clone();
+    }
+}
+
 pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
     // Drain poller observations into sessions.json so daemon-only sessions persist
     // post-`/clear` sids.
@@ -105,6 +117,11 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                 .chain(outcome.rolled_back.iter())
                 .map(String::as_str)
                 .collect();
+            let lifecycle_advanced: std::collections::HashSet<&str> = outcome
+                .lifecycle_advanced
+                .iter()
+                .map(String::as_str)
+                .collect();
             let mut guard = state.instances.write().await;
             for src in &mutated {
                 let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) else {
@@ -121,6 +138,9 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                 }
                 if runtime_changed.contains(&src.id) {
                     apply_poller_runtime_if_unchanged(dst, src, identity_baseline);
+                }
+                if lifecycle_advanced.contains(src.id.as_str()) {
+                    apply_drained_lifecycle_if_unchanged(dst, src, identity_baseline);
                 }
             }
         }

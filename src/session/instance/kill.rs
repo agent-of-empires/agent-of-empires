@@ -363,7 +363,9 @@ impl Instance {
                 current.is_sandboxed(),
             );
             match flushed {
-                Some(SidWrite::PinnedForeign) => container_result,
+                Some(SidWrite::PinnedForeign) | Some(SidWrite::OwnershipConflict) => {
+                    container_result
+                }
                 Some(SidWrite::Applied) | None => container_result,
                 Some(SidWrite::Failed) | Some(SidWrite::Skipped) => {
                     container_result?;

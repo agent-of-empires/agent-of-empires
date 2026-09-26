@@ -741,7 +741,12 @@ impl Instance {
         });
 
         match outcome {
-            Ok(write @ (SidWrite::Applied | SidWrite::Skipped | SidWrite::PinnedForeign)) => {
+            Ok(
+                write @ (SidWrite::Applied
+                | SidWrite::Skipped
+                | SidWrite::OwnershipConflict
+                | SidWrite::PinnedForeign),
+            ) => {
                 if let Some(disk) = storage
                     .load()
                     .ok()

@@ -187,13 +187,13 @@ pub(crate) fn read_pi_session_observation(
     );
     observation.pi_session_path = published_path;
     if let Some(active) = active {
-        let mut binding = active.binding.clone();
         if let Some((_, physical)) = transcript {
+            let mut binding = active.binding.clone();
             binding.stores = vec![physical.parent()?.to_path_buf()];
             observation.transcript_path = Some(physical);
+            observation.source = Some(binding);
         }
         observation.execution = Some(active.clone());
-        observation.source = Some(binding);
     }
     Some(observation)
 }
@@ -314,7 +314,7 @@ mod tests {
         crate::hooks::write_session_id_via_guard(&inst.id, current, Some(launch)).unwrap();
         let scoped = pi_sidecar_poll_fn(inst.id.clone(), source, Some(active.clone()));
         let observation = scoped().expect("a launch-scoped Pi ID is attributable without a path");
-        assert_eq!(observation.source.as_ref(), Some(&binding));
+        assert!(observation.source.is_none());
         assert_eq!(observation.execution.as_ref(), Some(&active));
         assert!(observation.transcript_path.is_none());
         assert!(observation.pi_session_path.is_none());
