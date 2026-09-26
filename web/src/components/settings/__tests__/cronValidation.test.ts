@@ -2,41 +2,38 @@ import { describe, expect, it } from "vitest";
 import { validateCron } from "../cronValidation";
 
 describe("validateCron", () => {
-  it("accepts a plain 5-field expression and wildcards", () => {
-    expect(validateCron("0 9 * * 1-5")).toBeNull();
-    expect(validateCron("* * * * *")).toBeNull();
-    expect(validateCron("  0   9   *   *   *  ")).toBeNull();
-  });
-
-  it("accepts lists, ranges, and steps within range", () => {
-    expect(validateCron("0,30 9-17 * * *")).toBeNull();
-    expect(validateCron("*/15 * * * *")).toBeNull();
-    expect(validateCron("0 0 1-15/2 * 0")).toBeNull();
+  it("accepts wildcards, lists, ranges, and in-range steps", () => {
     // Both 0 and 7 are Sunday for day-of-week.
-    expect(validateCron("0 0 * * 7")).toBeNull();
+    for (const expr of [
+      "0 9 * * 1-5",
+      "* * * * *",
+      "  0   9   *   *   *  ",
+      "0,30 9-17 * * *",
+      "*/15 * * * *",
+      "0 0 1-15/2 * 0",
+      "0 0 * * 7",
+    ]) {
+      expect(validateCron(expr), expr).toBeNull();
+    }
   });
 
-  it("rejects the wrong field count", () => {
-    expect(validateCron("0 9 * *")).toMatch(/exactly 5 fields/);
-    expect(validateCron("0 9 * * 1-5 extra")).toMatch(/exactly 5 fields/);
-    expect(validateCron("")).toMatch(/exactly 5 fields/);
-  });
-
-  it("rejects out-of-range values per field", () => {
-    expect(validateCron("60 * * * *")).toMatch(/minute/);
-    expect(validateCron("* 24 * * *")).toMatch(/hour/);
-    expect(validateCron("* * 0 * *")).toMatch(/day-of-month/);
-    expect(validateCron("* * * 13 *")).toMatch(/month/);
-    expect(validateCron("* * * * 8")).toMatch(/day-of-week/);
-  });
-
-  it("rejects malformed items (bad step, non-numeric, over-split range)", () => {
-    expect(validateCron("*/0 * * * *")).toMatch(/minute/);
-    expect(validateCron("*/a * * * *")).toMatch(/minute/);
-    expect(validateCron("1-2-3 * * * *")).toMatch(/minute/);
-    expect(validateCron("1/2/3 * * * *")).toMatch(/minute/);
-    expect(validateCron("abc * * * *")).toMatch(/minute/);
-    // Range with an out-of-range endpoint.
-    expect(validateCron("1-99 * * * *")).toMatch(/minute/);
+  it("rejects the wrong field count, out-of-range values, and malformed items, naming the field", () => {
+    const cases: [string, RegExp][] = [
+      ["0 9 * *", /exactly 5 fields/],
+      ["0 9 * * 1-5 extra", /exactly 5 fields/],
+      ["", /exactly 5 fields/],
+      ["60 * * * *", /minute/],
+      ["* 24 * * *", /hour/],
+      ["* * 0 * *", /day-of-month/],
+      ["* * * 13 *", /month/],
+      ["* * * * 8", /day-of-week/],
+      ["*/0 * * * *", /minute/],
+      ["*/a * * * *", /minute/],
+      ["1-2-3 * * * *", /minute/],
+      ["1/2/3 * * * *", /minute/],
+      ["abc * * * *", /minute/],
+      ["1-99 * * * *", /minute/],
+    ];
+    for (const [expr, err] of cases) expect(validateCron(expr), expr).toMatch(err);
   });
 });

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { expect, it } from "vitest";
 
 import {
   anchorIsStale,
@@ -22,104 +22,56 @@ const base = {
   lastLoadAt: 0,
 };
 
-describe("autoLoadDecision", () => {
-  it("fires at the top when armed, overflowing, and past the cooldown", () => {
-    expect(autoLoadDecision(base)).toEqual({ armed: false, fire: true });
-  });
-
-  it("re-arms and does not fire away from the top", () => {
-    expect(autoLoadDecision({ ...base, scrollTop: HISTORY_PRELOAD_PX + 1, armed: false })).toEqual({
-      armed: true,
-      fire: false,
-    });
-  });
-
-  it("never fires (and arms) when the transcript does not overflow", () => {
-    expect(autoLoadDecision({ ...base, scrollHeight: base.clientHeight + HISTORY_PRELOAD_PX })).toEqual({
-      armed: true,
-      fire: false,
-    });
-  });
-
-  it("does not fire while disarmed (one load per arming)", () => {
-    expect(autoLoadDecision({ ...base, armed: false })).toEqual({ armed: false, fire: false });
-  });
-
-  it("holds fire within the cooldown window", () => {
-    expect(autoLoadDecision({ ...base, lastLoadAt: base.now - (HISTORY_AUTOLOAD_COOLDOWN_MS - 1) })).toEqual({
-      armed: true,
-      fire: false,
-    });
-  });
-
-  it("does not fire when there is no older history left", () => {
-    expect(autoLoadDecision({ ...base, canLoadEarlier: false })).toEqual({ armed: true, fire: false });
-  });
+it("autoLoadDecision fires once per arming at the top of an overflowing transcript", () => {
+  const cases: [string, Partial<typeof base>, { armed: boolean; fire: boolean }][] = [
+    ["armed at the top past the cooldown", {}, { armed: false, fire: true }],
+    ["away from the top re-arms", { scrollTop: HISTORY_PRELOAD_PX + 1, armed: false }, { armed: true, fire: false }],
+    ["no overflow", { scrollHeight: base.clientHeight + HISTORY_PRELOAD_PX }, { armed: true, fire: false }],
+    ["disarmed", { armed: false }, { armed: false, fire: false }],
+    [
+      "within the cooldown",
+      { lastLoadAt: base.now - (HISTORY_AUTOLOAD_COOLDOWN_MS - 1) },
+      { armed: true, fire: false },
+    ],
+    ["no older history", { canLoadEarlier: false }, { armed: true, fire: false }],
+  ];
+  for (const [name, over, expected] of cases) expect(autoLoadDecision({ ...base, ...over }), name).toEqual(expected);
 });
 
-describe("isPinnedToBottom", () => {
-  it("treats exact-bottom and within-slop positions as pinned, and further up as not", () => {
-    const clientHeight = 500;
-    const scrollHeight = 5000;
-    const cases: [number, boolean][] = [
-      [4500, true], // exact bottom: 4500 + 500 === 5000
-      [4500 - PINNED_BOTTOM_SLOP_PX, true], // within slop
-      [4500 - PINNED_BOTTOM_SLOP_PX - 1, false], // just past the slop
-      [0, false], // scrolled to the top of a long transcript
-    ];
-    for (const [scrollTop, expected] of cases) {
-      expect(isPinnedToBottom(scrollTop, clientHeight, scrollHeight), `scrollTop=${scrollTop}`).toBe(expected);
-    }
-  });
-
-  it("is pinned when content fits the viewport (no overflow)", () => {
-    expect(isPinnedToBottom(0, 800, 800)).toBe(true);
-    expect(isPinnedToBottom(0, 800, 400)).toBe(true);
-  });
+it("isPinnedToBottom allows the slop and treats non-overflowing content as pinned", () => {
+  const cases: [number, number, number, boolean][] = [
+    [4500, 500, 5000, true],
+    [4500 - PINNED_BOTTOM_SLOP_PX, 500, 5000, true],
+    [4500 - PINNED_BOTTOM_SLOP_PX - 1, 500, 5000, false],
+    [0, 500, 5000, false],
+    [0, 800, 800, true],
+    [0, 800, 400, true],
+  ];
+  for (const [top, client, height, expected] of cases) {
+    expect(isPinnedToBottom(top, client, height), `${top}/${client}/${height}`).toBe(expected);
+  }
 });
 
-describe("scrollRestoreDelta", () => {
-  it("returns the growth delta when scrolled up", () => {
-    expect(scrollRestoreDelta(1000, 1300, false)).toBe(300);
-  });
-  it("returns 0 when pinned to the bottom", () => {
-    expect(scrollRestoreDelta(1000, 1300, true)).toBe(0);
-  });
-  it("returns 0 when nothing grew", () => {
-    expect(scrollRestoreDelta(1300, 1300, false)).toBe(0);
-    expect(scrollRestoreDelta(1300, 1000, false)).toBe(0);
-  });
+it("scrollRestoreDelta compensates growth only when scrolled up", () => {
+  expect(scrollRestoreDelta(1000, 1300, false)).toBe(300);
+  expect(scrollRestoreDelta(1000, 1300, true)).toBe(0);
+  expect(scrollRestoreDelta(1300, 1300, false)).toBe(0);
+  expect(scrollRestoreDelta(1300, 1000, false)).toBe(0);
 });
 
-describe("earlierAction / canOfferEarlier", () => {
-  it("reveals loaded rows before fetching", () => {
-    expect(earlierAction(true, true)).toBe("reveal");
-    expect(earlierAction(true, false)).toBe("reveal");
-  });
-  it("fetches when nothing loaded remains but the server has more", () => {
-    expect(earlierAction(false, true)).toBe("fetch");
-  });
-  it("is a no-op when neither has more", () => {
-    expect(earlierAction(false, false)).toBe("none");
-  });
-  it("offers the control when either source has more", () => {
-    expect(canOfferEarlier(true, false)).toBe(true);
-    expect(canOfferEarlier(false, true)).toBe(true);
-    expect(canOfferEarlier(false, false)).toBe(false);
-  });
+it("earlierAction reveals loaded rows before fetching; canOfferEarlier needs either source", () => {
+  expect(earlierAction(true, true)).toBe("reveal");
+  expect(earlierAction(true, false)).toBe("reveal");
+  expect(earlierAction(false, true)).toBe("fetch");
+  expect(earlierAction(false, false)).toBe("none");
+  expect(canOfferEarlier(true, false)).toBe(true);
+  expect(canOfferEarlier(false, true)).toBe(true);
+  expect(canOfferEarlier(false, false)).toBe(false);
 });
 
-describe("anchorIsStale", () => {
-  it("is stale when settled with no growth", () => {
-    expect(anchorIsStale(false, 1000, 1000)).toBe(true);
-  });
-  it("is not stale while a fetch is in flight", () => {
-    expect(anchorIsStale(true, 1000, 1000)).toBe(false);
-  });
-  it("is not stale once the transcript grew", () => {
-    expect(anchorIsStale(false, 1000, 1300)).toBe(false);
-  });
-  it("is not stale with no anchor set", () => {
-    expect(anchorIsStale(false, null, 1000)).toBe(false);
-  });
+it("anchorIsStale only once settled with an anchor and no growth", () => {
+  expect(anchorIsStale(false, 1000, 1000)).toBe(true);
+  expect(anchorIsStale(true, 1000, 1000)).toBe(false);
+  expect(anchorIsStale(false, 1000, 1300)).toBe(false);
+  expect(anchorIsStale(false, null, 1000)).toBe(false);
 });

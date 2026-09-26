@@ -41,25 +41,23 @@ function renderModal(
 }
 
 describe("TipsModal (tip of the day)", () => {
-  it("opens on the start index and shows that tip with a counter", () => {
-    const { getByText } = renderModal({ startIndex: 1 });
+  it("opens on the start index and navigates with wraparound, marking shown tips seen", () => {
+    const onMarkSeen = vi.fn();
+    const { getByRole, getByText } = renderModal({ startIndex: 1, onMarkSeen });
     expect(getByText("Second tip")).toBeTruthy();
     expect(getByText("Second body.")).toBeTruthy();
     expect(getByText("Tip 2 of 2")).toBeTruthy();
-  });
 
-  it("cycles to the next tip and marks it seen", () => {
-    const onMarkSeen = vi.fn();
-    const { getByRole, getByText } = renderModal({ onMarkSeen });
-    fireEvent.click(getByRole("button", { name: "Next" }));
-    expect(getByText("Second tip")).toBeTruthy();
-    expect(onMarkSeen).toHaveBeenCalledWith("b");
-  });
-
-  it("wraps from the last tip to the first with Next", () => {
-    const { getByRole, getByText } = renderModal({ startIndex: 1 });
     fireEvent.click(getByRole("button", { name: "Next" }));
     expect(getByText("First tip")).toBeTruthy();
+    expect(getByText("Tip 1 of 2")).toBeTruthy();
+    expect(onMarkSeen).toHaveBeenLastCalledWith("a");
+
+    fireEvent.click(getByRole("button", { name: "Next" }));
+    expect(getByText("Second tip")).toBeTruthy();
+    expect(onMarkSeen).toHaveBeenLastCalledWith("b");
+
+    fireEvent.click(getByRole("button", { name: "Previous" }));
     expect(getByText("Tip 1 of 2")).toBeTruthy();
   });
 
@@ -72,40 +70,21 @@ describe("TipsModal (tip of the day)", () => {
     expect(onSetEnabled).toHaveBeenCalledWith(false);
   });
 
-  it("disables navigation and hides the counter for a single tip", () => {
-    const { getByRole, queryByText } = renderModal({ tips: [TIPS[0]] });
-    expect((getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true);
-    expect((getByRole("button", { name: "Previous" }) as HTMLButtonElement).disabled).toBe(true);
-    expect(queryByText(/Tip \d+ of/)).toBeNull();
-  });
-
-  it("navigates backward with Previous", () => {
-    const { getByRole, getByText } = renderModal({ startIndex: 1 });
-    fireEvent.click(getByRole("button", { name: "Previous" }));
-    expect(getByText("First tip")).toBeTruthy();
-    expect(getByText("Tip 1 of 2")).toBeTruthy();
-  });
-
-  it("closes from the Close button", () => {
-    const { getByRole, onClose } = renderModal();
-    fireEvent.click(getByRole("button", { name: "Close" }));
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
-  it("closes when the overlay is clicked", () => {
-    const { getByRole, onClose } = renderModal();
-    fireEvent.click(getByRole("dialog"));
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
-  it("closes on Escape", () => {
-    const { onClose } = renderModal();
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
-  it("renders an empty state with no tips", () => {
+  it("disables navigation for a single tip and shows an empty state with none", () => {
+    const one = renderModal({ tips: [TIPS[0]] });
+    expect((one.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((one.getByRole("button", { name: "Previous" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(one.queryByText(/Tip \d+ of/)).toBeNull();
+    one.unmount();
     const { getByText } = renderModal({ tips: [] });
     expect(getByText(/No tips right now/)).toBeTruthy();
+  });
+
+  it("closes from the Close button, the overlay, and Escape", () => {
+    const { getByRole, onClose } = renderModal();
+    fireEvent.click(getByRole("button", { name: "Close" }));
+    fireEvent.click(getByRole("dialog"));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(3);
   });
 });

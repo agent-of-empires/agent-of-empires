@@ -50,29 +50,16 @@ function buttonByText(container: HTMLElement, match: string): HTMLButtonElement 
 }
 
 describe("NotificationSettings", () => {
-  it("renders an Enable button when state is 'off'", () => {
+  it("'off' offers Enable, which calls hook.enable()", () => {
     const container = renderFor({ kind: "off" });
-    expect(buttonByText(container, "Enable notifications")).not.toBeNull();
     expect(buttonByText(container, "Send test notification")).toBeNull();
-  });
-
-  it("clicking Enable calls hook.enable()", () => {
-    const container = renderFor({ kind: "off" });
-    const btn = buttonByText(container, "Enable notifications")!;
-    fireEvent.click(btn);
+    fireEvent.click(buttonByText(container, "Enable notifications")!);
     expect(enable).toHaveBeenCalledTimes(1);
   });
 
-  it("when 'enabled', shows Send test, Re-subscribe, Turn off; hides Enable", () => {
+  it("'enabled' offers Send test, Re-subscribe, and Turn off wired to their primitives", () => {
     const container = renderFor({ kind: "enabled" });
-    expect(buttonByText(container, "Send test notification")).not.toBeNull();
-    expect(buttonByText(container, "Re-subscribe")).not.toBeNull();
-    expect(buttonByText(container, "Turn off")).not.toBeNull();
     expect(buttonByText(container, "Enable notifications")).toBeNull();
-  });
-
-  it("clicking Send test, Re-subscribe, Turn off invokes the right primitives", () => {
-    const container = renderFor({ kind: "enabled" });
     fireEvent.click(buttonByText(container, "Send test notification")!);
     fireEvent.click(buttonByText(container, "Re-subscribe")!);
     fireEvent.click(buttonByText(container, "Turn off")!);
@@ -102,22 +89,10 @@ describe("NotificationSettings", () => {
       "turned off by the server",
       false,
     ],
+    ["'asking' shows status text instead of Enable", { kind: "asking" }, "Asking your browser", false],
   ] as [string, PushState, string | null, boolean][])("%s", (_name, state, text, enableShown) => {
     const container = renderFor(state);
     if (text) expect(container.textContent).toContain(text);
     expect(buttonByText(container, "Enable notifications") !== null).toBe(enableShown);
-  });
-
-  it("disables the Enable button while a transition is in flight", () => {
-    setState({ kind: "off" });
-    const { container, rerender } = render(<NotificationSettings />);
-    const beforeBtn = buttonByText(container, "Enable notifications")!;
-    expect(beforeBtn.disabled).toBe(false);
-    setState({ kind: "asking" });
-    rerender(<NotificationSettings />);
-    // 'asking' has no button; verify we switched away from the actionable
-    // 'off' UI (the stale Enable button is gone) onto the status text.
-    expect(container.textContent).toContain("Asking your browser");
-    expect(buttonByText(container, "Enable notifications")).toBeNull();
   });
 });

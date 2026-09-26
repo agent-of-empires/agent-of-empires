@@ -2309,62 +2309,55 @@ mod vt_input_encode_tests {
     }
 
     #[test]
-    fn arrows_follow_decckm() {
-        assert_eq!(enc("Up", false), b"\x1b[A");
-        assert_eq!(enc("Up", true), b"\x1bOA");
-        assert_eq!(enc("Down", false), b"\x1b[B");
-        assert_eq!(enc("Right", true), b"\x1bOC");
-        assert_eq!(enc("Left", false), b"\x1b[D");
-        // Home/End are cursor-mode keys too.
-        assert_eq!(enc("Home", true), b"\x1bOH");
-        assert_eq!(enc("End", false), b"\x1b[F");
-    }
+    fn keys_and_actions_encode_to_vt_bytes() {
+        // Only unmodified cursor keys follow DECCKM; modified keys use the CSI modifier
+        // param (1 + shift + 2*alt + 4*ctrl). PageUp/PageDown alias PPage/NPage because the
+        // page-forward paths emit those names.
+        let cases: &[(&str, bool, &[u8])] = &[
+            ("Up", false, b"\x1b[A"),
+            ("Up", true, b"\x1bOA"),
+            ("Down", false, b"\x1b[B"),
+            ("Right", true, b"\x1bOC"),
+            ("Left", false, b"\x1b[D"),
+            ("Home", true, b"\x1bOH"),
+            ("End", false, b"\x1b[F"),
+            ("S-Up", false, b"\x1b[1;2A"),
+            ("S-Up", true, b"\x1b[1;2A"),
+            ("C-Up", false, b"\x1b[1;5A"),
+            ("M-Up", false, b"\x1b[1;3A"),
+            ("C-S-Left", false, b"\x1b[1;6D"),
+            ("PPage", false, b"\x1b[5~"),
+            ("NPage", true, b"\x1b[6~"),
+            ("PageUp", false, b"\x1b[5~"),
+            ("PageDown", false, b"\x1b[6~"),
+            ("C-PageUp", false, b"\x1b[5;5~"),
+            ("DC", false, b"\x1b[3~"),
+            ("S-DC", false, b"\x1b[3;2~"),
+            ("F1", false, b"\x1bOP"),
+            ("F4", false, b"\x1bOS"),
+            ("F5", false, b"\x1b[15~"),
+            ("F12", false, b"\x1b[24~"),
+            ("C-F5", false, b"\x1b[15;5~"),
+            ("Enter", false, b"\r"),
+            ("Tab", false, b"\t"),
+            ("BTab", false, b"\x1b[Z"),
+            ("BSpace", false, b"\x7f"),
+            ("Escape", false, b"\x1b"),
+            ("Space", false, b" "),
+            ("C-Space", false, b"\x00"),
+            ("C-c", false, b"\x03"),
+            ("C-a", false, b"\x01"),
+            ("M-x", false, b"\x1bx"),
+            ("M-Enter", false, b"\x1b\r"),
+        ];
+        for &(name, app_cursor, expected) in cases {
+            assert_eq!(
+                enc(name, app_cursor),
+                expected,
+                "{name} app_cursor={app_cursor}"
+            );
+        }
 
-    #[test]
-    fn modified_arrows_use_csi_param_not_decckm() {
-        // modifier param = 1 + shift + 2*alt + 4*ctrl; mode is irrelevant.
-        assert_eq!(enc("S-Up", false), b"\x1b[1;2A");
-        assert_eq!(enc("S-Up", true), b"\x1b[1;2A");
-        assert_eq!(enc("C-Up", false), b"\x1b[1;5A");
-        assert_eq!(enc("M-Up", false), b"\x1b[1;3A");
-        assert_eq!(enc("C-S-Left", false), b"\x1b[1;6D");
-    }
-
-    #[test]
-    fn editing_block_and_fkeys() {
-        assert_eq!(enc("PPage", false), b"\x1b[5~");
-        assert_eq!(enc("NPage", true), b"\x1b[6~"); // unaffected by DECCKM
-                                                    // PageUp/PageDown alias PPage/NPage: the page-forward paths emit these
-                                                    // names, so the encoder must not drop them on the VT input path.
-        assert_eq!(enc("PageUp", false), b"\x1b[5~");
-        assert_eq!(enc("PageDown", false), b"\x1b[6~");
-        assert_eq!(enc("C-PageUp", false), b"\x1b[5;5~");
-        assert_eq!(enc("DC", false), b"\x1b[3~");
-        assert_eq!(enc("S-DC", false), b"\x1b[3;2~");
-        assert_eq!(enc("F1", false), b"\x1bOP");
-        assert_eq!(enc("F4", false), b"\x1bOS");
-        assert_eq!(enc("F5", false), b"\x1b[15~");
-        assert_eq!(enc("F12", false), b"\x1b[24~");
-        assert_eq!(enc("C-F5", false), b"\x1b[15;5~");
-    }
-
-    #[test]
-    fn simple_keys_and_chords() {
-        assert_eq!(enc("Enter", false), b"\r");
-        assert_eq!(enc("Tab", false), b"\t");
-        assert_eq!(enc("BTab", false), b"\x1b[Z");
-        assert_eq!(enc("BSpace", false), vec![0x7f]);
-        assert_eq!(enc("Escape", false), vec![0x1b]);
-        assert_eq!(enc("Space", false), b" ");
-        assert_eq!(enc("C-Space", false), vec![0x00]);
-        assert_eq!(enc("C-c", false), vec![0x03]);
-        assert_eq!(enc("C-a", false), vec![0x01]);
-        assert_eq!(enc("M-x", false), b"\x1bx");
-        assert_eq!(enc("M-Enter", false), b"\x1b\r");
-    }
-
-    #[test]
-    fn action_literal_and_repeat() {
         assert_eq!(
             encode_action_bytes(&TmuxAction::Literal("hi".into()), false),
             b"hi"
@@ -2659,95 +2652,66 @@ mod tests {
     // chord-list tests below cover the configurable exit path.
 
     #[test]
-    fn translate_never_emits_exit_for_ctrl_q() {
-        // translate is pure key→tmux. Ctrl+q now passes through; the
-        // exit decision belongs to the chord-list matcher.
-        assert_named(
-            translate(k_mod(KeyCode::Char('q'), KeyModifiers::CONTROL)),
-            "C-q",
-        );
+    fn parse_chord_accepts_known_forms_and_rejects_garbage() {
+        let ctrl = KeyModifiers::CONTROL;
+        let cases = [
+            ("C-q", Some((KeyCode::Char('q'), ctrl))),
+            // Uppercase folds to lowercase under Ctrl (tmux: C-a and C-A are one chord).
+            ("C-Q", Some((KeyCode::Char('q'), ctrl))),
+            ("C-]", Some((KeyCode::Char(']'), ctrl))),
+            (
+                "Ctrl+Alt+x",
+                Some((KeyCode::Char('x'), ctrl | KeyModifiers::ALT)),
+            ),
+            ("F12", Some((KeyCode::F(12), KeyModifiers::NONE))),
+            ("S-Up", Some((KeyCode::Up, KeyModifiers::SHIFT))),
+            ("Escape", Some((KeyCode::Esc, KeyModifiers::NONE))),
+            ("PageUp", Some((KeyCode::PageUp, KeyModifiers::NONE))),
+            ("", None),
+            ("X-q", None),  // unknown modifier
+            ("C-qq", None), // multi-char key without F-prefix
+            ("C-", None),   // missing key
+        ];
+        for (input, expected) in cases {
+            assert_eq!(parse_chord(input), expected, "{input:?}");
+        }
     }
 
     #[test]
-    fn parse_chord_basics() {
-        assert_eq!(
-            parse_chord("C-q"),
-            Some((KeyCode::Char('q'), KeyModifiers::CONTROL))
-        );
-        // Uppercase letter folds to lowercase under Ctrl (tmux
-        // convention: C-a and C-A are the same chord).
-        assert_eq!(
-            parse_chord("C-Q"),
-            Some((KeyCode::Char('q'), KeyModifiers::CONTROL))
-        );
-        // Punctuation as the key.
-        assert_eq!(
-            parse_chord("C-]"),
-            Some((KeyCode::Char(']'), KeyModifiers::CONTROL))
-        );
-        // Long modifier names.
-        assert_eq!(
-            parse_chord("Ctrl+Alt+x"),
-            Some((
-                KeyCode::Char('x'),
-                KeyModifiers::CONTROL | KeyModifiers::ALT
-            ))
-        );
-        // Named keys.
-        assert_eq!(
-            parse_chord("F12"),
-            Some((KeyCode::F(12), KeyModifiers::NONE))
-        );
-        assert_eq!(
-            parse_chord("S-Up"),
-            Some((KeyCode::Up, KeyModifiers::SHIFT))
-        );
-        assert_eq!(
-            parse_chord("Escape"),
-            Some((KeyCode::Esc, KeyModifiers::NONE))
-        );
-        assert_eq!(
-            parse_chord("PageUp"),
-            Some((KeyCode::PageUp, KeyModifiers::NONE))
-        );
-    }
-
-    #[test]
-    fn parse_chord_rejects_garbage() {
-        assert_eq!(parse_chord(""), None);
-        assert_eq!(parse_chord("X-q"), None); // unknown modifier
-        assert_eq!(parse_chord("C-qq"), None); // multi-char key without F-prefix
-        assert_eq!(parse_chord("C-"), None); // missing key
-    }
-
-    #[test]
-    fn chord_matches_handles_ctrl_case_folding() {
-        let spec = parse_chord("C-q").unwrap();
-        // Crossterm may deliver Ctrl+Q as Char('q') or Char('Q')+SHIFT depending on the
-        // terminal. The match must recognize the lowercase form but not the shift form,
-        // which means the user wants to send Ctrl+Shift+q to the agent.
-        assert!(chord_matches(
-            spec,
-            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)
-        ));
-        assert!(!chord_matches(
-            spec,
-            KeyEvent::new(
+    fn chord_matching_is_exact_with_ctrl_case_folding() {
+        let ctrl_q = parse_chord("C-q").unwrap();
+        let leader = parse_chord(DEFAULT_LEADER).unwrap();
+        let cases = [
+            // Crossterm may deliver Ctrl+Q as Char('q') or Char('Q')+SHIFT; the shift form
+            // means the user wants to send Ctrl+Shift+q to the agent.
+            (ctrl_q, KeyCode::Char('q'), KeyModifiers::CONTROL, true),
+            (
+                ctrl_q,
                 KeyCode::Char('Q'),
-                KeyModifiers::CONTROL | KeyModifiers::SHIFT
-            )
-        ));
-        assert!(!chord_matches(
-            spec,
-            KeyEvent::new(
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                false,
+            ),
+            (
+                ctrl_q,
                 KeyCode::Char('q'),
-                KeyModifiers::CONTROL | KeyModifiers::ALT
-            )
-        ));
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+                false,
+            ),
+            // The armed leader fires again on Ctrl+B; bare `b` is a menu command.
+            (leader, KeyCode::Char('b'), KeyModifiers::CONTROL, true),
+            (leader, KeyCode::Char('b'), KeyModifiers::NONE, false),
+        ];
+        for (chord, code, mods, expected) in cases {
+            assert_eq!(
+                chord_matches(chord, KeyEvent::new(code, mods)),
+                expected,
+                "{chord:?} vs {code:?}+{mods:?}"
+            );
+        }
     }
 
     #[test]
-    fn parse_chord_list_filters_invalid_pieces() {
+    fn chord_list_parses_matches_and_displays() {
         let chords = parse_chord_list("C-q, garbage, C-]");
         assert_eq!(
             chords,
@@ -2756,124 +2720,67 @@ mod tests {
                 (KeyCode::Char(']'), KeyModifiers::CONTROL),
             ]
         );
-    }
-
-    #[test]
-    fn parse_chord_list_falls_back_to_default_on_all_invalid() {
-        // Misconfigured chord lists shouldn't trap the user in live
-        // mode with no exit; we drop back to the default set.
-        let chords = parse_chord_list("not-a-chord, also-bad");
-        let defaults = parse_chord_list(DEFAULT_EXIT_CHORD);
-        assert_eq!(chords, defaults);
-        assert!(!chords.is_empty());
-    }
-
-    #[test]
-    fn default_chord_set_is_only_ctrl_q() {
-        let chords = parse_chord_list(DEFAULT_EXIT_CHORD);
-        assert_eq!(chords, vec![(KeyCode::Char('q'), KeyModifiers::CONTROL)]);
-        // `Ctrl+]` (the 1.9.0 default) and `Ctrl+\` were both pulled because each failed
-        // on at least one common macOS terminal/keyboard combination.
-        assert!(!chords.contains(&(KeyCode::Char(']'), KeyModifiers::CONTROL)));
-        assert!(!chords.contains(&(KeyCode::Char('\\'), KeyModifiers::CONTROL)));
-    }
-
-    #[test]
-    fn default_leader_is_ctrl_b() {
-        // Ctrl+B matches the tmux/herdr leader. Kept in sync with
-        // session::config::default_live_send_leader().
-        assert_eq!(
-            parse_chord(DEFAULT_LEADER),
-            Some((KeyCode::Char('b'), KeyModifiers::CONTROL))
-        );
-    }
-
-    #[test]
-    fn leader_matches_only_its_exact_chord() {
-        let leader = parse_chord(DEFAULT_LEADER).unwrap();
-        // The armed leader: Ctrl+B fires it again (passthrough path).
-        assert!(chord_matches(
-            leader,
-            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)
-        ));
-        // Bare `b` is a menu command, not a second leader press, so it
-        // must NOT match the leader chord.
-        assert!(!chord_matches(
-            leader,
-            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)
-        ));
-    }
-
-    #[test]
-    fn chord_list_matches_any() {
-        let chords = parse_chord_list("C-q, C-]");
-        assert!(chord_list_matches(
-            &chords,
-            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)
-        ));
-        assert!(chord_list_matches(
-            &chords,
-            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL)
-        ));
-        assert!(!chord_list_matches(
-            &chords,
-            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)
-        ));
-    }
-
-    #[test]
-    fn display_chord_list_joins_with_slash() {
-        let chords = parse_chord_list("C-q, C-]");
+        for (c, expected) in [('q', true), (']', true), ('x', false)] {
+            assert_eq!(
+                chord_list_matches(
+                    &chords,
+                    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+                ),
+                expected,
+                "Ctrl+{c}"
+            );
+        }
         assert_eq!(display_chord_list(&chords), "Ctrl+Q / Ctrl+]");
+        for (chord, shown) in [("F12", "F12"), ("Ctrl+Alt+Shift+x", "Ctrl+Alt+Shift+X")] {
+            assert_eq!(display_chord(parse_chord(chord).unwrap()), shown);
+        }
+
+        // An all-invalid list must not trap the user in live mode with no exit.
+        let fallback = parse_chord_list("not-a-chord, also-bad");
+        assert!(!fallback.is_empty());
+        assert_eq!(fallback, parse_chord_list(DEFAULT_EXIT_CHORD));
     }
 
     #[test]
-    fn display_chord_single() {
-        let chord = parse_chord("C-]").unwrap();
-        assert_eq!(display_chord(chord), "Ctrl+]");
-        let chord = parse_chord("F12").unwrap();
-        assert_eq!(display_chord(chord), "F12");
-        let chord = parse_chord("Ctrl+Alt+Shift+x").unwrap();
-        assert_eq!(display_chord(chord), "Ctrl+Alt+Shift+X");
-    }
-
-    #[test]
-    fn plain_letters_go_literal_preserving_case() {
-        assert_literal(translate(k(KeyCode::Char('a'))), "a");
-        assert_literal(translate(k(KeyCode::Char('Z'))), "Z");
-        assert_literal(translate(k(KeyCode::Char('!'))), "!");
-        assert_literal(translate(k(KeyCode::Char(' '))), " ");
-    }
-
-    #[test]
-    fn ctrl_letter_folds_lowercase_to_named() {
-        assert_named(
-            translate(k_mod(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            "C-c",
-        );
-        assert_named(
-            translate(k_mod(KeyCode::Char('A'), KeyModifiers::CONTROL)),
-            "C-a",
-        );
-    }
-
-    #[test]
-    fn alt_letter_folds_to_named() {
-        assert_named(
-            translate(k_mod(KeyCode::Char('x'), KeyModifiers::ALT)),
-            "M-x",
-        );
-    }
-
-    #[test]
-    fn ctrl_alt_combo() {
-        assert_named(
-            translate(k_mod(
-                KeyCode::Char('q'),
-                KeyModifiers::CONTROL | KeyModifiers::ALT,
-            )),
-            "C-M-q",
-        );
+    fn translate_maps_keys_to_tmux() {
+        let lit = |s: &str| LiveDispatch::Send(TmuxKey::Literal(s.into()));
+        let named = |s: &str| LiveDispatch::Send(TmuxKey::Named(s.into()));
+        let none = KeyModifiers::NONE;
+        let ctrl = KeyModifiers::CONTROL;
+        let cases = [
+            // translate is pure key->tmux: Ctrl+q passes through, and the exit decision
+            // belongs to the chord-list matcher.
+            (KeyCode::Char('q'), ctrl, named("C-q")),
+            (KeyCode::Char('a'), none, lit("a")),
+            (KeyCode::Char('Z'), none, lit("Z")),
+            (KeyCode::Char('!'), none, lit("!")),
+            (KeyCode::Char(' '), none, lit(" ")),
+            (KeyCode::Char('c'), ctrl, named("C-c")),
+            (KeyCode::Char('A'), ctrl, named("C-a")),
+            (KeyCode::Char('x'), KeyModifiers::ALT, named("M-x")),
+            (KeyCode::Char('q'), ctrl | KeyModifiers::ALT, named("C-M-q")),
+            // The case carries Shift: Shift+A sends literal "A", not "S-a".
+            (KeyCode::Char('A'), KeyModifiers::SHIFT, lit("A")),
+            // Some terminals set SHIFT on BackTab too; tmux would reject "S-BTab".
+            (KeyCode::BackTab, KeyModifiers::SHIFT, named("BTab")),
+            (KeyCode::Esc, none, named("Escape")),
+            (KeyCode::Enter, none, named("Enter")),
+            (KeyCode::Tab, none, named("Tab")),
+            (KeyCode::BackTab, none, named("BTab")),
+            (KeyCode::Backspace, none, named("BSpace")),
+            (KeyCode::Delete, none, named("DC")),
+            (KeyCode::Insert, none, named("IC")),
+            (KeyCode::Home, none, named("Home")),
+            (KeyCode::End, none, named("End")),
+            (KeyCode::PageUp, none, named("PPage")),
+            (KeyCode::PageDown, none, named("NPage")),
+            (KeyCode::F(1), none, named("F1")),
+            (KeyCode::F(12), none, named("F12")),
+            (KeyCode::F(5), ctrl, named("C-F5")),
+        ];
+        for (code, mods, expected) in cases {
+            assert_eq!(translate(k_mod(code, mods)), expected, "{code:?}+{mods:?}");
+        }
     }
 
     #[test]
@@ -2925,13 +2832,6 @@ mod tests {
     }
 
     #[test]
-    fn bare_enter_still_named() {
-        // Plain Enter stays on the named-key path so it keeps delivering bare CR (submit).
-        // Guards against widening the strict-mod match.
-        assert_named(translate(k(KeyCode::Enter)), "Enter");
-    }
-
-    #[test]
     fn alt_enter_still_named_m_enter() {
         // Alt+Enter (terminals that pre-encode Shift+Enter as ESC+CR deliver Enter+ALT)
         // must keep producing the named `M-Enter`, which tmux expands to ESC+CR; the
@@ -2968,51 +2868,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shift_letter_stays_literal_uppercase() {
-        // The Char path drops Shift from the prefix because the case carries it:
-        // Shift+A sends literal "A", not "S-a".
-        assert_literal(
-            translate(k_mod(KeyCode::Char('A'), KeyModifiers::SHIFT)),
-            "A",
-        );
-    }
-
-    #[test]
-    fn back_tab_stays_btab_even_with_shift_modifier() {
-        // BackTab is Shift+Tab by keycode, and some terminals also set SHIFT on top; the
-        // result must not be "S-BTab", which tmux would reject.
-        assert_named(
-            translate(k_mod(KeyCode::BackTab, KeyModifiers::SHIFT)),
-            "BTab",
-        );
-    }
-
-    #[test]
-    fn navigation_named_keys() {
-        assert_named(translate(k(KeyCode::Esc)), "Escape");
-        assert_named(translate(k(KeyCode::Enter)), "Enter");
-        assert_named(translate(k(KeyCode::Tab)), "Tab");
-        assert_named(translate(k(KeyCode::BackTab)), "BTab");
-        assert_named(translate(k(KeyCode::Backspace)), "BSpace");
-        assert_named(translate(k(KeyCode::Delete)), "DC");
-        assert_named(translate(k(KeyCode::Insert)), "IC");
-        assert_named(translate(k(KeyCode::Home)), "Home");
-        assert_named(translate(k(KeyCode::End)), "End");
-        assert_named(translate(k(KeyCode::PageUp)), "PPage");
-        assert_named(translate(k(KeyCode::PageDown)), "NPage");
-    }
-
-    #[test]
-    fn function_keys() {
-        assert_named(translate(k(KeyCode::F(1))), "F1");
-        assert_named(translate(k(KeyCode::F(12))), "F12");
-        assert_named(
-            translate(k_mod(KeyCode::F(5), KeyModifiers::CONTROL)),
-            "C-F5",
-        );
-    }
-
     fn snd_lit(s: &str) -> WorkerMsg {
         WorkerMsg::Send(TmuxKey::Literal(s.into()))
     }
@@ -3023,76 +2878,6 @@ mod tests {
         WorkerMsg::Send(TmuxKey::HexBytes(bytes.to_vec()))
     }
 
-    #[test]
-    fn coalesce_empty_batch_is_empty() {
-        assert_eq!(coalesce(vec![]), vec![]);
-    }
-
-    #[test]
-    fn coalesce_single_literal_passes_through() {
-        assert_eq!(
-            coalesce(vec![snd_lit("a")]),
-            vec![TmuxAction::Literal("a".into())]
-        );
-    }
-
-    #[test]
-    fn coalesce_single_named_passes_through() {
-        assert_eq!(
-            coalesce(vec![snd_named("Escape")]),
-            vec![TmuxAction::Named("Escape".into())]
-        );
-    }
-
-    #[test]
-    fn coalesce_run_of_literals_merges_into_one_call() {
-        // The whole point of coalescing: typing "hello" should be a
-        // single tmux send-keys call, not five.
-        let out = coalesce(vec![
-            snd_lit("h"),
-            snd_lit("e"),
-            snd_lit("l"),
-            snd_lit("l"),
-            snd_lit("o"),
-        ]);
-        assert_eq!(out, vec![TmuxAction::Literal("hello".into())]);
-    }
-
-    #[test]
-    fn coalesce_named_breaks_the_run() {
-        // An Up arrow mid-typing must arrive in order, not after the surrounding text, so
-        // coalescing splits the run at the named key.
-        let out = coalesce(vec![
-            snd_lit("a"),
-            snd_lit("b"),
-            snd_named("Up"),
-            snd_lit("c"),
-            snd_lit("d"),
-        ]);
-        assert_eq!(
-            out,
-            vec![
-                TmuxAction::Literal("ab".into()),
-                TmuxAction::Named("Up".into()),
-                TmuxAction::Literal("cd".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn coalesce_back_to_back_named_keys() {
-        // Two named keys in a row (e.g., Up Up) stay as two separate
-        // dispatches; tmux send-keys won't accept them as one literal.
-        let out = coalesce(vec![snd_named("Up"), snd_named("Up")]);
-        assert_eq!(
-            out,
-            vec![
-                TmuxAction::Named("Up".into()),
-                TmuxAction::Named("Up".into()),
-            ]
-        );
-    }
-
     fn snd_named_repeat(name: &str, count: usize) -> WorkerMsg {
         WorkerMsg::Send(TmuxKey::NamedRepeat {
             name: name.into(),
@@ -3101,122 +2886,107 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_same_named_repeats_fold_counts() {
-        // Several wheel notches drained in one batch collapse to a single
-        // `send-keys -N <total>` fork.
-        let out = coalesce(vec![snd_named_repeat("Up", 3), snd_named_repeat("Up", 3)]);
-        assert_eq!(
-            out,
-            vec![TmuxAction::NamedRepeat {
-                name: "Up".into(),
-                count: 6,
-            }]
-        );
-    }
-
-    #[test]
-    fn coalesce_different_named_repeats_do_not_fold() {
-        // A direction change (Up then Down) must not merge; the counts and
-        // order have to survive so the agent scrolls each way in turn.
-        let out = coalesce(vec![snd_named_repeat("Up", 3), snd_named_repeat("Down", 3)]);
-        assert_eq!(
-            out,
-            vec![
-                TmuxAction::NamedRepeat {
-                    name: "Up".into(),
-                    count: 3,
-                },
-                TmuxAction::NamedRepeat {
-                    name: "Down".into(),
-                    count: 3,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn coalesce_named_repeat_flushes_literal_run() {
-        // Order must hold: literals typed before the wheel notch flush
-        // ahead of the arrow repeat, never after it.
-        let out = coalesce(vec![
-            snd_lit("ab"),
-            snd_named_repeat("Down", 3),
-            snd_lit("cd"),
-        ]);
-        assert_eq!(
-            out,
-            vec![
-                TmuxAction::Literal("ab".into()),
-                TmuxAction::NamedRepeat {
-                    name: "Down".into(),
-                    count: 3,
-                },
-                TmuxAction::Literal("cd".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn coalesce_trailing_literal_is_flushed() {
-        // Regression guard for the obvious off-by-one: the final
-        // unflushed literal run must escape the loop.
-        let out = coalesce(vec![snd_named("Tab"), snd_lit("x"), snd_lit("y")]);
-        assert_eq!(
-            out,
-            vec![
-                TmuxAction::Named("Tab".into()),
-                TmuxAction::Literal("xy".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn coalesce_hex_bytes_breaks_literal_run() {
-        // A HexBytes payload (bracketed-paste marker, raw CR, etc.)
-        // must dispatch in order, not after surrounding literals.
-        let out = coalesce(vec![snd_lit("a"), snd_hex(&[0x0d]), snd_lit("b")]);
-        assert_eq!(
-            out,
-            vec![
-                TmuxAction::Literal("a".into()),
-                TmuxAction::HexBytes(vec![0x0d]),
-                TmuxAction::Literal("b".into()),
-            ]
-        );
-    }
-
-    #[test]
-    fn coalesce_back_to_back_hex_bytes_merge() {
-        // Consecutive HexBytes payloads (a paste with a blank line sends two raw CRs)
-        // collapse into one `send-keys -H`. Named keys can't merge, since each is a separate
-        // key argument; raw bytes have no such constraint.
-        let out = coalesce(vec![snd_hex(&[0x0d]), snd_hex(&[0x0d])]);
-        assert_eq!(out, vec![TmuxAction::HexBytes(vec![0x0d, 0x0d])]);
-    }
-
-    #[test]
-    fn coalesce_preserves_order_when_hex_bytes_and_literals_interleave() {
-        // A caller could send `HexBytes` and `Literal` back to back, so coalesce must keep
-        // wire ordering: each `Literal` flushes the run and only adjacent `HexBytes` merge.
-        let start = vec![0x1b, b'[', b'2', b'0', b'0', b'~'];
-        let end = vec![0x1b, b'[', b'2', b'0', b'1', b'~'];
-        let out = coalesce(vec![
-            snd_hex(&start),
-            snd_lit("a"),
-            snd_hex(&[0x0d]),
-            snd_lit("b"),
-            snd_hex(&end),
-        ]);
-        assert_eq!(
-            out,
-            vec![
-                TmuxAction::HexBytes(start),
-                TmuxAction::Literal("a".into()),
-                TmuxAction::HexBytes(vec![0x0d]),
-                TmuxAction::Literal("b".into()),
-                TmuxAction::HexBytes(end),
-            ]
-        );
+    fn coalesce_merges_runs_and_preserves_order() {
+        let lit = |s: &str| TmuxAction::Literal(s.into());
+        let named = |s: &str| TmuxAction::Named(s.into());
+        let rep = |s: &str, count| TmuxAction::NamedRepeat {
+            name: s.into(),
+            count,
+        };
+        let hex = |bytes: &[u8]| TmuxAction::HexBytes(bytes.to_vec());
+        let paste_start = [0x1b, b'[', b'2', b'0', b'0', b'~'];
+        let paste_end = [0x1b, b'[', b'2', b'0', b'1', b'~'];
+        let cases: Vec<(&str, Vec<WorkerMsg>, Vec<TmuxAction>)> = vec![
+            ("empty", vec![], vec![]),
+            ("single literal", vec![snd_lit("a")], vec![lit("a")]),
+            (
+                "single named",
+                vec![snd_named("Escape")],
+                vec![named("Escape")],
+            ),
+            // Typing "hello" is one tmux send-keys call, not five.
+            (
+                "literal run",
+                vec![
+                    snd_lit("h"),
+                    snd_lit("e"),
+                    snd_lit("l"),
+                    snd_lit("l"),
+                    snd_lit("o"),
+                ],
+                vec![lit("hello")],
+            ),
+            // A named key mid-typing splits the run so it arrives in order.
+            (
+                "named splits run",
+                vec![
+                    snd_lit("a"),
+                    snd_lit("b"),
+                    snd_named("Up"),
+                    snd_lit("c"),
+                    snd_lit("d"),
+                ],
+                vec![lit("ab"), named("Up"), lit("cd")],
+            ),
+            // tmux send-keys won't accept two named keys as one literal.
+            (
+                "back-to-back named",
+                vec![snd_named("Up"), snd_named("Up")],
+                vec![named("Up"), named("Up")],
+            ),
+            // Wheel notches drained in one batch collapse to one `send-keys -N` fork.
+            (
+                "same repeats fold",
+                vec![snd_named_repeat("Up", 3), snd_named_repeat("Up", 3)],
+                vec![rep("Up", 6)],
+            ),
+            (
+                "direction change keeps both repeats",
+                vec![snd_named_repeat("Up", 3), snd_named_repeat("Down", 3)],
+                vec![rep("Up", 3), rep("Down", 3)],
+            ),
+            (
+                "repeat flushes literal run",
+                vec![snd_lit("ab"), snd_named_repeat("Down", 3), snd_lit("cd")],
+                vec![lit("ab"), rep("Down", 3), lit("cd")],
+            ),
+            (
+                "trailing literal flushed",
+                vec![snd_named("Tab"), snd_lit("x"), snd_lit("y")],
+                vec![named("Tab"), lit("xy")],
+            ),
+            (
+                "hex splits run",
+                vec![snd_lit("a"), snd_hex(&[0x0d]), snd_lit("b")],
+                vec![lit("a"), hex(&[0x0d]), lit("b")],
+            ),
+            // Raw bytes have no one-argument-per-key constraint, so adjacent payloads merge.
+            (
+                "adjacent hex merges",
+                vec![snd_hex(&[0x0d]), snd_hex(&[0x0d])],
+                vec![hex(&[0x0d, 0x0d])],
+            ),
+            (
+                "interleaved hex and literals keep wire order",
+                vec![
+                    snd_hex(&paste_start[..]),
+                    snd_lit("a"),
+                    snd_hex(&[0x0d]),
+                    snd_lit("b"),
+                    snd_hex(&paste_end[..]),
+                ],
+                vec![
+                    hex(&paste_start[..]),
+                    lit("a"),
+                    hex(&[0x0d]),
+                    lit("b"),
+                    hex(&paste_end[..]),
+                ],
+            ),
+        ];
+        for (name, input, expected) in cases {
+            assert_eq!(coalesce(input), expected, "{name}");
+        }
     }
 
     #[test]

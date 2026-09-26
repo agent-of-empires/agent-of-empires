@@ -707,6 +707,36 @@ mod tests {
     }
 
     #[test]
+    fn merge_joins_each_substrate_to_its_instance() {
+        let instances = vec![inst("abcd1234ef567890", "My Session")];
+        let tmux = vec![tmux_state("aoe_My_Session_abcd1234", Status::Running)];
+        let rows = merge_rows(&instances, &tmux, vec![], 2000, SubstrateFilter::All, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].id, "abcd1234ef567890",
+            "tmux joins on the id suffix"
+        );
+        assert_eq!(rows[0].title, "My Session");
+        assert_eq!(rows[0].state, "running");
+        assert_eq!(rows[0].age_secs, Some(1000));
+        assert!(!rows[0].is_orphan);
+
+        let instances = vec![inst("full-session-id-1234", "Structured")];
+        let acp = vec![acp_state("full-session-id-1234", "attached", 500)];
+        let rows = merge_rows(&instances, &[], acp, 2000, SubstrateFilter::All, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].substrate,
+            Substrate::Acp,
+            "acp joins on the full id"
+        );
+        assert_eq!(rows[0].title, "Structured");
+        assert_eq!(rows[0].pid, Some(7));
+        assert_eq!(rows[0].age_secs, Some(1000));
+        assert!(!rows[0].is_orphan);
+    }
+
+    #[test]
     fn normalize_tmux_state_maps_every_status() {
         assert_eq!(normalize_tmux_state(Status::Running), "running");
         assert_eq!(normalize_tmux_state(Status::Waiting), "waiting");
@@ -736,36 +766,6 @@ mod tests {
         assert_eq!(tmux_id_suffix("aoe_My_Session_abcd1234"), Some("abcd1234"));
         assert_eq!(tmux_id_suffix("aoe__abcd1234"), Some("abcd1234"));
         assert_eq!(tmux_id_suffix("nounderscore"), None);
-    }
-
-    #[test]
-    fn merge_joins_each_substrate_to_its_instance() {
-        let instances = vec![inst("abcd1234ef567890", "My Session")];
-        let tmux = vec![tmux_state("aoe_My_Session_abcd1234", Status::Running)];
-        let rows = merge_rows(&instances, &tmux, vec![], 2000, SubstrateFilter::All, false);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].id, "abcd1234ef567890",
-            "tmux joins on the id suffix"
-        );
-        assert_eq!(rows[0].title, "My Session");
-        assert_eq!(rows[0].state, "running");
-        assert_eq!(rows[0].age_secs, Some(1000));
-        assert!(!rows[0].is_orphan);
-
-        let instances = vec![inst("full-session-id-1234", "Structured")];
-        let acp = vec![acp_state("full-session-id-1234", "attached", 500)];
-        let rows = merge_rows(&instances, &[], acp, 2000, SubstrateFilter::All, false);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].substrate,
-            Substrate::Acp,
-            "acp joins on the full id"
-        );
-        assert_eq!(rows[0].title, "Structured");
-        assert_eq!(rows[0].pid, Some(7));
-        assert_eq!(rows[0].age_secs, Some(1000));
-        assert!(!rows[0].is_orphan);
     }
 
     #[test]
@@ -885,10 +885,7 @@ mod tests {
         ] {
             assert!(table.contains(cell), "table missing {cell}: {table}");
         }
-    }
 
-    #[test]
-    fn session_cell_truncates_long_titles_and_drops_orphan_titles() {
         let cell = session_cell(&row(
             "abcd1234ef567890",
             "A very long session title that exceeds the budget",
@@ -956,6 +953,15 @@ mod tests {
             table.contains(&model_cell),
             "absent model renders as a dash cell of width {COL_MODEL}: {table}"
         );
+
+        let cases = [
+            ("1.9.5+gabc123", false, "1.9.5+gabc123"),
+            ("1.9.4+gdeadbe", true, "1.9.4+gdeadbe (stale)"),
+            ("", true, "<legacy> (stale)"),
+        ];
+        for (version, stale, expected) in cases {
+            assert_eq!(render_build_cell(version, stale), expected, "{version:?}");
+        }
     }
 
     #[test]
@@ -1020,18 +1026,6 @@ mod tests {
         assert_eq!(obj["substrate"], "acp");
         assert!(obj["last_attached_at"].is_null());
         assert!(obj["detached_at"].is_null());
-    }
-
-    #[test]
-    fn render_build_cell_cases() {
-        let cases = [
-            ("1.9.5+gabc123", false, "1.9.5+gabc123"),
-            ("1.9.4+gdeadbe", true, "1.9.4+gdeadbe (stale)"),
-            ("", true, "<legacy> (stale)"),
-        ];
-        for (version, stale, expected) in cases {
-            assert_eq!(render_build_cell(version, stale), expected, "{version:?}");
-        }
     }
 
     #[test]

@@ -152,63 +152,26 @@ mod tests {
     }
 
     #[test]
-    fn digit_presets() {
-        let cases: &[(char, u32)] = &[
-            ('1', 60),
-            ('2', 120),
-            ('3', 180),
-            ('4', 240),
-            ('5', 300),
-            ('6', 360),
-            ('8', 1440),
-            ('0', 10080),
+    fn keys_pick_a_preset_or_cancel() {
+        let cases = [
+            ('1', DialogResult::Submit(60)),
+            ('2', DialogResult::Submit(120)),
+            ('3', DialogResult::Submit(180)),
+            ('4', DialogResult::Submit(240)),
+            ('5', DialogResult::Submit(300)),
+            ('6', DialogResult::Submit(360)),
+            ('8', DialogResult::Submit(1440)),
+            ('0', DialogResult::Submit(10080)),
+            ('7', DialogResult::Continue),
+            ('9', DialogResult::Continue),
+            ('x', DialogResult::Continue),
+            ('q', DialogResult::Cancel),
         ];
-        for (digit, minutes) in cases {
+        for (ch, want) in cases {
             let mut d = SnoozeDurationDialog::new("sess");
-            match d.handle_key(k(KeyCode::Char(*digit))) {
-                DialogResult::Submit(m) => assert_eq!(m, *minutes, "digit {digit}"),
-                _ => panic!("expected Submit({minutes}) for digit {digit}"),
-            }
+            assert_eq!(d.handle_key(k(KeyCode::Char(ch))), want, "{ch}");
         }
-    }
-
-    #[test]
-    fn esc_cancels() {
         let mut d = SnoozeDurationDialog::new("sess");
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Esc)),
-            DialogResult::Cancel
-        ));
-    }
-
-    #[test]
-    fn q_cancels() {
-        let mut d = SnoozeDurationDialog::new("sess");
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Char('q'))),
-            DialogResult::Cancel
-        ));
-    }
-
-    #[test]
-    fn unknown_continues() {
-        let mut d = SnoozeDurationDialog::new("sess");
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Char('x'))),
-            DialogResult::Continue
-        ));
-    }
-
-    #[test]
-    fn seven_and_nine_unbound() {
-        let mut d = SnoozeDurationDialog::new("sess");
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Char('7'))),
-            DialogResult::Continue
-        ));
-        assert!(matches!(
-            d.handle_key(k(KeyCode::Char('9'))),
-            DialogResult::Continue
-        ));
+        assert_eq!(d.handle_key(k(KeyCode::Esc)), DialogResult::Cancel);
     }
 }

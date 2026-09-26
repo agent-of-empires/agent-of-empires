@@ -7,120 +7,48 @@ use serial_test::parallel;
 
 use crate::harness::{app_dir_in, TuiTestHarness};
 
+/// Read-path commands refuse an unknown profile with guidance and never
+/// create its directory. The bare TUI (#148) must refuse before terminal
+/// setup and migrations, and `aoe add` before looking at any other argument.
 #[test]
 #[parallel]
-fn test_list_with_unknown_profile_fails_without_creating_dir() {
-    let h = TuiTestHarness::new("profile_lazy_list_unknown");
-
-    let out = h.run_cli(&["list", "-p", "ghost-profile"]);
-    assert!(
-        !out.status.success(),
-        "aoe list -p <unknown profile> should fail"
-    );
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("does not exist") && stderr.contains("aoe profile create"),
-        "expected 'does not exist' + 'aoe profile create' guidance, got: {stderr}"
-    );
-
+fn test_unknown_profile_is_refused_without_creating_dir() {
+    let h = TuiTestHarness::new("profile_lazy_unknown");
     let ghost_dir = app_dir_in(h.home_path())
         .join("profiles")
         .join("ghost-profile");
-    assert!(
-        !ghost_dir.exists(),
-        "merely referencing an unknown profile must not create {}",
-        ghost_dir.display()
-    );
-}
 
-#[test]
-#[parallel]
-fn test_profile_create_then_list_succeeds() {
-    let h = TuiTestHarness::new("profile_lazy_create_then_list");
+    for (args, expected) in [
+        (
+            vec!["list", "-p", "ghost-profile"],
+            &["does not exist", "aoe profile create"][..],
+        ),
+        (
+            vec!["-p", "ghost-profile"],
+            &["does not exist", "aoe profile create"][..],
+        ),
+        (
+            vec!["add", "/nonexistent/aoe-e2e-path", "-p", "ghost-profile"],
+            &["Profile 'ghost-profile' does not exist"][..],
+        ),
+    ] {
+        let stderr = h.run_cli_err(&args);
+        for needle in expected {
+            assert!(stderr.contains(needle), "{args:?}: {stderr}");
+        }
+        assert!(
+            !ghost_dir.exists(),
+            "{args:?} must not create {}",
+            ghost_dir.display()
+        );
+    }
 
-    let created = h.run_cli(&["profile", "create", "freshly-made"]);
-    assert!(
-        created.status.success(),
-        "aoe profile create should succeed: {}",
-        String::from_utf8_lossy(&created.stderr)
-    );
-
-    let profile_dir = app_dir_in(h.home_path())
+    h.run_cli_ok(&["profile", "create", "freshly-made"]);
+    assert!(app_dir_in(h.home_path())
         .join("profiles")
-        .join("freshly-made");
-    assert!(
-        profile_dir.exists(),
-        "expected {} to exist after `aoe profile create`",
-        profile_dir.display()
-    );
-
-    let listed = h.run_cli(&["list", "-p", "freshly-made"]);
-    assert!(
-        listed.status.success(),
-        "aoe list -p <existing profile> should succeed: {}",
-        String::from_utf8_lossy(&listed.stderr)
-    );
-}
-
-/// The bare TUI launches under `--profile` and would create the profile
-/// directory on open, so it is refused up front (#148). Without a TTY the
-/// refusal must still be the profile error, i.e. it fires before terminal
-/// setup and migrations, never after a stray directory has been minted.
-#[test]
-#[parallel]
-fn test_tui_with_unknown_profile_fails_without_creating_dir() {
-    let h = TuiTestHarness::new("profile_lazy_tui_unknown");
-
-    let out = h.run_cli(&["-p", "ghost-profile"]);
-    assert!(
-        !out.status.success(),
-        "aoe -p <unknown profile> should fail"
-    );
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("does not exist") && stderr.contains("aoe profile create"),
-        "expected 'does not exist' + 'aoe profile create' guidance, got: {stderr}"
-    );
-
-    let ghost_dir = app_dir_in(h.home_path())
-        .join("profiles")
-        .join("ghost-profile");
-    assert!(
-        !ghost_dir.exists(),
-        "launching the TUI under an unknown profile must not create {}",
-        ghost_dir.display()
-    );
-}
-
-/// `aoe add` files the new session under `--profile`; an unknown name is
-/// refused before any other argument is looked at.
-#[test]
-#[parallel]
-fn test_add_with_unknown_profile_fails_without_creating_dir() {
-    let h = TuiTestHarness::new("profile_lazy_add_unknown");
-
-    let out = h.run_cli(&["add", "/nonexistent/aoe-e2e-path", "-p", "ghost-profile"]);
-    assert!(
-        !out.status.success(),
-        "aoe add -p <unknown profile> should fail"
-    );
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("Profile 'ghost-profile' does not exist"),
-        "expected the unknown-profile error first, got: {stderr}"
-    );
-
-    let ghost_dir = app_dir_in(h.home_path())
-        .join("profiles")
-        .join("ghost-profile");
-    assert!(
-        !ghost_dir.exists(),
-        "`add -p <unknown>` must not create {}",
-        ghost_dir.display()
-    );
+        .join("freshly-made")
+        .exists());
+    h.run_cli_ok(&["list", "-p", "freshly-made"]);
 }
 
 /// Commands that never consume `--profile` must not be blocked by an unknown

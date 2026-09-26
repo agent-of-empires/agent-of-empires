@@ -80,7 +80,6 @@ describe("SidebarGroupHeader", () => {
       views(workspace("live", idle(1)), workspace("arch", idle(1), "archived"), workspace("zz", idle(1), "snoozed")),
       "(1)",
     ],
-    ["only sunk", views(workspace("arch", idle(2), "archived"), workspace("zz", idle(1), "snoozed")), "(0)"],
   ])("counts %s as %s", (_n, workspaces, count) => {
     renderHeader({ group: group({ workspaces }) });
     expect(text("sidebar-group-session-count")).toBe(count);

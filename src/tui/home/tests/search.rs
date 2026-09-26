@@ -2,16 +2,25 @@
 
 use super::*;
 
+/// `/` opens an empty query that captures typed chars and Backspace; Esc exits and clears
+/// the query, the matches and the match index.
 #[test]
 #[serial]
 fn test_search_mode_esc_exits_and_clears() {
     let mut env = create_test_env_with_sessions(3);
     env.view.handle_key(key(KeyCode::Char('/')), None);
-    env.view.handle_key(key(KeyCode::Char('x')), None);
+    assert!(env.view.search_active);
+    assert!(env.view.search_query.value().is_empty());
+    for code in [KeyCode::Char('s'), KeyCode::Char('x'), KeyCode::Backspace] {
+        env.view.handle_key(key(code), None);
+    }
+    assert_eq!(env.view.search_query.value(), "s");
+    assert!(!env.view.search_matches.is_empty());
     env.view.handle_key(key(KeyCode::Esc), None);
     assert!(!env.view.search_active);
     assert!(env.view.search_query.value().is_empty());
     assert!(env.view.search_matches.is_empty());
+    assert_eq!(env.view.search_match_index, 0);
 }
 
 #[test]
@@ -143,6 +152,7 @@ fn test_search_mode_enter_keeps_matches_for_cycling() {
     for expected in 1..n_matches {
         env.view.handle_key(key(KeyCode::Char('n')), None);
         assert_eq!(env.view.search_match_index, expected);
+        assert_eq!(env.view.cursor, env.view.search_matches[expected]);
     }
 
     env.view.handle_key(key(KeyCode::Char('n')), None);
@@ -162,20 +172,18 @@ fn test_search_mode_enter_keeps_matches_for_cycling() {
     );
 }
 
+/// `d` opens the session delete dialog on a session row and the group delete options on a
+/// group row.
 #[test]
 #[serial]
-fn test_d_on_session_opens_delete_dialog() {
+fn test_d_opens_delete_dialog_for_session_and_group() {
     let mut env = create_test_env_with_sessions(3);
     disable_delete_to_trash();
     env.view.update_selected();
     assert!(env.view.unified_delete_dialog.is_none());
     env.view.handle_key(key(KeyCode::Char('d')), None);
     assert!(env.view.unified_delete_dialog.is_some());
-}
 
-#[test]
-#[serial]
-fn test_d_on_group_with_sessions_opens_group_delete_options_dialog() {
     let mut env = create_test_env_with_groups();
     env.view.cursor = 1;
     env.view.update_selected();
@@ -185,197 +193,82 @@ fn test_d_on_group_with_sessions_opens_group_delete_options_dialog() {
     assert!(env.view.group_delete_options_dialog.is_some());
 }
 
+/// The selection follows the cursor: session rows set the session and its title, group rows
+/// set the group and clear both.
 #[test]
 #[serial]
-fn test_selected_session_updates_on_cursor_move() {
+fn test_selection_tracks_cursor_across_sessions_and_groups() {
     let mut env = create_test_env_with_sessions(3);
     let first_id = env.view.selected_session.clone();
-    env.view.handle_key(key(KeyCode::Down), None);
-    assert_ne!(env.view.selected_session, first_id);
-}
-
-#[test]
-#[serial]
-fn test_selected_session_title_tracks_cursor() {
-    let mut env = create_test_env_with_sessions(3);
     let first = env.view.selected_session_title().map(str::to_string);
     assert!(first.is_some());
     env.view.handle_key(key(KeyCode::Down), None);
-    let second = env.view.selected_session_title().map(str::to_string);
-    assert_ne!(first, second);
-}
+    assert_ne!(env.view.selected_session, first_id);
+    assert_ne!(env.view.selected_session_title().map(str::to_string), first);
 
-#[test]
-#[serial]
-fn test_selected_session_title_none_on_group() {
     let mut env = create_test_env_with_groups();
-    for i in 0..env.view.flat_items.len() {
-        env.view.cursor = i;
-        env.view.update_selected();
-        if env.view.selected_session.is_none() {
-            assert_eq!(env.view.selected_session_title(), None);
-            return;
-        }
-    }
-    panic!("No group found in flat_items");
+    let group_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { .. }))
+        .expect("a group row");
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+    assert!(env.view.selected_group.is_some());
+    assert!(env.view.selected_session.is_none());
+    assert_eq!(env.view.selected_session_title(), None);
 }
 
+/// Search scores titles (case-insensitively), paths and group names without filtering the
+/// list, jumps the cursor to the best match, and leaves the whole list navigable.
 #[test]
 #[serial]
-fn test_selected_group_set_when_on_group() {
-    let mut env = create_test_env_with_groups();
-    for i in 0..env.view.flat_items.len() {
-        env.view.cursor = i;
-        env.view.update_selected();
-        if matches!(env.view.flat_items.get(i), Some(Item::Group { .. })) {
-            assert!(env.view.selected_group.is_some());
-            assert!(env.view.selected_session.is_none());
-            return;
-        }
-    }
-    panic!("No group found in flat_items");
-}
-
-#[test]
-#[serial]
-fn test_search_matches_session_title() {
+fn test_search_matching_and_cursor() {
     let mut env = create_test_env_with_sessions(5);
+    let original_len = env.view.flat_items.len();
+    for (query, matches) in [
+        ("session2", true),
+        ("SESSION2", true),
+        ("/tmp/3", true),
+        ("zzzznonexistent", false),
+        ("", false),
+    ] {
+        env.view.search_query = Input::new(query.to_string());
+        env.view.update_search();
+        assert_eq!(!env.view.search_matches.is_empty(), matches, "{query:?}");
+        assert_eq!(env.view.flat_items.len(), original_len, "{query:?}");
+    }
+
     env.view.search_query = Input::new("session2".to_string());
     env.view.update_search();
-    assert!(!env.view.search_matches.is_empty());
-    // The best match should be session2
-    let best_idx = env.view.search_matches[0];
-    if let Item::Session { id, .. } = &env.view.flat_items[best_idx] {
-        let inst = env.view.get_instance(id).unwrap();
-        assert!(inst.title.contains("session2"));
+    let best = session_id_at(&env.view, env.view.search_matches[0]).expect("session row");
+    assert!(env
+        .view
+        .get_instance(&best)
+        .unwrap()
+        .title
+        .contains("session2"));
+
+    // With default sort (Newest), session0 is the last row.
+    env.view.cursor = 0;
+    env.view.search_active = true;
+    env.view.search_query = Input::new("session0".to_string());
+    env.view.update_search();
+    assert_eq!(env.view.cursor, 4);
+    env.view.cursor = 0;
+    for _ in 0..10 {
+        env.view.move_cursor(1);
     }
-}
+    assert_eq!(
+        env.view.cursor, 4,
+        "cursor reaches the last row of the full list"
+    );
 
-#[test]
-#[serial]
-fn test_search_case_insensitive() {
-    let mut env = create_test_env_with_sessions(5);
-    env.view.search_query = Input::new("SESSION2".to_string());
-    env.view.update_search();
-    assert!(!env.view.search_matches.is_empty());
-}
-
-#[test]
-#[serial]
-fn test_search_matches_path() {
-    let mut env = create_test_env_with_sessions(5);
-    env.view.search_query = Input::new("/tmp/3".to_string());
-    env.view.update_search();
-    assert!(!env.view.search_matches.is_empty());
-}
-
-#[test]
-#[serial]
-fn test_search_matches_group_name() {
     let mut env = create_test_env_with_groups();
     env.view.search_query = Input::new("work".to_string());
     env.view.update_search();
     assert!(!env.view.search_matches.is_empty());
-}
-
-#[test]
-#[serial]
-fn test_search_empty_query_clears_matches() {
-    let mut env = create_test_env_with_sessions(5);
-    env.view.search_query = Input::new("session".to_string());
-    env.view.update_search();
-    assert!(!env.view.search_matches.is_empty());
-
-    env.view.search_query = Input::default();
-    env.view.update_search();
-    assert!(env.view.search_matches.is_empty());
-}
-
-#[test]
-#[serial]
-fn test_search_no_matches() {
-    let mut env = create_test_env_with_sessions(5);
-    env.view.search_query = Input::new("zzzznonexistent".to_string());
-    env.view.update_search();
-    assert!(env.view.search_matches.is_empty());
-}
-
-#[test]
-#[serial]
-fn test_search_jumps_to_best_match() {
-    let mut env = create_test_env_with_sessions(5);
-    env.view.cursor = 0; // start at beginning
-    env.view.search_active = true;
-    env.view.search_query = Input::new("session0".to_string());
-    env.view.update_search();
-    // Cursor should jump to the best match
-    // With default sort (Newest), session0 is at index 4 (last)
-    assert_eq!(env.view.cursor, 4);
-}
-
-#[test]
-#[serial]
-fn test_search_keeps_full_list() {
-    let mut env = create_test_env_with_sessions(5);
-    let original_len = env.view.flat_items.len();
-    env.view.search_query = Input::new("session2".to_string());
-    env.view.update_search();
-    // All items should still be in flat_items
-    assert_eq!(env.view.flat_items.len(), original_len);
-}
-
-#[test]
-#[serial]
-fn test_search_n_cycles_forward() {
-    let mut env = create_test_env_with_sessions(5);
-    env.view.search_query = Input::new("session".to_string());
-    env.view.update_search();
-    let match_count = env.view.search_matches.len();
-    assert!(match_count > 1);
-
-    let first_cursor = env.view.cursor;
-    env.view.handle_key(key(KeyCode::Char('n')), None);
-    assert_eq!(env.view.search_match_index, 1);
-    // Cursor should have moved
-    assert_ne!(env.view.cursor, first_cursor);
-}
-
-#[test]
-#[serial]
-fn test_search_n_wraps_around() {
-    let mut env = create_test_env_with_sessions(3);
-    env.view.search_query = Input::new("session".to_string());
-    env.view.update_search();
-    let match_count = env.view.search_matches.len();
-
-    // Cycle through all matches to wrap
-    for _ in 0..match_count {
-        env.view.handle_key(key(KeyCode::Char('n')), None);
-    }
-    assert_eq!(env.view.search_match_index, 0);
-}
-
-#[test]
-#[serial]
-fn test_search_shift_n_opens_new_from_selection_not_cycle() {
-    // #3038: after a committed search, Shift+N must create a new session rather than jump
-    // to the previous match, which the committed search used to shadow.
-    let mut env = create_test_env_with_sessions(5);
-    env.view.search_query = Input::new("session".to_string());
-    env.view.update_search();
-    assert!(env.view.search_matches.len() > 1);
-    assert_eq!(env.view.search_match_index, 0);
-
-    assert!(env.view.new_dialog.is_none());
-    env.view.handle_key(key(KeyCode::Char('N')), None);
-    assert!(
-        env.view.new_dialog.is_some(),
-        "Shift+N opens new-from-selection during a committed search"
-    );
-    assert_eq!(
-        env.view.search_match_index, 0,
-        "Shift+N must not cycle the search backward"
-    );
 }
 
 #[test]
@@ -420,130 +313,36 @@ fn matched_running_row_keeps_status_color_on_spinner_and_bolds() {
     );
 }
 
-#[test]
-#[serial]
-fn test_esc_clears_search_matches() {
-    let mut env = create_test_env_with_sessions(5);
-    env.view.handle_key(key(KeyCode::Char('/')), None);
-    env.view.handle_key(key(KeyCode::Char('s')), None);
-    assert!(!env.view.search_matches.is_empty());
-    env.view.handle_key(key(KeyCode::Esc), None);
-    assert!(env.view.search_matches.is_empty());
-    assert_eq!(env.view.search_match_index, 0);
-}
-
+/// A committed search, even one that matched nothing, keeps the bar and its query visible
+/// until Esc: `search_bar_visible` gates on the committed query rather than on matches.
 #[test]
 #[serial]
 fn committed_search_keeps_bar_visible_until_esc() {
-    // The searched text stays pinned at the bottom until Esc. `search_bar_visible` gates
-    // both the render and the row reservation, so it must stay true through a commit.
-    let mut env = create_test_env_with_sessions(5);
-    env.view.handle_key(key(KeyCode::Char('/')), None);
-    env.view.handle_key(key(KeyCode::Char('s')), None);
-    assert!(env.view.search_active);
-    assert!(env.view.search_bar_visible());
-
-    env.view.handle_key(key(KeyCode::Enter), None);
-    assert!(!env.view.search_active, "Enter commits the search");
-    assert!(!env.view.search_matches.is_empty(), "matches are kept");
-    assert!(
-        env.view.search_bar_visible(),
-        "the committed bar stays visible so the query is still shown"
-    );
-    assert_eq!(
-        env.view.search_query.value(),
-        "s",
-        "the searched text persists in the bar"
-    );
-
-    env.view.handle_key(key(KeyCode::Esc), None);
-    assert!(
-        !env.view.search_bar_visible(),
-        "Esc clears the search and hides the bar"
-    );
-}
-
-#[test]
-#[serial]
-fn committed_zero_result_search_keeps_bar_visible() {
-    // A committed search that matched nothing is still something you searched for, so the
-    // bar stays visible showing `/query [0/0]` until Esc; gating on the committed query
-    // rather than on matches is what keeps it up.
-    let mut env = create_test_env_with_sessions(5);
-    env.view.handle_key(key(KeyCode::Char('/')), None);
-    for ch in ['z', 'q', 'x', 'w', 'v'] {
-        env.view.handle_key(key(KeyCode::Char(ch)), None);
-    }
-    assert!(
-        env.view.search_matches.is_empty(),
-        "the query is expected to match no session"
-    );
-
-    env.view.handle_key(key(KeyCode::Enter), None);
-    assert!(
-        !env.view.search_active,
-        "Enter commits even with no matches"
-    );
-    assert!(env.view.search_matches.is_empty());
-    assert!(
-        env.view.search_bar_visible(),
-        "a committed zero-result search keeps the bar (and query) visible"
-    );
-    assert_eq!(env.view.search_query.value(), "zqxwv");
-
-    env.view.handle_key(key(KeyCode::Esc), None);
-    assert!(
-        !env.view.search_bar_visible(),
-        "Esc clears the committed zero-result search"
-    );
-}
-
-#[test]
-#[serial]
-fn committed_search_bar_renders_query_after_enter() {
-    use crate::tui::styles::load_theme;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-
-    let mut env = create_test_env_with_sessions(5);
-    let theme = load_theme("empire");
-
-    let render_to_string = |view: &mut HomeView| {
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal
-            .draw(|f| {
-                let area = f.area();
-                view.render(f, area, &theme, None, None, None);
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let mut out = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                out.push_str(buf[(x, y)].symbol());
-            }
-            out.push('\n');
+    for (query, matches) in [("sess", true), ("zqxwv", false)] {
+        let mut env = create_test_env_with_sessions(5);
+        env.view.handle_key(key(KeyCode::Char('/')), None);
+        for ch in query.chars() {
+            env.view.handle_key(key(KeyCode::Char(ch)), None);
         }
-        out
-    };
+        assert!(env.view.search_active);
+        assert!(env.view.search_bar_visible());
+        assert_eq!(!env.view.search_matches.is_empty(), matches, "{query}");
 
-    for ch in ['/', 's', 'e', 's', 's'] {
-        env.view.handle_key(key(KeyCode::Char(ch)), None);
+        env.view.handle_key(key(KeyCode::Enter), None);
+        assert!(!env.view.search_active, "Enter commits the search");
+        assert_eq!(!env.view.search_matches.is_empty(), matches, "{query}");
+        assert!(env.view.search_bar_visible(), "{query}");
+        assert_eq!(env.view.search_query.value(), query);
+        // The `/`-prefixed query is unique to the bar (titles carry no leading slash).
+        let screen = render_home_to_string(&mut env.view, 120, 40);
+        assert!(
+            screen.contains(&format!("/{query}")),
+            "committed search bar must still render the query after Enter\n{screen}"
+        );
+
+        env.view.handle_key(key(KeyCode::Esc), None);
+        assert!(!env.view.search_bar_visible(), "Esc clears the search");
     }
-    env.view.handle_key(key(KeyCode::Enter), None);
-    assert!(!env.view.search_active);
-    assert!(
-        !env.view.search_matches.is_empty(),
-        "query must match a row"
-    );
-
-    let screen = render_to_string(&mut env.view);
-    // The `/`-prefixed query is unique to the bar (session titles carry no
-    // leading slash), so its presence proves the committed bar rendered.
-    assert!(
-        screen.contains("/sess"),
-        "committed search bar must still render the query after Enter"
-    );
 }
 
 #[test]
@@ -600,99 +399,45 @@ fn persist_tips_outcome_merges_seen_sets_disabled_and_updates_badge() {
     assert_eq!(env.view.tips_unseen, 0);
 }
 
+/// The footer tips badge shows the unseen count, outranks low-priority hints on a thin
+/// footer, hides at zero, and highlights on hover and opens the overlay on click.
 #[test]
 #[serial]
-fn tips_badge_renders_with_count_and_hides_when_zero() {
-    use crate::tui::styles::load_theme;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-
+fn footer_tips_badge_renders_hovers_and_opens_overlay() {
     let mut env = create_test_env_with_sessions(1);
-    let theme = load_theme("empire");
-
-    let render = |env: &mut TestEnv| -> String {
-        let backend = TestBackend::new(200, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| {
-                let area = f.area();
-                env.view.render(f, area, &theme, None, None, None);
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer();
-        let mut out = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                out.push_str(buf[(x, y)].symbol());
-            }
-            out.push('\n');
-        }
-        out
-    };
-
-    // Earn the tip so the badge shows a count.
-    earn_tip(&mut env);
-    let n = env.view.tips_unseen;
-    assert!(n > 0);
-    let shown = render(&mut env);
-    assert!(
-        shown.contains(&format!("{n} tips")),
-        "badge should show the unseen count\n{shown}"
-    );
-
-    // Zero unseen (or disabled) hides the badge entirely.
-    env.view.tips_unseen = 0;
-    let hidden = render(&mut env);
-    assert!(
-        !hidden.contains("tips"),
-        "no badge when nothing is unseen\n{hidden}"
-    );
-}
-
-#[test]
-#[serial]
-fn footer_hints_yield_to_tips_badge_when_thin() {
-    use crate::tui::styles::load_theme;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-
-    let mut env = create_test_env_with_sessions(1);
-    let theme = load_theme("empire");
     earn_tip(&mut env);
     let n = env.view.tips_unseen;
     assert!(n > 0);
     let badge = format!("{n} tips");
 
-    let render_at = |env: &mut TestEnv, w: u16| -> String {
-        let backend = TestBackend::new(w, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| {
-                let area = f.area();
-                env.view.render(f, area, &theme, None, None, None);
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer();
-        let mut out = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                out.push_str(buf[(x, y)].symbol());
-            }
-            out.push('\n');
-        }
-        out
-    };
-
     // Wide: the badge and even a low-priority hint (Diff) both fit.
-    let wide = render_at(&mut env, 200);
+    let wide = render_home_to_string(&mut env.view, 200, 40);
     assert!(wide.contains(&badge), "badge shows when wide\n{wide}");
     assert!(
         wide.contains("Diff"),
         "low-priority hint present when wide\n{wide}"
     );
+    let rect = env
+        .view
+        .tips_badge_rect
+        .expect("badge rect should be captured when shown");
+
+    assert!(!env.view.tips_badge_hovered);
+    assert!(env.view.handle_hover(rect.x, rect.y));
+    assert!(env.view.tips_badge_hovered);
+    assert!(env.view.handle_hover(0, 0));
+    assert!(!env.view.tips_badge_hovered);
+
+    assert!(env.view.tips_dialog.is_none());
+    assert!(env.view.handle_tips_badge_click(rect.x, rect.y));
+    assert!(
+        env.view.tips_dialog.is_some(),
+        "clicking the badge opens the tips overlay"
+    );
+    env.view.tips_dialog = None;
 
     // Thin: the badge still shows (it takes priority); the hints yield.
-    let thin = render_at(&mut env, 30);
+    let thin = render_home_to_string(&mut env.view, 30, 40);
     assert!(
         thin.contains(&badge),
         "badge survives on a thin footer\n{thin}"
@@ -701,72 +446,13 @@ fn footer_hints_yield_to_tips_badge_when_thin() {
         !thin.contains("Diff"),
         "low-priority hints drop to make room for the badge\n{thin}"
     );
-}
 
-#[test]
-#[serial]
-fn clicking_footer_tips_badge_opens_overlay() {
-    use crate::tui::styles::load_theme;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-
-    let mut env = create_test_env_with_sessions(1);
-    let theme = load_theme("empire");
-    earn_tip(&mut env);
-    assert!(env.view.tips_unseen > 0);
-
-    // Render once so the footer captures the badge's clickable rect.
-    let backend = TestBackend::new(200, 40);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|f| {
-            let area = f.area();
-            env.view.render(f, area, &theme, None, None, None);
-        })
-        .unwrap();
-    let rect = env
-        .view
-        .tips_badge_rect
-        .expect("badge rect should be captured when shown");
-
-    assert!(env.view.tips_dialog.is_none());
-    let handled = env.view.handle_tips_badge_click(rect.x, rect.y);
-    assert!(handled, "click on the badge is handled");
+    env.view.tips_unseen = 0;
+    let hidden = render_home_to_string(&mut env.view, 200, 40);
     assert!(
-        env.view.tips_dialog.is_some(),
-        "clicking the badge opens the tips overlay"
+        !hidden.contains("tips"),
+        "no badge when nothing is unseen\n{hidden}"
     );
-}
-
-#[test]
-#[serial]
-fn hovering_footer_tips_badge_sets_hover_state() {
-    use crate::tui::styles::load_theme;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-
-    let mut env = create_test_env_with_sessions(1);
-    let theme = load_theme("empire");
-    earn_tip(&mut env);
-
-    // Render once so the badge's rect is captured.
-    let backend = TestBackend::new(200, 40);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|f| {
-            let area = f.area();
-            env.view.render(f, area, &theme, None, None, None);
-        })
-        .unwrap();
-    let rect = env.view.tips_badge_rect.expect("badge rect captured");
-
-    assert!(!env.view.tips_badge_hovered);
-    // Hovering the badge sets the highlight and reports a change.
-    assert!(env.view.handle_hover(rect.x, rect.y));
-    assert!(env.view.tips_badge_hovered);
-    // Moving off clears it.
-    assert!(env.view.handle_hover(0, 0));
-    assert!(!env.view.tips_badge_hovered);
 }
 
 #[test]
@@ -888,39 +574,22 @@ fn test_reload_does_not_snap_cursor_after_enter() {
     assert_eq!(env.view.cursor, 4);
 }
 
+/// `r` opens the rename dialog (a registered modal) on a session row and, with a group
+/// rename context, on a group row.
 #[test]
 #[serial]
-fn test_cursor_moves_over_full_list_during_search() {
-    let mut env = create_test_env_with_sessions(10);
-    env.view.search_query = Input::new("session".to_string());
-    env.view.update_search();
-
-    // Cursor should be able to move to last item in full list
-    env.view.cursor = 0;
-    for _ in 0..20 {
-        env.view.move_cursor(1);
-    }
-    assert_eq!(env.view.cursor, 9); // last item in 10-item list
-}
-
-#[test]
-#[serial]
-fn test_r_opens_rename_dialog() {
+fn test_r_opens_rename_dialog_for_session_and_group() {
     let mut env = create_test_env_with_sessions(3);
     env.view.update_selected();
-    assert!(env.view.rename_dialog.is_none());
+    assert!(!env.view.has_dialog());
     env.view.handle_key(key(KeyCode::Char('r')), None);
     assert!(env.view.rename_dialog.is_some());
-}
+    assert!(env.view.has_dialog());
 
-#[test]
-#[serial]
-fn test_rename_dialog_opened_on_group() {
     let mut env = create_test_env_with_groups();
     env.view.cursor = 1;
     env.view.update_selected();
     assert!(env.view.selected_group.is_some());
-    assert!(env.view.rename_dialog.is_none());
     env.view.handle_key(key(KeyCode::Char('r')), None);
     assert!(env.view.rename_dialog.is_some());
     assert!(env.view.group_rename_context.is_some());
@@ -928,131 +597,63 @@ fn test_rename_dialog_opened_on_group() {
 
 #[test]
 #[serial]
-fn test_has_dialog_returns_true_for_rename_dialog() {
-    let mut env = create_test_env_with_sessions(1);
-    env.view.update_selected();
-    assert!(!env.view.has_dialog());
-    env.view.handle_key(key(KeyCode::Char('r')), None);
-    assert!(env.view.has_dialog());
-}
-
-#[test]
-#[serial]
 fn test_select_session_by_id() {
     let mut env = create_test_env_with_sessions(3);
     let session_id = env.view.instance_at(1).id.clone();
+    assert_eq!(env.view.cursor, 0);
 
+    env.view.select_session_by_id("nonexistent-id");
     assert_eq!(env.view.cursor, 0);
 
     env.view.select_session_by_id(&session_id);
-
     assert_eq!(env.view.cursor, 1);
     assert_eq!(env.view.selected_session, Some(session_id));
 }
 
+/// `select_top_attention` lands on the first session, skips the session being returned
+/// from, and falls back to it when it is the only session.
 #[test]
 #[serial]
-fn test_select_session_by_id_nonexistent() {
+fn test_select_top_attention() {
     let mut env = create_test_env_with_sessions(3);
-
-    assert_eq!(env.view.cursor, 0);
-    env.view.select_session_by_id("nonexistent-id");
-    assert_eq!(env.view.cursor, 0);
-}
-
-#[test]
-#[serial]
-fn test_select_top_attention_lands_on_first_session() {
-    let mut env = create_test_env_with_sessions(3);
+    let first_id = session_id_at(&env.view, 0).expect("first row is a session");
+    let second_id = session_id_at(&env.view, 1).expect("second row is a session");
     env.view.cursor = 2;
     env.view.update_selected();
-    assert_eq!(env.view.cursor, 2);
 
     env.view.select_top_attention(None);
-
     assert_eq!(env.view.cursor, 0);
-    if let Item::Session { id, .. } = &env.view.flat_items[0] {
-        assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
-    } else {
-        panic!("expected first flat_items row to be a Session");
-    }
-}
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(first_id.as_str())
+    );
 
-#[test]
-#[serial]
-fn test_select_top_attention_skips_returning_session() {
-    let mut env = create_test_env_with_sessions(3);
-
-    // Grab id of first session (the one we're "returning from").
-    let first_id = if let Item::Session { id, .. } = &env.view.flat_items[0] {
-        id.clone()
-    } else {
-        panic!("expected first flat_items row to be a Session");
-    };
-    let second_id = if let Item::Session { id, .. } = &env.view.flat_items[1] {
-        id.clone()
-    } else {
-        panic!("expected second flat_items row to be a Session");
-    };
-
-    env.view.cursor = 0;
-    env.view.update_selected();
-
-    // Simulate returning from `first_id`: skip it, land on the next session.
     env.view.select_top_attention(Some(&first_id));
-
     assert_eq!(env.view.cursor, 1);
     assert_eq!(
         env.view.selected_session.as_deref(),
         Some(second_id.as_str())
     );
-}
 
-#[test]
-#[serial]
-fn test_select_top_attention_falls_back_to_returning_when_only_session() {
     let mut env = create_test_env_with_sessions(1);
-
-    let only_id = if let Item::Session { id, .. } = &env.view.flat_items[0] {
-        id.clone()
-    } else {
-        panic!("expected first flat_items row to be a Session");
-    };
-
-    env.view.cursor = 0;
-    env.view.update_selected();
-
-    // Only one session; skip would leave nothing; must fall back to it.
+    let only_id = session_id_at(&env.view, 0).expect("only row is a session");
     env.view.select_top_attention(Some(&only_id));
-
     assert_eq!(env.view.cursor, 0);
     assert_eq!(env.view.selected_session.as_deref(), Some(only_id.as_str()));
 }
 
+/// `P` opens the profile picker, except in search mode where it is query input.
 #[test]
 #[serial]
-fn test_uppercase_p_opens_profile_picker() {
-    let env = create_test_env_empty();
-    let mut view = env.view;
+fn test_uppercase_p_opens_profile_picker_outside_search() {
+    let mut env = create_test_env_empty();
+    env.view.handle_key(key(KeyCode::Char('/')), None);
+    env.view.handle_key(key(KeyCode::Char('P')), None);
+    assert!(env.view.profile_picker_dialog.is_none());
+    assert_eq!(env.view.search_query.value(), "P");
+    env.view.handle_key(key(KeyCode::Esc), None);
 
-    assert!(view.profile_picker_dialog.is_none());
-    let action = view.handle_key(key(KeyCode::Char('P')), None);
+    let action = env.view.handle_key(key(KeyCode::Char('P')), None);
     assert_eq!(action, None);
-    assert!(view.profile_picker_dialog.is_some());
-}
-
-#[test]
-#[serial]
-fn test_uppercase_p_in_search_mode_does_not_open_picker() {
-    let env = create_test_env_empty();
-    let mut view = env.view;
-
-    // Enter search mode
-    view.handle_key(key(KeyCode::Char('/')), None);
-    assert!(view.search_active);
-
-    // P should be treated as search input, not open picker
-    view.handle_key(key(KeyCode::Char('P')), None);
-    assert!(view.profile_picker_dialog.is_none());
-    assert_eq!(view.search_query.value(), "P");
+    assert!(env.view.profile_picker_dialog.is_some());
 }

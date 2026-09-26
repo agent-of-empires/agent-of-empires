@@ -119,43 +119,32 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn parse_request_round_trip() {
+    fn parse_request_skips_blanks_and_defers_envelope_errors() {
         let req = parse_request(r#"{"jsonrpc":"2.0","id":7,"method":"sessions.list","params":{}}"#)
             .unwrap()
             .unwrap();
         assert_eq!(req.validate_envelope().unwrap(), "sessions.list");
         assert_eq!(req.id, Some(json!(7)));
         assert!(!req.is_notification());
-    }
 
-    #[test]
-    fn notification_has_no_id() {
         let req = parse_request(r#"{"jsonrpc":"2.0","method":"events.publish","params":{}}"#)
             .unwrap()
             .unwrap();
         assert!(req.is_notification());
         assert_eq!(req.validate_envelope().unwrap(), "events.publish");
-    }
 
-    #[test]
-    fn a_blank_line_is_skipped_and_a_malformed_one_is_an_error() {
         assert!(parse_request("   ").unwrap().is_none());
         assert!(parse_request("").unwrap().is_none());
         assert!(parse_request("{not json").is_err());
-    }
 
-    #[test]
-    fn well_formed_json_with_bad_envelope_is_not_a_parse_error() {
-        let req = parse_request(r#"{"method":"sessions.list"}"#)
-            .unwrap()
-            .unwrap();
-        assert!(req.validate_envelope().is_err());
-        let req = parse_request(r#"{"jsonrpc":"1.0","method":"sessions.list"}"#)
-            .unwrap()
-            .unwrap();
-        assert!(req.validate_envelope().is_err());
-        let req = parse_request(r#"{"jsonrpc":"2.0"}"#).unwrap().unwrap();
-        assert!(req.validate_envelope().is_err());
+        for line in [
+            r#"{"method":"sessions.list"}"#,
+            r#"{"jsonrpc":"1.0","method":"sessions.list"}"#,
+            r#"{"jsonrpc":"2.0"}"#,
+        ] {
+            let req = parse_request(line).unwrap().unwrap();
+            assert!(req.validate_envelope().is_err(), "{line}");
+        }
     }
 
     #[test]

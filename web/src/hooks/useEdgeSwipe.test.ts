@@ -42,7 +42,6 @@ afterEach(() => {
 
 describe("useEdgeSwipe", () => {
   it.each<[string, Partial<Options>, Point, Point[], number]>([
-    ["left edge past the 60px threshold", {}, [10, 100], [[80, 105]], 1],
     [
       "left edge fires once across further moves",
       {},

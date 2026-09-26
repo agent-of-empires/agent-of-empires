@@ -915,9 +915,9 @@
     },
     {
       "id": "wizard.worktree-title-derived-branch",
-      "kind": "mocked-playwright",
+      "kind": "vitest",
       "risk": "medium",
-      "specs": ["tests/wizard.spec.ts"],
+      "specs": ["src/components/session-wizard/wizardReducer.test.ts"],
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/sessionNames.ts",
@@ -950,9 +950,12 @@
     },
     {
       "id": "wizard.hooks-trust",
-      "kind": "mocked-playwright",
+      "kind": "vitest",
       "risk": "high",
-      "specs": ["tests/wizard.spec.ts"],
+      "specs": [
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/components/session-wizard/__tests__/ConfirmCreateDialogs.test.tsx"
+      ],
       "components": [
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/HooksTrustDialog.tsx"
@@ -1101,9 +1104,12 @@
     },
     {
       "id": "wizard.scratch-hides-worktree",
-      "kind": "mocked-playwright",
+      "kind": "vitest",
       "risk": "medium",
-      "specs": ["tests/wizard-project.spec.ts"],
+      "specs": [
+        "src/components/session-wizard/__tests__/SessionStep.test.tsx",
+        "src/components/session-wizard/wizardReducer.test.ts"
+      ],
       "components": ["web/src/components/session-wizard/steps/SessionStep.tsx"]
     },
     {
@@ -1933,9 +1939,12 @@
     },
     {
       "id": "right-panel.mobile-plugin-pane",
-      "kind": "mocked-playwright",
+      "kind": "vitest",
       "risk": "medium",
-      "specs": ["tests/mobile-panes.spec.ts"],
+      "specs": [
+        "src/components/__tests__/MobileRightPanelPicker.test.tsx",
+        "src/components/__tests__/MobileMainPane.test.tsx"
+      ],
       "components": [
         "web/src/components/MobileRightPanelPicker.tsx",
         "web/src/components/MobileMainPane.tsx",
@@ -3121,7 +3130,7 @@
       "id": "story.settings-theme-select",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": ["tests/live/acp-stories/settings-theme.spec.ts"],
+      "specs": ["tests/live/settings-persistence.spec.ts"],
       "components": ["web/src/components/settings/SchemaSection.tsx"]
     },
     {
@@ -3216,7 +3225,7 @@
       "id": "acp.story.approval-deny",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": ["tests/live/acp-stories/approvals.spec.ts"],
+      "specs": ["tests/live/acp-prompt-lifecycle.spec.ts", "src/components/acp/ApprovalCard.test.tsx"],
       "components": ["web/src/components/acp/ApprovalCard.tsx"]
     },
     {
@@ -3252,9 +3261,9 @@
     },
     {
       "id": "story.diff-empty-state",
-      "kind": "mocked-playwright",
+      "kind": "vitest",
       "risk": "low",
-      "specs": ["tests/diff.spec.ts", "src/components/diff/__tests__/DiffFileList.test.tsx"],
+      "specs": ["src/components/diff/__tests__/DiffFileList.test.tsx"],
       "components": ["web/src/components/diff/DiffFileList.tsx"]
     },
     {
@@ -3466,9 +3475,9 @@
     },
     {
       "id": "acp.story.fold-failed-tool-card",
-      "kind": "mocked-playwright",
+      "kind": "vitest",
       "risk": "medium",
-      "specs": ["tests/acp-structured-view.spec.ts", "src/components/acp/ToolCards.render.test.tsx"],
+      "specs": ["src/components/acp/ToolCards.render.test.tsx"],
       "components": [
         "web/src/components/acp/ToolCards.tsx",
         "web/src/components/acp/CoreToolCards.tsx",
@@ -3488,9 +3497,13 @@
     },
     {
       "id": "acp.edit-card-diff",
-      "kind": "mocked-playwright",
+      "kind": "vitest",
       "risk": "medium",
-      "specs": ["tests/acp-edit-card-diff.spec.ts"],
+      "specs": [
+        "src/lib/diffPair.test.ts",
+        "src/components/diff/__tests__/StringDiff.test.tsx",
+        "src/components/acp/ToolCards.render.test.tsx"
+      ],
       "components": ["web/src/components/acp/ToolCards.tsx", "web/src/components/diff/StringDiff.tsx"]
     },
     {
@@ -3576,9 +3589,12 @@
     },
     {
       "id": "story.wizard-worktree-toggle",
-      "kind": "mocked-playwright",
+      "kind": "vitest",
       "risk": "medium",
-      "specs": ["tests/wizard.spec.ts"],
+      "specs": [
+        "src/components/session-wizard/__tests__/SessionStep.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.projectWorktreeOverride.test.tsx"
+      ],
       "components": ["web/src/components/session-wizard/steps/SessionStep.tsx"]
     },
     {
@@ -3617,14 +3633,14 @@
       "id": "story.wizard-launch-button",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": ["tests/live/acp-stories/navigation.spec.ts"],
+      "specs": ["tests/live/session-create.spec.ts"],
       "components": ["web/src/components/session-wizard/LaunchFooter.tsx"]
     },
     {
       "id": "story.wizard-branch-from-title",
-      "kind": "mocked-playwright",
+      "kind": "vitest",
       "risk": "medium",
-      "specs": ["tests/wizard.spec.ts"],
+      "specs": ["src/components/session-wizard/wizardReducer.test.ts"],
       "components": [
         "web/src/components/session-wizard/sessionNames.ts",
         "web/src/components/session-wizard/steps/SessionStep.tsx"
@@ -3775,9 +3791,9 @@
     },
     {
       "id": "sidebar.smart-rename-chip-render",
-      "kind": "mocked-playwright",
+      "kind": "vitest",
       "risk": "low",
-      "specs": ["tests/sidebar-chrome.spec.ts"],
+      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {

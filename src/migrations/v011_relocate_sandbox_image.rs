@@ -52,132 +52,29 @@ fn migrate_config_file(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use crate::migrations::test_cases::assert_rewrites;
 
     #[test]
-    fn test_rewrites_aoe_sandbox() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config_path = dir.path().join("config.toml");
-        fs::write(
-            &config_path,
-            r#"[sandbox]
-default_image = "ghcr.io/njbrake/aoe-sandbox:latest"
-"#,
-        )
-        .unwrap();
-
-        migrate_config_file(&config_path.to_path_buf()).unwrap();
-
-        let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
-        assert_eq!(
-            result["sandbox"]["default_image"].as_str(),
-            Some("ghcr.io/agent-of-empires/aoe-sandbox:latest")
+    fn relocates_only_the_old_sandbox_images() {
+        let unchanged = |toml: &'static str| (Some(toml), Some(toml));
+        assert_rewrites(
+            "config.toml",
+            migrate_config_file,
+            &[
+                (
+                    Some("[sandbox]\ndefault_image = \"ghcr.io/njbrake/aoe-sandbox:latest\"\n"),
+                    Some("[sandbox]\ndefault_image = \"ghcr.io/agent-of-empires/aoe-sandbox:latest\"\n"),
+                ),
+                (
+                    Some("[sandbox]\ndefault_image = \"ghcr.io/njbrake/aoe-dev-sandbox:0.10\"\n"),
+                    Some("[sandbox]\ndefault_image = \"ghcr.io/agent-of-empires/aoe-dev-sandbox:0.10\"\n"),
+                ),
+                unchanged("[sandbox]\ndefault_image = \"ghcr.io/agent-of-empires/aoe-sandbox:latest\"\n"),
+                unchanged("[sandbox]\ndefault_image = \"docker.io/library/ubuntu:22.04\"\n"),
+                unchanged("[session]\ndefault_tool = \"claude\"\n"),
+                unchanged("[sandbox]\nenabled_by_default = true\n"),
+                (None, None),
+            ],
         );
-    }
-
-    #[test]
-    fn test_rewrites_aoe_dev_sandbox() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config_path = dir.path().join("config.toml");
-        fs::write(
-            &config_path,
-            r#"[sandbox]
-default_image = "ghcr.io/njbrake/aoe-dev-sandbox:0.10"
-"#,
-        )
-        .unwrap();
-
-        migrate_config_file(&config_path.to_path_buf()).unwrap();
-
-        let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
-        assert_eq!(
-            result["sandbox"]["default_image"].as_str(),
-            Some("ghcr.io/agent-of-empires/aoe-dev-sandbox:0.10")
-        );
-    }
-
-    #[test]
-    fn test_idempotent_on_already_migrated() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config_path = dir.path().join("config.toml");
-        let original = r#"[sandbox]
-default_image = "ghcr.io/agent-of-empires/aoe-sandbox:latest"
-"#;
-        fs::write(&config_path, original).unwrap();
-
-        migrate_config_file(&config_path.to_path_buf()).unwrap();
-
-        let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
-        assert_eq!(
-            result["sandbox"]["default_image"].as_str(),
-            Some("ghcr.io/agent-of-empires/aoe-sandbox:latest")
-        );
-    }
-
-    #[test]
-    fn test_leaves_unrelated_images_alone() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config_path = dir.path().join("config.toml");
-        fs::write(
-            &config_path,
-            r#"[sandbox]
-default_image = "docker.io/library/ubuntu:22.04"
-"#,
-        )
-        .unwrap();
-
-        migrate_config_file(&config_path.to_path_buf()).unwrap();
-
-        let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
-        assert_eq!(
-            result["sandbox"]["default_image"].as_str(),
-            Some("docker.io/library/ubuntu:22.04")
-        );
-    }
-
-    #[test]
-    fn test_no_sandbox_section() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config_path = dir.path().join("config.toml");
-        fs::write(
-            &config_path,
-            r#"[session]
-default_tool = "claude"
-"#,
-        )
-        .unwrap();
-
-        migrate_config_file(&config_path.to_path_buf()).unwrap();
-
-        let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
-        assert_eq!(result["session"]["default_tool"].as_str(), Some("claude"));
-    }
-
-    #[test]
-    fn test_no_default_image_set() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config_path = dir.path().join("config.toml");
-        fs::write(
-            &config_path,
-            r#"[sandbox]
-enabled_by_default = true
-"#,
-        )
-        .unwrap();
-
-        migrate_config_file(&config_path.to_path_buf()).unwrap();
-
-        let result: toml::Table = fs::read_to_string(&config_path).unwrap().parse().unwrap();
-        assert_eq!(
-            result["sandbox"]["enabled_by_default"].as_bool(),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn test_nonexistent_file() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let config_path = dir.path().join("nonexistent.toml");
-        migrate_config_file(&config_path.to_path_buf()).unwrap();
     }
 }

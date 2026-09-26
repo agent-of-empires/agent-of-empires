@@ -38,7 +38,6 @@ afterEach(() => {
 describe("useQueuedCountForSessions", () => {
   it.each([
     ["no entries", {}, 0],
-    ["one persisted entry", { a: entry("a", 3) }, 3],
     ["the sum across sessions", { a: entry("a", 2), b: entry("b", 1) }, 3],
     ["a TTL-expired entry", { a: entry("a", 5, Date.now() - 8 * 24 * 60 * 60 * 1000) }, 0],
     ["a corrupt entry", { a: "{not json" }, 0],

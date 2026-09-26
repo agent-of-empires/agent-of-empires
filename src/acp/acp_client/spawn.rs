@@ -731,7 +731,7 @@ mod tests {
     /// resets context before the connection ends on a soft stop.
     #[cfg(unix)]
     #[tokio::test]
-    async fn unsupported_session_prompt_rejection_emits_context_reset_before_error() {
+    async fn recoverable_startup_failures_do_not_surface_startup_errors() {
         let _env = crate::session::test_support::EnvGuard::read_lock();
         let dir = tempfile::tempdir().unwrap();
         let mut client = scripted_agent(
@@ -757,27 +757,24 @@ mod tests {
         );
         assert_eq!(kinds[1], "stopped:stored_session_rejected");
         let _ = client.shutdown().await;
-    }
 
-    /// #3514: a limit hit at `session/new` parks the session instead of
-    /// failing startup and burning the restart budget.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn handshake_rate_limit_parks_the_session_instead_of_failing_startup() {
-        let _env = crate::session::test_support::EnvGuard::read_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let mut client = scripted_agent(
-            dir.path(),
-            false,
-            &[(
-                "session/new",
-                r#""error":{"code":-32603,"message":"Internal error","data":{"details":"You have hit your limit","errorKind":"rate_limit"}}"#,
-            )],
-            None,
-        )
-        .await;
-        let kinds = terminal_events(&mut client).await;
-        assert_eq!(kinds, ["rate_limit:rate_limit", "stopped:rate_limited"]);
-        let _ = client.shutdown().await;
+        // #3514: a limit hit at `session/new` parks the session instead of
+        // failing startup and burning the restart budget.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut client = scripted_agent(
+                dir.path(),
+                false,
+                &[(
+                    "session/new",
+                    r#""error":{"code":-32603,"message":"Internal error","data":{"details":"You have hit your limit","errorKind":"rate_limit"}}"#,
+                )],
+                None,
+            )
+            .await;
+            let kinds = terminal_events(&mut client).await;
+            assert_eq!(kinds, ["rate_limit:rate_limit", "stopped:rate_limited"]);
+            let _ = client.shutdown().await;
+        }
     }
 }

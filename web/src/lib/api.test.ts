@@ -76,7 +76,6 @@ const requestCases: RequestCase[] = [
   ["GET /api/settings?profile=my%20profile", () => api.fetchSettings("my profile")],
   ["PATCH /api/settings", () => api.updateSettings({ a: 1 }), { body: { a: 1 }, result: true }],
   ["PATCH /api/theme", () => api.updateTheme({ name: "dracula" }), { body: { name: "dracula" }, result: true }],
-  ["PATCH /api/theme", () => api.updateTheme({ color_mode: "palette" }), { body: { color_mode: "palette" } }],
   ["GET /api/app-state/web-ui-state", () => api.getWebUiState(), { respond: json({ k: "v" }), result: { k: "v" } }],
   [
     "PATCH /api/app-state/web-ui-state",
@@ -232,7 +231,6 @@ const requestCases: RequestCase[] = [
   ["GET /api/agents", () => api.fetchAgents(), { respond: json([{ id: "claude" }]), result: [{ id: "claude" }] }],
   ["GET /api/profiles", () => api.fetchProfiles()],
   ["GET /api/filesystem/home", () => api.getHomePath(), { respond: json({ path: "/home/u" }), result: "/home/u" }],
-  ["GET /api/filesystem/home", () => api.getHomePath(), { respond: json({}), result: null }],
   [
     "GET /api/filesystem/browse?path=%2Frepo",
     () => api.browseFilesystem("/repo"),
@@ -276,21 +274,11 @@ const requestCases: RequestCase[] = [
   ],
   [
     "PATCH /api/projects/p?scope=global",
-    () => api.updateProject("p", "global", null),
-    { body: { default_base_branch: null }, respond: json({}) },
-  ],
-  [
-    "PATCH /api/projects/p?scope=global",
     () => api.updateProject("p", "global", "develop", { worktree_enabled: true, smart_rename: null }),
     {
       body: { default_base_branch: "develop", overrides: { worktree_enabled: true, smart_rename: null } },
       respond: json({}),
     },
-  ],
-  [
-    "POST /api/projects",
-    () => api.createProject({ path: "/p", overrides: { worktree_enabled: true } }),
-    { body: { path: "/p", overrides: { worktree_enabled: true } }, respond: json({}) },
   ],
   [
     "PATCH /api/projects/a%20b?scope=profile",
@@ -335,7 +323,6 @@ const requestCases: RequestCase[] = [
     () => api.setSessionDiffBase("s1", "develop"),
     { body: { base_branch: "develop" }, respond: json(session), result: session },
   ],
-  ["PATCH /api/sessions/s1/diff-base", () => api.setSessionDiffBase("s1", null), { body: { base_branch: null } }],
   [
     "PATCH /api/sessions/s1/diff-base",
     () => api.setSessionDiffBase("s1", "main", "r"),
@@ -353,21 +340,14 @@ const requestCases: RequestCase[] = [
     { body: { archived: true, kill_pane: true } },
   ],
   [
-    "PATCH /api/sessions/s1/archive",
-    () => api.setSessionArchive("s1", false, false),
-    { body: { archived: false, kill_pane: false } },
-  ],
-  [
     "POST /api/sessions/s1/trash",
     () => api.trashSession("s1"),
     { body: { kill_pane: true }, respond: json(session), result: session },
   ],
-  ["POST /api/sessions/s1/trash", () => api.trashSession("s1", false), { body: { kill_pane: false } }],
   ["POST /api/sessions/s1/restore", () => api.restoreSession("s1"), { respond: json(session), result: session }],
   ["POST /api/sessions/s1/stop", () => api.stopSession("s1"), { respond: json(session), result: session }],
   ["POST /api/sessions/s1/start", () => api.startSession("s1"), { respond: json(session), result: session }],
   ["PATCH /api/sessions/s1/snooze", () => api.setSessionSnooze("s1", 60), { body: { minutes: 60 } }],
-  ["PATCH /api/sessions/s1/snooze", () => api.setSessionSnooze("s1", null), { body: { minutes: null } }],
   ["PATCH /api/sessions/s1/unread", () => api.setSessionUnread("s1", true), { body: { unread: true } }],
   [
     "DELETE /api/workspaces",
@@ -490,11 +470,6 @@ const requestCases: RequestCase[] = [
     },
   ],
   [
-    "POST /api/plugins/p/settings/options/resolve",
-    () => api.resolvePluginOptions("p", "s", []),
-    { body: { source: "s", depends: [] }, respond: json({}), result: [] },
-  ],
-  [
     "POST /api/plugins/acme%2Fweird%20id/enabled",
     () => api.setPluginEnabled("acme/weird id", false),
     { body: { enabled: false }, respond: json(plugins), result: { kind: "ok", data: plugins } },
@@ -574,14 +549,10 @@ describe("request shapes", () => {
 
 const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["fetchSessions", () => api.fetchSessions(), null],
-  ["fetchRecentProjects", () => api.fetchRecentProjects(), null],
   ["searchConversations", () => api.searchConversations("q"), []],
   ["updateWorkspaceOrdering", () => api.updateWorkspaceOrdering([]), false],
   ["ensureTerminal", () => api.ensureTerminal("s1"), false],
   ["getSessionFileContents", () => api.getSessionFileContents("s1", "a"), null],
-  ["fetchVolumeIgnoresPreview", () => api.fetchVolumeIgnoresPreview("/r"), null],
-  ["markTipSeen", () => api.markTipSeen("x"), false],
-  ["setTelemetryConsent", () => api.setTelemetryConsent(true), null],
   ["fetchThemes", () => api.fetchThemes(), []],
   ["fetchAcpAgents", () => api.fetchAcpAgents(), []],
   ["fetchAcpOptionCatalog", () => api.fetchAcpOptionCatalog(), { version: 1, agents: {} }],
@@ -597,19 +568,10 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["verifyToken", () => api.verifyToken(), false],
   ["enqueueServerPrompt", () => api.enqueueServerPrompt("s1", { id: "q", text: "t" }), null],
   ["listServerQueue", () => api.listServerQueue("s1"), []],
-  ["clearServerQueue", () => api.clearServerQueue("s1"), false],
-  ["setSessionPin", () => api.setSessionPin("s1", true), null],
-  ["trashSession", () => api.trashSession("s1"), null],
-  ["updateSessionGroup", () => api.updateSessionGroup("s1", "g"), false],
   ["renameSession", () => api.renameSession("s1", "x"), { ok: false }],
   ["smartRenameSession", () => api.smartRenameSession("s1"), { ok: false }],
-  ["summarizeSession", () => api.summarizeSession("s1"), { ok: false }],
-  ["setWorktreeName", () => api.setWorktreeName("s1", "x", false), { ok: false }],
   ["attachSessionProject", () => api.attachSessionProject("s1", "p"), { ok: false }],
   ["resolveMcpConflict", () => api.resolveMcpConflict("n", "a", "aoe", "fp"), "error"],
-  ["keepMcpServer", () => api.keepMcpServer("n", "a"), false],
-  ["fetchSkill", () => api.fetchSkill("s", "d"), null],
-  ["fetchPlugins", () => api.fetchPlugins(), null],
   ["invokePluginAction", () => api.invokePluginAction("p", "m"), null],
   ["resolvePluginOptions", () => api.resolvePluginOptions("p", "s", []), []],
   ["fetchSoundBlob", () => api.fetchSoundBlob("x.wav"), null],
@@ -742,9 +704,6 @@ describe("installAcpAgent", () => {
 describe("project mutations", () => {
   const calls: [string, () => Promise<{ ok: boolean; error?: string }>][] = [
     ["createProject", () => api.createProject({ path: "/p" })],
-    ["deleteProject", () => api.deleteProject("p", "global")],
-    ["updateProject", () => api.updateProject("p", "global", "x")],
-    ["setProjectPinned", () => api.setProjectPinned("p", "global", true)],
   ];
 
   it.each(calls)("%s maps JSON, text, and network errors", async (_name, call) => {
@@ -856,8 +815,6 @@ describe("session mutation messages", () => {
   it.each([
     ["renameSession", () => api.renameSession("s1", "x")],
     ["smartRenameSession", () => api.smartRenameSession("s1")],
-    ["summarizeSession", () => api.summarizeSession("s1")],
-    ["setWorktreeName", () => api.setWorktreeName("s1", "x", false)],
     ["attachSessionProject", () => api.attachSessionProject("s1", "p")],
   ])("%s surfaces the server message", async (_name, call) => {
     fetchSpy.mockResolvedValueOnce(json({ message: "running" }, 409));

@@ -439,7 +439,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_ls_remote_prefers_the_peeled_tag() {
+    fn parse_ls_remote_prefers_the_peeled_tag_and_a_pinned_sha_skips_the_remote() {
         let peeled = "1111111111111111111111111111111111111111\trefs/tags/v1\n\
                       2222222222222222222222222222222222222222\trefs/tags/v1^{}";
         assert_eq!(
@@ -451,12 +451,9 @@ mod tests {
             "3333333333333333333333333333333333333333"
         );
         assert!(parse_ls_remote("", "nope").is_err());
-    }
 
-    #[test]
-    fn ls_remote_returns_pinned_sha_as_is() {
-        let sha = "abcdef0123456789abcdef0123456789abcdef01";
-        assert_eq!(ls_remote("unused://", Some(sha)).unwrap(), sha);
+        let pinned = "abcdef0123456789abcdef0123456789abcdef01";
+        assert_eq!(ls_remote("unused://", Some(pinned)).unwrap(), pinned);
     }
 
     #[test]
@@ -540,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_tree_skips_git() {
+    fn copy_tree_skips_git_and_rejects_symlinks() {
         let src = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("aoe-plugin.toml"), b"x").unwrap();
         std::fs::create_dir(src.path().join(".git")).unwrap();
@@ -550,16 +547,9 @@ mod tests {
         copy_tree(src.path(), &into).unwrap();
         assert!(into.join("aoe-plugin.toml").exists());
         assert!(!into.join(".git").exists());
-    }
 
-    #[cfg(unix)]
-    #[test]
-    fn copy_tree_rejects_symlinks() {
-        let src = tempfile::tempdir().unwrap();
-        std::fs::write(src.path().join("real"), b"x").unwrap();
-        std::os::unix::fs::symlink("real", src.path().join("link")).unwrap();
-        let dst = tempfile::tempdir().unwrap();
-        let err = copy_tree(src.path(), &dst.path().join("tree"))
+        std::os::unix::fs::symlink("aoe-plugin.toml", src.path().join("link")).unwrap();
+        let err = copy_tree(src.path(), &dst.path().join("tree2"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("symlink"), "got: {err}");

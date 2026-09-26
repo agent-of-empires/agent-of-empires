@@ -57,7 +57,7 @@ const UI_ENTRIES = [
 ];
 
 test.describe("Plugin UI link navigation (#4089)", () => {
-  test("an internal relative link navigates via the router, not a full page load", async ({ page }) => {
+  test("an external link opens a new tab; an internal relative link routes without a page load", async ({ page }) => {
     await mockApis(page, UI_ENTRIES);
     let documentRequests = 0;
     page.on("request", (request) => {
@@ -65,13 +65,20 @@ test.describe("Plugin UI link navigation (#4089)", () => {
         documentRequests += 1;
       }
     });
-
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto("/");
-    // exact: true — a badge's name is otherwise a substring of its parent
+    // exact: true: a badge's name is otherwise a substring of its parent
     // sidebar row's own accessible name (which concatenates all its badges).
-    await page.getByRole("link", { name: "acme: settings link", exact: true }).click();
+    const settingsLink = page.getByRole("link", { name: "acme: settings link", exact: true });
 
+    const [external] = await Promise.all([
+      page.context().waitForEvent("page"),
+      page.getByRole("link", { name: "acme: pr link", exact: true }).click(),
+    ]);
+    await expect(external).toHaveURL("https://github.com/o/r/pull/1");
+    await expect(page).toHaveURL("/");
+
+    await settingsLink.click();
     await expect(page).toHaveURL(/\/settings$/);
     expect(documentRequests).toBe(0);
   });
@@ -95,19 +102,6 @@ test.describe("Plugin UI link navigation (#4089)", () => {
         }),
       )
       .toBe(true);
-  });
-
-  test("an external link opens a new tab instead of navigating in place", async ({ page }) => {
-    await mockApis(page, UI_ENTRIES);
-    await page.setViewportSize({ width: 1280, height: 800 });
-    await page.goto("/");
-
-    const [popup] = await Promise.all([
-      page.context().waitForEvent("page"),
-      page.getByRole("link", { name: "acme: pr link", exact: true }).click(),
-    ]);
-    await expect(popup).toHaveURL("https://github.com/o/r/pull/1");
-    await expect(page).not.toHaveURL(/github\.com/);
   });
 
   test("a modified click on an internal link is not intercepted", async ({ page }) => {

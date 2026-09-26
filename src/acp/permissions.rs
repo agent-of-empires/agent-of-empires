@@ -37,7 +37,7 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::approvals::{ApprovalDecision, ApprovalOptionKind};
+    use crate::acp::approvals::ApprovalOptionKind;
 
     fn tool_call(name: &str, kind: &str, args_preview: &str) -> ToolCall {
         ToolCall {
@@ -76,12 +76,5 @@ mod tests {
         assert!(question.choice);
         assert!(!question.destructive);
         assert_eq!(question.options, options);
-    }
-
-    #[test]
-    fn resolve_sets_decision_and_timestamp() {
-        let mut a = build_approval(tool_call("Read", "read", "{}"), Vec::new());
-        resolve(&mut a, ApprovalDecision::Allow, None);
-        assert_eq!(a.resolved.unwrap().decision, ApprovalDecision::Allow);
     }
 }

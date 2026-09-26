@@ -269,33 +269,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial(shell_env)]
-    fn claude_no_marker_untouched() {
-        let _g = unset_agent_home_env();
-        let (_tmp, home, app_dir) = setup_dirs();
-        let claude = home.join(".claude/settings.json");
-        write_json(
-            &claude,
-            &serde_json::json!({
-                "hooks": {
-                    "PreToolUse": [
-                        {"hooks": [{"type": "command", "command": "echo only-user"}]}
-                    ]
-                }
-            }),
-        );
-        let before = fs::read(&claude).unwrap();
-
-        run_in(&home, &app_dir).unwrap();
-
-        assert_eq!(
-            fs::read(&claude).unwrap(),
-            before,
-            "files without an AoE marker must be byte-untouched"
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
     fn claude_idempotent_byte_identical_and_canonical() {
         let _g = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
@@ -589,46 +562,44 @@ mod tests {
         );
     }
 
+    /// Files the gate must leave alone: no AoE marker, unparseable, or absent
+    /// (never created). A hermes allowlist is never written beside a bad config.
     #[test]
     #[serial_test::serial(shell_env)]
-    fn missing_files_noop() {
-        let _g = unset_agent_home_env();
-        let (_tmp, home, app_dir) = setup_dirs();
-
-        run_in(&home, &app_dir).unwrap();
-
-        assert!(
-            !home.join(".claude/settings.json").exists(),
-            "no AoE config existed; migration must NOT create new files"
-        );
-        assert!(!home.join(".codex/config.toml").exists());
-        assert!(!home.join(".hermes/config.yaml").exists());
-        assert!(!home.join(".settl/config.toml").exists());
-    }
-
-    /// A file the gate cannot parse stays byte-identical, and nothing is
-    /// written beside it.
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn unparseable_gate_files_stay_byte_identical() {
+    fn gate_leaves_unmarked_unparseable_and_missing_files_alone() {
+        let user_only = serde_json::to_string(&serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"hooks": [{"type": "command", "command": "echo only-user"}]}
+                ]
+            }
+        }))
+        .unwrap();
         for (rel, body, sibling) in [
-            (".claude/settings.json", "{not json", None),
-            (".settl/config.toml", "[[hooks\n# unclosed", None),
+            (".claude/settings.json", Some(user_only.as_str()), None),
+            (".claude/settings.json", Some("{not json"), None),
+            (".settl/config.toml", Some("[[hooks\n# unclosed"), None),
             (
                 ".hermes/config.yaml",
-                "hooks:\n  pre_tool_call:\n    - command: 'unterminated\n",
+                Some("hooks:\n  pre_tool_call:\n    - command: 'unterminated\n"),
                 Some(".hermes/shell-hooks-allowlist.json"),
             ),
+            (".claude/settings.json", None, None),
+            (".codex/config.toml", None, None),
+            (".hermes/config.yaml", None, None),
+            (".settl/config.toml", None, None),
         ] {
             let _g = unset_agent_home_env();
             let (_tmp, home, app_dir) = setup_dirs();
             let path = home.join(rel);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, body).unwrap();
+            if let Some(body) = body {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, body).unwrap();
+            }
 
             run_in(&home, &app_dir).unwrap();
 
-            assert_eq!(fs::read_to_string(&path).unwrap(), body, "{rel}");
+            assert_eq!(fs::read_to_string(&path).ok().as_deref(), body, "{rel}");
             if let Some(sibling) = sibling {
                 assert!(
                     !home.join(sibling).exists(),

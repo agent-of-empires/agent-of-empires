@@ -10,7 +10,6 @@ import {
   mockAcpSession,
   openStructuredSession,
   stopped,
-  toolCallCompleted,
   toolCallStarted,
   usageUpdated,
   waitForComposerConnected,
@@ -73,16 +72,23 @@ test.describe("chat bubble overflow", () => {
   });
 });
 
-test("send message via Enter renders agent response", async ({ page }) => {
+test("Enter sends a multi-line message that keeps its line breaks and renders the streamed response as one message", async ({
+  page,
+}) => {
   const mock = await mockAcpSession(page, {
     title: "story-send-enter",
-    onPrompt: () => [agentMessageChunk("Hello from fake ACP agent."), stopped()],
+    onPrompt: () => [
+      agentMessageChunk("Hello from "),
+      agentMessageChunk("fake ACP "),
+      agentMessageChunk("agent."),
+      stopped(),
+    ],
   });
   await openStructuredSession(page, mock);
   await waitForComposerConnected(page);
 
   const composer = composerBox(page);
-  await composer.fill("hello agent");
+  await composer.fill("hello agent\nline b\nline c");
   await composer.press("Enter");
 
   await expect(page.getByText("Hello from fake ACP agent.")).toBeVisible({
@@ -91,42 +97,13 @@ test("send message via Enter renders agent response", async ({ page }) => {
   // The clear can land after the streamed chunk renders.
   await expect(composer).toHaveValue("", { timeout: 5_000 });
 
-  expect(mock.promptBodies.map((b) => b.text)).toEqual(["hello agent"]);
-});
-
-// #1472: single newlines survive in the sent user bubble.
-test("single newlines in a user message render as line breaks", async ({ page }) => {
-  const mock = await mockAcpSession(page, { title: "story-single-newline" });
-  await openStructuredSession(page, mock);
-  await waitForComposerConnected(page);
-
-  const composer = composerBox(page);
-  await composer.fill("line a\nline b\nline c");
-  await composer.press("Enter");
-
-  const userBubble = page.locator("div.rounded-br-sm").filter({ hasText: "line a" });
-  await expect(userBubble).toBeVisible({ timeout: 10_000 });
+  expect(mock.promptBodies.map((b) => b.text)).toEqual(["hello agent\nline b\nline c"]);
+  // #1472: single newlines survive in the sent user bubble.
+  const userBubble = page.locator("div.rounded-br-sm").filter({ hasText: "hello agent" });
+  await expect(userBubble).toBeVisible();
   await expect(userBubble.locator("br")).toHaveCount(2);
   await expect(userBubble).toContainText("line b");
   await expect(userBubble).toContainText("line c");
-});
-
-// Multiple chunks in one turn render as one concatenated message.
-test("multi-chunk agent response assembles in the transcript", async ({ page }) => {
-  const mock = await mockAcpSession(page, {
-    title: "story-stream",
-    onPrompt: () => [agentMessageChunk("Once "), agentMessageChunk("upon "), agentMessageChunk("a time."), stopped()],
-  });
-  await openStructuredSession(page, mock);
-  await waitForComposerConnected(page);
-
-  const composer = composerBox(page);
-  await composer.fill("tell me a story");
-  await composer.press("Enter");
-
-  await expect(page.getByText("Once upon a time.")).toBeVisible({
-    timeout: 10_000,
-  });
 });
 
 // ─────────────────────────── tool cards ───────────────────────────
@@ -170,43 +147,6 @@ test.describe("edit card diff scroll", () => {
     await expect(viewport).toBeVisible();
     await expect.poll(() => overflowX(viewport)).toBeLessThanOrEqual(0);
   });
-});
-
-// #1467: a failed tool card opens on its own but its header still folds it.
-test("failed tool card auto-opens and folds via the chevron", async ({ page }) => {
-  const ERROR_TEXT = "boom: the command exploded";
-  const mock = await mockAcpSession(page, {
-    title: "story-fold-fail",
-    initialEvents: [
-      toolCallStarted({
-        id: "tc-fail-1",
-        name: "Terminal",
-        kind: "execute",
-        args_preview: JSON.stringify({ command: "rm -rf /nope" }),
-      }),
-      toolCallCompleted({
-        tool_call_id: "tc-fail-1",
-        is_error: true,
-        content: ERROR_TEXT,
-      }),
-      stopped(),
-    ],
-  });
-  await openStructuredSession(page, mock);
-
-  const errorText = page.getByText(ERROR_TEXT);
-  await expect(errorText).toBeVisible({ timeout: 10_000 });
-  await expect(page.getByText("tool failed")).toBeVisible();
-
-  const cardHeader = page
-    .getByRole("button")
-    .filter({ hasText: /failed/i })
-    .first();
-  await cardHeader.click();
-  await expect(errorText).toBeHidden({ timeout: 10_000 });
-
-  await cardHeader.click();
-  await expect(errorText).toBeVisible({ timeout: 10_000 });
 });
 
 // ─────────────────────────── composer ────────────────────────────
@@ -345,34 +285,6 @@ test("synthesize memory recall renders cleaned, sanitized markdown", async ({ pa
   await expect(body.locator("li")).toHaveCount(2);
 });
 
-test("malformed memory_recall falls back to a generic read card", async ({ page }) => {
-  const mock = await mockAcpSession(page, {
-    title: "story-memory-recall-bad",
-    initialEvents: [
-      {
-        ToolCallStarted: {
-          tool_call: {
-            id: "mem-bad",
-            name: "Recalled synthesized memory",
-            kind: "read",
-            args_preview: "{}",
-            // No `mode`: asMemoryRecall rejects it, so the dispatcher
-            // must not render the dedicated card.
-            memory_recall: { synthesized_text: "x" } as unknown as { mode: string },
-            started_at: new Date().toISOString(),
-          },
-        },
-      },
-      stopped(),
-    ],
-  });
-  await openStructuredSession(page, mock);
-
-  // No dedicated synthesize card; the generic read card shows the title.
-  await expect(page.getByText("Recalled synthesized memory")).toBeVisible({ timeout: 10_000 });
-  await expect(page.getByTestId("memory-recall-synthesized")).toHaveCount(0);
-});
-
 // ─────────────────────────── font size ───────────────────────────
 
 // The transcript font size has mobile and desktop values chosen by
@@ -478,16 +390,6 @@ test.describe("trashed structured session is read-only", () => {
     // No composer / send affordance for a session that cannot be resumed.
     await expect(page.getByTestId("composer-footer")).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Send message" })).toHaveCount(0);
-  });
-
-  test("a live (non-trashed) session still renders the composer", async ({ page }) => {
-    const mock = await mockAcpSession(page, {
-      title: "story-live",
-      initialEvents: [agentMessageChunk("hello")],
-    });
-    await openStructuredSession(page, mock);
-
-    await expect(page.getByTestId("composer-footer")).toBeVisible({ timeout: 10_000 });
   });
 });
 

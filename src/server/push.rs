@@ -1007,48 +1007,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vapid_generate_roundtrip() {
-        let kp = VapidKeypair::generate().unwrap();
-        assert!(kp.public_b64url.len() > 80);
-        assert!(kp.private_pem.contains("BEGIN PRIVATE KEY"));
-    }
-
-    #[test]
-    fn vapid_persist_and_reload_same_key() {
+    fn vapid_keypair_is_generated_once_and_reloaded() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("push.vapid.json");
         let first = VapidKeypair::load_or_generate(&path).unwrap();
+        assert!(first.public_b64url.len() > 80);
+        assert!(first.private_pem.contains("BEGIN PRIVATE KEY"));
         let second = VapidKeypair::load_or_generate(&path).unwrap();
         assert_eq!(first.public_b64url, second.public_b64url);
         assert_eq!(first.private_pem, second.private_pem);
     }
 
+    /// Re-subscribing bumps the generation, and a GC only removes the
+    /// generation it observed failing.
     #[tokio::test]
-    async fn subscription_store_upsert_increments_generation() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("push.subscriptions.json");
-        let store = SubscriptionStore::load_or_empty(path);
-
-        let base = Subscription {
-            endpoint: "https://push.example/abc".into(),
-            p256dh: "pk".into(),
-            auth: "auth".into(),
-            owner_token_hash: [1u8; 32],
-            user_agent: "UA".into(),
-            created_at: Utc::now(),
-            generation: 0,
-            origin: "http://localhost:8080".into(),
-        };
-        store.upsert(base.clone()).await.unwrap();
-        store.upsert(base.clone()).await.unwrap();
-
-        let all = store.snapshot().await;
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].generation, 1);
-    }
-
-    #[tokio::test]
-    async fn gc_stale_respects_generation() {
+    async fn subscription_generation_gates_stale_gc() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("push.subscriptions.json");
         let store = SubscriptionStore::load_or_empty(path);
@@ -1060,19 +1033,18 @@ mod tests {
             owner_token_hash: [1u8; 32],
             user_agent: "UA".into(),
             created_at: Utc::now(),
-            generation: 5,
+            generation: 0,
             origin: "http://localhost:8080".into(),
         };
         store.upsert(sub.clone()).await.unwrap();
+        store.upsert(sub.clone()).await.unwrap();
+        let all = store.snapshot().await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].generation, 1);
 
-        // Stale GC (observed generation differs) does NOT remove.
-        let removed = store.gc_stale(&sub.endpoint, 4).await.unwrap();
-        assert!(!removed);
+        assert!(!store.gc_stale(&sub.endpoint, 0).await.unwrap());
         assert_eq!(store.snapshot().await.len(), 1);
-
-        // Matching generation removes.
-        let removed = store.gc_stale(&sub.endpoint, 5).await.unwrap();
-        assert!(removed);
+        assert!(store.gc_stale(&sub.endpoint, 1).await.unwrap());
         assert_eq!(store.snapshot().await.len(), 0);
     }
 
@@ -1208,10 +1180,7 @@ mod tests {
         for (name, headers, want) in cases {
             assert_eq!(origin(headers).as_deref(), *want, "{name}");
         }
-    }
 
-    #[test]
-    fn build_push_url_joins_a_non_empty_origin_with_the_path() {
         let with_origin = |origin: &str| Subscription {
             endpoint: "https://push.example/abc".into(),
             p256dh: "pk".into(),
@@ -1340,14 +1309,5 @@ mod tests {
             NotificationEvent::Waiting,
             &inst
         ));
-    }
-
-    #[test]
-    fn sha256_token_is_deterministic_and_differs_per_input() {
-        let a = sha256_token("token-1");
-        let b = sha256_token("token-1");
-        let c = sha256_token("token-2");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
     }
 }

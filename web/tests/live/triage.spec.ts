@@ -28,7 +28,10 @@ async function patchVia(page: Page, sessionId: string, endpoint: string, click: 
   return res.request().postDataJSON();
 }
 
-test("pin → unpin round-trip lands on the server and survives reload", async ({ page, spawnServe }) => {
+test("pin → unpin survives reload; snooze presets, a 1h pick, and unsnooze round-trip", async ({
+  page,
+  spawnServe,
+}) => {
   const title = "pin-target";
   const { serve, sessionId, row } = await openWithSession(
     page,
@@ -51,6 +54,49 @@ test("pin → unpin round-trip lands on the server and survives reload", async (
   await row.click({ button: "right" });
   expect(await patchVia(page, sessionId, "pin", () => menuItem(page, "pin").click())).toEqual({ pinned: false });
   await expect.poll(field(serve, "pinned_at"), { timeout: 5_000 }).toBeNull();
+
+  // Snooze: the TUI preset list, a 1h pick, and an unsnooze round trip.
+  await row.click({ button: "right" });
+  await menuItem(page, "snooze").click();
+  const modal = page.locator("[data-testid='snooze-modal']");
+  await expect(modal).toBeVisible();
+  // Matches the TUI presets in src/tui/dialogs/snooze_duration.rs.
+  for (const m of [60, 120, 180, 240, 300, 360, 1440, 10080]) {
+    await expect(modal.locator(`[data-testid='snooze-modal-preset-${m}']`)).toBeVisible();
+  }
+
+  const issuedAt = Date.now();
+  expect(
+    await patchVia(page, sessionId, "snooze", () => modal.locator("[data-testid='snooze-modal-preset-60']").click()),
+  ).toEqual({ minutes: 60 });
+  await expect
+    .poll(
+      async () => {
+        const ts = (await field(serve, "snoozed_until")()) as string | null;
+        return ts ? Date.parse(ts) : null;
+      },
+      { timeout: 5_000 },
+    )
+    .toBeGreaterThan(issuedAt + 55 * 60_000);
+
+  const sunkSection = page.locator("[data-testid='sidebar-sunk-section']");
+  await expect(sunkSection).toBeVisible({ timeout: 5_000 });
+  await sunkSection.locator("[data-testid='sidebar-sunk-toggle']").click();
+  const snoozedRow = sunkSection.locator("[data-testid='sidebar-session-row']");
+  await expect(snoozedRow).toContainText(title);
+  await expect(snoozedRow.locator("[aria-label='Snoozed']")).toBeVisible();
+  // A snoozed row offers only Unsnooze.
+  await snoozedRow.click({ button: "right" });
+  await expect(menuItem(page, "unsnooze")).toBeVisible();
+  await expect(menuItem(page, "pin")).toHaveCount(0);
+  await expect(menuItem(page, "archive")).toHaveCount(0);
+  await page.mouse.click(5, 5);
+
+  await snoozedRow.click({ button: "right" });
+  expect(await patchVia(page, sessionId, "snooze", () => menuItem(page, "unsnooze").click())).toEqual({
+    minutes: null,
+  });
+  await expect.poll(field(serve, "snoozed_until"), { timeout: 5_000 }).toBeNull();
 });
 
 test("archive sinks the row into the collapsible footer and persists", async ({ page, spawnServe }) => {
@@ -111,56 +157,6 @@ test("archive sinks the row into the collapsible footer and persists", async ({ 
   });
   await expect.poll(field(serve, "archived_at"), { timeout: 5_000 }).toBeNull();
   await expect(page.locator("[data-testid='sidebar-group-header']")).toHaveCount(1, { timeout: 5_000 });
-});
-
-test("snooze preset list + 1h pick + unsnooze round-trip", async ({ page, spawnServe }) => {
-  const title = "snooze-target";
-  const { serve, sessionId, row } = await openWithSession(
-    page,
-    () => spawnServe({ seedFn: seedSessionViaAoeAdd({ title }) }),
-    title,
-  );
-  await row.click({ button: "right" });
-  await menuItem(page, "snooze").click();
-  const modal = page.locator("[data-testid='snooze-modal']");
-  await expect(modal).toBeVisible();
-  // Matches the TUI presets in src/tui/dialogs/snooze_duration.rs.
-  for (const m of [60, 120, 180, 240, 300, 360, 1440, 10080]) {
-    await expect(modal.locator(`[data-testid='snooze-modal-preset-${m}']`)).toBeVisible();
-  }
-
-  const issuedAt = Date.now();
-  expect(
-    await patchVia(page, sessionId, "snooze", () => modal.locator("[data-testid='snooze-modal-preset-60']").click()),
-  ).toEqual({ minutes: 60 });
-  await expect
-    .poll(
-      async () => {
-        const ts = (await field(serve, "snoozed_until")()) as string | null;
-        return ts ? Date.parse(ts) : null;
-      },
-      { timeout: 5_000 },
-    )
-    .toBeGreaterThan(issuedAt + 55 * 60_000);
-
-  const sunkSection = page.locator("[data-testid='sidebar-sunk-section']");
-  await expect(sunkSection).toBeVisible({ timeout: 5_000 });
-  await sunkSection.locator("[data-testid='sidebar-sunk-toggle']").click();
-  const snoozedRow = sunkSection.locator("[data-testid='sidebar-session-row']");
-  await expect(snoozedRow).toContainText(title);
-  await expect(snoozedRow.locator("[aria-label='Snoozed']")).toBeVisible();
-  // A snoozed row offers only Unsnooze.
-  await snoozedRow.click({ button: "right" });
-  await expect(menuItem(page, "unsnooze")).toBeVisible();
-  await expect(menuItem(page, "pin")).toHaveCount(0);
-  await expect(menuItem(page, "archive")).toHaveCount(0);
-  await page.mouse.click(5, 5);
-
-  await snoozedRow.click({ button: "right" });
-  expect(await patchVia(page, sessionId, "snooze", () => menuItem(page, "unsnooze").click())).toEqual({
-    minutes: null,
-  });
-  await expect.poll(field(serve, "snoozed_until"), { timeout: 5_000 }).toBeNull();
 });
 
 test("selecting two rows and bulk-archiving persists both", async ({ page, spawnServe }) => {

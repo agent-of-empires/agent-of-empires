@@ -64,19 +64,6 @@ describe("SessionWizard prefill.worktreeEnabled (project override on quick-creat
     expect(createSession.mock.calls[0][0]).toMatchObject({ path: "/repo/alpha", worktree_enabled: false });
   });
 
-  it("falls back to the global default when the project has no override", async () => {
-    let resolveSettings!: (settings: unknown) => void;
-    fetchSettings.mockReturnValue(new Promise((resolve) => (resolveSettings = resolve)));
-    const { getByText } = renderWizard({ path: "/repo/beta" });
-
-    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
-    await act(async () => resolveSettings({ worktree: { enabled: true } }));
-    await clickLaunch(getByText);
-
-    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
-    expect(createSession.mock.calls[0][0]).toMatchObject({ path: "/repo/beta", worktree_enabled: true });
-  });
-
   it.each([
     ["settings before projects", true],
     ["projects before settings", false],

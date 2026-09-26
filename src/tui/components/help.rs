@@ -393,16 +393,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn help_contains_resize_shortcut() {
-        for strict in [false, true] {
-            let all = shortcuts(strict, false);
-            let views_section = all.iter().find(|(name, _)| *name == "Views");
-            assert!(views_section.is_some(), "Views section should exist");
-            let (_, keys) = views_section.unwrap();
-            assert!(
-                keys.iter().any(|(k, _)| *k == "< >"),
-                "Views section should contain < > resize shortcut"
-            );
+    fn help_lists_discoverable_shortcuts_in_their_sections() {
+        // (section prefix, non-strict key, strict key, desc substring). Snooze
+        // shipped unadvertised in #1084; lock the listing in.
+        let cases = [
+            ("Views", "< >", "< >", ""),
+            ("Attention", "h", "H", "Snooze"),
+            ("Other", "Ctrl+K", "Ctrl+K", "Command palette"),
+        ];
+        for (section, non_strict_key, strict_key, desc_sub) in cases {
+            for (strict, key) in [(false, non_strict_key), (true, strict_key)] {
+                let all = shortcuts(strict, false);
+                let (_, keys) = all
+                    .iter()
+                    .find(|(name, _)| name.starts_with(section))
+                    .unwrap_or_else(|| panic!("{section} section should exist"));
+                assert!(
+                    keys.iter()
+                        .any(|(k, desc)| *k == key && desc.contains(desc_sub)),
+                    "{section} should list {key} {desc_sub} (strict={strict})"
+                );
+            }
         }
     }
 
@@ -437,26 +448,6 @@ mod tests {
     }
 
     #[test]
-    fn help_lists_snooze() {
-        // PR #1084 introduced the snooze primitive (H in strict mode, h in
-        // non-strict) but did not advertise it in the help overlay. Lock the
-        // listing in so a future binding rename keeps the docs honest.
-        for (strict, expected_key) in [(false, "h"), (true, "H")] {
-            let all = shortcuts(strict, false);
-            let attention = all
-                .iter()
-                .find(|(name, _)| name.starts_with("Attention"))
-                .expect("Attention section should exist");
-            let (_, keys) = attention;
-            assert!(
-                keys.iter()
-                    .any(|(k, desc)| *k == expected_key && desc.contains("Snooze")),
-                "Attention section should contain {expected_key} Snooze entry (strict={strict})"
-            );
-        }
-    }
-
-    #[test]
     fn attention_section_groups_triage_bindings() {
         // The Attention section bundles snooze/archive/favorite/next-waiting
         // so users see them together instead of scattered across Navigation
@@ -486,25 +477,6 @@ mod tests {
                     }
                 }
             }
-        }
-    }
-
-    #[test]
-    fn help_lists_command_palette() {
-        // Asserts both keymaps surface the Ctrl+K command palette entry in
-        // their "Other" section so users can discover the palette from `?`.
-        for strict in [false, true] {
-            let all = shortcuts(strict, false);
-            let other = all
-                .iter()
-                .find(|(name, _)| *name == "Other")
-                .expect("Other section should exist");
-            let (_, keys) = other;
-            assert!(
-                keys.iter()
-                    .any(|(k, desc)| *k == "Ctrl+K" && desc.contains("Command palette")),
-                "Other section should contain Ctrl+K Command palette (strict={strict})"
-            );
         }
     }
 
@@ -558,78 +530,45 @@ mod tests {
     }
 
     #[test]
-    fn pick_columns_grows_with_width() {
-        // 40 cells per column is enough for the canonical help rows; verify
-        // the picker scales with viewport width.
-        let min = 40;
-        assert_eq!(pick_columns(30, min, 4), 1);
-        assert_eq!(pick_columns(80, min, 4), 1);
-        assert_eq!(pick_columns(85, min, 4), 2);
-        assert_eq!(pick_columns(130, min, 4), 3);
-        assert_eq!(pick_columns(180, min, 4), 4);
-        assert_eq!(pick_columns(300, min, 4), 4);
-    }
-
-    #[test]
-    fn pick_columns_capped_at_section_count() {
-        assert_eq!(pick_columns(1000, 10, 2), 2);
-        assert_eq!(pick_columns(1000, 10, 0), 0);
-    }
-
-    #[test]
-    fn distribute_preserves_reading_order() {
-        // For 4 sections across 1..=4 columns the partition must be
-        // contiguous so the user reads top-to-bottom, left-to-right.
-        for n_cols in 1..=4 {
-            let cols = distribute_sections(4, n_cols);
-            let mut prev = -1i32;
-            for c in &cols {
-                for &i in c {
-                    assert!(
-                        (i as i32) > prev,
-                        "section {i} out of order in {n_cols}-col layout"
-                    );
-                    prev = i as i32;
-                }
-            }
-            let total: usize = cols.iter().map(|c| c.len()).sum();
-            assert_eq!(total, 4, "every section must be placed");
+    fn pick_columns_scales_with_width_up_to_section_count() {
+        for (width, min, sections, want) in [
+            (30, 40, 4, 1),
+            (80, 40, 4, 1),
+            (85, 40, 4, 2),
+            (130, 40, 4, 3),
+            (180, 40, 4, 4),
+            (300, 40, 4, 4),
+            (1000, 10, 2, 2),
+            (1000, 10, 0, 0),
+        ] {
+            assert_eq!(pick_columns(width, min, sections), want, "{width}");
         }
     }
 
     #[test]
-    fn distribute_balances_section_counts() {
-        // 4 sections into 3 columns should give [2, 1, 1] (extras at the
-        // front), keeping column heights as close as possible.
-        let cols = distribute_sections(4, 3);
-        assert_eq!(cols.len(), 3);
-        assert_eq!(cols[0].len(), 2);
-        assert_eq!(cols[1].len(), 1);
-        assert_eq!(cols[2].len(), 1);
-    }
+    fn distribute_keeps_reading_order_and_balances_columns() {
+        // The partition must be contiguous so the user reads top-to-bottom,
+        // left-to-right.
+        for n_cols in 1..=4 {
+            let flat: Vec<usize> = distribute_sections(4, n_cols).concat();
+            assert_eq!(flat, [0, 1, 2, 3], "{n_cols}-col layout");
+        }
+        // Extras go to the front columns: 4 into 3 is [2, 1, 1].
+        let lens: Vec<usize> = distribute_sections(4, 3).iter().map(|c| c.len()).collect();
+        assert_eq!(lens, [2, 1, 1]);
 
-    #[test]
-    fn render_keeps_max_col_height_balanced() {
-        // Sanity check: the chosen 4 → 3 split keeps max column height
-        // below the naive [1, 3, 0] alternative that would happen if we
-        // pushed all extras to one column.
+        // That split keeps the tallest real column within the top-two sum.
         let sections = build_sections(false, SortOrder::Newest, false);
         let heights: Vec<usize> = sections.iter().map(section_height).collect();
-        let cols = distribute_sections(sections.len(), 3);
-        let max_h = cols
+        let max_h = distribute_sections(sections.len(), 3)
             .iter()
             .map(|c| c.iter().map(|&i| heights[i]).sum::<usize>())
             .max()
             .unwrap_or(0);
-        // Sum of the two largest sections is an upper bound on the
-        // tallest 3-column slot; assert we land at or below it.
         let mut sorted = heights.clone();
         sorted.sort_unstable_by(|a, b| b.cmp(a));
         let bound = sorted[0] + sorted.get(1).copied().unwrap_or(0);
-        assert!(
-            max_h <= bound,
-            "3-col layout produced max column {max_h} > top-two sum {bound}"
-        );
+        assert!(max_h <= bound, "max column {max_h} > top-two sum {bound}");
     }
 
     fn render_to_buffer(width: u16, height: u16, scroll: &mut u16) -> ratatui::buffer::Buffer {
@@ -706,35 +645,16 @@ mod tests {
     }
 
     #[test]
-    fn render_shows_scroll_hint_when_overflowing() {
-        // 60x14 is too small to fit all rows; the footer should show the
-        // scroll position.
-        let mut scroll = 0;
-        let buf = render_to_buffer(60, 14, &mut scroll);
-        assert!(
-            buffer_contains(&buf, "scroll"),
-            "scroll hint should be visible when content overflows"
-        );
-    }
-
-    #[test]
-    fn render_clamps_scroll_to_max() {
-        // u16::MAX overshoot must be clamped after render so 'g' /
-        // 'Home' from that state actually lands on something sensible.
+    fn render_clamps_scroll_and_hints_only_on_overflow() {
+        // 60x14 overflows: the footer shows the scroll position, and a
+        // u16::MAX overshoot clamps so 'g' / 'Home' land somewhere sensible.
         let mut scroll = u16::MAX;
-        let _buf = render_to_buffer(60, 14, &mut scroll);
-        assert!(
-            scroll < u16::MAX,
-            "scroll should be clamped to the layout max"
-        );
-    }
-
-    #[test]
-    fn render_with_no_overflow_keeps_scroll_zero() {
-        // A roomy viewport fits all content; scroll stays at 0 even if
-        // we pass a positive value in (it gets clamped to max=0).
+        let buf = render_to_buffer(60, 14, &mut scroll);
+        assert!(buffer_contains(&buf, "scroll"));
+        assert!(scroll < u16::MAX);
+        // A roomy viewport fits everything; scroll clamps to 0.
         let mut scroll = 5;
-        let _buf = render_to_buffer(200, 60, &mut scroll);
-        assert_eq!(scroll, 0, "no overflow should clamp scroll to 0");
+        render_to_buffer(200, 60, &mut scroll);
+        assert_eq!(scroll, 0);
     }
 }

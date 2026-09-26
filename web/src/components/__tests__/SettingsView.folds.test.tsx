@@ -181,7 +181,7 @@ describe("Settings Advanced fold", () => {
     expect(screen.queryByText("CPU limit")).toBeNull();
   });
 
-  it("saves structured-view advanced knobs through the normal path", async () => {
+  it("saves structured-view controls inside and outside the fold through the normal path", async () => {
     const { container } = renderView("structured-view");
     await screen.findByText("Show tool-call durations");
 
@@ -201,12 +201,8 @@ describe("Settings Advanced fold", () => {
     expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
       acp: { auto_stop_idle_secs: 28800 },
     });
-  });
 
-  it("exercises the structured-view high-level controls outside the fold", async () => {
-    const { container } = renderView("structured-view");
-    await screen.findByText("Show tool-call durations");
-
+    // High-level controls outside the fold save the same way.
     commit(fieldInputByLabel(container, "History cap (events)", "number"), "500");
     clickToggle(container, "Auto-resume after rate limit");
 

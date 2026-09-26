@@ -1,5 +1,5 @@
-//! A session's persisted model pick must be re-applied after every handshake,
-//! not just on a fresh `session/new`: the thought-level rule, for the model.
+//! A session's persisted model pick and pinned effort must be re-applied after
+//! every handshake, not just on a fresh `session/new`.
 //!
 //! A worker respawn resumes the stored ACP session via `session/load`. The pick
 //! travels to the adapter only as `AOE_AGENT_MODEL`, which claude-agent-acp
@@ -113,62 +113,77 @@ async fn run(config: SpawnConfig, label: &str) -> Vec<Event> {
     events
 }
 
-/// The respawn shape: the agent advertises `loadSession` and we hand it a
-/// stored id, so the handshake resumes via `session/load`. The persisted model
-/// must still be applied, or the pick the user made before the restart is gone.
+/// The persisted model and pinned effort are applied after every establish
+/// path: the respawn shape resumes via `session/load` (the agent advertises
+/// `loadSession` and we hand it a stored id), where both picks used to be lost,
+/// and `session/new` applies each exactly once. An unpinned session sends no
+/// config-option RPC at all, so it keeps the agent's own defaults.
 #[tokio::test]
 #[serial_test::parallel]
-async fn pinned_model_applied_on_session_load() {
+async fn pinned_model_and_effort_applied_on_load_and_new() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
     }
-    let temp = tempfile::tempdir().expect("tempdir");
-    let record_path = temp.path().join("config-option-calls.log");
-    let config = spawn_config(
-        shim_path(),
-        shim_env(&record_path, true, false),
-        Some("stored-model-session".into()),
-        Some("opus".into()),
-        None,
-    );
-    run(config, "model-load").await;
+    // (label, resume via load, model, effort, expected record line, exact count)
+    let cases = [
+        (
+            "model-load",
+            true,
+            Some("opus"),
+            None,
+            Some("model=opus"),
+            None,
+        ),
+        (
+            "model-new",
+            false,
+            Some("sonnet"),
+            None,
+            Some("model=sonnet"),
+            Some(1),
+        ),
+        (
+            "effort-load",
+            true,
+            None,
+            Some("high"),
+            Some("thought_level=high"),
+            None,
+        ),
+        (
+            "effort-new",
+            false,
+            None,
+            Some("high"),
+            Some("thought_level=high"),
+            Some(1),
+        ),
+        ("unpinned", true, None, None, None, None),
+    ];
+    for (label, load, model, effort, line, exact) in cases {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let record_path = temp.path().join("config-option-calls.log");
+        let config = spawn_config(
+            shim_path(),
+            shim_env(&record_path, load, effort.is_some() || model.is_none()),
+            (load && (model.is_some() || effort.is_some())).then(|| format!("stored-{label}")),
+            model.map(Into::into),
+            effort.map(Into::into),
+        );
+        run(config, label).await;
 
-    let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
-    assert!(
-        recorded.lines().any(|line| line == "model=opus"),
-        "a session/load respawn must re-apply the persisted model (recorded: {recorded:?})"
-    );
-}
-
-/// The fresh-session path applies the model exactly once.
-#[tokio::test]
-#[serial_test::parallel]
-async fn pinned_model_applied_once_on_session_new() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
+        let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
+        let Some(line) = line else {
+            assert!(recorded.trim().is_empty(), "{label}: {recorded:?}");
+            continue;
+        };
+        let count = recorded.lines().filter(|l| *l == line).count();
+        match exact {
+            Some(exact) => assert_eq!(count, exact, "{label}: {recorded:?}"),
+            None => assert!(count > 0, "{label}: {recorded:?}"),
+        }
     }
-    let temp = tempfile::tempdir().expect("tempdir");
-    let record_path = temp.path().join("config-option-calls.log");
-    let config = spawn_config(
-        shim_path(),
-        shim_env(&record_path, false, false),
-        None,
-        Some("sonnet".into()),
-        None,
-    );
-    run(config, "model-new").await;
-
-    let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
-    assert_eq!(
-        recorded
-            .lines()
-            .filter(|line| *line == "model=sonnet")
-            .count(),
-        1,
-        "session/new must apply the persisted model exactly once (recorded: {recorded:?})"
-    );
 }
 
 /// When the handshake response already reports the persisted value, the

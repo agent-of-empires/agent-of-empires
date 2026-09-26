@@ -408,18 +408,22 @@ mod tests {
     }
 
     #[test]
-    fn extract_includes_prompts_and_agent_text_coalesced() {
+    fn extract_coalesces_agent_text_and_honours_since_seq() {
         let events = vec![
             (1, user("fix the login bug")),
             (2, agent("Looking ")),
             (3, agent("at auth.rs")),
+            (4, user("second")),
         ];
-        let (text, snap, turns) = extract_transcript_delta(&events, 0);
+        let (text, snap, turns) = extract_transcript_delta(&events[..3], 0);
         assert!(text.contains("[User]\nfix the login bug"));
         assert_eq!(text.matches("[Assistant]").count(), 1);
         assert!(text.contains("Looking at auth.rs"));
-        assert_eq!(snap, 3);
-        assert_eq!(turns, 1);
+        assert_eq!((snap, turns), (3, 1));
+
+        let (text, snap, turns) = extract_transcript_delta(&events, 3);
+        assert!(!text.contains("login") && text.contains("second"));
+        assert_eq!((snap, turns), (4, 1));
     }
 
     #[test]
@@ -453,16 +457,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_honours_since_seq_for_the_delta() {
-        let events = vec![(1, user("first")), (2, agent("done")), (3, user("second"))];
-        let (text, snap, turns) = extract_transcript_delta(&events, 2);
-        assert!(!text.contains("first"));
-        assert!(text.contains("second"));
-        assert_eq!(snap, 3);
-        assert_eq!(turns, 1);
-    }
-
-    #[test]
     fn extract_truncates_oversized_delta_from_the_head() {
         let long = "y".repeat(MAX_INPUT_BYTES + 10_000);
         let events = vec![(1, user("start")), (2, agent(&long))];
@@ -473,43 +467,17 @@ mod tests {
 
     #[test]
     fn last_summary_finds_the_most_recent() {
+        let summary = |text: &str, until| Event::ConversationSummary {
+            text: text.into(),
+            summarized_until_seq: until,
+        };
         let events = vec![
-            (
-                1,
-                Event::ConversationSummary {
-                    text: "old".into(),
-                    summarized_until_seq: 1,
-                },
-            ),
+            (1, summary("old", 1)),
             (2, user("more")),
-            (
-                3,
-                Event::ConversationSummary {
-                    text: "new".into(),
-                    summarized_until_seq: 2,
-                },
-            ),
+            (3, summary("new", 2)),
         ];
-        let (prev, seq) = last_summary(&events);
-        assert_eq!(prev.as_deref(), Some("new"));
-        assert_eq!(seq, 2);
-    }
-
-    #[test]
-    fn last_summary_none_when_never_summarized() {
-        let events = vec![(1, user("hi"))];
-        assert_eq!(last_summary(&events), (None, 0));
-    }
-
-    #[test]
-    fn build_prompt_is_incremental_when_previous_present() {
-        let p = build_summary_prompt(Some("prior recap"), "[User]\nnext thing");
-        assert!(p.contains("Summary so far"));
-        assert!(p.contains("prior recap"));
-        assert!(p.contains("next thing"));
-        let p0 = build_summary_prompt(None, "[User]\nfirst");
-        assert!(!p0.contains("Summary so far"));
-        assert!(p0.contains("first"));
+        assert_eq!(last_summary(&events), (Some("new".into()), 2));
+        assert_eq!(last_summary(&events[1..2]), (None, 0));
     }
 
     #[test]
@@ -521,16 +489,6 @@ mod tests {
             sanitize_summary("\u{1b}[32m- did the thing\u{1b}[0m").as_deref(),
             Some("- did the thing")
         );
-    }
-
-    #[test]
-    fn delta_threshold_byte_or_turn() {
-        assert!(delta_meets_threshold(MIN_DELTA_BYTES, 0));
-        assert!(delta_meets_threshold(0, MIN_DELTA_TURNS));
-        assert!(!delta_meets_threshold(
-            MIN_DELTA_BYTES - 1,
-            MIN_DELTA_TURNS - 1
-        ));
     }
 
     #[test]

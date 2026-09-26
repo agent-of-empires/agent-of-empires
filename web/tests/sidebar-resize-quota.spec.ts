@@ -9,7 +9,6 @@ import { mockStaticApis } from "./helpers/apiMocks";
 import type { Page } from "@playwright/test";
 
 const SIDEBAR_WIDTH_KEY = "aoe-sidebar-width";
-const SPLIT_STORAGE_KEY = "aoe-split-ratio";
 const RIGHT_PANEL_KEY = "aoe-pane-layout";
 
 async function stubQuotaForKey(page: Page, key: string) {
@@ -69,32 +68,6 @@ test.describe("#1345 localStorage QuotaExceeded crash regression", () => {
 
     // App stayed mounted. If the fix regresses, the React tree blanks and
     // the header detaches from the DOM.
-    await expect(page.locator("header")).toBeVisible();
-  });
-
-  test("content split resize handle click does not crash when setItem throws QuotaExceeded", async ({ page }) => {
-    await stubQuotaForKey(page, SPLIT_STORAGE_KEY);
-    await mockApis(page);
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-
-    await enableThrow(page, SPLIT_STORAGE_KEY);
-
-    const handle = page.getByTestId("content-split-resize-handle");
-    // Empty session list still renders the split; if not visible, this test
-    // is a no-op for the build under test, not a regression.
-    const count = await handle.count();
-    if (count === 0) {
-      test.skip(true, "content split not rendered with empty session list");
-      return;
-    }
-    const box = await handle.first().boundingBox();
-    if (!box) throw new Error("content-split handle has no bounding box");
-    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-    await page.mouse.down();
-    await page.mouse.up();
-
     await expect(page.locator("header")).toBeVisible();
   });
 

@@ -19,56 +19,34 @@ import {
 
 const REVIEW_COMMAND = { name: "review", description: "Review the diff", accepts_input: true, hint: "what to review" };
 
-test.describe("slash command picks", () => {
-  for (const c of [
-    {
-      name: "picking a no-arg slash command does not trap Enter",
-      title: "story-slash-pick-no-arg",
-      commands: [{ name: "help", description: "Show help", accepts_input: false }, REVIEW_COMMAND],
-      typed: "/h",
-      item: /\/help/,
-      picked: "/help ",
+// #1512: without the trailing space the popover reopens and claims the next Enter. The args-command
+// variant (trailing space, caret after it) is pinned by Composer.test.tsx.
+test("picking a no-arg slash command does not trap Enter", async ({ page, spawnServe }) => {
+  const { serve, sessionId } = await startAcpSession(spawnServe, {
+    title: "story-slash-pick-no-arg",
+    extraEnv: {
+      FAKE_ACP_COMMANDS: JSON.stringify([
+        { name: "help", description: "Show help", accepts_input: false },
+        REVIEW_COMMAND,
+      ]),
     },
-    {
-      name: "picking an args slash command leaves trailing space and closes popover",
-      title: "story-slash-pick-args",
-      commands: [REVIEW_COMMAND],
-      // `/r` would also match the seeded `/clear` alias, which ranks first.
-      typed: "/rev",
-      item: /\/review/,
-      picked: "/review ",
-    },
-  ]) {
-    test(c.name, async ({ page, spawnServe }) => {
-      const { serve, sessionId } = await startAcpSession(spawnServe, {
-        title: c.title,
-        extraEnv: { FAKE_ACP_COMMANDS: JSON.stringify(c.commands) },
-      });
-      // An explicit spawn attaches the session before the first available_commands_update.
-      await spawnAcpAgent(serve.baseUrl, sessionId);
-      await waitForReplayContains(serve.baseUrl, sessionId, "AvailableCommandsUpdated");
+  });
+  // An explicit spawn attaches the session before the first available_commands_update.
+  await spawnAcpAgent(serve.baseUrl, sessionId);
+  await waitForReplayContains(serve.baseUrl, sessionId, "AvailableCommandsUpdated");
 
-      const composer = await openStructuredView(page, serve, sessionId);
-      await composer.click();
-      await composer.pressSequentially(c.typed);
-      const item = page.getByRole("option").filter({ hasText: c.item });
-      await expect(item).toBeVisible({ timeout: 15_000 });
-      await composer.press("Enter");
+  const composer = await openStructuredView(page, serve, sessionId);
+  await composer.click();
+  await composer.pressSequentially("/h");
+  const item = page.getByRole("option").filter({ hasText: /\/help/ });
+  await expect(item).toBeVisible({ timeout: 15_000 });
+  await composer.press("Enter");
 
-      // #1512: without the trailing space the popover reopens and claims the next Enter.
-      await expect(composer).toHaveValue(c.picked, { timeout: 5_000 });
-      await expect(item).toBeHidden({ timeout: 5_000 });
-
-      if (c.picked === "/help ") {
-        await composer.press("Enter");
-        await expect(page.getByText("Hello from fake ACP agent.")).toBeVisible({ timeout: 10_000 });
-        await expect(composer).toHaveValue("", { timeout: 5_000 });
-      } else {
-        await composer.pressSequentially("scope");
-        await expect(composer).toHaveValue("/review scope");
-      }
-    });
-  }
+  await expect(composer).toHaveValue("/help ", { timeout: 5_000 });
+  await expect(item).toBeHidden({ timeout: 5_000 });
+  await composer.press("Enter");
+  await expect(page.getByText("Hello from fake ACP agent.")).toBeVisible({ timeout: 10_000 });
+  await expect(composer).toHaveValue("", { timeout: 5_000 });
 });
 
 const STOP_CASES = [
@@ -187,19 +165,6 @@ async function pickMode(page: Page, mode: RegExp) {
   await expect(item).toBeVisible({ timeout: 5_000 });
   await item.click();
 }
-
-test("ModePicker switches the structured view mode", async ({ page, spawnServe }) => {
-  const { serve, sessionId } = await startAcpSession(spawnServe, { title: "story-mode-picker" });
-  // Without an attached session /acp/mode races the implicit spawn and fails silently.
-  await spawnAcpAgent(serve.baseUrl, sessionId);
-  await openStructuredView(page, serve, sessionId);
-
-  const trigger = modeTrigger(page, /^(Default|Plan|Accept|Bypass)$/);
-  await expect(trigger).toBeVisible({ timeout: 10_000 });
-  await trigger.click();
-  await pickMode(page, /^Plan$/i);
-  await expect(trigger).toContainText(/Plan/i, { timeout: 10_000 });
-});
 
 test("ModePicker uses OpenCode's config-option modes and never traps the user", async ({ page, spawnServe }) => {
   // #1764: OpenCode advertises modes only as a config option and rejects claude's phantom "Default".

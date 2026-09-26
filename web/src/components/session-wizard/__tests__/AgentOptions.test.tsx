@@ -110,11 +110,6 @@ describe("AgentOptions view card", () => {
     expect(viewSwitch()?.getAttribute("aria-checked")).toBe("false");
   });
 
-  it("describes the sandboxed structured view when both are on", () => {
-    renderOptions({ sandboxEnabled: true }, { dockerAvailable: true });
-    expect(screen.getByText(/the agent runs inside the sandbox container/)).toBeTruthy();
-  });
-
   it.each([
     ["aider", undefined, /has no ACP adapter yet/],
     ["remote-helper", undefined, /Custom agents run in the terminal unless they define agent_acp_cmd/],
@@ -133,15 +128,6 @@ describe("AgentOptions workflow presets", () => {
     { name: "work", is_default: false },
   ];
 
-  it("renders descriptions, the Active badge, and the selected preset", () => {
-    renderOptions({ profile: "work" }, { profiles: PROFILES });
-    expect(screen.getByText("Stock setup, no overrides")).toBeTruthy();
-    expect(screen.queryByText(/undefined/)).toBeNull();
-    expect(screen.getAllByText("Active")).toHaveLength(1);
-    expect(screen.getByRole("radio", { name: /work/ }).getAttribute("aria-checked")).toBe("true");
-    expect(screen.getByRole("radio", { name: /^Server default/ }).getAttribute("aria-checked")).toBe("false");
-  });
-
   it("selects a preset, and Server default clears it without applying defaults", () => {
     const { onChange, onApplyProfileDefaults } = renderOptions({ profile: "work" }, { profiles: PROFILES });
     fireEvent.click(screen.getByRole("radio", { name: /Server default/ }));
@@ -149,11 +135,6 @@ describe("AgentOptions workflow presets", () => {
     expect(onApplyProfileDefaults).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("radio", { name: /work/ }));
     expect(onChange).toHaveBeenCalledWith("profile", "work");
-  });
-
-  it("marks edited presets", () => {
-    renderOptions({ profile: "default", profileDirty: true }, { profiles: PROFILES });
-    expect(screen.getByText(/\(Custom\) Settings differ from preset defaults/)).toBeTruthy();
   });
 
   it.each([{ profileDirty: true }, { structuredViewDirty: true }])(

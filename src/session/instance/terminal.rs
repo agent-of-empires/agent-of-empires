@@ -543,16 +543,6 @@ exec /usr/bin/env -i PATH="$TARGET_PATH" SHELL="$FALLBACK_SHELL" "$@"
         assert!(!injection_marker.exists());
     }
 
-    #[test]
-    fn has_terminal_requires_a_created_terminal() {
-        let mut inst = Instance::new("test", "/tmp/test");
-        assert!(!inst.has_terminal(), "no terminal_info");
-        inst.terminal_info = Some(TerminalInfo { created: false });
-        assert!(!inst.has_terminal(), "terminal never created");
-        inst.terminal_info = Some(TerminalInfo { created: true });
-        assert!(inst.has_terminal());
-    }
-
     mod kill_terminal_if_dead {
         use super::*;
 

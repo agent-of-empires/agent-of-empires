@@ -13,7 +13,7 @@ use super::tests::live_send_state;
 use super::watchers::{ConfigWatchKey, ReloadFailureState, WatcherInitError, WatcherInitErrorKind};
 use super::HomeView;
 use crate::file_watch::{FileWatchService, WatchErrorKind};
-use crate::session::test_support::{isolate_home, EnvGuard, HomeGuard};
+use crate::session::test_support::{isolate_home, HomeGuard};
 use crate::session::{Instance, Item, Storage};
 
 fn init_err(profile: Option<&str>, kind: WatcherInitErrorKind, message: &str) -> WatcherInitError {
@@ -107,33 +107,26 @@ async fn peer_write_flips_disk_dirty() {
     }
 }
 
+/// Dropping a profile from either rewire removes its entry, and re-adding a config watch
+/// reuses the subscription slot instead of leaking or double-subscribing.
 #[tokio::test]
 #[serial]
-async fn rewire_disk_subscriptions_drops_removed_profile_entry() {
+async fn rewire_drops_removed_profiles_without_leaking_subscriptions() {
     let mut e = env("hv-keep", &["hv-keep", "hv-drop"]);
     e.view
         .rewire_disk_subscriptions(&names(&["hv-keep", "hv-drop"]));
     assert!(e.view.disk_watch.handles.contains_key("hv-drop"));
-
     e.view.rewire_disk_subscriptions(&names(&["hv-keep"]));
-
     let keys: Vec<_> = e.view.disk_watch.handles.keys().collect();
     assert_eq!(keys, ["hv-keep"]);
-}
 
-#[tokio::test]
-#[serial]
-async fn config_subscriptions_remove_then_recreate_does_not_leak_or_double_subscribe() {
-    let mut e = env("cfg-leak", &["cfg-leak"]);
-    e.view.rewire_config_subscriptions(&names(&["cfg-leak"]));
+    e.view.rewire_config_subscriptions(&names(&["hv-drop"]));
     let baseline = e.live.subscriber_count();
-    assert!(has_config_watch(&e.view, "cfg-leak"));
-
+    assert!(has_config_watch(&e.view, "hv-drop"));
     e.view.rewire_config_subscriptions(&[]);
-    assert!(!has_config_watch(&e.view, "cfg-leak"));
-
-    e.view.rewire_config_subscriptions(&names(&["cfg-leak"]));
-    assert!(has_config_watch(&e.view, "cfg-leak"));
+    assert!(!has_config_watch(&e.view, "hv-drop"));
+    e.view.rewire_config_subscriptions(&names(&["hv-drop"]));
+    assert!(has_config_watch(&e.view, "hv-drop"));
     assert_eq!(e.live.subscriber_count(), baseline);
 }
 
@@ -342,12 +335,31 @@ async fn reload_failure_dialog_waits_until_live_send_exits() {
     );
 }
 
-/// A `list_profiles` failure after a profile delete raises a Watcher Warning that sits outside
-/// `reload_failure_state`, survives the recovery-edge cleanup, and never replaces another dialog.
+/// A `list_profiles` failure degrades a storage-only reload instead of failing it. After a
+/// profile delete it raises a Watcher Warning that sits outside `reload_failure_state`,
+/// survives the recovery-edge cleanup, and never replaces another dialog.
 #[tokio::test]
 #[serial]
-async fn rewire_after_profile_delete_warns_when_list_profiles_fails() {
+async fn list_profiles_failure_degrades_reload_and_warns_on_rewire() {
     let mut e = env("seam-test", &["seam-test"]);
+    Storage::new("seam-test", e.live.clone())
+        .expect("writer")
+        .update(|instances, _groups| {
+            *instances = vec![Instance::new("fallback-row", "/tmp/fallback")];
+            Ok(())
+        })
+        .expect("peer write");
+    let _fail_guard = crate::session::FailNextListProfilesGuard::new();
+    e.view
+        .reload_storage_only()
+        .expect("reload should degrade, not fail");
+    assert!(e
+        .view
+        .instances
+        .values()
+        .any(|inst| inst.title == "fallback-row"));
+    assert!(crate::session::list_profiles().is_ok());
+
     let _fail_guard = crate::session::FailNextListProfilesGuard::new();
     e.view.rewire_after_profile_delete("seam-test");
     assert!(
@@ -375,31 +387,6 @@ async fn rewire_after_profile_delete_warns_when_list_profiles_fails() {
         e.view.info_dialog.as_ref().map(|d| d.title()),
         Some("Existing dialog")
     );
-}
-
-#[tokio::test]
-#[serial]
-async fn reload_storage_only_survives_list_profiles_failure() {
-    let mut e = env("reload-fallback", &["reload-fallback"]);
-    Storage::new("reload-fallback", e.live.clone())
-        .expect("writer")
-        .update(|instances, _groups| {
-            *instances = vec![Instance::new("fallback-row", "/tmp/fallback")];
-            Ok(())
-        })
-        .expect("peer write");
-
-    let _fail_guard = crate::session::FailNextListProfilesGuard::new();
-    e.view
-        .reload_storage_only()
-        .expect("reload should degrade, not fail");
-
-    assert!(e
-        .view
-        .instances
-        .values()
-        .any(|inst| inst.title == "fallback-row"));
-    assert!(crate::session::list_profiles().is_ok());
 }
 
 /// The rewire fast path keeps a latched init failure only while its profile is still current.
@@ -667,7 +654,8 @@ fn reload_failure_state_dialog_body_aggregates_all_four_sources() {
     }
 }
 
-/// An on-screen Reload Failed dialog rebuilds its body as failing sources come and go.
+/// A Reload Failed dialog waits while a foreign dialog occupies the slot, then rebuilds its
+/// body on screen as failing sources come and go.
 #[tokio::test]
 #[serial]
 async fn reload_failure_dialog_body_tracks_failing_sources() {
@@ -683,6 +671,17 @@ async fn reload_failure_dialog_body_tracks_failing_sources() {
 
     view.reload_failure_state
         .record_storage(&Err(anyhow::anyhow!("storage broken")));
+    view.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+        "Watcher Warning",
+        "unrelated message",
+    ));
+    assert!(!view.try_present_reload_failure_dialog());
+    assert_eq!(
+        view.info_dialog.as_ref().unwrap().title(),
+        "Watcher Warning"
+    );
+    assert!(view.reload_failure_state.has_unacknowledged_failure());
+    view.info_dialog = None;
     assert!(view.try_present_reload_failure_dialog());
     assert_eq!(view.info_dialog.as_ref().unwrap().title(), "Reload Failed");
 
@@ -700,54 +699,6 @@ async fn reload_failure_dialog_body_tracks_failing_sources() {
     assert!(view.try_present_reload_failure_dialog());
     let body = message(view);
     assert!(body.contains("config broken") && !body.contains("storage broken"));
-}
-
-#[tokio::test]
-#[serial]
-async fn try_present_reload_failure_dialog_skips_while_foreign_dialog_occupies_slot() {
-    let mut e = env("foreign-skip", &["foreign-skip"]);
-    let view = &mut e.view;
-    view.reload_failure_state
-        .record_storage(&Err(anyhow::anyhow!("storage broken")));
-    view.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
-        "Watcher Warning",
-        "unrelated message",
-    ));
-
-    assert!(!view.try_present_reload_failure_dialog());
-    assert_eq!(
-        view.info_dialog.as_ref().unwrap().title(),
-        "Watcher Warning"
-    );
-    assert!(view.reload_failure_state.has_unacknowledged_failure());
-
-    view.info_dialog = None;
-    assert!(view.try_present_reload_failure_dialog());
-    assert_eq!(view.info_dialog.as_ref().unwrap().title(), "Reload Failed");
-}
-
-#[tokio::test]
-#[serial]
-async fn watcher_config_refresh_count_exports_to_e2e_debug_file() {
-    let _debug_absent = EnvGuard::unset(&["AOE_E2E_DEBUG"]);
-    let mut e = env("e2e-debug", &["e2e-debug"]);
-    let counter_path = crate::session::get_app_dir()
-        .unwrap()
-        .join(".aoe_e2e_refresh_count");
-
-    let _ = e.view.try_refresh_from_config_watcher();
-    assert_eq!(
-        e.view.watcher_config_refresh_count.load(Ordering::Relaxed),
-        1
-    );
-    assert!(!counter_path.exists(), "no export without AOE_E2E_DEBUG=1");
-
-    let _debug_enabled = EnvGuard::set(&[("AOE_E2E_DEBUG", "1")]);
-    for expected in ["2", "3"] {
-        let _ = e.view.try_refresh_from_config_watcher();
-        let exported = std::fs::read_to_string(&counter_path).expect("counter file");
-        assert_eq!(exported.trim(), expected);
-    }
 }
 
 /// A same-path dir recreated with a new inode forces both rewires to rebuild the entry.

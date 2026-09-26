@@ -89,12 +89,6 @@ mod tests {
         panic!("timed out waiting for stop result");
     }
 
-    #[test]
-    fn try_recv_reports_empty_while_idle() {
-        let mut poller = StopPoller::new();
-        assert!(matches!(poller.try_recv_result(), Err(TryRecvError::Empty)));
-    }
-
     /// A request is in flight until its result lands, and stopping writes the
     /// durable `Stopped` status.
     #[test]

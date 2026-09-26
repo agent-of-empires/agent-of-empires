@@ -40,32 +40,15 @@ fn scrollbar_hit(env: &TestEnv) -> Option<(u16, u16)> {
     None
 }
 
-/// Wheel-down while Settings is open must be consumed by the fields
-/// panel (returns true), not swallowed by the `has_dialog()` guard.
+/// A scrollbar press starts a `SettingsScrollbar` drag that survives moves until release,
+/// wheel-down is consumed by the fields panel, and a click off the bar falls through to
+/// normal settings routing without starting a drag.
 #[test]
 #[serial]
-fn wheel_routes_into_open_settings() {
+fn settings_takeover_owns_wheel_and_scrollbar_drag() {
     let mut env = create_test_env_empty();
     open_overflowing_settings(&mut env);
-    assert!(
-        scrollbar_hit(&env).is_some(),
-        "fields must overflow at this size so there is something to scroll"
-    );
-    assert!(
-        env.view.handle_scroll_down(10, 10),
-        "a wheel-down must scroll the settings fields panel"
-    );
-}
-
-/// Pressing the scrollbar starts a `SettingsScrollbar` drag, and a
-/// subsequent move keeps it alive (the drag path no longer cancels on
-/// `has_dialog()`), until release clears it.
-#[test]
-#[serial]
-fn scrollbar_press_starts_a_drag_that_survives_moves() {
-    let mut env = create_test_env_empty();
-    open_overflowing_settings(&mut env);
-    let (col, row) = scrollbar_hit(&env).expect("scrollbar should render");
+    let (col, row) = scrollbar_hit(&env).expect("fields must overflow so a scrollbar renders");
 
     assert!(
         env.view.handle_dialog_click(col, row),
@@ -75,24 +58,19 @@ fn scrollbar_press_starts_a_drag_that_survives_moves() {
         matches!(env.view.drag_state, Some(DragKind::SettingsScrollbar)),
         "the press seeds a scrollbar drag"
     );
-
     env.view.handle_drag_move(col, row.saturating_add(2));
     assert!(
         matches!(env.view.drag_state, Some(DragKind::SettingsScrollbar)),
         "the drag must survive a move even though has_dialog() is true"
     );
-
     env.view.handle_drag_end();
     assert!(env.view.drag_state.is_none(), "release ends the drag");
-}
 
-/// A plain click that misses the scrollbar must NOT start a scrollbar
-/// drag; it falls through to the normal settings click routing.
-#[test]
-#[serial]
-fn click_off_the_scrollbar_does_not_start_a_drag() {
-    let mut env = create_test_env_empty();
-    open_overflowing_settings(&mut env);
+    assert!(
+        env.view.handle_scroll_down(10, 10),
+        "a wheel-down must scroll the settings fields panel"
+    );
+
     // Column 2 is deep in the categories panel, nowhere near the bar.
     assert!(env.view.handle_dialog_click(2, 6));
     assert!(

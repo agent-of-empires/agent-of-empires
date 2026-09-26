@@ -56,78 +56,41 @@ fn delete_action_does_not_wait_for_lifecycle_flock() {
     );
 }
 
+/// A TUI save with a stale view merges peer writes (a field, a new row, a new group) instead
+/// of clobbering them.
 #[test]
 #[serial]
-fn test_save_preserves_peer_field_update() {
-    let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
+fn test_save_preserves_peer_writes() {
+    let (_temp, _guard, mut view, id) = boot_view_with_one_session("a", "/tmp/a");
 
-    let peer_storage = Storage::new_unwatched("test").unwrap();
     let peer_archived_at = Utc::now();
-    peer_storage
-        .update(|insts, _| {
+    Storage::new_unwatched("test")
+        .unwrap()
+        .update(|insts, groups| {
             if let Some(inst) = insts.iter_mut().find(|i| i.id == id) {
                 inst.archived_at = Some(peer_archived_at);
             }
-            Ok(())
-        })
-        .unwrap();
-
-    view.save().expect("save must merge peer-owned field write");
-
-    let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
-    let row = reloaded.iter().find(|i| i.id == id).expect("row present");
-    assert_eq!(
-        row.archived_at,
-        Some(peer_archived_at),
-        "peer's archive must survive a TUI save with stale view"
-    );
-}
-
-#[test]
-#[serial]
-fn test_save_preserves_peer_added_row() {
-    let (_temp, _guard, mut view, _id) = boot_view_with_one_session("a", "/tmp/a");
-
-    let peer_storage = Storage::new_unwatched("test").unwrap();
-    peer_storage
-        .update(|insts, _| {
             insts.push(Instance::new("peer-added", "/tmp/peer"));
+            groups.push(crate::session::Group::new("peer-grp", "peer-grp"));
             Ok(())
         })
         .unwrap();
 
-    view.save()
-        .expect("save must not delete rows the TUI does not know about");
+    view.save().expect("save must merge peer writes");
 
-    let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
-    assert!(
-        reloaded.iter().any(|i| i.title == "peer-added"),
-        "peer-added row must survive TUI save"
-    );
-    assert!(
-        reloaded.iter().any(|i| i.title == "a"),
-        "TUI's known row must remain"
-    );
+    let (reloaded, groups) = Storage::new_unwatched("test")
+        .unwrap()
+        .load_with_groups()
+        .unwrap();
+    let row = reloaded.iter().find(|i| i.id == id).expect("row present");
+    assert_eq!(row.archived_at, Some(peer_archived_at), "peer field write");
+    assert!(reloaded.iter().any(|i| i.title == "peer-added"), "peer row");
+    assert!(groups.iter().any(|g| g.path == "peer-grp"), "peer group");
 }
 
 #[test]
 #[serial]
 fn test_save_drops_explicitly_deleted_row() {
-    let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/victim");
-
-    view.remove_instance(&id);
-    view.save().expect("save must propagate the delete");
-
-    let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
-    assert!(
-        !reloaded.iter().any(|i| i.id == id),
-        "tombstoned row must be removed from disk"
-    );
-}
-
-#[test]
-#[serial]
-fn test_save_drains_pending_deletions_on_ok() {
     let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/victim");
 
     view.remove_instance(&id);
@@ -137,58 +100,21 @@ fn test_save_drains_pending_deletions_on_ok() {
             .is_some_and(|s| s.contains(&id)),
         "remove_instance must populate pending_deletions"
     );
+    view.save().expect("save must propagate the delete");
 
-    view.save().unwrap();
-
+    let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
+    assert!(
+        !reloaded.iter().any(|i| i.id == id),
+        "tombstoned row must be removed from disk"
+    );
     assert!(
         !view.pending_deletions.contains_key("test"),
         "pending_deletions must drain on Ok save"
     );
 }
 
-#[test]
-#[serial]
-fn test_save_preserves_peer_added_group() {
-    let (_temp, _guard, mut view, _id) = boot_view_with_one_session("a", "/tmp/a");
-
-    let peer_storage = Storage::new_unwatched("test").unwrap();
-    peer_storage
-        .update(|_insts, groups| {
-            groups.push(crate::session::Group::new("peer-grp", "peer-grp"));
-            Ok(())
-        })
-        .unwrap();
-
-    view.save()
-        .expect("save must not clobber groups the TUI does not know about");
-
-    let reloaded = Storage::new_unwatched("test")
-        .unwrap()
-        .load_with_groups()
-        .unwrap()
-        .1;
-    assert!(
-        reloaded.iter().any(|g| g.path == "peer-grp"),
-        "peer-added group must survive TUI save"
-    );
-}
-
-#[test]
-#[serial]
-fn test_apply_user_action_persists_atomically() {
-    let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
-
-    view.apply_user_action(&id, |inst| inst.archive())
-        .expect("apply_user_action must persist");
-
-    let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
-    let row = reloaded.iter().find(|i| i.id == id).expect("row present");
-    assert!(
-        row.archived_at.is_some(),
-        "apply_user_action must persist archived_at to disk"
-    );
-}
-
+/// `apply_user_action` persists its own edit with a field-level merge, so unrelated peer
+/// writes survive.
 #[test]
 #[serial]
 fn test_apply_user_action_does_not_clobber_peer_field() {
@@ -199,6 +125,7 @@ fn test_apply_user_action_does_not_clobber_peer_field() {
         .update(|insts, _| {
             if let Some(inst) = insts.iter_mut().find(|i| i.id == id) {
                 inst.notify_on_waiting = Some(true);
+                inst.group_path = "peer/group".to_string();
             }
             Ok(())
         })
@@ -210,11 +137,8 @@ fn test_apply_user_action_does_not_clobber_peer_field() {
     let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
     let row = reloaded.iter().find(|i| i.id == id).expect("row present");
     assert!(row.archived_at.is_some(), "TUI archive landed");
-    assert_eq!(
-        row.notify_on_waiting,
-        Some(true),
-        "peer's notify_on_waiting must survive an apply_user_action that does not touch it"
-    );
+    assert_eq!(row.notify_on_waiting, Some(true));
+    assert_eq!(row.group_path, "peer/group");
 }
 
 #[test]
@@ -276,36 +200,6 @@ fn test_apply_user_action_archive_clears_peer_snooze() {
 
 #[test]
 #[serial]
-fn test_apply_user_action_preserves_peer_user_action_field() {
-    // Field-level merge regression: a TUI snooze must not clobber an unrelated peer write
-    // (group_path). Snooze rather than archive, so `snoozed_until` is touched on both sides
-    // and the peer-field-survival invariant is isolated from the XOR rules above.
-    let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
-
-    let peer_storage = Storage::new_unwatched("test").unwrap();
-    peer_storage
-        .update(|insts, _| {
-            if let Some(inst) = insts.iter_mut().find(|i| i.id == id) {
-                inst.group_path = "peer/group".to_string();
-            }
-            Ok(())
-        })
-        .unwrap();
-
-    view.apply_user_action(&id, |inst| inst.snooze(30))
-        .expect("snooze must persist");
-
-    let reloaded = Storage::new_unwatched("test").unwrap().load().unwrap();
-    let row = reloaded.iter().find(|i| i.id == id).expect("row present");
-    assert!(row.snoozed_until.is_some(), "TUI snooze landed");
-    assert_eq!(
-        row.group_path, "peer/group",
-        "peer-written group_path must survive a TUI snooze that does not touch the field",
-    );
-}
-
-#[test]
-#[serial]
 fn test_save_drops_peer_deleted_row_from_mirror() {
     let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/peer-rm");
 
@@ -337,46 +231,30 @@ fn test_save_drops_peer_deleted_row_from_mirror() {
     );
 }
 
+/// A TUI-added row is pushed to disk; one added and removed in the same cycle never is.
 #[test]
 #[serial]
 fn test_save_pushes_tui_added_row_to_disk() {
     let (_temp, _guard, mut view, _) = boot_view_with_one_session("seed", "/tmp/seed");
 
-    let mut new_inst = Instance::new("tui-added", "/tmp/added");
-    new_inst.source_profile = "test".to_string();
-    let new_id = new_inst.id.clone();
-    view.add_instance(new_inst);
+    let mut added = Instance::new("tui-added", "/tmp/added");
+    added.source_profile = "test".to_string();
+    let added_id = added.id.clone();
+    view.add_instance(added);
+    let mut ephemeral = Instance::new("ephemeral", "/tmp/ephemeral");
+    ephemeral.source_profile = "test".to_string();
+    let ephemeral_id = ephemeral.id.clone();
+    view.add_instance(ephemeral);
+    view.remove_instance(&ephemeral_id);
 
     view.save().expect("save must persist TUI-added row");
 
     let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
-    assert!(
-        disk.iter().any(|i| i.id == new_id),
-        "TUI-added row must be persisted to disk"
-    );
+    assert!(disk.iter().any(|i| i.id == added_id));
+    assert!(!disk.iter().any(|i| i.id == ephemeral_id));
     assert!(
         !view.pending_added.contains_key("test"),
         "pending_added must drain on Ok save"
-    );
-}
-
-#[test]
-#[serial]
-fn test_save_add_then_remove_in_same_cycle_does_not_persist() {
-    let (_temp, _guard, mut view, _) = boot_view_with_one_session("seed", "/tmp/seed");
-
-    let mut new_inst = Instance::new("ephemeral", "/tmp/ephemeral");
-    new_inst.source_profile = "test".to_string();
-    let new_id = new_inst.id.clone();
-    view.add_instance(new_inst);
-    view.remove_instance(&new_id);
-
-    view.save().expect("save must succeed");
-
-    let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
-    assert!(
-        !disk.iter().any(|i| i.id == new_id),
-        "add+remove in same save cycle must not leak the row to disk"
     );
 }
 
@@ -434,15 +312,30 @@ fn test_move_to_profile_commits_without_pending_bookkeeping() {
     assert!(in_memory.force_fresh_next_launch);
 }
 
+/// A same-profile move only regroups (no tombstone); a cross-profile move then saves the row
+/// under the target profile only.
 #[test]
 #[serial]
 fn test_move_to_profile_save_roundtrip_persists_under_target() {
     let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
+
+    let mut requested = view.get_instance(&id).unwrap().clone();
+    requested.group_path = "newgrp".to_string();
+    view.move_to_profile(&id, "test", requested, None, false)
+        .unwrap();
+    assert!(
+        !view
+            .pending_deletions
+            .get("test")
+            .is_some_and(|ids| ids.contains(&id)),
+        "same-profile move must NOT tombstone the row"
+    );
+    assert_eq!(view.get_instance(&id).unwrap().group_path, "newgrp");
+
     view.storages.insert(
         "target".to_string(),
         Storage::new_unwatched("target").unwrap(),
     );
-
     let mut requested = view.get_instance(&id).unwrap().clone();
     requested.group_path.clear();
     view.move_to_profile(&id, "target", requested, None, false)
@@ -746,24 +639,6 @@ fn restart_profile_move_rejects_invalid_targets_before_mutation() {
 
 #[test]
 #[serial]
-fn test_move_to_profile_same_profile_only_updates_group_path() {
-    let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
-
-    let mut requested = view.get_instance(&id).unwrap().clone();
-    requested.group_path = "newgrp".to_string();
-    view.move_to_profile(&id, "test", requested, None, false)
-        .unwrap();
-
-    assert!(
-        !view.pending_deletions.contains_key("test")
-            || !view.pending_deletions.get("test").unwrap().contains(&id),
-        "same-profile move must NOT tombstone the row"
-    );
-    assert_eq!(view.get_instance(&id).unwrap().group_path, "newgrp");
-}
-
-#[test]
-#[serial]
 fn test_reload_honors_peer_cleared_session_id() {
     let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/sid");
 
@@ -844,6 +719,24 @@ fn stamp_last_accessed_on_archived_row_unsinks_persistently() {
     assert!(
         !archived_section_present(&view.flat_items),
         "Archived section must disappear once the only archived row is unsunk"
+    );
+
+    // Snoozed sibling: `snoozed_until` is also excluded from `merge_from_tui`.
+    view.apply_user_action(&id, |inst| inst.snooze(30))
+        .expect("seed snooze must persist");
+    assert!(view.get_instance(&id).unwrap().is_snoozed());
+    view.stamp_last_accessed(&id);
+    assert!(!view.get_instance(&id).unwrap().is_snoozed());
+    let disk_row = Storage::new_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.id == id)
+        .expect("disk row present");
+    assert!(
+        disk_row.snoozed_until.is_none(),
+        "stamp_last_accessed must persist the auto-unsnooze"
     );
 }
 #[test]
@@ -1134,38 +1027,4 @@ fn tied_cross_profile_collision_rejects_before_worktree_effects() {
     assert_eq!(source.title, "old-name");
     assert_eq!(source.project_path, old_path.to_string_lossy().to_string());
     assert_eq!(source.worktree_info.unwrap().branch, "old-name");
-}
-
-/// Snoozed sibling of the archive case: `snoozed_until` is also cleared by
-/// `touch_last_accessed` and also excluded from `merge_from_tui`, so the same persistence
-/// bug applied, with the same fix path.
-#[test]
-#[serial]
-fn stamp_last_accessed_on_snoozed_row_persistently_clears_snooze() {
-    let (_temp, _guard, mut view, id) = boot_view_with_one_session("session", "/tmp/grp");
-
-    view.apply_user_action(&id, |inst| inst.snooze(30))
-        .expect("seed snooze must persist");
-    assert!(
-        view.get_instance(&id).unwrap().is_snoozed(),
-        "precondition: row snoozed in memory"
-    );
-
-    view.stamp_last_accessed(&id);
-
-    assert!(
-        !view.get_instance(&id).unwrap().is_snoozed(),
-        "stamp_last_accessed must clear snoozed_until in memory"
-    );
-    let disk_row = Storage::new_unwatched("test")
-        .unwrap()
-        .load()
-        .unwrap()
-        .into_iter()
-        .find(|i| i.id == id)
-        .expect("disk row present");
-    assert!(
-        disk_row.snoozed_until.is_none(),
-        "stamp_last_accessed must persist the auto-unsnooze (merge_from_tui drops snoozed_until)"
-    );
 }

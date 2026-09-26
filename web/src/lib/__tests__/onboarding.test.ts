@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { expect, it } from "vitest";
 import { shouldShowWelcome } from "../onboarding";
 
 const base = {
@@ -10,37 +10,18 @@ const base = {
   welcomeSeen: false,
 };
 
-describe("shouldShowWelcome", () => {
-  it("shows on a settled, writable, never-onboarded dashboard", () => {
-    expect(shouldShowWelcome(base)).toBe(true);
-  });
-
-  it("waits until the dashboard is settled", () => {
-    expect(shouldShowWelcome({ ...base, autoLaunchReady: false })).toBe(false);
-  });
-
-  it("only shows on the dashboard scope", () => {
-    expect(shouldShowWelcome({ ...base, scope: "session" })).toBe(false);
-    expect(shouldShowWelcome({ ...base, scope: "structured-view" })).toBe(false);
-  });
-
-  it("is suppressed in read-only mode (cannot persist a theme)", () => {
-    expect(shouldShowWelcome({ ...base, readOnly: true })).toBe(false);
-  });
-
-  it("is suppressed in automated sessions", () => {
-    expect(shouldShowWelcome({ ...base, automated: true })).toBe(false);
-  });
-
-  it("does not re-prompt users who already finished the tour (upgraders)", () => {
-    expect(shouldShowWelcome({ ...base, tourSeen: true })).toBe(false);
-  });
-
-  it("does not show once the welcome has been seen", () => {
-    expect(shouldShowWelcome({ ...base, welcomeSeen: true })).toBe(false);
-  });
-
-  it("ignores pointer type: shows on touch (unlike the tour auto-launch)", () => {
-    expect(shouldShowWelcome(base)).toBe(true);
-  });
+it("shouldShowWelcome only on a settled, writable, never-onboarded dashboard", () => {
+  expect(shouldShowWelcome(base)).toBe(true);
+  const blockers: Partial<Parameters<typeof shouldShowWelcome>[0]>[] = [
+    { autoLaunchReady: false },
+    { scope: "session" },
+    { scope: "structured-view" },
+    // Read-only cannot persist a theme.
+    { readOnly: true },
+    { automated: true },
+    // Upgraders who already finished the tour.
+    { tourSeen: true },
+    { welcomeSeen: true },
+  ];
+  for (const over of blockers) expect(shouldShowWelcome({ ...base, ...over }), JSON.stringify(over)).toBe(false);
 });

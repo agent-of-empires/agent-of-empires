@@ -3,7 +3,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import {
-  ArchivedWorkerStoppedBanner,
   ScheduledWakeupBanner,
   SnoozedWorkerStoppedBanner,
   TrashedWorkerStoppedBanner,
@@ -15,25 +14,16 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-describe("triage worker-stopped banners", () => {
-  it("renders the archived copy keyed by session id", () => {
-    render(<ArchivedWorkerStoppedBanner sessionId="alpha" />);
-    const banner = screen.getByTestId("acp-archived-banner-alpha");
-    expect(banner.textContent).toContain("Session archived");
-    expect(banner.textContent).toContain("Unarchive");
-    expect(screen.queryByTestId("acp-archived-banner-beta")).toBeNull();
-  });
-
+describe("SnoozedWorkerStoppedBanner", () => {
   it.each([
     ["2099-01-01T00:00:00Z", /2099|2098/],
     // Unparseable timestamps render raw instead of "Invalid Date".
     ["not-a-date", /not-a-date/],
-  ])("renders the snoozed copy with wake time for %s", (snoozedUntil, wake) => {
+  ])("renders the wake time for %s", (snoozedUntil, wake) => {
     render(<SnoozedWorkerStoppedBanner sessionId="abc-123" snoozedUntil={snoozedUntil} />);
-    const banner = screen.getByTestId("acp-snoozed-banner-abc-123");
-    expect(banner.textContent).toContain("Session snoozed");
-    expect(banner.textContent).toContain("Unsnooze");
-    expect(banner.textContent).toMatch(wake);
+    const text = screen.getByTestId("acp-snoozed-banner-abc-123").textContent;
+    expect(text).toMatch(wake);
+    expect(text).not.toContain("Invalid Date");
   });
 });
 

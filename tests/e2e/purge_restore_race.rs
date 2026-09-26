@@ -101,10 +101,10 @@ fn restore_refused_while_purge_reservation_present_then_succeeds() {
 }
 
 /// Symmetry: purge is refused and keeps the row while a fresh Restore
-/// reservation owns it.
+/// reservation owns it, and purges cleanly once no reservation competes.
 #[test]
 #[parallel]
-fn purge_refused_while_restore_reservation_present() {
+fn purge_refused_while_restore_reservation_present_then_removes_row() {
     let h = TuiTestHarness::new("purge_restore_race_purge");
     create_trashed(&h, "RacePurge");
 
@@ -126,26 +126,12 @@ fn purge_refused_while_restore_reservation_present() {
         row["lifecycle_reservation"]["op"], "restore",
         "peer's Restore reservation must be untouched"
     );
-}
 
-/// A trashed session with no competing reservation purges cleanly.
-#[test]
-#[parallel]
-fn purge_trashed_no_claim_removes_row() {
-    let h = TuiTestHarness::new("purge_restore_race_clean");
-    create_trashed(&h, "RaceClean");
-
-    let ok = h.run_cli(&["rm", "--purge", "RaceClean"]);
+    clear_reservation(&h, "RacePurge");
+    let stdout = h.run_cli_ok(&["rm", "--purge", "RacePurge"]);
+    assert!(stdout.contains("Removed session: RacePurge"), "{stdout}");
     assert!(
-        ok.status.success(),
-        "clean purge must succeed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&ok.stdout),
-        String::from_utf8_lossy(&ok.stderr),
-    );
-    assert!(String::from_utf8_lossy(&ok.stdout).contains("Removed session: RaceClean"));
-    let after = h.read_sessions();
-    assert!(
-        row_title(&after, "RaceClean").is_none(),
+        row_title(&h.read_sessions(), "RacePurge").is_none(),
         "purged row must be gone from disk"
     );
 }

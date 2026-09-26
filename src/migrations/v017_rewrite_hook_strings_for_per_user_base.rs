@@ -535,8 +535,14 @@ mod tests {
         write_json(&claude, &pre_v017_claude_settings());
 
         run_in(&home, &app_dir).unwrap();
-
         assert_post_v017_canonical(&claude);
+        let after_first = fs::read_to_string(&claude).unwrap();
+        run_in(&home, &app_dir).unwrap();
+        assert_eq!(
+            fs::read_to_string(&claude).unwrap(),
+            after_first,
+            "v017 must be byte-idempotent"
+        );
     }
 
     #[test]
@@ -564,22 +570,6 @@ mod tests {
             "echo user-only",
             "non-AoE file must be byte-untouched"
         );
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn idempotent_byte_identical_on_second_run() {
-        let _env = unset_agent_home_env();
-        let (_tmp, home, app_dir) = setup_dirs();
-        let claude = home.join(".claude").join("settings.json");
-        write_json(&claude, &pre_v017_claude_settings());
-
-        run_in(&home, &app_dir).unwrap();
-        let after_first = fs::read_to_string(&claude).unwrap();
-        run_in(&home, &app_dir).unwrap();
-        let after_second = fs::read_to_string(&claude).unwrap();
-
-        assert_eq!(after_first, after_second, "v017 must be byte-idempotent");
     }
 
     #[test]

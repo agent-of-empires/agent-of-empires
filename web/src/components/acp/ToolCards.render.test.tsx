@@ -79,14 +79,6 @@ describe("ToolCard headers", () => {
     ["edit", fixtures.edit, undefined, {}, ["edit", "/tmp/main.rs"], []],
     ["write", fixtures.write, undefined, {}, ["write", "/tmp/new.rs"], []],
     ["codex structured diff", fixtures.codexEdit, undefined, {}, ["edit", "src/codex.rs"], ["(unknown file)"]],
-    [
-      "codex multi-file diff",
-      fixtures.codexEditMultiFile,
-      undefined,
-      {},
-      ["src/alpha.rs", "+1 more"],
-      ["(unknown file)"],
-    ],
     ["delete", fixtures.del, undefined, {}, ["delete", "/tmp/gone.rs"], []],
     [
       "search",
@@ -251,14 +243,6 @@ describe("ToolCard headers", () => {
     for (const s of excludes) expect(text()).not.toContain(s);
   });
 
-  it("ticks a live duration while running", () => {
-    const { text } = renderCard(
-      makeToolCall({ kind: "execute", started_at: new Date(Date.now() - 1500).toISOString() }),
-    );
-    expect(text()).toContain("running");
-    expect(text()).toMatch(/\ds/);
-  });
-
   it("renders the resolved skill's provenance badge", () => {
     skillIndexRef.current = buildSkillIndex({
       roots: [
@@ -284,7 +268,6 @@ describe("ToolCard headers", () => {
 describe("ToolCard expanded bodies", () => {
   it.each<[string, ToolCall, ActivityRow | undefined, RenderOpts, string[], string[]]>([
     ["bash output", fixtures.bash, makeCompletion({ text: "hello world\n" }), {}, ["hello world"], []],
-    ["codex second file", fixtures.codexEditMultiFile, undefined, {}, ["src/beta.rs"], []],
     [
       "monitor timeout chip and body",
       makeToolCall({
@@ -312,6 +295,14 @@ describe("ToolCard expanded bodies", () => {
       ["a note", "body text here"],
       [],
     ],
+    [
+      "recalled memory paths",
+      fixtures.memoryRecallList,
+      undefined,
+      {},
+      ["user_role.md", "feedback_no_em_dashes.md"],
+      [],
+    ],
   ])("%s", (_label, tool, result, opts, contains, excludes) => {
     const { text, toggle } = renderCard(tool, result, opts);
     toggle();
@@ -325,21 +316,10 @@ describe("ToolCard expanded bodies", () => {
     expect(text()).not.toContain("hello world");
   });
 
-  it.each([
-    [fixtures.codexEdit, 1],
-    [fixtures.codexEditMultiFile, 2],
-  ])("renders structured diff bodies (%#)", (tool, count) => {
-    const { container, toggle } = renderCard(tool);
+  it("renders one structured diff body per file", () => {
+    const { container, toggle } = renderCard(fixtures.codexEditMultiFile);
     toggle();
-    expect(container.querySelectorAll('[data-testid="string-diff"]').length).toBe(count);
-  });
-
-  it("lists recalled memory paths", () => {
-    const { getByTestId, toggle } = renderCard(fixtures.memoryRecallList);
-    toggle();
-    const list = getByTestId("memory-recall-paths");
-    expect(list.textContent).toContain("user_role.md");
-    expect(list.textContent).toContain("feedback_no_em_dashes.md");
+    expect(container.querySelectorAll('[data-testid="string-diff"]').length).toBe(2);
   });
 
   it("renders synthesized memory as markdown with the envelope and line numbers stripped", () => {
@@ -473,21 +453,12 @@ describe("structured output media", () => {
 
 describe("repo-relative paths", () => {
   const session: FileRefSession = { project_path: "/tmp", main_repo_path: null, workspace_repos: [] };
-  const multi: FileRefSession = {
-    project_path: "/tmp/ws",
-    main_repo_path: null,
-    workspace_repos: [{ name: "api", source_path: "/tmp/api" }],
-  };
-  const editAt = (file_path: string) =>
-    makeToolCall({ kind: "edit", args_preview: args({ file_path, old_string: "a", new_string: "b" }) });
 
   it.each<[string, ToolCall, FileRefSession, string, string | null]>([
     ["edit", fixtures.edit, session, "main.rs", "/tmp/main.rs"],
     ["read", fixtures.read, session, "main.rs", "/tmp/main.rs"],
     ["delete", fixtures.del, session, "gone.rs", "/tmp/gone.rs"],
     ["write", fixtures.write, session, "new.rs", "/tmp/new.rs"],
-    ["multi-repo workspace", editAt("/tmp/api/src/h.ts"), multi, "api/src/h.ts", "/tmp/api/src/h.ts"],
-    ["outside every root", editAt("/etc/hosts"), session, "/etc/hosts", null],
   ])("%s", (_label, tool, fileRefSession, shown, hidden) => {
     const { text } = renderCard(tool, undefined, { session: fileRefSession });
     expect(text()).toContain(shown);
@@ -526,16 +497,14 @@ describe("repo-relative paths", () => {
     expect(container.querySelector('[title="/tmp/main.rs"]')!.textContent).toContain("main.rs");
   });
 
-  it.each([
-    [fixtures.read, "/tmp/main.rs"],
-    [fixtures.write, "/tmp/new.rs"],
-  ])("opens %#'s file via onOpenFileRef, or renders plain text without a handler", (tool, path) => {
+  it("opens the file via onOpenFileRef, or renders plain text without a handler", () => {
+    const path = "/tmp/main.rs";
     const onOpenFileRef = vi.fn();
-    const { container } = renderCard(tool, undefined, { session, onOpenFileRef });
+    const { container } = renderCard(fixtures.read, undefined, { session, onOpenFileRef });
     fireEvent.click(container.querySelector(`button[title="${path}"]`)!);
     expect(onOpenFileRef).toHaveBeenCalledWith({ path });
     cleanup();
-    const plain = renderCard(tool, undefined, { session });
+    const plain = renderCard(fixtures.read, undefined, { session });
     expect(plain.container.querySelector(`button[title="${path}"]`)).toBeNull();
     expect(plain.container.querySelector(`[title="${path}"]`)).not.toBeNull();
   });

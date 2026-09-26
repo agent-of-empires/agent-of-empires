@@ -117,6 +117,7 @@ fn backfill(path: &Path, aliases: &HashMap<String, String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migrations::test_cases::assert_rewrites;
 
     fn aliases(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs
@@ -127,11 +128,15 @@ mod tests {
 
     #[test]
     fn backfills_only_unaliased_rows_with_a_mapped_tool() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        fs::write(
-            &path,
-            r#"[
+        let map = aliases(&[("claude-personal", "claude")]);
+        let corrupt = "{ not valid json";
+        assert_rewrites(
+            "sessions.json",
+            |path| backfill(path, &map),
+            &[
+                (
+                    Some(
+                        r#"[
                 {"id":"a","tool":"claude-personal"},
                 {"id":"b","tool":"claude-personal","detect_as":""},
                 {"id":"c","tool":"claude-personal","detect_as":"codex"},
@@ -139,58 +144,30 @@ mod tests {
                 {"id":"e","tool":"claude"},
                 {"id":"f"}
             ]"#,
-        )
-        .unwrap();
-
-        backfill(&path, &aliases(&[("claude-personal", "claude")])).unwrap();
-
-        let v: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        let arr = v.as_array().unwrap();
-        // absent alias + mapped tool -> filled (the bug footprint)
-        assert_eq!(arr[0]["detect_as"], "claude");
-        // empty alias is the same state as absent -> filled
-        assert_eq!(arr[1]["detect_as"], "claude");
-        // an alias already stored is a deliberate pin -> untouched
-        assert_eq!(arr[2]["detect_as"], "codex");
-        // tool with no config entry -> left for the runtime fallback to miss too
-        assert!(arr[3].get("detect_as").is_none());
-        // built-in tool -> never aliased
-        assert!(arr[4].get("detect_as").is_none());
-        // row without a tool -> untouched, not a panic
-        assert!(arr[5].get("detect_as").is_none());
-    }
-
-    #[test]
-    fn is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        fs::write(&path, r#"[{"id":"a","tool":"claude-personal"}]"#).unwrap();
-        let map = aliases(&[("claude-personal", "claude")]);
-        backfill(&path, &map).unwrap();
-        let first = fs::read_to_string(&path).unwrap();
-        backfill(&path, &map).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), first);
-    }
-
-    #[test]
-    fn skips_unreadable_and_absent_and_unmapped() {
-        let dir = tempfile::tempdir().unwrap();
-        // Missing file.
-        backfill(&dir.path().join("nope.json"), &aliases(&[("a", "claude")])).unwrap();
-
-        // Corrupt file is left exactly as found.
-        let corrupt = dir.path().join("corrupt.json");
-        fs::write(&corrupt, "{ not valid json").unwrap();
-        backfill(&corrupt, &aliases(&[("a", "claude")])).unwrap();
-        assert_eq!(fs::read_to_string(&corrupt).unwrap(), "{ not valid json");
-
-        // No aliases configured means no rewrite at all.
-        let path = dir.path().join("sessions.json");
+                    ),
+                    // Absent or empty aliases fill; a stored alias is a deliberate
+                    // pin; unmapped, built-in and tool-less rows stay as they are.
+                    Some(
+                        r#"[
+                {"id":"a","tool":"claude-personal","detect_as":"claude"},
+                {"id":"b","tool":"claude-personal","detect_as":"claude"},
+                {"id":"c","tool":"claude-personal","detect_as":"codex"},
+                {"id":"d","tool":"codex-company"},
+                {"id":"e","tool":"claude"},
+                {"id":"f"}
+            ]"#,
+                    ),
+                ),
+                (Some(corrupt), Some(corrupt)),
+                (None, None),
+            ],
+        );
         let row = r#"[{"id":"a","tool":"claude-personal"}]"#;
-        fs::write(&path, row).unwrap();
-        backfill(&path, &HashMap::new()).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), row);
+        assert_rewrites(
+            "sessions.json",
+            |path| backfill(path, &HashMap::new()),
+            &[(Some(row), Some(row))],
+        );
     }
 
     #[test]

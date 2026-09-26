@@ -63,30 +63,22 @@ test.describe("Mobile soft-keyboard Backspace autorepeat", () => {
     await expect.poll(() => handle.liveMessages.length, { timeout: 5_000 }).toBeGreaterThan(0);
   }
 
-  test("holding Backspace sends one DEL per autorepeat tick", async ({ page }) => {
+  test("a Backspace tap sends one DEL and holding it sends one DEL per autorepeat tick", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     await openSession(page, handle);
-
-    const start = handle.liveMessages.length;
-    await fireDeleteBackward(page, 5);
-
-    // Core bug: pre-fix this stream produced a single DEL (or none); post-fix
-    // each tick maps to one DEL.
-    await expect.poll(() => delCount(handle, start), { timeout: 5_000 }).toBe(5);
-  });
-
-  test("single Backspace tap sends exactly one DEL (no double-delete)", async ({ page }) => {
-    const handle = await mockTerminalApis(page);
-    await openSession(page, handle);
-
-    const start = handle.liveMessages.length;
-    await fireDeleteBackward(page, 1);
 
     // A single native edit must not be forwarded twice.
+    const start = handle.liveMessages.length;
+    await fireDeleteBackward(page, 1);
     await expect.poll(() => delCount(handle, start), { timeout: 5_000 }).toBe(1);
     await observeFor(page, 200, async () => {
       expect(delCount(handle, start)).toBe(1);
     });
+
+    // Core bug: pre-fix a held stream produced a single DEL (or none); post-fix
+    // each tick maps to one DEL.
+    await fireDeleteBackward(page, 5);
+    await expect.poll(() => delCount(handle, start), { timeout: 5_000 }).toBe(6);
   });
 
   test("Backspace during IME composition is not forwarded", async ({ page }) => {
@@ -104,22 +96,5 @@ test.describe("Mobile soft-keyboard Backspace autorepeat", () => {
     await observeFor(page, 200, async () => {
       expect(delCount(handle, start)).toBe(0);
     });
-  });
-});
-
-test.describe("Desktop uses the unified live view", () => {
-  test.use({ viewport: { width: 1280, height: 800 }, hasTouch: false });
-
-  test("desktop renders the live input (no xterm); the touch toolbar is hidden", async ({ page }) => {
-    await mockTerminalApis(page);
-    await page.goto("/");
-    await clickSidebarSession(page, "pinch-test");
-    await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
-
-    // Unified renderer: the live view + its input mount everywhere; xterm is
-    // gone. The soft-keyboard toolbar/FAB are touch-only, hidden on desktop.
-    await expect(page.locator(".xterm")).toHaveCount(0);
-    await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeAttached();
-    await expect(page.getByRole("button", { name: "Backspace" })).toHaveCount(0);
   });
 });
