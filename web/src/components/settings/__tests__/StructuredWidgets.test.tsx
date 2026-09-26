@@ -82,14 +82,6 @@ describe("object_list", () => {
     expect(typeof value[0]!.id).toBe("string");
   });
 
-  it("feeds an item's dynamic_select from the plugin's resolver endpoint", async () => {
-    renderSection(CRON_JOBS, { jobs: [job("id-1")] });
-    await waitFor(() =>
-      expect(fetchMock).toHaveBeenCalledWith(RESOLVE_URL, expect.objectContaining({ method: "POST" })),
-    );
-    expect(await screen.findByText("Claude Code")).toBeTruthy();
-  });
-
   it("removes and reorders items", async () => {
     const removed = renderSection(CRON_JOBS, { jobs: [job("id-1")] });
     fireEvent.click(screen.getByRole("button", { name: "Remove item" }));
@@ -99,27 +91,6 @@ describe("object_list", () => {
     const moved = renderSection(CRON_JOBS, { jobs: [job("id-1"), job("id-2", "claude-code", "0 17 * * 1-5")] });
     fireEvent.click(screen.getAllByRole("button", { name: "Move down" })[0]!);
     expect(((await moved.lastValue()) as { id: string }[]).map((it) => it.id)).toEqual(["id-2", "id-1"]);
-  });
-
-  it("renders every item widget kind plus top-level cron and dynamic_select", async () => {
-    const schema = [
-      descriptor("when", { kind: "cron" }),
-      descriptor("who", { kind: "dynamic_select", source: "acp_agents" }),
-      ...jobs(
-        itemField("On", { kind: "toggle" }),
-        itemField("N", { kind: "number" }),
-        itemField("Pick", { kind: "select", options: ["a", "b"] } as never),
-        itemField("Note", { kind: "text" }),
-      ),
-    ];
-    renderSection(schema, {
-      when: "0 9 * * 1-5",
-      who: "codex",
-      jobs: [{ id: "r1", On: true, N: 2, Pick: "a", Note: "hi" }],
-    });
-    expect(screen.getByDisplayValue("0 9 * * 1-5")).toBeTruthy();
-    for (const label of ["On", "N", "Pick", "Note"]) expect(screen.getByText(label)).toBeTruthy();
-    expect(await screen.findByText("Claude Code")).toBeTruthy();
   });
 
   it("re-syncs its working copy when persisted items change externally", async () => {

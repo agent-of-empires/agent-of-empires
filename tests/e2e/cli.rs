@@ -542,15 +542,23 @@ fn cli_skill_management_flow() {
     assert!(!source.exists());
 }
 
-/// `aoe session capture` reports a stopped session as empty in both output
-/// modes.
+/// `aoe stop` is a hidden trap that redirects to the scoped verbs rather than
+/// silently doing nothing or tearing sessions down, and `aoe session capture`
+/// reports a stopped session as empty in both output modes.
 #[test]
 #[parallel]
-fn cli_session_capture_stopped_session() {
+fn cli_stop_trap_redirects_and_capture_reports_a_stopped_session() {
     let h = TuiTestHarness::new("cli_capture_stopped");
+    for argv in [vec!["stop"], vec!["stop", "abc123"], vec!["stop", "--all"]] {
+        let stderr = h.run_cli_err(&argv);
+        assert!(
+            stderr.contains("aoe killall") && stderr.contains("aoe session stop"),
+            "aoe {argv:?} should redirect to killall and session stop, got:\n{stderr}"
+        );
+    }
+
     let project = h.project_path();
     let session_id = h.add_session(&[project.to_str().unwrap(), "-t", "CaptureTest"]);
-
     let json = json_out(&h, &["session", "capture", &session_id, "--json"]);
     assert_eq!(json["status"], "stopped");
     assert_eq!(json["content"], "");
@@ -830,21 +838,6 @@ fn cli_scratch_session_provisions_and_purges_its_dir() {
 fn cli_ps_empty_json() {
     let h = TuiTestHarness::new("cli_ps_empty_json");
     assert_eq!(json_out(&h, &["ps", "--json"]), json!([]));
-}
-
-/// `aoe stop` is a hidden trap: it must redirect to the scoped verbs rather
-/// than silently doing nothing or tearing sessions down.
-#[test]
-#[parallel]
-fn cli_stop_trap_redirects() {
-    let h = TuiTestHarness::new("cli_stop_trap");
-    for argv in [vec!["stop"], vec!["stop", "abc123"], vec!["stop", "--all"]] {
-        let stderr = h.run_cli_err(&argv);
-        assert!(
-            stderr.contains("aoe killall") && stderr.contains("aoe session stop"),
-            "aoe {argv:?} should redirect to killall and session stop, got:\n{stderr}"
-        );
-    }
 }
 
 /// `aoe send` straight after `aoe session start` (what a headless dispatcher

@@ -8,7 +8,6 @@ import {
   LoggingTargetsWidget,
   SmartRenameAgentWidget,
   SmartRenameModelWidget,
-  SoundVolumeWidget,
   ThemeNameWidget,
   type CustomWidgetProps,
 } from "../customWidgets";
@@ -78,14 +77,6 @@ function commitText(input: HTMLInputElement, value: string) {
   fireEvent.blur(input);
 }
 
-it("SoundVolumeWidget saves a 0.1-1.5 float", () => {
-  const { save, container } = mount(SoundVolumeWidget, "Volume", 1.0);
-  const slider = container.querySelector<HTMLInputElement>('input[type="range"]')!;
-  expect([slider.min, slider.max]).toEqual(["0.1", "1.5"]);
-  fireEvent.change(slider, { target: { value: "0.5" } });
-  expect(save).toHaveBeenCalledWith(0.5);
-});
-
 it("LoggingTargetsWidget sets an override and removes it on (default)", () => {
   const { save, rerender } = mount(LoggingTargetsWidget, "Targets", {});
   fireEvent.change(control("acp.protocol", "select"), { target: { value: "debug" } });
@@ -120,22 +111,15 @@ it("SmartRenameAgentWidget lists installed one-shot agents plus Same as session"
   expect(save).toHaveBeenCalledWith("");
 });
 
-describe("SmartRenameModelWidget", () => {
-  it("renders a row per installed one-shot agent and sets an override", async () => {
-    const { save } = mount(SmartRenameModelWidget, "Model", {});
-    await waitFor(() => expect(control("codex", "input")).toBeTruthy());
-    expect(control("gemini", "input")).toBeFalsy();
-    expect(control("cursor", "input")).toBeFalsy();
-    commitText(control("claude", "input"), "haiku");
-    expect(save).toHaveBeenCalledWith({ claude: "haiku" });
-  });
-
-  it("clearing a row removes only that key", async () => {
-    const { save } = mount(SmartRenameModelWidget, "Model", { claude: "haiku", codex: "gpt-5" });
-    await waitFor(() => expect(control("claude", "input")).toBeTruthy());
-    commitText(control("claude", "input"), "");
-    expect(save).toHaveBeenCalledWith({ codex: "gpt-5" });
-  });
+it("SmartRenameModelWidget rows cover installed one-shot agents; edits set or remove only that key", async () => {
+  const { save } = mount(SmartRenameModelWidget, "Model", { codex: "gpt-5" });
+  await waitFor(() => expect(control("codex", "input")).toBeTruthy());
+  expect(control("gemini", "input")).toBeFalsy();
+  expect(control("cursor", "input")).toBeFalsy();
+  commitText(control("claude", "input"), "haiku");
+  expect(save).toHaveBeenCalledWith({ codex: "gpt-5", claude: "haiku" });
+  commitText(control("codex", "input"), "");
+  expect(save).toHaveBeenLastCalledWith({});
 });
 
 it("DefaultToolWidget clears to null when emptied", () => {

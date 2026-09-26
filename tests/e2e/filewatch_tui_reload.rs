@@ -1,12 +1,10 @@
-//! e2e: peer-process writes to `sessions.json` propagate to the TUI through
-//! both the kernel-watcher path and the five-second storage heartbeat fallback.
-//!
-//! The watcher case must land within 1.5 seconds. The fallback case creates a
-//! previously unknown profile while live-send is active, so no disk watch can
-//! already cover it; the periodic storage-only reload must discover it without
-//! running the deferred full heartbeat.
+//! e2e: peer-process writes to `sessions.json` reach the TUI through the
+//! five-second storage heartbeat fallback (the watcher path is covered by
+//! `filewatch_tui_dynamic_profile`). The test creates a previously unknown
+//! profile while live-send is active, so no disk watch can already cover it;
+//! the periodic storage-only reload must discover it without running the
+//! deferred full heartbeat.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use agent_of_empires::file_watch::FileWatchService;
@@ -14,35 +12,6 @@ use agent_of_empires::session::{Instance, Storage};
 use serial_test::serial;
 
 use crate::harness::{require_tmux, HomeGuard, TuiTestHarness};
-
-#[test]
-#[serial]
-fn peer_storage_update_reflects_within_sub_tick_budget() {
-    require_tmux!();
-
-    let mut h = TuiTestHarness::new("filewatch_reload");
-    h.spawn_tui();
-    h.wait_for(" aoe ");
-
-    // Set HOME/XDG_CONFIG_HOME for THIS process so `Storage::new`
-    // resolves the same app dir the TUI is watching.
-    let _home = HomeGuard::new(h.home_path());
-
-    let svc: Arc<FileWatchService> = FileWatchService::noop();
-    let storage = Storage::new("default", svc).expect("storage in test process");
-
-    let title = "filewatch-test-row";
-    storage
-        .update(|i, _g| {
-            let mut inst = Instance::new(title, "/tmp/filewatch-test");
-            inst.source_profile = "default".to_string();
-            i.push(inst);
-            Ok(())
-        })
-        .expect("peer write to sessions.json");
-
-    h.wait_for_timeout(title, Duration::from_millis(1_500));
-}
 
 #[test]
 #[serial]

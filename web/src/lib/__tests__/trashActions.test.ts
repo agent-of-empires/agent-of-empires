@@ -69,13 +69,10 @@ describe("trash and restore loops (#2489)", () => {
 });
 
 describe("trashedWorkspaceRestoreIds (#2593)", () => {
-  it("returns every session id in the workspace containing the session", () => {
+  it("returns every session id in the containing workspace, else just the session id", () => {
     const workspaces = [ws("w1", ["a", "b"]), ws("w2", ["c"])];
     expect(trashedWorkspaceRestoreIds(workspaces, "b")).toEqual(["a", "b"]);
-  });
-
-  it("falls back to just the session id when no workspace groups it", () => {
-    expect(trashedWorkspaceRestoreIds([ws("w2", ["c"])], "orphan")).toEqual(["orphan"]);
+    expect(trashedWorkspaceRestoreIds(workspaces, "orphan")).toEqual(["orphan"]);
   });
 });
 
@@ -130,22 +127,16 @@ describe("deleteWorkspaceSessions (#2536)", () => {
     expect(d.notify.error).toHaveBeenCalledWith("dirty");
   });
 
-  it("navigates home when the open session is among the deleted", async () => {
-    deleteMock.mockResolvedValue(ok({ deleted: ["a", "b"] }));
-    const d = deps();
-
-    await deleteWorkspaceSessions(sessions("a", "b"), {}, "b", d);
-
-    expect(d.navigateHome).toHaveBeenCalledTimes(1);
-  });
-
-  it("does NOT navigate home when the open session is the one that failed", async () => {
-    deleteMock.mockResolvedValue(ok({ deleted: ["a"], failed: [{ id: "b", error: "boom" }] }));
-    const d = deps();
-
-    await deleteWorkspaceSessions(sessions("a", "b"), {}, "b", d);
-
-    expect(d.navigateHome).not.toHaveBeenCalled();
+  it("navigates home only when the open session was deleted, not when it failed", async () => {
+    for (const [result, navigations] of [
+      [ok({ deleted: ["a", "b"] }), 1],
+      [ok({ deleted: ["a"], failed: [{ id: "b", error: "boom" }] }), 0],
+    ] as const) {
+      deleteMock.mockResolvedValue(result);
+      const d = deps();
+      await deleteWorkspaceSessions(sessions("a", "b"), {}, "b", d);
+      expect(d.navigateHome).toHaveBeenCalledTimes(navigations);
+    }
   });
 
   it("reports a partial failure: purges the deleted id, flags the failed one Error", async () => {

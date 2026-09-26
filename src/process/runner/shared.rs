@@ -642,7 +642,7 @@ impl RunnerShared {
                     if announces_session {
                         channel.session_announced = true;
                     }
-                    #[cfg(feature = "test-support")]
+                    #[cfg(debug_assertions)]
                     if kind == QueuedKind::PromptCompleted {
                         if let Some(path) = std::env::var_os("AOE_E2E_PROMPT_COMPLETED_FILE") {
                             std::fs::write(path, b"queued").expect("publish e2e prompt completion");

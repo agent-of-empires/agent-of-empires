@@ -209,101 +209,43 @@ mod tests {
     }
 
     #[test]
-    fn suffix_empty_when_unconfigured_and_unfocused() {
+    fn suffix_spans_cases() {
         let theme = Theme::default();
-        assert!(tool_config_suffix_spans(false, false, false, &theme).is_empty());
+        // (configured, focused, compact) -> spans
+        let cases: [((bool, bool, bool), &[&str]); 5] = [
+            ((false, false, false), &[]),
+            ((false, true, false), &["  (Ctrl+P to configure)"]),
+            ((true, true, false), &["  (configured)", "  Ctrl+P: edit"]),
+            ((true, true, true), &["  (configured)", " Ctrl+P"]),
+            ((true, false, false), &["  (configured)"]),
+        ];
+        for ((configured, focused, compact), want) in cases {
+            let spans = tool_config_suffix_spans(configured, focused, compact, &theme);
+            assert_eq!(contents(&spans), want, "{configured} {focused} {compact}");
+        }
     }
 
     #[test]
-    fn suffix_shows_configure_hint_when_focused_unconfigured() {
-        let theme = Theme::default();
-        let spans = tool_config_suffix_spans(false, true, false, &theme);
-        assert_eq!(contents(&spans), ["  (Ctrl+P to configure)"]);
-    }
-
-    #[test]
-    fn suffix_shows_configured_and_edit_when_focused_configured() {
-        let theme = Theme::default();
-        let spans = tool_config_suffix_spans(true, true, false, &theme);
-        assert_eq!(contents(&spans), ["  (configured)", "  Ctrl+P: edit"]);
-        let compact = tool_config_suffix_spans(true, true, true, &theme);
-        assert_eq!(contents(&compact), ["  (configured)", " Ctrl+P"]);
-    }
-
-    #[test]
-    fn suffix_shows_configured_only_when_unfocused_configured() {
-        let theme = Theme::default();
-        let spans = tool_config_suffix_spans(true, false, false, &theme);
-        assert_eq!(contents(&spans), ["  (configured)"]);
-    }
-
-    #[test]
-    fn key_enter_and_esc_request_close() {
-        let mut cmd = Input::default();
-        let mut args = Input::default();
-        let mut field = 0;
-        assert!(matches!(
-            handle_tool_config_key(
-                KeyEvent::from(KeyCode::Enter),
-                &mut cmd,
-                &mut args,
-                &mut field
-            ),
-            ToolConfigOutcome::Close
-        ));
-        assert!(matches!(
-            handle_tool_config_key(
-                KeyEvent::from(KeyCode::Esc),
-                &mut cmd,
-                &mut args,
-                &mut field
-            ),
-            ToolConfigOutcome::Close
-        ));
-    }
-
-    #[test]
-    fn key_tab_wraps_fields() {
-        let mut cmd = Input::default();
-        let mut args = Input::default();
-        let mut field = 0;
-        handle_tool_config_key(
-            KeyEvent::from(KeyCode::Tab),
-            &mut cmd,
-            &mut args,
-            &mut field,
-        );
-        assert_eq!(field, 1);
-        handle_tool_config_key(
-            KeyEvent::from(KeyCode::Tab),
-            &mut cmd,
-            &mut args,
-            &mut field,
-        );
-        assert_eq!(field, 0);
-    }
-
-    #[test]
-    fn key_typing_routes_to_focused_field() {
+    fn keys_close_wrap_and_route_typing() {
         let mut cmd = Input::default();
         let mut args = Input::default();
         let mut field = TOOL_CONFIG_CMD;
-        handle_tool_config_key(
-            KeyEvent::from(KeyCode::Char('z')),
-            &mut cmd,
-            &mut args,
-            &mut field,
-        );
-        assert_eq!(cmd.value(), "z");
-        assert_eq!(args.value(), "");
-
-        field = TOOL_CONFIG_ARGS;
-        handle_tool_config_key(
-            KeyEvent::from(KeyCode::Char('q')),
-            &mut cmd,
-            &mut args,
-            &mut field,
-        );
-        assert_eq!(args.value(), "q");
+        let press = |code, field: &mut usize, cmd: &mut Input, args: &mut Input| {
+            handle_tool_config_key(KeyEvent::from(code), cmd, args, field)
+        };
+        for code in [KeyCode::Enter, KeyCode::Esc] {
+            assert!(matches!(
+                press(code, &mut field, &mut cmd, &mut args),
+                ToolConfigOutcome::Close
+            ));
+        }
+        press(KeyCode::Char('z'), &mut field, &mut cmd, &mut args);
+        assert_eq!((cmd.value(), args.value()), ("z", ""));
+        press(KeyCode::Tab, &mut field, &mut cmd, &mut args);
+        assert_eq!(field, TOOL_CONFIG_ARGS);
+        press(KeyCode::Char('q'), &mut field, &mut cmd, &mut args);
+        assert_eq!((cmd.value(), args.value()), ("z", "q"));
+        press(KeyCode::Tab, &mut field, &mut cmd, &mut args);
+        assert_eq!(field, TOOL_CONFIG_CMD, "Tab wraps");
     }
 }

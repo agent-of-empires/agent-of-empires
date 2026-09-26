@@ -189,6 +189,151 @@ mod tests {
 
     #[test]
     fn pane_fixture_table() {
+        assert_all(detect_pi_status, Status::Running, &[PI_RUNNING_PANE]);
+        assert_all(
+            detect_pi_status,
+            Status::Idle,
+            &[PI_FINISHED_PANE_WITH_ACTIVITY_PROSE],
+        );
+        assert_all(detect_omp_status, Status::Idle, &[
+            // activity timer without interrupt row
+                "Completed response.\n⠸ 1s > historical timing\n╰─",
+            // indented prose is not an interrupt row
+                "  Completed response.\n⠸ 1s > historical timing\n╰─",
+            // interrupt row without activity timer
+                "⎋ Working…\nπ > idle status\n╰─",
+            // digitless timer
+                "⎋ Working…\n⠸ .s > model status\n╰─",
+            // multi-decimal timer
+                "⎋ Working…\n⠸ 1..2s > model status\n╰─",
+            // leading-zero timer
+                "⎋ Working…\n⠸ 01s > model status\n╰─",
+            // duration prose below interrupt row
+                "⎋ Working…\nThe probe took 1s > historical timing\n╰─",
+            // stale interrupt rows around completed output
+                "⎋ Working…\nDone. Wrote 3 files.\nesc Working...",
+            // duration prose with a single-cell prefix
+                "esc Working...\nx 30m saved per run",
+            // active band pushed above current composer
+                "⎋ Working…\n⠸ 1s > model status\nCompleted response.\n╭── π > idle ─╮\n╰─           ─╯",
+            // persistent elapsed segment
+                "⎋ Working…\nπ > RCA Slow Turn > ⏱ 5m\n╰─",
+            // clock-only first segment
+                "  ⎋ Working…\n\n❯\n ⏱ 5m · RCA Slow Turn",
+            // nerd clock-only first segment
+                "  󱊷 Working…\n\n❯\n  5m  RCA Slow Turn",
+            // ascii clock-only first segment
+                "  esc Working...\n\n>\n t: 5m > RCA Slow Turn",
+            // decorated nerd clock-only first segment
+                "  󱊷 Working…\n\n❯\n  5m  RCA Slow Turn",
+            // decorated unicode clock-only first segment
+                "  ⎋ Working…\n❯\n╭── ⏱ 5m ─╮\n╰─",
+            // stale band with parked pi footer
+                "─ Continue Autonomous · ⏱ 2h4m ─\n❯\n───────────────────────────────────\n π · 🖥 host",
+            // parked claude shape at prompt
+                "❯\n───────────────────────────────────\n π · 🖥 host",
+            // stale parked spinner with prose mentioning esc to cancel
+                "Some tool output: press (esc to cancel) to abort\n\
+                 ❯\n\
+                 ───────────────────────────────────\n\
+                  ⠏ 28s · 🖥 host",
+        ]);
+        // Selector hints without an approval panel are prose, not a prompt.
+        let box_ = "╭── π ─╮\n╰─ ─╯";
+        let selector_hints = [
+            format!("Quoted UI:\nApprove and execute\nRefine plan\nSave and quit\ntab regions · esc cancel\n{box_}"),
+            format!("The instructions said: Enter select · n note\n{box_}"),
+            "╭── π  > approve and execute the migration ─╮\n│ then refine plan wording                    │\n╰─                                           ─╯".to_string(),
+            format!("Options were:\n> Approve and execute\nor Refine plan\n{box_}"),
+            format!("| > Approve and execute |\n|   Refine plan |\n|   Save and quit |\nPlan approved.\nrunning step 1\ndone\n{box_}"),
+            format!("I approve and execute\nthen refine plan things\n{box_}"),
+            format!("│ up/down navigate  enter select  esc cancel │\n{box_}"),
+            format!("│ up/down navigate  enter select  esc cancel │\nI will approve or deny later\n{box_}"),
+            format!("I would approve and execute refine plan steps\n{box_}"),
+            "╭── π > GPT-5.6 Sol ─╮\n│ Enter select · n note while documenting the UI │\n│ second draft line │\n╰──────────────────╯"
+                .to_string(),
+            "│ Enter submit · ↑/↓ scroll · current prompt to answer │\n╭── \u{f0d57} > ─╮"
+                .to_string(),
+            format!("press enter to select an option\n{box_}"),
+        ];
+        assert_all(
+            detect_omp_status,
+            Status::Idle,
+            &selector_hints
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        assert_all(
+            detect_omp_status,
+            Status::Waiting,
+            &[
+                "\
+╭─ Ask ────────────────────────────────────────╮
+│                                              │
+│ Which database for the new service?          │
+│                                              │
+│  ❯ PostgreSQL                                │
+│    SQLite                                    │
+│    Other (type your own)                     │
+│                                              │
+│ Enter select · n note · ↑/↓ move · Esc       │
+│                                              │
+╰──────────────────────────────────────────────╯",
+                "\
+| Space toggle · Enter next · ↑/↓ move · Esc   |
++----------------------------------------------+",
+                "\
+│ Enter submit · ↑/↓ scroll · Esc              │
+╰──────────────────────────────────────────────╯",
+                "\
+│ Finish or clear the current prompt to answer · Esc cancel │
+╰──────────────────────────────────────────────╯",
+                "\
+╭─ Ask ────────────────────────────────────────╮
+│ Enter select · n note · ↑/↓ move · Esc       │
+╰──────────────────────────────────────────────╯
+╭── π > draft ─────────────────────────────────╮
+╰──────────────────────────────────────────────╯",
+                "\
+╭─ Ask ────────────────────────────────────────╮
+│ Finish or clear the current prompt to answer · Esc cancel │
+╰──────────────────────────────────────────────╯
+╭── π > draft ─────────────────────────────────╮
+╰──────────────────────────────────────────────╯",
+            ],
+        );
+        assert_all(
+            detect_claude_status,
+            Status::Waiting,
+            &[
+                CLAUDE_FOLDER_TRUST_PROMPT,
+                CLAUDE_FOLDER_TRUST_PROMPT_WRAPPED,
+                CLAUDE_FOLDER_TRUST_PROMPT_NARROW,
+            ],
+        );
+        // A trust prompt echoed during a live turn is not the dialog.
+        let bodies = [
+            " \u{276f} 1. Yes, I trust this folder\n   2. No, exit",
+            "     \u{276f} 1. Yes, I trust this folder\n       2. No, exit",
+            "  \u{276f} 1. Yes, I trust this folder\n    2. No, exit\n     test result: FAILED",
+            " 1. Yes, I trust this folder is what you pick, and then\n 2. the session starts",
+        ];
+        let mut echoed = Vec::new();
+        for body in bodies {
+            let pane = format!(
+                "\u{25cf} The first-run dialog reads:\n \
+                 Quick safety check: Is this a project you created or one you trust?\n\
+                 {body}\n \u{2736} Working\u{2026} (12s \u{b7} \u{2193} 431 tokens)\n   \
+                 esc to interrupt\n"
+            );
+            echoed.push(pane);
+        }
+        assert_all(
+            detect_claude_status,
+            Status::Running,
+            &echoed.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
         assert_all(
             detect_cursor_status,
             Status::Running,
@@ -993,31 +1138,82 @@ path: /workspace/secrets.env
         assert_all(
             detect_antigravity_status,
             Status::Idle,
-            &["file saved", "random output text"],
+            &[
+                "file saved",
+                "random output text",
+                "Running tests completed successfully.",
+                "Reading config.toml finished.",
+                "Editing src/session/instance.rs done.",
+                "Testing finished with success.",
+            ],
         );
-    }
-
-    #[test]
-    fn test_detect_cursor_status_idle_on_completed_activity_phrases() {
-        for content in [
-            "Running tests completed successfully.\n\n→ Add a follow-up",
-            "Reading config.toml finished.\n\n→ Add a follow-up",
-            "Editing src/app.rs done.\n\n→ Add a follow-up",
-            "Testing finished with success.\n\n→ Add a follow-up",
-        ] {
-            assert_eq!(detect_cursor_status(content), Status::Idle);
+        let completed = [
+            "Running tests completed successfully.",
+            "Reading config.toml finished.",
+            "Editing src/app.rs done.",
+            "Testing finished with success.",
+        ];
+        for tail in ["\n\n→ Add a follow-up", "\n  Composer 2.5"] {
+            for phrase in completed {
+                assert_eq!(
+                    detect_cursor_status(&format!("{phrase}{tail}")),
+                    Status::Idle,
+                    "{phrase}{tail}"
+                );
+            }
         }
-    }
+        assert_all(
+            detect_hermes_status,
+            Status::Waiting,
+            &[
+                "⚠️  DANGEROUS COMMAND: rm -rf /tmp\n[o]nce  |  [s]ession  |  [a]lways  |  [d]eny\nChoice [o/s/a/D]:",
+                "dangerous command detected\nproceed?",
+            ],
+        );
+        assert_all(
+            detect_omp_status,
+            Status::Idle,
+            &["plain command output", "", " \n\t\n"],
+        );
+        assert_all(
+            detect_vibe_status,
+            Status::Waiting,
+            &[
+                "↑↓ navigate  Enter select  ESC reject",
+                "⚠ bash command\nExecute this?",
+                "› Yes\n  Yes and always allow bash for this session\n  No and tell the agent",
+            ],
+        );
+        let padded = format!(
+            "✶ Working… (4s · ↓ 88 tokens)\n  esc to interrupt\n{}",
+            "\n".repeat(40)
+        );
+        assert_eq!(detect_claude_status(&padded), Status::Running);
 
-    #[test]
-    fn test_detect_cursor_status_idle_on_completed_activity_without_prompt() {
-        for content in [
-            "Running tests completed successfully.\n  Composer 2.5",
-            "Reading config.toml finished.\n  Composer 2.5",
-            "Editing src/app.rs done.\n  Composer 2.5",
-            "Testing finished with success.\n  Composer 2.5",
+        // ANSI is stripped before matching, including Claude 2.1.118's per-word colouring.
+        for (tool, pane, expected) in [
+            (
+                "claude",
+                "\x1b[38;5;174m✶\x1b[39m \x1b[38;5;180mWorking…\x1b[38;5;174m \x1b[38;5;246m(4s · ↓\x1b[39m \x1b[38;5;246m88 tokens)\x1b[39m\n\x1b[39m  \x1b[38;5;246mesc\x1b[39m \x1b[38;5;246mto\x1b[39m \x1b[38;5;246minterrupt\x1b[39m",
+                Status::Running,
+            ),
+            (
+                "opencode",
+                "\x1b[38;2;39;62;94m⬝⬝⬝⬝⬝⬝⬝⬝\x1b[0m  \x1b[38;2;238;238;238mesc \x1b[38;2;128;128;128minterrupt\x1b[0m",
+                Status::Running,
+            ),
+            (
+                "opencode",
+                "\x1b[38;2;255;255;255m⠋\x1b[0m generating",
+                Status::Running,
+            ),
+            ("unknown_tool", "Processing ⠋", Status::Idle),
         ] {
-            assert_eq!(detect_cursor_status(content), Status::Idle);
+            assert_eq!(
+                detect_status_from_content_in("", pane, tool),
+                expected,
+                "{tool}: {pane:?}"
+            );
         }
     }
 
@@ -1127,18 +1323,83 @@ path: /workspace/secrets.env
         }
     }
 
-    #[test]
-    fn test_detect_claude_status_finds_signal_above_blank_padding() {
-        let mut content = String::from("✶ Working… (4s · ↓ 88 tokens)\n  esc to interrupt\n");
-        for _ in 0..40 {
-            content.push('\n');
-        }
-        assert_eq!(detect_claude_status(&content), Status::Running);
-    }
-
     /// Pane shape against the hook's last word, for Claude Code.
     #[test]
     fn claude_hook_reconciliation_table() {
+        let parked_over_completion = "\
+✻ Sautéed for 39s · 1 monitor still running\n\
+──────────────────────────────\n\
+❯ stop the monitor\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage";
+        let streaming_over_prompt = "\
+  prose still being generated by the model\n\
+──────────────────────────────\n\
+❯ stop the monitor\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage";
+        let clear_hint = "\
+  PR #484 is green across all checks and ready for your call on merging.\n\
+✻ Crunched for 10m 12s\n\
+                                              new task? /clear to save 131.6k tokens\n\
+──────────────────────────────\n\
+❯ merge it\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #484 · ← for agents";
+        let labeled_separator = "\
+✻ Worked for 43s\n\
+─────────────────────── rebrand-chord-charts-primary ──\n\
+❯ merge it and confirm the deploy\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
+        let streaming_over_chrome = "\
+  prose still being generated by the model\n\
+                                              new task? /clear to save 131.6k tokens\n\
+─────────────────────── rebrand-chord-charts-primary ──\n\
+❯ merge it\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #484 · ← for agents";
+        let running_stale = hook(Status::Running, secs(120));
+        let fresh_bound = claude_fresh_bound();
+        let parked_at_prompt = "❯ \n\n  ? for shortcuts · ← for agents";
+        // A standing waiting hook holds on a blank pane.
+        assert_hook_all("claude", stale_wait(), Status::Waiting, &["", "   \n\n"]);
+        assert_hook_all(
+            "claude",
+            hook(Status::Idle, None),
+            Status::Idle,
+            &["✻ Worked for 1m 52s\n❯\n  ? for shortcuts", "  \n \n"],
+        );
+        // A stale running hook yields to parked evidence under a typed prompt,
+        // never to a blank pane or to prose still streaming.
+        assert_hook_all(
+            "claude",
+            running_stale,
+            Status::Idle,
+            &[parked_over_completion, clear_hint, labeled_separator],
+        );
+        assert_hook_all(
+            "claude",
+            running_stale,
+            Status::Running,
+            &["   \n\n  ", streaming_over_prompt, streaming_over_chrome],
+        );
+        // The freshness bound is exclusive.
+        assert_hook_all(
+            "claude",
+            hook(Status::Running, Some(fresh_bound)),
+            Status::Idle,
+            &[parked_at_prompt],
+        );
+        assert_hook_all(
+            "claude",
+            hook(
+                Status::Running,
+                Some(fresh_bound - std::time::Duration::from_secs(1)),
+            ),
+            Status::Running,
+            &[parked_at_prompt],
+        );
         let running = hook(Status::Running, None);
         let idle = hook(Status::Idle, None);
         let running_fresh = hook(Status::Running, secs(1));
@@ -1380,6 +1641,20 @@ Do you want to proceed?\n\
   ⏸ plan mode on (shift+tab to cycle) · ← for agents",
             ],
         );
+
+        // Non-running hooks pass through whatever the pane shows.
+        assert_hook_all(
+            "claude",
+            hook(Status::Waiting, None),
+            Status::Waiting,
+            &[""],
+        );
+        assert_hook_all(
+            "claude",
+            hook(Status::Idle, None),
+            Status::Idle,
+            &["Do you want to proceed?\n1. Yes"],
+        );
     }
 
     /// Pane shape against the hook's last word, for Codex.
@@ -1612,35 +1887,28 @@ report the issue.
 "#,
             ],
         );
-    }
 
-    #[test]
-    fn test_reconcile_claude_hook_status_passes_non_running_through() {
-        assert_eq!(
-            detect_via_manifest("claude", "", "", hook(Status::Waiting, None)),
-            Status::Waiting
+        // Generic pane states never override a running codex hook.
+        assert_hook_all(
+            "codex",
+            running_now,
+            Status::Running,
+            &[
+                "\n>> Code review started: staged changes <<\n\n<< Code review finished >>\n\n\
+                 › Implement the review comment\n\n\
+                 I’ll inspect the status detection path first and then adjust the idle override.\n",
+                "run this command? (y/n)",
+                "› Write tests for @filename",
+                "file saved",
+            ],
         );
-        assert_eq!(
-            detect_via_manifest(
-                "claude",
-                "Do you want to proceed?\n1. Yes",
-                "",
-                hook(Status::Idle, None)
-            ),
-            Status::Idle
-        );
-    }
-
-    #[test]
-    fn test_stale_waiting_hook_blank_pane_keeps_waiting() {
-        assert_eq!(
-            detect_via_manifest("claude", "", "", stale_wait()),
-            Status::Waiting
-        );
-        assert_eq!(
-            detect_via_manifest("claude", "   \n\n", "", stale_wait()),
-            Status::Waiting
-        );
+        // Only running hooks are overridden by a question on screen.
+        let question =
+            "  Question 1/1 (1 unanswered)\n  Pick one\n\n  › 1. Apple\n    2. Banana\n\n\
+                        \x20 tab to add notes | enter to submit answer | esc to interrupt\n";
+        for status in [Status::Waiting, Status::Idle] {
+            assert_hook_all("codex", hook(status, secs(0)), Status::Waiting, &[question]);
+        }
     }
 
     const CLAUDE_FOLDER_TRUST_PROMPT: &str = "\
@@ -1743,50 +2011,6 @@ report the issue.
    this folder
    2. No, exit
 ";
-
-    #[test]
-    fn claude_folder_trust_prompt_is_waiting() {
-        let cases = [
-            ("default", CLAUDE_FOLDER_TRUST_PROMPT),
-            ("wrapped", CLAUDE_FOLDER_TRUST_PROMPT_WRAPPED),
-            ("narrow", CLAUDE_FOLDER_TRUST_PROMPT_NARROW),
-        ];
-        for (name, fixture) in cases {
-            assert_eq!(detect_claude_status(fixture), Status::Waiting, "{name}");
-        }
-    }
-
-    #[test]
-    fn claude_echoed_trust_prompt_during_a_turn_is_not_waiting() {
-        let bodies = [
-            " \u{276f} 1. Yes, I trust this folder\n   2. No, exit",
-            "     \u{276f} 1. Yes, I trust this folder\n       2. No, exit",
-            "  \u{276f} 1. Yes, I trust this folder\n    2. No, exit\n     test result: FAILED",
-            " 1. Yes, I trust this folder is what you pick, and then\n 2. the session starts",
-        ];
-        for body in bodies {
-            let pane = format!(
-                "\u{25cf} The first-run dialog reads:\n \
-                 Quick safety check: Is this a project you created or one you trust?\n\
-                 {body}\n \u{2736} Working\u{2026} (12s \u{b7} \u{2193} 431 tokens)\n   \
-                 esc to interrupt\n"
-            );
-            assert_eq!(detect_claude_status(&pane), Status::Running, "{body:?}");
-        }
-    }
-
-    #[test]
-    fn test_reconcile_claude_idle_hook_parked_pane_keeps_idle() {
-        let pane = "✻ Worked for 1m 52s\n❯\n  ? for shortcuts";
-        assert_eq!(
-            detect_via_manifest("claude", pane, "", hook(Status::Idle, None)),
-            Status::Idle
-        );
-        assert_eq!(
-            detect_via_manifest("claude", "  \n \n", "", hook(Status::Idle, None)),
-            Status::Idle
-        );
-    }
 
     #[test]
     fn test_claude_deciding_rule_names_the_evidence() {
@@ -1921,32 +2145,6 @@ enter to select · esc to cancel";
                 "footer: {footer}"
             );
         }
-    }
-
-    #[test]
-    fn test_reconcile_claude_hook_status_age_gate_boundary() {
-        let pane = "❯ \n\n  ? for shortcuts · ← for agents";
-        assert_eq!(
-            detect_via_manifest(
-                "claude",
-                pane,
-                "",
-                hook(Status::Running, Some(claude_fresh_bound()))
-            ),
-            Status::Idle
-        );
-        assert_eq!(
-            detect_via_manifest(
-                "claude",
-                pane,
-                "",
-                hook(
-                    Status::Running,
-                    Some(claude_fresh_bound() - std::time::Duration::from_secs(1))
-                )
-            ),
-            Status::Running
-        );
     }
 
     #[test]
@@ -2134,67 +2332,6 @@ Do you want to proceed?\n\
     }
 
     #[test]
-    fn test_reconcile_claude_hook_status_stale_running_typed_prompt_over_completion_line() {
-        let parked = "\
-✻ Sautéed for 39s · 1 monitor still running\n\
-──────────────────────────────\n\
-❯ stop the monitor\n\
-──────────────────────────────\n\
-  ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage";
-        let streaming = "\
-  prose still being generated by the model\n\
-──────────────────────────────\n\
-❯ stop the monitor\n\
-──────────────────────────────\n\
-  ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage";
-        let cases = [(parked, Status::Idle), (streaming, Status::Running)];
-        for (pane, expected) in cases {
-            assert_eq!(
-                detect_via_manifest("claude", pane, "", hook(Status::Running, secs(120))),
-                expected,
-                "pane:\n{pane}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_reconcile_claude_hook_status_stale_running_typed_prompt_over_box_chrome() {
-        let clear_hint = "\
-  PR #484 is green across all checks and ready for your call on merging.\n\
-✻ Crunched for 10m 12s\n\
-                                              new task? /clear to save 131.6k tokens\n\
-──────────────────────────────\n\
-❯ merge it\n\
-──────────────────────────────\n\
-  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #484 · ← for agents";
-        let labeled_separator = "\
-✻ Worked for 43s\n\
-─────────────────────── rebrand-chord-charts-primary ──\n\
-❯ merge it and confirm the deploy\n\
-──────────────────────────────\n\
-  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
-        let streaming = "\
-  prose still being generated by the model\n\
-                                              new task? /clear to save 131.6k tokens\n\
-─────────────────────── rebrand-chord-charts-primary ──\n\
-❯ merge it\n\
-──────────────────────────────\n\
-  ⏵⏵ bypass permissions on (shift+tab to cycle) · PR #484 · ← for agents";
-        let cases = [
-            (clear_hint, Status::Idle),
-            (labeled_separator, Status::Idle),
-            (streaming, Status::Running),
-        ];
-        for (pane, expected) in cases {
-            assert_eq!(
-                detect_via_manifest("claude", pane, "", hook(Status::Running, secs(120))),
-                expected,
-                "pane:\n{pane}"
-            );
-        }
-    }
-
-    #[test]
     fn test_claude_mode_footer_is_chrome_not_evidence() {
         let stale = hook(Status::Running, secs(120));
         for footer in [
@@ -2238,48 +2375,6 @@ Do you want to proceed?\n\
     }
 
     #[test]
-    fn test_reconcile_claude_hook_status_stale_running_keeps_running_on_blank_pane() {
-        assert_eq!(
-            detect_via_manifest("claude", "   \n\n  ", "", hook(Status::Running, secs(120))),
-            Status::Running
-        );
-    }
-
-    #[test]
-    fn test_detect_claude_status_handles_v2_1_118_per_word_ansi() {
-        let ansi_running = "\x1b[38;5;174m✶\x1b[39m \x1b[38;5;180mWorking…\x1b[38;5;174m \x1b[38;5;246m(4s · ↓\x1b[39m \x1b[38;5;246m88 tokens)\x1b[39m\n\x1b[39m  \x1b[38;5;246mesc\x1b[39m \x1b[38;5;246mto\x1b[39m \x1b[38;5;246minterrupt\x1b[39m";
-        assert_eq!(
-            detect_status_from_content_in("", ansi_running, "claude"),
-            Status::Running,
-            "Per-word ANSI coloring must not prevent Running detection for Claude Code"
-        );
-    }
-
-    #[test]
-    fn test_detect_status_from_content_unknown_tool_returns_idle() {
-        let status = detect_status_from_content_in("", "Processing ⠋", "unknown_tool");
-        assert_eq!(status, Status::Idle);
-    }
-
-    #[test]
-    fn test_detect_status_strips_ansi_before_matching() {
-        let ansi_running =
-            "\x1b[38;2;39;62;94m⬝⬝⬝⬝⬝⬝⬝⬝\x1b[0m  \x1b[38;2;238;238;238mesc \x1b[38;2;128;128;128minterrupt\x1b[0m";
-        assert_eq!(
-            detect_status_from_content_in("", ansi_running, "opencode"),
-            Status::Running,
-            "ANSI codes around 'esc interrupt' should not prevent Running detection"
-        );
-
-        let ansi_spinner = "\x1b[38;2;255;255;255m⠋\x1b[0m generating";
-        assert_eq!(
-            detect_status_from_content_in("", ansi_spinner, "opencode"),
-            Status::Running,
-            "ANSI codes around spinner chars should not prevent Running detection"
-        );
-    }
-
-    #[test]
     fn test_detect_vibe_status_running() {
         assert_eq!(detect_vibe_status("processing ⠋"), Status::Running);
         assert_eq!(detect_vibe_status("⠹"), Status::Running);
@@ -2305,91 +2400,6 @@ Do you want to proceed?\n\
 
         assert_eq!(detect_vibe_status("Working…"), Status::Running);
         assert_eq!(detect_vibe_status("Loading..."), Status::Running);
-    }
-
-    #[test]
-    fn test_detect_vibe_status_waiting() {
-        assert_eq!(
-            detect_vibe_status("↑↓ navigate  Enter select  ESC reject"),
-            Status::Waiting
-        );
-        assert_eq!(
-            detect_vibe_status("⚠ bash command\nExecute this?"),
-            Status::Waiting
-        );
-        assert_eq!(
-            detect_vibe_status(
-                "› Yes\n  Yes and always allow bash for this session\n  No and tell the agent"
-            ),
-            Status::Waiting
-        );
-    }
-
-    #[test]
-    fn test_reconcile_codex_hook_status_keeps_running_after_completed_review_with_plain_new_output()
-    {
-        let pane = r#"
->> Code review started: staged changes <<
-
-<< Code review finished >>
-
-› Implement the review comment
-
-I’ll inspect the status detection path first and then adjust the idle override.
-"#;
-
-        assert_eq!(
-            detect_via_manifest("codex", pane, "", hook(Status::Running, secs(0))),
-            Status::Running
-        );
-    }
-
-    #[test]
-    fn test_reconcile_codex_hook_status_does_not_use_generic_pane_states() {
-        assert_eq!(
-            detect_via_manifest(
-                "codex",
-                "run this command? (y/n)",
-                "",
-                hook(Status::Running, secs(0))
-            ),
-            Status::Running
-        );
-        assert_eq!(
-            detect_via_manifest(
-                "codex",
-                "› Write tests for @filename",
-                "",
-                hook(Status::Running, secs(0))
-            ),
-            Status::Running
-        );
-        assert_eq!(
-            detect_via_manifest("codex", "file saved", "", hook(Status::Running, secs(0))),
-            Status::Running
-        );
-    }
-
-    #[test]
-    fn test_reconcile_codex_hook_status_only_overrides_running_hooks() {
-        let pane = "\
-  Question 1/1 (1 unanswered)
-  Pick one
-
-  › 1. Apple
-    2. Banana
-
-  tab to add notes | enter to submit answer | esc to interrupt
-";
-
-        assert_eq!(
-            detect_via_manifest("codex", pane, "", hook(Status::Waiting, secs(0))),
-            Status::Waiting
-        );
-        assert_eq!(
-            detect_via_manifest("codex", pane, "", hook(Status::Idle, secs(0))),
-            Status::Waiting
-        );
     }
 
     #[test]
@@ -2458,19 +2468,6 @@ Still more prose in the second section.\n\
 ────────────────────────────────────────\n\
 Closing prose line.\n\
 Final prose line.\n";
-
-    #[test]
-    fn test_detect_pi_status_running_spinner_footer() {
-        assert_eq!(detect_pi_status(PI_RUNNING_PANE), Status::Running);
-    }
-
-    #[test]
-    fn test_detect_pi_status_finished_with_activity_prose_is_not_running() {
-        assert_eq!(
-            detect_pi_status(PI_FINISHED_PANE_WITH_ACTIVITY_PROSE),
-            Status::Idle
-        );
-    }
 
     fn pane_with_line_at_depth(line: &str, depth: usize) -> String {
         let filler = "Footer filler line.\n".repeat(depth.saturating_sub(1));
@@ -2580,14 +2577,6 @@ Final prose line.\n";
             .expect("omp manifest");
         assert_eq!(detection.status, Some(Status::Idle));
         assert!(!detection.visible);
-    }
-
-    #[test]
-    fn test_detect_omp_status_idle_without_prompt() {
-        let panes = ["plain command output", "", " \n\t\n"];
-        for pane in panes {
-            assert_eq!(detect_omp_status(pane), Status::Idle, "case: {pane:?}");
-        }
     }
 
     #[test]
@@ -3287,55 +3276,6 @@ Final prose line.\n";
     }
 
     #[test]
-    fn test_detect_omp_status_active_brand_near_misses_idle() {
-        for pane in [
-            // activity timer without interrupt row
-                "Completed response.\n⠸ 1s > historical timing\n╰─",
-            // indented prose is not an interrupt row
-                "  Completed response.\n⠸ 1s > historical timing\n╰─",
-            // interrupt row without activity timer
-                "⎋ Working…\nπ > idle status\n╰─",
-            // digitless timer
-                "⎋ Working…\n⠸ .s > model status\n╰─",
-            // multi-decimal timer
-                "⎋ Working…\n⠸ 1..2s > model status\n╰─",
-            // leading-zero timer
-                "⎋ Working…\n⠸ 01s > model status\n╰─",
-            // duration prose below interrupt row
-                "⎋ Working…\nThe probe took 1s > historical timing\n╰─",
-            // stale interrupt rows around completed output
-                "⎋ Working…\nDone. Wrote 3 files.\nesc Working...",
-            // duration prose with a single-cell prefix
-                "esc Working...\nx 30m saved per run",
-            // active band pushed above current composer
-                "⎋ Working…\n⠸ 1s > model status\nCompleted response.\n╭── π > idle ─╮\n╰─           ─╯",
-            // persistent elapsed segment
-                "⎋ Working…\nπ > RCA Slow Turn > ⏱ 5m\n╰─",
-            // clock-only first segment
-                "  ⎋ Working…\n\n❯\n ⏱ 5m · RCA Slow Turn",
-            // nerd clock-only first segment
-                "  󱊷 Working…\n\n❯\n  5m  RCA Slow Turn",
-            // ascii clock-only first segment
-                "  esc Working...\n\n>\n t: 5m > RCA Slow Turn",
-            // decorated nerd clock-only first segment
-                "  󱊷 Working…\n\n❯\n  5m  RCA Slow Turn",
-            // decorated unicode clock-only first segment
-                "  ⎋ Working…\n❯\n╭── ⏱ 5m ─╮\n╰─",
-            // stale band with parked pi footer
-                "─ Continue Autonomous · ⏱ 2h4m ─\n❯\n───────────────────────────────────\n π · 🖥 host",
-            // parked claude shape at prompt
-                "❯\n───────────────────────────────────\n π · 🖥 host",
-            // stale parked spinner with prose mentioning esc to cancel
-                "Some tool output: press (esc to cancel) to abort\n\
-                 ❯\n\
-                 ───────────────────────────────────\n\
-                  ⠏ 28s · 🖥 host",
-        ] {
-            assert_eq!(detect_omp_status(pane), Status::Idle, "{pane}");
-        }
-    }
-
-    #[test]
     fn test_detect_omp_status_active_brand_uses_lowest_marker() {
         let band = "⎋ Working…\n⠸ 1s > model status";
         let approval = "│ ❯ Approve │\n│ Deny │\n│ up/down navigate  enter select  esc cancel │";
@@ -3363,48 +3303,6 @@ Final prose line.\n";
         ];
         for (name, pane, expected) in cases {
             assert_eq!(detect_omp_status(&pane), expected, "case: {name}");
-        }
-    }
-
-    #[test]
-    fn test_detect_omp_status_waiting_on_ask_dialog() {
-        let cases = [
-            "\
-╭─ Ask ────────────────────────────────────────╮
-│                                              │
-│ Which database for the new service?          │
-│                                              │
-│  ❯ PostgreSQL                                │
-│    SQLite                                    │
-│    Other (type your own)                     │
-│                                              │
-│ Enter select · n note · ↑/↓ move · Esc       │
-│                                              │
-╰──────────────────────────────────────────────╯",
-            "\
-| Space toggle · Enter next · ↑/↓ move · Esc   |
-+----------------------------------------------+",
-            "\
-│ Enter submit · ↑/↓ scroll · Esc              │
-╰──────────────────────────────────────────────╯",
-            "\
-│ Finish or clear the current prompt to answer · Esc cancel │
-╰──────────────────────────────────────────────╯",
-            "\
-╭─ Ask ────────────────────────────────────────╮
-│ Enter select · n note · ↑/↓ move · Esc       │
-╰──────────────────────────────────────────────╯
-╭── π > draft ─────────────────────────────────╮
-╰──────────────────────────────────────────────╯",
-            "\
-╭─ Ask ────────────────────────────────────────╮
-│ Finish or clear the current prompt to answer · Esc cancel │
-╰──────────────────────────────────────────────╯
-╭── π > draft ─────────────────────────────────╮
-╰──────────────────────────────────────────────╯",
-        ];
-        for (i, pane) in cases.iter().enumerate() {
-            assert_eq!(detect_omp_status(pane), Status::Waiting, "case {i}");
         }
     }
 
@@ -3453,56 +3351,6 @@ Final prose line.\n";
         ];
         for (name, pane) in cases {
             assert_eq!(detect_omp_status(pane), Status::Waiting, "case: {name}");
-        }
-    }
-
-    #[test]
-    fn test_detect_omp_status_selector_hint_without_approval() {
-        let box_ = "╭── π ─╮\n╰─ ─╯";
-        let cases = [
-            format!("Quoted UI:\nApprove and execute\nRefine plan\nSave and quit\ntab regions · esc cancel\n{box_}"),
-            format!("The instructions said: Enter select · n note\n{box_}"),
-            "╭── π  > approve and execute the migration ─╮\n│ then refine plan wording                    │\n╰─                                           ─╯".to_string(),
-            format!("Options were:\n> Approve and execute\nor Refine plan\n{box_}"),
-            format!("| > Approve and execute |\n|   Refine plan |\n|   Save and quit |\nPlan approved.\nrunning step 1\ndone\n{box_}"),
-            format!("I approve and execute\nthen refine plan things\n{box_}"),
-            format!("│ up/down navigate  enter select  esc cancel │\n{box_}"),
-            format!("│ up/down navigate  enter select  esc cancel │\nI will approve or deny later\n{box_}"),
-            format!("I would approve and execute refine plan steps\n{box_}"),
-            "╭── π > GPT-5.6 Sol ─╮\n│ Enter select · n note while documenting the UI │\n│ second draft line │\n╰──────────────────╯"
-                .to_string(),
-            "│ Enter submit · ↑/↓ scroll · current prompt to answer │\n╭── \u{f0d57} > ─╮"
-                .to_string(),
-            format!("press enter to select an option\n{box_}"),
-        ];
-        for pane in &cases {
-            assert_eq!(detect_omp_status(pane), Status::Idle, "case: {pane:?}");
-        }
-    }
-
-    #[test]
-    fn test_detect_hermes_status_waiting_on_approval() {
-        assert_eq!(
-            detect_hermes_status(
-                "⚠️  DANGEROUS COMMAND: rm -rf /tmp\n[o]nce  |  [s]ession  |  [a]lways  |  [d]eny\nChoice [o/s/a/D]:"
-            ),
-            Status::Waiting
-        );
-        assert_eq!(
-            detect_hermes_status("dangerous command detected\nproceed?"),
-            Status::Waiting
-        );
-    }
-
-    #[test]
-    fn test_detect_antigravity_status_idle_on_completed_activity_phrases() {
-        for content in [
-            "Running tests completed successfully.",
-            "Reading config.toml finished.",
-            "Editing src/session/instance.rs done.",
-            "Testing finished with success.",
-        ] {
-            assert_eq!(detect_antigravity_status(content), Status::Idle);
         }
     }
 }

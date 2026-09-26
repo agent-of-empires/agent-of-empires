@@ -571,15 +571,14 @@ mod tests {
                 }
             }
         }
-    }
 
-    #[tokio::test]
-    async fn watchdog_does_not_cancel_compaction_via_classifier() {
-        let t0 = Instant::now();
-        let mut w = SilentOrphanWatchdog::default();
-        let sig = classify_lifecycle_signal(&text_chunk("Compacting...", Some("m1"))).unwrap();
-        w.apply_signal(sig, t0, chrono::Utc::now(), CFG);
-        assert!(!w.should_fire(t0 + Duration::from_millis(120_400), CFG));
+        {
+            let t0 = Instant::now();
+            let mut w = SilentOrphanWatchdog::default();
+            let sig = classify_lifecycle_signal(&text_chunk("Compacting...", Some("m1"))).unwrap();
+            w.apply_signal(sig, t0, chrono::Utc::now(), CFG);
+            assert!(!w.should_fire(t0 + Duration::from_millis(120_400), CFG));
+        }
     }
 
     #[test]

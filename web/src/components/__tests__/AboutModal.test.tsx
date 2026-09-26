@@ -53,38 +53,25 @@ describe("AboutModal session id", () => {
     expect(info).toHaveBeenCalledWith("Copied session id");
   });
 
-  it("falls back to execCommand when navigator.clipboard is unavailable", async () => {
+  it("falls back to execCommand without navigator.clipboard and reports its result", async () => {
     setSecureContext(false);
     Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true });
-    const exec = vi.fn().mockReturnValue(true);
-    Object.defineProperty(document, "execCommand", { value: exec, configurable: true });
-    const { info } = stubToasts();
-    render(<AboutModal onClose={() => {}} sessionId="sess-fallback" />);
+    for (const ok of [true, false]) {
+      const exec = vi.fn().mockReturnValue(ok);
+      Object.defineProperty(document, "execCommand", { value: exec, configurable: true });
+      const { info, error } = stubToasts();
+      const { unmount } = render(<AboutModal onClose={() => {}} sessionId="sess-fallback" />);
 
-    fireEvent.click(screen.getByRole("button", { name: /copy session id/i }));
-    await flushMicrotasks();
+      fireEvent.click(screen.getByRole("button", { name: /copy session id/i }));
+      await flushMicrotasks();
 
-    expect(exec).toHaveBeenCalledWith("copy");
-    expect(info).toHaveBeenCalledWith("Copied session id");
-  });
-
-  it("reports an error when the copy fails", async () => {
-    setSecureContext(false);
-    Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true });
-    const exec = vi.fn().mockReturnValue(false);
-    Object.defineProperty(document, "execCommand", { value: exec, configurable: true });
-    const { info, error } = stubToasts();
-    render(<AboutModal onClose={() => {}} sessionId="sess-fail" />);
-
-    fireEvent.click(screen.getByRole("button", { name: /copy session id/i }));
-    await flushMicrotasks();
-
-    expect(error).toHaveBeenCalledWith("Copy failed");
-    expect(info).not.toHaveBeenCalled();
-  });
-
-  it("renders no session-id row when there is no open session", () => {
-    render(<AboutModal onClose={() => {}} sessionId={null} />);
-    expect(screen.queryByRole("button", { name: /copy session id/i })).toBeNull();
+      expect(exec).toHaveBeenCalledWith("copy");
+      if (ok) expect(info).toHaveBeenCalledWith("Copied session id");
+      else {
+        expect(error).toHaveBeenCalledWith("Copy failed");
+        expect(info).not.toHaveBeenCalled();
+      }
+      unmount();
+    }
   });
 });

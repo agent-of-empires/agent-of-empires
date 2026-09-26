@@ -23,7 +23,12 @@ const EVENT_RETENTION_PER_TOPIC: usize = 10_000;
 const MAX_WORKERS: usize = 32;
 const MAX_RESPAWNS: usize = 3;
 const RESPAWN_WINDOW: Duration = Duration::from_secs(60);
-const REAP_GRACE: Duration = Duration::from_secs(2);
+// Unit tests reap `sleep` workers that ignore SIGTERM; don't wait out the grace.
+const REAP_GRACE: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(2)
+};
 
 struct RunningWorker {
     supervisor_id: u64,

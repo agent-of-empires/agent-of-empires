@@ -1,36 +1,23 @@
-import { describe, expect, it } from "vitest";
+import { expect, it } from "vitest";
 import { getClientCapabilities } from "../clientCapabilities";
 import type { ServerAbout } from "../api";
 
-describe("getClientCapabilities", () => {
-  it("locks down every affordance in CityHall mode", () => {
-    const caps = getClientCapabilities({ cityhall_mode: true } as ServerAbout);
-    expect(caps).toEqual({
-      cityhall: true,
-      canUseTerminal: false,
-      canUseDiff: false,
-      canManageProjects: false,
-      nameOnlyWizard: true,
-    });
+it("locks down every affordance only in CityHall mode", () => {
+  const open = {
+    cityhall: false,
+    canUseTerminal: true,
+    canUseDiff: true,
+    canManageProjects: true,
+    nameOnlyWizard: false,
+  };
+  expect(getClientCapabilities({ cityhall_mode: true } as ServerAbout)).toEqual({
+    cityhall: true,
+    canUseTerminal: false,
+    canUseDiff: false,
+    canManageProjects: false,
+    nameOnlyWizard: true,
   });
-
-  it("leaves everything open in normal mode", () => {
-    const caps = getClientCapabilities({ cityhall_mode: false } as ServerAbout);
-    expect(caps).toEqual({
-      cityhall: false,
-      canUseTerminal: true,
-      canUseDiff: true,
-      canManageProjects: true,
-      nameOnlyWizard: false,
-    });
-  });
-
-  it("defaults to open when serverAbout is absent", () => {
-    for (const about of [null, undefined]) {
-      const caps = getClientCapabilities(about);
-      expect(caps.cityhall).toBe(false);
-      expect(caps.canManageProjects).toBe(true);
-      expect(caps.nameOnlyWizard).toBe(false);
-    }
-  });
+  for (const about of [{ cityhall_mode: false } as ServerAbout, null, undefined]) {
+    expect(getClientCapabilities(about), String(about?.cityhall_mode)).toEqual(open);
+  }
 });

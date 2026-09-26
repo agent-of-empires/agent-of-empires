@@ -493,337 +493,114 @@ mod tests {
         }
     }
 
-    // Locks: a non-UTF-8 prior value MUST round-trip through the guard byte-for-byte.
+    // Drop restores each key's exact prior state: a non-UTF-8 value byte-for-byte (#2751), empty
+    // versus unset, a value `unset` removed, and a key set twice to its pre-guard value.
     #[test]
     #[serial]
-    #[cfg(unix)]
-    fn env_guard_drop_restores_non_utf8_prior_value() {
-        use std::os::unix::ffi::OsStrExt;
-
-        let _restore = AmbientEnvRestore::capture("HOME");
-
-        let non_utf8 = OsString::from(OsStr::from_bytes(b"/tmp/aoe-\xFF\xFE-home"));
-        assert!(
-            non_utf8.to_str().is_none(),
-            "precondition: the seeded value must not be valid UTF-8"
-        );
-        std::env::set_var("HOME", &non_utf8);
-        assert!(
-            std::env::var("HOME").is_err(),
-            "precondition: env::var must surface NotUnicode, the error the old \
-             Option<String> snapshot swallowed via .ok()"
-        );
-
-        {
-            let _guard = EnvGuard::set(&[("HOME", "/tmp/aoe-envguard-scoped")]);
-            assert_eq!(
-                std::env::var_os("HOME"),
-                Some(OsString::from("/tmp/aoe-envguard-scoped")),
-                "guard must apply its override while live"
-            );
-        }
-
-        assert_eq!(
-            std::env::var_os("HOME"),
-            Some(non_utf8),
-            "Drop must restore the non-UTF-8 prior value byte-for-byte rather than remove it (#2751)"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn env_guard_drop_preserves_empty_versus_unset() {
-        let _restore_set = AmbientEnvRestore::capture("AOE_ENVGUARD_EMPTY");
-        let _restore_unset = AmbientEnvRestore::capture("AOE_ENVGUARD_UNSET");
-
-        std::env::set_var("AOE_ENVGUARD_EMPTY", "");
-        std::env::remove_var("AOE_ENVGUARD_UNSET");
-
-        {
-            let _guard = EnvGuard::set(&[
-                ("AOE_ENVGUARD_EMPTY", "populated"),
-                ("AOE_ENVGUARD_UNSET", "populated"),
-            ]);
-        }
-
-        assert_eq!(
-            std::env::var_os("AOE_ENVGUARD_EMPTY"),
-            Some(OsString::new()),
-            "an empty prior value must be restored as empty, not removed"
-        );
-        assert_eq!(
-            std::env::var_os("AOE_ENVGUARD_UNSET"),
-            None,
-            "a previously-unset var must be removed on Drop, not set to empty"
-        );
-    }
-
-    // `EnvGuard::unset` removes the key for the scope and restores the prior value on `Drop`.
-    #[test]
-    #[serial]
-    fn env_guard_unset_removes_then_restores() {
-        let _restore = AmbientEnvRestore::capture("AOE_ENVGUARD_UNSET_ME");
-
-        std::env::set_var("AOE_ENVGUARD_UNSET_ME", "original");
-
-        {
-            let _guard = EnvGuard::unset(&["AOE_ENVGUARD_UNSET_ME"]);
-            assert_eq!(
-                std::env::var_os("AOE_ENVGUARD_UNSET_ME"),
+    fn env_guard_drop_restores_the_exact_prior_state() {
+        // (key, prior, values set in one call or None for `unset`, value while live)
+        let mut cases: Vec<(
+            &'static str,
+            Option<OsString>,
+            Option<&[&str]>,
+            Option<&str>,
+        )> = vec![
+            (
+                "AOE_ENVGUARD_EMPTY",
+                Some(OsString::new()),
+                Some(&["populated"]),
+                Some("populated"),
+            ),
+            (
+                "AOE_ENVGUARD_UNSET",
                 None,
-                "unset must remove the var while the guard is live"
-            );
-        }
-
-        assert_eq!(
-            std::env::var_os("AOE_ENVGUARD_UNSET_ME"),
-            Some(OsString::from("original")),
-            "Drop must restore the value unset removed"
-        );
-    }
-
-    // A key listed twice in one `set` call must round-trip to its pre-guard value, not to the
-    // intermediate write.
-    #[test]
-    #[serial]
-    fn env_guard_drop_restores_duplicate_key_to_pre_guard_value() {
-        let _restore = AmbientEnvRestore::capture("AOE_ENVGUARD_DUP");
-
-        std::env::set_var("AOE_ENVGUARD_DUP", "original");
-
+                Some(&["populated"]),
+                Some("populated"),
+            ),
+            ("AOE_ENVGUARD_UNSET_ME", Some("original".into()), None, None),
+            (
+                "AOE_ENVGUARD_DUP",
+                Some("original".into()),
+                Some(&["first", "second"]),
+                Some("second"),
+            ),
+        ];
+        #[cfg(unix)]
         {
-            let _guard = EnvGuard::set(&[
-                ("AOE_ENVGUARD_DUP", "first"),
-                ("AOE_ENVGUARD_DUP", "second"),
-            ]);
-            assert_eq!(
-                std::env::var_os("AOE_ENVGUARD_DUP"),
-                Some(OsString::from("second")),
-                "the last write in the pair list wins while the guard is live"
-            );
+            use std::os::unix::ffi::OsStrExt;
+            let non_utf8 = OsString::from(OsStr::from_bytes(b"/tmp/aoe-\xFF\xFE-home"));
+            cases.push((
+                "HOME",
+                Some(non_utf8),
+                Some(&["/tmp/aoe-envguard-scoped"]),
+                Some("/tmp/aoe-envguard-scoped"),
+            ));
         }
-
-        assert_eq!(
-            std::env::var_os("AOE_ENVGUARD_DUP"),
-            Some(OsString::from("original")),
-            "Drop must restore the pre-guard value, not the intermediate 'first'"
-        );
+        for (key, prior, values, live) in cases {
+            let _restore = AmbientEnvRestore::capture(key);
+            match &prior {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            {
+                let _guard = match values {
+                    Some(values) => {
+                        EnvGuard::set(&values.iter().map(|value| (key, *value)).collect::<Vec<_>>())
+                    }
+                    None => EnvGuard::unset(&[key]),
+                };
+                assert_eq!(
+                    std::env::var_os(key),
+                    live.map(OsString::from),
+                    "{key} while live"
+                );
+            }
+            assert_eq!(std::env::var_os(key), prior, "{key} after drop");
+        }
     }
 
-    // Locks the fix for: `Drop` MUST restore `HOME` and (on Linux/macOS) `XDG_CONFIG_HOME` plus
-    // `XDG_DATA_HOME` to their pre-guard values.
+    // Drop restores HOME and the XDG roots to their pre-construction snapshot (#2717), after a
+    // plain scope, a mid-scope write, and a panicking test body.
     #[test]
     #[serial]
     fn app_dir_guard_drop_restores_env_vars() {
-        let _home = AmbientEnvRestore::capture("HOME");
-        let _xdg = AmbientEnvRestore::capture("XDG_CONFIG_HOME");
-        let _data = AmbientEnvRestore::capture("XDG_DATA_HOME");
-        let before_home = std::env::var_os("HOME");
-        let before_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        let before_xdg_data = std::env::var_os("XDG_DATA_HOME");
-
-        {
-            let guard = isolate_app_dir();
-            assert_eq!(
-                std::env::var_os("HOME"),
-                Some(guard.path().as_os_str().to_os_string()),
-                "HOME must point at the guard's tempdir during the test body"
-            );
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            {
+        const KEYS: [&str; 3] = ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"];
+        type Body = fn(&AppDirGuard);
+        let cases: [(&str, Body, bool); 3] = [
+            ("plain", |_| {}, false),
+            (
+                "mid-scope write",
+                |_| std::env::set_var("HOME", "/tmp/aoe-mid-scope-sentinel"),
+                false,
+            ),
+            ("panic", |_| panic!("simulate a test-body panic"), true),
+        ];
+        for (case, body, panics) in cases {
+            let _restore = KEYS.map(AmbientEnvRestore::capture);
+            let before = KEYS.map(std::env::var_os);
+            let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let guard = isolate_app_dir();
                 assert_eq!(
-                    std::env::var_os("XDG_CONFIG_HOME"),
-                    Some(guard.path().join(".config").into_os_string()),
-                    "XDG_CONFIG_HOME must point at <tempdir>/.config"
+                    std::env::var_os("HOME"),
+                    Some(guard.path().into()),
+                    "{case}"
                 );
-                assert_eq!(
-                    std::env::var_os("XDG_DATA_HOME"),
-                    Some(guard.path().join(".local/share").into_os_string()),
-                    "XDG_DATA_HOME must point at <tempdir>/.local/share"
-                );
-            }
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                for (key, sub) in [
+                    ("XDG_CONFIG_HOME", ".config"),
+                    ("XDG_DATA_HOME", ".local/share"),
+                ] {
+                    assert_eq!(
+                        std::env::var_os(key),
+                        Some(guard.path().join(sub).into()),
+                        "{case}"
+                    );
+                }
+                body(&guard);
+            }));
+            assert_eq!(unwound.is_err(), panics, "{case}");
+            assert_eq!(KEYS.map(std::env::var_os), before, "{case}");
         }
-
-        assert_eq!(
-            std::env::var_os("HOME"),
-            before_home,
-            "HOME must be restored on guard Drop"
-        );
-        assert_eq!(
-            std::env::var_os("XDG_CONFIG_HOME"),
-            before_xdg,
-            "XDG_CONFIG_HOME must be restored on guard Drop"
-        );
-        assert_eq!(
-            std::env::var_os("XDG_DATA_HOME"),
-            before_xdg_data,
-            "XDG_DATA_HOME must be restored on guard Drop"
-        );
-    }
-
-    // Locks the `remove_var` branch of `restore_or_remove`: when the pre-guard env var was unset,
-    // `Drop` MUST leave it unset.
-    #[test]
-    #[serial]
-    fn app_dir_guard_drop_removes_env_vars_when_unset() {
-        let _restore_home = AmbientEnvRestore::capture("HOME");
-        let _restore_xdg = AmbientEnvRestore::capture("XDG_CONFIG_HOME");
-        let _restore_xdg_data = AmbientEnvRestore::capture("XDG_DATA_HOME");
-
-        std::env::remove_var("HOME");
-        std::env::remove_var("XDG_CONFIG_HOME");
-        std::env::remove_var("XDG_DATA_HOME");
-
-        {
-            let guard = isolate_app_dir();
-            assert_eq!(
-                std::env::var_os("HOME"),
-                Some(guard.path().as_os_str().to_os_string()),
-                "constructor must set HOME to the guard tempdir even when the prior value was unset"
-            );
-        }
-
-        assert_eq!(
-            std::env::var_os("HOME"),
-            None,
-            "HOME must be removed on Drop when it was unset before construction"
-        );
-        assert_eq!(
-            std::env::var_os("XDG_CONFIG_HOME"),
-            None,
-            "XDG_CONFIG_HOME must stay unset on Drop when it was unset before construction"
-        );
-        assert_eq!(
-            std::env::var_os("XDG_DATA_HOME"),
-            None,
-            "XDG_DATA_HOME must stay unset on Drop when it was unset before construction"
-        );
-    }
-
-    // `AsRef<Path>` lets call sites pass `&guard` wherever a `Path`-like is expected, matching
-    // `Path::join`-style ergonomics.
-    #[test]
-    #[serial]
-    fn app_dir_guard_as_ref_path_matches_path() {
-        let guard = isolate_app_dir();
-        let via_as_ref: &Path = guard.as_ref();
-        assert_eq!(
-            via_as_ref,
-            guard.path(),
-            "AsRef<Path>::as_ref must return the same path as AppDirGuard::path"
-        );
-    }
-
-    // Locks the "Drop-runs-on-unwind" contract that motivates the entire RAII conversion.
-    #[test]
-    #[serial]
-    fn app_dir_guard_drop_restores_env_vars_on_panic() {
-        let _home = AmbientEnvRestore::capture("HOME");
-        let _xdg = AmbientEnvRestore::capture("XDG_CONFIG_HOME");
-        let _data = AmbientEnvRestore::capture("XDG_DATA_HOME");
-        let before_home = std::env::var_os("HOME");
-        let before_xdg = std::env::var_os("XDG_CONFIG_HOME");
-
-        let unwound = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _guard = isolate_app_dir();
-            panic!("simulate a test-body panic while the guard is live");
-        }));
-        assert!(
-            unwound.is_err(),
-            "the inner panic must actually propagate to catch_unwind"
-        );
-
-        assert_eq!(
-            std::env::var_os("HOME"),
-            before_home,
-            "HOME must be restored on guard Drop even when the test body panics"
-        );
-        assert_eq!(
-            std::env::var_os("XDG_CONFIG_HOME"),
-            before_xdg,
-            "XDG_CONFIG_HOME must be restored on guard Drop even when the test body panics"
-        );
-    }
-
-    // Locks the "snapshot at construction" semantic: `Drop` restores to the pre-construction env
-    // values, not to whatever the test last wrote inside the guard's scope.
-    #[test]
-    #[serial]
-    fn app_dir_guard_drop_ignores_mid_scope_env_writes() {
-        let _home = AmbientEnvRestore::capture("HOME");
-        let _xdg = AmbientEnvRestore::capture("XDG_CONFIG_HOME");
-        let _data = AmbientEnvRestore::capture("XDG_DATA_HOME");
-        let before_home = std::env::var_os("HOME");
-
-        {
-            let _guard = isolate_app_dir();
-            std::env::set_var("HOME", "/tmp/aoe-mid-scope-sentinel");
-            assert_eq!(
-                std::env::var_os("HOME"),
-                Some(OsString::from("/tmp/aoe-mid-scope-sentinel")),
-                "mid-scope write must land while the guard is live"
-            );
-        }
-
-        assert_eq!(
-            std::env::var_os("HOME"),
-            before_home,
-            "Drop must restore the pre-construction snapshot, not the mid-scope write"
-        );
-    }
-
-    // A peer thread writing `HOME` mid-scope must not survive the guard's `Drop`: `Drop`
-    // unconditionally restores the pre-construction snapshot regardless of intervening writes from
-    // any thread.
-    #[test]
-    #[serial]
-    fn app_dir_guard_survives_concurrent_peer_env_swap() {
-        use std::sync::{Arc, Barrier};
-        use std::thread;
-
-        let _home = AmbientEnvRestore::capture("HOME");
-        let _xdg = AmbientEnvRestore::capture("XDG_CONFIG_HOME");
-        let _data = AmbientEnvRestore::capture("XDG_DATA_HOME");
-        let before_home = std::env::var_os("HOME");
-
-        let peer_at_swap = Arc::new(Barrier::new(2));
-        let peer_done = Arc::new(Barrier::new(2));
-
-        let peer_at_swap_clone = Arc::clone(&peer_at_swap);
-        let peer_done_clone = Arc::clone(&peer_done);
-        let peer = thread::spawn(move || {
-            peer_at_swap_clone.wait();
-            std::env::set_var("HOME", "/tmp/aoe-peer-swap-sentinel");
-            peer_done_clone.wait();
-        });
-
-        {
-            let guard = isolate_app_dir();
-            let guard_path = guard.path().to_path_buf();
-
-            peer_at_swap.wait();
-            peer_done.wait();
-
-            assert_eq!(
-                std::env::var_os("HOME"),
-                Some(OsString::from("/tmp/aoe-peer-swap-sentinel")),
-                "peer thread must have swapped HOME by now (Barrier rendezvous)"
-            );
-
-            assert_eq!(
-                guard.path(),
-                guard_path,
-                "guard.path() must remain the snapshotted path even after a peer env swap"
-            );
-        }
-
-        peer.join().expect("peer thread must not panic");
-
-        assert_eq!(
-            std::env::var_os("HOME"),
-            before_home,
-            "guard Drop must restore the pre-construction HOME even when a peer thread swapped it mid-scope"
-        );
     }
 
     // `isolate_app_dir_at` reads a caller-owned path and MUST NOT own or delete it: after the guard

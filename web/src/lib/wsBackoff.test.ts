@@ -10,26 +10,21 @@
 // during first-session-open without keeping the client asleep on a 30s
 // timer once the server is finally ready. See #1455.
 
-import { describe, expect, it } from "vitest";
+import { expect, it } from "vitest";
 import { retryDelayMs } from "./wsBackoff";
 
-describe("retryDelayMs", () => {
-  it("uses the fast-start schedule for the first attempts", () => {
-    expect(retryDelayMs(1)).toBe(200);
-    expect(retryDelayMs(2)).toBe(400);
-    expect(retryDelayMs(3)).toBe(800);
-    expect(retryDelayMs(4)).toBe(1500);
-    expect(retryDelayMs(5)).toBe(3000);
-  });
-
-  it("caps at 10s for the tail of the backoff", () => {
-    expect(retryDelayMs(6)).toBe(6000);
-    expect(retryDelayMs(7)).toBe(10000);
-    expect(retryDelayMs(20)).toBe(10000);
-  });
-
-  it("clamps non-positive attempts to the first delay", () => {
-    expect(retryDelayMs(0)).toBe(200);
-    expect(retryDelayMs(-1)).toBe(200);
-  });
+it("retryDelayMs starts fast, caps at 10s, and clamps non-positive attempts", () => {
+  const schedule: [number, number][] = [
+    [-1, 200],
+    [0, 200],
+    [1, 200],
+    [2, 400],
+    [3, 800],
+    [4, 1500],
+    [5, 3000],
+    [6, 6000],
+    [7, 10000],
+    [20, 10000],
+  ];
+  for (const [attempt, delay] of schedule) expect(retryDelayMs(attempt), `attempt ${attempt}`).toBe(delay);
 });

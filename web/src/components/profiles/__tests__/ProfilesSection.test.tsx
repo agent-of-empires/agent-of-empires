@@ -71,15 +71,11 @@ async function mountAndSelectWork(readOnly?: boolean) {
 }
 
 describe("ProfilesSection", () => {
-  it("lists profiles with a default badge and shows the selected profile's hooks", async () => {
+  it("shows the selected profile's hooks and saves a description with only `description` in the body", async () => {
     const api = await mountAndSelectWork();
     expect(api.getByText("default")).toBeTruthy();
     await waitFor(() => api.getByText("echo seeded"));
     expect(api.getByText("echo global")).toBeTruthy();
-  });
-
-  it("saves a description with only `description` in the body, never hooks", async () => {
-    const api = await mountAndSelectWork();
     fireEvent.change(await waitFor(() => api.getByPlaceholderText("What this profile is for")), {
       target: { value: "client repos" },
     });

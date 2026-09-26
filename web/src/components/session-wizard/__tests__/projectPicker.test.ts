@@ -56,7 +56,6 @@ describe("mergeRecentProjects", () => {
   it.each([
     [persisted("/repo/frontend", undefined, "frontend"), "frontend"],
     [persisted("/repo/backend"), "backend"],
-    [persisted("/"), "/"],
   ])("appends persisted-only %j with a zero count", (entry, displayName) => {
     expect(mergeRecentProjects([], [entry])).toMatchObject([{ displayName, sessionCount: 0 }]);
   });

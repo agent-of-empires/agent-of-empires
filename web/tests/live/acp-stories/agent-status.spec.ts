@@ -7,7 +7,6 @@ import {
   chunk,
   endTurn,
   openStructuredView,
-  postPrompt,
   replayFrames,
   script,
   sessionIdByTitle,
@@ -106,7 +105,7 @@ const planUpdate = (...entries: [string, string, string][]) => ({
   entries: entries.map(([content, status, priority]) => ({ content, status, priority })),
 });
 
-test("plan session update renders in PlanStrip", async ({ page, spawnServe }) => {
+test("plan session update renders in PlanStrip and the sidebar PlanProgressMini", async ({ page, spawnServe }) => {
   const { serve, sessionId } = await startAcpSession(spawnServe, {
     title: "story-plan",
     fakeAcpScript: script(
@@ -124,23 +123,8 @@ test("plan session update renders in PlanStrip", async ({ page, spawnServe }) =>
   // The expanded list and the sidebar row repeat these texts; the strip mounts first.
   await expect(page.getByText("Investigate the bug").first()).toBeVisible({ timeout: 15_000 });
   await expect(page.getByText("0/3").first()).toBeVisible({ timeout: 15_000 });
-});
-
-test("sidebar PlanProgressMini renders the structured view plan summary", async ({ page, spawnServe }) => {
-  const { serve, sessionId } = await startAcpSession(spawnServe, {
-    title: "story-sidebar-plan",
-    fakeAcpScript: script(
-      endTurn(
-        planUpdate(["Step alpha", "in_progress", "high"], ["Step bravo", "pending", "medium"]),
-        chunk("Planned."),
-      ),
-    ),
-  });
-  const res = await postPrompt(serve.baseUrl, sessionId, "plan it");
-  if (!res.ok) throw new Error(`structured view prompt POST failed: ${res.status} ${await res.text()}`);
-
-  await page.goto(serve.baseUrl);
-  await expect(page.getByRole("progressbar", { name: /Plan progress: 0 of 2 steps/i })).toBeVisible({
+  // The sidebar row's PlanProgressMini summarizes the same plan.
+  await expect(page.getByRole("progressbar", { name: /Plan progress: 0 of 3 steps/i })).toBeVisible({
     timeout: 20_000,
   });
 });

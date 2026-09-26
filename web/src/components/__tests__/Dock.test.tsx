@@ -1,13 +1,11 @@
 // @vitest-environment jsdom
 
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { fireEvent, render } from "@testing-library/react";
 
 import { Dock } from "../Dock";
 import { PaneDndStateContext } from "../paneDnd";
 import { BUILTIN_PANES } from "../../lib/panes";
-
-afterEach(() => cleanup());
 
 const body = (id: string) => <div data-testid={`body-${id}`}>{id}</div>;
 const descriptorFor = (id: string) => {
@@ -45,35 +43,18 @@ describe("Dock", () => {
     expect(queryByTestId("body-diff")).toBeNull();
   });
 
-  it("renders nothing when there are no tabs", () => {
-    const { container } = renderDock({ tabs: [], active: null });
-    expect(container.firstChild).toBeNull();
-  });
-
-  it("activates a tab on click", () => {
+  it("routes tab clicks, close, move, and new-terminal controls to their callbacks", () => {
     const onActivate = vi.fn();
-    const { getByTestId } = renderDock({ onActivate });
+    const onClose = vi.fn();
+    const onMove = vi.fn();
+    const onNewTerminal = vi.fn();
+    const { getByTestId, getByLabelText } = renderDock({ onActivate, onClose, onMove, onNewTerminal });
     fireEvent.click(getByTestId("pane-tab-diff"));
     expect(onActivate).toHaveBeenCalledWith("diff");
-  });
-
-  it("closes a tab via its X control", () => {
-    const onClose = vi.fn();
-    const { getByLabelText } = renderDock({ onClose });
     fireEvent.click(getByLabelText("Close diff"));
     expect(onClose).toHaveBeenCalledWith("diff");
-  });
-
-  it("moves the active tab to the other dock", () => {
-    const onMove = vi.fn();
-    renderDock({ onMove });
-    fireEvent.click(document.querySelector('[aria-label="Move terminal to bottom dock"]')!);
+    fireEvent.click(getByLabelText("Move terminal to bottom dock"));
     expect(onMove).toHaveBeenCalledWith("terminal:0", "bottom");
-  });
-
-  it("requests a new terminal", () => {
-    const onNewTerminal = vi.fn();
-    const { getByLabelText } = renderDock({ onNewTerminal });
     fireEvent.click(getByLabelText("New terminal"));
     expect(onNewTerminal).toHaveBeenCalled();
   });

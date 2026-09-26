@@ -47,19 +47,12 @@ describe("SessionStep", () => {
     expect(screen.getByText("Scratch sessions do not use git worktrees.")).toBeTruthy();
   });
 
-  it("toggles the worktree once per switch click", () => {
-    const { onChange } = renderStep({ useWorktree: false });
-    fireEvent.click(screen.getByRole("switch"));
-    expect(onChange).toHaveBeenCalledTimes(1);
-    expect(onChange).toHaveBeenCalledWith("useWorktree", true);
-  });
-
   it.each([true, false])("gates the worktree toggle on pathIsGitRepo=%s", (pathIsGitRepo) => {
     const { onChange } = renderStep({ useWorktree: false, pathIsGitRepo });
     const toggle = screen.getByRole("switch") as HTMLButtonElement;
     expect(toggle.disabled).toBe(!pathIsGitRepo);
     expect(!!screen.queryByLabelText("Worktree disabled: not a git repository")).toBe(!pathIsGitRepo);
     fireEvent.click(toggle);
-    expect(onChange.mock.calls.some(([f, v]) => f === "useWorktree" && v === true)).toBe(pathIsGitRepo);
+    expect(onChange.mock.calls).toEqual(pathIsGitRepo ? [["useWorktree", true]] : []);
   });
 });

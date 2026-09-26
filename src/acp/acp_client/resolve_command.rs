@@ -225,45 +225,6 @@ pub(super) fn push_subdirs(out: &mut Vec<std::path::PathBuf>, root: &std::path::
 mod tests {
     use super::*;
 
-    /// A path or a `${placeholder}` is already resolved, so it is left alone.
-    #[test]
-    fn resolve_agent_command_skips_paths_and_placeholders() {
-        let app = std::path::Path::new("/nonexistent-app-dir");
-        for command in [
-            "/usr/local/bin/claude-agent-acp",
-            "./relative/path",
-            "${aoe_data_dir}/acp-worker/dist/aoe-agent",
-        ] {
-            assert!(
-                resolve_agent_command(command, Some(app)).is_none(),
-                "{command}"
-            );
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn resolve_agent_command_falls_back_to_bundled_when_not_on_path() {
-        // PATH-scrubbed because the adapter names are real: a dev machine
-        // with a global `claude-agent-acp` would (correctly) resolve that
-        // copy instead of the bundled one.
-        let app = tempfile::TempDir::new().unwrap();
-        let name = "claude-agent-acp";
-        let bin_dir = app
-            .path()
-            .join("acp-worker/adapters/claude-agent-acp/node_modules/.bin");
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        let bin = bin_dir.join(name);
-        std::fs::write(&bin, "#!/usr/bin/env node\n").unwrap();
-
-        let empty = tempfile::TempDir::new().unwrap();
-        let _path = crate::session::test_support::EnvGuard::set(&[("PATH", empty.path())]);
-        let resolved = resolve_agent_command(name, Some(app.path()))
-            .expect("should resolve from the bundled adapter dir");
-        assert_eq!(resolved.path, bin);
-        assert_eq!(resolved.prepend_paths.first(), Some(&bin_dir));
-    }
-
     /// The probe reads a version off a cooperative binary and abandons one
     /// that hangs, proving through `entered` that it really did start.
     #[cfg(unix)]
@@ -293,21 +254,10 @@ mod tests {
         );
     }
 
-    /// #1048: without an app dir, resolution still falls through to PATH and
-    /// the node-manager scan rather than collapsing to nothing.
+    /// #1048: without an app dir, resolution still falls through to PATH.
     #[test]
     #[serial_test::serial]
-    fn resolve_agent_command_without_app_dir_still_uses_path() {
-        assert!(resolve_agent_command("aoe-definitely-not-installed", None).is_none());
-        // `sh` is on PATH everywhere the suite runs.
-        let resolved =
-            resolve_agent_command("sh", None).expect("PATH resolution must work without app_dir");
-        assert!(resolved.path.is_file());
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn resolve_agent_command_finds_binary_in_path_env() {
+    fn resolve_agent_command_cases() {
         let dir = tempfile::TempDir::new().unwrap();
         let bin = dir.path().join("aoe-test-resolver-fake");
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();
@@ -321,5 +271,40 @@ mod tests {
             .expect("binary should resolve from PATH");
         assert_eq!(resolved.path, bin);
         assert_eq!(resolved.prepend_paths, vec![dir.path().to_path_buf()]);
+        assert!(resolve_agent_command("aoe-definitely-not-installed", None).is_none());
+
+        // A path or a `${placeholder}` is already resolved, so it is left alone.
+        let app = std::path::Path::new("/nonexistent-app-dir");
+        for command in [
+            "/usr/local/bin/claude-agent-acp",
+            "./relative/path",
+            "${aoe_data_dir}/acp-worker/dist/aoe-agent",
+        ] {
+            assert!(
+                resolve_agent_command(command, Some(app)).is_none(),
+                "{command}"
+            );
+        }
+
+        {
+            // PATH-scrubbed because the adapter names are real: a dev machine
+            // with a global `claude-agent-acp` would (correctly) resolve that
+            // copy instead of the bundled one.
+            let app = tempfile::TempDir::new().unwrap();
+            let name = "claude-agent-acp";
+            let bin_dir = app
+                .path()
+                .join("acp-worker/adapters/claude-agent-acp/node_modules/.bin");
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            let bin = bin_dir.join(name);
+            std::fs::write(&bin, "#!/usr/bin/env node\n").unwrap();
+
+            let empty = tempfile::TempDir::new().unwrap();
+            let _path = crate::session::test_support::EnvGuard::set(&[("PATH", empty.path())]);
+            let resolved = resolve_agent_command(name, Some(app.path()))
+                .expect("should resolve from the bundled adapter dir");
+            assert_eq!(resolved.path, bin);
+            assert_eq!(resolved.prepend_paths.first(), Some(&bin_dir));
+        }
     }
 }

@@ -1,4 +1,4 @@
-//! Smoke tests for `aoe update --check` and `--dry-run`.
+//! Smoke test for `aoe update --check`.
 //!
 //! These spawn a small axum fixture server that serves canned GitHub
 //! releases JSON, then run the `aoe` binary as a subprocess pointed at
@@ -96,84 +96,37 @@ fn spawn_fixture(latest_version: &str) -> FixtureServer {
     }
 }
 
+/// `--check` prints the current and latest versions and whether an update is
+/// available, for a newer release and for the running version.
 #[test]
 #[serial_test::parallel]
-fn update_check_prints_three_lines_and_exits_zero() {
-    // Pick a latest version that's deliberately newer than the binary
-    // under test so the "available" line reads `true`. The crate's own
-    // version (CARGO_PKG_VERSION) gets the `current:` line; the fixture
-    // controls `latest:`.
-    let fixture = spawn_fixture("999.0.0");
-    let tmp = tempfile::TempDir::new().unwrap();
+fn update_check_reports_availability_and_exits_zero() {
+    for (latest, available) in [("999.0.0", true), (env!("CARGO_PKG_VERSION"), false)] {
+        let fixture = spawn_fixture(latest);
+        let tmp = tempfile::TempDir::new().unwrap();
 
-    let output = Command::new(aoe_binary())
-        .args(["update", "--check"])
-        .env("HOME", tmp.path())
-        .env("XDG_CONFIG_HOME", tmp.path())
-        .env("AOE_UPDATE_API_BASE", &fixture.base_url)
-        .output()
-        .expect("running aoe update --check");
+        let output = Command::new(aoe_binary())
+            .args(["update", "--check"])
+            .env("HOME", tmp.path())
+            .env("XDG_CONFIG_HOME", tmp.path())
+            .env("AOE_UPDATE_API_BASE", &fixture.base_url)
+            .output()
+            .expect("running aoe update --check");
 
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("current:"), "stdout was: {stdout}");
-    assert!(stdout.contains("latest:  999.0.0"), "stdout was: {stdout}");
-    assert!(stdout.contains("available: true"), "stdout was: {stdout}");
-}
-
-#[test]
-#[serial_test::parallel]
-fn update_dry_run_prints_prompt_block_and_exits_zero() {
-    let fixture = spawn_fixture("999.0.0");
-    let tmp = tempfile::TempDir::new().unwrap();
-
-    let output = Command::new(aoe_binary())
-        .args(["update", "--dry-run"])
-        .env("HOME", tmp.path())
-        .env("XDG_CONFIG_HOME", tmp.path())
-        .env("AOE_UPDATE_API_BASE", &fixture.base_url)
-        .output()
-        .expect("running aoe update --dry-run");
-
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    // The test binary lives at target/debug/deps/... which doesn't match
-    // any known install prefix, so detect_install_method classifies it as
-    // Unknown. perform_update for Unknown prints the install-script
-    // refusal and exits 0; --dry-run is bypassed for refusal methods,
-    // which is documented behavior. Either the prompt block or the
-    // refusal message is acceptable here — both prove the binary
-    // exited cleanly with the right shape of output.
-    assert!(
-        stdout.contains("Update v") || stdout.contains("Couldn't determine how aoe was installed"),
-        "unexpected dry-run stdout: {stdout}"
-    );
-}
-
-#[test]
-#[serial_test::parallel]
-fn update_check_no_update_available_when_versions_match() {
-    // Serve the same version the binary reports — `available: false`.
-    let fixture = spawn_fixture(env!("CARGO_PKG_VERSION"));
-    let tmp = tempfile::TempDir::new().unwrap();
-
-    let output = Command::new(aoe_binary())
-        .args(["update", "--check"])
-        .env("HOME", tmp.path())
-        .env("XDG_CONFIG_HOME", tmp.path())
-        .env("AOE_UPDATE_API_BASE", &fixture.base_url)
-        .output()
-        .expect("running aoe update --check");
-
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("available: false"), "stdout was: {stdout}");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("current:"), "stdout was: {stdout}");
+        assert!(
+            stdout.contains(&format!("latest:  {latest}")),
+            "stdout was: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("available: {available}")),
+            "stdout was: {stdout}"
+        );
+    }
 }

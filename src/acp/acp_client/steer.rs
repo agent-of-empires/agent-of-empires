@@ -85,7 +85,7 @@ mod tests {
     /// The wire contract (#2805): a typo in `sessionId` or the `_meta` opt-in
     /// silently degrades a racing steer to `startedNewTurn`, with no error.
     #[test]
-    fn steer_request_carries_the_prompt_required_opt_in() {
+    fn steer_wire_forms() {
         let req = SteerRequest::new(
             SessionId::new("sess-1"),
             vec![ContentBlock::Text(TextContent::new("also check the tests"))],
@@ -94,35 +94,34 @@ mod tests {
         assert_eq!(wire["sessionId"], "sess-1");
         assert_eq!(wire["_meta"]["steering"]["idleBehavior"], "promptRequired");
         assert_eq!(wire["prompt"][0]["text"], "also check the tests");
-    }
 
-    /// An outcome this build has never seen must land on `Unknown`, which
-    /// reads as "consumed, do not resend", never on a success arm.
-    #[test]
-    fn steer_outcome_maps_every_wire_form() {
-        for (value, expected) in [
-            (
-                serde_json::json!({"outcome": "injected"}),
-                SteerOutcome::Injected,
-            ),
-            (
-                serde_json::json!({"outcome": "promptRequired", "reason": "noRunningTurn"}),
-                SteerOutcome::PromptRequired,
-            ),
-            (
-                serde_json::json!({"outcome": "startedNewTurn"}),
-                SteerOutcome::StartedNewTurn,
-            ),
-            // Forward-compat and malformed shapes both fall to Unknown.
-            (
-                serde_json::json!({"outcome": "teleported"}),
-                SteerOutcome::Unknown,
-            ),
-            (serde_json::json!({"outcome": 7}), SteerOutcome::Unknown),
-            (serde_json::json!({}), SteerOutcome::Unknown),
-            (serde_json::json!(null), SteerOutcome::Unknown),
-        ] {
-            assert_eq!(SteerOutcome::from_response(&value), expected, "{value}");
+        // An outcome this build has never seen must land on `Unknown`, which
+        // reads as "consumed, do not resend", never on a success arm.
+        {
+            for (value, expected) in [
+                (
+                    serde_json::json!({"outcome": "injected"}),
+                    SteerOutcome::Injected,
+                ),
+                (
+                    serde_json::json!({"outcome": "promptRequired", "reason": "noRunningTurn"}),
+                    SteerOutcome::PromptRequired,
+                ),
+                (
+                    serde_json::json!({"outcome": "startedNewTurn"}),
+                    SteerOutcome::StartedNewTurn,
+                ),
+                // Forward-compat and malformed shapes both fall to Unknown.
+                (
+                    serde_json::json!({"outcome": "teleported"}),
+                    SteerOutcome::Unknown,
+                ),
+                (serde_json::json!({"outcome": 7}), SteerOutcome::Unknown),
+                (serde_json::json!({}), SteerOutcome::Unknown),
+                (serde_json::json!(null), SteerOutcome::Unknown),
+            ] {
+                assert_eq!(SteerOutcome::from_response(&value), expected, "{value}");
+            }
         }
     }
 

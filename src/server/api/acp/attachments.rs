@@ -156,7 +156,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mime_allowlist_gates_by_kind() {
+    fn attachment_mime_gates_allow_listed_kinds_and_sniffed_images() {
         assert!(mime_allowed(PromptAttachmentKind::Image, "image/png"));
         assert!(mime_allowed(PromptAttachmentKind::Image, "image/webp"));
         assert!(!mime_allowed(PromptAttachmentKind::Image, "image/svg+xml"));
@@ -167,10 +167,6 @@ mod tests {
             "application/pdf"
         ));
         assert!(!mime_allowed(PromptAttachmentKind::Resource, "text/html"));
-    }
-
-    #[test]
-    fn image_magic_bytes_sniff() {
         let mut webp = b"RIFF".to_vec();
         webp.extend_from_slice(&[0, 0, 0, 0]);
         webp.extend_from_slice(b"WEBP");

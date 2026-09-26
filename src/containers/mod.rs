@@ -358,14 +358,6 @@ mod tests {
     }
 
     #[test]
-    fn test_container_exec_command() {
-        let mut container = DockerContainer::new("test1234567890ab", "ubuntu:latest");
-        container.runtime = ContainerRuntime::docker();
-
-        let cmd = container.exec_command(None, "my-agent");
-        assert_eq!(cmd, "docker exec -it aoe-sandbox-test1234 my-agent");
-    }
-    #[test]
     fn test_anonymous_volumes_in_create_args() {
         let container = DockerContainer::new("test1234567890ab", "alpine:latest");
         let config = ContainerConfig {

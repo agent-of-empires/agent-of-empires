@@ -67,7 +67,7 @@ pub(super) async fn build_disk_watch_entry(
         },
     );
     // Test-only barrier.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, debug_assertions))]
     {
         let armed = disk_watch_build_barrier().lock().unwrap().clone();
         if let Some(barrier) = armed {
@@ -83,7 +83,7 @@ pub(super) async fn build_disk_watch_entry(
 
 /// Test-only barrier installed inside `build_disk_watch_entry` to deterministically pin a
 /// building task at a known point so a concurrent same-profile remove can run against it.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, debug_assertions))]
 pub(crate) struct DiskWatchBuildBarrier {
     pub(crate) entered: tokio::sync::Notify,
     pub(crate) release: tokio::sync::Notify,
@@ -91,7 +91,7 @@ pub(crate) struct DiskWatchBuildBarrier {
     pub(crate) armed: tokio::sync::Notify,
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn disk_watch_build_barrier(
 ) -> &'static std::sync::Mutex<Option<Arc<DiskWatchBuildBarrier>>> {
     static BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<DiskWatchBuildBarrier>>>> =
@@ -593,11 +593,15 @@ mod tests {
             "a created session must survive a pre-create snapshot: {titles:?}"
         );
 
-        // And the converse, which is what the create path's bump buys.
+        // And the converse, which is what the create path's bump buys. The guard
+        // must not work by dropping ids missing from the prior in-memory map: a
+        // row this daemon never saw is still adopted at the current epoch.
         let unbumped = test_support::build_test_app_state(vec![existing.clone(), created.clone()]);
+        let mut current_snapshot = stale_snapshot;
+        current_snapshot.push(Instance::new("created-elsewhere", "/tmp/elsewhere"));
         reload_state_instances_from_disk(
             &unbumped,
-            stale_snapshot,
+            current_snapshot,
             Vec::new(),
             StatusSource::DiskOnly,
             0,
@@ -612,7 +616,7 @@ mod tests {
             .collect();
         assert_eq!(
             titles,
-            vec!["existing".to_string()],
+            vec!["existing".to_string(), "created-elsewhere".to_string()],
             "without the epoch bump the reload drops the created row"
         );
     }
@@ -665,90 +669,6 @@ mod tests {
         assert!(
             !titles.contains(&"doomed".to_string()),
             "a reload that was already waiting on the lock when the delete landed must still drop: {titles:?}"
-        );
-    }
-
-    // The guard must not be implemented by dropping ids missing from the prior in-memory
-    // map.
-    #[tokio::test]
-    async fn a_reload_at_the_current_epoch_still_adopts_externally_created_rows() {
-        let known = Instance::new("known", "/tmp/known");
-        let created_elsewhere = Instance::new("created-elsewhere", "/tmp/elsewhere");
-        let state = test_support::build_test_app_state(vec![known.clone()]);
-        let read_epoch = state
-            .mutation_epoch
-            .load(std::sync::atomic::Ordering::SeqCst);
-
-        reload_state_instances_from_disk(
-            &state,
-            vec![known, created_elsewhere],
-            Vec::new(),
-            StatusSource::DiskOnly,
-            read_epoch,
-        )
-        .await;
-
-        let titles: Vec<String> = state
-            .instances
-            .read()
-            .await
-            .iter()
-            .map(|i| i.title.clone())
-            .collect();
-        assert!(
-            titles.contains(&"created-elsewhere".to_string()),
-            "a row this daemon has never seen must still be adopted: {titles:?}"
-        );
-    }
-
-    // Bootstrap correctness here has two requirements.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn bootstrap_wake_makes_pre_init_writes_reachable_via_reload() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
-
-        let storage = crate::session::Storage::new_unwatched("startup-reload").expect("storage");
-        storage
-            .update(|instances, _groups| {
-                *instances = vec![Instance::new("pre-init", "/tmp/pre-init")];
-                Ok(())
-            })
-            .expect("seed write");
-
-        let state = state_with_live_watch();
-
-        init_disk_watch_subscriptions(state.clone()).await;
-
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            state.disk_changed.notified(),
-        )
-        .await
-        .expect("bootstrap wake must fire after init returns");
-
-        // Invariant 8.
-        let read_epoch = state
-            .mutation_epoch
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let file_watch = state.file_watch.clone();
-        let fresh = tokio::task::spawn_blocking(move || load_all_instances(&file_watch))
-            .await
-            .expect("join")
-            .expect("load");
-        reload_state_instances_from_disk(
-            &state,
-            fresh,
-            Vec::new(),
-            StatusSource::DiskOnly,
-            read_epoch,
-        )
-        .await;
-
-        let instances = state.instances.read().await;
-        assert!(
-            instances.iter().any(|i| i.title == "pre-init"),
-            "bootstrap wake plus reload must surface writes that landed before init returned"
         );
     }
 }

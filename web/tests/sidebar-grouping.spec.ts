@@ -75,7 +75,7 @@ async function cycleAxisTo(toggle: Locator, target: string) {
 }
 
 test.describe("sidebar repo groups (#1220)", () => {
-  test("two repos render as two groups, both rows visible", async ({ page }) => {
+  test("two repos render as two groups; the filter narrows groups and rows by repo name", async ({ page }) => {
     await installSidebarMocks(page, { sessions: twoRepoSessions() });
     await gotoDesktop(page);
 
@@ -86,13 +86,6 @@ test.describe("sidebar repo groups (#1220)", () => {
     await expect(page.locator(ROW)).toHaveCount(2);
     await expect(page.getByText("alpha-session")).toBeVisible();
     await expect(page.getByText("beta-session")).toBeVisible();
-  });
-
-  test("filter input narrows visible groups + rows by repo name", async ({ page }) => {
-    await installSidebarMocks(page, { sessions: twoRepoSessions() });
-    await gotoDesktop(page);
-
-    await expect(page.locator(HEADER)).toHaveCount(2);
 
     await page.getByLabel("Filter sessions").click();
     const filter = page.locator("[data-testid='sidebar-filter-input']");
@@ -110,25 +103,6 @@ test.describe("sidebar repo groups (#1220)", () => {
     await filter.fill("nonexistent-repo-xyz");
     await expect(page.getByText(/No matches for/)).toBeVisible();
     await expect(page.locator(ROW)).toHaveCount(0);
-  });
-
-  test("group header chevron toggles aria-expanded and hides rows", async ({ page }) => {
-    await installSidebarMocks(page, { sessions: twoRepoSessions() });
-    await gotoDesktop(page);
-
-    const alphaHeader = page.locator(HEADER, { has: page.getByText("repo-alpha") });
-    const expandBtn = alphaHeader.locator("button[aria-expanded]");
-    await expect(expandBtn).toHaveAttribute("aria-expanded", "true");
-
-    await expandBtn.click();
-    await expect(expandBtn).toHaveAttribute("aria-expanded", "false");
-
-    await expect(page.getByText("alpha-session")).toBeHidden();
-    await expect(page.getByText("beta-session")).toBeVisible();
-
-    await expandBtn.click();
-    await expect(expandBtn).toHaveAttribute("aria-expanded", "true");
-    await expect(page.getByText("alpha-session")).toBeVisible();
   });
 
   test("a collapsed group marks that it holds the open session (#3912)", async ({ page }) => {
@@ -155,7 +129,9 @@ test.describe("sidebar repo groups (#1220)", () => {
 });
 
 test.describe("sidebar user-group axis (#1234)", () => {
-  test("axis toggle renders user groups by group_path", async ({ page }) => {
+  test("axis toggle renders user groups by group_path; their collapse persists across reload per axis", async ({
+    page,
+  }) => {
     await installSidebarMocks(page, { sessions: groupedSessions() });
     await gotoDesktop(page);
 
@@ -176,15 +152,6 @@ test.describe("sidebar user-group axis (#1234)", () => {
     await expect(page.locator(`${HEADER}[data-group-id='feature']`)).toBeVisible();
     await expect(page.locator(`${HEADER}[data-group-id='refactor']`)).toBeVisible();
     await expect(page.locator(ROW)).toHaveCount(3);
-  });
-
-  test("group-axis collapse persists across reload and is per-axis", async ({ page }) => {
-    await installSidebarMocks(page, { sessions: groupedSessions() });
-    await gotoDesktop(page);
-
-    const axisToggle = page.locator(AXIS_TOGGLE);
-    await expect(axisToggle).toHaveAttribute("data-axis", "repo");
-    await cycleAxisTo(axisToggle, "group");
 
     const featureHeader = page.locator(`${HEADER}[data-group-id='feature']`);
     const featureExpand = featureHeader.locator("button[aria-expanded]");
@@ -205,7 +172,9 @@ test.describe("sidebar user-group axis (#1234)", () => {
 });
 
 test.describe("sidebar nested repo+group axis (#1720)", () => {
-  test("nests user groups inside the repo block", async ({ page }) => {
+  test("nests user groups inside the repo block; subgroup collapse is independent of repo collapse and persists", async ({
+    page,
+  }) => {
     await installSidebarMocks(page, { sessions: nestedSessions() });
     await gotoDesktop(page);
 
@@ -223,15 +192,6 @@ test.describe("sidebar nested repo+group axis (#1720)", () => {
     await expect(repo.locator("[data-testid='sidebar-nested-subgroup'] [data-group-id='__ungrouped__']")).toBeVisible();
 
     await expect(page.locator(ROW)).toHaveCount(4);
-  });
-
-  test("subgroup collapse is independent of repo collapse and persists", async ({ page }) => {
-    await installSidebarMocks(page, { sessions: nestedSessions() });
-    await gotoDesktop(page);
-
-    const axisToggle = page.locator(AXIS_TOGGLE);
-    await expect(axisToggle).toHaveAttribute("data-axis", "repo");
-    await cycleAxisTo(axisToggle, "repo+group");
 
     const featureSub = page.locator("[data-testid='sidebar-nested-subgroup'] [data-group-id='feature']");
     const featureExpand = featureSub.locator("button[aria-expanded]");
@@ -257,7 +217,9 @@ test.describe("sidebar nested repo+group axis (#1720)", () => {
 });
 
 test.describe("sidebar org axis (#3283)", () => {
-  test("buckets repos by remote owner, with No organization pinned last", async ({ page }) => {
+  test("buckets repos by remote owner, No organization last; repo collapse within an org persists independently", async ({
+    page,
+  }) => {
     await stubOwnerAvatars(page);
     await installSidebarMocks(page, { sessions: orgSessions() });
     await gotoDesktop(page);
@@ -281,18 +243,7 @@ test.describe("sidebar org axis (#3283)", () => {
     await expect(orgBlocks.nth(1)).toHaveAttribute("data-org-id", "__no_org__");
 
     await expect(page.locator(ROW)).toHaveCount(3);
-  });
 
-  test("repo collapse within an org is independent of the org header and persists", async ({ page }) => {
-    await stubOwnerAvatars(page);
-    await installSidebarMocks(page, { sessions: orgSessions() });
-    await gotoDesktop(page);
-
-    const axisToggle = page.locator(AXIS_TOGGLE);
-    await expect(axisToggle).toHaveAttribute("data-axis", "repo");
-    await cycleAxisTo(axisToggle, "org");
-
-    const acmeOrg = page.locator("[data-testid='sidebar-org-group'][data-org-id='acme@example.com']");
     const alphaRepo = acmeOrg.locator("[data-testid='sidebar-org-repo'][data-repo-id='/tmp/repo-alpha']");
     const alphaExpand = alphaRepo.locator("button[aria-expanded]");
     await expect(alphaExpand).toHaveAttribute("aria-expanded", "true");

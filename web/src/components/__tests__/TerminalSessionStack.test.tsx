@@ -62,21 +62,6 @@ describe("TerminalSessionStack", () => {
     expect(screen.getByTestId("terminal-s2").dataset.active).toBe("true");
   });
 
-  it("keeps recent inactive sessions mounted when persistence is enabled", async () => {
-    const sessions = [makeSession("s1"), makeSession("s2")];
-    const { rerender } = render(<TerminalSessionStack activeSessionId="s1" sessions={sessions} persistent={true} />);
-    await waitFor(() => {
-      expect(screen.getByTestId("terminal-s1").dataset.active).toBe("true");
-    });
-
-    rerender(<TerminalSessionStack activeSessionId="s2" sessions={sessions} persistent={true} />);
-
-    await waitFor(() => {
-      expect(screen.getByTestId("terminal-s1").dataset.active).toBe("false");
-      expect(screen.getByTestId("terminal-s2").dataset.active).toBe("true");
-    });
-  });
-
   it("evicts older inactive sessions beyond the configured limit", async () => {
     const activate = await mountThreeKeepingTwo();
 

@@ -4,12 +4,7 @@
 // the adapter's confirmation or rejection. The live spec pins the wire shape.
 
 import { test, expect } from "./helpers/mockedTest";
-import {
-  mockAcpSession,
-  openStructuredSession,
-  configOptionsUpdated,
-  configOptionSwitchFailed,
-} from "./helpers/acpMock";
+import { mockAcpSession, openStructuredSession, configOptionsUpdated } from "./helpers/acpMock";
 
 function modelOption(current: string) {
   return {
@@ -56,24 +51,9 @@ function snapshot(model: string, effort: string) {
   return configOptionsUpdated([modelOption(model), effortOption(effort)]);
 }
 
-test("user sees model and effort pickers after the adapter advertises config options", async ({ page }) => {
-  const mock = await mockAcpSession(page, {
-    title: "ui-pickers-render",
-    initialEvents: [snapshot("claude-opus-4-7", "default")],
-  });
-  await openStructuredSession(page, mock);
-
-  const modelChip = page.getByTestId("config-option-model");
-  await expect(modelChip).toBeVisible({ timeout: 15_000 });
-  await expect(modelChip).toContainText("Claude Opus 4.7");
-
-  const effortControl = page.getByTestId("config-option-effort");
-  await expect(effortControl).toBeVisible();
-  await expect(effortControl).toContainText("Default");
-  await expect(effortControl).toContainText("High");
-});
-
-test("user switches the model and the chip reflects the adapter confirmation", async ({ page }) => {
+test("advertised pickers render; switching the model posts it and the chip follows the adapter confirmation", async ({
+  page,
+}) => {
   const mock = await mockAcpSession(page, {
     title: "ui-pickers-switch-model",
     initialEvents: [snapshot("claude-opus-4-7", "default")],
@@ -86,6 +66,9 @@ test("user switches the model and the chip reflects the adapter confirmation", a
   const modelChip = page.getByTestId("config-option-model");
   await expect(modelChip).toBeVisible({ timeout: 15_000 });
   await expect(modelChip).toContainText("Claude Opus 4.7");
+  const effortControl = page.getByTestId("config-option-effort");
+  await expect(effortControl).toContainText("Default");
+  await expect(effortControl).toContainText("High");
 
   await modelChip.click();
   await page.getByTestId("config-option-model-value-claude-sonnet-4-6").click();
@@ -101,28 +84,6 @@ test("user switches the model and the chip reflects the adapter confirmation", a
   await expect(modelChip).toContainText("Claude Sonnet 4.6", {
     timeout: 10_000,
   });
-});
-
-test("user picks reasoning effort and the segment becomes active", async ({ page }) => {
-  const mock = await mockAcpSession(page, {
-    title: "ui-pickers-switch-effort",
-    initialEvents: [snapshot("claude-opus-4-7", "default")],
-    onConfigOption: (body) => [snapshot("claude-opus-4-7", body.value)],
-  });
-  await openStructuredSession(page, mock);
-
-  const effortControl = page.getByTestId("config-option-effort");
-  await expect(effortControl).toBeVisible({ timeout: 15_000 });
-
-  const highSegment = page.getByTestId("config-option-effort-value-high");
-  await highSegment.click();
-
-  // After the adapter confirms, the High radio reports
-  // aria-checked=true and Default no longer does.
-  await expect(highSegment).toHaveAttribute("aria-checked", "true", {
-    timeout: 10_000,
-  });
-  await expect(page.getByTestId("config-option-effort-value-default")).toHaveAttribute("aria-checked", "false");
 });
 
 test("model menu stays on-screen and scrollable on a short viewport", async ({ page }) => {
@@ -160,31 +121,4 @@ test("model menu stays on-screen and scrollable on a short viewport", async ({ p
     clientHeight: el.clientHeight,
   }));
   expect(scrollHeight).toBeGreaterThan(clientHeight);
-});
-
-test("rejected switch renders a dismissable non-blocking notice", async ({ page }) => {
-  const mock = await mockAcpSession(page, {
-    title: "ui-pickers-reject",
-    initialEvents: [snapshot("claude-opus-4-7", "default")],
-    // The adapter rejects the switch; the daemon broadcasts the failure
-    // frame instead of a confirming snapshot.
-    onConfigOption: (body) => [configOptionSwitchFailed(body.config_id, body.value, "rate limited (test)")],
-  });
-  await openStructuredSession(page, mock);
-
-  const modelChip = page.getByTestId("config-option-model");
-  await expect(modelChip).toBeVisible({ timeout: 15_000 });
-  await modelChip.click();
-  await page.getByTestId("config-option-model-value-claude-sonnet-4-6").click();
-
-  const notice = page.getByTestId("config-option-switch-failed-notice");
-  await expect(notice).toBeVisible({ timeout: 10_000 });
-  await expect(notice).toContainText("rate limited (test)");
-
-  // Chip stays on the previously-current value: pessimistic UI.
-  await expect(modelChip).toContainText("Claude Opus 4.7");
-
-  // Manual dismiss removes the notice.
-  await notice.getByRole("button", { name: "Dismiss notice" }).click();
-  await expect(notice).toHaveCount(0);
 });

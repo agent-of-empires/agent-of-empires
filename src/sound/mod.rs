@@ -50,38 +50,3 @@ pub fn play_for_transition(old: Status, new: Status, config: &SoundConfig) {
         play_sound(&name, config.volume);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_resolve_sound_name_override() {
-        let result = resolve_sound_name(Some("alarm"));
-        assert_eq!(result, Some("alarm".to_string()));
-    }
-
-    #[test]
-    fn test_play_for_transition_disabled() {
-        let config = SoundConfig::default();
-        play_for_transition(Status::Idle, Status::Running, &config);
-    }
-
-    #[test]
-    fn test_play_for_transition_same_status() {
-        let config = SoundConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        play_for_transition(Status::Running, Status::Running, &config);
-    }
-
-    #[test]
-    fn test_play_for_transition_deleting_skipped() {
-        let config = SoundConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        play_for_transition(Status::Running, Status::Deleting, &config);
-    }
-}

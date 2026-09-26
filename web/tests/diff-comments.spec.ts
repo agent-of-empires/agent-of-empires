@@ -137,19 +137,6 @@ async function selectRange(page: Page, startLine: number, endLine: number) {
 test.use({ viewport: { width: 1280, height: 900 } });
 
 test.describe("Diff comments (#928)", () => {
-  test("saves a single-line comment and renders the card inline", async ({ page }) => {
-    await setup(page);
-    await openSessionAndFile(page);
-    await startSingleLineComment(page, 3);
-    const textarea = page.getByPlaceholder(/Leave a comment \(markdown supported\)/);
-    await expect(textarea).toBeVisible();
-    await textarea.fill("rename `greet` to `salute`");
-    await page.getByRole("button", { name: "Save" }).click();
-    await expect(textarea).toHaveCount(0);
-    await expect(page.getByText("line 3 (new)").first()).toBeVisible();
-    await expect(page.getByText("rename").first()).toBeVisible();
-  });
-
   test("range select across two lines in the same hunk", async ({ page }) => {
     await setup(page);
     await openSessionAndFile(page);
@@ -162,12 +149,15 @@ test.describe("Diff comments (#928)", () => {
     await expect(page.getByText("lines 3-4 (new)").first()).toBeVisible();
   });
 
-  test("banner shows count and persists comments through reload", async ({ page }) => {
+  test("a saved single-line comment renders inline, counts in the banner, and survives reload", async ({ page }) => {
     await setup(page);
     await openSessionAndFile(page);
     await startSingleLineComment(page, 3);
-    await page.getByPlaceholder(/Leave a comment \(markdown supported\)/).fill("nit");
+    const textarea = page.getByPlaceholder(/Leave a comment \(markdown supported\)/);
+    await textarea.fill("nit");
     await page.getByRole("button", { name: "Save" }).click();
+    await expect(textarea).toHaveCount(0);
+    await expect(page.getByText("line 3 (new)").first()).toBeVisible();
     await expect(page.getByText(/^1 comment$/).first()).toBeVisible();
     // The banner renders once per mounted right pane.
 

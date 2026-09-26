@@ -99,6 +99,8 @@ fn fresh_instance(profile: &str, title: &str) -> Instance {
     inst
 }
 
+/// An applied CAS publishes the new sid to whichever pane the row runs in: the agent
+/// session by default, the paired terminal for terminal rows, and nowhere without a pane.
 #[test]
 #[serial]
 fn apply_session_id_updates_publishes_after_cas() {
@@ -108,90 +110,106 @@ fn apply_session_id_updates_publishes_after_cas() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
 
-    let profile = "apply-publish";
-    let inst = fresh_instance(profile, "apa");
-    let mut view = build_view_with_inst(profile, &inst);
+    // (profile, terminal row, create a pane)
+    for (profile, terminal, with_pane) in [
+        ("apply-publish", false, true),
+        ("apply-terminal-publish", true, true),
+        ("apply-pane-dead", false, false),
+    ] {
+        let mut inst = fresh_instance(profile, profile);
+        if terminal {
+            inst.terminal_info = Some(crate::session::TerminalInfo { created: true });
+        }
+        let mut view = build_view_with_inst(profile, &inst);
+        let agent_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let tmux = with_pane.then(|| {
+            if terminal {
+                TmuxSession::create_terminal(&inst.id, &inst.title)
+            } else {
+                TmuxSession::create(&inst.id, &inst.title)
+            }
+        });
 
-    let tmux = TmuxSession::create(&inst.id, &inst.title);
+        attach_poller_with_update(&mut view, &inst.id, NEW_SID);
 
-    attach_poller_with_update(&mut view, &inst.id, NEW_SID);
-
-    let updated = view.apply_session_id_updates();
-    assert!(updated, "Applied CAS must report a touch");
-    assert_eq!(captured_env(tmux.name()).as_deref(), Some(NEW_SID));
+        assert!(
+            view.apply_session_id_updates(),
+            "{profile}: Applied CAS must report a touch"
+        );
+        let mem_sid = view
+            .instances
+            .get(&inst.id)
+            .and_then(|i| i.agent_session_id.clone());
+        assert_eq!(mem_sid.as_deref(), Some(NEW_SID), "{profile}");
+        match &tmux {
+            Some(tmux) => {
+                assert_eq!(
+                    captured_env(tmux.name()).as_deref(),
+                    Some(NEW_SID),
+                    "{profile}"
+                );
+                if terminal {
+                    assert!(captured_env(&agent_name).is_none(), "{profile}");
+                }
+            }
+            None => assert!(
+                captured_env(&agent_name).is_none(),
+                "{profile}: no tmux session means no publish target"
+            ),
+        }
+    }
 }
 
+/// A sid filtered before the CAS (retroactively excluded or invalid) stays out of memory,
+/// and the pane env converges on the disk-backed mirror (None) rather than the stale value.
 #[test]
 #[serial]
-fn apply_session_id_updates_publishes_to_terminal_session() {
+fn apply_session_id_updates_filtered_sid_clears_env() {
     if skip_if_no_tmux() {
         return;
     }
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
 
-    let profile = "apply-terminal-publish";
-    let mut inst = fresh_instance(profile, "terminal-post-cas");
-    inst.terminal_info = Some(crate::session::TerminalInfo { created: true });
-    let mut view = build_view_with_inst(profile, &inst);
+    // (profile, sid the poller reports, exclude it retroactively)
+    for (profile, sid, exclude) in [
+        ("apply-excludes", NEW_SID, true),
+        ("apply-invalid", "bad sid!", false),
+    ] {
+        let inst = fresh_instance(profile, profile);
+        let mut view = build_view_with_inst(profile, &inst);
+        if exclude {
+            if let Some(i) = view.instances.get_mut(&inst.id) {
+                i.retroactive_capture_excludes.insert(
+                    crate::session::ConversationBinding::unknown(sid.to_string()),
+                );
+            }
+        }
 
-    let tmux = TmuxSession::create_terminal(&inst.id, &inst.title);
-    let agent_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let tmux = TmuxSession::create(&inst.id, &inst.title);
+        crate::tmux::env::set_hidden_env(
+            tmux.name(),
+            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            "stale-untouched",
+        )
+        .unwrap();
 
-    attach_poller_with_update(&mut view, &inst.id, NEW_SID);
+        attach_poller_with_update(&mut view, &inst.id, sid);
 
-    let updated = view.apply_session_id_updates();
-    assert!(updated, "Applied CAS must report a touch");
-    assert!(captured_env(&agent_name).is_none());
-    assert_eq!(captured_env(tmux.name()).as_deref(), Some(NEW_SID));
-}
-
-#[test]
-#[serial]
-fn apply_session_id_updates_skips_retroactive_excludes() {
-    if skip_if_no_tmux() {
-        return;
+        assert!(
+            !view.apply_session_id_updates(),
+            "{profile}: filtered sid must not propagate to memory"
+        );
+        let mem_sid = view
+            .instances
+            .get(&inst.id)
+            .and_then(|i| i.agent_session_id.clone());
+        assert!(mem_sid.is_none(), "{profile}: filtered sid entered memory");
+        assert!(
+            captured_env(tmux.name()).is_none(),
+            "{profile}: env must converge on disk (None)"
+        );
     }
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-
-    let profile = "apply-excludes";
-    let inst = fresh_instance(profile, "aer");
-    let mut view = build_view_with_inst(profile, &inst);
-    if let Some(i) = view.instances.get_mut(&inst.id) {
-        i.retroactive_capture_excludes
-            .insert(crate::session::ConversationBinding::unknown(
-                NEW_SID.to_string(),
-            ));
-    }
-
-    let tmux = TmuxSession::create(&inst.id, &inst.title);
-    crate::tmux::env::set_hidden_env(
-        tmux.name(),
-        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-        "stale-untouched",
-    )
-    .unwrap();
-
-    attach_poller_with_update(&mut view, &inst.id, NEW_SID);
-
-    let updated = view.apply_session_id_updates();
-    assert!(
-        !updated,
-        "filtered sid must not propagate to memory (returned bool tracks memory)"
-    );
-    let mem_sid = view
-        .instances
-        .get(&inst.id)
-        .and_then(|i| i.agent_session_id.clone());
-    assert!(
-        mem_sid.is_none(),
-        "filtered sid must not enter in-memory mirror"
-    );
-    assert!(
-        captured_env(tmux.name()).is_none(),
-        "filtered sid must not survive in tmux env: env converges on disk (None)"
-    );
 }
 
 #[test]
@@ -245,76 +263,6 @@ fn apply_session_id_updates_skipped_publishes_disk_value() {
         captured_env(tmux.name()).as_deref(),
         Some(other_peer),
         "env converges from poller's pre-published NEW_SID to disk's other_peer"
-    );
-}
-
-#[test]
-#[serial]
-fn apply_session_id_updates_invalid_sid_corrects_env() {
-    if skip_if_no_tmux() {
-        return;
-    }
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-
-    let profile = "apply-invalid";
-    let inst = fresh_instance(profile, "aiv");
-    let mut view = build_view_with_inst(profile, &inst);
-
-    let tmux = TmuxSession::create(&inst.id, &inst.title);
-    crate::tmux::env::set_hidden_env(
-        tmux.name(),
-        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-        "bad sid!",
-    )
-    .unwrap();
-
-    attach_poller_with_update(&mut view, &inst.id, "bad sid!");
-
-    let updated = view.apply_session_id_updates();
-    assert!(
-        !updated,
-        "validation-filtered sid must not propagate to memory"
-    );
-    assert!(
-        captured_env(tmux.name()).is_none(),
-        "env converges to disk-backed memory mirror (None) after validation failure"
-    );
-}
-
-#[test]
-#[serial]
-fn apply_session_id_updates_no_tmux_session_skips_publish() {
-    if skip_if_no_tmux() {
-        return;
-    }
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-
-    let profile = "apply-pane-dead";
-    let inst = fresh_instance(profile, "apds");
-    let mut view = build_view_with_inst(profile, &inst);
-
-    attach_poller_with_update(&mut view, &inst.id, NEW_SID);
-
-    let updated = view.apply_session_id_updates();
-    assert!(
-        updated,
-        "CAS still applies even when no tmux session exists"
-    );
-    let mem_sid = view
-        .instances
-        .get(&inst.id)
-        .and_then(|i| i.agent_session_id.clone());
-    assert_eq!(
-        mem_sid.as_deref(),
-        Some(NEW_SID),
-        "memory still mirrors the CAS-applied sid",
-    );
-    let expected_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-    assert!(
-        captured_env(&expected_name).is_none(),
-        "no tmux session means no publish target"
     );
 }
 

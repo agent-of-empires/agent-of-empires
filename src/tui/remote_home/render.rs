@@ -364,23 +364,18 @@ mod tests {
     }
 
     #[test]
-    fn row_shows_the_plugin_row_column_text() {
-        let state = state_with(&["s1"], json!([row_column("s1", "CI failing")]));
-        let painted = rows(&state);
-        assert!(
-            painted.iter().any(|l| l.contains("CI failing")),
-            "{painted:?}"
-        );
-    }
-
-    #[test]
-    fn plugin_column_pads_so_the_path_stays_aligned() {
+    fn plugin_column_shows_text_and_pads_rows_without_a_cell() {
+        // Highlight, title, status and context-resume columns occupy 54 cells
+        // before the path when no plugin column is present.
+        let painted = rows(&state_with(&["s1"], json!([])));
+        assert_eq!(column_of(&painted, "/tmp/s1"), 54);
         // s2 has no cell; both rows must start the path at the same column.
         let state = state_with(
             &["s1", "s2"],
             json!([row_column("s1", "changes requested")]),
         );
         let painted = rows(&state);
+        assert!(painted.iter().any(|l| l.contains("changes requested")));
         assert_eq!(
             column_of(&painted, "/tmp/s1"),
             column_of(&painted, "/tmp/s2")
@@ -388,15 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn no_plugin_entries_reserve_no_width() {
-        let painted = rows(&state_with(&["s1"], json!([])));
-        // Highlight, title, status and context-resume columns occupy 54 cells
-        // before the path when no plugin column is present.
-        assert_eq!(column_of(&painted, "/tmp/s1"), 54);
-    }
-
-    #[test]
-    fn long_plugin_text_is_capped_so_the_path_survives() {
+    fn plugin_cells_are_capped_to_the_budget() {
         let long = "x".repeat(ROW_COLUMN_MAX_WIDTH + 20);
         let state = state_with(&["s1"], json!([row_column("s1", &long)]));
         let (cells, width) = row_column_cells(&state, "s1");
@@ -404,6 +391,18 @@ mod tests {
         assert!(cells[0].0.ends_with('…'));
         let painted = rows(&state);
         assert!(painted.iter().any(|l| l.contains("/tmp/s1")), "{painted:?}");
+
+        // A second cell is dropped once the first spends the budget.
+        let state = state_with(
+            &["s1"],
+            json!([
+                row_column("s1", &"y".repeat(ROW_COLUMN_MAX_WIDTH)),
+                row_column("s1", "dropped")
+            ]),
+        );
+        let (cells, width) = row_column_cells(&state, "s1");
+        assert_eq!(cells.len(), 1);
+        assert_eq!(width, ROW_COLUMN_MAX_WIDTH);
     }
 
     #[test]
@@ -464,7 +463,8 @@ mod tests {
     /// right on that row alone.
     #[test]
     fn wide_column_text_keeps_the_path_aligned() {
-        let cases: [(&str, &str); 3] = [
+        let title_40 = "\u{754c}".repeat(40);
+        let cases: [(&str, &str); 4] = [
             // 8 chars, 16 cells: a char pad reserved 8 cells too few.
             (
                 "\u{691c}\u{67fb}\u{5931}\u{6557}\u{691c}\u{67fb}\u{5931}\u{6557}",
@@ -475,6 +475,9 @@ mod tests {
             ("\u{ff8a}\u{ff9e}\u{ff8a}\u{ff9e}\u{ff8a}\u{ff9e}", "idle"),
             // A wide status is the same bug one column to the right.
             ("plain", "\u{5b9f}\u{884c}\u{4e2d}"),
+            // An overlong wide title is cut to the column budget, not to a
+            // char count.
+            (&title_40, "idle"),
         ];
         for (title, status) in cases {
             let mut state = state_with(&["s1", "s2"], json!([]));
@@ -490,58 +493,24 @@ mod tests {
         }
     }
 
-    /// A title past its column is cut to the budget, not to a char count, so
-    /// the column still ends where every other row's does.
     #[test]
-    fn an_overlong_wide_title_is_cut_to_its_column() {
-        let mut state = state_with(&["s1", "s2"], json!([]));
-        state.sessions[0].title = "\u{754c}".repeat(40);
-        let painted = rows(&state);
-        assert_eq!(column_of(&painted, "/tmp/s1"), 54, "{painted:?}");
-        assert_eq!(
-            column_of(&painted, "/tmp/s1"),
-            column_of(&painted, "/tmp/s2")
-        );
-    }
-
-    #[test]
-    fn second_plugin_cell_is_dropped_when_the_budget_is_spent() {
-        let state = state_with(
-            &["s1"],
-            json!([
-                row_column("s1", &"y".repeat(ROW_COLUMN_MAX_WIDTH)),
-                row_column("s1", "dropped")
-            ]),
-        );
-        let (cells, width) = row_column_cells(&state, "s1");
-        assert_eq!(cells.len(), 1);
-        assert_eq!(width, ROW_COLUMN_MAX_WIDTH);
-    }
-
-    #[test]
-    fn selected_row_style_preserves_readable_color() {
-        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
-        let style = Style::default().fg(theme.text);
-
-        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
-    }
-
-    #[test]
-    fn selected_row_style_sets_text_for_default_foreground() {
-        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
-        let style = Style::default();
-
-        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
-    }
-
-    #[test]
-    fn selected_row_style_falls_back_for_low_contrast_color() {
+    fn selected_row_style_keeps_text_readable_on_the_selection() {
         let mut theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        // A low-contrast fg on the selection falls back to the text color.
         theme.dimmed = theme.session_selection;
-        let style = Style::default().fg(theme.dimmed);
-
-        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
+        for style in [
+            Style::default().fg(theme.text),
+            Style::default(),
+            Style::default().fg(theme.dimmed),
+        ] {
+            assert_eq!(
+                selected_row_style(style, &theme).fg,
+                Some(theme.text),
+                "{style:?}"
+            );
+        }
     }
+
     #[test]
     fn missing_context_metadata_is_visible_without_disabling_enter() {
         let mut state = state_with(&["s1"], json!([]));

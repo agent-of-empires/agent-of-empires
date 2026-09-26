@@ -369,35 +369,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn peer_pid_from_socket_missing_path_returns_none_bounded() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("does-not-exist.sock");
-        let start = std::time::Instant::now();
-        assert_eq!(peer_pid_from_socket(&path), None);
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
-    }
-
-    #[test]
-    fn peer_pid_from_socket_non_socket_file_returns_none_bounded() {
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("not-a-socket");
-        std::fs::write(&path, b"regular file").unwrap();
-        let start = std::time::Instant::now();
-        assert_eq!(peer_pid_from_socket(&path), None);
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
-    }
-
+    /// A missing path or a non-socket answers `None`, and every answer comes
+    /// back well inside the probe bound.
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
-    fn peer_pid_from_socket_healthy_listener_returns_our_pid_bounded() {
+    fn peer_pid_from_socket_answers_within_its_bound() {
         use std::os::unix::net::UnixListener;
         let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("healthy.sock");
-        let _listener = UnixListener::bind(&path).unwrap();
-        let start = std::time::Instant::now();
-        let pid = peer_pid_from_socket(&path);
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
-        assert_eq!(pid, Some(std::process::id()));
+        std::fs::write(tmp.path().join("not-a-socket"), b"regular file").unwrap();
+        let _listener = UnixListener::bind(tmp.path().join("healthy.sock")).unwrap();
+        for (name, expected) in [
+            ("does-not-exist.sock", None),
+            ("not-a-socket", None),
+            ("healthy.sock", Some(std::process::id())),
+        ] {
+            let start = std::time::Instant::now();
+            assert_eq!(
+                peer_pid_from_socket(&tmp.path().join(name)),
+                expected,
+                "{name}"
+            );
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(1),
+                "{name}"
+            );
+        }
     }
 }

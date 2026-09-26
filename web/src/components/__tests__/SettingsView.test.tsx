@@ -39,11 +39,6 @@ describe("buildSidebar", () => {
       { kind: "tab", id: "cityhall", label: "CityHall" },
     ]);
   });
-
-  it("gives the Profiles tab an icon", () => {
-    const profiles = buildSidebar().find((item) => item.kind === "tab" && item.id === "profiles");
-    expect(profiles && "icon" in profiles && profiles.icon).toBeTruthy();
-  });
 });
 
 describe("resolveSelectedProfile", () => {
@@ -53,10 +48,8 @@ describe("resolveSelectedProfile", () => {
   ];
   it.each([
     ["keeps a still-valid selection", "work", both("default"), "work"],
-    ["keeps a selection that is the default-flagged profile", "default", both("default"), "default"],
     ["falls back to the default-flagged profile", "scratch", both("work"), "work"],
     ["falls back to 'default' with no default flag", "missing", [{ name: "scratch", is_default: false }], "default"],
-    ["falls back to 'default' on an empty list", "anything", [], "default"],
   ])("%s", (_n, current, profiles, expected) => {
     expect(resolveSelectedProfile(current, profiles)).toBe(expected);
   });

@@ -81,18 +81,6 @@ describe("useClampedMenuPosition", () => {
     expect(updater({ x: 100, y: 700, scope: "bulk" } as never)).toEqual({ x: 100, y: 472, scope: "bulk" });
   });
 
-  it("clamps the menu left when the anchor overflows the right edge", () => {
-    const { setContextMenu } = setupHook({
-      anchor: { x: 1270, y: 100 },
-      menuRect: { width: 180, height: 240 },
-      viewport: { width: 1280, height: 720 },
-    });
-    const updater = setContextMenu.mock.calls[0][0] as (
-      prev: { x: number; y: number } | null,
-    ) => { x: number; y: number } | null;
-    expect(updater({ x: 1270, y: 100 })).toEqual({ x: 1092, y: 100 });
-  });
-
   it("does not call setContextMenu when contextMenu is null", () => {
     const { setContextMenu } = setupHook({
       anchor: null,

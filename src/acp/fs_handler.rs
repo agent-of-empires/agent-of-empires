@@ -200,24 +200,24 @@ fn write_no_follow(path: &Path, contents: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
-    fn resolve_inside_allowed_root() {
+    fn resolve_inside_accepts_roots_and_mapped_paths_only() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
-        fs::write(root.join("file.txt"), "hello").unwrap();
-        let policy = FsPolicy::new(vec![root.clone()]);
-        let resolved = policy
-            .resolve_inside(&root.join("file.txt"))
-            .expect("should resolve inside root");
-        assert!(resolved.starts_with(root.canonicalize().unwrap()));
-    }
-
-    #[test]
-    fn resolve_inside_rejects_relative_and_out_of_root_paths() {
-        let temp = tempfile::tempdir().unwrap();
-        let policy = FsPolicy::new(vec![temp.path().to_path_buf()]);
+        std::fs::write(root.join("file.txt"), "hello").unwrap();
+        let canonical = root.canonicalize().unwrap();
+        let map = SandboxPathMap::new(vec![(PathBuf::from("/workspace/proj"), root.clone())]);
+        let policy = FsPolicy::with_sandbox_map(vec![root.clone()], map);
+        for inside in [
+            root.join("file.txt"),
+            PathBuf::from("/workspace/proj/file.txt"),
+        ] {
+            let resolved = policy
+                .resolve_inside(&inside)
+                .expect("resolves inside root");
+            assert!(resolved.starts_with(&canonical), "{inside:?}");
+        }
         let outside = std::env::temp_dir().join("definitely-not-in-temp-dir-of-test");
         assert!(matches!(
             policy.resolve_inside(&outside),
@@ -229,47 +229,43 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn read_and_write_roundtrip() {
+    fn read_write_refuse_symlink_leaves() {
         let temp = tempfile::tempdir().unwrap();
         let policy = FsPolicy::new(vec![temp.path().to_path_buf()]);
         let path = temp.path().join("hello.txt");
         handle_write(&policy, "s-1", &path, "hi there").unwrap();
-        let read = handle_read(&policy, "s-1", &path).unwrap();
-        assert_eq!(read, "hi there");
-    }
+        assert_eq!(handle_read(&policy, "s-1", &path).unwrap(), "hi there");
 
-    #[cfg(unix)]
-    #[test]
-    fn rejects_symlink_leaf_pointing_outside_root() {
-        let temp = tempfile::tempdir().unwrap();
-        let policy = FsPolicy::new(vec![temp.path().to_path_buf()]);
         let outside_dir = tempfile::tempdir().unwrap();
         let outside = outside_dir.path().join("symlink-target");
         std::fs::write(&outside, "secret").unwrap();
-        let symlink_in_root = temp.path().join("escape");
-        std::os::unix::fs::symlink(&outside, &symlink_in_root).unwrap();
+        let escape = temp.path().join("escape");
+        std::os::unix::fs::symlink(&outside, &escape).unwrap();
+        assert!(matches!(
+            handle_read(&policy, "s-1", &escape),
+            Err(FsError::OutsideRoots(_))
+        ));
+        assert!(matches!(
+            handle_write(&policy, "s-1", &escape, "owned"),
+            Err(FsError::OutsideRoots(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret");
 
-        let read_result = handle_read(&policy, "s-1", &symlink_in_root);
-        assert!(matches!(read_result, Err(FsError::OutsideRoots(_))));
-
-        let write_result = handle_write(&policy, "s-1", &symlink_in_root, "owned");
-        assert!(matches!(write_result, Err(FsError::OutsideRoots(_))));
-
-        let target_after = std::fs::read_to_string(&outside).unwrap();
-        assert_eq!(target_after, "secret", "outside file must remain untouched");
-    }
-
-    /// Dangling symlink (target does not exist) inside the allowed root.
-    #[cfg(unix)]
-    #[test]
-    fn rejects_dangling_symlink_leaf() {
-        let temp = tempfile::tempdir().unwrap();
-        let policy = FsPolicy::new(vec![temp.path().to_path_buf()]);
         let dangling = temp.path().join("dangling");
         std::os::unix::fs::symlink("/no/such/path", &dangling).unwrap();
-        let result = handle_write(&policy, "s-1", &dangling, "x");
-        assert!(matches!(result, Err(FsError::SymlinkInPath(_))));
+        assert!(matches!(
+            handle_write(&policy, "s-1", &dangling, "x"),
+            Err(FsError::SymlinkInPath(_))
+        ));
+
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(
+            read_no_follow(&link).is_err(),
+            "O_NOFOLLOW must refuse a symlinked leaf"
+        );
     }
 
     #[test]
@@ -295,32 +291,5 @@ mod tests {
                 "{container}"
             );
         }
-    }
-
-    #[test]
-    fn fs_policy_resolves_container_path_via_sandbox_map() {
-        let temp = tempfile::tempdir().unwrap();
-        let host_root = temp.path().to_path_buf();
-        std::fs::write(host_root.join("file.txt"), "ok").unwrap();
-        let map = SandboxPathMap::new(vec![(PathBuf::from("/workspace/proj"), host_root.clone())]);
-        let policy = FsPolicy::with_sandbox_map(vec![host_root.clone()], map);
-        let resolved = policy
-            .resolve_inside(Path::new("/workspace/proj/file.txt"))
-            .expect("should resolve via sandbox map");
-        assert!(resolved.starts_with(host_root.canonicalize().unwrap()));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn open_with_nofollow_rejects_symlink_leaf() {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("real");
-        std::fs::write(&target, "ok").unwrap();
-        let link = temp.path().join("link");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(
-            read_no_follow(&link).is_err(),
-            "O_NOFOLLOW must refuse a symlinked leaf"
-        );
     }
 }

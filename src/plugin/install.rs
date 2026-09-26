@@ -1402,46 +1402,36 @@ mod tests {
         assert!(err.contains("gh:"), "{err}");
     }
 
+    /// Uninstall removes only a configured external plugin's directory: a
+    /// malformed id or a bare plugins subdirectory is refused untouched, and a
+    /// configured plugin whose directory is gone still has its config removed.
     #[test]
     #[serial]
-    fn uninstall_rejects_malformed_id_before_touching_plugin_dir() {
+    fn uninstall_only_removes_installed_external_plugins() {
         let _home = isolate_app_dir();
         let plugins = super::super::plugins_dir().unwrap();
         let jobs = plugins.join("jobs");
         let keep = plugins.join("keepdir");
-        std::fs::create_dir_all(&jobs).unwrap();
-        std::fs::create_dir_all(&keep).unwrap();
-        std::fs::write(keep.join("keep.log"), b"keep").unwrap();
+        for dir in [&jobs, &keep] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("keep.log"), b"keep").unwrap();
+        }
 
-        let err = uninstall("jobs/../keepdir").unwrap_err().to_string();
-        assert!(err.contains("invalid plugin id"), "{err}");
-        assert!(
-            keep.join("keep.log").exists(),
-            "malformed ids must not remove plugin subdirectories"
-        );
-    }
+        for (id, needle) in [
+            ("jobs/../keepdir", "invalid plugin id"),
+            ("jobs", "not an installed external plugin"),
+        ] {
+            let err = uninstall(id).unwrap_err().to_string();
+            assert!(err.contains(needle), "{id}: {err}");
+        }
+        for dir in [&jobs, &keep] {
+            assert!(
+                dir.join("keep.log").exists(),
+                "{} was removed",
+                dir.display()
+            );
+        }
 
-    #[test]
-    #[serial]
-    fn uninstall_requires_external_plugin_config_before_removing_dir() {
-        let _home = isolate_app_dir();
-        let plugins = super::super::plugins_dir().unwrap();
-        let jobs = plugins.join("jobs");
-        std::fs::create_dir_all(&jobs).unwrap();
-        std::fs::write(jobs.join("keep.log"), b"keep").unwrap();
-
-        let err = uninstall("jobs").unwrap_err().to_string();
-        assert!(err.contains("not an installed external plugin"), "{err}");
-        assert!(
-            jobs.join("keep.log").exists(),
-            "uninstall should not remove non-plugin subdirectories"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn uninstall_external_plugin_cleans_config_even_when_dir_is_missing() {
-        let _home = isolate_app_dir();
         update_config(|config| {
             config.plugins.insert(
                 "acme.thing".to_string(),
@@ -1452,33 +1442,16 @@ mod tests {
             );
         })
         .unwrap();
-
         uninstall("acme.thing").unwrap();
-
-        let config = Config::load().unwrap();
-        assert!(!config.plugins.contains_key("acme.thing"));
+        assert!(!Config::load().unwrap().plugins.contains_key("acme.thing"));
     }
 
+    /// Dismissing an update for a plugin that is not an installed external
+    /// plugin must neither create a blank `[plugins.*]` entry nor record the
+    /// dismissal on a source-less one.
     #[test]
     #[serial]
-    fn dismiss_update_unknown_plugin_leaves_no_stray_config_entry() {
-        let _home = isolate_app_dir();
-
-        let err = dismiss_update("no.such.plugin", "abc123")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not an installed external plugin"), "{err}");
-
-        let config = Config::load().unwrap();
-        assert!(
-            !config.plugins.contains_key("no.such.plugin"),
-            "dismiss_update's error path must not persist a blank [plugins.*] entry"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn dismiss_update_uninstalled_plugin_leaves_entry_untouched() {
+    fn dismiss_update_refuses_plugins_that_are_not_installed_externally() {
         let _home = isolate_app_dir();
         update_config(|config| {
             config
@@ -1487,16 +1460,12 @@ mod tests {
         })
         .unwrap();
 
-        let err = dismiss_update("acme.thing", "abc123")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not an installed external plugin"), "{err}");
-
+        for id in ["no.such.plugin", "acme.thing"] {
+            let err = dismiss_update(id, "abc123").unwrap_err().to_string();
+            assert!(err.contains("not an installed external plugin"), "{err}");
+        }
         let config = Config::load().unwrap();
-        let entry = config.plugins.get("acme.thing").unwrap();
-        assert!(
-            entry.dismissed_update.is_none(),
-            "an entry with no source is not installed, so dismissal must not be recorded"
-        );
+        assert!(!config.plugins.contains_key("no.such.plugin"));
+        assert!(config.plugins["acme.thing"].dismissed_update.is_none());
     }
 }

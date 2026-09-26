@@ -40,10 +40,6 @@ function noticeProps(overrides?: Partial<NoticeProps>): NoticeProps {
 const mount = (overrides?: Partial<NoticeProps>) => render(<SystemNotices {...noticeProps(overrides)} />);
 
 describe("SystemNotices", () => {
-  it("renders nothing for a healthy session", () => {
-    expect(mount().container.firstChild).toBeNull();
-  });
-
   it.each([
     [true, /Auto-resume is armed/],
     [false, /Auto-resume is off for this profile/],
@@ -55,7 +51,7 @@ describe("SystemNotices", () => {
     else expect(queryByText(/Auto-resume/)).toBeNull();
   });
 
-  // Without a parseable reset, the banner shows the agent's own wording, never a made-up clock.
+  // Without a parseable reset, the banner shows the agent's own wording, never a made-up clock (#3174).
   it.each([
     [
       "a reported reset",
@@ -143,7 +139,7 @@ describe("SystemNotices", () => {
     expect(getByRole("button", { name: /continue in another agent/i })).toBeDefined();
   });
 
-  // `Stopped` does not clear `rate_limit` server-side, so a cap park keeps the snapshot and both buttons.
+  // `Stopped` does not clear `rate_limit` server-side, so a cap park keeps the snapshot and both buttons (#3693).
   it.each([
     [{ status: "limited", resets_at: "2099-01-01T00:00:00Z", kind: "usage" }, true],
     [null, false],

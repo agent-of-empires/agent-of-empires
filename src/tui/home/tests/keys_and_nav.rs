@@ -84,29 +84,39 @@ fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
     );
 }
 
+/// Watcher refreshes stash the latest theme for the tick loop and never reopen the hotkey
+/// warning; interactive refreshes do the reverse.
 #[test]
 #[serial]
-fn watcher_refresh_does_not_reopen_hotkey_warning_dialog() {
+fn refresh_origin_controls_hotkey_warning_and_theme_stash() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let _storage = Storage::new_unwatched("test").unwrap();
     let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
-    std::fs::write(
-        &global_config,
-        "[tools.alpha]\ncommand = \"alpha\"\nhotkey = \"Ctrl+g\"\n",
-    )
-    .unwrap();
+    let write_config = |theme: &str| {
+        std::fs::write(
+            &global_config,
+            format!(
+                "[theme]\nname = \"{theme}\"\n\n[tools.alpha]\ncommand = \"alpha\"\nhotkey = \"Ctrl+g\"\n"
+            ),
+        )
+        .unwrap();
+    };
+    write_config("dracula");
 
-    let tools = AvailableTools::with_tools(&["alpha"]);
     let mut view = HomeView::new_for_test(
         Some("test".to_string()),
-        tools,
+        AvailableTools::with_tools(&["alpha"]),
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
     assert!(
         view.info_dialog.is_some(),
         "precondition: initial load shows warning dialog"
+    );
+    assert!(
+        view.pending_watcher_theme.is_none(),
+        "HomeView::new must not stash a pending watcher theme"
     );
     view.info_dialog = None;
 
@@ -115,113 +125,29 @@ fn watcher_refresh_does_not_reopen_hotkey_warning_dialog() {
         view.info_dialog.is_none(),
         "watcher-driven refresh must not reopen the hotkey warning dialog"
     );
-}
+    assert_eq!(view.pending_watcher_theme.as_deref(), Some("dracula"));
 
-#[test]
-#[serial]
-fn interactive_refresh_reopens_hotkey_warning_dialog() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _storage = Storage::new_unwatched("test").unwrap();
-    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
-    std::fs::write(
-        &global_config,
-        "[tools.alpha]\ncommand = \"alpha\"\nhotkey = \"Ctrl+g\"\n",
-    )
-    .unwrap();
-
-    let tools = AvailableTools::with_tools(&["alpha"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.info_dialog = None;
+    write_config("empire");
+    view.refresh_from_config(crate::tui::home::ConfigRefreshOrigin::Watcher);
+    assert_eq!(
+        view.pending_watcher_theme.as_deref(),
+        Some("empire"),
+        "a second watcher refresh must overwrite the stale stash"
+    );
+    assert_eq!(view.take_pending_watcher_theme().as_deref(), Some("empire"));
+    assert!(
+        view.take_pending_watcher_theme().is_none(),
+        "take must drain the stash so one refresh dispatches at most one set_theme"
+    );
 
     view.refresh_from_config(crate::tui::home::ConfigRefreshOrigin::Interactive);
     assert!(
         view.info_dialog.is_some(),
         "interactive refresh must still surface the hotkey warning dialog"
     );
-}
-
-#[test]
-#[serial]
-fn watcher_refresh_stashes_pending_watcher_theme() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _storage = Storage::new_unwatched("test").unwrap();
-    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
-    std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
-
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
     assert!(
         view.pending_watcher_theme.is_none(),
-        "precondition: HomeView::new must not stash a pending watcher theme"
-    );
-
-    view.refresh_from_config(crate::tui::home::ConfigRefreshOrigin::Watcher);
-    assert_eq!(
-        view.pending_watcher_theme.as_deref(),
-        Some("dracula"),
-        "watcher-driven refresh must stash the resolved theme name so the tick loop can dispatch App::set_theme"
-    );
-}
-
-#[test]
-#[serial]
-fn interactive_refresh_does_not_stash_pending_watcher_theme() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _storage = Storage::new_unwatched("test").unwrap();
-    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
-    std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
-
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    assert!(
-        view.pending_watcher_theme.is_none(),
-        "precondition: HomeView::new must not stash a pending watcher theme"
-    );
-
-    view.refresh_from_config(crate::tui::home::ConfigRefreshOrigin::Interactive);
-    assert!(
-        view.pending_watcher_theme.is_none(),
-        "interactive refresh must not stash a pending theme; settings/intro input handlers dispatch Action::SetTheme directly"
-    );
-}
-
-#[test]
-#[serial]
-fn take_pending_watcher_theme_clears_the_field() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _storage = Storage::new_unwatched("test").unwrap();
-
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.pending_watcher_theme = Some("zinc".to_string());
-
-    let first = view.take_pending_watcher_theme();
-    let second = view.take_pending_watcher_theme();
-    assert_eq!(first.as_deref(), Some("zinc"));
-    assert!(
-        second.is_none(),
-        "take must drain the pending field so a single watcher refresh dispatches at most one set_theme"
+        "interactive refresh must not stash a pending theme"
     );
 }
 
@@ -258,41 +184,6 @@ fn watcher_refresh_stashes_global_theme_not_profile_override() {
         Some("dracula"),
         "watcher path must stash the global theme name via resolve_theme_name; a stale per-profile theme override (legacy or hand-edited) must not mask the global value"
     );
-}
-
-#[test]
-#[serial]
-fn second_watcher_refresh_overwrites_stale_stash() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _storage = Storage::new_unwatched("test").unwrap();
-
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-
-    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
-    std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
-    view.refresh_from_config(crate::tui::home::ConfigRefreshOrigin::Watcher);
-    assert_eq!(view.pending_watcher_theme.as_deref(), Some("dracula"));
-
-    std::fs::write(&global_config, "[theme]\nname = \"empire\"\n").unwrap();
-    view.refresh_from_config(crate::tui::home::ConfigRefreshOrigin::Watcher);
-    assert_eq!(
-        view.pending_watcher_theme.as_deref(),
-        Some("empire"),
-        "second watcher refresh must overwrite the stale stash; first-write-wins would silently drop the latest theme change"
-    );
-}
-
-#[test]
-#[serial]
-fn test_initial_cursor_position() {
-    let env = create_test_env_with_sessions(3);
-    assert_eq!(env.view.cursor, 0);
 }
 
 #[test]
@@ -798,156 +689,11 @@ fn unread_flag_survives_sink_round_trip() {
     assert!(inst.is_unread(), "unsnooze must keep unread");
 }
 
-/// Dwell-to-read: an unread row that stays selected past `UNREAD_DWELL` with the list in
-/// the foreground is cleared, distinguishing "stopped to read it" from "scrolled past".
+/// Dwell-to-read clears an unread row that stays selected past `UNREAD_DWELL`; moving the
+/// selection first spares it, so arrowing through a list doesn't read everything you pass.
 #[test]
 #[serial]
-fn unread_dwell_clears_after_threshold() {
-    use std::time::{Duration, Instant};
-    crate::session::set_unread_enabled(true);
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.mutate_instance(&id, |inst| {
-        inst.status = crate::session::Status::Idle;
-        inst.mark_unread();
-    });
-    env.view.flat_items = env.view.build_flat_items();
-    env.view.select_session_by_id(&id);
-    assert!(env.view.get_instance(&id).unwrap().is_unread());
-
-    let t0 = Instant::now();
-    // First tick arms the dwell clock; nothing cleared yet.
-    assert!(!env.view.tick_unread_dwell(t0));
-    assert!(env.view.get_instance(&id).unwrap().is_unread());
-    // Below the threshold: still unread (this is the "scrolled past" guard).
-    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_millis(500)));
-    assert!(env.view.get_instance(&id).unwrap().is_unread());
-    // Past the threshold: cleared.
-    assert!(env
-        .view
-        .tick_unread_dwell(t0 + crate::tui::home::UNREAD_DWELL + Duration::from_millis(1)));
-    assert!(!env.view.get_instance(&id).unwrap().is_unread());
-}
-
-/// A fresh manual flag (`u`) is held for the current visit, so marking a session unread and
-/// keeping the cursor on it must not let dwell-to-read undo the mark.
-#[test]
-#[serial]
-fn manual_unread_survives_same_visit_dwell() {
-    use std::time::{Duration, Instant};
-    crate::session::set_unread_enabled(true);
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.mutate_instance(&id, |inst| {
-        inst.status = crate::session::Status::Idle;
-    });
-    env.view.flat_items = env.view.build_flat_items();
-    env.view.select_session_by_id(&id);
-    env.view
-        .toggle_unread_at_cursor()
-        .expect("manual toggle should succeed");
-    assert!(env.view.get_instance(&id).unwrap().is_unread());
-
-    let t0 = Instant::now();
-    // Arm the clock, then sit well past the threshold without moving: the hold
-    // keeps the mark.
-    assert!(!env.view.tick_unread_dwell(t0));
-    assert!(!env
-        .view
-        .tick_unread_dwell(t0 + crate::tui::home::UNREAD_DWELL + Duration::from_secs(5)));
-    assert!(
-        env.view.get_instance(&id).unwrap().is_unread(),
-        "a freshly hand-flagged row must survive dwell while it stays selected"
-    );
-}
-
-/// The manual hold is per-visit: after leaving a hand-flagged row and coming back, dwelling
-/// clears the mark like any other unread row.
-#[test]
-#[serial]
-fn manual_unread_clears_after_leave_and_return() {
-    use std::time::{Duration, Instant};
-    crate::session::set_unread_enabled(true);
-    let mut env = create_test_env_with_sessions(2);
-    let a = env.view.instance_at(0).id.clone();
-    let b = env.view.instance_at(1).id.clone();
-    for id in [&a, &b] {
-        env.view.mutate_instance(id, |inst| {
-            inst.status = crate::session::Status::Idle;
-        });
-    }
-    env.view.flat_items = env.view.build_flat_items();
-
-    // Select A and flag it unread by hand.
-    env.view.select_session_by_id(&a);
-    env.view.toggle_unread_at_cursor().expect("manual mark A");
-    assert!(env.view.get_instance(&a).unwrap().is_unread());
-
-    // Move to B with no dwell tick in between, like real navigation: the hold must release
-    // purely from the selection change, or returning to A would stay suppressed forever.
-    env.view.select_session_by_id(&b);
-    assert!(
-        env.view.manual_unread_hold.is_none(),
-        "moving off the row must release the hold without needing a dwell tick"
-    );
-
-    // Come back to A: arm the clock, then sit past the threshold. Now it clears.
-    let t0 = Instant::now();
-    env.view.select_session_by_id(&a);
-    assert!(!env.view.tick_unread_dwell(t0));
-    let cleared = env
-        .view
-        .tick_unread_dwell(t0 + crate::tui::home::UNREAD_DWELL + Duration::from_secs(1));
-    assert!(cleared, "revisiting and dwelling should clear the mark");
-    assert!(
-        !env.view.get_instance(&a).unwrap().is_unread(),
-        "a hand-flagged row clears on revisit + dwell (per-visit hold)"
-    );
-}
-
-/// Engaging with a hand-flagged row (open/attach, which clears it) also drops the per-visit
-/// hold, so a later auto mark on that still-selected row clears on dwell.
-#[test]
-#[serial]
-fn manual_hold_released_on_engagement_lets_auto_clear() {
-    use std::time::{Duration, Instant};
-    crate::session::set_unread_enabled(true);
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    env.view.mutate_instance(&id, |inst| {
-        inst.status = crate::session::Status::Idle;
-    });
-    env.view.flat_items = env.view.build_flat_items();
-    env.view.select_session_by_id(&id);
-
-    // Hand-flag, then engage (the open/attach path), which clears it and ends
-    // the hold even though the cursor never left the row.
-    env.view.toggle_unread_at_cursor().expect("manual mark");
-    env.view.clear_unread_on_view(&id);
-    assert!(
-        env.view.manual_unread_hold.is_none(),
-        "engaging with the row must release the manual hold"
-    );
-    assert!(!env.view.get_instance(&id).unwrap().is_unread());
-
-    // A later auto mark on the same (still-selected) row must clear on dwell.
-    env.view.mutate_instance(&id, |inst| inst.mark_unread());
-    let t0 = Instant::now();
-    assert!(!env.view.tick_unread_dwell(t0));
-    let cleared = env
-        .view
-        .tick_unread_dwell(t0 + crate::tui::home::UNREAD_DWELL + Duration::from_secs(1));
-    assert!(
-        cleared && !env.view.get_instance(&id).unwrap().is_unread(),
-        "a later auto mark must not be suppressed by a stale hold"
-    );
-}
-
-/// Moving the selection to a different row before the dwell completes spares
-/// the first row: arrowing through a list doesn't read everything you pass.
-#[test]
-#[serial]
-fn unread_dwell_resets_on_selection_change() {
+fn unread_dwell_clears_after_threshold_and_resets_on_selection_change() {
     use std::time::{Duration, Instant};
     crate::session::set_unread_enabled(true);
     let mut env = create_test_env_with_sessions(2);
@@ -968,8 +714,12 @@ fn unread_dwell_resets_on_selection_change() {
     // Move to B well before A's threshold; A's clock is dropped, B's arms.
     env.view.select_session_by_id(&b);
     assert!(!env.view.tick_unread_dwell(t0 + Duration::from_millis(500)));
-    // Long after, B has now dwelled past the threshold and clears; A, which we
-    // left early, is untouched.
+    // Below B's threshold: still unread (the "scrolled past" guard).
+    assert!(!env
+        .view
+        .tick_unread_dwell(t0 + crate::tui::home::UNREAD_DWELL));
+    assert!(env.view.get_instance(&b).unwrap().is_unread());
+    // Past B's threshold: B clears; A, which we left early, is untouched.
     assert!(env
         .view
         .tick_unread_dwell(t0 + crate::tui::home::UNREAD_DWELL + Duration::from_secs(2)));
@@ -980,6 +730,74 @@ fn unread_dwell_resets_on_selection_change() {
     assert!(
         !env.view.get_instance(&b).unwrap().is_unread(),
         "row dwelled past the threshold must be cleared"
+    );
+}
+
+/// A manual flag (`u`) is held for the current visit only: dwelling in place keeps it,
+/// leaving (without a dwell tick) releases the hold so a revisit clears on dwell, and
+/// engaging with the row (open/attach) also drops the hold.
+#[test]
+#[serial]
+fn manual_unread_hold_lasts_one_visit() {
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(2);
+    let a = env.view.instance_at(0).id.clone();
+    let b = env.view.instance_at(1).id.clone();
+    for id in [&a, &b] {
+        env.view.mutate_instance(id, |inst| {
+            inst.status = crate::session::Status::Idle;
+        });
+    }
+    env.view.flat_items = env.view.build_flat_items();
+    let past_dwell = crate::tui::home::UNREAD_DWELL + Duration::from_secs(5);
+
+    // Same visit: the hold keeps the hand-set mark through a full dwell.
+    env.view.select_session_by_id(&a);
+    env.view.toggle_unread_at_cursor().expect("manual mark A");
+    let t0 = Instant::now();
+    assert!(!env.view.tick_unread_dwell(t0));
+    assert!(!env.view.tick_unread_dwell(t0 + past_dwell));
+    assert!(
+        env.view.get_instance(&a).unwrap().is_unread(),
+        "a freshly hand-flagged row must survive dwell while it stays selected"
+    );
+
+    // Leave and return: the selection change alone releases the hold.
+    env.view.select_session_by_id(&b);
+    assert!(
+        env.view.manual_unread_hold.is_none(),
+        "moving off the row must release the hold without needing a dwell tick"
+    );
+    assert!(
+        !env.view.tick_unread_dwell(t0 + past_dwell),
+        "B arms its own clock"
+    );
+    let t1 = t0 + past_dwell * 2;
+    env.view.select_session_by_id(&a);
+    assert!(!env.view.tick_unread_dwell(t1));
+    assert!(
+        env.view.tick_unread_dwell(t1 + past_dwell),
+        "revisiting and dwelling should clear the mark"
+    );
+    assert!(!env.view.get_instance(&a).unwrap().is_unread());
+
+    // Engaging clears the mark and ends the hold without leaving the row, so a later auto
+    // mark on the still-selected row clears on the next tick of the parked dwell clock.
+    env.view
+        .toggle_unread_at_cursor()
+        .expect("manual mark A again");
+    env.view.clear_unread_on_view(&a);
+    assert!(
+        env.view.manual_unread_hold.is_none(),
+        "engaging with the row must release the manual hold"
+    );
+    assert!(!env.view.get_instance(&a).unwrap().is_unread());
+    env.view.mutate_instance(&a, |inst| inst.mark_unread());
+    assert!(
+        env.view.tick_unread_dwell(t1 + past_dwell * 2)
+            && !env.view.get_instance(&a).unwrap().is_unread(),
+        "a later auto mark must not be suppressed by a stale hold"
     );
 }
 
@@ -1040,59 +858,25 @@ fn test_quit_confirm_without_opt_out_keeps_flag() {
     assert!(env.view.confirm_before_quit);
 }
 
+/// `?` opens help (a dialog for routing purposes); `Esc`, `?`, `q` and strict mode's `Q`
+/// all close it.
 #[test]
 #[serial]
-fn test_question_mark_opens_help() {
+fn help_overlay_opens_on_question_mark_and_closes_on_each_dismiss_key() {
     let mut env = create_test_env_empty();
-    assert!(!env.view.show_help);
-    env.view.handle_key(key(KeyCode::Char('?')), None);
-    assert!(env.view.show_help);
-}
-
-#[test]
-#[serial]
-fn test_help_closes_on_esc() {
-    let mut env = create_test_env_empty();
-    env.view.show_help = true;
-    env.view.handle_key(key(KeyCode::Esc), None);
-    assert!(!env.view.show_help);
-}
-
-#[test]
-#[serial]
-fn test_help_closes_on_question_mark() {
-    let mut env = create_test_env_empty();
-    env.view.show_help = true;
-    env.view.handle_key(key(KeyCode::Char('?')), None);
-    assert!(!env.view.show_help);
-}
-
-#[test]
-#[serial]
-fn test_help_closes_on_q() {
-    let mut env = create_test_env_empty();
-    env.view.show_help = true;
-    env.view.handle_key(key(KeyCode::Char('q')), None);
-    assert!(!env.view.show_help);
-}
-
-#[test]
-#[serial]
-fn test_help_closes_on_uppercase_q_for_strict_mode() {
-    // Strict mode binds quit to uppercase Q, so the help overlay must accept it too.
-    let mut env = create_test_env_empty();
-    env.view.show_help = true;
-    env.view.handle_key(key(KeyCode::Char('Q')), None);
-    assert!(!env.view.show_help);
-}
-
-#[test]
-#[serial]
-fn test_has_dialog_returns_true_for_help() {
-    let mut env = create_test_env_empty();
-    assert!(!env.view.has_dialog());
-    env.view.show_help = true;
-    assert!(env.view.has_dialog());
+    for close in [
+        KeyCode::Esc,
+        KeyCode::Char('?'),
+        KeyCode::Char('q'),
+        KeyCode::Char('Q'),
+    ] {
+        assert!(!env.view.has_dialog());
+        env.view.handle_key(key(KeyCode::Char('?')), None);
+        assert!(env.view.show_help);
+        assert!(env.view.has_dialog());
+        env.view.handle_key(key(close), None);
+        assert!(!env.view.show_help, "{close:?} must close help");
+    }
 }
 
 #[test]
@@ -1102,44 +886,7 @@ fn test_n_opens_new_dialog() {
     assert!(env.view.new_dialog.is_none());
     env.view.handle_key(key(KeyCode::Char('n')), None);
     assert!(env.view.new_dialog.is_some());
-}
-
-#[test]
-#[serial]
-fn test_has_dialog_returns_true_for_new_dialog() {
-    let mut env = create_test_env_empty();
-    env.view.new_dialog = Some(NewSessionDialog::new(
-        AvailableTools::with_tools(&["claude"]),
-        Vec::new(),
-        "default",
-        vec!["default".to_string()],
-    ));
     assert!(env.view.has_dialog());
-}
-
-#[test]
-#[serial]
-fn test_b_opens_project_session_picker_when_projects_exist() {
-    use crate::session::projects::{self, Project, ProjectScope};
-    let mut env = create_test_env_empty();
-    let repo = env._temp.path().join("repoA");
-    std::fs::create_dir_all(&repo).unwrap();
-    projects::add(
-        "test",
-        ProjectScope::Profile,
-        Project::new("repoA", repo.to_string_lossy(), ProjectScope::Profile),
-        false,
-    )
-    .unwrap();
-
-    assert!(env.view.project_session_picker_dialog.is_none());
-    env.view.handle_key(key(KeyCode::Char('b')), None);
-    assert!(env.view.project_session_picker_dialog.is_some());
-    assert!(env.view.info_dialog.is_none());
-    // The picker captures filter chars, so it must register as a modal: unregistered, the
-    // global `q` shortcut quits the app and the paste-burst detector fires mid-filter.
-    assert!(env.view.has_dialog());
-    assert!(!env.view.wants_paste_burst());
 }
 
 #[test]
@@ -1203,6 +950,11 @@ fn test_b_submit_opens_new_dialog_with_prefilled_path() {
 
     env.view.handle_key(key(KeyCode::Char('b')), None);
     assert!(env.view.project_session_picker_dialog.is_some());
+    assert!(env.view.info_dialog.is_none());
+    // The picker captures filter chars, so it must register as a modal: unregistered, the
+    // global `q` shortcut quits the app and the paste-burst detector fires mid-filter.
+    assert!(env.view.has_dialog());
+    assert!(!env.view.wants_paste_burst());
     env.view.handle_key(key(KeyCode::Enter), None);
     assert!(env.view.project_session_picker_dialog.is_none());
     let dialog = env
@@ -1213,112 +965,36 @@ fn test_b_submit_opens_new_dialog_with_prefilled_path() {
     assert_eq!(dialog.path_value(), expected);
 }
 
+/// Arrow/vi/page/home/end keys over a 20-row list, including clamping at both ends.
 #[test]
 #[serial]
-fn test_cursor_down_j() {
-    let mut env = create_test_env_with_sessions(5);
-    assert_eq!(env.view.cursor, 0);
-    env.view.handle_key(key(KeyCode::Char('j')), None);
-    assert_eq!(env.view.cursor, 1);
-}
-
-#[test]
-#[serial]
-fn test_cursor_down_arrow() {
-    let mut env = create_test_env_with_sessions(5);
-    assert_eq!(env.view.cursor, 0);
-    env.view.handle_key(key(KeyCode::Down), None);
-    assert_eq!(env.view.cursor, 1);
-}
-
-#[test]
-#[serial]
-fn test_cursor_up_k() {
-    let mut env = create_test_env_with_sessions(5);
-    env.view.cursor = 3;
-    env.view.handle_key(key(KeyCode::Char('k')), None);
-    assert_eq!(env.view.cursor, 2);
-}
-
-#[test]
-#[serial]
-fn test_cursor_up_arrow() {
-    let mut env = create_test_env_with_sessions(5);
-    env.view.cursor = 3;
-    env.view.handle_key(key(KeyCode::Up), None);
-    assert_eq!(env.view.cursor, 2);
-}
-
-#[test]
-#[serial]
-fn test_cursor_bounds_at_top() {
-    let mut env = create_test_env_with_sessions(5);
-    env.view.cursor = 0;
-    env.view.handle_key(key(KeyCode::Up), None);
-    assert_eq!(env.view.cursor, 0);
-}
-
-#[test]
-#[serial]
-fn test_cursor_bounds_at_bottom() {
-    let mut env = create_test_env_with_sessions(5);
-    env.view.cursor = 4;
-    env.view.handle_key(key(KeyCode::Down), None);
-    assert_eq!(env.view.cursor, 4);
-}
-
-#[test]
-#[serial]
-fn test_page_down() {
+fn cursor_navigation_keys_move_and_clamp() {
     let mut env = create_test_env_with_sessions(20);
-    env.view.cursor = 0;
-    env.view.handle_key(key(KeyCode::PageDown), None);
-    assert_eq!(env.view.cursor, 10);
-}
+    for (start, code, expected) in [
+        (0, KeyCode::Char('j'), 1),
+        (0, KeyCode::Down, 1),
+        (3, KeyCode::Char('k'), 2),
+        (3, KeyCode::Up, 2),
+        (0, KeyCode::Up, 0),
+        (19, KeyCode::Down, 19),
+        (0, KeyCode::PageDown, 10),
+        (15, KeyCode::PageUp, 5),
+        (15, KeyCode::PageDown, 19),
+        (3, KeyCode::PageUp, 0),
+        (7, KeyCode::Home, 0),
+        (3, KeyCode::End, 19),
+        (3, KeyCode::Char('G'), 19),
+    ] {
+        env.view.cursor = start;
+        env.view.handle_key(key(code), None);
+        assert_eq!(env.view.cursor, expected, "{code:?} from {start}");
+    }
 
-#[test]
-#[serial]
-fn test_page_up() {
-    let mut env = create_test_env_with_sessions(20);
-    env.view.cursor = 15;
-    env.view.handle_key(key(KeyCode::PageUp), None);
-    assert_eq!(env.view.cursor, 5);
-}
-
-#[test]
-#[serial]
-fn test_page_down_clamps_to_end() {
-    let mut env = create_test_env_with_sessions(5);
-    env.view.cursor = 0;
-    env.view.handle_key(key(KeyCode::PageDown), None);
-    assert_eq!(env.view.cursor, 4);
-}
-
-#[test]
-#[serial]
-fn test_page_up_clamps_to_start() {
-    let mut env = create_test_env_with_sessions(5);
-    env.view.cursor = 3;
-    env.view.handle_key(key(KeyCode::PageUp), None);
-    assert_eq!(env.view.cursor, 0);
-}
-
-#[test]
-#[serial]
-fn test_home_key() {
-    let mut env = create_test_env_with_sessions(10);
-    env.view.cursor = 7;
-    env.view.handle_key(key(KeyCode::Home), None);
-    assert_eq!(env.view.cursor, 0);
-}
-
-#[test]
-#[serial]
-fn test_end_key() {
-    let mut env = create_test_env_with_sessions(10);
-    env.view.cursor = 3;
-    env.view.handle_key(key(KeyCode::End), None);
-    assert_eq!(env.view.cursor, 9);
+    let mut empty = create_test_env_empty();
+    for code in [KeyCode::Down, KeyCode::Up] {
+        empty.view.handle_key(key(code), None);
+        assert_eq!(empty.view.cursor, 0);
+    }
 }
 
 #[test]
@@ -1353,114 +1029,4 @@ fn test_g_key_opens_group_picker() {
     env.view.handle_key(key(KeyCode::Enter), None);
     assert!(env.view.group_picker_dialog.is_none());
     assert_eq!(env.view.group_by, GroupByMode::Org);
-}
-
-#[test]
-#[serial]
-fn test_uppercase_g_goes_to_end() {
-    let mut env = create_test_env_with_sessions(10);
-    env.view.cursor = 3;
-    env.view.handle_key(key(KeyCode::Char('G')), None);
-    assert_eq!(env.view.cursor, 9);
-}
-
-#[test]
-#[serial]
-fn test_cursor_movement_on_empty_list() {
-    let mut env = create_test_env_empty();
-    env.view.handle_key(key(KeyCode::Down), None);
-    assert_eq!(env.view.cursor, 0);
-    env.view.handle_key(key(KeyCode::Up), None);
-    assert_eq!(env.view.cursor, 0);
-}
-
-#[test]
-#[serial]
-fn test_enter_on_session_returns_attach_action() {
-    let mut env = create_test_env_with_sessions(3);
-    env.view.cursor = 1;
-    env.view.update_selected();
-    let action = env.view.handle_key(key(KeyCode::Enter), None);
-    assert!(matches!(action, Some(Action::AttachSession(_))));
-}
-
-#[test]
-#[serial]
-fn test_enter_on_acp_session_opens_structured_view() {
-    use crate::session::config::GroupByMode;
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-    let mut instances = vec![
-        Instance::new("plain", "/tmp/0"),
-        Instance::new("acp", "/tmp/1"),
-        Instance::new("plain2", "/tmp/2"),
-    ];
-    instances[1].view = crate::session::View::Structured;
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.cursor = 1;
-    view.update_selected();
-
-    let action = view.handle_key(key(KeyCode::Enter), None);
-    match action {
-        Some(Action::OpenStructuredView(id)) => {
-            // Should target the structured view instance, not the plain ones.
-            assert!(
-                id.contains("acp") || !id.is_empty(),
-                "OpenStructuredView carried an empty session id"
-            );
-        }
-        other => {
-            panic!("expected Action::OpenStructuredView for structured view session, got {other:?}")
-        }
-    }
-}
-
-#[test]
-#[serial]
-fn test_slash_enters_search_mode() {
-    let mut env = create_test_env_with_sessions(3);
-    assert!(!env.view.search_active);
-    env.view.handle_key(key(KeyCode::Char('/')), None);
-    assert!(env.view.search_active);
-    assert!(env.view.search_query.value().is_empty());
-}
-
-#[test]
-#[serial]
-fn test_search_mode_captures_chars() {
-    let mut env = create_test_env_with_sessions(3);
-    env.view.handle_key(key(KeyCode::Char('/')), None);
-    env.view.handle_key(key(KeyCode::Char('t')), None);
-    env.view.handle_key(key(KeyCode::Char('e')), None);
-    env.view.handle_key(key(KeyCode::Char('s')), None);
-    env.view.handle_key(key(KeyCode::Char('t')), None);
-    assert_eq!(env.view.search_query.value(), "test");
-}
-
-#[test]
-#[serial]
-fn test_search_mode_backspace() {
-    let mut env = create_test_env_with_sessions(3);
-    env.view.handle_key(key(KeyCode::Char('/')), None);
-    env.view.handle_key(key(KeyCode::Char('a')), None);
-    env.view.handle_key(key(KeyCode::Char('b')), None);
-    env.view.handle_key(key(KeyCode::Backspace), None);
-    assert_eq!(env.view.search_query.value(), "a");
 }

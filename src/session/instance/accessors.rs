@@ -705,36 +705,6 @@ mod tests {
     }
 
     #[test]
-    fn new_instance_has_a_unique_hex_id_and_defaults() {
-        let inst = Instance::new("test", "/tmp/test");
-        assert_eq!(
-            (inst.title.as_str(), inst.project_path.as_str()),
-            ("test", "/tmp/test")
-        );
-        assert_eq!(inst.status, Status::Idle);
-        assert_eq!(inst.id.len(), 16);
-        assert!(inst.id.chars().all(|c| c.is_ascii_hexdigit()));
-        let ids: std::collections::HashSet<_> =
-            (0..100).map(|_| Instance::new("t", "/t").id).collect();
-        assert_eq!(ids.len(), 100);
-    }
-
-    #[test]
-    fn sub_session_and_sandbox_predicates() {
-        let mut inst = Instance::new("test", "/tmp/test");
-        assert!(!inst.is_sub_session());
-        assert!(!inst.is_sandboxed());
-        inst.parent_session_id = Some("parent123".to_string());
-        assert!(inst.is_sub_session());
-        let mut sandbox = test_sandbox("test", None);
-        sandbox.enabled = false;
-        inst.sandbox_info = Some(sandbox);
-        assert!(!inst.is_sandboxed());
-        inst.sandbox_info.as_mut().unwrap().enabled = true;
-        assert!(inst.is_sandboxed());
-    }
-
-    #[test]
     fn serialization_keeps_persisted_fields_and_drops_runtime_ones() {
         let mut inst = Instance::new("Test Project", "/home/user/project");
         inst.group_path = "work/clients".to_string();

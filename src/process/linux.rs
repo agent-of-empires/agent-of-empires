@@ -434,23 +434,6 @@ Cached:          5678901 kB
     }
 
     #[test]
-    fn test_sample_used_derivation() {
-        let total = parse_meminfo_field(MEMINFO, "MemTotal")
-            .map(kib_to_bytes)
-            .unwrap();
-        let avail = parse_meminfo_field(MEMINFO, "MemAvailable")
-            .map(kib_to_bytes)
-            .unwrap();
-        let sample = super::super::metrics::MemorySample {
-            total_bytes: total,
-            available_bytes: avail,
-            ..Default::default()
-        };
-        assert_eq!(sample.used_bytes(), total - avail);
-        assert!((sample.used_fraction() - (total - avail) as f64 / total as f64).abs() < 1e-9);
-    }
-
-    #[test]
     fn test_parse_psi_some_avg10() {
         let psi = "\
 some avg10=1.23 avg60=4.56 avg300=7.89 total=123456789

@@ -405,39 +405,8 @@ mod tests {
         SessionNotification::new(id.to_string(), text_chunk("x", None))
     }
 
-    // A reattach flushes the runner's detached control queue before the
-    // establish response confirms identity, buffering every frame here. The
-    // buffer must accept a backlog as large as that queue, or the reconciler
-    // terminates a session it should have resumed. See #3937.
-    #[test]
-    fn pending_replay_spans_the_runner_detach_queue() {
-        let ingress = SessionIngress::default();
-        ingress.begin();
-        for _ in 0..MAX_CONTROL_QUEUE_FRAMES {
-            ingress
-                .route(notif("s"), None)
-                .expect("a full detach-queue backlog fits");
-        }
-        let replay = ingress
-            .finish(Some(SessionId::from("s")))
-            .expect("commit succeeds");
-        assert_eq!(replay.len(), MAX_CONTROL_QUEUE_FRAMES);
-    }
-
-    // Past that contract the buffer stays bounded: an overflow fails the
-    // attach rather than growing without limit.
-    #[test]
-    fn pending_replay_overflow_is_bounded() {
-        let ingress = SessionIngress::default();
-        ingress.begin();
-        for _ in 0..MAX_CONTROL_QUEUE_FRAMES {
-            ingress.route(notif("s"), None).expect("under the cap");
-        }
-        assert!(ingress.route(notif("s"), None).is_err());
-    }
-
     #[tokio::test]
-    async fn original_wire_budget_survives_the_admission_fence() {
+    async fn pending_replay_and_wire_budget_are_bounded() {
         let ingress = SessionIngress::new(Some(SessionId::from("s")));
         let guard = ingress.fence.lock().await;
         let mut admission =
@@ -454,17 +423,42 @@ mod tests {
         assert!(ingress.notification(notif("s"), Some(1)).await.is_err());
         assert!(futures_util::poll!(std::pin::pin!(ingress.failed())).is_ready());
         assert!(ingress.finish(Some(SessionId::from("s"))).is_err());
-    }
 
-    #[test]
-    fn original_wire_budget_accepts_its_ceiling() {
-        let ingress = SessionIngress::default();
-        ingress.begin();
-        for _ in 0..2 {
-            ingress
-                .route(notif("s"), Some(MAX_PENDING_BYTES / 2))
-                .unwrap();
+        // The budget accepts its exact ceiling.
+        {
+            let ingress = SessionIngress::default();
+            ingress.begin();
+            for _ in 0..2 {
+                ingress
+                    .route(notif("s"), Some(MAX_PENDING_BYTES / 2))
+                    .unwrap();
+            }
+            assert_eq!(ingress.finish(Some(SessionId::from("s"))).unwrap().len(), 2);
         }
-        assert_eq!(ingress.finish(Some(SessionId::from("s"))).unwrap().len(), 2);
+
+        {
+            let ingress = SessionIngress::default();
+            ingress.begin();
+            for _ in 0..MAX_CONTROL_QUEUE_FRAMES {
+                ingress
+                    .route(notif("s"), None)
+                    .expect("a full detach-queue backlog fits");
+            }
+            let replay = ingress
+                .finish(Some(SessionId::from("s")))
+                .expect("commit succeeds");
+            assert_eq!(replay.len(), MAX_CONTROL_QUEUE_FRAMES);
+
+            // Past that contract the buffer stays bounded: an overflow fails the
+            // attach rather than growing without limit.
+            {
+                let ingress = SessionIngress::default();
+                ingress.begin();
+                for _ in 0..MAX_CONTROL_QUEUE_FRAMES {
+                    ingress.route(notif("s"), None).expect("under the cap");
+                }
+                assert!(ingress.route(notif("s"), None).is_err());
+            }
+        }
     }
 }

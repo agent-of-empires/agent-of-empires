@@ -203,30 +203,15 @@ mod tests {
     }
 
     #[test]
-    fn last_n_lines_returns_tail_and_preserves_trailing_newline() {
-        let input = "a\nb\nc\nd\ne\n";
-        assert_eq!(last_n_lines(input, 2), "d\ne\n");
-    }
-
-    #[test]
-    fn last_n_lines_no_trailing_newline_in_input() {
-        let input = "a\nb\nc";
-        assert_eq!(last_n_lines(input, 2), "b\nc");
-    }
-
-    #[test]
-    fn last_n_lines_zero_returns_empty() {
-        assert_eq!(last_n_lines("a\nb\n", 0), "");
-    }
-
-    #[test]
-    fn last_n_lines_n_larger_than_input_returns_full_input() {
-        let input = "a\nb\n";
-        assert_eq!(last_n_lines(input, 100), "a\nb\n");
-    }
-
-    #[test]
-    fn last_n_lines_empty_input() {
-        assert_eq!(last_n_lines("", 5), "");
+    fn last_n_lines_returns_the_tail() {
+        for (input, n, expected) in [
+            ("a\nb\nc\nd\ne\n", 2, "d\ne\n"),
+            ("a\nb\nc", 2, "b\nc"),
+            ("a\nb\n", 0, ""),
+            ("a\nb\n", 100, "a\nb\n"),
+            ("", 5, ""),
+        ] {
+            assert_eq!(last_n_lines(input, n), expected, "{input:?} {n}");
+        }
     }
 }

@@ -72,7 +72,7 @@ aoe serve --host 127.0.0.1 --port 42041 \
   --behind-proxy --allowed-host aoe.example.com
 ```
 
-The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the last value as the client IP, and only when the socket peer is loopback, so a misconfigured upstream cannot spoof it. `--behind-proxy` also withdraws the same-host bypass, so a browser on the daemon's own host signs in with the passphrase like any other client. Add `--allowed-origin https://aoe.example.com:8443` when the proxy listens on a nonstandard port. Both flags are replayed across `aoe serve --restart`.
+The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the last value as the client IP, and only when the socket peer is loopback, so a misconfigured upstream cannot spoof it. `--behind-proxy` also withdraws the same-host bypass, so a browser on the daemon's own host signs in with the passphrase like any other client, and the local TUI and `aoe acp` commands log in with the daemon's own `serve.passphrase`. Add `--allowed-origin https://aoe.example.com:8443` when the proxy listens on a nonstandard port. Both flags are replayed across `aoe serve --restart`.
 
 ## Security
 

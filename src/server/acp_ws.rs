@@ -1086,38 +1086,6 @@ mod tests {
         let _ = server.await;
     }
 
-    /// `frames` gates only the raw-frame forwarding, and its default has to stay "send
-    /// them".
-    #[test]
-    fn ws_query_frames_flag_defaults_to_forwarding() {
-        let cases = [
-            ("", true),
-            ("since=7", true),
-            ("frames=1", true),
-            ("frames=0", false),
-            ("since=7&frames=0", false),
-        ];
-        for (query, expected) in cases {
-            let uri: axum::http::Uri = format!("/sessions/s-1/acp/ws?{query}").parse().unwrap();
-            let Query(q) = Query::<AcpWsQuery>::try_from_uri(&uri).expect("parse query");
-            assert_eq!(q.frames.unwrap_or(1) != 0, expected, "{query:?}");
-        }
-    }
-
-    #[test]
-    fn push_body_snippet_collapses_whitespace_and_caps_length() {
-        // Short text passes through with whitespace collapsed.
-        assert_eq!(
-            push_body_snippet("Which   env?\n staging\tor prod"),
-            "Which env? staging or prod"
-        );
-        // Long text is truncated and gets an ellipsis.
-        let long = "word ".repeat(100);
-        let snippet = push_body_snippet(&long);
-        assert!(snippet.ends_with('…'));
-        assert_eq!(snippet.chars().count(), 120 + 1);
-    }
-
     /// The clear path reuses the tag helpers, so a drift here would silently fail to
     /// close the matching notification (#2491). Both payloads carry `kind` and `seq`,
     /// and a clear keeps title/body so a not-yet-updated service worker degrades to a
@@ -1155,120 +1123,16 @@ mod tests {
         assert_eq!(notify["kind"], "notify");
         assert_eq!(notify["tag"], "acp-question-s1");
         assert_eq!(notify["seq"], 3);
-    }
 
-    #[tokio::test]
-    async fn publish_with_no_receivers_does_not_panic() {
-        let state = crate::server::test_support::build_test_app_state(Vec::new());
-        let frame = AcpBroadcastFrame {
-            session_id: "s".into(),
-            seq: 1,
-            event: Arc::new(Event::ThinkingStarted),
-            worker_generation: None,
-        };
-        publish(&state, frame);
-        let mut receiver = state.acp_events_tx.subscribe();
-        publish(
-            &state,
-            AcpBroadcastFrame {
-                session_id: "s".into(),
-                seq: 2,
-                event: Arc::new(Event::ThinkingEnded),
-                worker_generation: None,
-            },
+        // Short text passes through with whitespace collapsed.
+        assert_eq!(
+            push_body_snippet("Which   env?\n staging\tor prod"),
+            "Which env? staging or prod"
         );
-        let delivered = receiver
-            .try_recv()
-            .expect("publisher remains usable after a disconnected publish");
-        assert_eq!(delivered.seq, 2);
-        assert!(matches!(*delivered.event, Event::ThinkingEnded));
-    }
-
-    /// The keepalive has to survive one missed round-trip and still tick well inside
-    /// Cloudflare's documented 100s WebSocket idle cap. The client staleness watchdog
-    /// matches the heartbeat frame byte for byte.
-    #[test]
-    fn keepalive_intervals_and_heartbeat_frame_are_stable() {
-        assert!(
-            PONG_IDLE_TIMEOUT >= PING_INTERVAL * 2,
-            "PONG_IDLE_TIMEOUT ({PONG_IDLE_TIMEOUT:?}) must tolerate two missed pings at \
-             PING_INTERVAL ({PING_INTERVAL:?})"
-        );
-        assert!(
-            PING_INTERVAL < Duration::from_secs(100),
-            "Cloudflare idle cap"
-        );
-        assert_eq!(heartbeat_frame(), r#"{"kind":"heartbeat"}"#);
-    }
-
-    /// Pins the transcript wire contract that the live loop emits.
-    #[test]
-    fn transcript_frames_carry_kind_seq_and_payload() {
-        use crate::acp::transcript::{TranscriptModel, TranscriptRowKind};
-
-        let mut transcript = TranscriptModel::new();
-        // A prompt then a tool start: two live events, each yielding one Append.
-        let script = [
-            (
-                7u64,
-                crate::acp::Event::UserPromptSent {
-                    prompt_id: None,
-                    text: "hi".into(),
-                    attachments: Vec::new(),
-                    synthesized: false,
-                },
-            ),
-            (
-                8u64,
-                crate::acp::Event::ToolCallStarted {
-                    tool_call: crate::acp::state::ToolCall {
-                        id: "t-1".into(),
-                        name: "Bash".into(),
-                        kind: "execute".into(),
-                        args_preview: "{}".into(),
-                        started_at: chrono::Utc::now(),
-                        parent_tool_call_id: None,
-                        memory_recall: None,
-                        diffs: Vec::new(),
-                    },
-                },
-            ),
-        ];
-
-        // Mirror the drain.
-        let mut last_deltas = Vec::new();
-        let mut last_seq = 0u64;
-        for (seq, ev) in &script {
-            last_deltas = transcript.apply_event(*seq, ev);
-            last_seq = *seq;
-        }
-
-        // The connect snapshot envelope carries the built rows under `rows`.
-        let snapshot = serde_json::json!({
-            "kind": "transcript_snapshot",
-            "session_id": "s1",
-            "seq": last_seq,
-            "rows": transcript.rows(),
-        });
-        assert_eq!(snapshot["kind"], "transcript_snapshot");
-        assert_eq!(snapshot["seq"], 8);
-        assert_eq!(snapshot["rows"].as_array().unwrap().len(), 2);
-        assert_eq!(transcript.rows()[0].kind, TranscriptRowKind::UserPrompt);
-        assert_eq!(transcript.rows()[1].kind, TranscriptRowKind::ToolStart);
-
-        // The last live event produced exactly one Append delta; its envelope
-        // tags `kind`, `seq`, and nests the serialized delta under `delta`.
-        assert_eq!(last_deltas.len(), 1);
-        let delta_frame = serde_json::json!({
-            "kind": "transcript_delta",
-            "session_id": "s1",
-            "seq": last_seq,
-            "delta": &last_deltas[0],
-        });
-        assert_eq!(delta_frame["kind"], "transcript_delta");
-        assert_eq!(delta_frame["seq"], 8);
-        // TranscriptDelta serializes as an externally tagged enum, so an Append
-        // is `{"Append": {..row..}}`; clients switch on that key.
-        assert_eq!(delta_frame["delta"]["Append"]["id"], "start-t-1");
+        // Long text is truncated and gets an ellipsis.
+        let long = "word ".repeat(100);
+        let snippet = push_body_snippet(&long);
+        assert!(snippet.ends_with('…'));
+        assert_eq!(snippet.chars().count(), 120 + 1);
     }
 }

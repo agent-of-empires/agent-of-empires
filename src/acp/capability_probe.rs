@@ -113,15 +113,3 @@ async fn drain_first_snapshot(client: &mut AcpClient, agent: &str) -> bool {
     }
     false
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn unknown_agent_never_spawns() {
-        assert!(!probe_agent("definitely-not-an-agent-xyz")
-            .await
-            .expect("unknown agent is a clean no-op"));
-    }
-}

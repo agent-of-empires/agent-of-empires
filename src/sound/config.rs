@@ -92,20 +92,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sound_config_default() {
-        let config = SoundConfig::default();
-        assert!(!config.enabled);
-        assert!(config.on_start.is_none());
-        assert!(config.on_running.is_none());
-        assert!(config.on_waiting.is_none());
-        assert!(config.on_idle.is_none());
-        assert!(config.on_error.is_none());
-        assert!(config.on_approval.is_none());
-        // A 0.0 default would mute playback on a fresh install.
-        assert!((config.volume - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
     fn deserialize_reads_known_keys_and_tolerates_the_removed_mode_field() {
         let cases = [
             ("", None, None),
@@ -127,6 +113,8 @@ mod tests {
             assert_eq!(config.enabled, !toml.is_empty(), "{toml}");
             assert_eq!(config.on_error.as_deref(), on_error, "{toml}");
             assert_eq!(config.on_approval.as_deref(), on_approval, "{toml}");
+            // A 0.0 default would mute playback on a fresh install.
+            assert!((config.volume - 1.0).abs() < 1e-9, "{toml}");
         }
     }
 
@@ -136,6 +124,7 @@ mod tests {
         assert_eq!(options.len(), 15);
         for (i, opt) in options.iter().enumerate() {
             assert_eq!(opt, &format!("{:.1}", (i + 1) as f64 * 0.1));
+            assert_eq!(volume_to_index(volume_from_option(opt)), i);
         }
     }
 
@@ -171,14 +160,6 @@ mod tests {
                 (volume_from_option(option) - expected).abs() < 1e-9,
                 "{option}"
             );
-        }
-    }
-
-    #[test]
-    fn test_volume_options_roundtrip() {
-        for (i, opt) in volume_options().iter().enumerate() {
-            let v = volume_from_option(opt);
-            assert_eq!(volume_to_index(v), i);
         }
     }
 }

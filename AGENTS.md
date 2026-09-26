@@ -64,6 +64,9 @@ parallel field registries or override structs.
 
 Use in-module unit tests for pure logic and `tests/` for integration behavior.
 Tests must be deterministic, isolated from user state, and clean up resources.
+CI runs the non-e2e suites with `cargo nextest run`, one process per test, so
+every test must pass when run alone. nextest skips doctests; write examples
+that need checking as unit tests.
 Use table cases inside one test when setup is shared. Do not test constants,
 derived implementations, trivial getters, or rendering without an asserted
 behavior.

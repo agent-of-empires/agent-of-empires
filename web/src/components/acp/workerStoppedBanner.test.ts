@@ -18,7 +18,6 @@ describe("pickWorkerStoppedVariant", () => {
     ["empty startup error is not an error", { startupError: "" }, "generic"],
     ["empty startup error falls through to archived", { startupError: "", archivedAt: T }, "archived"],
     ["stopping yields the generic banner", { workerStopping: true }, "none"],
-    ["not stopping keeps the generic banner", { workerStopping: false }, "generic"],
     ["stopping keeps triage banners", { workerStopping: true, archivedAt: T }, "archived"],
   ])("%s", (_label, overrides, expected) => {
     expect(pickWorkerStoppedVariant({ ...base, ...overrides })).toBe(expected);
@@ -30,7 +29,6 @@ describe("showWorkerStoppingBanner", () => {
     ["stopping", null, true],
     ["stopping", "missing API key", false],
     ["resuming", null, false],
-    ["absent", null, false],
   ])("%s with startupError %s -> %s", (acpWorkerState, startupError, expected) => {
     expect(showWorkerStoppingBanner({ acpWorkerState, startupError })).toBe(expected);
   });

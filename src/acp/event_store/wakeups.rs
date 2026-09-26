@@ -217,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_wakeup_is_the_latest_future_schedule() {
+    fn pending_and_fired_wakeups_follow_the_latest_schedule() {
         let (_tmp, store) = open_store(1000);
         record_from(
             &store,
@@ -236,6 +236,40 @@ mod tests {
 
         store.record("s-2", 1, &wakeup(-30, None)).unwrap();
         assert!(store.latest_pending_wakeup("s-2").is_none());
+
+        // A fired wakeup is claimed once, by the first prompt past its time.
+        let (_tmp, store) = open_store(1000);
+        record_from(
+            &store,
+            "future",
+            1,
+            [
+                user_prompt("schedule a wake"),
+                wakeup(300, Some("test wake")),
+                user_prompt("ping me when you wake"),
+            ],
+        );
+        assert!(
+            store.fired_wakeup_for_prompt("future", 3).is_none(),
+            "a mid-wait follow-up is not a wake-fire"
+        );
+
+        record_from(
+            &store,
+            "past",
+            1,
+            [
+                wakeup(-60, Some("test wake")),
+                user_prompt("first prompt past at"),
+                user_prompt("second prompt past at"),
+            ],
+        );
+        let fired = store.fired_wakeup_for_prompt("past", 2).expect("wake-fire");
+        assert_eq!(fired.1.as_deref(), Some("test wake"));
+        assert!(
+            store.fired_wakeup_for_prompt("past", 3).is_none(),
+            "a later prompt must not claim the wake again"
+        );
     }
 
     #[test]
@@ -269,41 +303,5 @@ mod tests {
         }
         store.record("none", 1, &user_prompt("hi")).unwrap();
         assert!(store.latest_active_monitor("none").is_none());
-    }
-
-    #[test]
-    fn fired_wakeup_is_claimed_once_by_the_first_prompt_past_its_time() {
-        let (_tmp, store) = open_store(1000);
-        record_from(
-            &store,
-            "future",
-            1,
-            [
-                user_prompt("schedule a wake"),
-                wakeup(300, Some("test wake")),
-                user_prompt("ping me when you wake"),
-            ],
-        );
-        assert!(
-            store.fired_wakeup_for_prompt("future", 3).is_none(),
-            "a mid-wait follow-up is not a wake-fire"
-        );
-
-        record_from(
-            &store,
-            "past",
-            1,
-            [
-                wakeup(-60, Some("test wake")),
-                user_prompt("first prompt past at"),
-                user_prompt("second prompt past at"),
-            ],
-        );
-        let fired = store.fired_wakeup_for_prompt("past", 2).expect("wake-fire");
-        assert_eq!(fired.1.as_deref(), Some("test wake"));
-        assert!(
-            store.fired_wakeup_for_prompt("past", 3).is_none(),
-            "a later prompt must not claim the wake again"
-        );
     }
 }
