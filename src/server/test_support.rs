@@ -8,11 +8,10 @@ use crate::server::push::STATUS_CHANNEL_CAPACITY;
 use crate::server::rate_limit::RateLimiter;
 use crate::session::Instance;
 use crate::session::Storage;
-use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 
@@ -25,7 +24,9 @@ struct RuntimeEnvGuard {
 
 impl RuntimeEnvGuard {
     fn set(value: &Path) -> Self {
-        let lock = RUNTIME_ENV_LOCK.lock();
+        let lock = RUNTIME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let previous = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", value);
         Self {
@@ -302,7 +303,9 @@ pub async fn reload_tmux_applied_for_test(
 /// order and the real publisher is the oracle: a base whose ancestor chain the
 /// trusted walk would reject is reported as `app_dir_untrusted` and skipped.
 pub struct RuntimeUdsTestServer {
-    _namespace: tempfile::TempDir,
+    /// The temporary base a publication owns, when this harness created it.
+    _namespace: Option<tempfile::TempDir>,
+    app_dir: std::path::PathBuf,
     _env: RuntimeEnvGuard,
     listener: tokio::task::JoinHandle<()>,
 }
@@ -335,7 +338,8 @@ impl RuntimeUdsTestServer {
                         super::runtime_uds::serve(state, published),
                     );
                     return Ok(Self {
-                        _namespace: namespace,
+                        app_dir: namespace.path().join(crate::session::APP_DIR_NAME_XDG),
+                        _namespace: Some(namespace),
                         _env: env,
                         listener,
                     });
@@ -351,11 +355,33 @@ impl RuntimeUdsTestServer {
         Err(format!("no trusted app dir base: {rejected:?}"))
     }
 
+    /// A live local read published into the XDG base the caller chose, so the
+    /// store under it is the one the daemon serves and the one a client
+    /// pointed at the same base resolves.
+    ///
+    /// The base is what [`Self::start`] also takes: the app dir is
+    /// `base/<APP_DIR_NAME_XDG>`, exactly where the client looks for it.
+    pub fn start_in(xdg_base: &std::path::Path, state: Arc<AppState>) -> Result<Self, String> {
+        let app_dir = xdg_base.join(crate::session::APP_DIR_NAME_XDG);
+        std::fs::create_dir_all(&app_dir).map_err(|error| error.to_string())?;
+        let env = RuntimeEnvGuard::set(xdg_base);
+        let published = super::runtime_uds::publish().map_err(|error| error.to_string())?;
+        let listener = crate::task_util::spawn_supervised(
+            "runtime.uds.test",
+            crate::task_util::PanicPolicy::Log,
+            super::runtime_uds::serve(state, published),
+        );
+        Ok(Self {
+            app_dir,
+            _namespace: None,
+            _env: env,
+            listener,
+        })
+    }
+
     /// The app dir this publication owns, for assertions on its artifacts.
     pub fn app_dir(&self) -> std::path::PathBuf {
-        self._namespace
-            .path()
-            .join(crate::session::APP_DIR_NAME_XDG)
+        self.app_dir.clone()
     }
 
     /// Join after the daemon's shutdown is cancelled: the accept loop returns

@@ -5,8 +5,13 @@ use std::sync::LazyLock;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use tempfile::TempDir;
 
-static APP_DIR_OVERRIDE: LazyLock<parking_lot::Mutex<Option<PathBuf>>> =
-    LazyLock::new(|| parking_lot::Mutex::new(None));
+static APP_DIR_OVERRIDE: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
+
+fn app_dir_override_slot() -> MutexGuard<'static, Option<PathBuf>> {
+    APP_DIR_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
 
 pub struct RuntimeAppDirGuard {
     previous: Option<PathBuf>,
@@ -15,7 +20,7 @@ pub struct RuntimeAppDirGuard {
 impl RuntimeAppDirGuard {
     pub fn set(path: &Path) -> Self {
         let previous = {
-            let mut guard = APP_DIR_OVERRIDE.lock();
+            let mut guard = app_dir_override_slot();
             let previous = guard.clone();
             *guard = Some(path.to_path_buf());
             previous
@@ -26,12 +31,12 @@ impl RuntimeAppDirGuard {
 
 impl Drop for RuntimeAppDirGuard {
     fn drop(&mut self) {
-        *APP_DIR_OVERRIDE.lock() = self.previous.clone();
+        *app_dir_override_slot() = self.previous.clone();
     }
 }
 
 pub(crate) fn app_dir_override() -> Option<PathBuf> {
-    APP_DIR_OVERRIDE.lock().clone()
+    app_dir_override_slot().clone()
 }
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -51,12 +56,10 @@ fn acquire_env_lock() -> Option<MutexGuard<'static, ()>> {
     if ENV_LOCK_HELD.with(Cell::get) {
         None
     } else {
-        #[cfg(test)]
+        // This whole module is `#[cfg(test)]`, so the contention report is the
+        // only caller there is.
         let guard = lock_reporting_contention(&ENV_LOCK, tests::report_env_lock_contention)
             .unwrap_or_else(PoisonError::into_inner);
-        #[cfg(not(test))]
-        let guard =
-            lock_reporting_contention(&ENV_LOCK, || {}).unwrap_or_else(PoisonError::into_inner);
         ENV_LOCK_HELD.with(|held| held.set(true));
         Some(guard)
     }
