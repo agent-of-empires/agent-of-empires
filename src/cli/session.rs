@@ -592,7 +592,7 @@ async fn list_trash(profile: &str) -> Result<()> {
     for inst in trashed {
         let when = inst
             .trashed_at
-            .map(|t| t.to_rfc3339())
+            .map(super::list::display_timestamp)
             .unwrap_or_else(|| "?".to_string());
         println!("  {}  {}  (trashed {})", inst.id, inst.title, when);
     }
@@ -1416,7 +1416,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
             println!(
                 "  State:   {} ({})",
                 super::list::state_tag(&inst),
-                at.to_rfc3339()
+                super::list::display_timestamp(at)
             );
         }
         println!("  Profile: {}", storage.profile());

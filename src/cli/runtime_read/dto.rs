@@ -136,6 +136,26 @@ pub(crate) struct ProjectRead {
     pub path: String,
     pub scope: ProjectScope,
     pub default_base_branch: Option<String>,
+    /// Whether the row came from a project registry rather than being
+    /// synthesized so a session's project path resolves. Only a synthesized
+    /// row may be absent from both registries, and a session row of the same
+    /// profile must justify it.
+    ///
+    /// An absent flag means `true`, deliberately. The flag arrived with the
+    /// synthesized-row contract, so a snapshot that does not name it predates
+    /// it, and every row such a snapshot carries is a registry row — the
+    /// renderer filters on this flag, so defaulting it to `false` would make
+    /// those snapshots parse cleanly and then render an empty project
+    /// inventory. A missing field must not be able to hide rows, which is the
+    /// one direction a permissive default is safe in and the one this takes.
+    #[serde(default = "registered_by_default")]
+    pub registered: bool,
+}
+
+/// The default for [`ProjectRead::registered`], kept as a named function so
+/// the serde attribute and its rationale read in one place.
+fn registered_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -220,6 +240,23 @@ impl WireStatus {
             Self::Starting => "starting",
             Self::Deleting => "deleting",
             Self::Creating => "creating",
+        }
+    }
+
+    /// The local status this wire value names, so the renderer's tallies are
+    /// the local command's own rather than a second set of rules.
+    pub(crate) fn session_status(self) -> crate::session::Status {
+        use crate::session::Status;
+        match self {
+            Self::Running => Status::Running,
+            Self::Waiting => Status::Waiting,
+            Self::Idle => Status::Idle,
+            Self::Unknown => Status::Unknown,
+            Self::Stopped => Status::Stopped,
+            Self::Error => Status::Error,
+            Self::Starting => Status::Starting,
+            Self::Deleting => Status::Deleting,
+            Self::Creating => Status::Creating,
         }
     }
 }
@@ -472,10 +509,13 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
     }
 
     validate_freshness(&snapshot.status_freshness)?;
+    // Session rows keep the store's own order, because that is the order a
+    // local `aoe list` prints them in. Distinct ids are the identity rule.
+    let mut unique_ids: HashSet<&str> = HashSet::new();
     if snapshot
         .sessions
-        .windows(2)
-        .any(|pair| pair[0].id >= pair[1].id)
+        .iter()
+        .any(|session| !unique_ids.insert(session.id.as_str()))
     {
         return Err("schema_invalid");
     }
@@ -487,6 +527,15 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
         .collect();
     let mut profile_groups: HashMap<&str, HashSet<&str>> = HashMap::new();
     let mut profile_projects: HashMap<&str, HashSet<&str>> = HashMap::new();
+    // Every project path a session of that profile uses, so an unregistered
+    // project row can be checked against the row that justifies it.
+    let mut profile_session_paths: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for session in &snapshot.sessions {
+        profile_session_paths
+            .entry(session.profile.as_str())
+            .or_default()
+            .insert(session.project_path.as_str());
+    }
     for profile in &snapshot.profiles {
         profile_groups.insert(
             profile.name.as_str(),
@@ -504,6 +553,20 @@ pub(crate) fn validate_snapshot(snapshot: &SnapshotData) -> Result<(), &'static 
                 .map(|project| project.path.as_str())
                 .collect(),
         );
+        // An unregistered row exists only to make a session's project path
+        // resolve, so a session row of this profile must name it. Without
+        // that, a server could withhold a registry project by relabelling it.
+        let used = profile_session_paths
+            .get(profile.name.as_str())
+            .cloned()
+            .unwrap_or_default();
+        if profile
+            .projects
+            .iter()
+            .any(|project| !project.registered && !used.contains(project.path.as_str()))
+        {
+            return Err("schema_invalid");
+        }
     }
     let global_projects: HashSet<&str> = snapshot
         .global_projects
@@ -604,11 +667,15 @@ pub(crate) fn validate_cross_message(
     Ok(())
 }
 
+/// Profiles in the producer's own order, which is the order a local
+/// `aoe profile` prints them in. The wire therefore carries presentation, and
+/// the identity rule is uniqueness rather than a canonical sort.
 fn validate_profiles(profiles: &[ProfileRead]) -> Result<(), &'static str> {
-    if profiles.windows(2).any(|pair| pair[0].name >= pair[1].name) {
-        return Err("schema_invalid");
-    }
+    let mut names = HashSet::new();
     for profile in profiles {
+        if !names.insert(profile.name.as_str()) {
+            return Err("schema_invalid");
+        }
         validate_safe_text(&profile.name)?;
         validate_profile_health(&profile.health)?;
         validate_groups(&profile.groups)?;
@@ -649,42 +716,37 @@ fn validate_profile_component(health: ComponentHealth) -> Result<(), &'static st
     Ok(())
 }
 
+/// Groups in the producer's own order, which is the order a local
+/// `aoe group list` prints them in: the registry's insertion order, then the
+/// groups the sessions imply. Every structural rule still holds; only the
+/// canonical sort is gone, and distinct paths replace it.
 fn validate_groups(groups: &[GroupRead]) -> Result<(), &'static str> {
-    if groups.windows(2).any(|pair| pair[0].path >= pair[1].path) {
-        return Err("schema_invalid");
+    let mut unique: HashSet<&str> = HashSet::new();
+    for group in groups {
+        if !unique.insert(group.path.as_str()) {
+            return Err("schema_invalid");
+        }
     }
-    let paths: HashSet<&str> = groups.iter().map(|group| group.path.as_str()).collect();
+    let paths = unique;
     for group in groups {
         if !valid_group_path(&group.path) || !valid_text(&group.name) {
             return Err("schema_invalid");
         }
         let expected_name = group.path.rsplit('/').next().unwrap_or_default();
-        if group.name != expected_name || group.children.windows(2).any(|pair| pair[0] >= pair[1]) {
+        if group.name != expected_name {
             return Err("schema_invalid");
         }
-        let expected: BTreeMap<&str, usize> = groups
-            .iter()
-            .filter_map(|candidate| {
-                candidate
-                    .path
-                    .strip_prefix(&format!("{}/", group.path))
-                    .and_then(|tail| tail.split('/').next())
-                    .map(|name| (name, 0))
-            })
-            .fold(BTreeMap::new(), |mut map, (name, value)| {
-                *map.entry(name).or_insert(value) += 1;
-                map
-            });
-        let actual: BTreeMap<&str, usize> = group
-            .children
-            .iter()
-            .map(|name| (name.as_str(), 0))
-            .fold(BTreeMap::new(), |mut map, (name, value)| {
-                *map.entry(name).or_insert(value) += 1;
-                map
-            });
-        if expected != actual {
-            return Err("schema_invalid");
+        // A child name must name a group that really sits directly under this
+        // one, and no name twice. The producer does not have to list every
+        // child: the local group tree hands out its rows without the child
+        // lists filled in, so demanding completeness would refuse the very
+        // rows the local `aoe group list --json` prints.
+        let mut child_names: HashSet<&str> = HashSet::new();
+        for child in &group.children {
+            let child_path = format!("{}/{}", group.path, child);
+            if !child_names.insert(child.as_str()) || !paths.contains(child_path.as_str()) {
+                return Err("schema_invalid");
+            }
         }
         if let Some((parent, _)) = group.path.rsplit_once('/') {
             if !paths.contains(parent) {
@@ -695,23 +757,28 @@ fn validate_groups(groups: &[GroupRead]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Projects in the producer's own registry order, and unique by identity —
+/// name, path and the registered flag together, so a synthesized row and the
+/// registry row it stands in for are two identities rather than one repeated.
 fn validate_projects(projects: &[ProjectRead], scope: ProjectScope) -> Result<(), &'static str> {
-    if projects
-        .windows(2)
-        .any(|pair| (&pair[0].name, &pair[0].path) >= (&pair[1].name, &pair[1].path))
-    {
-        return Err("schema_invalid");
-    }
     let mut identities = HashSet::new();
     for project in projects {
         if project.scope as u8 != scope as u8
+            // The global list is the global registry, so every row in it is
+            // registered by definition; only a profile list may hold a
+            // synthesized row.
+            || (matches!(scope, ProjectScope::Global) && !project.registered)
             || !valid_text(&project.name)
             || !valid_absolute_path(&project.path)
             || project
                 .default_base_branch
                 .as_deref()
                 .is_some_and(|value| !valid_text(value))
-            || !identities.insert((project.name.as_str(), project.path.as_str()))
+            || !identities.insert((
+                project.name.as_str(),
+                project.path.as_str(),
+                project.registered,
+            ))
         {
             return Err("schema_invalid");
         }
@@ -774,16 +841,21 @@ fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
     if !valid_timestamp(&session.created_at) {
         return Err("schema_invalid");
     }
-    if session
-        .archived_at
-        .as_deref()
-        .is_some_and(|value| value < session.created_at.as_str())
-        || session
-            .trashed_at
-            .as_deref()
-            .is_some_and(|value| value < session.created_at.as_str())
+    // Compared as instants, not as bytes: a fractional part sorts below the
+    // `Z` of a whole second, so a byte comparison would read
+    // `…:00.5Z < …:00Z` and reject a session archived after it was created.
+    let created_at = parse_timestamp(&session.created_at).ok_or("schema_invalid")?;
+    for later in [
+        session.archived_at.as_deref(),
+        session.trashed_at.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
     {
-        return Err("schema_invalid");
+        let later = parse_timestamp(later).ok_or("schema_invalid")?;
+        if later < created_at {
+            return Err("schema_invalid");
+        }
     }
     match session.state {
         WireState::Live if session.archived_at.is_some() || session.trashed_at.is_some() => {
@@ -813,6 +885,13 @@ fn validate_session(session: &SessionRead) -> Result<(), &'static str> {
             return Err("schema_invalid");
         }
     }
+    // The one collection that keeps its order rule, and it is the producer's
+    // order rather than a canonical one: `SessionRead::from_instance` sorts
+    // the list it emits, so the rule holds however the stored
+    // `workspace_info.repos` happen to be arranged and an unsorted stored row
+    // cannot reach this check. Keeping it costs a client nothing and still
+    // refuses a repeated (name, source_path) pair, which a set-like
+    // collection on the wire cannot express on its own.
     if session
         .workspace_repos
         .windows(2)
@@ -883,15 +962,44 @@ fn is_c1_c0(value: char) -> bool {
     )
 }
 
+/// `YYYY-MM-DDTHH:MM:SS[.f{1,9}]Z`: UTC, `Z` zoned, and either a whole
+/// second or the fractional part RFC 3339 allows. The fixed separators are
+/// checked by position and the value must parse, so a permissive length is
+/// the only thing that is relaxed — a control character, a numeric offset or a
+/// lowercase `t`/`z` is still refused.
 fn valid_timestamp(value: &str) -> bool {
-    value.len() == 20
-        && value.as_bytes()[4] == b'-'
-        && value.as_bytes()[7] == b'-'
-        && value.as_bytes()[10] == b'T'
-        && value.as_bytes()[13] == b':'
-        && value.as_bytes()[16] == b':'
-        && value.ends_with('Z')
-        && chrono::DateTime::parse_from_rfc3339(value).is_ok()
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return false;
+    }
+    // The head is 19 bytes: a whole second puts its `Z` at index 19, and a
+    // fractional part puts a `.` there with 1..=9 digits before the final `Z`.
+    let fraction: &[u8] = match bytes.len() {
+        20 => &[],
+        length if length > 21 => match bytes[19] {
+            b'.' => &bytes[20..length - 1],
+            _ => return false,
+        },
+        _ => return false,
+    };
+    if fraction.len() > 9 || !fraction.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    value.ends_with('Z') && parse_timestamp(value).is_some()
+}
+
+/// The instant a validated timestamp names, for the ordering rules. Byte
+/// comparison is not an ordering: `Z` sorts above `.`.
+fn parse_timestamp(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|parsed| parsed.with_timezone(&chrono::Utc))
 }
 
 fn valid_group_path(value: &str) -> bool {
@@ -1037,9 +1145,192 @@ mod tests {
         ));
     }
 
+    /// The wire keeps the fractional part the local command serializes, so the
+    /// grammar accepts it — and still refuses every other spelling.
+    #[test]
+    fn a_timestamp_is_utc_z_or_a_utc_z_with_up_to_nine_fractional_digits() {
+        assert!(valid_timestamp("2026-01-01T00:00:00Z"));
+        for fraction in ["1", "123", "123456", "123456789"] {
+            assert!(
+                valid_timestamp(&format!("2026-01-01T00:00:00.{fraction}Z")),
+                "{fraction}"
+            );
+        }
+        for refused in [
+            "2026-01-01T00:00:00",             // no zone
+            "2026-01-01T00:00:00+00:00",       // a numeric offset
+            "2026-01-01t00:00:00Z",            // a lowercase date/time separator
+            "2026-01-01T00:00:00z",            // a lowercase zone
+            "2026-01-01T00:00:00.Z",           // an empty fraction
+            "2026-01-01T00:00:00.1234567890Z", // ten fractional digits
+            "2026-01-01T00:00:00.12a456Z",     // a non-digit in the fraction
+            "2026-01-01T00:00:0\u{1b}Z",       // a control character
+        ] {
+            assert!(!valid_timestamp(refused), "{refused} must be refused");
+        }
+    }
+
+    /// A session archived a fraction of a second after it was created is not
+    /// archived before it: the ordering rule compares instants, and `Z` sorts
+    /// above `.` as a byte.
+    #[test]
+    fn the_later_timestamp_rule_compares_instants_not_bytes() {
+        let mut value = snapshot();
+        value.health.profiles.insert("main".into(), health());
+        value.profiles[0].projects = vec![ProjectRead {
+            name: "repo".into(),
+            path: "/repo".into(),
+            scope: ProjectScope::Profile,
+            default_base_branch: None,
+            registered: true,
+        }];
+        let row = SessionRead {
+            id: "a".into(),
+            title: "A".into(),
+            project_path: "/repo".into(),
+            group_path: String::new(),
+            tool: "tool".into(),
+            command: String::new(),
+            profile: "main".into(),
+            status: WireStatus::Idle,
+            state: WireState::Archived,
+            created_at: "2026-01-01T00:00:00.500Z".into(),
+            last_accessed_at: None,
+            idle_entered_at: None,
+            last_error: None,
+            archived_at: Some("2026-01-01T00:00:01Z".into()),
+            trashed_at: None,
+            active_snoozed_until: None,
+            pinned_at: None,
+            agent_session_id: None,
+            parent_session_id: None,
+            has_terminal: false,
+            has_worktree_info: false,
+            has_managed_worktree: false,
+            has_cleanable_worktree: false,
+            worktree: None,
+            workspace_repos: vec![],
+            cleanup_defaults: CleanupDefaults {
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                delete_to_trash: false,
+            },
+        };
+        value.sessions.push(row.clone());
+        assert_eq!(validate_snapshot(&value), Ok(()));
+
+        let mut earlier = row;
+        earlier.archived_at = Some("2026-01-01T00:00:00.100Z".into());
+        value.sessions = vec![earlier];
+        assert_eq!(validate_snapshot(&value), Err("schema_invalid"));
+    }
+
     #[test]
     fn status_wire_values_are_pascal_case() {
         assert_eq!(WireStatus::Waiting.as_str(), "Waiting");
         assert_eq!(WireStatus::Creating.as_str(), "Creating");
+    }
+
+    /// A snapshot written before the flag existed names no `registered`, and
+    /// every row in it is a registry row. Defaulting the absent flag to
+    /// `false` would let such a snapshot parse and then render an empty
+    /// project inventory, so the default is the one that keeps the rows the
+    /// daemon published.
+    #[test]
+    fn an_absent_registered_flag_keeps_the_row_it_describes() {
+        let project: ProjectRead = serde_json::from_value(json!({
+            "name": "alpha",
+            "path": "/srv/alpha",
+            "scope": {"kind": "profile"},
+            "default_base_branch": null,
+        }))
+        .expect("a row without the flag deserializes");
+        assert!(project.registered, "absent means registered, not hidden");
+
+        let mut value = snapshot();
+        value.health.profiles.insert("main".into(), health());
+        value.profiles[0].projects = vec![project];
+        value.global_projects = vec![ProjectRead {
+            name: "beta".into(),
+            path: "/srv/beta".into(),
+            scope: ProjectScope::Global,
+            default_base_branch: None,
+            registered: true,
+        }];
+        assert_eq!(validate_snapshot(&value), Ok(()));
+    }
+
+    /// The one collection that keeps its order rule, and the reason it is
+    /// safe: the producer sorts what it emits, so a stored row in any order
+    /// arrives ascending. What the rule still buys is the refusal of a
+    /// repeated (name, source_path) pair.
+    #[test]
+    fn workspace_repos_keep_their_ascending_rule() {
+        let repo = |name: &str, source: &str| WorkspaceRepo {
+            name: name.into(),
+            source_path: source.into(),
+            branch: "main".into(),
+        };
+        assert_eq!(
+            validate_session(&session_with_repos(vec![
+                repo("a", "/srv/a"),
+                repo("a", "/srv/b"),
+                repo("b", "/srv/a"),
+            ])),
+            Ok(())
+        );
+        assert_eq!(
+            validate_session(&session_with_repos(vec![
+                repo("b", "/srv/a"),
+                repo("a", "/srv/b"),
+            ])),
+            Err("schema_invalid"),
+            "descending rows are refused"
+        );
+        assert_eq!(
+            validate_session(&session_with_repos(vec![
+                repo("a", "/srv/a"),
+                repo("a", "/srv/a"),
+            ])),
+            Err("schema_invalid"),
+            "a repeated repo is refused"
+        );
+    }
+
+    fn session_with_repos(repos: Vec<WorkspaceRepo>) -> SessionRead {
+        SessionRead {
+            id: "a".into(),
+            title: "A".into(),
+            project_path: "/repo".into(),
+            group_path: String::new(),
+            tool: "tool".into(),
+            command: String::new(),
+            profile: "main".into(),
+            status: WireStatus::Idle,
+            state: WireState::Live,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_accessed_at: None,
+            idle_entered_at: None,
+            last_error: None,
+            archived_at: None,
+            trashed_at: None,
+            active_snoozed_until: None,
+            pinned_at: None,
+            agent_session_id: None,
+            parent_session_id: None,
+            has_terminal: false,
+            has_worktree_info: false,
+            has_managed_worktree: false,
+            has_cleanable_worktree: false,
+            worktree: None,
+            workspace_repos: repos,
+            cleanup_defaults: CleanupDefaults {
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+                delete_to_trash: false,
+            },
+        }
     }
 }

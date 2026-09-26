@@ -6,11 +6,11 @@ use serde::Serialize;
 
 use crate::session::{Instance, SessionBucket, SessionScope, Storage};
 
-const TABLE_COL_TITLE: usize = 20;
-const TABLE_COL_GROUP: usize = 15;
-const TABLE_COL_PATH: usize = 40;
-const TABLE_COL_ID_DISPLAY: usize = 12;
-const TABLE_COL_STATE: usize = 9;
+pub(crate) const TABLE_COL_TITLE: usize = 20;
+pub(crate) const TABLE_COL_GROUP: usize = 15;
+pub(crate) const TABLE_COL_PATH: usize = 40;
+pub(crate) const TABLE_COL_ID_DISPLAY: usize = 12;
+pub(crate) const TABLE_COL_STATE: usize = 9;
 
 /// The `aoe list --state=` vocabulary shared with the REST API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -49,32 +49,20 @@ pub struct ListArgs {
     pub(crate) state: StateFilter,
 }
 
-impl ListArgs {
-    #[cfg(test)]
-    pub(crate) fn test_json() -> Self {
-        Self {
-            json: true,
-            all: false,
-            state: StateFilter::All,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_all() -> Self {
-        Self {
-            json: false,
-            all: true,
-            state: StateFilter::All,
-        }
-    }
-}
-
 pub(super) fn state_tag(inst: &Instance) -> &'static str {
     match inst.effective_bucket() {
         SessionBucket::Trashed => "trashed",
         SessionBucket::Archived => "archived",
         SessionBucket::Active => "live",
     }
+}
+
+/// One timestamp spelling for every human line that shows one: RFC 3339 in UTC
+/// with the fractional part `AutoSi` keeps, zoned with `Z`. This is the same
+/// spelling `DateTime<Utc>` serializes to, so the human lines and the `--json`
+/// lines of one command agree — and so do the two transports.
+pub(crate) fn display_timestamp(value: chrono::DateTime<chrono::Utc>) -> String {
+    value.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
 }
 
 pub(super) fn active_snoozed_until(inst: &Instance) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -85,47 +73,49 @@ pub(super) fn active_snoozed_until(inst: &Instance) -> Option<chrono::DateTime<c
     }
 }
 
+/// `aoe list --json`, the shape the command has always emitted. The renderer
+/// fills this same struct from a snapshot rather than keeping a second copy,
+/// so the two transports cannot drift on a key, a spelling or a member order.
 #[derive(Serialize)]
-struct SessionJson {
-    id: String,
-    title: String,
-    path: String,
-    group: String,
-    tool: String,
+pub(crate) struct SessionJson {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) path: String,
+    pub(crate) group: String,
+    pub(crate) tool: String,
     #[serde(skip_serializing_if = "String::is_empty")]
-    command: String,
-    profile: String,
-    state: &'static str,
-    created_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) command: String,
+    pub(crate) profile: String,
+    pub(crate) state: &'static str,
+    pub(crate) created_at: chrono::DateTime<chrono::Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    trashed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) trashed_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) archived_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pinned_at: Option<chrono::DateTime<chrono::Utc>>,
-    workspace_repos: Vec<WorkspaceRepoJson>,
+    pub(crate) pinned_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) workspace_repos: Vec<WorkspaceRepoJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    worktree: Option<WorktreeJson>,
+    pub(crate) worktree: Option<WorktreeJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    parent_session_id: Option<String>,
+    pub(crate) parent_session_id: Option<String>,
 }
 
 #[derive(Serialize)]
-struct WorkspaceRepoJson {
-    name: String,
-    source_path: String,
-    branch: String,
+pub(crate) struct WorkspaceRepoJson {
+    pub(crate) name: String,
+    pub(crate) source_path: String,
+    pub(crate) branch: String,
 }
 
 #[derive(Serialize)]
-struct WorktreeJson {
-    branch: String,
-    main_repo_path: String,
-    managed_by_aoe: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    base_branch: Option<String>,
+pub(crate) struct WorktreeJson {
+    pub(crate) branch: String,
+    pub(crate) main_repo_path: String,
+    pub(crate) managed_by_aoe: bool,
+    pub(crate) base_branch: Option<String>,
 }
 
 fn worktree_for(inst: &Instance) -> Option<WorktreeJson> {
@@ -169,9 +159,12 @@ fn workspace_repos_for(inst: &Instance) -> Vec<WorkspaceRepoJson> {
         .collect()
 }
 
-fn print_table_header(show_state: bool) {
-    if show_state {
-        println!(
+/// The two header lines, the way this table has always printed them: the
+/// heading row, then a separator as wide as the columns plus their gaps. The
+/// renderer emits these exact bytes, so a served listing is the listing.
+pub(crate) fn table_header(show_state: bool) -> String {
+    let heading = if show_state {
+        format!(
             "{:<width_title$} {:<width_group$} {:<width_path$} {:<width_state$} ID",
             "TITLE",
             "GROUP",
@@ -181,20 +174,9 @@ fn print_table_header(show_state: bool) {
             width_group = TABLE_COL_GROUP,
             width_path = TABLE_COL_PATH,
             width_state = TABLE_COL_STATE,
-        );
-        println!(
-            "{}",
-            "-".repeat(
-                TABLE_COL_TITLE
-                    + TABLE_COL_GROUP
-                    + TABLE_COL_PATH
-                    + TABLE_COL_STATE
-                    + TABLE_COL_ID_DISPLAY
-                    + 6
-            )
-        );
+        )
     } else {
-        println!(
+        format!(
             "{:<width_title$} {:<width_group$} {:<width_path$} ID",
             "TITLE",
             "GROUP",
@@ -202,82 +184,58 @@ fn print_table_header(show_state: bool) {
             width_title = TABLE_COL_TITLE,
             width_group = TABLE_COL_GROUP,
             width_path = TABLE_COL_PATH
-        );
-        println!(
-            "{}",
-            "-".repeat(
-                TABLE_COL_TITLE + TABLE_COL_GROUP + TABLE_COL_PATH + TABLE_COL_ID_DISPLAY + 5
-            )
-        );
-    }
+        )
+    };
+    let separator = if show_state {
+        TABLE_COL_TITLE
+            + TABLE_COL_GROUP
+            + TABLE_COL_PATH
+            + TABLE_COL_STATE
+            + TABLE_COL_ID_DISPLAY
+            + 6
+    } else {
+        TABLE_COL_TITLE + TABLE_COL_GROUP + TABLE_COL_PATH + TABLE_COL_ID_DISPLAY + 5
+    };
+    format!("{heading}\n{}\n", "-".repeat(separator))
 }
 
-fn nest_children<'a>(instances: &[&'a Instance]) -> Vec<(&'a Instance, usize)> {
-    fn place<'a>(
-        inst: &'a Instance,
-        depth: usize,
-        instances: &[&'a Instance],
-        placed: &mut std::collections::HashSet<&'a str>,
-        ordered: &mut Vec<(&'a Instance, usize)>,
-    ) {
-        if !placed.insert(inst.id.as_str()) {
-            return;
-        }
-        ordered.push((inst, depth));
-        for child in instances
-            .iter()
-            .filter(|c| c.parent_session_id.as_deref() == Some(inst.id.as_str()))
-        {
-            place(child, depth + 1, instances, placed, ordered);
-        }
-    }
-
-    let listed: std::collections::HashSet<&str> = instances.iter().map(|i| i.id.as_str()).collect();
-    let mut placed = std::collections::HashSet::new();
-    let mut ordered = Vec::with_capacity(instances.len());
-    for inst in instances {
-        let under_listed_parent = inst
-            .parent_session_id
-            .as_deref()
-            .is_some_and(|p| p != inst.id && listed.contains(p));
-        if !under_listed_parent {
-            place(inst, 0, instances, &mut placed, &mut ordered);
-        }
-    }
-    for inst in instances {
-        place(inst, 0, instances, &mut placed, &mut ordered);
-    }
-    ordered
-}
-
-fn table_title(inst: &Instance, depth: usize) -> String {
+/// The title cell, indented by its depth in the parent/child nesting.
+pub(crate) fn table_title(title: &str, depth: usize) -> String {
     match depth {
-        0 => inst.title.clone(),
-        _ => format!("{}└ {}", "  ".repeat(depth - 1), inst.title),
+        0 => title.to_string(),
+        _ => format!("{}└ {}", "  ".repeat(depth - 1), title),
     }
 }
 
-fn print_table_row(inst: &Instance, depth: usize, show_state: bool) {
-    let title = super::truncate(&table_title(inst, depth), TABLE_COL_TITLE);
-    let group = super::truncate(&inst.group_path, TABLE_COL_GROUP);
-    let path = super::truncate(&inst.project_path, TABLE_COL_PATH);
-    let id_display = super::truncate_id(&inst.id, TABLE_COL_ID_DISPLAY);
-    if show_state {
-        println!(
-            "{:<width_title$} {:<width_group$} {:<width_path$} {:<width_state$} {}",
+/// One table row. The id column is truncated to the display width with no
+/// ellipsis, and the other three to theirs with one; the widths are the
+/// constants above, so the row and the separator cannot disagree.
+pub(crate) fn table_row(
+    title: &str,
+    group: &str,
+    path: &str,
+    state: Option<&str>,
+    id: &str,
+) -> String {
+    let title = super::truncate(title, TABLE_COL_TITLE);
+    let group = super::truncate(group, TABLE_COL_GROUP);
+    let path = super::truncate(path, TABLE_COL_PATH);
+    let id_display = super::truncate_id(id, TABLE_COL_ID_DISPLAY);
+    match state {
+        Some(state) => format!(
+            "{:<width_title$} {:<width_group$} {:<width_path$} {:<width_state$} {}\n",
             title,
             group,
             path,
-            state_tag(inst),
+            state,
             id_display,
             width_title = TABLE_COL_TITLE,
             width_group = TABLE_COL_GROUP,
             width_path = TABLE_COL_PATH,
             width_state = TABLE_COL_STATE,
-        );
-    } else {
-        println!(
-            "{:<width_title$} {:<width_group$} {:<width_path$} {}",
+        ),
+        None => format!(
+            "{:<width_title$} {:<width_group$} {:<width_path$} {}\n",
             title,
             group,
             path,
@@ -285,8 +243,77 @@ fn print_table_row(inst: &Instance, depth: usize, show_state: bool) {
             width_title = TABLE_COL_TITLE,
             width_group = TABLE_COL_GROUP,
             width_path = TABLE_COL_PATH
-        );
+        ),
     }
+}
+
+/// The listing order: every row whose listed parent is absent or itself, then
+/// their children beneath them, then anything the walk did not reach. The
+/// renderer runs the same walk over the snapshot, so a served listing is
+/// ordered exactly as the local one is.
+pub(crate) fn nest_order<'a, T>(
+    rows: &'a [T],
+    id: impl Fn(&'a T) -> &'a str,
+    parent: impl Fn(&'a T) -> Option<&'a str>,
+) -> Vec<(usize, usize)> {
+    fn place<'a, T>(
+        index: usize,
+        depth: usize,
+        rows: &'a [T],
+        id: &impl Fn(&'a T) -> &'a str,
+        parent: &impl Fn(&'a T) -> Option<&'a str>,
+        placed: &mut std::collections::HashSet<usize>,
+        ordered: &mut Vec<(usize, usize)>,
+    ) {
+        if !placed.insert(index) {
+            return;
+        }
+        ordered.push((index, depth));
+        let name = id(&rows[index]);
+        for (candidate, row) in rows.iter().enumerate() {
+            if parent(row) == Some(name) {
+                place(candidate, depth + 1, rows, id, parent, placed, ordered);
+            }
+        }
+    }
+
+    let listed: std::collections::HashSet<&str> = rows.iter().map(&id).collect();
+    let mut placed = std::collections::HashSet::new();
+    let mut ordered = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let under_listed_parent = parent(row).is_some_and(|p| p != id(row) && listed.contains(p));
+        if !under_listed_parent {
+            place(index, 0, rows, &id, &parent, &mut placed, &mut ordered);
+        }
+    }
+    for index in 0..rows.len() {
+        place(index, 0, rows, &id, &parent, &mut placed, &mut ordered);
+    }
+    ordered
+}
+
+fn nest_children<'a>(instances: &[&'a Instance]) -> Vec<(&'a Instance, usize)> {
+    nest_order(
+        instances,
+        |inst| inst.id.as_str(),
+        |inst| inst.parent_session_id.as_deref(),
+    )
+    .into_iter()
+    .map(|(index, depth)| (instances[index], depth))
+    .collect()
+}
+
+fn print_table_row(inst: &Instance, depth: usize, show_state: bool) {
+    print!(
+        "{}",
+        table_row(
+            &table_title(&inst.title, depth),
+            &inst.group_path,
+            &inst.project_path,
+            show_state.then(|| state_tag(inst)),
+            &inst.id,
+        )
+    );
 }
 
 fn table_shows_state(scope: SessionScope) -> bool {
@@ -323,7 +350,7 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
 
     let show_state = table_shows_state(scope);
     println!("Profile: {}\n", storage.profile());
-    print_table_header(show_state);
+    print!("{}", table_header(show_state));
     let listed: Vec<&Instance> = instances.iter().collect();
     for (inst, depth) in nest_children(&listed) {
         print_table_row(inst, depth, show_state);
@@ -375,7 +402,7 @@ async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
                 }
 
                 println!("\n═══ Profile: {} ═══\n", profile_name);
-                print_table_header(show_state);
+                print!("{}", table_header(show_state));
                 for (inst, depth) in nest_children(&instances) {
                     print_table_row(inst, depth, show_state);
                 }
@@ -426,7 +453,7 @@ mod tests {
         ];
         let titles: Vec<String> = nest_children(&listed)
             .into_iter()
-            .map(|(inst, depth)| table_title(inst, depth))
+            .map(|(inst, depth)| table_title(&inst.title, depth))
             .collect();
         assert_eq!(
             titles,

@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 use tokio::net::UnixStream;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -24,11 +25,15 @@ use serde::Serialize;
 use tokio_tungstenite::tungstenite;
 
 use super::AppState;
-use crate::session::Instance;
+use crate::session::{GroupTree, Instance, Storage};
 
 /// Wire protocol version. The client refuses anything else.
 const PROTOCOL_VERSION: u16 = 2;
-
+/// A stalled reader must not hold a connection slot — or a full disk rescan's
+/// worth of work — open indefinitely. Both transports spend this one budget:
+/// the local socket path in `runtime_uds`, the HTTP route here, so a peer that
+/// authenticates and then says nothing is bounded identically either way.
+pub(crate) const CONNECTION_BUDGET: Duration = Duration::from_secs(15);
 /// The trusted namespace this build publishes for itself, and the name the
 /// UDS marker files carry.
 pub(crate) const NAMESPACE: &str = if cfg!(debug_assertions) {
@@ -51,8 +56,20 @@ pub async fn runtime_ws(
     if let Some(response) = super::api::cityhall_block(&state) {
         return response;
     }
-    ws.on_upgrade(move |socket| serve_runtime_read(socket, state))
-        .into_response()
+    // The whole read is one budget, as on the local socket: the two frames and
+    // the close. The response that admits the upgrade is written by the
+    // extractor, so the bound has to wrap the upgraded task itself — a peer
+    // that authenticates, upgrades and then stops reading must not hold this
+    // task, its connection slot and its sample for the life of the daemon.
+    ws.on_upgrade(move |socket| async move {
+        if tokio::time::timeout(CONNECTION_BUDGET, serve_runtime_read(socket, state))
+            .await
+            .is_err()
+        {
+            tracing::warn!(target: "runtime.ws", "runtime read exceeded its budget");
+        }
+    })
+    .into_response()
 }
 
 fn has_bearer_header(headers: &HeaderMap) -> bool {
@@ -162,11 +179,8 @@ async fn run_read(
     let flight = runtime.flight.lock().await;
 
     let instances: Vec<Instance> = state.instances.read().await.clone();
-    let active_profile = state.profile.clone();
-    let sampled = tokio::task::spawn_blocking(move || {
-        build_snapshot(runtime, &active_profile, &instances, owner)
-    })
-    .await;
+    let sampled =
+        tokio::task::spawn_blocking(move || build_snapshot(runtime, &instances, owner)).await;
 
     // The sample is the only work the flight serializes. A reader that stalls
     // mid-write must not keep the next one from sampling.
@@ -284,7 +298,7 @@ fn publish_freshness(runtime: &RuntimeState) -> (StatusFreshness, u64) {
     (
         StatusFreshness::Observed {
             revision: next,
-            observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            observed_at: format_timestamp(Utc::now()),
         },
         cursor,
     )
@@ -309,15 +323,11 @@ struct Sampled {
 /// Everything one profile contributes that is not derived from its sessions.
 struct ProfileDisk {
     projects: Result<Vec<ProjectRead>, ()>,
+    groups: Result<Vec<crate::session::Group>, ()>,
     cleanup: CleanupDefaults,
 }
 
-fn build_snapshot(
-    runtime: &RuntimeState,
-    active_profile: &str,
-    instances: &[Instance],
-    owner: Owner,
-) -> Sampled {
+fn build_snapshot(runtime: &RuntimeState, instances: &[Instance], owner: Owner) -> Sampled {
     // `local_owner` mirrors the declared owner so the two can never disagree.
     let local_owner = owner.is_local();
     let identity = &runtime.identity;
@@ -349,9 +359,14 @@ fn build_snapshot(
                                     path: project.path,
                                     scope: ProjectScope::Profile,
                                     default_base_branch: project.default_base_branch,
+                                    registered: true,
                                 })
                                 .collect::<Vec<_>>()
                         })
+                        .map_err(|_| ()),
+                    groups: Storage::open_unwatched(name)
+                        .and_then(|storage| storage.load_with_groups())
+                        .map(|(_, groups)| groups)
                         .map_err(|_| ()),
                     cleanup: cleanup_defaults(),
                 },
@@ -368,6 +383,7 @@ fn build_snapshot(
                     path: project.path,
                     scope: ProjectScope::Global,
                     default_base_branch: project.default_base_branch,
+                    registered: true,
                 })
                 .collect::<Vec<_>>(),
         ),
@@ -380,7 +396,6 @@ fn build_snapshot(
     let global_projects = global_projects.unwrap_or_default();
 
     sessions.retain(|row| names.contains(&row.profile));
-    sessions.sort_by(|left, right| left.id.cmp(&right.id));
     reconcile_legacy_rows(&mut sessions);
     for row in &mut sessions {
         row.cleanup_defaults = disk[&row.profile].cleanup;
@@ -392,14 +407,25 @@ fn build_snapshot(
         let entry = &disk[name];
         let scoped: Vec<&SessionRead> =
             sessions.iter().filter(|row| &row.profile == name).collect();
+        let scoped_instances: Vec<&Instance> = instances
+            .iter()
+            .filter(|inst| &inst.source_profile == name)
+            .collect();
         let mut projects = entry.projects.clone().unwrap_or_default();
         // Referential integrity: every session's project path is a member of its
         // own profile's project list.
         add_session_projects(&mut projects, &scoped, &global_projects);
-        projects.sort_by(|left, right| (&left.name, &left.path).cmp(&(&right.name, &right.path)));
-        projects.dedup_by(|left, right| left.name == right.name && left.path == right.path);
+        // Registry order, not a canonical sort: that is the order a local
+        // `aoe project list` prints, and the wire carries the presentation.
+        let mut identities: HashSet<(String, String)> = HashSet::new();
+        projects.retain(|project| identities.insert((project.name.clone(), project.path.clone())));
+        let owned: Vec<Instance> = scoped_instances.into_iter().cloned().collect();
+        let groups = group_reads(&GroupTree::new_with_groups(
+            &owned,
+            &entry.groups.clone().unwrap_or_default(),
+        ));
         let health = ProfileHealth {
-            profile_enumeration: if entry.projects.is_ok() {
+            profile_enumeration: if entry.projects.is_ok() && entry.groups.is_ok() {
                 ComponentHealth::Healthy
             } else {
                 ComponentHealth::Degraded {
@@ -412,7 +438,7 @@ fn build_snapshot(
         profile_health.insert(name.clone(), health);
         profile_reads.push(ProfileRead {
             name: name.clone(),
-            groups: group_reads(&scoped),
+            groups,
             projects,
             health,
         });
@@ -424,9 +450,17 @@ fn build_snapshot(
         profiles: profile_health,
     };
     let aggregate = aggregate_health(&snapshot_health);
-    let default_profile = (!active_profile.is_empty() && names.contains(active_profile))
-        .then(|| active_profile.to_string())
-        .or_else(|| names.iter().min().cloned());
+    // The resolved default, not the daemon's active profile: `aoe profile` marks
+    // the resolved one, and a client that resolved a different name would mark
+    // a different row. Resolution is skipped when there is no profile at all,
+    // so a read never bootstraps one.
+    let default_profile = if names.is_empty() {
+        None
+    } else {
+        Some(crate::session::config::resolve_default_profile())
+            .filter(|name| names.contains(name))
+            .or_else(|| names.iter().min().cloned())
+    };
 
     Sampled {
         hello: HelloData {
@@ -590,34 +624,16 @@ fn cleanup_defaults() -> CleanupDefaults {
     }
 }
 
-/// Every group path used by a profile's sessions, plus the ancestor paths the
-/// `children` relation implies, sorted bytewise.
-fn group_reads(sessions: &[&SessionRead]) -> Vec<GroupRead> {
-    let mut paths: BTreeSet<String> = BTreeSet::new();
-    for session in sessions {
-        if session.group_path.is_empty() {
-            continue;
-        }
-        let components: Vec<&str> = session.group_path.split('/').collect();
-        for index in 1..=components.len() {
-            paths.insert(components[..index].join("/"));
-        }
-    }
-    paths
+/// The profile's group inventory, in the order the tree holds them: the
+/// registry's insertion order, then the groups its sessions imply. A group
+/// with no session is in the registry and therefore still appears.
+fn group_reads(tree: &GroupTree) -> Vec<GroupRead> {
+    tree.get_all_groups()
         .iter()
-        .map(|path| {
-            let prefix = format!("{path}/");
-            let children: BTreeSet<String> = paths
-                .iter()
-                .filter_map(|other| other.strip_prefix(&prefix))
-                .filter_map(|tail| tail.split('/').next())
-                .map(str::to_string)
-                .collect();
-            GroupRead {
-                name: path.rsplit('/').next().unwrap_or_default().to_string(),
-                path: path.clone(),
-                children: children.into_iter().collect(),
-            }
+        .map(|group| GroupRead {
+            name: group.name.clone(),
+            path: group.path.clone(),
+            children: group.children.iter().map(|c| c.name.clone()).collect(),
         })
         .collect()
 }
@@ -645,6 +661,7 @@ fn add_session_projects(
             path,
             scope: ProjectScope::Profile,
             default_base_branch: None,
+            registered: false,
         });
     }
 }
@@ -813,6 +830,10 @@ struct ProjectRead {
     path: String,
     scope: ProjectScope,
     default_base_branch: Option<String>,
+    /// True for a row the registry holds, false for one synthesized so a
+    /// session's project path resolves. A `aoe project list` prints only the
+    /// registered ones.
+    registered: bool,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -955,10 +976,13 @@ fn wire_state(inst: &Instance) -> &'static str {
     }
 }
 
-/// One canonical timestamp spelling: RFC 3339 UTC seconds with a `Z` zone and no
-/// fractional part.
+/// One canonical timestamp spelling: RFC 3339 in UTC with the fractional part
+/// `AutoSi` keeps, spelled with `Z`. This is exactly how chrono's own
+/// `Serialize for DateTime<Utc>` writes a value — `to_rfc3339()` would instead
+/// spell the zone as `+00:00`, which is neither the wire grammar the client
+/// accepts nor the bytes the local command prints.
 fn format_timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(SecondsFormat::Secs, true)
+    value.to_rfc3339_opts(SecondsFormat::AutoSi, true)
 }
 
 fn timestamp(value: Option<DateTime<Utc>>) -> Option<String> {
@@ -973,6 +997,55 @@ mod tests {
     use crate::cli::runtime_read::dto::{
         parse_hello, parse_snapshot, validate_cross_message, validate_snapshot,
     };
+    use crate::session::{WorkspaceInfo, WorkspaceRepo as StoredRepo};
+
+    /// The client keeps the one collection ordering rule the wire has, so the
+    /// producer has to make it hold: however a stored workspace's repos happen
+    /// to be arranged on disk, the row it emits is ascending, which is what
+    /// keeps an unsorted stored list from refusing a whole snapshot. The list
+    /// is also unique on the way out, so the rule the client relies on to catch
+    /// a repeated repo is still the producer's to keep.
+    #[test]
+    fn the_producer_sorts_workspace_repos_however_they_were_stored() {
+        let mut instance = Instance::new("s1", "/srv/repo");
+        instance.source_profile = "main".into();
+        instance.workspace_info = Some(WorkspaceInfo {
+            branch: "main".into(),
+            workspace_dir: "/srv/repo/.aoe/workspace".into(),
+            created_at: Utc::now(),
+            cleanup_on_delete: true,
+            repos: vec![repo("beta", "/srv/beta"), repo("alpha", "/srv/alpha")],
+        });
+        let emitted = SessionRead::from_instance(&instance);
+        assert_eq!(
+            emitted
+                .workspace_repos
+                .iter()
+                .map(|repo| (repo.name.as_str(), repo.source_path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("alpha", "/srv/alpha"), ("beta", "/srv/beta")],
+            "an unsorted stored list must not reach the wire unsorted"
+        );
+
+        // The client half of this contract — an ascending list accepted, a
+        // descending or repeated one refused — is pinned in the client's own
+        // `workspace_repos_keep_their_ascending_rule`; what only the producer
+        // can prove is that the list arrives ascending at all.
+    }
+
+    fn repo(name: &str, source_path: &str) -> StoredRepo {
+        StoredRepo {
+            name: name.into(),
+            source_path: source_path.into(),
+            branch: "main".into(),
+            worktree_path: format!("{source_path}/.worktrees/main"),
+            main_repo_path: source_path.into(),
+            managed_by_aoe: true,
+            branch_preexisting: false,
+            base_branch: None,
+            base_branch_override: None,
+        }
+    }
 
     /// Points the app dir at an empty temporary XDG base for the duration of one
     /// test, so a snapshot is assembled from fixtures rather than the developer's
@@ -1043,7 +1116,7 @@ mod tests {
     fn emitted_frames_satisfy_the_client_wire_contract() {
         let _home = TempHome::new();
         let instances = vec![instance("a", "main"), instance("b", "main")];
-        let sampled = build_snapshot(&RuntimeState::new(), "main", &instances, Owner::remote());
+        let sampled = build_snapshot(&RuntimeState::new(), &instances, Owner::remote());
 
         let hello = parse_hello(&hello_frame(&sampled)).expect("client accepts the Hello");
         let snapshot =
@@ -1062,7 +1135,6 @@ mod tests {
         let _home = TempHome::new();
         let sampled = build_snapshot(
             &RuntimeState::new(),
-            "main",
             &[instance("a", "main")],
             Owner::remote(),
         );
@@ -1079,7 +1151,11 @@ mod tests {
         assert_eq!(freshness["kind"], "observed");
         assert!(freshness["revision"].as_u64().expect("revision") >= 1);
         let observed_at = freshness["observed_at"].as_str().expect("timestamp");
-        assert!(observed_at.ends_with('Z') && !observed_at.contains('.'));
+        assert!(observed_at.ends_with('Z'));
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(observed_at).is_ok(),
+            "{observed_at}"
+        );
     }
 
     /// The cursor is the independent counter: it is the observed revision plus
@@ -1089,8 +1165,8 @@ mod tests {
     fn each_sample_advances_revision_and_cursor_together() {
         let _home = TempHome::new();
         let runtime = RuntimeState::new();
-        let first = build_snapshot(&runtime, "main", &[], Owner::remote());
-        let second = build_snapshot(&runtime, "main", &[], Owner::remote());
+        let first = build_snapshot(&runtime, &[], Owner::remote());
+        let second = build_snapshot(&runtime, &[], Owner::remote());
 
         assert_eq!(observed_revision(&first), 1);
         assert_eq!(observed_revision(&second), 2);
@@ -1115,30 +1191,6 @@ mod tests {
         assert_eq!(cursor, 0);
     }
 
-    #[test]
-    fn group_children_are_the_sorted_immediate_child_names() {
-        let rows: Vec<SessionRead> = vec![
-            {
-                let mut row = SessionRead::from_instance(&instance("a", "main"));
-                row.group_path = "alpha/beta".into();
-                row
-            },
-            {
-                let mut row = SessionRead::from_instance(&instance("b", "main"));
-                row.group_path = "alpha/gamma".into();
-                row
-            },
-        ];
-        let scoped: Vec<&SessionRead> = rows.iter().collect();
-        let groups = group_reads(&scoped);
-
-        let paths: Vec<&str> = groups.iter().map(|group| group.path.as_str()).collect();
-        assert_eq!(paths, vec!["alpha", "alpha/beta", "alpha/gamma"]);
-        assert_eq!(groups[0].name, "alpha");
-        assert_eq!(groups[0].children, vec!["beta", "gamma"]);
-        assert!(groups[1].children.is_empty());
-    }
-
     /// Referential integrity: a session whose project path is in no registry
     /// still gets a same-profile project, or the client rejects the snapshot.
     #[test]
@@ -1152,6 +1204,10 @@ mod tests {
         assert_eq!(projects[0].path, "/repo");
         assert_eq!(projects[0].name, "repo");
         assert_eq!(projects[0].scope, ProjectScope::Profile);
+        assert!(
+            !projects[0].registered,
+            "a synthesized row is not a registry row"
+        );
     }
 
     /// `Instance::new` mints its own id, so a fixture row sets the one the test
@@ -1183,7 +1239,7 @@ mod tests {
         trailing.project_path = "/repo/".into();
         let instances = vec![named("a", "main"), orphan, trailing];
 
-        let sampled = build_snapshot(&RuntimeState::new(), "main", &instances, Owner::remote());
+        let sampled = build_snapshot(&RuntimeState::new(), &instances, Owner::remote());
 
         let snapshot =
             parse_snapshot(&snapshot_frame(&sampled)).expect("client accepts the Snapshot");
@@ -1231,6 +1287,31 @@ mod tests {
             parents,
             vec![("a", None), ("x", None), ("y", Some("x")), ("z", Some("x"))]
         );
+    }
+
+    /// The wire keeps the fraction a stored timestamp carries: a session
+    /// created mid-second comes back spelled the same way on the far side,
+    /// which is what the local `--json` output prints.
+    #[test]
+    #[serial_test::serial]
+    fn a_fractional_timestamp_survives_the_wire_intact() {
+        let _home = TempHome::new();
+        let mut inst = named("fractional", "main");
+        inst.created_at = "2026-01-02T03:04:05.123456789Z".parse().expect("timestamp");
+        inst.pinned_at = Some("2026-01-02T03:04:06.5Z".parse().expect("timestamp"));
+        let sampled = build_snapshot(&RuntimeState::new(), &[inst], Owner::remote());
+
+        let row = &sampled.data.sessions[0];
+        assert_eq!(row.created_at, "2026-01-02T03:04:05.123456789Z");
+        // `AutoSi` writes the smallest of 0, 3, 6 or 9 digits that keeps the
+        // instant, so `.5` comes back as `.500` — the same spelling the local
+        // `DateTime<Utc>` serializer produces.
+        assert_eq!(row.pinned_at.as_deref(), Some("2026-01-02T03:04:06.500Z"));
+
+        // And the client's own validator accepts the spelling it is handed.
+        let snapshot =
+            parse_snapshot(&snapshot_frame(&sampled)).expect("client accepts the Snapshot");
+        validate_snapshot(&snapshot).expect("the snapshot is projectable");
     }
 
     #[test]
