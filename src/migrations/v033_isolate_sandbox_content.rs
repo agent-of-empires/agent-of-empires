@@ -73,8 +73,7 @@ fn retired_binding_matches(
         Some(retired) => current == Some(retired),
         None => current.is_none_or(|binding| {
             binding.session_id == sid
-                && binding.execution.is_none()
-                && binding.provenance == crate::session::ConversationProvenance::Unknown
+                && binding.is_unattributed()
                 && binding.transcript_path.is_none()
         }),
     }
