@@ -61,14 +61,8 @@ pub struct SpawnConfig {
     /// Lifecycle epoch stamped on the runner's registry record.
     pub generation: u64,
     pub claude_store_pin: Option<crate::session::capture::ClaudeStorePin>,
-}
-
-/// Request-sourced `provider_env` keys: the shared deny policy, plus Claude's
-/// store routing, which the session's conversation pins.
-pub(super) fn request_env_denyreason(key: &str) -> Option<&'static str> {
-    provider_env_denyreason(key).or_else(|| {
-        (key == "CLAUDE_CONFIG_DIR").then_some("Claude store routing, pinned by the session")
-    })
+    /// Trusted environment before the current hook overlay or Claude routing.
+    pub base_host_environment: Vec<(String, String)>,
 }
 
 /// Request-sourced keys may not redirect infrastructure the operator env
@@ -86,6 +80,13 @@ pub(super) fn provider_env_denyreason(key: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Request-sourced environment cannot redirect a conversation's Claude store.
+pub(super) fn request_env_denyreason(key: &str) -> Option<&'static str> {
+    provider_env_denyreason(key).or_else(|| {
+        (key == "CLAUDE_CONFIG_DIR").then_some("Claude store routing, pinned by the session")
+    })
 }
 
 /// Trusted operator config may set infrastructure keys (as a terminal pane
@@ -223,7 +224,40 @@ pub(super) fn apply_env_filter(
         cmd.env(key, value);
         keys.provider.push(key.clone());
     }
+
     keys
+}
+
+/// Applies the pin after ambient, inherited, allowlist, and provider layers.
+pub(super) fn apply_claude_store_route(cmd: &mut std::process::Command, config: &SpawnConfig) {
+    let Some(pin) = config.claude_store_pin.as_ref() else {
+        return;
+    };
+    let home = config
+        .host_environment
+        .iter()
+        .rev()
+        .find(|(key, value)| key == "HOME" && !value.is_empty())
+        .map(|(_, value)| value.clone())
+        .or_else(|| effective_env_value(cmd, "HOME").filter(|value| !value.is_empty()))
+        .or_else(|| std::env::var("HOME").ok().filter(|value| !value.is_empty()))
+        .map(PathBuf::from);
+    let should_export = crate::session::capture::exports_claude_store(pin, home.as_deref());
+    if should_export {
+        cmd.env("CLAUDE_CONFIG_DIR", &pin.store);
+    } else {
+        cmd.env_remove("CLAUDE_CONFIG_DIR");
+    }
+}
+
+fn effective_env_value(cmd: &std::process::Command, key: &str) -> Option<String> {
+    let mut result = None;
+    for (name, value) in cmd.get_envs() {
+        if name == key {
+            result = value.and_then(|value| value.to_str().map(str::to_owned));
+        }
+    }
+    result
 }
 
 /// `dirs` first, then `path`, dropping any already present.
@@ -256,6 +290,7 @@ fn apply_stdio_env(
         cmd.env(key, value);
         keys.host.push(key.clone());
     }
+    apply_claude_store_route(cmd.as_std_mut(), config);
     if let Some(socket_path) = &config.socket_path {
         cmd.env("AOE_ACP_SOCKET", socket_path);
     }
@@ -278,12 +313,7 @@ pub(super) fn native_store_snapshot(
             .rev()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.clone())
-            .or_else(|| {
-                command
-                    .get_envs()
-                    .find(|(key, _)| *key == name)
-                    .and_then(|(_, value)| value?.to_str().map(str::to_owned))
-            })
+            .or_else(|| effective_env_value(command, name))
             .filter(|value| !value.is_empty())
     };
     let cwd = crate::session::capture::canonicalize_allowing_missing_leaf(&config.cwd)?;
@@ -297,20 +327,21 @@ pub(super) fn native_store_snapshot(
     } else {
         cwd.join(root)
     };
-    let exported_default_store = exported.is_some()
-        && home
-            .as_ref()
-            .is_some_and(|home| crate::session::capture::is_default_claude_store(&root, home));
+    let store = crate::session::capture::canonicalize_allowing_missing_leaf(&root)?;
+    let exported_default_store = Some(
+        exported.is_some()
+            && home
+                .as_ref()
+                .is_some_and(|home| crate::session::capture::is_default_claude_store(&store, home)),
+    );
     Some(crate::session::ExecutionBinding {
         agent: "claude".into(),
-        stores: vec![crate::session::capture::canonicalize_allowing_missing_leaf(
-            &root,
-        )?],
+        stores: vec![store],
         configuration: Vec::new(),
-        exported_default_store,
         cwd,
-        filesystem: "host".into(),
         cwd_filesystem: "host".into(),
+        filesystem: "host".into(),
+        exported_default_store,
     })
 }
 
@@ -434,6 +465,7 @@ mod tests {
         let mut cmd = std::process::Command::new("/bin/true");
         cmd.env_clear();
         apply_env_filter(&mut cmd, config, &[]);
+        apply_claude_store_route(&mut cmd, config);
         cmd.get_envs()
             .filter_map(|(k, v)| {
                 Some((
@@ -465,33 +497,6 @@ mod tests {
         }
     }
 
-    /// The worker's handoff binding records an exported default store the way the
-    /// terminal launch does, so an explicit selection keeps matching across surfaces.
-    #[test]
-    fn claude_snapshot_records_only_an_exported_default_store() {
-        let home = tempfile::tempdir().unwrap();
-        let home = home.path().canonicalize().unwrap();
-        let config = env_test_spawn_config(home.clone());
-        let command = std::process::Command::new("true");
-        let default = home.join(".claude");
-        let custom = home.join("custom");
-        for (exported, expected) in [
-            (None, false),
-            (Some(&default), true),
-            (Some(&custom), false),
-        ] {
-            let mut overrides = vec![("HOME".to_string(), home.display().to_string())];
-            overrides.extend(
-                exported.map(|dir| ("CLAUDE_CONFIG_DIR".to_string(), dir.display().to_string())),
-            );
-            let snapshot = native_store_snapshot(&config, &command, &overrides).unwrap();
-            assert_eq!(
-                snapshot.exported_default_store, expected,
-                "exported={exported:?}"
-            );
-        }
-    }
-
     #[test]
     fn env_deny_policies() {
         for (key, provider_denied, host_denied) in [
@@ -508,11 +513,12 @@ mod tests {
             ("MY_CUSTOM_VAR", false, false),
             ("XDG_CONFIG_HOME", false, false),
             ("CODEX_HOME", false, false),
+            ("CLAUDE_CONFIG_DIR", true, false),
             ("1BAD", false, true),
             ("HAS-DASH", false, true),
         ] {
             assert_eq!(
-                provider_env_denyreason(key).is_some(),
+                request_env_denyreason(key).is_some(),
                 provider_denied,
                 "{key}"
             );
@@ -634,19 +640,132 @@ mod tests {
                 assert!(!applied.contains_key(*key), "{key} leaked: {applied:#?}");
             }
         }
+    }
+    #[test]
+    #[serial_test::serial]
+    fn unpinned_claude_allowlist_preserves_an_operator_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let other = tmp.path().join("other");
+        let _env = crate::session::test_support::EnvGuard::set(&[(
+            "CLAUDE_CONFIG_DIR",
+            other.to_str().unwrap(),
+        )]);
+        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        config.spec.env_allowlist = Some(vec!["CLAUDE_CONFIG_DIR".into()]);
+        config.claude_store_pin = None;
 
-        // A request cannot move a worker off the store its conversation pins.
-        config.spec = crate::acp::AgentSpec::from_acp_cmd("custom", "/bin/true").unwrap();
+        assert_eq!(
+            applied_env(&config).get("CLAUDE_CONFIG_DIR"),
+            Some(&other.display().to_string())
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn final_claude_route_removes_ambient_allowlist_and_provider_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let default = home.join(".claude");
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&default).unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", home.to_str().unwrap()),
+            ("CLAUDE_CONFIG_DIR", other.to_str().unwrap()),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "witness"),
+        ]);
+        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        config.spec.env_allowlist = Some(vec![
+            "CLAUDE_CONFIG_DIR".into(),
+            "CLAUDE_CODE_OAUTH_TOKEN".into(),
+        ]);
         config.provider_env = vec![
-            ("CLAUDE_CONFIG_DIR".into(), "/request".into()),
-            ("ANTHROPIC_API_KEY".into(), "sk-request".into()),
+            ("CLAUDE_CONFIG_DIR".into(), other.display().to_string()),
+            ("ANTHROPIC_API_KEY".into(), "request-auth".into()),
         ];
+        config.claude_store_pin = Some(crate::session::capture::ClaudeStorePin {
+            store: default,
+            exported_default_store: Some(false),
+        });
+
         let applied = applied_env(&config);
+        assert!(!applied.contains_key("CLAUDE_CONFIG_DIR"));
+        assert_eq!(
+            applied.get("CLAUDE_CODE_OAUTH_TOKEN").map(String::as_str),
+            Some("witness")
+        );
         assert_eq!(
             applied.get("ANTHROPIC_API_KEY").map(String::as_str),
-            Some("sk-request")
+            Some("request-auth")
         );
-        assert!(!applied.contains_key("CLAUDE_CONFIG_DIR"), "{applied:#?}");
+    }
+
+    #[test]
+    fn native_snapshot_records_the_effective_default_route_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let mut config = env_test_spawn_config(home.clone());
+        config.claude_store_pin = Some(crate::session::capture::ClaudeStorePin {
+            store: home.join(".claude"),
+            exported_default_store: Some(false),
+        });
+        let command = std::process::Command::new("/bin/true");
+        let snapshot = native_store_snapshot(
+            &config,
+            &command,
+            &[("HOME".into(), home.display().to_string())],
+        )
+        .unwrap();
+        assert_eq!(snapshot.exported_default_store, Some(false));
+
+        let snapshot = native_store_snapshot(
+            &config,
+            &command,
+            &[
+                ("HOME".into(), home.display().to_string()),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    home.join(".claude").display().to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(snapshot.exported_default_store, Some(true));
+
+        let custom = home.join("custom");
+        let snapshot = native_store_snapshot(
+            &config,
+            &command,
+            &[
+                ("HOME".into(), home.display().to_string()),
+                ("CLAUDE_CONFIG_DIR".into(), custom.display().to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(snapshot.exported_default_store, Some(false));
+    }
+    #[test]
+    fn native_snapshot_uses_the_last_route_after_removal() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let default = home.join(".claude");
+        let other = home.join("other");
+        let mut config = env_test_spawn_config(home.clone());
+        config.claude_store_pin = Some(crate::session::capture::ClaudeStorePin {
+            store: default.clone(),
+            exported_default_store: Some(false),
+        });
+        let mut command = std::process::Command::new("/bin/true");
+        command.env("CLAUDE_CONFIG_DIR", &other);
+        command.env_remove("CLAUDE_CONFIG_DIR");
+        let snapshot = native_store_snapshot(
+            &config,
+            &command,
+            &[("HOME".into(), home.display().to_string())],
+        )
+        .unwrap();
+        assert_eq!(snapshot.stores, vec![default]);
+        assert_eq!(snapshot.exported_default_store, Some(false));
     }
 
     #[test]
