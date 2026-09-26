@@ -141,9 +141,12 @@ pub(super) fn resolve_create_fork_seed(
         .iter()
         .filter_map(|parent| parent.fork_parent_ref())
         .filter(|candidate| candidate.session_id() == parent_id);
-    // A qualified row wins over an unqualified one carrying the same id, so the
-    // outcome does not depend on the order `Storage::load()` returned the rows
-    // in, and the ambiguity scan stays a qualified-row question.
+    // A qualified row wins over an unqualified one carrying the same id, and the
+    // ambiguity scan compares only qualified rows, so the seed and the scan do
+    // not depend on the order `Storage::load()` returned the rows in. The refusal
+    // does: it describes the first row that carries a binding, so two rows
+    // disagreeing on provenance get whichever loaded first. Both are true of a
+    // row and each admits its own remedy, so none is ranked above another here.
     let mut first = None;
     let mut bound = None;
     let mut chosen = None;
