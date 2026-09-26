@@ -251,7 +251,8 @@ mod tests {
             Some(std::time::Duration::from_secs(5))
         );
 
-        // A relaunch landed: its clear stands, and the walk's schedule is dropped.
+        // A relaunch landed: its clear stands, and the walk's verdict is dropped. The counter is
+        // moved here rather than by the merge below, which is the point: the guard reads it alone.
         live.lifecycle_generation = 8;
         let mut relaunched = live.clone();
         // A relaunch that reached the launch stamp: new start time, cleared schedule.
@@ -262,7 +263,7 @@ mod tests {
         assert_eq!(
             live.poller_repair.current_reprobe_delay(),
             None,
-            "the relaunch replaced the poller this schedule paced"
+            "a lifecycle that moved under the walk discards its verdict"
         );
     }
 

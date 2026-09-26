@@ -1075,19 +1075,19 @@ pub(super) fn apply_post_restart_identity_sync(
         if conversation_unchanged {
             live.adopt_conversation_state(started.conversation_state());
         } else {
-            // The pane is the relaunch's whatever became of the conversation; see
-            // `merge_post_restart_with_baseline`.
-            live.active_execution = started.active_execution.clone();
+            live.adopt_active_execution(started);
         }
     }
-    if live.active_execution == started.active_execution {
+    // A poller serves the execution it was installed for, so the row takes the launch's only when
+    // that poller watches the execution the row has just taken on.
+    if started.poller_serves(live.active_execution.as_ref()) {
         live.session_id_poller = started.session_id_poller.clone();
         live.session_id_poller_retry_after = started.session_id_poller_retry_after;
     } else {
         started.stop_poller();
     }
     // Same signal as `merge_post_restart_with_baseline`: a new start time means the relaunch
-    // replaced the pane this schedule paced, whether or not the branch above took it.
+    // replaced the pane this schedule paced.
     if started.last_start_time != before.last_start_time {
         live.poller_repair.reset();
     }

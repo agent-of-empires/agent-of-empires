@@ -82,7 +82,7 @@ fn build_view_with_inst(profile: &str, inst: &Instance) -> HomeView {
 }
 
 fn attach_poller_with_update(view: &mut HomeView, instance_id: &str, sid: &str) {
-    let poller = SessionPoller::new("test-session".to_string());
+    let poller = SessionPoller::new("test-session".to_string(), None);
     poller.inject_test_update(instance_id, sid);
     let arc = Arc::new(Mutex::new(poller));
     if let Some(i) = view.instances.get_mut(instance_id) {
@@ -282,8 +282,8 @@ fn repair_session_id_pollers_skips_structured_and_repairs_live_terminal() {
     let mut view = build_view_with_inst(profile, &terminal);
     view.instances
         .insert(structured.id.clone(), structured.clone());
-    let terminal_stopped = Arc::new(Mutex::new(SessionPoller::new("stopped".to_string())));
-    let structured_stopped = Arc::new(Mutex::new(SessionPoller::new("stopped".to_string())));
+    let terminal_stopped = Arc::new(Mutex::new(SessionPoller::new("stopped".to_string(), None)));
+    let structured_stopped = Arc::new(Mutex::new(SessionPoller::new("stopped".to_string(), None)));
     view.instances
         .get_mut(&terminal.id)
         .unwrap()

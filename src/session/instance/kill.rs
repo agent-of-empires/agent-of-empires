@@ -576,10 +576,10 @@ mod tests {
             agent: "claude".into(),
             stores: vec![home.path().join("store")],
             configuration: Vec::new(),
-            exported_default_store: false,
             cwd: home.path().into(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         };
         inst.resume_intent = ResumeIntent::Use(sid.into());
         inst.resume_binding = Some(crate::session::ConversationBinding {

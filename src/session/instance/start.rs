@@ -333,6 +333,7 @@ impl Instance {
             self.adopt_conversation_state(canonical);
         }
         if let Some(execution) = prepared.execution.take() {
+            let attested = self.attested_claude_store_route(&execution);
             self.active_execution = Some(ActiveExecution {
                 launch_id: execution.inputs.launch_id,
                 binding: execution.binding.clone(),
@@ -361,7 +362,7 @@ impl Instance {
                                     .as_ref()
                                     .is_some_and(|prior| prior.agent == execution.binding.agent)))
                 });
-                let binding =
+                let mut binding =
                     if matches!(prepared.expected_conversation.intent, ResumeIntent::Use(_)) {
                         self.resume_binding.clone()
                     } else {
@@ -373,6 +374,13 @@ impl Instance {
                         provenance: ConversationProvenance::Preallocated,
                         transcript_path: None,
                     });
+                // #4127: a legacy binding adopts the route this launch
+                // attested, so the marker stops being derived from the
+                // configuration as it stands the moment a launch settles it.
+                // Both the binding being adopted and the ones still held are
+                // stamped, and the save below carries whichever persists.
+                super::execution::attest_observed_default_store(&mut binding, attested.as_ref());
+                self.attest_launch_default_store(attested.as_ref());
                 self.set_agent_conversation(Some(sid), Some(binding), self.pi_session_path.clone());
             }
         } else {
@@ -513,9 +521,9 @@ impl Instance {
         }
 
         // A launch re-evaluates the row: the schedule paced the poller the previous relaunch
-        // left, over a pane this launch replaces and a capture lease it still holds. The relaunch
-        // merges detect that launch by the `last_start_time` stamp below, so the two statements
-        // must stay adjacent and in this order.
+        // left, over a pane this launch replaces and a capture lease it still holds. Clearing it
+        // here voids this launch's own copy; the live row's is cleared by the relaunch merges,
+        // which key on the start-time stamp below and so only fire once the launch got this far.
         self.poller_repair.reset();
         self.maybe_start_poller_since(omp_capture_metadata);
 
@@ -557,6 +565,61 @@ impl Instance {
         }
         Ok(())
     }
+
+    /// The store route this launch actually applied, as a binding the stamp
+    /// helper accepts (#4127).
+    fn attested_claude_store_route(
+        &self,
+        execution: &super::execution::NativeExecution,
+    ) -> Option<ExecutionBinding> {
+        // A container routes to its own store; the host's Claude namespace says
+        // nothing about it.
+        if execution.inputs.container.is_some() {
+            return None;
+        }
+        let home = super::hooks::host_home(&self.resolved_host_environment())?;
+        let attested = attested_default_store(&execution.binding, &execution.routing, &home)?;
+        Some(ExecutionBinding {
+            exported_default_store: Some(attested),
+            ..execution.binding.clone()
+        })
+    }
+}
+
+/// The store route a terminal launch attested, read off the routing table the
+/// worker is about to be launched with (#4127).
+///
+/// That table — not the configuration as it stands — is what says whether the
+/// default store was exported explicitly, so it is the only thing consulted
+/// here: a launch that routed `CLAUDE_CONFIG_DIR` at Claude's default store
+/// attested `true`, one that left it implicit attested `false`, and a launch
+/// that attested nothing returns `None` so the binding keeps deriving its
+/// route at read time until one does.
+fn attested_default_store(
+    binding: &ExecutionBinding,
+    routing: &[(String, Option<String>)],
+    home: &std::path::Path,
+) -> Option<bool> {
+    if binding.agent != "claude" || binding.filesystem != "host" || binding.stores.len() != 1 {
+        return None;
+    }
+    // A launch that recorded no route attested nothing.
+    binding.exported_default_store?;
+    let store = binding.stores.first()?;
+    let routed = routing
+        .iter()
+        .find(|(key, _)| key == "CLAUDE_CONFIG_DIR")
+        .and_then(|(_, value)| value.as_deref())
+        .and_then(|value| {
+            crate::session::capture::canonicalize_allowing_missing_leaf(std::path::Path::new(value))
+        })
+        .zip(crate::session::capture::canonicalize_allowing_missing_leaf(
+            store,
+        ));
+    Some(
+        routed.is_some_and(|(routed, store)| routed == store)
+            && crate::session::capture::is_default_claude_store(store, home),
+    )
 }
 
 #[cfg(test)]
@@ -595,5 +658,180 @@ mod tests {
                 "no tmux session must exist after refusal for id={poisoned:?}"
             );
         }
+    }
+
+    /// #4127: the terminal launch attests the route it applied, and nothing
+    /// else. A binding that resolved no route, and a launch that is not a
+    /// single-store host Claude one, attest nothing at all.
+    #[test]
+    fn attested_default_store_reads_the_route_the_launch_applied() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let default = home.join(".claude");
+        let custom = home.join("custom-claude");
+        std::fs::create_dir_all(&default).unwrap();
+        let binding =
+            |store: &std::path::Path, agent: &str, marker: Option<bool>| ExecutionBinding {
+                agent: agent.into(),
+                stores: vec![store.to_path_buf()],
+                configuration: Vec::new(),
+                cwd: home.clone(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: marker,
+            };
+        let routing = |dir: Option<&std::path::Path>| {
+            vec![
+                ("HOME".to_string(), Some(home.display().to_string())),
+                (
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    dir.map(|dir| dir.display().to_string()),
+                ),
+            ]
+        };
+
+        // Routed at the default store: the launch exported it, so the marker
+        // says so rather than leaving the legacy row to guess.
+        assert_eq!(
+            attested_default_store(
+                &binding(&default, "claude", Some(true)),
+                &routing(Some(&default)),
+                &home
+            ),
+            Some(true)
+        );
+        // Left implicit, which the launch observed just as surely.
+        assert_eq!(
+            attested_default_store(
+                &binding(&default, "claude", Some(false)),
+                &routing(None),
+                &home
+            ),
+            Some(false)
+        );
+        // A store that is not the default one, however it was routed.
+        assert_eq!(
+            attested_default_store(
+                &binding(&custom, "claude", Some(false)),
+                &routing(Some(&custom)),
+                &home
+            ),
+            Some(false)
+        );
+        // No route resolved, and not this agent's host namespace.
+        assert_eq!(
+            attested_default_store(
+                &binding(&default, "claude", None),
+                &routing(Some(&default)),
+                &home
+            ),
+            None
+        );
+        // Another agent's host namespace, and a launch that is not on the host
+        // at all, attest nothing.
+        assert_eq!(
+            attested_default_store(
+                &binding(&default, "codex", Some(false)),
+                &routing(Some(&default)),
+                &home
+            ),
+            None
+        );
+        let mut container = binding(&default, "claude", Some(false));
+        container.filesystem = "container:session".into();
+        assert_eq!(
+            attested_default_store(&container, &routing(Some(&default)), &home),
+            None
+        );
+    }
+
+    /// #4127: the route the launch attests is the one the agent will actually
+    /// see. A containerised launch routes to the container's own store, so the
+    /// host's Claude namespace says nothing about it and the launch attests
+    /// nothing at all — even though the very same binding, launched on the
+    /// host, is stamped.
+    #[test]
+    fn attested_claude_store_route_refuses_a_container_launch() {
+        use crate::containers::{ContainerExecutionSnapshot, RuntimeExecutionSnapshot};
+        use crate::session::instance::execution::{NativeExecution, NativeLaunchInputs};
+        use crate::session::ContainerRuntimeName;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let store = home.join(".claude");
+        std::fs::create_dir_all(&store).unwrap();
+        let mut instance = Instance::new("attested-route", temp.path().to_str().unwrap());
+        // The launched agent's HOME, so the route is read off a known home
+        // rather than the one running the tests.
+        instance.pending_host_env = vec![("HOME".into(), home.display().to_string())];
+
+        let container = ContainerExecutionSnapshot {
+            runtime: RuntimeExecutionSnapshot {
+                kind: ContainerRuntimeName::Docker,
+                program: std::path::PathBuf::from("/usr/bin/docker"),
+                cwd: temp.path().to_path_buf(),
+                endpoint: "local://docker".into(),
+                local_mounts: true,
+                routing: Vec::new(),
+                global_arguments: Vec::new(),
+            },
+            name: "aoe-attested-route".into(),
+            id: "0123456789ab".into(),
+            mounts: Vec::new(),
+            shadow_mounts: Vec::new(),
+        };
+        let launch = |inputs_container: Option<ContainerExecutionSnapshot>| NativeExecution {
+            agent: crate::agents::get_agent("claude").expect("claude is a known agent"),
+            binding: ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![store.clone()],
+                configuration: Vec::new(),
+                cwd: home.clone(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: Some(false),
+            },
+            routing: vec![("CLAUDE_CONFIG_DIR".to_string(), None)],
+            case_insensitive_routing: &[],
+            omp: None,
+            inputs: NativeLaunchInputs {
+                launch_id: "launch-attested-route".into(),
+                environment: Default::default(),
+                cwd: temp.path().to_path_buf(),
+                profile: "default".into(),
+                container: inputs_container,
+                docker_env: None,
+                pane_env: Vec::new(),
+                identity_extension: None,
+            },
+            program: std::path::PathBuf::new(),
+            capture: None,
+            pi_transcript_path: None,
+            namespace_arguments: Vec::new(),
+            target_session_id: None,
+            resolved_target_session_id: None,
+            pi_pinnable: false,
+            opencode_preassign: false,
+        };
+
+        // The host launch stamps the binding it actually applied...
+        let host = launch(None);
+        let attested = instance
+            .attested_claude_store_route(&host)
+            .expect("a host launch attests the route it applied");
+        assert_eq!(attested.exported_default_store, Some(false));
+        // ...and stamps nothing else about it.
+        assert_eq!(attested.agent, host.binding.agent);
+        assert_eq!(attested.stores, host.binding.stores);
+        assert_eq!(attested.cwd, host.binding.cwd);
+
+        // The containerised launch attests no route at all, so the caller
+        // keeps the unstamped binding rather than one that claims the host's
+        // Claude namespace described the container's store.
+        let container_launch = launch(Some(container));
+        assert_eq!(
+            instance.attested_claude_store_route(&container_launch),
+            None
+        );
     }
 }

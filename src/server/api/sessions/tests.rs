@@ -770,7 +770,7 @@ fn fork_seed_and_structured_fork_guard_agree_per_agent() {
                 agent: "claude".into(),
                 stores: vec!["/tmp/claude-store".into()],
                 configuration: Vec::new(),
-                exported_default_store: false,
+                exported_default_store: None,
                 cwd: "/tmp".into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),
@@ -1647,7 +1647,7 @@ fn apply_post_restart_sync_propagates_agent_session_id() {
     started.status = Status::Starting;
     started.agent_session_id = Some("claude-uuid-restart".to_string());
     started.omp_capture_generation = Some("omp-generation-restart".to_string());
-    let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
+    let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string(), None);
     assert_eq!(
         poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
         crate::session::poller::PollerSpawn::Spawned
@@ -1713,7 +1713,7 @@ fn apply_post_restart_identity_sync_clears_the_live_poller_schedule() {
     // A relaunch stamps its start time next to the schedule it clears (start.rs).
     started.last_start_time = Some(std::time::Instant::now());
     started.poller_repair.reset();
-    let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
+    let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string(), None);
     assert_eq!(
         poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
         crate::session::poller::PollerSpawn::Spawned
@@ -1734,10 +1734,61 @@ fn apply_post_restart_identity_sync_clears_the_live_poller_schedule() {
     apply_post_restart_identity_sync(&mut peer_relaunched, &before, &started);
     assert_eq!(peer_relaunched.poller_repair.deferrals(), 0);
 
+    // A relaunch that replaced the pane without installing a poller carries one that watches the
+    // superseded execution, which the row is about to give up: the applier stops it and hands
+    // back nothing.
+    let launch_2 = crate::session::ActiveExecution {
+        launch_id: "launch-2".into(),
+        binding: crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: Vec::new(),
+            configuration: Vec::new(),
+            cwd: PathBuf::from("/tmp"),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store: None,
+        },
+        capture: None,
+        container: None,
+    };
+    let mut superseded_poller = crate::session::poller::SessionPoller::new(
+        "omp-restarted".to_string(),
+        Some(launch_2.clone()),
+    );
+    assert_eq!(
+        superseded_poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+        crate::session::poller::PollerSpawn::Spawned
+    );
+    let mut superseded = started.clone();
+    superseded.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(
+        superseded_poller,
+    )));
+    superseded.active_execution = Some(crate::session::ActiveExecution {
+        launch_id: "launch-3".into(),
+        ..launch_2.clone()
+    });
+    let mut live = before.clone();
+    live.agent_session_id = Some("peer-sid".to_string());
+    live.active_execution = Some(launch_2);
+    live.session_id_poller = superseded.session_id_poller.clone();
+    apply_post_restart_identity_sync(&mut live, &before, &superseded);
+    assert_eq!(
+        live.active_execution.as_ref().map(|e| e.launch_id.as_str()),
+        Some("launch-3"),
+        "the row takes the execution the launch ran"
+    );
+    assert!(
+        !superseded.session_id_poller_is_running(),
+        "the poller for the superseded launch is stopped"
+    );
+    assert!(
+        live.session_id_poller.is_none(),
+        "and it is not handed back beside the execution it cannot watch"
+    );
+
     // A relaunch that reached the launch stamp replaced the poller, so the schedule that paced it
     // goes with it, even though the live row's own walk had gone deeper since.
-    let mut relaunched = started.clone();
-    relaunched.last_start_time = Some(std::time::Instant::now());
+    let relaunched = started.clone();
     let mut live = before.clone();
     live.poller_repair.reprobe(now);
     live.poller_repair.reprobe(now);

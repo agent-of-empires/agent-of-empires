@@ -37,7 +37,7 @@ impl Instance {
             disk.last_error_check = self.last_error_check;
             disk.last_error = self.last_error.take();
         }
-        if self.active_execution != disk.active_execution {
+        if !self.poller_serves(disk.active_execution.as_ref()) {
             self.stop_poller();
             self.session_id_poller = None;
         }

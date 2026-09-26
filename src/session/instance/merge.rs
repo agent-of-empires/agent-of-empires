@@ -54,24 +54,21 @@ impl Instance {
             if conversation_unchanged {
                 self.adopt_conversation_state(src.conversation_state());
             } else {
-                // The pane is the relaunch's whatever became of the conversation, and a poller
-                // is only usable by a row holding the execution it was installed for: its
-                // observations are dropped otherwise (`sync.rs`), and a launch-id-scoped one
-                // reads the other launch's file. Without this the branch below stays closed.
-                self.active_execution = src.active_execution.clone();
+                // The pane is the relaunch's whatever became of the conversation.
+                self.adopt_active_execution(src);
             }
         }
-        if self.active_execution == src.active_execution {
+        // A poller serves the execution it was installed for, so the row takes the launch's only
+        // when that poller watches the execution the row has just taken on.
+        if src.poller_serves(self.active_execution.as_ref()) {
             self.session_id_poller = src.session_id_poller.clone();
             self.session_id_poller_retry_after = src.session_id_poller_retry_after;
         } else {
             src.stop_poller();
         }
-        // A relaunch stamps a new start time right after it clears the schedule (start.rs), so a
-        // difference here means it replaced the pane this schedule paced, and the walk that
-        // installs the next poller follows that pane. Keyed on the stamp alone: the branch above
-        // can decline, when the relaunch also moved the conversation. A relaunch that died before
-        // the stamp says nothing, and the live row keeps what its own walk armed.
+        // A relaunch that reached its start-time stamp replaced the pane this schedule paced, so
+        // the schedule goes with it and the walk installs a poller for the new pane. A relaunch
+        // that died before the stamp says nothing, and the live row keeps its own schedule.
         if src.last_start_time != before.last_start_time {
             self.poller_repair.reset();
         }
@@ -101,7 +98,7 @@ impl Instance {
         self.last_error = previous.last_error.clone();
         self.last_error_check = previous.last_error_check;
         self.last_start_time = previous.last_start_time;
-        if self.active_execution == previous.active_execution {
+        if previous.poller_serves(self.active_execution.as_ref()) {
             self.session_id_poller = previous.session_id_poller.clone();
             self.poller_repair = previous.poller_repair.clone();
             self.session_id_poller_retry_after = previous.session_id_poller_retry_after;
@@ -418,8 +415,8 @@ mod tests {
         }
     }
 
-    fn running_poller(id: &str) -> Arc<Mutex<SessionPoller>> {
-        let mut poller = SessionPoller::new("omp-restarted".to_string());
+    fn running_poller(id: &str, execution: Option<ActiveExecution>) -> Arc<Mutex<SessionPoller>> {
+        let mut poller = SessionPoller::new("omp-restarted".to_string(), execution);
         assert_eq!(
             poller.start(id.to_string(), Box::new(|| None), Box::new(|_| {}), None),
             crate::session::poller::PollerSpawn::Spawned
@@ -682,7 +679,7 @@ mod tests {
         // A relaunch stamps its start time next to the schedule it clears (start.rs).
         restarted.last_start_time = Some(std::time::Instant::now());
         restarted.poller_repair.reset();
-        let restarted_poller = running_poller(&before.id);
+        let restarted_poller = running_poller(&before.id, None);
         restarted.session_id_poller = Some(restarted_poller.clone());
 
         let mut live = before.clone();
@@ -690,6 +687,21 @@ mod tests {
         assert_eq!(live.omp_capture_generation.as_deref(), Some("generation-b"));
         assert!(live.session_id_poller.is_some());
         assert_eq!(live.poller_repair.deferrals(), 0);
+
+        // A relaunch that died before it reached its own poller step never installed one, so the
+        // merge is handed the row's own handle on both sides. Nothing was adopted, yet the handle
+        // is the row's: stopping it here would take the row's only watcher away, and no later walk
+        // can install one for a pane the row never stopped watching.
+        let mut dying_relaunch = before.clone();
+        dying_relaunch.omp_capture_generation = Some("generation-b".to_string());
+        dying_relaunch.session_id_poller = live.session_id_poller.clone();
+        let mut carried = before.clone();
+        carried.session_id_poller = live.session_id_poller.clone();
+        carried.merge_post_restart_with_baseline(&before, &dying_relaunch);
+        assert!(
+            carried.session_id_poller_is_running(),
+            "a poller the relaunch merely carried over is the row's own and stays running"
+        );
 
         let mut converged = before.clone();
         converged.agent_session_id = Some("peer-sid".to_string());
@@ -714,8 +726,7 @@ mod tests {
 
         // A relaunch that reached the launch stamp replaced the poller, so the schedule that
         // paced it goes with it, even though the live row's own walk had gone deeper since.
-        let mut relaunched = restarted.clone();
-        relaunched.last_start_time = Some(std::time::Instant::now());
+        let relaunched = restarted.clone();
         let mut live = before.clone();
         live.poller_repair.reprobe(now);
         live.poller_repair.reprobe(now);
@@ -729,8 +740,7 @@ mod tests {
         // A relaunch whose conversation moved under it still replaced the pane, so the row must
         // take its execution and its poller: a poller is only usable by a row holding the
         // execution it was installed for.
-        let mut relaunched = restarted.clone();
-        relaunched.active_execution = Some(ActiveExecution {
+        let launch_2 = ActiveExecution {
             launch_id: "launch-2".into(),
             binding: crate::session::instance::ExecutionBinding {
                 agent: "claude".into(),
@@ -739,11 +749,15 @@ mod tests {
                 cwd: PathBuf::from("/tmp"),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),
-                exported_default_store: false,
+                exported_default_store: None,
             },
             capture: None,
             container: None,
-        });
+        };
+        let launch_2_poller = running_poller(&before.id, Some(launch_2.clone()));
+        let mut relaunched = restarted.clone();
+        relaunched.session_id_poller = Some(launch_2_poller.clone());
+        relaunched.active_execution = Some(launch_2.clone());
         let mut live = before.clone();
         live.agent_session_id = Some("peer-sid".to_string());
         live.merge_post_restart_with_baseline(&before, &relaunched);
@@ -753,9 +767,90 @@ mod tests {
             "the pane the relaunch created is the row's, whatever became of the conversation"
         );
         assert!(
-            Arc::ptr_eq(live.session_id_poller.as_ref().unwrap(), &restarted_poller),
-            "and its poller comes with it"
+            Arc::ptr_eq(live.session_id_poller.as_ref().unwrap(), &launch_2_poller),
+            "and the poller it installed for that execution comes with it"
         );
+
+        // A relaunch that brought no poller at all says nothing about the row's own, even when it
+        // holds the very execution the row has: a third generation on both sides blocks the
+        // adoption, so the row keeps the watcher its execution needs.
+        let own = running_poller(&before.id, Some(launch_2.clone()));
+        let mut peer = restarted.clone();
+        peer.omp_capture_generation = Some("peer-generation".to_string());
+        peer.active_execution = Some(launch_2.clone());
+        peer.session_id_poller = None;
+        let mut live = before.clone();
+        live.omp_capture_generation = Some("live-generation".to_string());
+        live.active_execution = Some(launch_2.clone());
+        live.session_id_poller = Some(own.clone());
+        live.merge_post_restart_with_baseline(&before, &peer);
+        assert!(
+            Arc::ptr_eq(live.session_id_poller.as_ref().unwrap(), &own),
+            "the row keeps the watcher its own execution needs"
+        );
+        stop(&own);
+
+        // A relaunch that replaced the pane without installing a poller carries the superseded
+        // launch's own, which watches an execution the row is about to give up: it cannot keep
+        // it, and the walk is the only thing that installs one for the pane it launched.
+        let outgoing = running_poller(&before.id, Some(launch_2.clone()));
+        let mut relaunched = restarted.clone();
+        relaunched.session_id_poller = Some(outgoing.clone());
+        relaunched.active_execution = Some(ActiveExecution {
+            launch_id: "launch-3".into(),
+            binding: crate::session::instance::ExecutionBinding {
+                agent: "claude".into(),
+                stores: Vec::new(),
+                configuration: Vec::new(),
+                cwd: PathBuf::from("/tmp"),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            },
+            capture: None,
+            container: None,
+        });
+        let mut live = before.clone();
+        live.agent_session_id = Some("peer-sid".to_string());
+        live.active_execution = Some(launch_2);
+        live.session_id_poller = Some(outgoing.clone());
+        live.merge_post_restart_with_baseline(&before, &relaunched);
+        assert_eq!(
+            live.active_execution.as_ref().map(|e| e.launch_id.as_str()),
+            Some("launch-3")
+        );
+        assert!(
+            !live.session_id_poller_is_running(),
+            "the superseded launch's poller is stopped, so the walk can install one for launch-3"
+        );
+        assert!(
+            live.session_id_poller.is_none(),
+            "and it is not handed back beside the execution it cannot watch"
+        );
+        assert!(
+            live.poller_repair.due(std::time::Instant::now()),
+            "and the row is due at once rather than waiting out the old schedule"
+        );
+        stop(&outgoing);
+
+        // A relaunch that never got past its own poller step carries the row's poller over
+        // untouched, and the execution it launched is the row's own. That poller still watches
+        // the row's pane, so the merge must not stop it.
+        let carried = running_poller(&before.id, None);
+        let mut failed_relaunch = before.clone();
+        failed_relaunch.session_id_poller = Some(carried.clone());
+        let mut live = before.clone();
+        live.session_id_poller = Some(carried.clone());
+        live.merge_post_restart_with_baseline(&before, &failed_relaunch);
+        assert!(
+            live.session_id_poller_is_running(),
+            "a poller the relaunch never got past must not be stopped by the merge"
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            live.session_id_poller.as_ref().unwrap(),
+            &carried
+        ));
+        stop(&carried);
 
         // A relaunch that died before the launch stamp says nothing about the schedule, and the
         // live row keeps what its own walk armed.

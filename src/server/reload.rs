@@ -54,7 +54,7 @@ pub(super) fn load_all_instances(
 /// Carry over the in-memory-only fields from the prior `state.instances` entry into the
 /// freshly-loaded one.
 pub(super) fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
-    if fresh.active_execution == prior.active_execution {
+    if prior.poller_serves(fresh.active_execution.as_ref()) {
         fresh.session_id_poller = prior.session_id_poller;
         fresh.poller_repair = prior.poller_repair;
         fresh.session_id_poller_retry_after = prior.session_id_poller_retry_after;
@@ -775,10 +775,10 @@ mod tests {
                         agent: "claude".into(),
                         stores: vec![app.path().to_path_buf()],
                         configuration: Vec::new(),
-                        exported_default_store: false,
                         cwd: app.path().to_path_buf(),
                         cwd_filesystem: "host".into(),
                         filesystem: "host".into(),
+                        exported_default_store: None,
                     },
                     "capture": { "Hooks": hooks.join(format!("session_id.{launch}")) },
                     "container": null,
@@ -788,6 +788,10 @@ mod tests {
             assert_eq!(
                 prior.maybe_start_poller(),
                 crate::session::PollerStart::Started
+            );
+            assert!(
+                prior.poller_serves(prior.active_execution.as_ref()),
+                "an installed poller serves the row's own execution"
             );
             let mut fresh: Instance =
                 serde_json::from_str(&serde_json::to_string(&prior).unwrap()).unwrap();

@@ -6,6 +6,46 @@ use sha2::{Digest as _, Sha256};
 
 const MANAGED_CAPTURE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Lets a test hold the start path open long enough to observe that the repair
+/// schedule is stamped after it, the way a wedged `tmux` does.
+#[cfg(test)]
+pub(super) mod probe_delay {
+    thread_local! {
+        static DELAY: std::cell::RefCell<Option<Box<dyn Fn(&super::Instance)>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(in crate::session::instance) struct ProbeDelay;
+
+    impl ProbeDelay {
+        pub(in crate::session::instance) fn install(
+            delay: impl Fn(&super::Instance) + 'static,
+        ) -> Self {
+            DELAY.with(|slot| {
+                assert!(slot.borrow().is_none(), "one probe delay per test thread");
+                *slot.borrow_mut() = Some(Box::new(delay));
+            });
+            Self
+        }
+    }
+
+    impl Drop for ProbeDelay {
+        fn drop(&mut self) {
+            DELAY.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    pub(super) fn hold(instance: &super::Instance) {
+        DELAY.with(|slot| {
+            if let Some(delay) = slot.borrow().as_ref() {
+                delay(instance);
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static AFTER_FINAL_PI_DRAIN: std::cell::RefCell<
@@ -272,6 +312,8 @@ impl Instance {
         &mut self,
         omp_metadata: Option<OmpCaptureMetadata>,
     ) -> PollerStart {
+        #[cfg(test)]
+        probe_delay::hold(self);
         if !crate::migrations::v033_isolate_sandbox_content::instance_ready(self).unwrap_or(false) {
             self.session_id_poller = None;
             return PollerStart::NotApplicable;
@@ -416,7 +458,7 @@ impl Instance {
             None
         };
 
-        let mut poller = SessionPoller::new(tmux_session_name);
+        let mut poller = SessionPoller::new(tmux_session_name, self.active_execution.clone());
         let instance_id = self.id.clone();
         let initial_known = self.agent_session_id.clone().filter(|_| {
             self.agent_session_binding
@@ -622,6 +664,17 @@ impl Instance {
             .map(|sid| crate::session::poller::SessionIdObservation::instance_sidecar(sid, None));
         let spawn = poller.start_observations(instance_id, poll_fn, on_change, initial);
         self.install_poller(poller, spawn)
+    }
+
+    /// Whether the poller this row holds watches `execution`, the execution the row is taking on.
+    /// A row with no poller has none to watch, whatever it used to hold.
+    pub(crate) fn poller_serves(&self, execution: Option<&ActiveExecution>) -> bool {
+        self.session_id_poller.as_ref().is_some_and(|poller| {
+            poller
+                .lock()
+                .map(|guard| guard.serves(execution))
+                .unwrap_or_else(|poisoned| poisoned.into_inner().serves(execution))
+        })
     }
 
     pub(crate) fn session_id_poller_is_running(&self) -> bool {
@@ -878,6 +931,50 @@ mod tests {
             "a successful start clears the schedule whoever triggered it"
         );
         inst.stop_poller();
+    }
+
+    /// The window is stamped from after the attempt, so a probe that outlasts it cannot leave
+    /// the row due again on the next tick.
+    #[test]
+    #[serial_test::serial]
+    fn a_slow_probe_still_arms_a_window_that_has_not_expired() {
+        let _isolated = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("slow-probe", "/tmp/slow-probe");
+        inst.tool = "omp".to_string();
+        inst.omp_capture_generation = Some("gen-1".to_string());
+        let live = crate::tmux::LiveSessionSnapshot::from_parts(
+            Some(vec![crate::tmux::Session::generate_name(
+                &inst.id,
+                &inst.title,
+            )]),
+            None,
+        );
+        assert!(inst.has_live_agent_pane_in(&live));
+
+        let probing = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mark = probing.clone();
+        let _delay = super::probe_delay::ProbeDelay::install(move |_| {
+            *mark.lock().unwrap() = Some(std::time::Instant::now());
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        });
+        assert!(!inst.repair_session_id_poller_if_needed(&live));
+        let armed = inst
+            .poller_repair
+            .armed_at()
+            .expect("a re-probe arms a deadline");
+        let probing = probing.lock().unwrap().expect("the start path ran");
+        assert_eq!(
+            inst.poller_repair.current_reprobe_delay(),
+            Some(std::time::Duration::from_secs(5)),
+            "a re-probe arms its own ladder, not the failure one"
+        );
+        let since_probe = armed.duration_since(probing);
+        assert!(
+            since_probe >= std::time::Duration::from_secs(5)
+                && since_probe < std::time::Duration::from_secs(7),
+            "the deadline is the first re-probe delay counted from the end of the attempt, not \
+             from before it and not from the ceiling: {since_probe:?} since the probe began"
+        );
     }
 
     /// A live pane with nothing to poll right now (here: an OMP pane whose capture metadata is not
@@ -1245,7 +1342,7 @@ mod tests {
                     agent: "gemini".into(),
                     stores: vec![store.to_path_buf()],
                     configuration: Vec::new(),
-                    exported_default_store: false,
+                    exported_default_store: None,
                     cwd: "/workspace".into(),
                     cwd_filesystem: "host".into(),
                     filesystem: "host".into(),
@@ -1383,7 +1480,7 @@ mod tests {
         // Present but not running, so the running check does not
         // short-circuit and the handle stays observable.
         inst.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(
-            crate::session::poller::SessionPoller::new("unstarted".to_string()),
+            crate::session::poller::SessionPoller::new("unstarted".to_string(), None),
         )));
 
         assert!(!inst.repair_session_id_poller_if_needed(&snapshot));
