@@ -2046,6 +2046,9 @@ mod tests {
             "a session environment store must be named as the source"
         );
         drop(env);
+        // The session environment baselines on the process environment, so the
+        // default tier needs the variable removed, not merely undeclared.
+        let env = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         let (from_default, _) = resumed(&mut instance(), attested.binding.clone());
         assert_eq!(
             from_default
@@ -2057,7 +2060,7 @@ mod tests {
                 crate::session::instance::test_helpers::path_identity(&home.join(".claude")),
                 "default"
             )),
-            "with no declaration the default store is the source"
+            "with no declaration and no environment the default store is the source"
         );
     }
 }
