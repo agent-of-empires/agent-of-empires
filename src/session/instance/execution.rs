@@ -1279,11 +1279,17 @@ impl Instance {
                 inputs.cwd.join(path)
             })
         };
-        let declared = config
+        // A container routes to an isolated store, so the declaration does not
+        // select its root and is filtered out below. It still names a store
+        // otherwise, though, and the default-store route rule reads the
+        // declaration whether or not a container is in play.
+        let declared_store = config
             .session
             .agent_config_dir_for(&self.tool, &home)
-            .filter(|_| inputs.container.is_none())
             .map(absolute);
+        let declared = declared_store
+            .clone()
+            .filter(|_| inputs.container.is_none());
         let config_home = absolute(
             value("XDG_CONFIG_HOME")
                 .filter(|value| !value.is_empty())
@@ -1327,12 +1333,17 @@ impl Instance {
                 let explicit = recorded_execution
                     .and_then(|execution| execution.exported_default_store)
                     .unwrap_or_else(|| {
-                        let selected_alias = self.is_explicit_claude_store_alias(&root, &home);
-                        let exported_this_store = value("CLAUDE_CONFIG_DIR")
+                        let ambient = value("CLAUDE_CONFIG_DIR")
                             .filter(|value| !value.is_empty())
-                            .and_then(|value| inputs.canonical_path(&absolute(PathBuf::from(value))).ok())
-                            .is_some_and(|value| inputs.canonical_path(&root).ok().as_ref() == Some(&value));
-                        selected_alias || exported_this_store
+                            .and_then(|value| {
+                                inputs.canonical_path(&absolute(PathBuf::from(value))).ok()
+                            });
+                        crate::session::capture::is_explicit_claude_store_route(
+                            &root,
+                            &home,
+                            declared_store.as_deref(),
+                            ambient.as_deref(),
+                        )
                     });
                 let export = inputs.container.is_some() || explicit || !default;
                 exported_default_store = Some(export && default);

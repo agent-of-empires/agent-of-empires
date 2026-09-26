@@ -616,34 +616,32 @@ impl Instance {
         let execution = binding.execution.as_ref()?;
         (execution.agent == "claude" && execution.filesystem == "host").then_some((sid, execution))
     }
-    pub(crate) fn is_explicit_claude_store_alias(
-        &self,
-        store: &std::path::Path,
-        home: &std::path::Path,
-    ) -> bool {
-        self.declared_agent_config_dir_for(&self.tool)
-            .is_some_and(|declared| {
-                crate::session::capture::is_default_claude_store(&declared, home)
-                    && crate::git::template::lexical_normalize(&declared)
-                        != crate::git::template::lexical_normalize(&home.join(".claude"))
-                    && crate::session::capture::is_default_claude_store(store, home)
-            })
-    }
 
+    /// A legacy binding carries no route marker, so the marker is derived from
+    /// the configuration as it stands right now — the same rule the launch
+    /// itself routes with, ambient `CLAUDE_CONFIG_DIR` included, since a
+    /// wrapper that exports the default store is naming it too. Deriving
+    /// rather than reading keeps a reconfigured alias observed instead of
+    /// frozen into the row.
     pub(crate) fn selected_claude_store_pin(
         &self,
     ) -> Option<crate::session::capture::ClaudeStorePin> {
         let (_, execution) = self.selected_claude_conversation()?;
         let mut pin = crate::session::capture::ClaudeStorePin::of(execution)?;
         if pin.exported_default_store.is_none() {
-            let home = super::hooks::host_home(&self.resolved_host_environment());
-            let default = home.as_deref().is_some_and(|home| {
-                crate::session::capture::is_default_claude_store(&pin.store, home)
+            let host_env = self.resolved_host_environment();
+            let declared = self.declared_agent_config_dir_for(&self.tool);
+            let ambient = crate::hooks::resolve_config_dir_override("CLAUDE_CONFIG_DIR", &host_env)
+                .map(std::path::PathBuf::from);
+            let explicit = super::hooks::host_home(&host_env).is_some_and(|home| {
+                crate::session::capture::is_explicit_claude_store_route(
+                    &pin.store,
+                    &home,
+                    declared.as_deref(),
+                    ambient.as_deref(),
+                )
             });
-            let explicit_alias = home
-                .as_deref()
-                .is_some_and(|home| self.is_explicit_claude_store_alias(&pin.store, home));
-            pin.exported_default_store = Some(if default { explicit_alias } else { false });
+            pin.exported_default_store = Some(explicit);
         }
         Some(pin)
     }
@@ -772,6 +770,7 @@ mod tests {
     fn legacy_claude_default_binding_derives_implicit_routing_without_freezing_it() {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         let sid = "11111111-1111-4111-8111-111111111111";
         let mut inst = Instance::new("legacy-acp-default", temp.path().to_str().unwrap());
         inst.tool = "claude".into();
@@ -815,6 +814,7 @@ mod tests {
     fn explicit_alias_of_default_store_derives_exported_routing() {
         let temp = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         let profile = "alias-routing-provenance";
         let work = temp.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
@@ -868,6 +868,59 @@ mod tests {
                 .unwrap()
                 .exported_default_store,
             Some(false)
+        );
+    }
+
+    /// The ambient `CLAUDE_CONFIG_DIR` names the default store exactly like a
+    /// declared alias does, and a legacy binding is re-derived against it: a
+    /// wrapper that exports `<home>/.claude` has selected that store, so
+    /// dropping the export on the next read would route the conversation into
+    /// the bare one.
+    #[test]
+    #[serial_test::serial]
+    fn ambient_default_store_derives_exported_routing() {
+        let temp = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let default = temp.path().join(".claude");
+        let sid = "11111111-1111-4111-8111-111111111111";
+        let mut inst = Instance::new("ambient-acp-default", temp.path().to_str().unwrap());
+        inst.tool = "claude".into();
+        inst.resume_intent = ResumeIntent::Use(sid.into());
+        inst.resume_binding = Some(ConversationBinding {
+            session_id: sid.into(),
+            execution: Some(ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![default.clone()],
+                configuration: Vec::new(),
+                cwd: temp.path().to_path_buf(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            }),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+
+        let _env = crate::session::test_support::EnvGuard::set(&[(
+            "CLAUDE_CONFIG_DIR",
+            default.as_os_str(),
+        )]);
+        assert_eq!(
+            inst.selected_claude_store_pin()
+                .unwrap()
+                .exported_default_store,
+            Some(true)
+        );
+        assert_eq!(
+            inst.resume_binding
+                .as_ref()
+                .unwrap()
+                .execution
+                .as_ref()
+                .unwrap()
+                .exported_default_store,
+            None,
+            "the derived route must not be persisted into the binding"
         );
     }
 
