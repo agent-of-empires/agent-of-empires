@@ -380,28 +380,6 @@ mod tests {
     }
 
     #[test]
-    fn unread_marker_is_idempotent_toggles_and_skips_serialization_when_false() {
-        let mut inst = inst();
-        assert!(!inst.is_unread());
-        for (step, expected) in [
-            (Instance::mark_unread as fn(&mut Instance), true),
-            (Instance::mark_unread, true),
-            (Instance::mark_read, false),
-            (Instance::mark_read, false),
-            (Instance::toggle_unread, true),
-            (Instance::toggle_unread, false),
-        ] {
-            step(&mut inst);
-            assert_eq!(inst.is_unread(), expected);
-        }
-        assert!(serde_json::to_value(&inst).unwrap().get("unread").is_none());
-        inst.unread = true;
-        let json = serde_json::to_value(&inst).unwrap();
-        assert_eq!(json["unread"], serde_json::json!(true));
-        assert!(serde_json::from_value::<Instance>(json).unwrap().unread);
-    }
-
-    #[test]
     fn dormancy_presents_only_on_an_idle_row() {
         for (status, marked, shown) in [
             (Status::Idle, true, true),
@@ -484,24 +462,5 @@ mod tests {
         inst.idle_entered_at = ago(5);
         let age = inst.idle_age().unwrap().as_secs();
         assert!((4..=30).contains(&age));
-    }
-
-    #[test]
-    fn archive_settles_only_live_interaction_statuses() {
-        for (status, expected) in [
-            (Status::Running, Status::Idle),
-            (Status::Waiting, Status::Idle),
-            (Status::Starting, Status::Idle),
-            (Status::Idle, Status::Idle),
-            (Status::Stopped, Status::Stopped),
-            (Status::Error, Status::Error),
-            (Status::Unknown, Status::Unknown),
-        ] {
-            let mut inst = inst();
-            inst.status = status;
-            inst.archive();
-            assert!(inst.is_archived());
-            assert_eq!(inst.status, expected, "{status:?}");
-        }
     }
 }

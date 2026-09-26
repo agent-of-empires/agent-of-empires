@@ -634,33 +634,27 @@ mod workspace_ordering_tests {
     }
 
     #[test]
-    fn id_uses_branch_when_present() {
-        let r = mock_response("s1", "/tmp/repo", Some("feature/x"));
-        assert_eq!(workspace_id_for_session(&r), "/tmp/repo::feature/x");
-    }
-
-    #[test]
-    fn id_falls_back_to_session_id_when_branchless() {
-        let r = mock_response("abc123", "/tmp/repo", None);
-        assert_eq!(
-            workspace_id_for_session(&r),
-            "/tmp/repo::__session__::abc123"
-        );
-    }
-
-    #[test]
-    fn id_strips_trailing_slash() {
-        // The client's `normalizePath` strips trailing slashes; the server
-        // must match so the merged ordering keys line up.
-        let r = mock_response("s1", "/tmp/repo/", Some("main"));
-        assert_eq!(workspace_id_for_session(&r), "/tmp/repo::main");
-    }
-
-    #[test]
-    fn id_prefers_main_repo_path_over_project_path() {
-        let mut r = mock_response("s1", "/tmp/worktree", Some("main"));
-        r.main_repo_path = Some("/tmp/repo".to_string());
-        assert_eq!(workspace_id_for_session(&r), "/tmp/repo::main");
+    fn workspace_id_keys_on_repo_and_branch() {
+        let mut worktree = mock_response("s1", "/tmp/worktree", Some("main"));
+        worktree.main_repo_path = Some("/tmp/repo".to_string());
+        for (response, expected) in [
+            (
+                mock_response("s1", "/tmp/repo", Some("feature/x")),
+                "/tmp/repo::feature/x",
+            ),
+            (
+                mock_response("abc123", "/tmp/repo", None),
+                "/tmp/repo::__session__::abc123",
+            ),
+            // Matches the client's `normalizePath`, which strips trailing slashes.
+            (
+                mock_response("s1", "/tmp/repo/", Some("main")),
+                "/tmp/repo::main",
+            ),
+            (worktree, "/tmp/repo::main"),
+        ] {
+            assert_eq!(workspace_id_for_session(&response), expected);
+        }
     }
 
     #[test]
@@ -702,48 +696,6 @@ mod workspace_ordering_tests {
 
     #[test]
     #[serial]
-    fn merge_dedupes_within_a_single_request() -> anyhow::Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        // Two sessions on one workspace (legal: multiple agents in one
-        // worktree). The workspace id appears once.
-        let sessions = vec![
-            mock_response("sa1", "/tmp/repo", Some("main")),
-            mock_response("sa2", "/tmp/repo", Some("main")),
-        ];
-
-        let merged = merge_workspace_ordering(&sessions, false)?;
-        assert_eq!(merged, vec!["/tmp/repo::main".to_string()]);
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
-    fn merge_no_op_when_all_known() -> anyhow::Result<()> {
-        let temp = tempdir()?;
-        let _guard = setup_test_home(temp.path());
-
-        crate::session::update_workspace_ordering(|ord| {
-            ord.order = vec!["/tmp/repo::a".to_string(), "/tmp/repo::b".to_string()];
-            Ok(())
-        })?;
-
-        let sessions = vec![
-            mock_response("sa", "/tmp/repo", Some("a")),
-            mock_response("sb", "/tmp/repo", Some("b")),
-        ];
-
-        let merged = merge_workspace_ordering(&sessions, false)?;
-        assert_eq!(
-            merged,
-            vec!["/tmp/repo::a".to_string(), "/tmp/repo::b".to_string()]
-        );
-        Ok(())
-    }
-
-    #[test]
-    #[serial]
     fn merge_read_only_returns_merged_but_does_not_write() -> anyhow::Result<()> {
         let temp = tempdir()?;
         let _guard = setup_test_home(temp.path());
@@ -762,54 +714,43 @@ mod workspace_ordering_tests {
     }
 
     #[test]
-    fn compute_merged_ordering_pure_no_known_ids() {
-        let sessions = vec![
-            mock_response("s1", "/repo/a", Some("main")),
-            mock_response("s2", "/repo/b", Some("dev")),
-        ];
-        let merged = compute_merged_ordering(&sessions, &[]);
-        assert_eq!(
-            merged,
-            vec!["/repo/b::dev".to_string(), "/repo/a::main".to_string()]
-        );
-    }
-
-    #[test]
-    fn compute_merged_ordering_pure_dedupes_unknowns() {
-        let sessions = vec![
-            mock_response("s1", "/repo/a", Some("main")),
-            mock_response("s2", "/repo/a", Some("main")),
-            mock_response("s3", "/repo/b", Some("dev")),
-        ];
-        let merged = compute_merged_ordering(&sessions, &[]);
-        assert_eq!(merged.len(), 2);
-        assert!(merged.contains(&"/repo/a::main".to_string()));
-        assert!(merged.contains(&"/repo/b::dev".to_string()));
-    }
-
-    #[test]
-    fn compute_merged_ordering_pure_preserves_existing_order() {
+    fn compute_merged_ordering_prepends_unknowns_newest_first_once() {
+        let known = |id: &str, path: &str, branch: &str| mock_response(id, path, Some(branch));
         let existing = vec!["/repo/x::main".to_string(), "/repo/y::dev".to_string()];
-        let sessions = vec![mock_response("s1", "/repo/z", Some("feat"))];
-        let merged = compute_merged_ordering(&sessions, &existing);
-        assert_eq!(
-            merged,
-            vec![
-                "/repo/z::feat".to_string(),
-                "/repo/x::main".to_string(),
-                "/repo/y::dev".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn compute_merged_ordering_pure_returns_existing_when_all_known() {
-        let existing = vec!["/repo/x::main".to_string(), "/repo/y::dev".to_string()];
-        let sessions = vec![
-            mock_response("s1", "/repo/x", Some("main")),
-            mock_response("s2", "/repo/y", Some("dev")),
+        let cases = [
+            (
+                vec![
+                    known("s1", "/repo/a", "main"),
+                    known("s2", "/repo/b", "dev"),
+                ],
+                vec![],
+                vec!["/repo/b::dev", "/repo/a::main"],
+            ),
+            (
+                vec![
+                    known("s1", "/repo/a", "main"),
+                    known("s2", "/repo/a", "main"),
+                    known("s3", "/repo/b", "dev"),
+                ],
+                vec![],
+                vec!["/repo/b::dev", "/repo/a::main"],
+            ),
+            (
+                vec![known("s1", "/repo/z", "feat")],
+                existing.clone(),
+                vec!["/repo/z::feat", "/repo/x::main", "/repo/y::dev"],
+            ),
+            (
+                vec![
+                    known("s1", "/repo/x", "main"),
+                    known("s2", "/repo/y", "dev"),
+                ],
+                existing,
+                vec!["/repo/x::main", "/repo/y::dev"],
+            ),
         ];
-        let merged = compute_merged_ordering(&sessions, &existing);
-        assert_eq!(merged, existing);
+        for (sessions, existing, expected) in cases {
+            assert_eq!(compute_merged_ordering(&sessions, &existing), expected);
+        }
     }
 }

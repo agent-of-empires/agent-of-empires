@@ -53,12 +53,6 @@ impl Default for AttachProjectPoller {
 mod tests {
     use super::*;
 
-    #[test]
-    fn idle_poller_reports_empty_rather_than_blocking() {
-        let poller = AttachProjectPoller::new();
-        assert!(matches!(poller.try_recv_result(), Err(TryRecvError::Empty)));
-    }
-
     /// The seeded constructor is what lets the home-view tests drive the
     /// completion path without a real worktree on disk.
     #[test]

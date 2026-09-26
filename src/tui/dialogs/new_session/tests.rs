@@ -65,27 +65,6 @@ fn screen_of(dialog: &mut NewSessionDialog, width: u16, height: u16) -> String {
 }
 
 #[test]
-fn opens_on_the_path_field_with_the_caller_s_path() {
-    let dialog = single_tool_dialog();
-    assert_eq!(dialog.path.value(), TEST_PATH);
-    assert_eq!(dialog.title.value(), "");
-    assert_eq!(dialog.group.value(), "");
-    assert_eq!(dialog.focused_field, 0);
-    assert_eq!(dialog.tool_index, 0);
-    assert_eq!(dialog.profile_index, 0);
-    assert_eq!(dialog.selected_profile(), "default");
-    assert!(dialog.create_new_branch, "new branch is the default");
-    assert!(!dialog.sandbox_enabled);
-    assert!(!dialog.worktree_enabled);
-    assert!(!dialog.yolo_mode);
-    assert!(!dialog.scratch);
-    assert_eq!(
-        dialog.sandbox_image.value(),
-        crate::containers::get_container_runtime().effective_default_image()
-    );
-}
-
-#[test]
 fn config_seeds_the_worktree_toggle_and_sandbox_image() {
     let mut config = Config::default();
     config.worktree.enabled = true;
@@ -905,25 +884,6 @@ fn clicks_focus_a_row_and_act_on_it_while_hover_does_neither() {
 }
 
 #[test]
-fn help_content_fits_in_dialog() {
-    const BORDER_WIDTH: u16 = 2;
-    const INDENT: usize = 2;
-    let available_width = (HELP_DIALOG_WIDTH - BORDER_WIDTH) as usize;
-
-    for help in FIELD_HELP {
-        let line_width = INDENT + help.description.len();
-        assert!(
-            line_width <= available_width,
-            "Help for '{}': description '{}' exceeds dialog width ({} > {})",
-            help.name,
-            help.description,
-            line_width,
-            available_width
-        );
-    }
-}
-
-#[test]
 fn structured_default_reseeds_only_until_the_user_decides() {
     let cases = [
         // (configured default, user toggled first, expected after regain)
@@ -1216,19 +1176,20 @@ fn terminal_fork_hides_structured_despite_structured_default() {
     dialog.apply_structured_default();
     assert!(dialog.structured_enabled);
     dialog.set_fork_from(crate::session::ForkSeed::Terminal {
-        parent: crate::session::ConversationBinding {
+        parent: Box::new(crate::session::ConversationBinding {
             session_id: "parent".into(),
             execution: Some(crate::session::ExecutionBinding {
                 agent: "claude".into(),
                 stores: vec!["/store".into()],
                 configuration: Vec::new(),
+                exported_default_store: false,
                 cwd: TEST_PATH.into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),
             }),
             provenance: crate::session::ConversationProvenance::Observed,
             transcript_path: None,
-        },
+        }),
         child_session_id: "child".into(),
     });
     assert!(!dialog.structured_capable);

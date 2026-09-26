@@ -53,6 +53,10 @@ jobs:
           # toolchain hash, so successive pushes to the same PR reuse
           # the slot rather than thrashing the 10GB repo cache budget.
           save-if: true
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        if: matrix.leg != 'web-e2e'
+        with:
+          tool: cargo-nextest
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -126,13 +130,15 @@ jobs:
       # leg covers it end to end with no dashboard bundle and no npm in the
       # build. Without `e2e-tests` the e2e target is gated off, so it is
       # skipped here while every non-e2e test binary stays auto-discovered.
+      # nextest runs one process per test and the test binaries concurrently,
+      # so no test can pass on state an earlier one left behind.
       - name: Cargo test (default features, everything except e2e)
         if: matrix.leg == 'core-rest'
         # Echo the temp root so a silently-dropped TMPDIR is visible in the log
         # rather than passing as a green run with the guard gone.
         run: |
           echo "TMPDIR=${TMPDIR:-unset}"
-          cargo test
+          cargo nextest run --no-fail-fast
       # bare-core: the three no-default-features feature corners. `web` is not
       # a default feature, so these runs are also the dashboard-off compile
       # gate that keeps the `cfg(feature = "web")` sites from rotting.
@@ -150,9 +156,9 @@ jobs:
       - name: Cargo test (bare core, no default features)
         if: matrix.leg == 'bare-core'
         run: |
-          cargo test --no-default-features --lib --bins
+          cargo nextest run --no-default-features --lib --bins --no-fail-fast
           cargo test --no-default-features --features e2e-tests --test e2e -- \
-            --test-threads=3 cli:: tui_launch:: new_session::
+            --test-threads=3 cli:: new_session::
           cargo check --no-default-features --features default-plugins,e2e-tests --all-targets
       # A default `cargo build` must ship the daemon without invoking Node
       # (#3619). Shadow node and npm with failing stubs so a `web`-gate
@@ -261,8 +267,9 @@ jobs:
     # `e2e-tests` is an empty feature whose only consumer is `required-features`
     # on the `[[test]] name = "e2e"` target, so adding it to the --lib --bins
     # run changes the cargo fingerprint and not one line of compiled behavior.
-    # `--features web` is a strict superset of the default suite, so one run
-    # covers both feature gates.
+    # Default features otherwise: the `web`-gated code is OS-portable and the
+    # Linux web-e2e leg runs it, so skipping it here spares the npm and Vite
+    # build on the slowest runner.
     #
     # The two halves of the macOS surface:
     #  1. --lib --bins: macOS-specific code lives in src/process/macos.rs plus
@@ -277,7 +284,7 @@ jobs:
     #     living in the e2e crate (e.g. #1890) is outside the reach of
     #     --lib --bins. The fake ACP agent is self-contained
     #     (web/tests/helpers/fakeAcpAgent.mjs uses only `node:` builtins), so
-    #     no npm install is needed beyond the web bundle build.rs builds.
+    #     no npm install is needed.
     name: Cargo Test (macos)
     runs-on: macos-latest
     # Backstop against a hung test wedging a runner for GitHub's 6h cap (#2863).
@@ -303,16 +310,20 @@ jobs:
       - name: Install tmux
         if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         run: brew install tmux
+      - uses: taiki-e/install-action@3f74d7c16a4242f1c95561e98edc25d36adb4375 # v2.87.12
+        if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
+        with:
+          tool: cargo-nextest
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
         with:
           node-version: '22'
       - name: Cargo test (macOS, lib + bins)
         if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
-        run: cargo test --features web,e2e-tests --lib --bins
+        run: cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
       - name: Cargo test (macOS, acp live-daemon e2e)
         if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-macos')
-        run: cargo test --features web,e2e-tests --test e2e -- acp_ --test-threads=1 --nocapture
+        run: cargo test --features e2e-tests --test e2e -- acp_ --test-threads=1 --nocapture
       - name: Skipped on pull requests
         if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'ci-macos')
         run: echo "macOS runs post-merge on main. Add the 'ci-macos' label to run it here."

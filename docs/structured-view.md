@@ -127,6 +127,8 @@ aoe acp attach <session_id> --daemon-url https://aoe.example.com
 
 With `AOE_DAEMON_URL` set, the TUI swaps its home view for a remote session picker and `aoe serve --status` and the `aoe acp *` verbs retarget to the remote. Local-only operations (tmux attach, `aoe stop`, file edit) are not available against a remote; use the dashboard or SSH. The session list is read with a bearer token only over HTTPS or a loopback URL, so a token plus a plaintext remote URL is refused; the other daemon requests do not apply that check yet, so use HTTPS or a tunnel.
 
+A remote daemon running `--auth=passphrase` never mints a bearer token, so `AOE_DAEMON_TOKEN` has nothing to carry. Set `AOE_DAEMON_PASSPHRASE` instead; the CLI logs in via the same `/api/login` handshake the web dashboard uses and caches the resulting session for the process. A local daemon needs neither: the CLI already reads its own `serve.passphrase` file (the same one `aoe serve --restart` recalls from) to log in automatically.
+
 ## Headless CLI verbs
 
 Every structured-view operation has a matching verb against the same daemon:

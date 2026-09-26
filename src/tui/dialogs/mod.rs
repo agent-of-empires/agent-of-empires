@@ -76,6 +76,7 @@ pub use tool_picker::ToolPickerDialog;
 pub use update_confirm::UpdateConfirmDialog;
 pub use worktree_name::{WorktreeNameData, WorktreeNameDialog};
 
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub enum DialogResult<T> {
     Continue,
     Cancel,

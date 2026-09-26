@@ -387,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_update_status_buckets_by_semver_distance() {
+    fn classify_update_status_and_releases_behind() {
         use UpdateStatus::*;
         assert_eq!(classify_update_status("1.2.3", None), Unknown);
         assert_eq!(classify_update_status("1.2.3", Some("")), Unknown);
@@ -398,33 +398,40 @@ mod tests {
         assert_eq!(classify_update_status("1.2.3", Some("1.2.4")), PatchBehind);
         assert_eq!(classify_update_status("1.2.3", Some("1.3.0")), MinorBehind);
         assert_eq!(classify_update_status("1.2.3", Some("2.0.0")), MajorBehind);
-    }
 
-    #[test]
-    fn test_classify_releases_behind_counts_cached_releases() {
-        use ReleasesBehind::*;
         let releases = vec![
             make_release("1.3.0"),
             make_release("1.2.5"),
             make_release("1.2.3"),
             make_release("1.2.0"),
         ];
-        assert_eq!(classify_releases_behind("1.2.3", None, &[]), Unknown);
-        assert_eq!(
-            classify_releases_behind("1.3.0", Some("1.3.0"), &releases),
-            Current
-        );
-        assert_eq!(
-            classify_releases_behind("1.2.3", Some("1.3.0"), &releases),
-            SeveralBehind
-        );
-        assert_eq!(
-            classify_releases_behind("1.2.5", Some("1.3.0"), &releases),
-            OneBehind
-        );
-        assert_eq!(
-            classify_releases_behind("1.2.3", Some("9.9.9"), &[]),
-            OneBehind
-        );
+        for (current, latest, cached, expected) in [
+            ("1.2.3", None, &[][..], ReleasesBehind::Unknown),
+            (
+                "1.3.0",
+                Some("1.3.0"),
+                &releases[..],
+                ReleasesBehind::Current,
+            ),
+            (
+                "1.2.3",
+                Some("1.3.0"),
+                &releases[..],
+                ReleasesBehind::SeveralBehind,
+            ),
+            (
+                "1.2.5",
+                Some("1.3.0"),
+                &releases[..],
+                ReleasesBehind::OneBehind,
+            ),
+            ("1.2.3", Some("9.9.9"), &[][..], ReleasesBehind::OneBehind),
+        ] {
+            assert_eq!(
+                classify_releases_behind(current, latest, cached),
+                expected,
+                "{current} -> {latest:?}"
+            );
+        }
     }
 }

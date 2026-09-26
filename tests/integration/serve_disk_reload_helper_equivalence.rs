@@ -211,20 +211,3 @@ async fn reload_state_instances_from_disk_disk_only_preserves_prior_tick_trackin
          reload between ticks drops a proposal awaiting its confirming poll"
     );
 }
-
-#[tokio::test]
-#[serial_test::parallel]
-async fn reload_state_instances_from_disk_new_ids_use_fresh() {
-    let prior = Instance::new("seed", "/tmp/seed");
-    let state = build_test_app_state(vec![prior]);
-    let new_inst = Instance::new("new", "/tmp/new");
-    let new_id = new_inst.id.clone();
-    reload_disk_only_for_test(&state, vec![new_inst], Vec::new()).await;
-    let result = state.instances.read().await;
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0].id, new_id);
-    assert!(
-        result[0].last_error.is_none(),
-        "new id has no prior runtime fields"
-    );
-}

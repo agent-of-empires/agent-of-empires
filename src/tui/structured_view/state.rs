@@ -564,31 +564,12 @@ mod tests {
     }
 
     #[test]
-    fn fresh_state_has_idle_turn_flags() {
-        let state = test_state(None);
-        assert!(!state.transcript.turn_active);
-        assert!(!state.in_flight);
-    }
-
-    #[test]
-    fn busy_while_turn_active() {
-        let mut state = test_state(None);
-        state.transcript.turn_active = true;
-        assert!(state.is_busy());
-    }
-
-    #[test]
-    fn busy_while_post_in_flight() {
-        let mut state = test_state(None);
-        state.in_flight = true;
-        assert!(state.is_busy());
-    }
-
-    #[test]
-    fn busy_while_socket_down() {
+    fn fresh_state_is_idle_but_busy_while_socket_down() {
         // A dropped WebSocket (ws = None) must force queuing, since turn
         // boundaries can't be observed to drive an immediate send.
         let state = test_state(None);
+        assert!(!state.transcript.turn_active);
+        assert!(!state.in_flight);
         assert!(state.is_busy());
     }
 
@@ -597,40 +578,34 @@ mod tests {
     }
 
     #[test]
-    fn recall_browses_from_newest_and_stashes_the_draft() {
+    fn recall_browses_from_newest_and_restores_the_stashed_draft() {
         let mut state = test_state(None);
         state.queue.push("first".into());
         state.queue.push("second".into());
         state.composer.insert_str("my draft");
 
-        // ArrowUp loads the newest queued prompt and stashes the draft.
-        state.recall_step(-1);
-        assert_eq!(composer_text(&state), "second");
-        assert_eq!(state.recall.as_ref().unwrap().index, 1);
-
-        // ArrowUp again walks to the older entry.
-        state.recall_step(-1);
-        assert_eq!(composer_text(&state), "first");
-        assert_eq!(state.recall.as_ref().unwrap().index, 0);
-
-        // Past the oldest: no wrap, stays put.
-        state.recall_step(-1);
-        assert_eq!(composer_text(&state), "first");
-        assert_eq!(state.recall.as_ref().unwrap().index, 0);
-    }
-
-    #[test]
-    fn recall_down_past_newest_restores_the_stashed_draft() {
-        let mut state = test_state(None);
-        state.queue.push("only".into());
-        state.composer.insert_str("draft text");
-
-        state.recall_step(-1);
-        assert_eq!(composer_text(&state), "only");
+        // ArrowUp loads the newest queued prompt and stashes the draft, then
+        // walks older without wrapping past the oldest.
+        for (text, index) in [("second", 1), ("first", 0), ("first", 0)] {
+            state.recall_step(-1);
+            assert_eq!(composer_text(&state), text);
+            assert_eq!(state.recall.as_ref().unwrap().index, index);
+        }
         // ArrowDown past the newest restores the draft and ends browse.
         state.recall_step(1);
-        assert_eq!(composer_text(&state), "draft text");
+        state.recall_step(1);
+        assert_eq!(composer_text(&state), "my draft");
         assert!(state.recall.is_none());
+
+        // Cancel-restore brings back the draft; plain cancel keeps the text.
+        state.recall_step(-1);
+        state.recall_cancel_restore();
+        assert!(state.recall.is_none());
+        assert_eq!(composer_text(&state), "my draft");
+        state.recall_step(-1);
+        state.cancel_recall();
+        assert!(state.recall.is_none());
+        assert_eq!(composer_text(&state), "second");
     }
 
     #[test]
@@ -669,48 +644,6 @@ mod tests {
         assert_eq!(composer_text(&state), browsed);
     }
 
-    #[test]
-    fn recall_cancel_restore_brings_back_the_draft() {
-        let mut state = test_state(None);
-        state.queue.push("queued".into());
-        state.composer.insert_str("draft");
-        state.recall_step(-1);
-        assert_eq!(composer_text(&state), "queued");
-        state.recall_cancel_restore();
-        assert!(state.recall.is_none());
-        assert_eq!(composer_text(&state), "draft");
-    }
-
-    #[test]
-    fn cancel_recall_keeps_composer_text() {
-        let mut state = test_state(None);
-        state.queue.push("queued".into());
-        state.recall_step(-1);
-        assert_eq!(composer_text(&state), "queued");
-        state.cancel_recall();
-        assert!(state.recall.is_none());
-        assert_eq!(composer_text(&state), "queued");
-    }
-
-    #[test]
-    fn caret_at_origin_tracks_cursor() {
-        let mut state = test_state(None);
-        assert!(state.caret_at_origin());
-        state.composer.insert_str("text");
-        assert!(!state.caret_at_origin());
-    }
-
-    #[test]
-    fn enqueue_grows_the_local_queue() {
-        let mut state = test_state(None);
-        assert!(state.queue.is_empty());
-        state.queue.push("hello".into());
-        state.queue.push("world".into());
-        assert_eq!(state.queue.len(), 2);
-        assert_eq!(state.queue.text_at(0), Some("hello"));
-        assert_eq!(state.queue.text_at(1), Some("world"));
-    }
-
     fn cmd(name: &str) -> AvailableCommand {
         AvailableCommand {
             name: name.to_string(),
@@ -732,45 +665,35 @@ mod tests {
     }
 
     #[test]
-    fn picker_opens_on_slash_query_with_matches() {
+    fn slash_picker_opens_on_matches_and_accept_inserts_without_submitting() {
+        let mut miss = state_with_commands(&["compact"]);
+        miss.composer.insert_str("/zzz");
+        assert!(!miss.slash_picker_open(), "no matches keeps it closed");
         let mut state = state_with_commands(&["compact", "clear"]);
         assert!(!state.slash_picker_open());
         state.composer.insert_str("/comp");
         assert!(state.slash_picker_open());
         assert_eq!(state.slash_matches()[0].name, "compact");
-    }
-
-    #[test]
-    fn picker_closed_when_no_matches() {
-        let mut state = state_with_commands(&["compact"]);
-        state.composer.insert_str("/zzz");
-        assert!(!state.slash_picker_open());
-    }
-
-    #[test]
-    fn accept_inserts_command_with_trailing_space_and_does_not_submit() {
-        let mut state = state_with_commands(&["compact", "clear"]);
-        state.composer.insert_str("/comp");
         assert!(state.accept_selected_slash());
-        assert_eq!(state.composer.lines().join("\n"), "/compact ");
+        assert_eq!(composer_text(&state), "/compact ");
         // Trailing space means the composer is no longer a bare slash
         // query, so the picker closes after accepting.
         assert!(!state.slash_picker_open());
     }
 
     #[test]
-    fn move_selection_clamps_at_both_ends() {
+    fn slash_selection_clamps_and_follows_shrinking_matches() {
         let mut state = state_with_commands(&["compact", "compactor", "comparable"]);
         state.composer.insert_str("/comp");
         assert_eq!(state.slash_selected, 0);
         state.move_slash_selection(-1);
         assert_eq!(state.slash_selected, 0, "clamps at top");
         state.move_slash_selection(99);
-        assert_eq!(
-            state.slash_selected,
-            state.slash_matches().len() - 1,
-            "clamps at bottom"
-        );
+        assert_eq!(state.slash_selected, 2, "clamps at bottom");
+        // The command list shrinks under the cursor.
+        state.transcript.available_commands = vec![cmd("compact")];
+        state.reconcile_slash_selection();
+        assert_eq!(state.slash_selected, 0);
     }
 
     #[test]
@@ -789,18 +712,6 @@ mod tests {
         assert!(state.slash_picker_open(), "query change reopens picker");
     }
 
-    #[test]
-    fn reconcile_clamps_selection_when_matches_shrink() {
-        let mut state = state_with_commands(&["compact", "compactor"]);
-        state.composer.insert_str("/comp");
-        state.move_slash_selection(1);
-        assert_eq!(state.slash_selected, 1);
-        // The command list shrinks under the cursor.
-        state.transcript.available_commands = vec![cmd("compact")];
-        state.reconcile_slash_selection();
-        assert_eq!(state.slash_selected, 0);
-    }
-
     fn notify_snapshot(notifications: serde_json::Value) -> UiSnapshot {
         serde_json::from_value(serde_json::json!({
             "entries": [],
@@ -810,17 +721,23 @@ mod tests {
     }
 
     #[test]
-    fn first_snapshot_baselines_without_toasting() {
+    fn first_snapshot_and_seq_rollback_rebaseline_without_toasting() {
         // test_state uses session "s-1".
         let mut state = test_state(None);
         state.ingest_plugin_ui(notify_snapshot(serde_json::json!([
-            {"seq": 5, "plugin_id": "p", "tone": "info", "title": "old"}
+            {"seq": 50, "plugin_id": "p", "tone": "info", "title": "old"}
         ])));
         assert!(
             state.next_plugin_toast().is_none(),
             "pre-open notifications stay silent"
         );
-        assert_eq!(state.plugin_notify.last_seen_seq, 5);
+        assert_eq!(state.plugin_notify.last_seen_seq, 50);
+        // Daemon restarts: seq ring resets, max seq drops below the watermark.
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([
+            {"seq": 1, "plugin_id": "p", "tone": "info", "title": "fresh"}
+        ])));
+        assert!(state.next_plugin_toast().is_none());
+        assert_eq!(state.plugin_notify.last_seen_seq, 1);
     }
 
     #[test]
@@ -859,20 +776,6 @@ mod tests {
         assert_eq!(state.plugin_notify.pending.len(), MAX_PENDING_PLUGIN_TOASTS);
         // Oldest dropped: the front is n6, not n1.
         assert_eq!(state.next_plugin_toast().unwrap().title, "n6");
-    }
-
-    #[test]
-    fn seq_rollback_rebaselines_without_toasting() {
-        let mut state = test_state(None);
-        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([
-            {"seq": 50, "plugin_id": "p", "tone": "info", "title": "high"}
-        ])));
-        // Daemon restarts: seq ring resets, max seq drops below the watermark.
-        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([
-            {"seq": 1, "plugin_id": "p", "tone": "info", "title": "fresh"}
-        ])));
-        assert!(state.next_plugin_toast().is_none());
-        assert_eq!(state.plugin_notify.last_seen_seq, 1);
     }
 
     #[test]

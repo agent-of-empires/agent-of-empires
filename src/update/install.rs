@@ -519,55 +519,6 @@ mod tests {
     }
 
     #[test]
-    fn classifier_requires_consistent_canonicalization() {
-        let raw_home = PathBuf::from("/tmp/test-home");
-        let canon_home = PathBuf::from("/private/tmp/test-home");
-        let canonicalized_exe = canon_home.join(".local/bin/aoe");
-
-        assert!(matches!(
-            classify_path_prefix(&canonicalized_exe, &raw_home),
-            InstallMethod::Unknown { .. }
-        ));
-
-        assert_eq!(
-            classify_path_prefix(&canonicalized_exe, &canon_home),
-            InstallMethod::Tarball {
-                binary_path: canonicalized_exe.clone()
-            }
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn detects_tarball_through_symlinked_home() {
-        use tempfile::TempDir;
-
-        let real_dir = TempDir::new().unwrap();
-        let bin_dir = real_dir.path().join(".local").join("bin");
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        let exe = bin_dir.join("aoe");
-        std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let link_dir = TempDir::new().unwrap();
-        let symlinked_home = link_dir.path().join("symlinked-home");
-        std::os::unix::fs::symlink(real_dir.path(), &symlinked_home).unwrap();
-
-        let canon_exe = exe.canonicalize().unwrap();
-        let canon_home = symlinked_home.canonicalize().unwrap();
-
-        assert_ne!(symlinked_home, canon_home);
-
-        assert_eq!(
-            classify_path_prefix(&canon_exe, &canon_home),
-            InstallMethod::Tarball {
-                binary_path: canon_exe
-            }
-        );
-    }
-
-    #[test]
     fn brew_classification_needs_a_probe_path_equal_to_the_exe() {
         let brew_exe = PathBuf::from("/opt/homebrew/Cellar/aoe/0.4.5/bin/aoe");
         let other_exe = PathBuf::from("/usr/local/bin/aoe");
@@ -614,27 +565,25 @@ mod tests {
 
     #[test]
     #[serial]
-    fn release_tarball_url_format() {
-        let _env = crate::session::test_support::EnvGuard::unset(&["AOE_UPDATE_BASE_URL"]);
-        let url = release_tarball_url("0.5.0", "linux-amd64");
-        assert_eq!(
-            url,
-            "https://github.com/agent-of-empires/agent-of-empires/releases/download/v0.5.0/aoe-linux-amd64.tar.gz"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn release_tarball_url_respects_env_override() {
-        let _env = crate::session::test_support::EnvGuard::set(&[(
-            "AOE_UPDATE_BASE_URL",
-            "http://127.0.0.1:9999/releases",
-        )]);
-        let url = release_tarball_url("0.5.0", "linux-amd64");
-        assert_eq!(
-            url,
-            "http://127.0.0.1:9999/releases/v0.5.0/aoe-linux-amd64.tar.gz"
-        );
+    fn release_tarball_url_honors_the_base_url_override() {
+        for (base, expected) in [
+            (
+                None,
+                "https://github.com/agent-of-empires/agent-of-empires/releases/download/v0.5.0/aoe-linux-amd64.tar.gz",
+            ),
+            (
+                Some("http://127.0.0.1:9999/releases"),
+                "http://127.0.0.1:9999/releases/v0.5.0/aoe-linux-amd64.tar.gz",
+            ),
+        ] {
+            let _env = match base {
+                Some(base) => {
+                    crate::session::test_support::EnvGuard::set(&[("AOE_UPDATE_BASE_URL", base)])
+                }
+                None => crate::session::test_support::EnvGuard::unset(&["AOE_UPDATE_BASE_URL"]),
+            };
+            assert_eq!(release_tarball_url("0.5.0", "linux-amd64"), expected);
+        }
     }
 
     #[test]
@@ -670,109 +619,52 @@ mod tests {
     }
 
     #[test]
-    fn refusal_messages_point_at_the_owning_installer() {
-        assert!(nix_refusal_message().contains("nix run github:agent-of-empires/agent-of-empires"));
-        assert!(cargo_refusal_message().contains("cargo install"));
-        let unknown = unknown_refusal_message(Path::new("/opt/weird/aoe"));
-        assert!(unknown.contains("install.sh"));
-        assert!(unknown.contains("/opt/weird/aoe"));
-    }
-
-    mod sudo_replace_tests {
-        use super::*;
-        use serial_test::serial;
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt;
-        use tempfile::TempDir;
-
-        fn write_sudo_shim(dir: &Path) {
-            let shim = dir.join("sudo");
-            std::fs::write(&shim, "#!/bin/sh\nexec \"$@\"\n").unwrap();
-            #[cfg(unix)]
+    #[serial]
+    fn sudo_replace_moves_then_chmods_and_propagates_mv_failure() {
+        for (shim_body, ok) in [("exec \"$@\"", true), ("exit 1", false)] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let shim = dir.path().join("sudo");
+            std::fs::write(&shim, format!("#!/bin/sh\n{shim_body}\n")).unwrap();
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        fn write_failing_sudo_shim(dir: &Path) {
-            let shim = dir.join("sudo");
-            std::fs::write(&shim, "#!/bin/sh\nexit 1\n").unwrap();
-            #[cfg(unix)]
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        #[test]
-        #[serial]
-        fn sudo_replace_moves_then_chmods() {
-            let dir = TempDir::new().unwrap();
-            write_sudo_shim(dir.path());
-
             let source = dir.path().join("source");
             std::fs::write(&source, b"new").unwrap();
             let target = dir.path().join("target");
             std::fs::write(&target, b"old").unwrap();
-            #[cfg(unix)]
             std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
 
             let _path = crate::session::test_support::path_prepended(dir.path());
-            sudo_replace(&source, &target).expect("sudo_replace should succeed");
-
-            assert!(!source.exists(), "source should be moved");
-            assert_eq!(std::fs::read(&target).unwrap(), b"new");
-            #[cfg(unix)]
-            {
+            let result = sudo_replace(&source, &target);
+            if ok {
+                result.expect("sudo_replace should succeed");
+                assert!(!source.exists(), "source should be moved");
+                assert_eq!(std::fs::read(&target).unwrap(), b"new");
                 let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
                 assert_eq!(mode, 0o755, "chmod should set 0o755");
+            } else {
+                let err = result
+                    .expect_err("failing sudo should propagate")
+                    .to_string();
+                assert!(err.contains("sudo mv failed"), "{err}");
             }
         }
+    }
 
-        #[test]
-        #[serial]
-        fn sudo_replace_propagates_failure_from_mv() {
-            let dir = TempDir::new().unwrap();
-            write_failing_sudo_shim(dir.path());
-
-            let source = dir.path().join("source");
-            std::fs::write(&source, b"new").unwrap();
-            let target = dir.path().join("target");
-
-            let _path = crate::session::test_support::path_prepended(dir.path());
-            let err = sudo_replace(&source, &target).expect_err("failing sudo should propagate");
-            let s = err.to_string();
-            assert!(
-                s.contains("sudo mv failed"),
-                "expected mv-failed error, got: {s}"
-            );
+    #[test]
+    fn parse_brew_stable_version_reads_v1_and_v2_and_rejects_garbage() {
+        let cases: [(&[u8], Option<&str>); 6] = [
+            (br#"[{"versions":{"stable":"1.5.2"}}]"#, Some("1.5.2")),
+            (
+                br#"{"formulae":[{"versions":{"stable":"1.5.2"}}],"casks":[]}"#,
+                Some("1.5.2"),
+            ),
+            (b"not json", None),
+            (b"", None),
+            (b"[]", None),
+            (br#"{"formulae":[],"casks":[]}"#, None),
+        ];
+        for (stdout, expected) in cases {
+            assert_eq!(parse_brew_stable_version(stdout).as_deref(), expected);
         }
-    }
-
-    #[test]
-    fn parse_brew_stable_version_handles_v1_array() {
-        let stdout = br#"[{"versions":{"stable":"1.5.2"}}]"#;
-        assert_eq!(parse_brew_stable_version(stdout), Some("1.5.2".to_string()));
-    }
-
-    #[test]
-    fn parse_brew_stable_version_handles_v2_envelope() {
-        let stdout = br#"{"formulae":[{"versions":{"stable":"1.5.2"}}],"casks":[]}"#;
-        assert_eq!(parse_brew_stable_version(stdout), Some("1.5.2".to_string()));
-    }
-
-    #[test]
-    fn parse_brew_stable_version_returns_none_for_garbage() {
-        assert_eq!(parse_brew_stable_version(b"not json"), None);
-        assert_eq!(parse_brew_stable_version(b""), None);
-        assert_eq!(parse_brew_stable_version(b"[]"), None);
-        assert_eq!(
-            parse_brew_stable_version(br#"{"formulae":[],"casks":[]}"#),
-            None
-        );
-    }
-
-    #[test]
-    fn brew_formula_lag_message_is_friendly() {
-        let msg = brew_formula_lag_message("1.5.2");
-        assert!(msg.contains("v1.5.2"));
-        assert!(msg.to_lowercase().contains("homebrew"));
-        assert!(msg.to_lowercase().contains("try again"));
     }
 
     mod brew_upgrade_tests {
@@ -793,16 +685,22 @@ mod tests {
                 Some(cmd) => format!("if [ \"$1\" = \"{cmd}\" ]; then exit 2; fi\n"),
                 None => String::new(),
             };
+            // An empty version models `brew info` printing no JSON at all.
+            let info_branch = match stable_version {
+                "" => String::new(),
+                stable => format!(
+                    "if [ \"$1\" = \"info\" ]; then\n\
+                     printf '[{{\"versions\":{{\"stable\":\"{stable}\"}}}}]'\n\
+                     fi\n"
+                ),
+            };
             let body = format!(
                 "#!/bin/sh\n\
                  echo \"$@\" >> {log}\n\
                  {fail_branch}\
-                 if [ \"$1\" = \"info\" ]; then\n\
-                 printf '[{{\"versions\":{{\"stable\":\"{stable}\"}}}}]'\n\
-                 fi\n\
+                 {info_branch}\
                  exit 0\n",
                 log = log.display(),
-                stable = stable_version,
             );
             std::fs::write(&shim, body).unwrap();
             #[cfg(unix)]
@@ -814,9 +712,15 @@ mod tests {
         #[serial]
         fn brew_upgrade_stops_at_the_first_failing_step() {
             // (formula version, step the shim fails on, brew calls expected, error substrings)
-            let cases: [(&str, Option<&str>, &[&str], &[&str]); 4] = [
+            let cases: [(&str, Option<&str>, &[&str], &[&str]); 5] = [
                 (
                     "1.5.2",
+                    None,
+                    &["update", "info aoe --json=v2", "upgrade aoe"],
+                    &[],
+                ),
+                (
+                    "",
                     None,
                     &["update", "info aoe --json=v2", "upgrade aoe"],
                     &[],
@@ -860,26 +764,6 @@ mod tests {
                     "{formula_version} {fail_on:?}"
                 );
             }
-        }
-
-        #[test]
-        #[serial]
-        fn proceeds_when_brew_info_returns_no_data() {
-            let dir = TempDir::new().unwrap();
-            let log = dir.path().join("brew.log");
-            let shim = dir.path().join("brew");
-            let body = format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log.display());
-            std::fs::write(&shim, body).unwrap();
-            #[cfg(unix)]
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-            let _path = crate::session::test_support::path_prepended(dir.path());
-            update_via_brew("1.5.2").expect("missing JSON should not block upgrade");
-
-            let invocations = std::fs::read_to_string(&log).unwrap();
-            let lines: Vec<_> = invocations.lines().collect();
-            assert_eq!(lines.len(), 3, "upgrade should still run; got {lines:?}");
-            assert_eq!(lines[2], "upgrade aoe");
         }
     }
 

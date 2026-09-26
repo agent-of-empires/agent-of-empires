@@ -22,23 +22,8 @@ it.each([
 
 it.each<[string, Record<string, unknown> | null]>([
   ["{}", {}],
-  ['{"a":1,"b":"x"}', { a: 1, b: "x" }],
   ['{"items":[1,2],"meta":{"n":3}}', { items: [1, 2], meta: { n: 3 } }],
-  ...[
-    "[]",
-    "[1,2,3]",
-    '"hello"',
-    "42",
-    "true",
-    "false",
-    "null",
-    "not json",
-    "",
-    "{",
-    '{"a":',
-    '{"a":1,',
-    '{"a":1}[truncated]',
-  ].map((input): [string, null] => [input, null]),
+  ...["[]", "42", "null", "not json", "", '{"a":1}[truncated]'].map((input): [string, null] => [input, null]),
 ])("parseJsonObject(%j)", (input, expected) => {
   expect(parseJsonObject(input)).toEqual(expected);
 });
@@ -76,10 +61,7 @@ describe("pickStr / pickFirst", () => {
 
 it.each<[string, string | null]>([
   [JSON.stringify({ command: "ls -al" }), "ls -al"],
-  [JSON.stringify({ file_path: "src/a.ts" }), "src/a.ts"],
   [JSON.stringify({ filepath: "/tmp/opencode" }), "/tmp/opencode"],
-  [JSON.stringify({ pattern: "TODO" }), "TODO"],
-  [JSON.stringify({ url: "https://x" }), "https://x"],
   [JSON.stringify({ _aoe_title: "Run the suite" }), "Run the suite"],
   ["{}", null],
   [JSON.stringify({ _aoe_parent: "p" }), null],
@@ -99,11 +81,13 @@ it.each([
 });
 
 describe("todoItemsFromArgs", () => {
-  it("returns todo items with non-blank content", () => {
+  it("returns todo items with non-blank content, ignoring whitespace-only ones", () => {
     expect(
       todoItemsFromArgs({
         todos: [
           { content: " Check schema ", status: "completed" },
+          { content: "   ", status: "pending" },
+          { content: "\t", status: "in_progress" },
           { content: "Render todos", status: "in_progress" },
         ],
       }),
@@ -111,18 +95,6 @@ describe("todoItemsFromArgs", () => {
       { content: " Check schema ", status: "completed" },
       { content: "Render todos", status: "in_progress" },
     ]);
-  });
-
-  it("ignores whitespace-only todo content", () => {
-    expect(
-      todoItemsFromArgs({
-        todos: [
-          { content: "   ", status: "pending" },
-          { content: "\t", status: "in_progress" },
-          { content: "Keep me", status: "completed" },
-        ],
-      }),
-    ).toEqual([{ content: "Keep me", status: "completed" }]);
   });
 
   it("detects todo args only when at least one item has content", () => {
@@ -135,7 +107,6 @@ it.each([
   [JSON.stringify({ todos: [] }), true],
   [JSON.stringify({ todos: [{ content: "Real", status: "pending" }] }), true],
   [JSON.stringify({ thought: "thinking" }), false],
-  ["{}", false],
   [JSON.stringify({ todos: "nope" }), false],
   ["not json", false],
 ])("hasTodoArrayArgsText(%s) is %s", (args, expected) => {

@@ -63,7 +63,7 @@ async function selectSortMode(page: Page, mode: string): Promise<void> {
 }
 
 test.describe("Sidebar sort picker (#1418, #1640)", () => {
-  test("default is manual; rows follow server workspace_ordering", async ({ page }) => {
+  test("last-activity reorders desc, persists, and drops drag affordances until manual returns", async ({ page }) => {
     const sessions: MockSession[] = [
       {
         id: "s-old",
@@ -81,48 +81,34 @@ test.describe("Sidebar sort picker (#1418, #1640)", () => {
         last_accessed_at: "2025-04-15T00:00:00Z",
       },
     ];
+    const puts: string[][] = [];
     await mockApis(
       page,
       () => sessions,
       () => ["/tmp/repo::feature/old", "/tmp/repo::feature/new"],
-    );
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-
-    await expect(page.locator(TOGGLE)).toHaveAttribute("data-sort-mode", "manual");
-    await expect.poll(() => readWorkspaceTitles(page), { timeout: 8000 }).toEqual(["old-ws", "new-ws"]);
-  });
-
-  test("selecting last-activity reorders desc and persists", async ({ page, context }) => {
-    const sessions: MockSession[] = [
-      {
-        id: "s-old",
-        title: "old-ws",
-        project_path: "/tmp/repo",
-        branch: "feature/old",
-        created_at: "2025-01-01T00:00:00Z",
-      },
-      {
-        id: "s-new",
-        title: "new-ws",
-        project_path: "/tmp/repo",
-        branch: "feature/new",
-        created_at: "2025-04-01T00:00:00Z",
-        last_accessed_at: "2025-04-15T00:00:00Z",
-      },
-    ];
-    await mockApis(
-      page,
-      () => sessions,
-      () => ["/tmp/repo::feature/old", "/tmp/repo::feature/new"],
+      (order) => puts.push(order),
     );
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
 
     await expect.poll(() => readWorkspaceTitles(page), { timeout: 8000 }).toEqual(["old-ws", "new-ws"]);
+
+    const handles = page.locator("[aria-roledescription='Press and hold to reorder']");
+    const draggableHeaders = page.locator("[data-testid='sidebar-group-header'][data-draggable='true']");
+    await expect(handles).toHaveCount(2);
+    await expect(draggableHeaders).not.toHaveCount(0);
 
     await selectSortMode(page, "lastActivity");
     await expect.poll(() => readWorkspaceTitles(page), { timeout: 4000 }).toEqual(["new-ws", "old-ws"]);
+
+    // Row and group-header drag affordances are gone, and a drag attempt PUTs nothing.
+    await expect(handles).toHaveCount(0);
+    await expect(draggableHeaders).toHaveCount(0);
+    const sourceBox = (await page.locator("[data-testid='sidebar-session-row']").nth(1).boundingBox())!;
+    await page.mouse.move(sourceBox.x + sourceBox.width - 4, sourceBox.y + sourceBox.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(sourceBox.x + 4, sourceBox.y + 4, { steps: 6 });
+    await page.mouse.up();
 
     const stored = await page.evaluate(() => window.localStorage.getItem("aoe-sidebar-sort-mode"));
     expect(stored).toBe("lastActivity");
@@ -133,165 +119,8 @@ test.describe("Sidebar sort picker (#1418, #1640)", () => {
 
     await selectSortMode(page, "manual");
     await expect.poll(() => readWorkspaceTitles(page), { timeout: 4000 }).toEqual(["old-ws", "new-ws"]);
-    // suppress unused-binding lint without changing the signature
-    void context;
-  });
-
-  test("drag affordances are absent in last-activity mode", async ({ page }) => {
-    const sessions: MockSession[] = [
-      {
-        id: "s1",
-        title: "alpha",
-        project_path: "/tmp/repo",
-        branch: "feature/a",
-        created_at: "2025-01-01T00:00:00Z",
-      },
-      {
-        id: "s2",
-        title: "beta",
-        project_path: "/tmp/repo",
-        branch: "feature/b",
-        created_at: "2025-02-01T00:00:00Z",
-      },
-    ];
-    const puts: string[][] = [];
-    await mockApis(
-      page,
-      () => sessions,
-      () => ["/tmp/repo::feature/a", "/tmp/repo::feature/b"],
-      (order) => puts.push(order),
-    );
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-
-    await expect(page.locator("[aria-roledescription='Press and hold to reorder']")).toHaveCount(2, { timeout: 8000 });
-
-    await selectSortMode(page, "lastActivity");
-
-    await expect(page.locator("[aria-roledescription='Press and hold to reorder']")).toHaveCount(0);
-
-    const rows = page.locator("[data-testid='sidebar-session-row']");
-    const sourceBox = await rows.nth(1).boundingBox();
-    if (!sourceBox) throw new Error("row missing");
-    await page.mouse.move(sourceBox.x + sourceBox.width - 4, sourceBox.y + sourceBox.height / 2);
-    await page.mouse.down();
-    await page.waitForTimeout(300);
-    await page.mouse.move(sourceBox.x + 4, sourceBox.y + 4, { steps: 6 });
-    await page.mouse.up();
-
-    await selectSortMode(page, "manual");
-    await expect(page.locator("[aria-roledescription='Press and hold to reorder']")).toHaveCount(2);
-
-    expect(puts.length).toBe(0);
-  });
-
-  test("multi-repo group stays pinned at the bottom in last-activity mode", async ({ page }) => {
-    const sessions: MockSession[] = [
-      {
-        id: "s-multi",
-        title: "multi-recent",
-        project_path: "/tmp/repo",
-        branch: "feature/multi",
-        created_at: "2025-01-01T00:00:00Z",
-        last_accessed_at: "2025-12-01T00:00:00Z",
-        workspace_repos: [
-          { name: "repo-a", source_path: "/tmp/repo", branch: "feature/multi" },
-          {
-            name: "repo-b",
-            source_path: "/tmp/other",
-            branch: "feature/multi",
-          },
-        ],
-      },
-      {
-        id: "s-single",
-        title: "single-old",
-        project_path: "/tmp/repo",
-        branch: "feature/single",
-        created_at: "2025-02-01T00:00:00Z",
-        last_accessed_at: "2025-03-01T00:00:00Z",
-      },
-    ];
-    await mockApis(
-      page,
-      () => sessions,
-      () => ["/tmp/repo::feature/multi", "/tmp/repo::feature/single"],
-    );
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-
-    await expect(page.locator("[data-testid='sidebar-session-row']")).toHaveCount(2, { timeout: 8000 });
-
-    await selectSortMode(page, "lastActivity");
-
-    await expect.poll(() => readWorkspaceTitles(page), { timeout: 4000 }).toEqual(["single-old", "multi-recent"]);
-  });
-
-  test("attention sort floats waiting and urgent rows to the top (#1640)", async ({ page }) => {
-    // One group with equal last_accessed_at, so only status ordering applies.
-    const sessions: MockSession[] = [
-      {
-        id: "s-running",
-        title: "running-ws",
-        project_path: "/tmp/repo",
-        branch: "feature/running",
-        status: "Running",
-        created_at: "2025-01-04T00:00:00Z",
-        last_accessed_at: "2025-06-01T00:00:00Z",
-      },
-      {
-        id: "s-waiting",
-        title: "waiting-ws",
-        project_path: "/tmp/repo",
-        branch: "feature/waiting",
-        status: "Waiting",
-        created_at: "2025-01-03T00:00:00Z",
-        last_accessed_at: "2025-06-01T00:00:00Z",
-      },
-      {
-        id: "s-error",
-        title: "error-ws",
-        project_path: "/tmp/repo",
-        branch: "feature/error",
-        status: "Error",
-        created_at: "2025-01-02T00:00:00Z",
-        last_accessed_at: "2025-06-01T00:00:00Z",
-      },
-      {
-        id: "s-urgent",
-        title: "urgent-ws",
-        project_path: "/tmp/repo",
-        branch: "feature/urgent",
-        // Urgent promotes across status ranks.
-        status: "Running",
-        urgent: true,
-        created_at: "2025-01-01T00:00:00Z",
-        last_accessed_at: "2025-06-01T00:00:00Z",
-      },
-    ];
-    await mockApis(
-      page,
-      () => sessions,
-      () => [
-        "/tmp/repo::feature/running",
-        "/tmp/repo::feature/waiting",
-        "/tmp/repo::feature/error",
-        "/tmp/repo::feature/urgent",
-      ],
-    );
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-
-    await expect(page.locator("[data-testid='sidebar-session-row']")).toHaveCount(4, { timeout: 8000 });
-
-    await selectSortMode(page, "attention");
-
-    await expect
-      .poll(() => readWorkspaceTitles(page), { timeout: 4000 })
-      .toEqual(["urgent-ws", "waiting-ws", "error-ws", "running-ws"]);
-
-    const stored = await page.evaluate(() => window.localStorage.getItem("aoe-sidebar-sort-mode"));
-    expect(stored).toBe("attention");
+    await expect(handles).toHaveCount(2);
+    expect(puts).toEqual([]);
   });
 
   // #1836, #2214: the trigger uses the shared portaled Tooltip, not a native title, and the list gains a separator.

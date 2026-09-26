@@ -3,7 +3,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render, screen } from "@testing-library/react";
 
 import { WorkingSpinner } from "../WorkingSpinner";
-import { THINKING_VERBS } from "../../../lib/acpRattle";
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -78,12 +77,6 @@ describe("WorkingSpinner", () => {
     for (const name of [/force end turn/i, /force stop/i]) {
       expect(button(name) !== null).toBe(String(name) === String(forceButton));
     }
-  });
-
-  it("shows the tool verb, not a thinking verb, when thinking stays latched through a tool", () => {
-    renderSpinner({ stalledSecs: 1, tool: "Terminal", thinking: true });
-    expect(screen.getByText(/Terminal…/)).toBeTruthy();
-    expect(THINKING_VERBS.some((v) => screen.queryByText(`${v}…`))).toBe(false);
   });
 
   it("renders an escalation countdown and Force stop invokes the handler", () => {

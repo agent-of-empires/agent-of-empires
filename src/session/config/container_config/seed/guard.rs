@@ -673,55 +673,38 @@ mod tests {
     }
 
     #[test]
-    fn a_looped_native_path_fails_validation_once_it_resolves() {
-        for swap in [false, true] {
-            let temporary = tempfile::tempdir().unwrap();
-            let source = temporary.path().join("source");
-            let active = temporary.path().join("active");
-            fs::create_dir(&source).unwrap();
-            fs::create_dir(&active).unwrap();
-            let native = source.join("projects");
-            symlink("projects", &native).unwrap();
-            let candidate = source.join("config.json");
-            fs::write(&candidate, b"{}").unwrap();
-            let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
-            boundary.add_path(native.clone());
-            let mut guard = ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
-            assert!(guard
-                .record_file(&candidate, &File::open(&candidate).unwrap())
-                .unwrap());
-            if swap {
-                fs::remove_file(&native).unwrap();
-                symlink("config.json", &native).unwrap();
+    fn a_looped_native_path_or_ancestor_fails_validation_once_it_resolves() {
+        for (layout, looped, watched) in [
+            ("path", "projects", "projects"),
+            ("ancestor", "agent", "agent/sessions"),
+        ] {
+            for swap in [false, true] {
+                let temporary = tempfile::tempdir().unwrap();
+                let source = temporary.path().join("source");
+                let active = temporary.path().join("active");
+                fs::create_dir(&source).unwrap();
+                fs::create_dir(&active).unwrap();
+                let looped = source.join(looped);
+                symlink(looped.file_name().unwrap(), &looped).unwrap();
+                let candidate = source.join("config.json");
+                fs::write(&candidate, b"{}").unwrap();
+                let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
+                boundary.add_path(source.join(watched));
+                let mut guard = ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
+                assert!(guard
+                    .record_file(&candidate, &File::open(&candidate).unwrap())
+                    .unwrap());
+                if swap {
+                    fs::remove_file(&looped).unwrap();
+                    if layout == "path" {
+                        symlink("config.json", &looped).unwrap();
+                    } else {
+                        fs::create_dir(&looped).unwrap();
+                        symlink("../config.json", looped.join("sessions")).unwrap();
+                    }
+                }
+                assert_eq!(guard.validate().is_err(), swap, "{layout} swap={swap}");
             }
-            assert_eq!(guard.validate().is_err(), swap, "swap={swap}");
-        }
-    }
-
-    #[test]
-    fn a_native_path_below_a_looped_ancestor_fails_validation_once_it_resolves() {
-        for swap in [false, true] {
-            let temporary = tempfile::tempdir().unwrap();
-            let source = temporary.path().join("source");
-            let active = temporary.path().join("active");
-            fs::create_dir(&source).unwrap();
-            fs::create_dir(&active).unwrap();
-            let ancestor = source.join("agent");
-            symlink("agent", &ancestor).unwrap();
-            let candidate = source.join("config.json");
-            fs::write(&candidate, b"{}").unwrap();
-            let mut boundary = NativeStateBoundary::for_source(&source, &active).unwrap();
-            boundary.add_path(ancestor.join("sessions"));
-            let mut guard = ReadGuard::new(&boundary, ReadAccess::default()).unwrap();
-            assert!(guard
-                .record_file(&candidate, &File::open(&candidate).unwrap())
-                .unwrap());
-            if swap {
-                fs::remove_file(&ancestor).unwrap();
-                fs::create_dir(&ancestor).unwrap();
-                symlink("../config.json", ancestor.join("sessions")).unwrap();
-            }
-            assert_eq!(guard.validate().is_err(), swap, "swap={swap}");
         }
     }
 

@@ -78,7 +78,9 @@ async function paneHeight(page: Page): Promise<number> {
 const openSession = (page: Page, handle: MockHandle) => openLiveSession(page, handle, { mobile: true, settings: null });
 
 test.describe("Keyboard auto-resize (#1432)", () => {
-  test("Safari mode: keyboard insets the pane but never resizes tmux", async ({ page }) => {
+  test("Safari mode: the keyboard insets the pane without resizing tmux and returns a reader to the prompt", async ({
+    page,
+  }) => {
     const handle = await mockTerminalApis(page);
     await openSession(page, handle);
 
@@ -103,11 +105,6 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     await observeFor(page, 800, async () => {
       expect(extractResizes(handle).length, "keyboard close must not resize tmux").toBe(baselineCount);
     });
-  });
-
-  test("Safari mode: opening the keyboard returns a scrollback reader to the visible prompt", async ({ page }) => {
-    const handle = await mockTerminalApis(page);
-    await openSession(page, handle);
 
     // Opening the keyboard is an intent to type, so it returns to the prompt from a reading position.
     await page.evaluate(() => {
@@ -159,21 +156,7 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     expect(extractResizes(handle).length, "PWA keyboard open must not emit a tmux resize").toBe(baselineCount);
   });
 
-  test("App root is NOT pinned for live-view sessions (dvh shrink wanted)", async ({ page }) => {
-    const handle = await mockTerminalApis(page);
-    await openSession(page, handle);
-
-    const rootInlineHeight = await page.evaluate(() => {
-      const root = document.querySelector<HTMLElement>("div.h-dvh.flex.flex-col");
-      return root?.style?.height ?? "";
-    });
-
-    // The live view wants the natural dvh shrink; only the single-pane paired shell pins the height.
-    expect(rootInlineHeight, "live sessions must keep the natural 100dvh root").toBe("");
-    expect(extractResizes(handle).length).toBeGreaterThan(0);
-  });
-
-  test("no persisted reservation: a closed keyboard on load starts full-size", async ({ page }) => {
+  test("a live-view session starts full-size: no pinned root, no stale persisted reservation", async ({ page }) => {
     const handle = await mockTerminalApis(page);
     // A stale reservation key from older builds must be ignored.
     await page.addInitScript(() => {
@@ -185,11 +168,18 @@ test.describe("Keyboard auto-resize (#1432)", () => {
     });
     await openSession(page, handle);
 
-    const rootPaddingBottom = await page.evaluate(() => {
+    const layout = await page.evaluate(() => {
+      const root = document.querySelector<HTMLElement>("div.h-dvh.flex.flex-col");
       const panel = document.querySelector('[data-term="agent"]');
-      const root = panel?.closest<HTMLElement>("div.flex-1.flex.flex-col");
-      return root ? getComputedStyle(root).paddingBottom : "";
+      const padded = panel?.closest<HTMLElement>("div.flex-1.flex.flex-col");
+      return {
+        rootInlineHeight: root?.style?.height ?? "",
+        paddingBottom: padded ? getComputedStyle(padded).paddingBottom : "",
+      };
     });
-    expect(["0px", "", "auto"]).toContain(rootPaddingBottom);
+    // The live view wants the natural dvh shrink; only the single-pane paired shell pins the height.
+    expect(layout.rootInlineHeight, "live sessions must keep the natural 100dvh root").toBe("");
+    expect(["0px", "", "auto"]).toContain(layout.paddingBottom);
+    expect(extractResizes(handle).length).toBeGreaterThan(0);
   });
 });

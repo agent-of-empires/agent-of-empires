@@ -61,43 +61,40 @@ fn clear_archived_live_status(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migrations::test_cases::assert_rewrites;
 
     #[test]
     fn settles_only_archived_live_status_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        fs::write(
-            &path,
-            r#"[
-                {"id":"a","status":"waiting","archived_at":"2026-07-13T22:17:21Z"},
-                {"id":"b","status":"running","archived_at":"2026-07-13T22:17:21Z"},
-                {"id":"c","status":"starting","archived_at":"2026-07-13T22:17:21Z"},
-                {"id":"d","status":"waiting"},
-                {"id":"e","status":"idle","archived_at":"2026-07-13T22:17:21Z"},
-                {"id":"f","status":"stopped","archived_at":"2026-07-13T22:17:21Z"},
-                {"id":"g","status":"error","archived_at":"2026-07-13T22:17:21Z"},
-                {"id":"h","status":"waiting","archived_at":null}
-            ]"#,
-        )
-        .unwrap();
-
-        clear_archived_live_status(&path).unwrap();
-
-        let v: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        let arr = v.as_array().unwrap();
-        // archived + live-interaction status -> idle (the bug footprint)
-        assert_eq!(arr[0]["status"], "idle");
-        assert_eq!(arr[1]["status"], "idle");
-        assert_eq!(arr[2]["status"], "idle");
-        // non-archived waiting -> untouched (a real permission prompt)
-        assert_eq!(arr[3]["status"], "waiting");
-        // archived resting/terminal statuses -> untouched
-        assert_eq!(arr[4]["status"], "idle");
-        assert_eq!(arr[5]["status"], "stopped");
-        assert_eq!(arr[6]["status"], "error");
-        // explicit null archived_at counts as non-archived -> untouched
-        assert_eq!(arr[7]["status"], "waiting");
+        let at = "2026-07-13T22:17:21Z";
+        let rows = |a: &str, b: &str, c: &str| {
+            format!(
+                r#"[
+                {{"id":"a","status":"{a}","archived_at":"{at}"}},
+                {{"id":"b","status":"{b}","archived_at":"{at}"}},
+                {{"id":"c","status":"{c}","archived_at":"{at}"}},
+                {{"id":"d","status":"waiting"}},
+                {{"id":"e","status":"idle","archived_at":"{at}"}},
+                {{"id":"f","status":"stopped","archived_at":"{at}"}},
+                {{"id":"g","status":"error","archived_at":"{at}"}},
+                {{"id":"h","status":"waiting","archived_at":null}}
+            ]"#
+            )
+        };
+        // Archived live-interaction statuses settle to idle; a non-archived
+        // waiting row is a real permission prompt.
+        let (before, after) = (
+            rows("waiting", "running", "starting"),
+            rows("idle", "idle", "idle"),
+        );
+        assert_rewrites(
+            "sessions.json",
+            clear_archived_live_status,
+            &[
+                (Some(before.as_str()), Some(after.as_str())),
+                (Some("not json"), Some("not json")),
+                (None, None),
+            ],
+        );
     }
 
     #[test]
@@ -167,21 +164,6 @@ mod tests {
         let loaded = storage.load().unwrap();
         assert_eq!(loaded[0].status, Status::Idle);
         assert_eq!(loaded[0].agent_session_id.as_deref(), Some("peer-sid"));
-    }
-
-    #[test]
-    fn missing_file_is_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        clear_archived_live_status(&dir.path().join("does-not-exist.json")).unwrap();
-    }
-
-    #[test]
-    fn unparseable_file_is_skipped() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        fs::write(&path, "not json").unwrap();
-        clear_archived_live_status(&path).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "not json");
     }
 
     #[test]

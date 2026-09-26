@@ -834,6 +834,8 @@ mod tests {
             .arg(&sidecar)
             .arg(&normal)
             .arg(&store)
+            // A host session source redirects the normal publication to a suffixed file.
+            .env_remove(crate::hooks::SESSION_SOURCE_ENV)
             .output()
             .unwrap();
         assert!(
@@ -870,6 +872,7 @@ mod tests {
             agent: "prime-agent".into(),
             stores: vec![store.clone()],
             configuration: Vec::new(),
+            exported_default_store: false,
             cwd: "/workspace/project".into(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),

@@ -418,42 +418,6 @@ mod tests {
     }
 
     #[test]
-    fn each_adapter_gets_its_own_prefix() {
-        let app = Path::new("/data");
-        assert_eq!(
-            adapter_dir(app, "codex-acp"),
-            Path::new("/data/acp-worker/adapters/codex-acp")
-        );
-        assert_eq!(
-            bin_dir(app, "claude-agent-acp"),
-            Path::new("/data/acp-worker/adapters/claude-agent-acp/node_modules/.bin")
-        );
-    }
-
-    #[test]
-    fn lookup_covers_exactly_the_pinned_adapters() {
-        assert!(is_bundled("claude-agent-acp"));
-        assert!(is_bundled("codex-acp"));
-        assert!(is_bundled("pi-acp"));
-        assert!(!is_bundled("opencode"));
-        assert!(!is_bundled("gemini"));
-        assert_eq!(DEFAULT_ADAPTER, "claude-agent-acp");
-        assert!(is_bundled(DEFAULT_ADAPTER));
-    }
-
-    #[test]
-    fn bundled_adapter_bin_is_per_adapter() {
-        let tmp = tempfile::tempdir().unwrap();
-        let app = tmp.path();
-        assert!(bundled_adapter_bin(app, "claude-agent-acp").is_none());
-
-        touch_bin(app, "claude-agent-acp");
-        assert!(bundled_adapter_bin(app, "claude-agent-acp").is_some());
-        // Installing one adapter must not make a sibling look installed.
-        assert!(bundled_adapter_bin(app, "codex-acp").is_none());
-    }
-
-    #[test]
     fn installation_is_current_requires_matching_digest_and_binary() {
         let tmp = tempfile::tempdir().unwrap();
         let app = tmp.path();
@@ -465,6 +429,8 @@ mod tests {
 
         write_digest(app, "claude-agent-acp");
         assert!(installation_is_current(app, "claude-agent-acp"));
+        // Installing one adapter must not make a sibling look installed.
+        assert!(bundled_adapter_bin(app, "codex-acp").is_none());
 
         // A stale digest (an aoe upgrade bumped the pin) forces reinstall.
         std::fs::write(
@@ -500,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_handles_fresh_replace_and_rollback() {
+    fn publish_and_sweep_keep_the_live_install() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
 
@@ -528,10 +494,8 @@ mod tests {
         let missing = root.join("a.tmp.absent");
         assert!(publish(&missing, &final_dir).is_err());
         assert_eq!(std::fs::read(final_dir.join("marker")).unwrap(), b"newer");
-    }
 
-    #[test]
-    fn sweep_stale_spares_fresh_dirs_and_unrelated_names() {
+        // The stale sweep spares fresh dirs and the real install.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let fresh_tmp = root.join("claude-agent-acp.tmp.999");

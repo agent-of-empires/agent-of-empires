@@ -33,7 +33,7 @@ pub(crate) mod status_poll;
 pub(crate) mod structured_repair;
 #[cfg(test)]
 mod test_helpers;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub mod test_support;
 pub(crate) mod token;

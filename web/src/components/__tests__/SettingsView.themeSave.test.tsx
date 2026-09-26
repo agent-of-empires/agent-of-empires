@@ -112,16 +112,6 @@ describe("SettingsView theme tab save routing", () => {
     expect(updateProfileSettings).not.toHaveBeenCalled();
   });
 
-  it("writes color mode to /api/theme too", async () => {
-    renderThemeTab();
-    await waitFor(() => selectWithOption("palette"));
-    fireEvent.change(selectWithOption("palette"), {
-      target: { value: "palette" },
-    });
-    await waitFor(() => expect(updateTheme).toHaveBeenCalledWith({ color_mode: "palette" }));
-    expect(updateProfileSettings).not.toHaveBeenCalled();
-  });
-
   // Ported from live settings-theme-color-mode.spec.ts.
   it("color-mode change PATCHes but never dispatches the theme repaint event", async () => {
     renderThemeTab();
@@ -131,6 +121,7 @@ describe("SettingsView theme tab save routing", () => {
     });
     await waitFor(() => expect(updateTheme).toHaveBeenCalledWith({ color_mode: "palette" }));
     expect(dispatchThemePickerChanged).not.toHaveBeenCalled();
+    expect(updateProfileSettings).not.toHaveBeenCalled();
 
     // Positive control: a theme-name pick through the same tab does dispatch,
     // proving the spy is wired and the gating is per-field, not global.

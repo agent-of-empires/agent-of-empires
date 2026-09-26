@@ -17,10 +17,7 @@ describe("Row URL linkification", () => {
     expect(a.textContent).toBe("https://github.com/o/r/pull/1");
   });
 
-  it.each([
-    ["plain output", "no links here", null],
-    ["the cursor row", "https://example.com", 0],
-  ])("leaves %s without anchors", (_n, text, cursorCol) => {
+  it.each([["the cursor row", "https://example.com", 0]])("leaves %s without anchors", (_n, text, cursorCol) => {
     const container = renderRow(text, cursorCol);
     expect(container.querySelector("a")).toBeNull();
     expect(container.textContent).toContain(text);

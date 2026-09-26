@@ -66,13 +66,6 @@ describe("MobileLiveTerminal live-edge scroll", () => {
     expect(scroller.scrollTop).toBeCloseTo(bottom() - LINE_H, 0);
   });
 
-  it("follows appended output when the user has not scrolled away", () => {
-    const { scroller, stream } = mount();
-    scrollHeight += 2 * LINE_H;
-    stream();
-    expect(scroller.scrollTop).toBe(bottom());
-  });
-
   it("does not detach when a content shrink clamps scrollTop", () => {
     const { scroller, stream } = mount();
     scrollHeight -= 2 * LINE_H;

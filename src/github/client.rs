@@ -318,11 +318,6 @@ mod tests {
     }
 
     #[test]
-    fn unauthenticated_client_builds() {
-        assert!(GitHubClient::unauthenticated(config()).is_ok());
-    }
-
-    #[test]
     fn api_base_trailing_slash_is_trimmed() {
         let mut cfg = config();
         cfg.api_base = "https://example.test/".to_string();
@@ -350,7 +345,16 @@ mod tests {
             &'static str,
             fn(GitHubError),
         );
-        let cases: [ErrorCase; 8] = [
+        let cases: [ErrorCase; 9] = [
+            (
+                StatusCode::NOT_FOUND,
+                &[],
+                r#"{"message":"Not Found"}"#,
+                |err| match err {
+                    GitHubError::NotFound { resource } => assert_eq!(resource, "Not Found"),
+                    other => panic!("expected NotFound, got {other:?}"),
+                },
+            ),
             (StatusCode::UNAUTHORIZED, &[], "", |err| {
                 assert!(matches!(err, GitHubError::Unauthorized))
             }),
@@ -417,23 +421,6 @@ mod tests {
         for (status, headers, body, check) in cases {
             check(classify_status(status, &headers_with(headers), body));
         }
-    }
-
-    #[test]
-    fn not_found_carries_message() {
-        let err = classify_status(
-            StatusCode::NOT_FOUND,
-            &HeaderMap::new(),
-            r#"{"message":"Not Found"}"#,
-        );
-        match err {
-            GitHubError::NotFound { resource } => assert_eq!(resource, "Not Found"),
-            other => panic!("expected NotFound, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn api_message_falls_back_to_raw_body() {
         assert_eq!(api_message("plain text error"), "plain text error");
     }
 

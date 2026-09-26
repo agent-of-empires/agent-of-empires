@@ -6,45 +6,33 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { ChromeCollapseHandle, CollapsibleRegion } from "../CollapsibleChrome";
 
 describe("collapsible chrome", () => {
-  it("marks the collapsed region inert so hidden chrome leaves the tab order", () => {
-    const { rerender, container } = render(
-      <CollapsibleRegion id="conversation-composer" collapsed={false}>
-        <button type="button">send</button>
-      </CollapsibleRegion>,
-    );
-    // React reflects `inert` as the DOM property on update (jsdom has no
-    // native inert behavior, so read the property, not the attribute).
-    const inner = () => container.firstElementChild!.firstElementChild as HTMLElement & { inert?: boolean };
-    expect(inner().inert || inner().hasAttribute("inert")).toBe(false);
-    rerender(
-      <CollapsibleRegion id="conversation-composer" collapsed>
-        <button type="button">send</button>
-      </CollapsibleRegion>,
-    );
-    expect(inner().inert || inner().hasAttribute("inert")).toBe(true);
-  });
-
-  it("points the handle's aria-controls at the region element it collapses", () => {
-    render(
+  it("points the handle at its region and marks the collapsed region inert", () => {
+    const tree = (collapsed: boolean) => (
       <>
         <ChromeCollapseHandle
           edge="bottom"
-          collapsed={false}
+          collapsed={collapsed}
           onToggle={() => {}}
           collapseLabel="Collapse message composer"
           expandLabel="Expand message composer"
           controlsId="conversation-composer"
           testId="handle"
         />
-        <CollapsibleRegion id="conversation-composer" collapsed={false}>
+        <CollapsibleRegion id="conversation-composer" collapsed={collapsed}>
           <button type="button">send</button>
         </CollapsibleRegion>
-      </>,
+      </>
     );
-    const controls = screen.getByTestId("handle").getAttribute("aria-controls")!;
-    // The referenced element must exist, and be the row that releases its
-    // height, not the clipped child inside it.
-    expect(document.getElementById(controls)).toBe(screen.getByTestId("conversation-composer"));
+    const { rerender } = render(tree(false));
+    const region = screen.getByTestId("conversation-composer");
+    // aria-controls names the row that releases its height, not the clipped child inside it.
+    expect(document.getElementById(screen.getByTestId("handle").getAttribute("aria-controls")!)).toBe(region);
+    // React reflects `inert` as the DOM property on update (jsdom has no
+    // native inert behavior, so read the property, not the attribute).
+    const inner = () => region.firstElementChild as HTMLElement & { inert?: boolean };
+    expect(inner().inert || inner().hasAttribute("inert")).toBe(false);
+    rerender(tree(true));
+    expect(inner().inert || inner().hasAttribute("inert")).toBe(true);
   });
 
   it("labels the handle for the action it performs and points the triangle at it", () => {

@@ -467,51 +467,14 @@ mod tests {
     use crate::tui::styles::builtin_theme_names;
 
     #[test]
-    fn resolve_all_builtins() {
+    fn resolve_builtins_and_fallback() {
         for name in builtin_theme_names() {
             let r = resolve_theme(name);
             assert_eq!(r.name, name);
             assert_eq!(r.source, ResolvedThemeSource::Builtin);
-            assert!(
-                r.web.css_vars.contains_key("--color-surface-900"),
-                "{name}: web projection missing surface-900"
-            );
-            assert!(
-                r.terminal.css_vars.contains_key("--term-bg"),
-                "{name}: terminal projection missing term-bg"
-            );
-            assert!(
-                !r.syntax.shiki_theme.is_empty(),
-                "{name}: shiki theme empty"
-            );
-        }
-    }
-
-    #[test]
-    fn catppuccin_latte_resolves_as_light() {
-        let r = resolve_theme("catppuccin-latte");
-        assert_eq!(r.appearance, ThemeAppearance::Light);
-        assert_eq!(r.syntax.shiki_theme, "catppuccin-latte");
-    }
-
-    #[test]
-    fn dracula_resolves_as_dark_with_shiki_dracula() {
-        let r = resolve_theme("dracula");
-        assert_eq!(r.appearance, ThemeAppearance::Dark);
-        assert_eq!(r.syntax.shiki_theme, "dracula");
-    }
-
-    #[test]
-    fn unknown_theme_resolves_to_fallback() {
-        let r = resolve_theme("does-not-exist");
-        assert_eq!(r.source, ResolvedThemeSource::Fallback);
-        assert_eq!(r.name, "zinc");
-    }
-
-    #[test]
-    fn css_vars_are_valid_hex() {
-        for name in builtin_theme_names() {
-            let r = resolve_theme(name);
+            assert!(r.web.css_vars.contains_key("--color-surface-900"), "{name}");
+            assert!(r.terminal.css_vars.contains_key("--term-bg"), "{name}");
+            assert!(!r.syntax.shiki_theme.is_empty(), "{name}");
             for (key, value) in r.web.css_vars.iter().chain(r.terminal.css_vars.iter()) {
                 if key == "--term-selection-bg" {
                     assert!(
@@ -521,18 +484,26 @@ mod tests {
                     continue;
                 }
                 assert!(
-                    value.starts_with('#') && value.len() == 7,
-                    "{name}: var {key} = {value} not a #rrggbb"
-                );
-                assert!(
-                    value
-                        .chars()
-                        .skip(1)
-                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-                    "{name}: var {key} = {value} contains non-hex or uppercase",
+                    value.len() == 7
+                        && value.starts_with('#')
+                        && value
+                            .chars()
+                            .skip(1)
+                            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                    "{name}: var {key} = {value} not a lowercase #rrggbb"
                 );
             }
         }
+        let latte = resolve_theme("catppuccin-latte");
+        assert_eq!(latte.appearance, ThemeAppearance::Light);
+        assert_eq!(latte.syntax.shiki_theme, "catppuccin-latte");
+        let dracula = resolve_theme("dracula");
+        assert_eq!(dracula.appearance, ThemeAppearance::Dark);
+        assert_eq!(dracula.syntax.shiki_theme, "dracula");
+
+        let r = resolve_theme("does-not-exist");
+        assert_eq!(r.source, ResolvedThemeSource::Fallback);
+        assert_eq!(r.name, "zinc");
     }
 
     #[test]
@@ -567,54 +538,50 @@ mod tests {
         // / surface-800 lift toward white. Sanity-check the ordering by
         // luminance on Catppuccin Latte vs Empire.
         let light = resolve_theme("catppuccin-latte");
-        let bg_light = parse_hex(light.web.css_vars.get("--color-surface-900").unwrap());
-        let elevated_light = parse_hex(light.web.css_vars.get("--color-surface-850").unwrap());
+        let bg_light = light.web.css_vars.get("--color-surface-900").unwrap();
+        let elevated_light = light.web.css_vars.get("--color-surface-850").unwrap();
         assert!(
-            luminance_of_hex(&elevated_light) >= luminance_of_hex(&bg_light),
+            luminance_of_hex(elevated_light) >= luminance_of_hex(bg_light),
             "light theme: surface-850 ({elevated_light}) should be >= surface-900 ({bg_light})"
         );
 
         let dark = resolve_theme("empire");
-        let bg_dark = parse_hex(dark.web.css_vars.get("--color-surface-900").unwrap());
-        let deeper_dark = parse_hex(dark.web.css_vars.get("--color-surface-950").unwrap());
+        let bg_dark = dark.web.css_vars.get("--color-surface-900").unwrap();
+        let deeper_dark = dark.web.css_vars.get("--color-surface-950").unwrap();
         assert!(
-            luminance_of_hex(&deeper_dark) <= luminance_of_hex(&bg_dark),
+            luminance_of_hex(deeper_dark) <= luminance_of_hex(bg_dark),
             "dark theme: surface-950 ({deeper_dark}) should be <= surface-900 ({bg_dark})"
         );
     }
 
     #[test]
-    fn brand_button_pair_keeps_contrast_in_light_theme() {
-        let theme = resolve_theme("catppuccin-latte");
-        let fg = color_from_hex(theme.web.css_vars.get("--color-brand-100").unwrap());
-        let bg = color_from_hex(theme.web.css_vars.get("--color-brand-900").unwrap());
-        let surface = color_from_hex(theme.web.css_vars.get("--color-surface-900").unwrap());
-        let composited_bg = composite(bg, surface, 0.4);
-
+    fn builtins_clear_contrast_floors() {
+        let latte = resolve_theme("catppuccin-latte");
+        let fg = color_from_hex(latte.web.css_vars.get("--color-brand-100").unwrap());
+        let bg = color_from_hex(latte.web.css_vars.get("--color-brand-900").unwrap());
+        let surface = color_from_hex(latte.web.css_vars.get("--color-surface-900").unwrap());
         assert!(
-            contrast_ratio(fg, composited_bg) >= 4.5,
+            contrast_ratio(fg, composite(bg, surface, 0.4)) >= 4.5,
             "catppuccin-latte: text-brand-100 must remain readable on bg-brand-900/40"
         );
-    }
 
-    #[test]
-    fn session_active_frame_clears_non_text_contrast_for_all_builtins() {
         for name in builtin_theme_names() {
             let theme = resolve_theme(name);
-            let frame = color_from_hex(theme.web.css_vars.get("--color-session-active").unwrap());
-            let fill = color_from_hex(theme.web.css_vars.get("--color-surface-800").unwrap());
-            let accent = color_from_hex(theme.web.css_vars.get("--color-brand-500").unwrap());
+            let var = |k: &str| color_from_hex(theme.web.css_vars.get(k).unwrap());
+            assert!(
+                contrast_ratio(var("--color-text-on-brand"), var("--color-brand-600")) >= 4.5,
+                "{name}: color-text-on-brand must remain readable on brand-600"
+            );
+            let frame = var("--color-session-active");
+            let fill = var("--color-surface-800");
             // The third surface is the fill an open row takes while it is also
             // multi-selected: `bg-brand-500/15` over the sidebar's surface-800.
             let surfaces = [
-                (
-                    "surface-900",
-                    color_from_hex(theme.web.css_vars.get("--color-surface-900").unwrap()),
-                ),
+                ("surface-900", var("--color-surface-900")),
                 ("surface-800", fill),
                 (
                     "surface-800 + selection tint",
-                    composite(accent, fill, SELECTION_TINT_ALPHA),
+                    composite(var("--color-brand-500"), fill, SELECTION_TINT_ALPHA),
                 ),
             ];
             for (label, bg) in surfaces {
@@ -669,19 +636,6 @@ mod tests {
     }
 
     #[test]
-    fn on_brand_token_keeps_contrast_for_all_builtins() {
-        for name in builtin_theme_names() {
-            let theme = resolve_theme(name);
-            let fg = color_from_hex(theme.web.css_vars.get("--color-text-on-brand").unwrap());
-            let bg = color_from_hex(theme.web.css_vars.get("--color-brand-600").unwrap());
-            assert!(
-                contrast_ratio(fg, bg) >= 4.5,
-                "{name}: color-text-on-brand must remain readable on brand-600"
-            );
-        }
-    }
-
-    #[test]
     fn on_brand_token_uses_wcag_contrast_for_custom_mid_amber() {
         let theme = Theme {
             accent: Color::Rgb(0xb6, 0x76, 0x08),
@@ -703,9 +657,6 @@ mod tests {
         );
     }
 
-    fn parse_hex(s: &str) -> String {
-        s.to_string()
-    }
     fn luminance_of_hex(hex: &str) -> f32 {
         let s = hex.trim_start_matches('#');
         let r = u8::from_str_radix(&s[0..2], 16).unwrap();

@@ -42,6 +42,28 @@ fn host_transcript_state(host_path: &Path) -> PiTranscriptState {
     }
 }
 
+#[cfg(test)]
+#[must_use]
+pub(crate) struct FailNextPiPathWriteGuard {
+    previous_armed: bool,
+    previous_consumed: bool,
+}
+
+#[cfg(test)]
+impl FailNextPiPathWriteGuard {
+    pub(crate) fn was_consumed(&self) -> bool {
+        FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(std::cell::Cell::get)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailNextPiPathWriteGuard {
+    fn drop(&mut self) {
+        FAIL_NEXT_PI_PATH_WRITE.with(|armed| armed.set(self.previous_armed));
+        FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(|consumed| consumed.set(self.previous_consumed));
+    }
+}
+
 impl Instance {
     #[cfg(test)]
     pub(crate) fn mark_pi_extension_launched_for_test(&mut self) {
@@ -267,6 +289,40 @@ impl Instance {
         })
     }
 
+    /// Whether this conversation still owns the observation's Pi transcript path.
+    pub(crate) fn observation_is_current_pi_path(
+        &self,
+        observation: &crate::session::poller::SessionIdObservation,
+    ) -> bool {
+        let crate::session::poller::SessionIdGuard::InstanceSidecar {
+            transcript: Some(path),
+        } = &observation.guard
+        else {
+            return false;
+        };
+        pi_transcript_names(path, &observation.sid)
+            && self.agent_session_id.as_deref() == Some(observation.sid.as_str())
+            && self.active_execution.as_ref() == observation.execution.as_ref()
+            && self
+                .agent_session_binding
+                .as_ref()
+                .map_or(observation.source.is_none(), |binding| {
+                    binding.session_id == observation.sid
+                        && binding.execution.as_ref() == observation.source.as_ref()
+                })
+            && !self.is_capture_excluded(&observation.sid, observation.source.as_ref())
+            && match &self.resume_intent {
+                ResumeIntent::Fork { .. } | ResumeIntent::Cleared => false,
+                ResumeIntent::Use(pinned) => {
+                    pinned == &observation.sid
+                        && self.resume_binding.as_ref().is_none_or(|target| {
+                            target.execution.as_ref() == observation.source.as_ref()
+                        })
+                }
+                ResumeIntent::Default => true,
+            }
+    }
+
     /// Persist the transcript path a poller observation carried. False only while the write keeps
     /// failing, so the caller holds the observation for a retry.
     pub(crate) fn persist_observed_pi_transcript(
@@ -318,32 +374,19 @@ impl Instance {
         match storage.update(|instances, _| {
             #[cfg(test)]
             anyhow::ensure!(
-                !FAIL_PI_PATH_WRITES.with(std::cell::Cell::get),
+                !FAIL_PI_PATH_WRITES.with(std::cell::Cell::get)
+                    && !FAIL_NEXT_PI_PATH_WRITE.with(|fail| {
+                        let armed = fail.replace(false);
+                        if armed {
+                            FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(|consumed| consumed.set(true));
+                        }
+                        armed
+                    }),
                 "injected transcript path write failure"
             );
-            let row = instances.iter_mut().find(|row| {
-                row.id == self.id
-                    && row.agent_session_id.as_deref() == Some(observation.sid.as_str())
-                    && row.active_execution.as_ref() == observation.execution.as_ref()
-                    && row.agent_session_binding.as_ref().map_or(
-                        observation.source.is_none(),
-                        |binding| {
-                            binding.session_id == observation.sid
-                                && binding.execution.as_ref() == observation.source.as_ref()
-                        },
-                    )
-                    && !row.is_capture_excluded(&observation.sid, observation.source.as_ref())
-                    && match &row.resume_intent {
-                        ResumeIntent::Fork { .. } | ResumeIntent::Cleared => false,
-                        ResumeIntent::Use(pinned) => {
-                            pinned == &observation.sid
-                                && row.resume_binding.as_ref().is_none_or(|target| {
-                                    target.execution.as_ref() == observation.source.as_ref()
-                                })
-                        }
-                        ResumeIntent::Default => true,
-                    }
-            });
+            let row = instances
+                .iter_mut()
+                .find(|row| row.id == self.id && row.observation_is_current_pi_path(observation));
             Ok(row
                 .map(|row| row.pi_session_path = Some(path.to_string()))
                 .is_some())
@@ -385,6 +428,27 @@ impl Instance {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_pi_path_write_for_test() -> FailNextPiPathWriteGuard {
+        let previous_armed = FAIL_NEXT_PI_PATH_WRITE.with(std::cell::Cell::get);
+        let previous_consumed = FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(std::cell::Cell::get);
+        assert!(
+            !previous_armed && !previous_consumed,
+            "a previous Pi path write failure is still active"
+        );
+        FAIL_NEXT_PI_PATH_WRITE.with(|armed| armed.set(true));
+        FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(|consumed| consumed.set(false));
+        FailNextPiPathWriteGuard {
+            previous_armed,
+            previous_consumed,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_pi_path_write_consumed_for_test() -> bool {
+        FAIL_NEXT_PI_PATH_WRITE_CONSUMED.with(std::cell::Cell::get)
+    }
+
     /// A host Pi launch that can carry selectors may pin `--session-id`.
     pub(super) fn pi_session_id_pinnable(&self) -> bool {
         self.is_pi()
@@ -398,6 +462,10 @@ impl Instance {
 thread_local! {
     /// Fails this thread's transcript-path writes while set.
     pub(crate) static FAIL_PI_PATH_WRITES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_PI_PATH_WRITE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_PI_PATH_WRITE_CONSUMED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 

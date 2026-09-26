@@ -14,6 +14,23 @@ pub(crate) fn is_http_url(url: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
+/// Whether `url` is safe for a plugin-supplied UI link: an [`is_http_url`]
+/// address, or a same-origin relative path.
+///
+/// A plugin cannot know aoe's own host, so a link back into aoe (e.g. a
+/// session) must be relative. A leading `//` is rejected because browsers
+/// resolve it as a scheme-relative URL to a different host, not a path. A
+/// backslash or embedded tab/CR/LF is also rejected: browsers normalize `\`
+/// to `/` for special schemes and strip tab/CR/LF anywhere in the string, so
+/// e.g. `/\evil.com` or `/\n/evil.com` would otherwise pass this check but
+/// resolve to a different origin. Mirrors the web `isAllowedHref`.
+pub(crate) fn is_allowed_href(url: &str) -> bool {
+    is_http_url(url)
+        || (url.starts_with('/')
+            && !url.starts_with("//")
+            && !url.contains(['\\', '\t', '\r', '\n']))
+}
+
 /// `path` with a leading `home` replaced by `~`, only when `path` is `home` or
 /// lies under it; a sibling that merely shares a string prefix is unchanged.
 pub(crate) fn collapse_home(path: &str, home: &str) -> String {
@@ -85,36 +102,35 @@ mod tests {
     }
 
     #[test]
-    fn system_time_to_ms_at_epoch_is_zero() {
+    fn system_time_to_ms_converts_and_saturates() {
         assert_eq!(system_time_to_ms(UNIX_EPOCH), 0);
-    }
-
-    #[test]
-    fn system_time_to_ms_converts_offset() {
-        let t = UNIX_EPOCH + Duration::from_millis(1_500);
-        assert_eq!(system_time_to_ms(t), 1_500);
-    }
-
-    #[test]
-    fn pre_epoch_saturates_to_zero() {
-        let before = UNIX_EPOCH - Duration::from_secs(1);
-        assert_eq!(system_time_to_ms(before), 0);
-    }
-
-    #[test]
-    fn now_ms_matches_seconds_at_same_instant() {
+        assert_eq!(
+            system_time_to_ms(UNIX_EPOCH + Duration::from_millis(1_500)),
+            1_500
+        );
+        assert_eq!(system_time_to_ms(UNIX_EPOCH - Duration::from_secs(1)), 0);
         let t = SystemTime::now();
-        let ms = system_time_to_ms(t);
-        let secs = t
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        assert_eq!(ms / 1_000, secs);
+        let secs = t.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(system_time_to_ms(t) / 1_000, secs);
     }
 
     #[test]
-    fn now_helpers_are_post_epoch() {
-        assert!(now_secs() > 0);
-        assert!(now_ms() > 0);
+    fn is_allowed_href_accepts_only_http_and_same_origin_paths() {
+        for url in ["https://example.com", "http://example.com", "/session/xyz"] {
+            assert!(is_allowed_href(url), "{url}");
+        }
+        for url in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,evil",
+            "//evil.com",
+            "//evil.com/path",
+            "/\\evil.com",
+            "/\t/evil.com",
+            "/\r/evil.com",
+            "/\n/evil.com",
+        ] {
+            assert!(!is_allowed_href(url), "{url:?}");
+        }
     }
 }

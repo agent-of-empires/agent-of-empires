@@ -211,49 +211,34 @@ mod tests {
     }
 
     #[test]
-    fn test_recheck_on_enter() {
-        let mut dialog = NoAgentsDialog::new();
-        // Default focus is on Re-check
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(
-            result,
-            DialogResult::Submit(NoAgentsAction::Recheck)
-        ));
-    }
-
-    #[test]
-    fn test_quit_on_esc() {
-        let mut dialog = NoAgentsDialog::new();
-        let result = dialog.handle_key(key(KeyCode::Esc));
-        assert!(matches!(result, DialogResult::Submit(NoAgentsAction::Quit)));
-    }
-
-    #[test]
-    fn test_quit_on_q() {
-        let mut dialog = NoAgentsDialog::new();
-        let result = dialog.handle_key(key(KeyCode::Char('q')));
-        assert!(matches!(result, DialogResult::Submit(NoAgentsAction::Quit)));
-    }
-
-    #[test]
-    fn test_recheck_on_r() {
-        let mut dialog = NoAgentsDialog::new();
-        let result = dialog.handle_key(key(KeyCode::Char('r')));
-        assert!(matches!(
-            result,
-            DialogResult::Submit(NoAgentsAction::Recheck)
-        ));
-    }
-
-    #[test]
-    fn test_tab_toggles_focus() {
-        let mut dialog = NoAgentsDialog::new();
-        assert!(dialog.recheck_focused);
-        dialog.handle_key(key(KeyCode::Tab));
-        assert!(!dialog.recheck_focused);
-        // Enter now submits Quit
-        let result = dialog.handle_key(key(KeyCode::Enter));
-        assert!(matches!(result, DialogResult::Submit(NoAgentsAction::Quit)));
+    fn keys_decide_the_action() {
+        use NoAgentsAction::{Quit, Recheck};
+        // Default focus is Re-check; Tab moves it to Quit.
+        let cases = [
+            (&[KeyCode::Enter][..], Some(Recheck)),
+            (&[KeyCode::Esc], Some(Quit)),
+            (&[KeyCode::Char('q')], Some(Quit)),
+            (&[KeyCode::Char('r')], Some(Recheck)),
+            (&[KeyCode::Tab, KeyCode::Enter], Some(Quit)),
+            (&[KeyCode::Char('x')], None),
+        ];
+        for (keys, want) in cases {
+            let mut dialog = NoAgentsDialog::new();
+            let mut last = DialogResult::Continue;
+            for code in keys {
+                last = dialog.handle_key(key(*code));
+            }
+            let got = match last {
+                DialogResult::Submit(action) => Some(action),
+                DialogResult::Continue => None,
+                DialogResult::Cancel => panic!("{keys:?} cancelled"),
+            };
+            assert_eq!(
+                got.map(|a| matches!(a, Recheck)),
+                want.map(|a| matches!(a, Recheck)),
+                "{keys:?}"
+            );
+        }
     }
 
     #[test]
@@ -271,12 +256,5 @@ mod tests {
         // Off the buttons clears.
         assert!(dialog.handle_hover(99, 99));
         assert_eq!(dialog.hover.current(), None);
-    }
-
-    #[test]
-    fn test_other_keys_continue() {
-        let mut dialog = NoAgentsDialog::new();
-        let result = dialog.handle_key(key(KeyCode::Char('x')));
-        assert!(matches!(result, DialogResult::Continue));
     }
 }

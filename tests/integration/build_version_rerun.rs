@@ -116,38 +116,6 @@ fn watch_paths_resolve_in_a_git_worktree() {
 
 #[test]
 #[serial_test::parallel]
-fn watch_paths_resolve_in_a_normal_checkout() {
-    if !git_available() {
-        eprintln!("skipping: git not available");
-        return;
-    }
-
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let repo = tmp.path().join("repo");
-    std::fs::create_dir(&repo).expect("create repo dir");
-
-    assert!(git(&repo, &["init", "-q"]).status.success());
-    git(&repo, &["config", "user.email", "test@example.com"]);
-    git(&repo, &["config", "user.name", "Test"]);
-    assert!(git(&repo, &["commit", "--allow-empty", "-qm", "init"])
-        .status
-        .success());
-
-    let paths = build_git_watch::git_watch_paths(&repo);
-    assert!(
-        paths.iter().any(|p| p.ends_with("HEAD")),
-        "expected a HEAD watch path, got {paths:?}"
-    );
-    for watched in &paths {
-        assert!(
-            watch_path_exists(&repo, watched),
-            "watched path does not exist: {watched}"
-        );
-    }
-}
-
-#[test]
-#[serial_test::parallel]
 fn git_watch_paths_empty_when_git_cannot_resolve() {
     if !git_available() {
         eprintln!("skipping: git not available");

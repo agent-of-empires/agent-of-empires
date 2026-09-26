@@ -501,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn project_patch_parses_base_branch() {
+    fn project_patch_parses_each_field() {
         // null clears, a string sets; the key being present is what matters.
         assert_eq!(
             parse_project_patch(&json!({"default_base_branch": null})),
@@ -523,10 +523,6 @@ mod tests {
             parse_project_patch(&json!({"default_base_branch": 42})),
             Err(("bad_field", "default_base_branch must be a string or null"))
         );
-    }
-
-    #[test]
-    fn project_patch_parses_pinned_alone() {
         // The unpin path sends only `pinned`, with no base-branch key.
         assert_eq!(
             parse_project_patch(&json!({"pinned": false})),
@@ -540,10 +536,6 @@ mod tests {
             parse_project_patch(&json!({"pinned": "yes"})),
             Err(("bad_field", "pinned must be a boolean"))
         );
-    }
-
-    #[test]
-    fn project_patch_parses_overrides() {
         assert_eq!(
             parse_project_patch(&json!({"overrides": {"worktree_enabled": true}})),
             Ok(ProjectPatch {

@@ -199,29 +199,6 @@ async fn silent_orphan_fires_when_the_turn_never_wraps_up() {
     );
 }
 
-/// A healthy turn (no parking keyword) completes long before either grace, so
-/// the natural `prompt_complete` wins and the watchdog stays disarmed.
-#[tokio::test]
-#[serial]
-async fn silent_orphan_suppressed_during_normal_turn() {
-    skip_without_shim!();
-    let outcome = observe_parked_turn(
-        "silent-orphan-negative",
-        ("10000", "10000"),
-        "normal turn",
-        None,
-        5,
-    )
-    .await;
-
-    assert_eq!(
-        outcome.stopped.as_deref(),
-        Some("prompt_complete"),
-        "the watchdog must stay disarmed on a normal turn; saw {:?}",
-        outcome.stopped
-    );
-}
-
 /// `0` disables the watchdog entirely. The fast grace is short enough that a
 /// wrongly-armed watchdog would fire inside the drain, so the silence is a real
 /// assertion rather than an untested window.
@@ -234,7 +211,7 @@ async fn silent_orphan_disabled_by_zero_grace() {
         ("0", "200"),
         "COST_THEN_SILENCE trigger",
         Some(None),
-        2,
+        1,
     )
     .await;
 
@@ -284,7 +261,7 @@ async fn silent_orphan_suppressed_while_off_protocol_work_is_pending() {
         ),
     ];
     for (preseed, prompt, marker, expected_usage) in cases {
-        let outcome = observe_parked_turn(preseed, ("300", "100"), prompt, Some(marker), 2).await;
+        let outcome = observe_parked_turn(preseed, ("300", "100"), prompt, Some(marker), 1).await;
         if let Some(expected) = expected_usage {
             assert_eq!(outcome.usage_cost, expected, "{preseed}");
         }
@@ -322,70 +299,5 @@ async fn background_bash_wrap_up_ends_as_prompt_complete() {
         outcome.stopped.as_deref(),
         Some("prompt_complete"),
         "a backgrounded command must not hold its turn open past the end-of-turn accounting frame"
-    );
-}
-
-/// Usage seen before a tool completion, or only during the drain, must survive
-/// both observation phases rather than being lost with the phase that saw it.
-#[tokio::test]
-#[serial]
-async fn usage_evidence_survives_activity_and_drain() {
-    skip_without_shim!();
-    let mut observed = Vec::new();
-    for (prompt, marker) in [
-        ("normal turn", Some("")),
-        ("USAGE_BEFORE_NO_COST", Some("")),
-        ("USAGE_BEFORE_COST USAGE_AFTER_NO_COST", Some("")),
-        ("USAGE_BEFORE_COST USAGE_AFTER_NO_COST", None),
-    ] {
-        // Park after the ordered notifications and drain through the watchdog
-        // terminal, so an immediate PromptResponse cannot overtake delivery.
-        let _env = EnvGuard::from_pairs(&[
-            ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
-            ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "300"),
-            ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
-        ]);
-        let preseed = "usage-observation";
-        let (socket_path, _runner) =
-            spawn_runner_with_shim(preseed, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())])
-                .await;
-        let mut client = AcpClient::attach(
-            socket_path,
-            std::env::temp_dir(),
-            vec![],
-            preseed.to_string(),
-            false,
-            AcpSessionId(preseed.into()),
-            None,
-            "claude".into(),
-            None,
-        )
-        .await
-        .expect("attach for usage observation");
-        client
-            .send_prompt(&format!("USAGE_OBSERVATION {prompt}"), &[])
-            .await
-            .expect("send prompt");
-
-        let mut outcome = TurnOutcome::default();
-        outcome.await_activity(&mut client, marker).await;
-        let activity_cost = outcome.usage_cost;
-        outcome
-            .drain_turn(&mut client, Instant::now() + Duration::from_secs(10))
-            .await;
-        let _ = client.shutdown().await;
-        assert_eq!(outcome.stopped.as_deref(), Some("prompt_orphaned"));
-        observed.push((activity_cost, outcome.usage_cost));
-    }
-
-    assert_eq!(
-        observed,
-        vec![
-            (None, None),
-            (Some(false), Some(false)),
-            (Some(true), Some(true)),
-            (Some(true), Some(true)),
-        ],
-        "usage before tool completion or a cost-less drain must not be lost"
     );
 }

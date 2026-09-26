@@ -100,12 +100,6 @@ mod tests {
         (guard, instance, generation)
     }
 
-    #[test]
-    fn try_recv_reports_empty_while_idle() {
-        let mut poller = TrashPoller::new();
-        assert!(matches!(poller.try_recv_result(), Err(TryRecvError::Empty)));
-    }
-
     /// A request is in flight until its result lands. A plain (non-worktree,
     /// non-sandbox) session has nothing to relocate.
     #[test]

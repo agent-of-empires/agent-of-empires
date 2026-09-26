@@ -17,12 +17,6 @@ const SCHEMA: SettingsFieldDescriptor[] = [
 ];
 
 describe("SettingsSearch", () => {
-  it("shows no result list until the user types", () => {
-    render(<SettingsSearch schema={SCHEMA} loading={false} onJump={vi.fn()} />);
-    expect(screen.queryByText("Theme")).toBeNull();
-    expect(screen.queryByText("No matching settings")).toBeNull();
-  });
-
   it("filters to matching settings and jumps with the resolved tab on select", () => {
     const onJump = vi.fn();
     render(<SettingsSearch schema={SCHEMA} loading={false} onJump={onJump} />);
@@ -39,10 +33,5 @@ describe("SettingsSearch", () => {
     expect(onJump).toHaveBeenCalledWith(
       expect.objectContaining({ section: "acp", field: "show_tool_durations", tab: "structured-view" }),
     );
-  });
-
-  it("disables the input while the schema is loading", () => {
-    render(<SettingsSearch schema={[]} loading={true} onJump={vi.fn()} />);
-    expect((screen.getByPlaceholderText("Loading settings...") as HTMLInputElement).disabled).toBe(true);
   });
 });

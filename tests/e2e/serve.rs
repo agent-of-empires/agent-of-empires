@@ -10,7 +10,9 @@ use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 use serial_test::parallel;
 
-use crate::harness::{app_dir_in, require_tmux, TuiTestHarness};
+use crate::harness::{
+    app_dir_in, pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness,
+};
 
 fn app_file(h: &TuiTestHarness, name: &str) -> PathBuf {
     app_dir_in(h.home_path()).join(name)
@@ -312,4 +314,258 @@ fn cli_serve_startup_bail_reaches_debug_log() {
         contents.contains("--behind-proxy requires --allowed-host"),
         "fatal startup reason must be routed through the tracing sink; debug.log was:\n{contents}"
     );
+}
+
+fn parse_session_id(add_stdout: &str) -> String {
+    add_stdout
+        .lines()
+        .find_map(|l| {
+            let id = l.trim().strip_prefix("ID:")?.trim();
+            (!id.is_empty()).then(|| id.to_string())
+        })
+        .unwrap_or_else(|| panic!("could not find session ID in `aoe add` output:\n{add_stdout}"))
+}
+
+#[test]
+fn parse_session_id_extracts_the_trimmed_value() {
+    assert_eq!(
+        parse_session_id("  Title:    demo\n  ID:      abc-123\n"),
+        "abc-123"
+    );
+}
+
+#[test]
+#[should_panic(expected = "could not find session ID")]
+fn parse_session_id_panics_when_id_line_is_missing() {
+    parse_session_id("  Title:    demo\n");
+}
+
+#[test]
+#[should_panic(expected = "could not find session ID")]
+fn parse_session_id_panics_when_id_value_is_empty() {
+    // A blank `ID:` line (broken `aoe add` output) must fail fast rather
+    // than hand `prompt_until_accepted` an empty id to retry for 30s.
+    parse_session_id("  Title:    demo\n  ID:      \n");
+}
+
+/// `aoe acp prompt` 404s until the worker is live and handshaked, so a
+/// successful call is the readiness oracle.
+fn prompt_until_accepted(h: &TuiTestHarness, session_id: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = h.run_cli(&["acp", "prompt", session_id, "hello"]);
+        if out.status.success() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "worker never accepted a prompt within {timeout:?}.\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// `aoe acp <verb>` (built on `HttpClient`, see `src/acp/client/http.rs`)
+/// authenticates against a `--behind-proxy --auth=passphrase` daemon by
+/// logging in via `POST /api/login` with the daemon's own `serve.passphrase`
+/// file (the same file `aoe serve --restart` reads) and caching the
+/// resulting `aoe_session` cookie, mirroring how it reuses `serve.token` for
+/// `--auth=token`. This matters specifically under `--behind-proxy`: the
+/// loopback auth bypass (`cli_serve_auth_passphrase_loopback_bypass`) is
+/// withdrawn there
+/// (`cli_serve_auth_passphrase_behind_proxy_gates_unforwarded_requests`), so
+/// a same-host, same-user caller has no other way in.
+#[test]
+#[parallel]
+fn cli_acp_prompt_authenticates_against_behind_proxy_passphrase_daemon() {
+    require_tmux!();
+    require_node!();
+
+    let mut h = TuiTestHarness::new_in_tmp("acp_prompt_passphrase_behind_proxy");
+    let script_path = h.home_path().join("passphrase-prompt-script.json");
+    std::fs::write(&script_path, "{}").expect("write fake-acp script");
+    h.install_acp_shim(&script_path);
+    h.stop_daemon_on_drop();
+
+    // A structured view session needs a git repo as its workspace.
+    let project = h.project_path();
+    for args in [
+        vec!["init", "-q"],
+        vec!["commit", "--allow-empty", "-q", "-m", "init"],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&project)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    let port = pick_free_port();
+    let port_s = port.to_string();
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--auth",
+        "passphrase",
+        "--passphrase",
+        "e2e-pass",
+        "--behind-proxy",
+        "--allowed-host",
+        "aoe.example.test",
+    ]);
+    assert!(
+        start.status.success(),
+        "aoe serve --daemon --auth=passphrase --behind-proxy failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stderr),
+    );
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "daemon never bound port {port}"
+    );
+
+    let add = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "passphrase-prompt",
+        "-c",
+        "claude",
+        "--structured-view",
+    ]);
+    assert!(
+        add.status.success(),
+        "aoe add --structured-view failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&add.stdout),
+        String::from_utf8_lossy(&add.stderr),
+    );
+    let session_id = parse_session_id(&String::from_utf8_lossy(&add.stdout));
+
+    prompt_until_accepted(&h, &session_id, Duration::from_secs(30));
+}
+
+/// The WS half of the passphrase-login fallback: `aoe acp tail` (and the
+/// TUI's live structured-view stream, same `src/acp/client/ws.rs`) must
+/// offer the literal `aoe-auth` subprotocol alongside
+/// `aoe-device.<secret>`. The daemon (`src/server/acp_ws.rs`) only echoes a
+/// `Sec-WebSocket-Protocol` response header when the client offered that
+/// literal, and tungstenite hard-fails the handshake
+/// (`SubProtocolError::NoSubProtocol`) when the response omits it while the
+/// request carried one (RFC 6455).
+#[test]
+#[parallel]
+fn cli_acp_tail_connects_to_behind_proxy_passphrase_daemon() {
+    require_tmux!();
+    require_node!();
+
+    let mut h = TuiTestHarness::new_in_tmp("acp_tail_passphrase_behind_proxy");
+    let script_path = h.home_path().join("passphrase-tail-script.json");
+    std::fs::write(&script_path, "{}").expect("write fake-acp script");
+    h.install_acp_shim(&script_path);
+    h.stop_daemon_on_drop();
+
+    let project = h.project_path();
+    for args in [
+        vec!["init", "-q"],
+        vec!["commit", "--allow-empty", "-q", "-m", "init"],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&project)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    let port = pick_free_port();
+    let port_s = port.to_string();
+    let start = h.run_cli(&[
+        "serve",
+        "--daemon",
+        "--port",
+        &port_s,
+        "--auth",
+        "passphrase",
+        "--passphrase",
+        "e2e-pass",
+        "--behind-proxy",
+        "--allowed-host",
+        "aoe.example.test",
+    ]);
+    assert!(
+        start.status.success(),
+        "aoe serve --daemon --auth=passphrase --behind-proxy failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stderr),
+    );
+    assert!(
+        wait_for_port(port, Duration::from_secs(10)),
+        "daemon never bound port {port}"
+    );
+
+    let add = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "passphrase-tail",
+        "-c",
+        "claude",
+        "--structured-view",
+    ]);
+    assert!(
+        add.status.success(),
+        "aoe add --structured-view failed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&add.stdout),
+        String::from_utf8_lossy(&add.stderr),
+    );
+    let session_id = parse_session_id(&String::from_utf8_lossy(&add.stdout));
+
+    prompt_until_accepted(&h, &session_id, Duration::from_secs(30));
+
+    // `tail` replays history from seq 0 by default, so a completed handshake
+    // is observable as a printed frame line; a failed one closes stdout
+    // (EOF) without ever printing one.
+    let mut child = h.spawn_cli(&["acp", "tail", &session_id]);
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let _ = tx.send(std::io::BufReader::new(stdout).lines().next());
+    });
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Some(Ok(line))) => {
+            assert!(
+                !line.trim().is_empty(),
+                "`aoe acp tail` printed an empty line instead of a frame"
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        other => {
+            use std::io::Read;
+            let _ = child.kill();
+            let status = child.wait().expect("wait for tail process");
+            let mut stderr = String::new();
+            if let Some(mut s) = child.stderr.take() {
+                let _ = s.read_to_string(&mut stderr);
+            }
+            panic!(
+                "`aoe acp tail` never streamed a frame ({other:?}); exited {status}; stderr:\n{stderr}"
+            );
+        }
+    }
 }

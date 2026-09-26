@@ -6,73 +6,49 @@ import { clickSidebarSession } from "./helpers/sidebar";
 test.describe("Desktop live terminal input", () => {
   test.use({ viewport: { width: 1280, height: 800 }, hasTouch: false });
 
-  test("clicking the terminal focuses the input and keystrokes are sent", async ({ page }) => {
+  test("a click focuses the input and marks the pane; keys reach the PTY at the desktop font size", async ({
+    page,
+  }) => {
     const handle = await mockTerminalApis(page);
-    await page.goto("/");
-    await clickSidebarSession(page, "pinch-test");
-    await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
-
-    await page.locator("[data-live-terminal]").first().click();
-    await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
-
-    const before = handle.liveInput.length;
-    await page.keyboard.type("ls");
-    await expect.poll(() => Buffer.concat(handle.liveInput.slice(before)).toString()).toBe("ls");
-  });
-
-  test("the focused pane is marked selected, like the TUI's active border", async ({ page }) => {
-    // The focused pane gets the terminal-active ring and data-pane-focused.
-    await mockTerminalApis(page);
     await page.goto("/");
     await clickSidebarSession(page, "pinch-test");
     const pane = page.locator('[data-term="agent"]').first();
     await pane.waitFor({ state: "visible", timeout: 10_000 });
+    // A fine pointer uses desktopFontSize (14px), not mobileFontSize.
+    const content = page.locator("[data-live-content]").first();
+    await expect
+      .poll(() => content.evaluate((el) => getComputedStyle(el.closest("[data-live-terminal] > div")!).fontSize))
+      .toBe("14px");
 
     await page.locator("[data-live-terminal]").first().click();
-    await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
+    const input = page.locator('textarea[aria-label="Live terminal input"]').first();
+    await expect(input).toBeFocused();
+    // The focused pane gets the terminal-active ring, like the TUI's active border.
     await expect(pane).toHaveAttribute("data-pane-focused", "true");
 
-    await page.locator('textarea[aria-label="Live terminal input"]').first().blur();
+    const sent = (from: number) => handle.liveMessages.slice(from).map((m) => m.toString("utf8"));
+    let before = handle.liveInput.length;
+    await page.keyboard.type("ls");
+    await expect.poll(() => Buffer.concat(handle.liveInput.slice(before)).toString()).toBe("ls");
+
+    // Shift+Tab is backtab (CSI Z), which Claude Code's mode cycle reads, not a plain Tab.
+    before = handle.liveMessages.length;
+    await page.keyboard.press("Shift+Tab");
+    await expect.poll(() => sent(before)).toContainEqual("\x1b[Z");
+    expect(sent(before)).not.toContainEqual("\t");
+
+    // Codex's Alt+V image paste: ESC + v, like a native terminal.
+    before = handle.liveMessages.length;
+    await page.keyboard.press("Alt+KeyV");
+    await expect.poll(() => sent(before)).toContainEqual("\x1bv");
+
+    await input.blur();
     await expect(pane).not.toHaveAttribute("data-pane-focused", "true");
   });
 
-  test("Ctrl+V pastes as a bracketed paste instead of sending a literal ^V", async ({ page }) => {
-    // #2384: Ctrl+V falls through to the native paste event instead of sending ^V.
-    const handle = await mockTerminalApis(page);
-    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
-    await page.goto("/");
-    await clickSidebarSession(page, "pinch-test");
-    await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
-    await page.locator("[data-live-terminal]").first().click();
-    await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
-
-    await page.evaluate(() => navigator.clipboard.writeText("pasted text"));
-    const before = handle.liveMessages.length;
-    await page.keyboard.press("Control+v");
-
-    await expect
-      .poll(() => handle.liveMessages.slice(before).map((m) => m.toString("utf8")))
-      .toContainEqual("\x1b[200~pasted text\x1b[201~");
-    const sentCtrlV = handle.liveMessages.slice(before).some((m) => m.toString("utf8") === "\x16");
-    expect(sentCtrlV).toBe(false);
-  });
-
-  test("Alt+V reaches the terminal as a Meta-v sequence", async ({ page }) => {
-    // Codex's Alt+V image paste: ESC + v, like a native terminal.
-    const handle = await mockTerminalApis(page);
-    await page.goto("/");
-    await clickSidebarSession(page, "pinch-test");
-    await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
-    await page.locator("[data-live-terminal]").first().click();
-    await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
-
-    const before = handle.liveMessages.length;
-    await page.keyboard.press("Alt+KeyV");
-
-    await expect.poll(() => handle.liveMessages.slice(before).map((m) => m.toString("utf8"))).toContainEqual("\x1bv");
-  });
-
-  test("Ctrl+Shift+C copies the terminal selection without sending ^C", async ({ page }) => {
+  test("Ctrl+Shift+C copies the selection without ^C, and Ctrl+V pastes as a bracketed paste without ^V", async ({
+    page,
+  }) => {
     // #2384: Ctrl+Shift+C copies the DOM selection; the focused hidden input would copy nothing, and Ctrl+C stays SIGINT.
     const handle = await mockTerminalApis(page);
     await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
@@ -115,6 +91,18 @@ test.describe("Desktop live terminal input", () => {
     await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(selected);
     const sentSigint = handle.liveMessages.slice(before).some((m) => m.toString("utf8") === "\x03");
     expect(sentSigint).toBe(false);
+
+    // #2384: Ctrl+V falls through to the native paste event instead of sending ^V.
+    await page.evaluate(() => navigator.clipboard.writeText("pasted text"));
+    await page.evaluate(() => window.getSelection()?.removeAllRanges());
+    await page.locator("[data-live-terminal]").first().click();
+    await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
+    const beforePaste = handle.liveMessages.length;
+    await page.keyboard.press("Control+v");
+    await expect
+      .poll(() => handle.liveMessages.slice(beforePaste).map((m) => m.toString("utf8")))
+      .toContainEqual("\x1b[200~pasted text\x1b[201~");
+    expect(handle.liveMessages.slice(beforePaste).some((m) => m.toString("utf8") === "\x16")).toBe(false);
   });
 
   test("an agent OSC 52 copy reaches the browser clipboard after mouse release", async ({ page }) => {
@@ -144,34 +132,6 @@ test.describe("Desktop live terminal input", () => {
     handle.pushLiveClipboard("copied through live-ws");
 
     await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe("copied through live-ws");
-  });
-
-  test("Shift+Tab sends backtab (CSI Z), not a plain Tab", async ({ page }) => {
-    // Shift+Tab sends backtab (\x1b[Z), which Claude Code's mode cycle reads.
-    const handle = await mockTerminalApis(page);
-    await page.goto("/");
-    await clickSidebarSession(page, "pinch-test");
-    await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
-    await page.locator("[data-live-terminal]").first().click();
-    await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
-
-    const before = handle.liveMessages.length;
-    await page.keyboard.press("Shift+Tab");
-
-    await expect.poll(() => handle.liveMessages.slice(before).map((m) => m.toString("utf8"))).toContainEqual("\x1b[Z");
-    const sentPlainTab = handle.liveMessages.slice(before).some((m) => m.toString("utf8") === "\t");
-    expect(sentPlainTab).toBe(false);
-  });
-
-  test("renders at the desktop font size, not the small mobile default", async ({ page }) => {
-    // A fine pointer uses desktopFontSize (14px), not mobileFontSize.
-    await mockTerminalApis(page);
-    await page.goto("/");
-    await clickSidebarSession(page, "pinch-test");
-    const content = page.locator("[data-live-content]").first();
-    await content.waitFor({ state: "visible", timeout: 10_000 });
-    const px = await content.evaluate((el) => getComputedStyle(el.closest("[data-live-terminal] > div")!).fontSize);
-    expect(px).toBe("14px");
   });
 
   test("scrolling down to the bottom keeps real rows visible", async ({ page }) => {
@@ -234,11 +194,18 @@ test.describe("Desktop live terminal input", () => {
       requestAnimationFrame(sample);
     });
     await scroller.hover();
-    for (let i = 0; i < 6; i++) {
-      await page.mouse.wheel(0, 5000);
-      await page.waitForTimeout(16);
-    }
-    await page.waitForTimeout(900);
+    for (let i = 0; i < 6; i++) await page.mouse.wheel(0, 5000);
+    // Sample until the live edge has rendered, then check every frame on the way.
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const samples =
+            (window as typeof window & { __BOTTOM_TRANSITION_SAMPLES__?: Array<{ visibleText: string }> })
+              .__BOTTOM_TRANSITION_SAMPLES__ ?? [];
+          return samples.at(-1)?.visibleText ?? "";
+        }),
+      )
+      .toContain("$ ready");
 
     const samples = await page.evaluate(() => {
       const state = window as typeof window & {

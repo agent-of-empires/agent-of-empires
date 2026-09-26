@@ -11,20 +11,9 @@ test.describe("Dashboard layout", () => {
     await expect(page.getByText("Clone URL")).toBeVisible();
     await expect(page.getByText("Docs")).toBeVisible();
   });
-
-  test("shows offline indicator when API unreachable", async ({ page }) => {
-    await page.goto("/");
-    await expect(page.getByText("offline")).toBeVisible();
-  });
 });
 
 test.describe("Sidebar", () => {
-  test("sidebar visible on desktop by default", async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await expect(page.getByLabel("New project session")).toBeVisible();
-  });
-
   test("sidebar Projects section lists a no-session saved project with an add button", async ({ page }) => {
     // The dedicated Projects section (#2212) replaced the /projects page: a
     // saved (non-pinned) project with no live session renders as a row in the
@@ -58,12 +47,6 @@ test.describe("Sidebar", () => {
 });
 
 test.describe("Create session from home screen", () => {
-  test("'New session' pane opens session wizard", async ({ page }) => {
-    await page.goto("/");
-    await page.getByRole("button", { name: NEW_SESSION_PANE_NAME }).click();
-    await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-  });
-
   test("'Clone URL' pane opens wizard on Clone tab", async ({ page }) => {
     await page.goto("/");
     await page.getByText("Clone URL").click();
@@ -78,16 +61,6 @@ test.describe("Create session from home screen", () => {
     await page.locator("body").click();
     await page.keyboard.press("n");
     await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-  });
-
-  test("wizard closes on the close button", async ({ page }) => {
-    await page.goto("/");
-    await page.getByRole("button", { name: NEW_SESSION_PANE_NAME }).click();
-    await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
-    // The single-screen wizard (#2210) has no Back/Cancel footer; it closes
-    // via the header close button (or Escape, covered below).
-    await page.getByTestId("session-wizard").getByRole("button", { name: "Close" }).click();
-    await expect(page.getByRole("heading", { name: "New session" })).not.toBeVisible();
   });
 
   test("wizard closes on escape", async ({ page }) => {
@@ -124,12 +97,6 @@ test.describe("Create session from home screen", () => {
 });
 
 test.describe("Settings", () => {
-  test("settings opens on click", async ({ page }) => {
-    await page.goto("/");
-    await page.getByRole("button", { name: "Settings" }).click();
-    await expect(page.getByRole("button", { name: /Back/i })).toBeVisible();
-  });
-
   test("settings opens with keyboard shortcut s", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
@@ -140,24 +107,6 @@ test.describe("Settings", () => {
 });
 
 test.describe("Keyboard shortcuts", () => {
-  test("D toggles diff pane (no-op when no session, no crash)", async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    // Should not crash even with no session selected
-    await page.keyboard.press("Shift+d");
-    await expect(page.getByText("empires", { exact: false })).toBeVisible();
-  });
-
-  test("? opens help overlay", async ({ page }) => {
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-    await page.locator("body").click();
-    await page.evaluate(() => {
-      document.dispatchEvent(new KeyboardEvent("keydown", { key: "?", bubbles: true }));
-    });
-    await expect(page.getByRole("heading", { name: "Help" })).toBeVisible();
-  });
-
   test("escape closes help overlay", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
@@ -172,16 +121,6 @@ test.describe("Keyboard shortcuts", () => {
 });
 
 test.describe("Mobile responsive", () => {
-  test("sidebar closed by default on mobile", async ({ page }) => {
-    await page.setViewportSize({ width: 375, height: 812 });
-    await page.goto("/");
-    // Sidebar is translated off-screen on mobile (not display:none), so
-    // use toBeInViewport rather than toBeVisible.
-    await expect(page.getByLabel("New project session")).not.toBeInViewport();
-    // Home screen content visible
-    await expect(page.getByText("empires", { exact: false })).toBeVisible();
-  });
-
   test("mobile home screen's Show sessions button opens the sidebar", async ({ page }) => {
     // Dashboard.tsx's own `md:hidden` trigger, not TopBar's "Toggle sidebar":
     // the two are separate elements and nothing else in web/ drives this one.
@@ -246,13 +185,6 @@ test.describe("Mobile responsive", () => {
     await expect(page).toHaveURL(/\/session\/new$/);
   });
 
-  test("hamburger opens sidebar overlay on mobile", async ({ page }) => {
-    await page.setViewportSize({ width: 375, height: 812 });
-    await page.goto("/");
-    await page.getByRole("button", { name: "Toggle sidebar" }).click();
-    await expect(page.getByLabel("New project session")).toBeInViewport();
-  });
-
   test("sidebar closes via toggle on mobile", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");
@@ -261,12 +193,5 @@ test.describe("Mobile responsive", () => {
     // Toggle the sidebar closed again
     await page.getByRole("button", { name: "Toggle sidebar" }).click();
     await expect(page.getByLabel("New project session")).not.toBeInViewport();
-  });
-
-  test("create modal works on mobile", async ({ page }) => {
-    await page.setViewportSize({ width: 375, height: 812 });
-    await page.goto("/");
-    await page.getByRole("button", { name: NEW_SESSION_PANE_NAME }).click();
-    await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
   });
 });

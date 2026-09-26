@@ -96,7 +96,9 @@ const UI_ENTRIES = [
 ];
 
 test.describe("Plugin sort-key and filter-facet slots (#2401)", () => {
-  test("a plugin sort-key reorders rows by sort_value desc", async ({ page }) => {
+  test("a plugin sort-key reorders rows by sort_value desc; a filter-facet filters by filter_values", async ({
+    page,
+  }) => {
     await mockApis(page, SESSIONS, ORDERING, UI_ENTRIES);
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
@@ -115,13 +117,8 @@ test.describe("Plugin sort-key and filter-facet slots (#2401)", () => {
     // The plugin sort is ephemeral: not persisted to localStorage.
     const stored = await page.evaluate(() => window.localStorage.getItem("aoe-sidebar-sort-mode"));
     expect(stored).not.toBe("plugin");
-  });
 
-  test("a plugin filter-facet filters rows by filter_values", async ({ page }) => {
-    await mockApis(page, SESSIONS, ORDERING, UI_ENTRIES);
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await page.goto("/");
-
+    // A plugin filter-facet filters rows by filter_values.
     await expect(page.locator("[data-testid='sidebar-session-row']")).toHaveCount(3, { timeout: 8000 });
 
     // Open the facet panel and select "running".

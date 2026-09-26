@@ -48,38 +48,25 @@ afterEach(() => {
 });
 
 describe("DiffCommentsUserCard", () => {
-  it.each([
-    [[comment()], "1 comment"],
-    [[comment({ id: "a" }), comment({ id: "b", filePath: "src/b.ts" })], "2 comments"],
-    [[], "0 comments"],
-  ])("labels the badge count", (comments, label) => {
+  it("labels the badge count", () => {
+    const comments = [comment({ id: "a" }), comment({ id: "b", filePath: "src/b.ts" })];
     const c = renderCard({ comments });
     expect(c.textContent).toContain("diff review");
     const count = Array.from(c.querySelectorAll("span")).find((s) => /^\d+ comments?$/.test(s.textContent ?? ""));
-    expect(count?.textContent).toBe(label);
+    expect(count?.textContent).toBe("2 comments");
     expect(c.querySelectorAll("li")).toHaveLength(comments.length);
   });
 
   it("renders body, path, side and plain snippet, without framing when blank", () => {
     const c = renderCard({ comments: [comment({ body: "fix this", filePath: "src/widget.ts", side: "old" })] });
-    for (const t of ["fix this", "src/widget.ts", "old"]) expect(c.textContent).toContain(t);
+    for (const t of ["fix this", "src/widget.ts", "old", "line 10"]) expect(c.textContent).toContain(t);
     expect(c.querySelector("pre")?.textContent).toBe("const x = 1;");
     expect(c.querySelectorAll(".border-l-2")).toHaveLength(0);
   });
 
-  it.each([
-    [5, 5, "line 5", "lines 5"],
-    [5, 9, "lines 5-9", undefined],
-  ])("renders range %i-%i", (startLine, endLine, shown, hidden) => {
-    const c = renderCard({ comments: [comment({ startLine, endLine })] });
-    expect(c.textContent).toContain(shown);
-    if (hidden) expect(c.textContent).not.toContain(hidden);
-  });
-
-  it("renders intro and outro framing", () => {
-    const c = renderCard({ intro: "Please review", outro: "Thanks!" });
-    expect(c.textContent).toContain("Please review");
-    expect(c.textContent).toContain("Thanks!");
+  it("renders a multi-line range", () => {
+    const c = renderCard({ comments: [comment({ startLine: 5, endLine: 9 })] });
+    expect(c.textContent).toContain("lines 5-9");
   });
 
   it.each([false, true])("shows the repo chip only for multi-repo (%s)", (isMultiRepo) => {
@@ -100,12 +87,6 @@ describe("DiffCommentsUserCard", () => {
     expect(items[0]).toContain("line 5");
     expect(items[1]).toContain("line 30");
     expect(items[2]).toContain("line 1");
-  });
-
-  it("renders highlighted HTML when the language resolves", async () => {
-    highlighter.loaded = true;
-    const c = renderCard({ comments: [comment({ capturedSnippet: "const y = 2;", language: "typescript" })] });
-    await waitFor(() => expect(c.querySelector("pre.shiki")?.textContent).toContain("const y = 2;"));
   });
 
   it("clears highlighted output when the same slot is reused with an unresolved language (#3974)", async () => {

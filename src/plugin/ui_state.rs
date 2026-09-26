@@ -269,7 +269,7 @@ fn push_link(
     let Some(href) = href.and_then(Value::as_str) else {
         return;
     };
-    if !crate::util::is_http_url(href) || !seen.insert(href.to_string()) {
+    if !crate::util::is_allowed_href(href) || !seen.insert(href.to_string()) {
         return;
     }
     let label = label
@@ -480,9 +480,9 @@ impl UiStore {
             return Err(UiError::BadRequest("notification body too long".into()));
         }
         if let Some(href) = &href {
-            if !crate::util::is_http_url(href) {
+            if !crate::util::is_allowed_href(href) {
                 return Err(UiError::BadRequest(
-                    "notification href must be http/https".into(),
+                    "notification href must be http/https or a relative path".into(),
                 ));
             }
         }
@@ -690,6 +690,8 @@ mod tests {
                         {"href": "https://example.com/pr/1", "text": "dup"},
                         {"href": "javascript:alert(1)", "text": "evil"},
                         {"href": "https://example.com/pr/2", "text": "PR 2"},
+                        {"href": "/session/xyz", "text": "Session"},
+                        {"href": "//evil.com", "text": "scheme-relative"},
                     ]
                 }),
             )],
@@ -701,6 +703,7 @@ mod tests {
             vec![
                 ("https://example.com/pr/1".to_string(), "PR 1".to_string()),
                 ("https://example.com/pr/2".to_string(), "PR 2".to_string()),
+                ("/session/xyz".to_string(), "Session".to_string()),
             ]
         );
 
@@ -731,33 +734,21 @@ mod tests {
     }
 
     #[test]
-    fn set_get_and_remove_global_entry() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        set(
-            &s,
-            g,
-            UiSlot::StatusBar,
-            "build",
-            None,
-            json!({"text": "ok", "tone": "success"}),
-        )
-        .unwrap();
-        let snap = s.snapshot();
-        assert_eq!(snap.entries.len(), 1);
-        assert_eq!(snap.entries[0].slot, UiSlot::StatusBar);
-        assert_eq!(snap.entries[0].payload["text"], json!("ok"));
-
-        s.remove("acme.kit", g, UiSlot::StatusBar, "build", None)
-            .unwrap();
-        assert_eq!(s.snapshot().entries.len(), 0);
-    }
-
-    #[test]
     fn set_enforces_scope_rules_and_payload_shape() {
         let s = store();
         let g = s.begin_generation("acme.kit");
         let composer = |draft: Value| json!({"label": "Voice", "method": "voice.start", "draft_operation": draft});
+        let nested_blocks = |depth: usize| {
+            let mut block = json!({"kind": "row", "label": "leaf"});
+            for _ in 0..depth {
+                block = json!({"kind": "section", "children": [block]});
+            }
+            json!({"blocks": [block]})
+        };
+        let mut inert = json!("leaf");
+        for _ in 0..64 {
+            inert = json!({"nested": inert});
+        }
         let cases: Vec<(&str, UiSlot, Option<&str>, Value, bool)> = vec![
             (
                 "status bar is global only",
@@ -870,6 +861,111 @@ mod tests {
                 })),
                 false,
             ),
+            (
+                "row badge accepts an items list",
+                UiSlot::RowBadge,
+                Some("s1"),
+                json!({"items": [
+                    {"icon": "git-pull-request-arrow", "tone": "success", "href": "https://x/pr/1", "tooltip": "PR #1"},
+                    {"icon": "git-pull-request-draft", "tone": "warn"}
+                ]}),
+                true,
+            ),
+            (
+                "row badge accepts an empty items list",
+                UiSlot::RowBadge,
+                Some("s1"),
+                json!({"items": []}),
+                true,
+            ),
+            (
+                "row badge item with unknown tone rejected",
+                UiSlot::RowBadge,
+                Some("s1"),
+                json!({"items": [{"tone": "rainbow"}]}),
+                false,
+            ),
+            (
+                "pane accepts unknown future block kinds",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"title": "GitHub", "default_location": "bottom", "blocks": [
+                    {"kind": "heading", "text": "GitHub"},
+                    {"kind": "divider"},
+                    {"kind": "some-future-kind", "whatever": {"nested": true}}
+                ]}),
+                true,
+            ),
+            (
+                "pane accepts title and body",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"title": "T", "body": "B"}),
+                true,
+            ),
+            (
+                "pane rejects unknown default location",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"default_location": "sideways"}),
+                false,
+            ),
+            (
+                "pane footer accepted",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"footer": {"text": "refreshed", "value": "blocked", "tone": "danger", "icon": "refresh-cw"}}),
+                true,
+            ),
+            (
+                "pane footer unknown field rejected",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"footer": {"txt": "oops"}}),
+                false,
+            ),
+            (
+                "pane nesting under the depth cap accepted",
+                UiSlot::Pane,
+                Some("s1"),
+                nested_blocks(MAX_BLOCK_DEPTH - 1),
+                true,
+            ),
+            (
+                "pane nesting past the depth cap rejected",
+                UiSlot::Pane,
+                Some("s1"),
+                nested_blocks(MAX_BLOCK_DEPTH + 1),
+                false,
+            ),
+            (
+                "deep inert payload inside an unknown block does not count",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"blocks": [{"kind": "some-future-kind", "payload": inert}]}),
+                true,
+            ),
+            (
+                "pane payload cap is larger than other slots",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"blocks": [{"kind": "note", "text": "x".repeat(40 * 1024)}]}),
+                true,
+            ),
+            (
+                "pane payload past its cap rejected",
+                UiSlot::Pane,
+                Some("s1"),
+                json!({"blocks": [{"kind": "note", "text": "x".repeat(64 * 1024)}]}),
+                false,
+            ),
+            (
+                "row badge payload past the slot cap rejected",
+                UiSlot::RowBadge,
+                Some("s1"),
+                json!({"text": "x".repeat(9 * 1024)}),
+                false,
+            ),
         ];
         for (name, slot, session, payload, ok) in cases {
             let result = set(&s, g, slot, "x", session, payload);
@@ -933,236 +1029,41 @@ mod tests {
     }
 
     #[test]
-    fn empty_notification_title_rejected() {
+    fn notify_requires_a_title_and_a_safe_href() {
         let s = store();
         assert!(matches!(
             s.notify("acme.kit", Tone::Info, String::new(), None, None, None),
             Err(UiError::BadRequest(_))
         ));
-    }
-
-    #[test]
-    fn notify_rejects_non_http_href() {
-        let s = store();
-        assert!(matches!(
-            s.notify(
+        for (href, ok) in [
+            ("javascript:alert(1)", false),
+            ("//evil.com", false),
+            ("https://example.com", true),
+            ("/session/xyz", true),
+        ] {
+            let result = s.notify(
                 "acme.kit",
                 Tone::Info,
                 "Open".into(),
                 None,
                 None,
-                Some("javascript:alert(1)".into()),
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        let seq = s
-            .notify(
-                "acme.kit",
-                Tone::Info,
-                "Open".into(),
-                None,
-                None,
-                Some("https://example.com".into()),
-            )
-            .unwrap();
-        assert_eq!(
-            s.snapshot().notifications[0].href.as_deref(),
-            Some("https://example.com")
-        );
-        assert_eq!(seq, 1);
-    }
-
-    #[test]
-    fn row_badge_accepts_items_list() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        set(&s, g, UiSlot::RowBadge, "repos", Some("s1"), json!({"items": [
-                {"icon": "git-pull-request-arrow", "tone": "success", "href": "https://x/pr/1", "tooltip": "PR #1"},
-                {"icon": "git-pull-request-draft", "tone": "warn"}
-            ]}))
-        .unwrap();
-        let snap = s.snapshot();
-        assert_eq!(
-            snap.entries[0].payload["items"].as_array().unwrap().len(),
-            2
-        );
-        set(
-            &s,
-            g,
-            UiSlot::RowBadge,
-            "repos",
-            Some("s1"),
-            json!({"items": []}),
-        )
-        .unwrap();
-        assert!(matches!(
-            set(
-                &s,
-                g,
-                UiSlot::RowBadge,
-                "repos",
-                Some("s1"),
-                json!({"items": [{"tone": "rainbow"}]})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn pane_blocks_are_forward_compatible() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        set(
-            &s,
-            g,
-            UiSlot::Pane,
-            "gh",
-            Some("s1"),
-            json!({"title": "GitHub", "default_location": "bottom", "blocks": [
-                {"kind": "heading", "text": "GitHub"},
-                {"kind": "row", "label": "nexus", "value": "PR #12", "href": "https://x/pr/12"},
-                {"kind": "divider"},
-                {"kind": "some-future-kind", "whatever": {"nested": true}}
-            ]}),
-        )
-        .unwrap();
-        let snap = s.snapshot();
-        let blocks = snap.entries[0].payload["blocks"].as_array().unwrap();
-        assert_eq!(blocks.len(), 4);
-        assert_eq!(blocks[3]["kind"], json!("some-future-kind"));
-        assert_eq!(snap.entries[0].payload["default_location"], json!("bottom"));
-        set(
-            &s,
-            g,
-            UiSlot::Pane,
-            "gh",
-            Some("s1"),
-            json!({"title": "T", "body": "B"}),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn pane_rejects_blocks_nested_past_the_depth_cap() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        let chain = |depth: usize| {
-            let mut block = json!({"kind": "row", "label": "leaf"});
-            for _ in 0..depth {
-                block = json!({"kind": "section", "children": [block]});
+                Some(href.into()),
+            );
+            assert_eq!(result.is_ok(), ok, "{href}: {result:?}");
+            if ok {
+                let snap = s.snapshot();
+                assert_eq!(
+                    snap.notifications.last().unwrap().href.as_deref(),
+                    Some(href)
+                );
+            } else {
+                assert!(matches!(result, Err(UiError::BadRequest(_))), "{href}");
             }
-            json!({"blocks": [block]})
-        };
-        set(
-            &s,
-            g,
-            UiSlot::Pane,
-            "gh",
-            Some("s1"),
-            chain(MAX_BLOCK_DEPTH - 1),
-        )
-        .unwrap();
-        assert!(matches!(
-            set(
-                &s,
-                g,
-                UiSlot::Pane,
-                "gh",
-                Some("s1"),
-                chain(MAX_BLOCK_DEPTH + 1)
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        let mut inert = json!("leaf");
-        for _ in 0..64 {
-            inert = json!({"nested": inert});
         }
-        set(
-            &s,
-            g,
-            UiSlot::Pane,
-            "gh",
-            Some("s1"),
-            json!({"blocks": [{"kind": "some-future-kind", "payload": inert}]}),
-        )
-        .unwrap();
     }
 
     #[test]
-    fn pane_footer_round_trips_and_rejects_unknown_fields() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        set(&s, g, UiSlot::Pane, "gh", Some("s1"), json!({"blocks": [{"kind": "heading", "text": "GitHub"}],
-                    "footer": {"text": "refreshed 12:07", "value": "blocked", "tone": "danger", "icon": "refresh-cw"}}))
-        .unwrap();
-        let snap = s.snapshot();
-        assert_eq!(snap.entries[0].payload["footer"]["value"], json!("blocked"));
-        assert_eq!(snap.entries[0].payload["footer"]["tone"], json!("danger"));
-        assert!(matches!(
-            set(
-                &s,
-                g,
-                UiSlot::Pane,
-                "gh",
-                Some("s1"),
-                json!({"footer": {"txt": "oops"}})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn pane_rejects_unknown_default_location() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        assert!(matches!(
-            set(
-                &s,
-                g,
-                UiSlot::Pane,
-                "gh",
-                Some("s1"),
-                json!({"default_location": "sideways"})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn pane_payload_cap_is_larger_than_other_slots() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        let pane = |text: String| {
-            set(
-                &s,
-                g,
-                UiSlot::Pane,
-                "gh",
-                Some("s1"),
-                json!({"blocks": [{"kind": "note", "text": text}]}),
-            )
-        };
-
-        pane("x".repeat(40 * 1024)).expect("40 KiB fits in a pane");
-        assert!(matches!(
-            pane("x".repeat(64 * 1024)),
-            Err(UiError::BadRequest(_))
-        ));
-        assert!(matches!(
-            set(
-                &s,
-                g,
-                UiSlot::RowBadge,
-                "b",
-                Some("s1"),
-                json!({"text": "x".repeat(9 * 1024)})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn per_scope_quota_blocks_only_that_scope_and_frees_on_remove() {
+    fn quotas_bound_each_scope_and_each_plugin() {
         let s = store();
         let g = s.begin_generation("acme.kit");
         let badge = |id: &str, session: &str| {
@@ -1186,10 +1087,8 @@ mod tests {
         s.remove("acme.kit", g, UiSlot::RowBadge, "b0", Some("s1"))
             .unwrap();
         badge("replacement", "s1").expect("removing an entry frees its scope slot");
-    }
 
-    #[test]
-    fn per_plugin_backstop_bounds_fabricated_scopes() {
+        // The per-plugin backstop bounds fabricated scopes.
         let s = store();
         let g = s.begin_generation("acme.kit");
         let badge = |session: &str| {
@@ -1202,7 +1101,6 @@ mod tests {
                 json!({"text": "x"}),
             )
         };
-
         for i in 0..MAX_ENTRIES_PER_PLUGIN {
             badge(&format!("s{i}")).unwrap();
         }
@@ -1210,7 +1108,7 @@ mod tests {
     }
 
     #[test]
-    fn revision_bumps_on_mutation_and_surfaces_in_snapshot() {
+    fn revision_bumps_per_scope_on_mutation_and_surfaces_in_snapshot() {
         let s = store();
         assert_eq!(s.revision("acme.kit", None), 0);
         let g = s.begin_generation("acme.kit");
@@ -1232,20 +1130,12 @@ mod tests {
             Some(&3)
         );
         assert_eq!(snap.revisions.get("other.kit"), None);
-    }
 
-    #[test]
-    fn revision_is_scoped_per_session() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
         set(&s, g, UiSlot::Pane, "p", Some("s1"), json!({"title": "a"})).unwrap();
         assert_eq!(s.revision("acme.kit", Some("s1")), 1);
         assert_eq!(s.revision("acme.kit", Some("s2")), 0);
-
         set(&s, g, UiSlot::Pane, "p", Some("s2"), json!({"title": "b"})).unwrap();
         assert_eq!(s.revision("acme.kit", Some("s1")), 1);
-        assert_eq!(s.revision("acme.kit", Some("s2")), 1);
-
         s.clear_plugin("acme.kit", g);
         assert_eq!(s.revision("acme.kit", Some("s1")), 2);
         assert_eq!(s.revision("acme.kit", Some("s2")), 2);

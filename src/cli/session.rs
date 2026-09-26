@@ -877,6 +877,7 @@ fn apply_import_mode(
                 agent: "claude".into(),
                 stores: vec![s.config_dir.clone()],
                 configuration: Vec::new(),
+                exported_default_store: false,
                 cwd: crate::session::capture::canonicalize_or_raw(&s.cwd),
                 filesystem: "host".into(),
                 cwd_filesystem: "host".into(),
@@ -2874,34 +2875,6 @@ mod restart_args_tests {
             (true, None, 5)
         );
         assert!(restart(&["aoe", "restart", "claude-3", "--all"]).is_err());
-    }
-
-    #[test]
-    fn add_project_parses_its_identifier_project_and_branch_opt_in() {
-        let cases = [
-            (vec!["aoe", "add-project", "claude-3", "../frontend"], false),
-            (
-                vec![
-                    "aoe",
-                    "add-project",
-                    "claude-3",
-                    "../frontend",
-                    "--attach-existing-branch",
-                ],
-                true,
-            ),
-        ];
-        for (argv, attach_existing) in cases {
-            let cli = Cli::try_parse_from(&argv).expect("add-project must parse");
-            match cli.cmd {
-                SessionCommands::AddProject(args) => {
-                    assert_eq!(args.identifier, "claude-3");
-                    assert_eq!(args.project, "../frontend");
-                    assert_eq!(args.attach_existing_branch, attach_existing, "{argv:?}");
-                }
-                _ => panic!("wrong subcommand"),
-            }
-        }
     }
 
     #[test]

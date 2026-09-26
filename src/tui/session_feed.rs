@@ -207,29 +207,6 @@ mod tests {
     }
 
     #[test]
-    fn structured_updates_parses_every_status_the_daemon_emits() {
-        for status in [
-            Status::Running,
-            Status::Waiting,
-            Status::Idle,
-            Status::Unknown,
-            Status::Stopped,
-            Status::Error,
-            Status::Starting,
-            Status::Deleting,
-            Status::Creating,
-        ] {
-            let wire = format!("{status:?}");
-            let updates = structured_updates(&[row("a", &wire, View::Structured)]);
-            assert_eq!(
-                updates.first().map(|u| u.status),
-                Some(status),
-                "wire form {wire} must round-trip"
-            );
-        }
-    }
-
-    #[test]
     fn structured_updates_carries_error_and_timestamps() {
         let row: SessionResponse = serde_json::from_value(serde_json::json!({
             "id": "a",

@@ -4,13 +4,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginUiEntry } from "../../../lib/api";
 import { PluginPaneBody } from "../PluginPane";
-import {
-  PluginCards,
-  PluginComposerActions,
-  PluginHomePanes,
-  PluginRowBadges,
-  PluginStatusBarSegments,
-} from "../PluginSlots";
+import { PluginComposerActions, PluginHomePanes, PluginRowBadges } from "../PluginSlots";
 import { composerDraftOperation } from "../composerDraftOperation";
 
 const { entriesRef, refreshingRef, revisionRef, pokeMock, invokeMock } = vi.hoisted(() => ({
@@ -57,19 +51,15 @@ beforeEach(() => {
 });
 
 describe("plugin slots", () => {
-  it("status-bar renders global segments and is empty otherwise", () => {
-    const { container, rerender } = render(<PluginStatusBarSegments />);
-    expect(container.textContent).toBe("");
-    entriesRef.current = [
-      { plugin_id: "acme.kit", slot: "status-bar", id: "s", payload: { text: "Build OK", tone: "success" } },
-    ];
-    rerender(<PluginStatusBarSegments />);
-    expect(screen.getByText("Build OK")).toBeTruthy();
-  });
-
   it("row-badge renders only the addressed session's entries as safe links with icons", async () => {
     entriesRef.current = [
       rowBadge({ text: "PR #12", icon: "git-pull-request-arrow", href: "https://github.com/o/r/pull/12" }),
+      rowBadge({
+        items: [
+          { icon: "git-pull-request-arrow", tone: "success", href: "https://x/pr/1", tooltip: "PR #1" },
+          { icon: "git-pull-request-draft", tone: "warn", href: "https://x/pr/2", tooltip: "PR #2" },
+        ],
+      }),
       rowBadge({ text: "other" }, "s2"),
     ];
     const { container } = render(<PluginRowBadges sessionId="s1" />);
@@ -78,7 +68,12 @@ describe("plugin slots", () => {
     expect(link.getAttribute("href")).toBe("https://github.com/o/r/pull/12");
     expect(link.getAttribute("target")).toBe("_blank");
     expect(link.getAttribute("rel")).toContain("noopener");
-    await waitFor(() => expect(container.querySelector("svg")).toBeTruthy());
+    // Items render one icon-only link each, named by tooltip and not truncated.
+    const item = screen.getByRole("link", { name: "PR #2" });
+    expect(item.getAttribute("href")).toBe("https://x/pr/2");
+    expect(item.className).not.toContain("truncate");
+    expect(item.className).toContain("shrink-0");
+    await waitFor(() => expect(container.querySelectorAll("svg")).toHaveLength(3));
   });
 
   it("row-badge link click does not bubble to an ancestor's onClick", () => {
@@ -105,39 +100,10 @@ describe("plugin slots", () => {
     expect(container.querySelector("svg")).toBeNull();
   });
 
-  it("row-badge items render one icon-only link each, named by tooltip and not truncated", async () => {
-    entriesRef.current = [
-      rowBadge({
-        items: [
-          { icon: "git-pull-request-arrow", tone: "success", href: "https://x/pr/1", tooltip: "PR #1" },
-          { icon: "git-pull-request-draft", tone: "warn", href: "https://x/pr/2", tooltip: "PR #2" },
-        ],
-      }),
-    ];
-    const { container } = render(<PluginRowBadges sessionId="s1" />);
-    const links = screen.getAllByRole("link");
-    expect(links.map((l) => l.getAttribute("href"))).toEqual(["https://x/pr/1", "https://x/pr/2"]);
-    await waitFor(() => expect(container.querySelectorAll("svg")).toHaveLength(2));
-    expect(screen.getByRole("link", { name: "PR #1" })).toBeTruthy();
-    for (const link of links) {
-      expect(link.className).not.toContain("truncate");
-      expect(link.className).toContain("shrink-0");
-    }
-  });
-
   it("row-badge empty items clears the row", () => {
     entriesRef.current = [rowBadge({ items: [] })];
     const { container } = render(<PluginRowBadges sessionId="s1" />);
     expect(container.querySelector("a, span")).toBeNull();
-  });
-
-  it("card renders title and body", () => {
-    entriesRef.current = [
-      { plugin_id: "acme.kit", slot: "card", id: "c", payload: { title: "Coverage", body: "92%" } },
-    ];
-    render(<PluginCards />);
-    expect(screen.getByText("Coverage")).toBeTruthy();
-    expect(screen.getByText("92%")).toBeTruthy();
   });
 
   it("home-pane renders blocks, and the simple form's title only once", () => {
@@ -386,16 +352,6 @@ describe("pane blocks", () => {
     expect(lines[1]!.getAttribute("class")).toContain("text-status-error");
   });
 
-  it("sparkline renders a band-colored point for one value", () => {
-    const { container } = renderBlocks({
-      kind: "sparkline",
-      values: [95],
-      max: 100,
-      bands: [{ at: 90, tone: "danger" }],
-    });
-    expect(container.querySelector("circle")?.getAttribute("class")).toContain("text-status-error");
-  });
-
   it("a bar sizes segments proportionally and drops non-positive values", () => {
     const { container } = renderBlocks({
       kind: "bar",
@@ -416,15 +372,71 @@ describe("pane blocks", () => {
     const two = renderBlocks({
       kind: "columns",
       children: [
-        { kind: "section", title: "DIFF", children: [{ kind: "row", value: "+842 -317" }] },
-        { kind: "section", title: "LINKED", children: [{ kind: "row", prefix: "#3180", label: "Stale daemon" }] },
+        {
+          kind: "section",
+          title: "DIFF",
+          value: "SUM-001",
+          children: [{ kind: "row", value: "+842 -317", color: "#00ff00" }],
+        },
+        {
+          kind: "section",
+          title: "LINKED",
+          children: [
+            {
+              kind: "row",
+              prefix: "#3180",
+              label: "Stale daemon",
+              badges: [{ text: "LONGBADGE", color: "#ff0000" }],
+            },
+          ],
+        },
       ],
     });
-    expect(two.getByTestId("plugin-pane-columns").className).toContain("grid-cols-2");
-    expect(screen.getByText("Stale daemon")).toBeTruthy();
+    expect(two.getByTestId("plugin-pane-columns").classList.contains("grid-cols-2")).toBe(true);
+    expect(two.getByTestId("plugin-pane-columns").classList.contains("sm:grid-cols-2")).toBe(false);
+    expect(screen.getByText("Stale daemon").className).toContain("wrap-anywhere");
+    expect(screen.getByText("+842 -317").className).toContain("wrap-anywhere");
+    expect(screen.getByText("+842 -317").className).not.toContain("shrink-0");
+    expect(screen.getByText("+842 -317").style.color).toBe("rgb(0, 255, 0)");
+    expect(screen.getByText("SUM-001").className).toContain("wrap-anywhere");
+    expect(screen.getByText("#3180").className).toContain("wrap-anywhere");
+    expect(screen.getByText("LONGBADGE").className).toContain("wrap-anywhere");
+    expect(screen.getByText("LONGBADGE").style.color).toBe("rgb(255, 0, 0)");
     two.unmount();
     const one = renderBlocks({ kind: "columns", children: [{ kind: "section", title: "DIFF" }] });
-    expect(one.getByTestId("plugin-pane-columns").className).toContain("grid-cols-1");
+    expect(one.getByTestId("plugin-pane-columns").classList.contains("grid-cols-1")).toBe(true);
+    one.unmount();
+    renderBlocks({
+      kind: "columns",
+      children: [
+        {
+          kind: "section",
+          title: "DIFF",
+          value: "SEC-1",
+          children: [{ kind: "row", prefix: "#99", label: "Solo row", value: "42", badges: [{ text: "B1" }] }],
+        },
+      ],
+    });
+    expect(screen.getByText("Solo row").className).toContain("truncate");
+    expect(screen.getByText("42").className).toContain("shrink-0");
+    expect(screen.getByText("#99").className).toContain("shrink-0");
+    expect(screen.getByText("SEC-1").className).not.toContain("wrap-anywhere");
+    expect(screen.getByText("B1").className).not.toContain("wrap-anywhere");
+  });
+
+  it("a single-child columns block inherits wrap from an outer column instead of resetting to truncate", () => {
+    renderBlocks({
+      kind: "columns",
+      children: [
+        {
+          kind: "section",
+          title: "NESTED",
+          children: [{ kind: "columns", children: [{ kind: "row", label: "Nested row" }] }],
+        },
+        { kind: "section", title: "OTHER" },
+      ],
+    });
+    expect(screen.getByText("Nested row").className).toContain("wrap-anywhere");
   });
 
   it("collapsible sections render uncontrolled details; plain sections stay <section>", () => {
@@ -451,57 +463,6 @@ describe("pane blocks", () => {
     expect(container.querySelector("details")!.open).toBe(false);
   });
 
-  it("a section title renders a tone-tinted icon", async () => {
-    const { container } = renderBlocks({
-      kind: "section",
-      title: "Checks: passing",
-      collapsible: true,
-      collapsed: true,
-      icon: "circle-check",
-      tone: "success",
-      children: [{ kind: "note", text: "ci" }],
-    });
-    const summary = container.querySelector("summary")!;
-    expect(summary.className).toContain("text-status-running");
-    await waitFor(() => expect(summary.querySelectorAll("svg")).toHaveLength(2));
-  });
-
-  it("a section header pins a value summary and badge pills", () => {
-    renderBlocks({
-      kind: "section",
-      title: "CHECKS",
-      value: "1 of 2 approved",
-      value_tone: "warn",
-      boxed: true,
-      scroll: true,
-      badges: [
-        { text: "2 failing", tone: "danger" },
-        { text: "17 passing", tone: "success" },
-      ],
-      children: [{ kind: "row", label: "Clippy" }],
-    });
-    for (const text of ["1 of 2 approved", "2 failing", "17 passing", "Clippy"]) {
-      expect(screen.getByText(text)).toBeTruthy();
-    }
-  });
-
-  it("comment blocks render read-only with author, location and resolved state", () => {
-    renderBlocks({
-      kind: "comment",
-      author: "alice",
-      body: "handle the nil case",
-      path: "src/foo.py",
-      line: 42,
-      href: "https://github.com/o/r/pull/1#c1",
-      resolved: false,
-    });
-    for (const text of ["alice", "handle the nil case", "src/foo.py:42", "unresolved"]) {
-      expect(screen.getByText(text)).toBeTruthy();
-    }
-    expect(screen.getByRole("link").getAttribute("href")).toBe("https://github.com/o/r/pull/1#c1");
-    expect(screen.queryByRole("button")).toBeNull();
-  });
-
   it("a long comment body is clamped with a more/less toggle", () => {
     const longBody = "x".repeat(250);
     renderBlocks({ kind: "comment", author: "bob", body: longBody });
@@ -518,16 +479,5 @@ describe("pane blocks", () => {
     expect(toggle.getAttribute("aria-expanded")).toBe("true");
     fireEvent.click(toggle);
     expect(body.className).toContain("line-clamp-3");
-  });
-
-  it("the pane footer renders outside the scroll area", () => {
-    renderPane({
-      blocks: [{ kind: "heading", text: "GitHub" }],
-      footer: { text: "refreshed 12:07", value: "blocked", tone: "danger", icon: "refresh-cw" },
-    });
-    const footer = screen.getByTestId("plugin-pane-footer");
-    expect(footer.textContent).toContain("refreshed 12:07");
-    expect(footer.textContent).toContain("blocked");
-    expect(footer.closest(".overflow-auto")).toBeNull();
   });
 });

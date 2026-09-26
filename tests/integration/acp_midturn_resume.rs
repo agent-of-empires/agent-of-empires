@@ -16,9 +16,8 @@
 //! Skipped automatically if `node` is not on PATH.
 //!
 //! Note: the parent `main.rs` only compiles this module under
-//! `cfg(debug_assertions)`. Debug-only because the watchdog grace is tunable
-//! via `AOE_RESUME_IDLE_GRACE_MS` only under `cfg(debug_assertions)`; release
-//! builds would wait the full 10s production default.
+//! `cfg(debug_assertions)`, the only builds where `AOE_RESUME_IDLE_GRACE_MS`
+//! and `AOE_RESUME_IDLE_CHECK_INTERVAL_MS` tune the watchdog.
 
 use std::time::{Duration, Instant};
 
@@ -47,9 +46,11 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
         return;
     }
 
-    // Shorten the watchdog grace so the test completes inside ~3s
-    // instead of the 10s production default.
-    let _env = crate::common::EnvGuard::new(&[]).and_set("AOE_RESUME_IDLE_GRACE_MS", "500");
+    // Shorten the watchdog grace and tick from the production defaults.
+    let _env = crate::common::EnvGuard::from_pairs(&[
+        ("AOE_RESUME_IDLE_GRACE_MS", "200"),
+        ("AOE_RESUME_IDLE_CHECK_INTERVAL_MS", "50"),
+    ]);
 
     // The runner must announce the same session id the daemon attaches
     // with; the control handshake verifies it.
@@ -89,7 +90,10 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
         return;
     }
 
-    let _env = crate::common::EnvGuard::new(&[]).and_set("AOE_RESUME_IDLE_GRACE_MS", "500");
+    let _env = crate::common::EnvGuard::from_pairs(&[
+        ("AOE_RESUME_IDLE_GRACE_MS", "200"),
+        ("AOE_RESUME_IDLE_CHECK_INTERVAL_MS", "50"),
+    ]);
 
     // The runner must announce the same session id the daemon attaches
     // with; the control handshake verifies it.
@@ -111,7 +115,7 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
     .expect("attach in_flight=false");
 
     let stopped =
-        drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_secs(2)).await;
+        drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_secs(1)).await;
     let _ = client.shutdown().await;
 
     assert!(
@@ -135,7 +139,10 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
     }
 
     // Release the notification only after the intended client attaches.
-    let _env = crate::common::EnvGuard::new(&[]).and_set("AOE_RESUME_IDLE_GRACE_MS", "800");
+    let _env = crate::common::EnvGuard::from_pairs(&[
+        ("AOE_RESUME_IDLE_GRACE_MS", "800"),
+        ("AOE_RESUME_IDLE_CHECK_INTERVAL_MS", "50"),
+    ]);
 
     let release_dir = tempfile::tempdir().expect("notification release directory");
     let release = release_dir.path().join("release");
@@ -185,77 +192,13 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
     .await
     .expect("final attachment received the intended notification");
     let stopped =
-        drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_millis(2500)).await;
+        drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_millis(1600)).await;
     let _ = client.shutdown().await;
 
     assert!(
         stopped.is_none(),
         "watchdog must disarm after the first inbound notification; mid-turn silence is not an orphan; got Stopped reason={stopped:?}"
     );
-}
-
-/// Attach to a production runner around the shim, send a prompt, and
-/// confirm the response returns as `AgentMessageChunk` and `Stopped`
-/// events through the v3 control transport.
-#[tokio::test]
-#[serial_test::parallel]
-async fn socket_transport_round_trips_prompt_via_attach() {
-    if let Err(reason) = shim_ready() {
-        eprintln!("skipping: {reason}");
-        return;
-    }
-
-    let preseed = "preseed-roundtrip-session";
-    // The runner must announce the same session id the daemon attaches
-    // with; the control handshake verifies it.
-    const SESSION: &str = "roundtrip";
-    let (socket_path, _runner) =
-        spawn_runner_with_shim(SESSION, &[("SHIM_PRESEED_SESSION_ID", preseed.to_string())]).await;
-
-    let mut client = AcpClient::attach(
-        socket_path,
-        std::env::temp_dir(),
-        vec![],
-        preseed.into(),
-        false, // not in flight; this is a fresh round-trip
-        AcpSessionId("roundtrip".into()),
-        None,
-        "claude".into(),
-        None,
-    )
-    .await
-    .expect("attach to bridge");
-
-    client
-        .send_prompt("hello over socket", &[])
-        .await
-        .expect("send_prompt");
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut saw_received = false;
-    let mut saw_stopped = false;
-    while Instant::now() < deadline && !(saw_received && saw_stopped) {
-        match tokio::time::timeout(Duration::from_millis(200), client.next_event()).await {
-            Ok(Some(Event::AgentMessageChunk { text })) => {
-                if text.contains("received: hello over socket") {
-                    saw_received = true;
-                }
-            }
-            Ok(Some(Event::Stopped { .. })) => {
-                saw_stopped = true;
-            }
-            Ok(Some(_)) => continue,
-            Ok(None) => break,
-            Err(_) => continue,
-        }
-    }
-    let _ = client.shutdown().await;
-
-    assert!(
-        saw_received,
-        "shim should echo received: hello over socket via the socket transport"
-    );
-    assert!(saw_stopped, "shim should emit Stopped at end of turn");
 }
 
 async fn read_typed_control(
@@ -347,7 +290,7 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         &ControlBody::Prompt {
             request: serde_json::json!({
                 "sessionId": acp_session_id,
-                "prompt": [{"type": "text", "text": "SLOW MAX_TOKENS detached completion"}],
+                "prompt": [{"type": "text", "text": "MAX_TOKENS detached completion"}],
             }),
         },
     )

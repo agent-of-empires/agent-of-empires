@@ -214,56 +214,30 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn make_diff_view_with_warning() -> DiffView {
-        let mut view = DiffView::test_default();
-        view.warning_dialog = Some(InfoDialog::new("Warning", "Test warning"));
-        view
-    }
-
     fn make_diff_view_no_warning() -> DiffView {
         DiffView::test_default()
     }
 
     #[test]
-    fn test_warning_dialog_blocks_normal_keys() {
-        let mut view = make_diff_view_with_warning();
-        // 'q' would normally close the view, but with warning dialog open it should not
-        let action = view.handle_key(key(KeyCode::Char('q')));
-        assert!(matches!(action, DiffAction::Continue));
-        // Dialog should still be there (q doesn't dismiss InfoDialog)
-        assert!(view.warning_dialog.is_some());
-    }
-
-    #[test]
-    fn test_warning_dialog_dismissed_by_enter() {
-        let mut view = make_diff_view_with_warning();
-        let action = view.handle_key(key(KeyCode::Enter));
-        assert!(matches!(action, DiffAction::Continue));
-        assert!(view.warning_dialog.is_none());
-    }
-
-    #[test]
-    fn test_warning_dialog_dismissed_by_esc() {
-        let mut view = make_diff_view_with_warning();
-        let action = view.handle_key(key(KeyCode::Esc));
-        assert!(matches!(action, DiffAction::Continue));
-        assert!(view.warning_dialog.is_none());
-    }
-
-    #[test]
-    fn test_warning_dialog_dismissed_by_space() {
-        let mut view = make_diff_view_with_warning();
-        let action = view.handle_key(key(KeyCode::Char(' ')));
-        assert!(matches!(action, DiffAction::Continue));
-        assert!(view.warning_dialog.is_none());
-    }
-
-    #[test]
-    fn test_normal_keys_work_without_warning() {
+    fn warning_dialog_swallows_keys_until_dismissed() {
+        // 'q' closes the view normally, but not while the warning is up, and
+        // it does not dismiss the InfoDialog either.
+        for (code, dismissed) in [
+            (KeyCode::Char('q'), false),
+            (KeyCode::Enter, true),
+            (KeyCode::Esc, true),
+            (KeyCode::Char(' '), true),
+        ] {
+            let mut view = DiffView::test_default();
+            view.warning_dialog = Some(InfoDialog::new("Warning", "Test warning"));
+            assert!(matches!(view.handle_key(key(code)), DiffAction::Continue));
+            assert_eq!(view.warning_dialog.is_none(), dismissed, "{code:?}");
+        }
         let mut view = make_diff_view_no_warning();
-        // 'q' should close the view when no dialog
-        let action = view.handle_key(key(KeyCode::Char('q')));
-        assert!(matches!(action, DiffAction::Close));
+        assert!(matches!(
+            view.handle_key(key(KeyCode::Char('q'))),
+            DiffAction::Close
+        ));
     }
 
     fn diff_file(path: &str) -> crate::git::diff::DiffFile {
@@ -292,71 +266,51 @@ mod tests {
     }
 
     #[test]
-    fn selected_path_string_returns_the_selected_file_path() {
+    fn selected_path_and_markdown_detection() {
+        let view = make_diff_view_no_warning();
+        assert_eq!(view.selected_path_string(), None);
         let mut view = make_diff_view_no_warning();
         view.files = vec![diff_file("src/app/foo.rs"), diff_file("README.md")];
         view.selected_file = 1;
         assert_eq!(view.selected_path_string().as_deref(), Some("README.md"));
-    }
 
-    #[test]
-    fn selected_path_string_is_none_without_files() {
-        let view = make_diff_view_no_warning();
-        assert_eq!(view.selected_path_string(), None);
-    }
-
-    #[test]
-    fn markdown_extensions_are_case_insensitive() {
-        for path in ["README.md", "guide.markdown", "NOTES.MD"] {
+        // Markdown extensions are case-insensitive.
+        for (path, markdown) in [
+            ("README.md", true),
+            ("guide.markdown", true),
+            ("NOTES.MD", true),
+            ("src/main.rs", false),
+        ] {
             let mut view = make_diff_view_no_warning();
             view.files = vec![diff_file(path)];
-            assert!(view.selected_file_is_markdown(), "expected {path} to match");
+            assert_eq!(view.selected_file_is_markdown(), markdown, "{path}");
         }
-
-        let mut view = make_diff_view_no_warning();
-        view.files = vec![diff_file("src/main.rs")];
-        assert!(!view.selected_file_is_markdown());
     }
 
     #[test]
-    fn m_key_toggles_markdown_mode_and_resets_scroll() {
-        let mut view = make_diff_view_no_warning();
-        view.files = vec![diff_file("README.md")];
-        cache_file_contents(&mut view, "README.md", false);
-        view.scroll_offset = 7;
-
-        let action = view.handle_key(key(KeyCode::Char('m')));
-
-        assert!(matches!(action, DiffAction::Continue));
-        assert!(!view.markdown_rendered);
-        assert_eq!(view.scroll_offset, 0);
-
-        view.handle_key(key(KeyCode::Char('m')));
-        assert!(view.markdown_rendered);
-    }
-
-    #[test]
-    fn m_key_ignores_non_markdown_and_binary_files() {
-        for (path, is_binary) in [("src/main.rs", false), ("README.md", true)] {
+    fn m_key_toggles_only_text_markdown_and_resets_scroll() {
+        // (path, binary, rendered after one press, scroll after)
+        for (path, is_binary, rendered, scroll) in [
+            ("README.md", false, false, 0),
+            ("src/main.rs", false, true, 7),
+            ("README.md", true, true, 7),
+        ] {
             let mut view = make_diff_view_no_warning();
             view.files = vec![diff_file(path)];
             cache_file_contents(&mut view, path, is_binary);
             view.scroll_offset = 7;
-
+            assert!(matches!(
+                view.handle_key(key(KeyCode::Char('m'))),
+                DiffAction::Continue
+            ));
+            assert_eq!(
+                view.markdown_rendered, rendered,
+                "{path} binary={is_binary}"
+            );
+            assert_eq!(view.scroll_offset, scroll, "{path} binary={is_binary}");
             view.handle_key(key(KeyCode::Char('m')));
-
-            assert!(view.markdown_rendered, "{path} should stay rendered");
-            assert_eq!(view.scroll_offset, 7, "{path} should keep its scroll");
+            assert!(view.markdown_rendered, "{path} toggles back");
         }
-    }
-
-    #[test]
-    fn y_key_is_wired_and_continues() {
-        // Empty file list: the handler short-circuits before touching the
-        // clipboard, so this asserts the binding without a real clipboard write.
-        let mut view = make_diff_view_no_warning();
-        let action = view.handle_key(key(KeyCode::Char('y')));
-        assert!(matches!(action, DiffAction::Continue));
     }
 
     #[test]

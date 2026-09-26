@@ -20,13 +20,6 @@ impl Drop for Cleanup {
                 .args(["kill-session", "-t", name])
                 .output();
         }
-        // tmux removes the socket asynchronously after its last session exits.
-        for _ in 0..40 {
-            if !socket.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
     }
 }
 

@@ -603,7 +603,8 @@ fn drain_plugin_toast(state: &mut StructuredViewState, toast_deadline: &mut Opti
     // A notification carrying an href is a worker `ui.open_url`; the seq dedupe
     // in `next_plugin_toast` guarantees one open per notification.
     if let Some(href) = &n.href {
-        let _ = crate::tui::open_url::open_url(href);
+        let url = crate::tui::open_url::resolve_href(&state.endpoint.base_url, href);
+        let _ = crate::tui::open_url::open_url(&url);
     }
     let text = match &n.body {
         Some(body) => format!("{}: {body}", n.title),
@@ -1361,7 +1362,8 @@ async fn handle_plugin_command(
 /// Open one resolved plugin link in the browser (through the test seam) and
 /// toast the outcome.
 fn open_link(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>, href: &str) {
-    if let Err(e) = crate::tui::open_url::open_url(href) {
+    let url = crate::tui::open_url::resolve_href(&state.endpoint.base_url, href);
+    if let Err(e) = crate::tui::open_url::open_url(&url) {
         set_toast(
             state,
             toast_deadline,
@@ -1854,6 +1856,8 @@ mod tests {
         assert_eq!(state.pane_scroll, u16::MAX);
         apply_pane_scroll(&mut state, i32::MIN);
         assert_eq!(state.pane_scroll, 0, "g jumps to the top");
+        apply_pane_scroll(&mut state, -5);
+        assert_eq!(state.pane_scroll, 0, "saturates at the top");
     }
 
     #[test]
@@ -1872,38 +1876,27 @@ mod tests {
     }
 
     #[test]
-    fn pane_scroll_up_at_the_top_saturates() {
-        let mut state = test_state();
-        state.last_pane_scroll_max.set(30);
-        apply_pane_scroll(&mut state, -5);
-        assert_eq!(state.pane_scroll, 0);
-    }
-
-    #[test]
     fn paste_inserts_at_caret_and_focuses_composer() {
-        let mut state = test_state();
-        state.focus = Focus::Transcript;
-        paste_into_composer(&mut state, "hello world");
-        assert_eq!(composer_text(&state), "hello world");
-        assert_eq!(state.focus, Focus::Composer);
-    }
-
-    #[test]
-    fn paste_normalizes_crlf_and_cr_to_newlines() {
-        let mut state = test_state();
-        state.focus = Focus::Composer;
-        paste_into_composer(&mut state, "one\r\ntwo\rthree");
-        assert_eq!(composer_text(&state), "one\ntwo\nthree");
-        assert_eq!(state.composer.lines().len(), 3);
-    }
-
-    #[test]
-    fn paste_appends_to_existing_draft() {
-        let mut state = test_state();
-        state.focus = Focus::Composer;
-        state.composer.insert_str("fix this: ");
-        paste_into_composer(&mut state, "Error: thing broke");
-        assert_eq!(composer_text(&state), "fix this: Error: thing broke");
+        // (draft, pasted, composer text after, mention picker opens)
+        for (draft, pasted, want, mention) in [
+            ("", "hello world", "hello world", false),
+            ("", "one\r\ntwo\rthree", "one\ntwo\nthree", false),
+            (
+                "fix this: ",
+                "Error: thing broke",
+                "fix this: Error: thing broke",
+                false,
+            ),
+            ("", "look at @src", "look at @src", true),
+        ] {
+            let mut state = test_state();
+            state.focus = Focus::Transcript;
+            state.composer.insert_str(draft);
+            paste_into_composer(&mut state, pasted);
+            assert_eq!(composer_text(&state), want);
+            assert_eq!(state.focus, Focus::Composer);
+            assert_eq!(state.mention.is_some(), mention, "{pasted:?}");
+        }
     }
 
     #[test]
@@ -2020,17 +2013,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn paste_opens_mention_picker_when_text_ends_in_at_token() {
-        let mut state = test_state();
-        state.focus = Focus::Composer;
-        paste_into_composer(&mut state, "look at @src");
-        assert!(
-            state.mention.is_some(),
-            "pasted trailing @-token should open the mention picker"
-        );
-    }
-
     fn mode(id: &str, name: &str) -> crate::acp::state::ModeInfo {
         crate::acp::state::ModeInfo {
             id: id.into(),
@@ -2049,13 +2031,10 @@ mod tests {
         assert_eq!(picker.selected, 1, "current mode preselected");
         assert_eq!(picker.options[1].0, "plan");
         assert!(matches!(picker.purpose, ChoicePurpose::Mode));
-    }
 
-    #[test]
-    fn mode_picker_noops_without_advertised_modes() {
         let mut state = test_state();
         open_mode_picker(&mut state);
-        assert!(state.choice.is_none());
+        assert!(state.choice.is_none(), "no advertised modes: no-op");
     }
 
     fn select_question(
@@ -2130,6 +2109,7 @@ mod tests {
                 select_question("question_0", "Proceed?", true, &["Yes", "No"]),
                 // The AskUserQuestion optional custom-answer box is skipped.
                 free_text_question("question_0_custom", false),
+                select_question("question_1", "Second?", true, &["C", "D"]),
             ],
         ));
         start_elicitation_answer(&mut state, &mut deadline);
@@ -2145,7 +2125,9 @@ mod tests {
             } => {
                 assert_eq!(nonce, &expected_nonce);
                 assert_eq!(field_key, "question_0");
-                assert!(remaining.is_empty());
+                // Later questions are asked in sequence.
+                assert_eq!(remaining.len(), 1);
+                assert_eq!(remaining[0].field_key, "question_1");
                 assert!(answers.is_empty());
             }
             ChoicePurpose::Mode | ChoicePurpose::OpenLink | ChoicePurpose::Approval { .. } => {
@@ -2190,30 +2172,5 @@ mod tests {
             "blank picker title: {:?}",
             picker.title
         );
-    }
-
-    #[test]
-    fn multi_question_form_asks_questions_in_sequence() {
-        let mut state = test_state();
-        let mut deadline = None;
-        state.transcript.pending_elicitations.push(pending(
-            &test_nonce(),
-            vec![
-                select_question("question_0", "First?", true, &["A", "B"]),
-                select_question("question_1", "Second?", true, &["C", "D"]),
-            ],
-        ));
-        start_elicitation_answer(&mut state, &mut deadline);
-        let picker = state.choice.as_ref().expect("picker open");
-        assert!(picker.title.contains("First?"));
-        match &picker.purpose {
-            ChoicePurpose::Elicitation { remaining, .. } => {
-                assert_eq!(remaining.len(), 1);
-                assert_eq!(remaining[0].field_key, "question_1");
-            }
-            ChoicePurpose::Mode | ChoicePurpose::OpenLink | ChoicePurpose::Approval { .. } => {
-                panic!("expected elicitation purpose")
-            }
-        }
     }
 }

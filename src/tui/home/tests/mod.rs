@@ -8,7 +8,7 @@ use crate::session::{
 };
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
-use crate::tui::dialogs::{InfoDialog, NewSessionData, NewSessionDialog};
+use crate::tui::dialogs::{InfoDialog, NewSessionData};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serial_test::serial;
 use tempfile::TempDir;
@@ -27,6 +27,7 @@ fn observed_fork_parent(agent: &str) -> Instance {
                 agent: agent.into(),
                 stores: vec!["/native-store".into()],
                 configuration: Vec::new(),
+                exported_default_store: false,
                 cwd: "/tmp/repo".into(),
                 cwd_filesystem: "host".into(),
                 filesystem: "host".into(),

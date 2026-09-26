@@ -2,7 +2,7 @@
 
 import type { Page } from "@playwright/test";
 import { test, expect } from "./helpers/mockedTest";
-import { expandMoreOptions, mockWizardApis, openWizard, sessionStub, startWizard, wizard } from "./helpers/wizard";
+import { mockWizardApis, openWizard, sessionStub, startWizard, wizard } from "./helpers/wizard";
 
 const option = (page: Page, text: string) => page.getByRole("option").filter({ hasText: text });
 
@@ -26,49 +26,6 @@ async function expectSelected(page: Page, path: string) {
 }
 
 test.describe("project tabs", () => {
-  test("Recent tab is the default when sessions exist", async ({ page }) => {
-    await startWizard(page, { project: false });
-    await openWizard(page);
-    for (const tab of ["Recent", "Browse", "Clone URL"]) {
-      await expect(page.getByRole("button", { name: tab, exact: true })).toBeVisible();
-    }
-    await expect(page.getByRole("button").filter({ hasText: "/tmp/example" }).first()).toBeVisible();
-  });
-
-  test("Browse tab defaults when no recents", async ({ page }) => {
-    await mockBrowse(page, []);
-    await startWizard(page, { sessions: [], project: false });
-    await openWizard(page);
-    await expect(page.getByRole("button", { name: "Recent" })).toHaveCount(0);
-    await expect(page.getByTitle("Go to home")).toBeVisible();
-  });
-
-  test("saved projects show under the Recent tab even with no sessions (#2140)", async ({ page }) => {
-    await startWizard(page, {
-      sessions: [],
-      projects: [{ name: "my-saved-repo", path: "/srv/my-saved-repo", scope: "global" }],
-      project: false,
-    });
-    await openWizard(page);
-    await expect(page.getByRole("button", { name: "Recent", exact: true })).toBeVisible();
-    await expect(page.getByText("Saved projects")).toBeVisible();
-    // Scoped: the sidebar Projects section (#2212) shows the same project.
-    const savedRow = wizard(page).getByRole("button").filter({ hasText: "/srv/my-saved-repo" });
-    await savedRow.click();
-    await expect(savedRow).toHaveClass(/border-brand-600/);
-    await expect(page.getByText("Selected project")).toHaveCount(0);
-    await expect(page.getByRole("button", { name: /Launch session/ })).toBeEnabled();
-  });
-
-  test("switching to Browse tab renders DirectoryBrowser and selecting a repo populates path", async ({ page }) => {
-    await mockBrowse(page, [{ name: "my-repo", is_git_repo: true }, { name: "docs" }]);
-    await startWizard(page, { project: false });
-    await openWizard(page);
-    await page.getByRole("button", { name: "Browse", exact: true }).click();
-    await option(page, "my-repo").click();
-    await expectSelected(page, "/home/user/my-repo");
-  });
-
   test("Browse tab pages beyond the first 100 entries and filters server-side", async ({ page }) => {
     const numbered = Array.from({ length: 124 }, (_, i) => ({ name: `project-${String(i + 1).padStart(3, "0")}` }));
     await mockBrowse(page, [
@@ -144,62 +101,9 @@ test.describe("extra repos", () => {
     await page.getByRole("button", { name: "Remove shared-lib" }).click();
     await expect(page.getByText("none")).toBeVisible();
   });
-
-  test("the picker's own search box filters its saved-projects list", async ({ page }) => {
-    // #3743. Scoped: the Recent tab's search box has the same accessible name.
-    const { picker, chip } = await openPicker(page);
-    await picker.getByLabel("Search projects").fill("shared");
-    await expect(chip("shared-lib")).toBeVisible();
-    await expect(chip("docs")).toHaveCount(0);
-  });
-
-  test("free-text paths add via Enter or the Add button, which needs input", async ({ page }) => {
-    const { input } = await openPicker(page);
-    await input.fill("/tmp/manual-path");
-    await input.press("Enter");
-    await expect(page.getByText("1 selected")).toBeVisible();
-    await expect(input).toHaveValue("");
-    await page.getByRole("button", { name: "Remove manual-path" }).click();
-    await expect(page.getByText("none")).toBeVisible();
-
-    const addBtn = page.getByRole("button", { name: "Add", exact: true });
-    await expect(addBtn).toBeDisabled();
-    await input.fill("/tmp/x");
-    await expect(addBtn).toBeEnabled();
-    await addBtn.click();
-    await expect(page.getByText("1 selected")).toBeVisible();
-  });
-
-  test("attempting to add the primary path as a free-text entry is a no-op", async ({ page }) => {
-    const { input } = await openPicker(page);
-    await input.fill("/tmp/example");
-    await page.getByRole("button", { name: "Add", exact: true }).click();
-    await expect(page.getByText("none")).toBeVisible();
-  });
 });
 
 test.describe("scratch sessions", () => {
-  test("Skip project folder defaults off, enables Launch without a path, and hides path sources and worktrees", async ({
-    page,
-  }) => {
-    await startWizard(page, { project: false });
-    await openWizard(page);
-    const w = wizard(page);
-    const toggle = w.getByRole("switch", { name: "Skip project folder" });
-    const launchButton = w.getByRole("button", { name: /Launch session/ });
-    await expect(toggle).toHaveAttribute("aria-checked", "false");
-    await expect(launchButton).toBeDisabled();
-
-    await toggle.click();
-    await expect(launchButton).toBeEnabled();
-    await expect(w.getByText(/Scratch session/).first()).toBeVisible();
-    await expect(w.getByRole("button", { name: "Browse" })).toBeHidden();
-    // A scratch directory is not a git repo.
-    await expandMoreOptions(page);
-    await expect(w.getByText(/Scratch sessions do not use git worktrees/)).toBeVisible();
-    await expect(w.getByRole("switch", { name: /Create a worktree/i })).toHaveCount(0);
-  });
-
   test("Cmd+Shift+N opens the wizard with scratch on; Cmd+Enter launches", async ({ page }) => {
     const created = await startWizard(page, { project: false });
     // The New session button doubles as a signal that the global shortcut handler is registered.

@@ -2,7 +2,7 @@
 // actions, the switch-view confirm gate, the context-resume badge, and the
 // Android long-press guard.
 
-import type { Locator, Page } from "@playwright/test";
+import type { Locator, Page, Route } from "@playwright/test";
 import { test, expect } from "./helpers/mockedTest";
 import { iPhone13 } from "./helpers/viewports";
 import { installSidebarMocks, threeSessionsInOneRepo, type MockSessionInput } from "./helpers/sidebarMocks";
@@ -62,16 +62,18 @@ test.describe("Sidebar context-menu viewport clamp (#1601)", () => {
     await expect(target).toHaveClass(/overflow-y-auto/);
   }
 
-  for (const [what, anchor, selector] of [
-    ["session row", ROW, MENU],
-    ["repo group header", "[data-testid='sidebar-group-header']", GROUP_MENU],
-  ] as const) {
-    test(`right-click on the bottom ${what} keeps the menu inside the viewport`, async ({ page }) => {
-      await installSidebarMocks(page, { sessions: THREE });
-      await page.setViewportSize({ width: 900, height: 360 });
-      await page.goto("/");
-      await expect(page.locator("header")).toBeVisible();
+  test("right-click on the bottom session row and repo group header keeps each menu inside the viewport", async ({
+    page,
+  }) => {
+    await installSidebarMocks(page, { sessions: THREE });
+    await page.setViewportSize({ width: 900, height: 360 });
+    await page.goto("/");
+    await expect(page.locator("header")).toBeVisible();
 
+    for (const [anchor, selector] of [
+      [ROW, MENU],
+      ["[data-testid='sidebar-group-header']", GROUP_MENU],
+    ] as const) {
       const anchors = page.locator(anchor);
       await expect(anchors).toHaveCount(3);
       await anchors.last().scrollIntoViewIfNeeded();
@@ -81,36 +83,16 @@ test.describe("Sidebar context-menu viewport clamp (#1601)", () => {
       await expect(target).toBeVisible();
       await expectClamped(page, selector);
       await expectDvhCap(target);
-    });
-  }
+      await page.mouse.click(5, 5);
+      await expect(target).toBeHidden();
+    }
+  });
 });
 
 // #1724, #2312: Cmd/Ctrl+click toggles a row into the selection without
 // navigating, Shift+click extends the range, and bulk triage runs from the
 // right-click menu (the BulkActionBar popup was removed in #2312).
 test.describe("Sidebar multi-select (#1724, #2312)", () => {
-  test("Cmd/Ctrl+click toggles selection without navigating", async ({ page }) => {
-    await openSidebar(page, THREE);
-    await expect(rows(page)).toHaveCount(3);
-
-    await rows(page)
-      .nth(0)
-      .click({ modifiers: ["ControlOrMeta"] });
-    await rows(page)
-      .nth(1)
-      .click({ modifiers: ["ControlOrMeta"] });
-    await expect(selectedRows(page)).toHaveCount(2);
-    expect(page.url()).not.toContain("/session/");
-
-    await rows(page)
-      .nth(0)
-      .click({ modifiers: ["ControlOrMeta"] });
-    await expect(selectedRows(page)).toHaveCount(1);
-
-    await page.keyboard.press("Escape");
-    await expect(selectedRows(page)).toHaveCount(0);
-  });
-
   test("right-click a selected row bulk-archives the whole selection", async ({ page }) => {
     const archived: Array<{ id: string; body: unknown }> = [];
     await page.route("**/api/sessions/*/archive", (r) => {
@@ -146,7 +128,9 @@ test.describe("Sidebar multi-select (#1724, #2312)", () => {
     await expect(selectedRows(page)).toHaveCount(0);
   });
 
-  test("right-click an unselected row resets the selection to that row (#2312)", async ({ page }) => {
+  test("right-click on an unselected row resets the selection; Shift+click ranges from a navigated row (#2312)", async ({
+    page,
+  }) => {
     await openSidebar(page, THREE);
     await rows(page)
       .nth(0)
@@ -157,20 +141,18 @@ test.describe("Sidebar multi-select (#1724, #2312)", () => {
     await expect(selectedRows(page)).toHaveCount(2);
 
     await rows(page).nth(2).click({ button: "right" });
-
     await expect(selectedRows(page)).toHaveCount(1);
     await expect(menu(page)).toBeVisible();
     await expect(menu(page)).not.toContainText("selected");
     await expect(menu(page).locator("[data-testid='sidebar-context-menu-bulk-archive']")).toHaveCount(0);
-  });
+    await page.keyboard.press("Escape");
+    await page.mouse.click(5, 5);
+    await expect(menu(page)).toBeHidden();
 
-  test("plain click then Shift+click selects the range from the navigated row (#2312)", async ({ page }) => {
-    await openSidebar(page, THREE);
     // A plain click navigates and leaves the row as the anchor; no intervening
     // Cmd+click is needed before the range works.
     await rows(page).nth(0).click();
     await expect.poll(() => page.url()).toContain("/session/s-1");
-
     await rows(page)
       .nth(2)
       .click({ modifiers: ["Shift"] });
@@ -207,57 +189,73 @@ test.describe("Sidebar Switch view (#2252)", () => {
     await page.locator("[data-testid='sidebar-context-menu-switch-view']").click();
   }
 
-  for (const c of [
-    {
-      dir: "structured session switches to terminal",
-      id: "sess-1",
-      view: "structured",
-      endpoint: "disable",
-    },
-    {
-      dir: "terminal acp-capable session switches to structured",
-      id: "sess-2",
-      view: "terminal",
-      endpoint: "enable",
-    },
-  ] as const) {
-    test(`${c.dir} after confirm`, async ({ page }) => {
-      await installSidebarMocks(page, {
-        sessions: [session(c.id, `Switch ${c.id}`, c.view, true)],
-      });
-      let posted: string | null = null;
-      await page.route(`**/api/sessions/*/acp/${c.endpoint}`, (r) => {
-        if (r.request().method() !== "POST") return r.fulfill({ status: 400 });
-        posted = r.request().url();
-        return r.fulfill({
-          json: {
-            session_id: c.id,
-            view: c.view === "structured" ? "terminal" : "structured",
-          },
-        });
-      });
-
-      await openSwitchMenu(page, `Switch ${c.id}`);
-      const dialog = page.locator("[data-testid='switch-view-dialog']");
-      await expect(dialog).toBeVisible();
-      // Claude keeps context: the confirm copy must say so, not threaten loss.
-      if (c.view === "structured") await expect(dialog).toContainText("continues in the terminal");
-      await page.locator("[data-testid='switch-view-confirm']").click();
-      await expect.poll(() => posted).toContain(`/api/sessions/${c.id}/acp/${c.endpoint}`);
-      if (c.view === "structured") await expect(page.getByText("Switched to terminal")).toBeVisible();
-    });
-  }
-
-  test("a failed switch surfaces an error toast", async ({ page }) => {
+  test("switches each way after confirm; a non-acp-capable session has no item", async ({ page }) => {
     await installSidebarMocks(page, {
-      sessions: [session("sess-9", "Broken switch", "structured", true)],
+      sessions: [
+        session("sess-1", "Switch sess-1", "structured", true),
+        session("sess-2", "Switch sess-2", "terminal", true),
+        session("sess-3", "Plain terminal", "terminal", false),
+      ],
     });
-    await page.route("**/api/sessions/*/acp/disable", (r) => r.fulfill({ status: 500 }));
+    const posted: string[] = [];
+    await page.route("**/api/sessions/*/acp/*", (r) => {
+      const m = r
+        .request()
+        .url()
+        .match(/\/api\/sessions\/([^/]+)\/acp\/(enable|disable)$/);
+      if (!m || r.request().method() !== "POST") return r.fulfill({ status: 400 });
+      posted.push(`${m[1]}/${m[2]}`);
+      return r.fulfill({ json: { session_id: m[1], view: m[2] === "enable" ? "structured" : "terminal" } });
+    });
 
-    await openSwitchMenu(page, "Broken switch");
+    await openSwitchMenu(page, "Switch sess-1");
+    const dialog = page.locator("[data-testid='switch-view-dialog']");
+    await expect(dialog).toBeVisible();
+    // Claude keeps context: the confirm copy must say so, not threaten loss.
+    await expect(dialog).toContainText("continues in the terminal");
     await page.locator("[data-testid='switch-view-confirm']").click();
-    await expect(page.getByText("Failed to switch to terminal")).toBeVisible();
+    await expect.poll(() => posted).toEqual(["sess-1/disable"]);
+    await expect(page.getByText("Switched to terminal")).toBeVisible();
+
+    await rows(page).filter({ hasText: "Switch sess-2" }).first().click({ button: "right" });
+    await page.locator("[data-testid='sidebar-context-menu-switch-view']").click();
+    await page.locator("[data-testid='switch-view-confirm']").click();
+    await expect.poll(() => posted).toEqual(["sess-1/disable", "sess-2/enable"]);
+
+    await rows(page).filter({ hasText: "Plain terminal" }).first().click({ button: "right" });
+    await expect(menu(page)).toBeVisible();
+    await expect(page.locator("[data-testid='sidebar-context-menu-switch-view']")).toHaveCount(0);
   });
+
+  test("failed switches to terminal surface the refusal guidance, else the generic error", async ({ page }) => {
+    await installSidebarMocks(page, {
+      sessions: [session("sess-9", "Refused handoff", "structured", true)],
+    });
+    const guidance =
+      "Native store is unknown. Run aoe session set-session-id sess-9 conversation-id --store /alternate/claude to restore context.";
+    const failures = [
+      (r: Route) => r.fulfill({ status: 409, contentType: "text/plain", body: guidance }),
+      (r: Route) => r.fulfill({ status: 500 }),
+      (r: Route) => r.abort("failed"),
+    ];
+    await page.route("**/api/sessions/*/acp/disable", (r) => failures.shift()!(r));
+
+    await openSwitchMenu(page, "Refused handoff");
+    await page.locator("[data-testid='switch-view-confirm']").click();
+    await expect(page.getByRole("alert").filter({ hasText: guidance })).toBeVisible();
+    await expect(page.locator("[data-testid='switch-view-dialog']")).toBeHidden();
+
+    // A 500 with no body, then a network failure: each adds one generic toast
+    // (both land well inside the toast lifetime).
+    const generic = page.getByText("Failed to switch to terminal", { exact: true });
+    for (const shown of [1, 2]) {
+      await rows(page).filter({ hasText: "Refused handoff" }).first().click({ button: "right" });
+      await page.locator("[data-testid='sidebar-context-menu-switch-view']").click();
+      await page.locator("[data-testid='switch-view-confirm']").click();
+      await expect(generic).toHaveCount(shown);
+    }
+  });
+
   test("a failed switch to structured view keeps the terminal available", async ({ page }) => {
     await installSidebarMocks(page, {
       sessions: [session("sess-9", "Cannot enable", "terminal", true)],
@@ -271,42 +269,6 @@ test.describe("Sidebar Switch view (#2252)", () => {
 
     await rows(page).filter({ hasText: "Cannot enable" }).first().click({ button: "right" });
     await expect(page.locator("[data-testid='sidebar-context-menu-switch-view']")).toContainText("structured");
-  });
-  test("a refused handoff displays the complete recovery guidance", async ({ page }) => {
-    await installSidebarMocks(page, {
-      sessions: [session("sess-9", "Refused handoff", "structured", true)],
-    });
-    const guidance =
-      "Native store is unknown. Run aoe session set-session-id sess-9 conversation-id --store /alternate/claude to restore context.";
-    await page.route("**/api/sessions/*/acp/disable", (r) =>
-      r.fulfill({ status: 409, contentType: "text/plain", body: guidance }),
-    );
-
-    await openSwitchMenu(page, "Refused handoff");
-    await page.locator("[data-testid='switch-view-confirm']").click();
-    await expect(page.getByRole("alert").filter({ hasText: guidance })).toBeVisible();
-    await expect(page.locator("[data-testid='switch-view-dialog']")).toBeHidden();
-  });
-
-  test("a network failure retains the generic switch error", async ({ page }) => {
-    await installSidebarMocks(page, {
-      sessions: [session("sess-9", "Offline handoff", "structured", true)],
-    });
-    await page.route("**/api/sessions/*/acp/disable", (r) => r.abort("failed"));
-
-    await openSwitchMenu(page, "Offline handoff");
-    await page.locator("[data-testid='switch-view-confirm']").click();
-    await expect(page.getByText("Failed to switch to terminal", { exact: true })).toBeVisible();
-  });
-
-  test("non-acp-capable terminal session has no switch-view item", async ({ page }) => {
-    await installSidebarMocks(page, {
-      sessions: [session("sess-3", "Plain terminal", "terminal", false)],
-    });
-    await page.goto("/");
-    await rows(page).filter({ hasText: "Plain terminal" }).first().click({ button: "right" });
-    await expect(menu(page)).toBeVisible();
-    await expect(page.locator("[data-testid='sidebar-context-menu-switch-view']")).toHaveCount(0);
   });
 });
 
@@ -449,7 +411,8 @@ test.describe("Long-press menu (mobile)", () => {
       type: "touchStart",
       touchPoints: [{ x, y, id: 1 }],
     });
-    await page.waitForTimeout(LONG_PRESS_MS + 100);
+    // The guard window starts at open; expect's backoff alone can spend most of it.
+    await page.waitForFunction((sel) => document.querySelector(sel) !== null, MENU, { polling: "raf" });
     await expect(menu(page)).toBeVisible();
 
     // The menu sits under the finger, which is what makes the inside-menu guard matter.

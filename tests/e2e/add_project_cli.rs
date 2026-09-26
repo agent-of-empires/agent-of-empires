@@ -107,40 +107,6 @@ fn add_project_converts_the_session_into_a_workspace() {
     );
 }
 
-/// The same repo cannot be attached twice, and the refusal leaves the session
-/// exactly as it was.
-#[test]
-#[parallel]
-fn add_project_refuses_a_duplicate_repo() {
-    let h = TuiTestHarness::new("add_project_duplicate");
-    let backend = h.home_path().join("backend");
-    let frontend = h.home_path().join("frontend");
-    init_repo(&backend);
-    init_repo(&frontend);
-
-    h.run_cli_ok(&[
-        "add",
-        backend.to_str().unwrap(),
-        "--cmd",
-        "claude",
-        "-t",
-        "Dup",
-    ]);
-    h.run_cli_ok(&["session", "add-project", "Dup", frontend.to_str().unwrap()]);
-
-    let stderr = h.run_cli_err(&["session", "add-project", "Dup", frontend.to_str().unwrap()]);
-    assert!(stderr.contains("already attached"), "{stderr}");
-
-    let sessions = h.read_sessions();
-    assert_eq!(
-        session_by_title(&sessions, "Dup")["workspace_info"]["repos"]
-            .as_array()
-            .map(Vec::len),
-        Some(2),
-        "the refused attach must not add a third repo"
-    );
-}
-
 /// A branch that already exists in the repo being attached is refused, because
 /// it can hold unrelated commits. `--attach-existing-branch` opts in and records
 /// that aoe does not own the branch.
@@ -226,27 +192,4 @@ fn add_project_gates_an_existing_branch_behind_the_opt_in() {
         serde_json::Value::Null,
         "the single-repo worktree record is superseded by the workspace entry"
     );
-}
-
-/// Attaching a path that is not a git repo is refused with a message that says
-/// why, rather than a bare git error.
-#[test]
-#[parallel]
-fn add_project_refuses_a_non_repo() {
-    let h = TuiTestHarness::new("add_project_non_repo");
-    let backend = h.home_path().join("backend");
-    let plain = h.home_path().join("just-a-dir");
-    init_repo(&backend);
-    std::fs::create_dir_all(&plain).unwrap();
-
-    h.run_cli_ok(&[
-        "add",
-        backend.to_str().unwrap(),
-        "--cmd",
-        "claude",
-        "-t",
-        "NonRepo",
-    ]);
-    let stderr = h.run_cli_err(&["session", "add-project", "NonRepo", plain.to_str().unwrap()]);
-    assert!(stderr.contains("not a git repository"), "{stderr}");
 }

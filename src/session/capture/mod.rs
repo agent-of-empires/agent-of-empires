@@ -23,6 +23,7 @@ mod prime;
 pub(crate) use claude::encode_claude_project_path;
 pub(crate) use claude::{
     claude_home_for_host_environment, claude_host_transcript_confirmed_absent,
+    is_default_claude_store, ClaudeStorePin,
 };
 pub(crate) use codex::codex_poll_fn_sandboxed_store;
 pub(crate) use gemini::{

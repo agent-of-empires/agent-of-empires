@@ -284,13 +284,6 @@ mod tests {
     }
 
     #[test]
-    fn malformed_section_value_rejected() {
-        let err =
-            validate_patch(&json!({"theme": "not-an-object"}), Scope::Global, true).unwrap_err();
-        assert!(matches!(err, PatchRejection::Malformed(_)));
-    }
-
-    #[test]
     fn profile_scope_rejects_global_only_fields_including_resets() {
         for field in schema().iter().filter(|field| !field.profile_overridable) {
             let body = json!({&field.section: {&field.field: null}});

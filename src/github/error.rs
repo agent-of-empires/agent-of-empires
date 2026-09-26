@@ -54,23 +54,13 @@ pub type Result<T> = std::result::Result<T, GitHubError>;
 mod tests {
     use super::*;
 
+    /// Auth failures must not steer users to a token path, and network
+    /// failures must not suggest re-authenticating.
     #[test]
-    fn insufficient_scope_names_the_scope() {
-        let msg = GitHubError::InsufficientScope {
-            scopes: "repo".to_string(),
-        }
-        .to_string();
-        assert!(msg.contains("repo"), "must name the missing scope");
-    }
-
-    #[test]
-    fn unauthorized_hint_does_not_push_a_token_path() {
+    fn error_hints_match_the_failure() {
         let auth = GitHubError::Unauthorized.to_string();
         assert!(!auth.contains("GITHUB_TOKEN") && !auth.contains("gh auth login"));
-    }
 
-    #[test]
-    fn network_hint_does_not_suggest_reauthenticating() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

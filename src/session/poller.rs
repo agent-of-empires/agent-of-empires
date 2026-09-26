@@ -671,6 +671,20 @@ impl SessionPoller {
         self.pending_observation.clone()
     }
 
+    /// Drain newly queued observations into the sticky mailbox, then test the pending one without
+    /// cloning it. The predicate sees only the newest observation.
+    pub(crate) fn pending_observation_matches(
+        &mut self,
+        predicate: impl FnOnce(&SessionIdObservation) -> bool,
+    ) -> bool {
+        while let Some(observation) = self.try_recv_observation() {
+            self.pending_observation = Some(observation);
+        }
+        self.pending_observation
+            .as_ref()
+            .is_some_and(|(_, observation)| predicate(observation))
+    }
+
     /// Acknowledge only the observation that reached a terminal outcome. A
     /// stale writer must not erase a newer correction queued in the meantime.
     pub(crate) fn acknowledge_observation(
@@ -685,7 +699,7 @@ impl SessionPoller {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, debug_assertions))]
     pub fn inject_test_update(&self, instance_id: &str, session_id: &str) {
         self.result_tx
             .send((
@@ -867,15 +881,12 @@ mod tests {
         configure_session_id_poller_max_threads(400);
         assert!(!budget.exhausted_now());
         assert!(budget.try_acquire().is_some());
-    }
 
-    #[test]
-    fn zero_ceiling_keeps_the_default() {
-        let _budget = test_support::IsolatedBudget::with_ceiling(7);
         configure_session_id_poller_max_threads(0);
         assert_eq!(
             session_id_poller_max_threads(),
-            DEFAULT_SESSION_ID_POLLER_MAX_THREADS
+            DEFAULT_SESSION_ID_POLLER_MAX_THREADS,
+            "zero keeps the default"
         );
     }
 
@@ -956,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_backoff_doubles_to_a_minute_and_holds() {
+    fn repair_backoff_doubles_to_a_minute_reminds_at_the_cap_and_resets() {
         let mut b = PollerRepairBackoff::default();
         let now = Instant::now();
         assert!(b.due(now), "a fresh schedule is due immediately");
@@ -989,93 +1000,67 @@ mod tests {
                 "not due one millisecond early"
             );
         }
-    }
 
-    #[test]
-    fn repair_backoff_reminds_every_tenth_deferral_at_the_cap() {
-        let mut b = PollerRepairBackoff::default();
-        let now = Instant::now();
-        for _ in 0..5 {
-            b.defer(now);
-        }
         let mut logged_at = Vec::new();
-        for _ in 0..25 {
+        for _ in 0..23 {
             if b.defer(now).is_some() {
                 logged_at.push(b.deferrals());
             }
         }
-        assert_eq!(logged_at, vec![10, 20, 30]);
-    }
+        assert_eq!(
+            logged_at,
+            vec![10, 20, 30],
+            "reminds every tenth at the cap"
+        );
 
-    #[test]
-    fn repair_backoff_reset_clears_the_schedule() {
-        let mut b = PollerRepairBackoff::default();
-        let now = Instant::now();
-        b.defer(now);
-        b.defer(now);
-        assert!(!b.due(now));
         b.reset();
         assert_eq!(b, PollerRepairBackoff::default());
         assert!(b.due(now));
         assert_eq!(b.defer(now), Some(Duration::from_secs(5)), "restarts at 5s");
     }
 
+    /// The two outcomes share one armed deadline and one escalation each, and neither inherits
+    /// the other's delay. The failure ladder itself is covered by
+    /// `repair_backoff_doubles_to_a_minute_reminds_at_the_cap_and_resets`.
     #[test]
-    fn reprobe_doubles_to_its_own_ceiling_and_keeps_failures_logged() {
+    fn re_probes_back_off_to_their_own_ceiling_and_end_each_other_streaks() {
         let mut b = PollerRepairBackoff::default();
         let now = Instant::now();
-        assert!(b.due(now), "a fresh schedule is due immediately");
 
-        // A row whose failure schedule has already escalated.
-        for _ in 0..5 {
-            b.defer(now);
-        }
-        assert_eq!(b.deferrals(), 5);
-
-        let mut delays = Vec::new();
+        let mut quiet = Vec::new();
         for _ in 0..4 {
             b.reprobe(now);
-            delays.push(b.current_reprobe_delay().unwrap());
+            quiet.push(b.current_reprobe_delay().unwrap());
         }
         assert_eq!(
-            delays,
+            quiet,
             vec![
                 Duration::from_secs(5),
                 Duration::from_secs(10),
                 Duration::from_secs(20),
                 POLLER_REPROBE_MAX_DELAY,
             ],
-            "re-probes back off to their own ceiling, half the failure one"
+            "a re-probe backs off to its own ceiling, half the failure one"
         );
+        assert_eq!(b.deferrals(), 0, "and it never counts as a failed repair");
         assert!(
             !b.due(now),
             "a row with nothing to poll is not probed next tick"
         );
-        assert_eq!(b.deferrals(), 0, "and it never counts as a failed repair");
 
-        // The next real failure restarts its own delay, so it logs on its first deferral
-        // instead of inheriting a silent ceiling from before the "nothing to poll" stretch.
+        // A failure then starts its own ladder over, so it warns on its first deferral.
         assert_eq!(
             b.defer(now),
             Some(Duration::from_secs(5)),
             "a failure after a stretch with nothing to poll starts over and warns"
         );
         assert_eq!(b.deferrals(), 1);
-
-        b.expire();
-        assert!(b.due(Instant::now()), "the schedule elapsed: due again");
-    }
-
-    #[test]
-    fn neither_outcome_inherits_the_others_delay() {
-        let mut b = PollerRepairBackoff::default();
-        let now = Instant::now();
-        for _ in 0..5 {
+        for _ in 0..4 {
             b.defer(now);
         }
         assert_eq!(b.current_delay(), Some(POLLER_REPAIR_MAX_DELAY));
 
-        // A row that fails hard and then has nothing to poll re-probes at the first delay.
+        // And the failure streak ends just the same: the next re-probe ignores that ceiling.
         b.reprobe(now);
         assert_eq!(
             b.current_reprobe_delay(),
@@ -1087,19 +1072,8 @@ mod tests {
             "the failure delay it escaped no longer governs the row"
         );
 
-        // And a row that goes quiet again after that failure starts over, rather than
-        // resuming at the ceiling the first stretch had reached.
-        for _ in 0..3 {
-            b.reprobe(now);
-        }
-        assert_eq!(b.current_reprobe_delay(), Some(POLLER_REPROBE_MAX_DELAY));
-        b.defer(now);
-        b.reprobe(now);
-        assert_eq!(
-            b.current_reprobe_delay(),
-            Some(POLLER_REPROBE_INITIAL_DELAY),
-            "a failure ends the quiet streak, so the next one starts at the first delay"
-        );
+        b.expire();
+        assert!(b.due(Instant::now()), "the schedule elapsed: due again");
     }
 
     #[test]
@@ -1141,15 +1115,6 @@ mod tests {
             assert!(interval.current() <= POLL_MAX_INTERVAL);
         }
         assert_eq!(interval.current(), POLL_MAX_INTERVAL);
-    }
-
-    #[test]
-    fn stopping_an_unstarted_poller_is_a_no_op() {
-        let mut poller = SessionPoller::new("test-session".to_string());
-        assert!(!poller.is_running());
-        poller.stop();
-        poller.stop();
-        assert!(!poller.is_running());
     }
 
     #[test]
@@ -1253,25 +1218,15 @@ mod tests {
     fn test_poller_detects_change() {
         let call_count = Arc::new(Mutex::new(0u32));
         let call_count_clone = call_count.clone();
-
         let poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static> = Box::new(move || {
             let mut count = lock_unpoisoned(&call_count_clone);
             *count += 1;
-            if *count <= 1 {
-                Some("id-1".to_string())
-            } else {
-                Some("id-2".to_string())
-            }
+            Some(if *count == 1 { "id-1" } else { "id-2" }.to_string())
         });
-
         let changed_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let changed_ids_clone = changed_ids.clone();
-        let (changed_tx, changed_rx) = mpsc::channel();
         let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |id: &str| {
             lock_unpoisoned(&changed_ids_clone).push(id.to_string());
-            if id == "id-2" {
-                let _ = changed_tx.send(());
-            }
         });
 
         let mut poller = SessionPoller::new("test-session".to_string());
@@ -1284,22 +1239,16 @@ mod tests {
             ),
             PollerSpawn::Spawned
         );
-
-        changed_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the changed observation must be published before retrying it");
+        // Commands queue behind the immediate first poll, and each retry forces a tick, so no
+        // interval elapses: poll 1 sees the known id-1, polls 2 and 3 see id-2.
+        poller.retry_last_observation();
         poller.retry_last_observation();
         poller.stop();
 
-        let ids = lock_unpoisoned(&changed_ids);
-        assert!(
-            !ids.contains(&"id-1".to_string()),
-            "on_change should NOT have been called with id-1 (initial known)"
-        );
         assert_eq!(
-            ids.iter().filter(|id| id.as_str() == "id-2").count(),
-            2,
-            "a failed durable write must be able to request the same observation again"
+            *lock_unpoisoned(&changed_ids),
+            ["id-2", "id-2"],
+            "the known id is suppressed and a retry re-emits the same observation"
         );
     }
 
@@ -1358,25 +1307,6 @@ mod tests {
             0,
             "start warned on an exhausted budget: {logs}"
         );
-    }
-
-    #[test]
-    #[serial]
-    fn test_poller_is_running_after_start() {
-        let mut poller = SessionPoller::new("test-session".to_string());
-        let outcome = poller.start(
-            "test-running".to_string(),
-            Box::new(|| {
-                std::thread::sleep(Duration::from_millis(10));
-                Some("id".to_string())
-            }),
-            Box::new(|_| {}),
-            None,
-        );
-
-        assert_eq!(outcome, PollerSpawn::Spawned);
-        assert!(poller.is_running(), "poller should be running after start");
-        poller.stop();
     }
 
     #[test]

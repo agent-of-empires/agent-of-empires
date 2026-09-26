@@ -143,6 +143,7 @@ fn migrate_config_file(path: &PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migrations::test_cases::assert_rewrites;
 
     fn write(content: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::TempDir::new().unwrap();
@@ -282,82 +283,22 @@ mode = { specific = "wololo" }
         assert_eq!(sound.get("enabled").and_then(|v| v.as_bool()), Some(true));
     }
 
+    /// A live setting must not trigger a rewrite of an otherwise clean config.
     #[test]
-    fn session_id_poller_max_threads_survives_migration() {
-        // `session_id_poller_max_threads` is a live setting again (the
-        // poller thread budget is configurable); the migration must not
-        // strip it while pruning its dropped neighbours.
-        let result = migrated(
-            r#"
-[session]
-smart_rename_timing = "prompt_start"
-session_id_poller_max_threads = 42
-"#,
+    fn clean_configs_are_untouched() {
+        let unchanged = |toml: &'static str| (Some(toml), Some(toml));
+        assert_rewrites(
+            "config.toml",
+            |path| migrate_config_file(&path.to_path_buf()),
+            &[
+                unchanged("[session]\nsession_id_poller_max_threads = 4\n"),
+                unchanged("[session]\ndefault_tool = \"claude\"\n"),
+                (
+                    Some("[session]\nnew_session_attach_mode = \"live_send\"\nsmart_rename_timing = \"turn_end\"\n"),
+                    Some("[session]\ndefault_attach_mode = \"live_send\"\n"),
+                ),
+                (None, None),
+            ],
         );
-        let session = result["session"].as_table().unwrap();
-        assert!(session.get("smart_rename_timing").is_none());
-        assert_eq!(
-            session
-                .get("session_id_poller_max_threads")
-                .and_then(|v| v.as_integer()),
-            Some(42)
-        );
-    }
-
-    #[test]
-    fn config_with_only_poller_threads_is_untouched() {
-        let (_dir, path) = write(
-            r#"
-[session]
-session_id_poller_max_threads = 4
-"#,
-        );
-        let before = fs::read_to_string(&path).unwrap();
-        migrate_config_file(&path).unwrap();
-        let after = fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            before, after,
-            "a live setting must not trigger a rewrite of a clean config"
-        );
-    }
-
-    #[test]
-    fn clean_config_is_untouched() {
-        let (_dir, path) = write(
-            r#"
-[session]
-default_tool = "claude"
-"#,
-        );
-        let before = fs::read_to_string(&path).unwrap();
-        migrate_config_file(&path).unwrap();
-        let after = fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            before, after,
-            "an already-clean config must not be rewritten"
-        );
-    }
-
-    #[test]
-    fn nonexistent_file_is_noop() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("nonexistent.toml");
-        migrate_config_file(&path).unwrap();
-    }
-
-    #[test]
-    fn migration_is_idempotent() {
-        let (_dir, path) = write(
-            r#"
-[session]
-new_session_attach_mode = "live_send"
-smart_rename_timing = "turn_end"
-"#,
-        );
-        migrate_config_file(&path).unwrap();
-        let first = fs::read_to_string(&path).unwrap();
-        migrate_config_file(&path).unwrap();
-        let second = fs::read_to_string(&path).unwrap();
-        assert_eq!(first, second);
     }
 }

@@ -241,8 +241,21 @@ mod tests {
     use crate::acp::Event;
     use chrono::TimeZone;
 
+    /// #3152 / #3688: no reported reset still retries, doubling per redelivery.
     #[test]
-    fn resume_at_is_the_later_of_reset_plus_grace_and_the_floor() {
+    fn unknown_reset_backs_off_per_redelivery_spent() {
+        let recorded_at = Utc.timestamp_opt(1_500_000, 0).unwrap();
+        let at =
+            |n| rate_limit_unknown_reset_retry_at(recorded_at.timestamp_millis(), n) - recorded_at;
+        let hour = chrono::Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS);
+        for (n, factor) in [(0, 1), (1, 2), (2, 4), (3, 8), (4, 16)] {
+            assert_eq!(at(n), hour * factor);
+        }
+        let total = (0..RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES)
+            .fold(chrono::Duration::zero(), |acc, n| acc + at(n));
+        assert_eq!(total, hour * 31);
+        assert_eq!(at(RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES + 50), hour * 16);
+
         let recorded = Utc.timestamp_opt(1_000_000, 0).unwrap();
         let ms = recorded.timestamp_millis();
         let secs = chrono::Duration::seconds;
@@ -268,22 +281,6 @@ mod tests {
                 "{name}"
             );
         }
-    }
-
-    /// #3152 / #3688: no reported reset still retries, doubling per redelivery.
-    #[test]
-    fn unknown_reset_backs_off_per_redelivery_spent() {
-        let recorded_at = Utc.timestamp_opt(1_500_000, 0).unwrap();
-        let at =
-            |n| rate_limit_unknown_reset_retry_at(recorded_at.timestamp_millis(), n) - recorded_at;
-        let hour = chrono::Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS);
-        for (n, factor) in [(0, 1), (1, 2), (2, 4), (3, 8), (4, 16)] {
-            assert_eq!(at(n), hour * factor);
-        }
-        let total = (0..RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES)
-            .fold(chrono::Duration::zero(), |acc, n| acc + at(n));
-        assert_eq!(total, hour * 31);
-        assert_eq!(at(RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES + 50), hour * 16);
     }
 
     /// A session parked on an elapsed limit with `redeliveries` resume cycles
