@@ -221,9 +221,6 @@ impl Instance {
                 if peer_backend != Some(backend) {
                     continue;
                 }
-                if peer.active_execution.is_none() {
-                    return false;
-                }
                 let Some(peer_store) = peer.capture_store_dir() else {
                     return false;
                 };
@@ -783,18 +780,6 @@ mod tests {
     use crate::session::instance::test_helpers::*;
     use crate::session::{Instance, Status};
 
-    fn admit_fixture_content(inst: &Instance) {
-        let app = crate::session::get_app_dir().unwrap();
-        for root in crate::migrations::v033_isolate_sandbox_content::instance_roots(inst).unwrap() {
-            std::fs::create_dir_all(&root.path).unwrap();
-            let roles: Vec<&str> = root.roles.iter().map(String::as_str).collect();
-            crate::migrations::v033_isolate_sandbox_content::certify_test_content(
-                &app, &inst.id, &root.path, &roles,
-            )
-            .unwrap();
-        }
-    }
-
     /// The 2026-09-04 fleet shape.
     #[test]
     fn repair_defers_with_backoff_while_the_poller_budget_is_spent() {
@@ -918,7 +903,7 @@ mod tests {
             "prime-repair",
             Some("/workspace/prime-repair"),
         ));
-        admit_fixture_content(&inst);
+        admit_sandbox_fixture(&inst);
         let store = inst.sandbox_capture_store_dir().unwrap();
         std::fs::create_dir_all(&store).unwrap();
         let live = crate::tmux::LiveSessionSnapshot::from_parts(
@@ -1025,7 +1010,7 @@ mod tests {
         inst.sandbox_info = Some(test_sandbox("aoe-pi-late-path", None));
         inst.agent_session_id = Some(sid.to_string());
         inst.mark_pi_extension_launched_for_test();
-        admit_fixture_content(&inst);
+        admit_sandbox_fixture(&inst);
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
         let seed = inst.clone();
         storage
@@ -1093,7 +1078,7 @@ mod tests {
         let mut sandboxed = Instance::new("pisandboxpoll001", "/tmp/pi-poll");
         sandboxed.tool = "pi".to_string();
         sandboxed.sandbox_info = Some(test_sandbox("aoe-pi-poll", None));
-        admit_fixture_content(&sandboxed);
+        admit_sandbox_fixture(&sandboxed);
         let dir = sandboxed
             .pi_sidecar_source()
             .and_then(|s| match s {
@@ -1166,7 +1151,7 @@ mod tests {
         inst.sandbox_info = Some(test_sandbox("test", Some("/workspace/gemini-backoff")));
         let name = inst.tmux_session().unwrap().name().to_string();
         let live = crate::tmux::LiveSessionSnapshot::from_parts(Some(vec![name]), None);
-        admit_fixture_content(&inst);
+        admit_sandbox_fixture(&inst);
         inst.session_id_poller_retry_after =
             Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
 
@@ -1188,6 +1173,21 @@ mod tests {
         inst
     }
 
+    /// A refusal from the profile walk is evidence about a peer only when that
+    /// profile is enumerated and its storage loads.
+    fn assert_enumerable(profiles: &[&str]) {
+        let enumerated = crate::session::list_profiles().expect("profile enumeration");
+        for profile in profiles {
+            assert!(
+                enumerated.iter().any(|name| name.as_str() == *profile)
+                    && crate::session::Storage::new_unwatched(profile)
+                        .and_then(|storage| storage.load())
+                        .is_ok(),
+                "profile {profile} is not enumerable and readable, so a refusal cannot name its peer"
+            );
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn managed_capture_exclusivity_is_store_based_across_profiles() {
@@ -1202,7 +1202,7 @@ mod tests {
         peer.source_profile = "capture-owner-b".into();
         let shared_store = app.path().join("shared");
         std::fs::create_dir_all(&shared_store).unwrap();
-        admit_fixture_content(&peer);
+        admit_sandbox_fixture(&peer);
         std::fs::create_dir_all(peer.sandbox_capture_store_dir().unwrap()).unwrap();
         let bind = |instance: &mut Instance, store: &std::path::Path| {
             instance.active_execution = Some(super::ActiveExecution {
@@ -1237,6 +1237,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        assert_enumerable(&["capture-owner-a", "capture-owner-b"]);
         assert!(
             !current.managed_capture_store_is_exclusive(backend),
             "inspected mounts override predicted private stores"
@@ -1267,6 +1268,13 @@ mod tests {
             current.managed_capture_store_is_exclusive(backend),
             "distinct physical stores do not conflict"
         );
+        {
+            let _fail_guard = crate::session::FailNextListProfilesGuard::new();
+            assert!(
+                !current.managed_capture_store_is_exclusive(backend),
+                "an unresolvable profile list fails closed rather than granting exclusivity"
+            );
+        }
 
         peer.active_execution = None;
         peer_storage
@@ -1287,8 +1295,115 @@ mod tests {
             })
             .unwrap();
         assert!(
+            current.managed_capture_store_is_exclusive(backend),
+            "a peer without an execution context falls back to its own predicted private store"
+        );
+        // A generation-1 peer's store is the legacy shared root, materialized
+        // here so the generation gate is the only thing that can refuse.
+        peer.sandbox_store_generation = 1;
+        let legacy = peer
+            .sandbox_capture_store_path()
+            .expect("a generation-1 gemini peer resolves the legacy shared store");
+        std::fs::create_dir_all(&legacy).unwrap();
+        peer_storage
+            .update(|instances, _| {
+                *instances = vec![peer.clone()];
+                Ok(())
+            })
+            .unwrap();
+        assert!(
             !current.managed_capture_store_is_exclusive(backend),
-            "an unlocated peer of the same backend cannot prove exclusivity"
+            "a peer below the current store generation cannot prove exclusivity"
+        );
+
+        let mut unadmitted = sandboxed_gemini("unadmitted", "/repos/unadmitted", "/workspace/u");
+        unadmitted.source_profile = "capture-owner-b".into();
+        assert!(
+            unadmitted.sandbox_capture_store_dir().is_none(),
+            "an unadmitted peer has no private store to compare"
+        );
+        peer_storage
+            .update(|instances, _| {
+                *instances = vec![unadmitted.clone()];
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            !current.managed_capture_store_is_exclusive(backend),
+            "a peer without certified sandbox content cannot prove exclusivity"
+        );
+
+        let missing_store = app.path().join("missing-store");
+        bind(&mut peer, &missing_store);
+        peer_storage
+            .update(|instances, _| {
+                *instances = vec![peer.clone()];
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            !current.managed_capture_store_is_exclusive(backend),
+            "a peer whose store cannot be canonicalized cannot prove exclusivity"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sandboxed_codex_compares_peers_on_their_private_store() {
+        let app = tempfile::tempdir().unwrap();
+        let _app_guard = crate::session::test_support::isolate_app_dir_at(app.path());
+        let backend = crate::agents::SessionCaptureBackend::Codex;
+        let current_storage = crate::session::Storage::new_unwatched("codex-owner-a").unwrap();
+        let peer_storage = crate::session::Storage::new_unwatched("codex-owner-b").unwrap();
+        let mut current = tool_instance("codex", "/repos/current");
+        current.status = Status::Running;
+        current.source_profile = "codex-owner-a".into();
+        current.sandbox_info = Some(test_sandbox(
+            &format!("test-{}", current.id),
+            Some("/workspace/current"),
+        ));
+        admit_sandbox_fixture(&current);
+        assert_eq!(
+            current
+                .source_session_support()
+                .map(|(capture, context)| (capture.backend, context)),
+            Some((
+                backend,
+                crate::agents::SessionCaptureContext::ManagedExclusiveStore
+            )),
+            "sandboxed Codex resolves the only context that must prove store exclusivity"
+        );
+        current_storage
+            .update(|instances, _| {
+                *instances = vec![current.clone()];
+                Ok(())
+            })
+            .unwrap();
+        assert_enumerable(&["codex-owner-a", "codex-owner-b"]);
+
+        // The self row is skipped only in its own profile, so the same id under
+        // another profile is still compared.
+        let mut shadow = current.clone();
+        shadow.source_profile = "codex-owner-b".into();
+        let current_store = current
+            .capture_store_dir()
+            .and_then(|store| std::fs::canonicalize(&store).ok());
+        let shadow_store = shadow
+            .capture_store_dir()
+            .and_then(|store| std::fs::canonicalize(&store).ok());
+        assert!(
+            current_store.is_some() && shadow_store == current_store,
+            "the same session id under another profile predicts this session's own physical store"
+        );
+        peer_storage
+            .update(|instances, _| {
+                *instances = vec![shadow];
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            !current.managed_capture_store_is_exclusive(backend),
+            "a peer that resolves this session's own store cannot prove exclusivity"
         );
     }
 
