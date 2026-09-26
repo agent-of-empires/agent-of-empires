@@ -11,6 +11,13 @@ pub mod pack;
 #[cfg(test)]
 mod pack_tests;
 mod render;
+/// The local admission walk and its peer-credential check, which read process
+/// identity from `/proc` and are therefore Linux-only. The publisher refuses
+/// every other platform for the same reason (`server::runtime_uds::publish`),
+/// so on one there is no local read to admit and the Local transport below
+/// reports the publication absent, which runs the command from the local store
+/// exactly as it did before the read existed.
+#[cfg(target_os = "linux")]
 mod uds;
 
 use std::time::Duration;
@@ -31,6 +38,7 @@ use self::dto::{
 /// endpoint; production callers use [`read_request_source`].
 pub use self::endpoint::ReadRequestSource;
 use self::endpoint::SelectedEndpoint;
+#[cfg(target_os = "linux")]
 use self::uds::UdsIdentity;
 use super::group::GroupListArgs;
 use super::list::ListArgs;
@@ -39,7 +47,11 @@ use super::session::ShowArgs;
 use super::status::StatusArgs;
 use super::{Cli, Commands};
 
-const ESTABLISHMENT_BUDGET: Duration = Duration::from_secs(15);
+/// How long a read may take to establish, admission included. The daemon
+/// bounds its own side of the same window with the same constant
+/// (`server::runtime_ws::CONNECTION_BUDGET`), so one stalled peer can never
+/// hold a client task and a server task open at once.
+pub(crate) const ESTABLISHMENT_BUDGET: Duration = Duration::from_secs(15);
 const EXCHANGE_BUDGET: Duration = Duration::from_secs(15);
 const CLOSE_BUDGET: Duration = Duration::from_millis(200);
 pub(crate) const APPLICATION_LIMIT: usize = 16 * 1024 * 1024;
@@ -78,6 +90,48 @@ pub fn classify(command: Option<&Commands>) -> Option<ScopedCommand<'_>> {
     }
 }
 
+/// Every code a scoped read can report, and the only vocabulary the Contract
+/// Pack's phase/code/exit table may use.
+///
+/// The two lists are held together from both ends. Each constructor below
+/// asserts that the code it was handed is in this set, so a new emitter cannot
+/// introduce a code the table does not describe; the pack verifier requires
+/// every code in its table to be in this set, so the table cannot describe a
+/// code no emitter produces. A code with no emitter is what left
+/// `identifier_required` frozen in the pack for a renderer that no longer
+/// exists.
+pub(crate) const EMITTABLE_CODES: &[&str] = &[
+    // `parser_error` is clap's, raised before any read begins.
+    "parser_error",
+    "anchored_alias_unavailable",
+    "close_timeout",
+    "connection_closed",
+    "default_missing",
+    "establishment_timeout",
+    "freshness_unavailable",
+    "frame_limit",
+    "health_degraded",
+    "invalid_endpoint",
+    "invalid_token",
+    "marker_identity",
+    "marker_invalid",
+    "marker_missing",
+    "peer_identity",
+    "profile_missing",
+    "protocol_mismatch",
+    "renderer_internal",
+    "schema_invalid",
+    "session_ambiguous",
+    "session_missing",
+    "socket_identity",
+    "unauthorized",
+    "unavailable",
+];
+
+/// The code a caller-chosen-exit refusal carries: the renderer refused on the
+/// user's own state, not on the wire.
+const RENDERER_INTERNAL: &str = "renderer_internal";
+
 #[derive(Debug)]
 pub(crate) struct ReadFailure {
     code: &'static str,
@@ -88,35 +142,37 @@ pub(crate) struct ReadFailure {
 
 impl ReadFailure {
     pub(crate) fn pre(code: &'static str) -> Self {
-        Self {
-            code,
-            exit: 2,
-            exact: None,
-            attempt_close: false,
-        }
+        Self::refusal(code, 2, false)
     }
 
     pub(crate) fn post(code: &'static str) -> Self {
-        Self {
-            code,
-            exit: 4,
-            exact: None,
-            attempt_close: true,
-        }
+        Self::refusal(code, 4, true)
     }
 
     pub(crate) fn post_no_close(code: &'static str) -> Self {
+        Self::refusal(code, 4, false)
+    }
+
+    fn refusal(code: &'static str, exit: i32, attempt_close: bool) -> Self {
+        debug_assert!(
+            EMITTABLE_CODES.contains(&code),
+            "{code} is not in the emittable code set"
+        );
         Self {
             code,
-            exit: 4,
+            exit,
             exact: None,
-            attempt_close: false,
+            attempt_close,
         }
     }
 
+    /// A refusal whose exit the renderer chooses: a user-facing message that is
+    /// not a wire failure. The code stays the renderer's own, so the pack can
+    /// still tell an internal fault (exit 1) from a refusal (exit 2).
     pub(crate) fn exit(exit: i32, message: &'static str) -> Self {
+        debug_assert!(EMITTABLE_CODES.contains(&RENDERER_INTERNAL));
         Self {
-            code: "renderer_internal",
+            code: RENDERER_INTERNAL,
             exit,
             exact: Some(message),
             attempt_close: true,
@@ -200,27 +256,38 @@ async fn execute_inner(
     let establishment_deadline = Instant::now() + ESTABLISHMENT_BUDGET;
     match endpoint {
         SelectedEndpoint::Local => {
-            let connection = uds::connect(establishment_deadline).await?;
-            let request = "ws://localhost/api/runtime/ws"
-                .into_client_request()
-                .map_err(|_| ReadFailure::post("unavailable"))?;
-            let exchange = connection.upgrade(request).await?;
-            let uds::UdsExchange {
-                stream,
-                identity,
-                home,
-                deadline,
-                _admission,
-            } = exchange;
-            exchange_stream(
-                stream,
-                deadline,
-                ExpectedPeer::Local(identity),
-                Some(home.as_path()),
-                command,
-                source,
-            )
-            .await
+            #[cfg(target_os = "linux")]
+            {
+                let connection = uds::connect(establishment_deadline).await?;
+                let request = "ws://localhost/api/runtime/ws"
+                    .into_client_request()
+                    .map_err(|_| ReadFailure::post("unavailable"))?;
+                let exchange = connection.upgrade(request).await?;
+                let uds::UdsExchange {
+                    stream,
+                    identity,
+                    home,
+                    deadline,
+                    _admission,
+                } = exchange;
+                exchange_stream(
+                    stream,
+                    deadline,
+                    ExpectedPeer::Local(identity),
+                    Some(home.as_path()),
+                    command,
+                    source,
+                )
+                .await
+            }
+            // No publisher runs on this platform, so the absence is the only
+            // answer the local transport can give, and the caller runs the
+            // command against the local store.
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = establishment_deadline;
+                Err(ReadFailure::pre("marker_missing"))
+            }
         }
         SelectedEndpoint::Http { request } => {
             let connected = tokio::time::timeout_at(
@@ -261,6 +328,7 @@ fn websocket_config() -> WebSocketConfig {
 #[derive(Debug)]
 enum ExpectedPeer {
     Remote,
+    #[cfg(target_os = "linux")]
     Local(UdsIdentity),
 }
 
@@ -311,6 +379,9 @@ where
     if let Err(code) = validate_hello(&hello) {
         return Err(ReadFailure::post_no_close(code));
     }
+    // The local transport proves the peer it reached is the publisher whose
+    // markers it admitted; a named endpoint has no such claim to check.
+    #[cfg(target_os = "linux")]
     if let ExpectedPeer::Local(identity) = &expected {
         if hello.namespace != identity.namespace
             || hello.prebind_instance_id != identity.prebind_instance_id
@@ -342,6 +413,7 @@ where
     }
     let local_uid = match &expected {
         ExpectedPeer::Remote => None,
+        #[cfg(target_os = "linux")]
         ExpectedPeer::Local(identity) => Some(identity.owner_uid),
     };
     if let Err(code) = validate_cross_message(&hello, &snapshot, local_uid) {
@@ -402,6 +474,18 @@ where
     }
 }
 
+/// Close the exchange and settle on the answer.
+///
+/// A close that fails is still an error — the contract says the read reports
+/// one, and a peer that cannot be told to stop must not pass for a clean
+/// finish. It is not, however, allowed to become *the* error: a snapshot the
+/// client refused (`schema_invalid`), a profile the daemon does not have
+/// (`profile_missing`) and a freshness the daemon never observed
+/// (`freshness_unavailable`) are the facts the exit code is about, and
+/// replacing any of them with `close_timeout` would report a transport hiccup
+/// as the reason the read failed. So the original failure is returned as it
+/// stands, and a close failure is what is reported only when there was no
+/// failure to report.
 async fn finish_with_close<S>(
     stream: &mut tokio_tungstenite::WebSocketStream<S>,
     deadline: Instant,
@@ -420,8 +504,11 @@ where
             });
         }
     }
-    close_local(stream, deadline).await?;
-    result
+    match (result, close_local(stream, deadline).await) {
+        (Err(error), _) => Err(error),
+        (Ok(projection), Ok(())) => Ok(projection),
+        (Ok(_), Err(close)) => Err(close),
+    }
 }
 
 async fn close_local<S>(
@@ -526,6 +613,51 @@ mod tests {
             post.stderr.as_deref(),
             Some("daemon read: schema_invalid\n")
         );
-        assert_eq!(post.exit, 4);
+    }
+
+    /// A close that cannot be sent is still an error, but it is not allowed to
+    /// become the error: the refusal that caused it is the fact the exit code
+    /// is about. The peer here is gone, so every close fails.
+    #[tokio::test]
+    async fn a_failed_close_never_replaces_the_failure_that_caused_it() {
+        let mut stream = broken_stream().await;
+        let deadline = Instant::now() + EXCHANGE_BUDGET;
+        for code in ["schema_invalid", "profile_missing", "freshness_unavailable"] {
+            let error = finish_with_close(&mut stream, deadline, Err(ReadFailure::post(code)))
+                .await
+                .expect_err("the read failed");
+            assert_eq!(error.code(), code, "{code} must survive a broken close");
+        }
+    }
+
+    /// With nothing to report, a close that cannot be sent is the whole story,
+    /// and a successful render is still refused rather than passed off as
+    /// clean.
+    #[tokio::test]
+    async fn a_failed_close_is_the_answer_when_the_read_otherwise_succeeded() {
+        let mut stream = broken_stream().await;
+        let deadline = Instant::now() + EXCHANGE_BUDGET;
+        let projection = render::Projection {
+            stdout: "rows\n".into(),
+            session_table: false,
+        };
+        let error = finish_with_close(&mut stream, deadline, Ok(projection))
+            .await
+            .expect_err("a broken close is not a clean finish");
+        assert_eq!(error.code(), "close_timeout");
+        assert_eq!(error.exit, 4);
+    }
+
+    /// A client-side stream whose peer is gone: every write fails, which is
+    /// what a close to a stalled or reset peer looks like from here.
+    async fn broken_stream() -> tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream> {
+        let (stream, peer) = tokio::io::duplex(1024);
+        drop(peer);
+        tokio_tungstenite::WebSocketStream::from_raw_socket(
+            stream,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await
     }
 }

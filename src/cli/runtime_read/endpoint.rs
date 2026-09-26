@@ -38,18 +38,28 @@ pub(crate) enum SelectedEndpoint {
 pub(crate) fn select_endpoint(source: &ReadRequestSource) -> Result<SelectedEndpoint, ReadFailure> {
     let selected = match (&source.explicit_url, &source.env_url) {
         (Some(_), _) => source.explicit_url.as_deref(),
-        (None, Some(value)) => Some(
-            value
+        (None, Some(value)) => {
+            let value = value
                 .to_str()
-                .ok_or_else(|| ReadFailure::pre("invalid_endpoint"))?,
-        ),
+                .ok_or_else(|| ReadFailure::pre("invalid_endpoint"))?;
+            // An empty variable is an unset one, which is how the rest of the
+            // tool reads it (`acp::client::discovery`): `AOE_DAEMON_URL=` in a
+            // shell profile or a CI environment is not a request to refuse
+            // every read, and refusing would strand the seven read commands
+            // where no daemon is published. A value that is present but not
+            // empty still has to parse, and an explicitly empty
+            // `--daemon-url` is a flag the user gave a value to by mistake.
+            match value.trim() {
+                "" => return Ok(SelectedEndpoint::Local),
+                trimmed => Some(trimmed),
+            }
+        }
         (None, None) => return Ok(SelectedEndpoint::Local),
     };
     let raw = selected.ok_or_else(|| ReadFailure::pre("invalid_endpoint"))?;
     if raw.is_empty() {
         return Err(ReadFailure::pre("invalid_endpoint"));
     }
-
     let (request_url, secure) = parse_endpoint(raw)?;
     let token = source
         .token
