@@ -1245,7 +1245,7 @@ impl HomeView {
             .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
         let source_profile = live.source_profile.clone();
         let _identity_lock = acquire_session_identity_lock()?;
-        let storage = Storage::new(&source_profile, self.file_watch.clone())?;
+        let storage = Storage::open(&source_profile, self.file_watch.clone())?;
         let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
         let authoritative_instances = storage.load()?;
         let mut authoritative = authoritative_instances

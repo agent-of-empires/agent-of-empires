@@ -147,13 +147,9 @@ async fn purge_session_artifacts(
                 );
             }
         }
-        if let Err(error) = state.acp_event_store.delete_session(id) {
-            return Err(format!(
-                "Session {id} was kept because ACP event deletion failed: {error}"
-            ));
-        }
     }
 
+    let mut post_commit_error: Option<String> = None;
     let deletion_result = if transcript_purged {
         // Commit the row removal before deleting the ACP transcript, so a lost
         // restore/generation race leaves both intact and a successful commit
@@ -173,13 +169,20 @@ async fn purge_session_artifacts(
                     &state.mutation_epoch,
                 );
 
-                // The runner is proven dead by now, so the local mirror and the
-                // ACP transcript can go before the sidecar teardown.
+                let event_error = state
+                    .acp_event_store
+                    .delete_session(id)
+                    .err()
+                    .map(|error| format!("ACP event deletion failed: {error}"));
+                // The durable row is committed and the runner is proven dead, so the local mirror
+                // and ACP transcript can now go before the sidecar teardown.
                 state.acp_supervisor.forget_session(id);
 
-                tokio::task::spawn_blocking(move || committed.finish())
+                let cleanup = tokio::task::spawn_blocking(move || committed.finish())
                     .await
-                    .map_err(|e| format!("Deletion cleanup task failed: {e}"))?
+                    .map_err(|e| format!("Deletion cleanup task failed: {e}"))?;
+                post_commit_error = event_error;
+                cleanup
             }
         }
     } else {
@@ -246,6 +249,9 @@ async fn purge_session_artifacts(
             tracing::warn!(target: "http.api.sessions",
                 "recording recent project after delete failed: {e}");
         }
+    }
+    if let Some(error) = post_commit_error {
+        return Err(format!("Session {id} was purged but {error}"));
     }
     Ok((true, messages))
 }

@@ -1004,9 +1004,7 @@ fn cleanup_instance_core(
         crate::session::deletion::PathsInUse::Unknown(_) => true,
         crate::session::deletion::PathsInUse::Known(paths) => {
             let paths = crate::session::deletion::PathsInUse::Known(paths);
-            candidate_paths
-                .iter()
-                .any(|path| paths.covers_destructive(path))
+            candidate_paths.iter().any(|path| paths.covers(path))
         }
     };
     if peer_claimed {
@@ -1029,35 +1027,29 @@ fn cleanup_instance_core(
         }
     }
 
-    if !peer_claimed {
-        // Scratch dirs are provisioned eagerly inside `build_instance` (well before this helper's other
-        // cleanup targets exist), so an abort between provisioning and the caller finishing the session
-        // would otherwise leak the directory on disk.
-        if instance.scratch {
-            let scratch_path = PathBuf::from(&instance.project_path);
-            if !protection.references_path(&scratch_path)
-                && super::scratch::is_scratch_path(&scratch_path)
-            {
-                if let Err(e) = std::fs::remove_dir_all(&scratch_path) {
-                    tracing::warn!(
-                        target: "session.create",
-                        "Failed to clean up scratch dir: {}",
-                        e
-                    );
-                }
+    // Scratch dirs are provisioned eagerly inside `build_instance` (well before this helper's
+    // other cleanup targets exist), so an abort between provisioning and the caller finishing the
+    // session would otherwise leak the directory on disk.
+    if instance.scratch {
+        let scratch_path = PathBuf::from(&instance.project_path);
+        if !protection.references_path(&scratch_path)
+            && super::scratch::is_scratch_path(&scratch_path)
+        {
+            if let Err(e) = std::fs::remove_dir_all(&scratch_path) {
+                tracing::warn!(target: "session.create", "Failed to clean up scratch dir: {}", e);
             }
         }
-        if let Some(worktree) = created_worktree {
-            cleanup_created_worktree(worktree, "worktree", &protection);
-        }
-        for worktree in created_workspace_worktrees {
-            cleanup_created_worktree(worktree, "workspace worktree", &protection);
-        }
-        if let Some(workspace) = &instance.workspace_info {
-            let workspace_dir = Path::new(&workspace.workspace_dir);
-            if !protection.references_path(workspace_dir) {
-                let _ = std::fs::remove_dir_all(workspace_dir);
-            }
+    }
+    if let Some(worktree) = created_worktree {
+        cleanup_created_worktree(worktree, "worktree", &protection);
+    }
+    for worktree in created_workspace_worktrees {
+        cleanup_created_worktree(worktree, "workspace worktree", &protection);
+    }
+    if let Some(workspace) = &instance.workspace_info {
+        let workspace_dir = Path::new(&workspace.workspace_dir);
+        if !protection.references_path(workspace_dir) {
+            let _ = std::fs::remove_dir_all(workspace_dir);
         }
     }
 }

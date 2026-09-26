@@ -1276,7 +1276,7 @@ fn cleanup_partial_session_under_locks(
             let paths = crate::session::deletion::PathsInUse::Known(paths);
             candidate_paths
                 .iter()
-                .any(|candidate| paths.covers_destructive(candidate))
+                .any(|candidate| paths.covers(candidate))
         }
     };
     if peer_claimed {

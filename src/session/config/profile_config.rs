@@ -121,13 +121,11 @@ pub(crate) fn overrides_ignored_keys(overrides: &serde_json::Value) -> Vec<Strin
 }
 
 /// Run `f` with the `config.toml` path of an *existing* profile while holding
-/// that profile's write locks: identity → profile-namespace → profile storage
-/// flock → in-process save mutex, the first three in the same order
-/// [`crate::session::rename_profile`] and [`crate::session::delete_profile`]
-/// take. The profile is resolved only after the namespace lock is held, so a
-/// concurrent rename/delete can neither slip between resolution and the write
-/// nor have its directory resurrected by a stale caller. An unknown profile is
-/// an error; nothing is ever created.
+/// that profile's write locks: identity, profile-namespace, in-process save
+/// mutex, then the profile storage flock. The profile is resolved only after
+/// the namespace lock is held, so a concurrent rename/delete can neither slip
+/// between resolution and the write nor resurrect a deleted directory. An
+/// unknown profile is an error; nothing is ever created.
 fn with_profile_config_locked<T>(
     profile: &str,
     f: impl FnOnce(&std::path::Path) -> Result<T>,
@@ -136,16 +134,15 @@ fn with_profile_config_locked<T>(
     let _namespace_lock = crate::session::storage::acquire_profile_namespace_lock()?;
     let profile_name = crate::session::resolve_existing_profile(profile)?;
     let dir = crate::session::get_profile_dir_path(&profile_name)?;
-    let _profile_storage_lock = crate::session::storage::acquire_storage_flock(
-        &dir,
-        crate::session::storage::STORAGE_LOCK_FILENAME,
-    )?;
-    // The in-process half of the same pair `Storage` uses: threads of this
-    // process serialize on the mutex, other processes on the flock above.
+    // Match Storage::update: in-process save mutex first, then the cross-process flock.
     let save_lock = crate::session::storage::save_lock_for(&profile_name);
     let _save_lock = save_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _profile_storage_lock = crate::session::storage::acquire_storage_flock(
+        &dir,
+        crate::session::storage::STORAGE_LOCK_FILENAME,
+    )?;
     f(&dir.join("config.toml"))
 }
 
