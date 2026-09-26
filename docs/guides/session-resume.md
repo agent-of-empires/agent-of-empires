@@ -33,7 +33,7 @@ Shell pipelines, remote launchers, redirections, expansion, and unrecognized con
 
 ## Supported managed contexts
 
-- **Claude:** the resolved `CLAUDE_CONFIG_DIR` or default Claude store. Conflicting store selectors are refused.
+- **Claude:** the store its conversation recorded, a declared `agent_config_dir`, the resolved `CLAUDE_CONFIG_DIR`, or the default Claude store. Conflicting selectors resolve in a fixed order rather than being refused; see [Swapping the engine on a restart](#swapping-the-engine-on-a-restart).
 - **Codex:** a local host-readable `CODEX_HOME`, file-backed API-key authentication, and local SQLite/thread storage. Cloud, keyring, profile, project-routing, managed-policy, and host macOS contexts are not currently proven.
 - **OpenCode:** an explicit `OPENCODE_DB`, or the common database when `OPENCODE_DISABLE_CHANNEL_DB` is already enabled. A workspace-routed target or different stored working directory is refused.
 - **Pi and OMP:** the verified transcript and exact store. Recovery uses `--store` with the transcript file. OMP also verifies its stored working directory and pins the resolved profile.
@@ -100,7 +100,7 @@ The outgoing account keeps its own copy, so swapping accounts back and forth sta
 
 Editing one tool's `agent_config_dir` entry in place is not that swap. A Claude conversation on the host resumes in the store its own binding recorded, and that store outranks the entry, so repointing or removing it leaves the session on the account it recorded and only new sessions follow the entry. A structured session resuming the same conversation pins that store without logging, and a sandboxed Claude session follows the entry instead, because its store is a per-session child of the entry ([Per-session agent stores](sandbox.md#per-session-agent-stores)).
 
-A host launch records a `session.store` warning when the two stores differ, naming the store the launch used as `launch_store`, the store a new session would take as `new_session_store`, and where that one comes from as `new_session_store_source`: `agent_config_dir`, `environment`, or `default`. The line goes to the log the TUI and the daemon write, which `aoe logs` opens, and the default level passes it. A one-shot `aoe session restart` has no log of its own, so the line appears there only with `AOE_LOG_LEVEL` or `AGENT_OF_EMPIRES_DEBUG` set, and a level of `error` filters it away. See [Environment variables](configuration.md#environment-variables) for both.
+A host launch records a `session.store` warning when the two stores differ, naming the store the launch used as `launch_store`, the store a new session would take as `new_session_store`, and where that one comes from as `new_session_store_source`: `agent_config_dir`, `environment`, or `default`. It is the only line on that target carrying `new_session_store=`, so match on that field: the same target also carries unrelated configuration warnings about entries that will be ignored. The line goes to the log the TUI and the daemon write, which `aoe logs` opens, and the default level passes it. A one-shot `aoe session restart` has no log of its own, so the line appears there only with `AOE_LOG_LEVEL` or `AGENT_OF_EMPIRES_DEBUG` set, and a level of `error` filters it away. See [Environment variables](configuration.md#environment-variables) for both.
 
 Rebinding the record with `aoe session set-session-id --store` copies nothing, so it only resumes if the target account already holds the conversation; swapping tool names as above is what has AoE copy the transcript.
 
@@ -110,7 +110,7 @@ Upgrading the agent binary from inside a session does not replace the process in
 
 ## Importing an existing Claude conversation
 
-Conversations started outside AoE can be pulled into a structured-view session from the web wizard's **Import from Claude** tab, which appears only when both Claude Code and `claude-agent-acp` are installed, since the import resumes through that adapter. It lists the Claude Code sessions on disk (under `$CLAUDE_CONFIG_DIR` or `~/.claude/projects`), newest first, with each one's first prompt, working directory, and last-used time.
+Conversations started outside AoE can be pulled into a structured-view session from the web wizard's **Import from Claude** tab, which appears only when both Claude Code and `claude-agent-acp` are installed, since the import resumes through that adapter. It lists the Claude Code sessions on disk (under `$CLAUDE_CONFIG_DIR` or `~/.claude/projects`), newest first, with each one's first prompt, working directory, and last-used time. The tab reads `CLAUDE_CONFIG_DIR` from AoE's own process environment and consults neither `agent_config_dir` nor a recorded store, so a conversation held in the store the entry points at is not listed.
 
 Picking one creates a structured-view session in that conversation's original working directory and resumes it, so the prior transcript is there and you can keep going. It always uses the recorded directory and never creates a worktree, because the conversation only resolves where it started. The original is read in place, not copied.
 

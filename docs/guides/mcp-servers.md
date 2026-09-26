@@ -23,7 +23,7 @@ Create `mcp.json` in the AoE app directory (`$XDG_CONFIG_HOME/agent-of-empires/m
 }
 ```
 
-Each entry is **stdio** (the default; `command` required, `args` and `env` optional), **http**, or **sse** (`url` required, `headers` optional). The same list is forwarded for fresh and resumed sessions, though a resumed conversation reads the agent's recorded store rather than the current entry.
+Each entry is **stdio** (the default; `command` required, `args` and `env` optional), **http**, or **sse** (`url` required, `headers` optional). The same list is forwarded for fresh and resumed sessions, but only the agent-native layer of a resumed conversation is read from the store it recorded rather than from the current entry.
 
 ## Layers and precedence
 
