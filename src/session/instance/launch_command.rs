@@ -2015,6 +2015,14 @@ mod tests {
             "an unresolvable selector is not a divergence to report"
         );
 
+        // The other side of that bargain: with nothing recorded the selector
+        // does choose the root, so an unresolvable one must still refuse.
+        let bare = instance();
+        assert!(
+            bare.resolve_native_execution(None).is_err(),
+            "an unresolvable selector must refuse a launch it decides"
+        );
+
         // Same declaration as the recorded store: the common launch stays quiet.
         declare("source");
         let (uncontested, _) = resumed(&mut instance(), attested.binding.clone());
