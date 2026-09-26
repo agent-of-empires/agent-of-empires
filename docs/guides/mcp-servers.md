@@ -23,7 +23,7 @@ Create `mcp.json` in the AoE app directory (`$XDG_CONFIG_HOME/agent-of-empires/m
 }
 ```
 
-Each entry is **stdio** (the default; `command` required, `args` and `env` optional), **http**, or **sse** (`url` required, `headers` optional). The same list is forwarded for fresh and resumed sessions.
+Each entry is **stdio** (the default; `command` required, `args` and `env` optional), **http**, or **sse** (`url` required, `headers` optional). The same list is forwarded for fresh and resumed sessions, though a resumed conversation reads the agent's recorded store rather than the current entry.
 
 ## Layers and precedence
 
@@ -33,7 +33,7 @@ Servers come from up to four sources, merged per server name:
 agent-native  <  mcp.json (global)  <  profile mcp.json  <  project-local .mcp.json (trusted)
 ```
 
-- **Agent-native config** is read (never written) so you need not copy servers in: `~/.claude.json` (`mcpServers`), `~/.gemini/settings.json` (transport chosen by which key the entry sets), and `~/.codex/config.toml` (`[mcp_servers.<name>]`, honoring Codex's `enabled` flag). Claude's directory is the one the launched CLI reads: a `session.agent_config_dir` entry, then `CLAUDE_CONFIG_DIR` from the session's environment, then from AoE's own, then `~`.
+- **Agent-native config** is read (never written) so you need not copy servers in: `~/.claude.json` (`mcpServers`), `~/.gemini/settings.json` (transport chosen by which key the entry sets), and `~/.codex/config.toml` (`[mcp_servers.<name>]`, honoring Codex's `enabled` flag). Claude's directory is the one the launched CLI reads: the store the conversation recorded, then a `session.agent_config_dir` entry, then `CLAUDE_CONFIG_DIR` from the session's environment, then from AoE's own, then `~`; a recorded store outranks the entry because a conversation resumes in the store it was captured in, see [Native Session Resume](session-resume.md#swapping-the-engine-on-a-restart). The dashboard and `aoe mcp list` resolve per agent rather than per conversation, so they read the entry without that first tier.
 - **`<app_dir>/profiles/<name>/mcp.json`** adds to or overrides the global file for sessions under that profile. A missing file is normal.
 - **Project-local `.mcp.json`** at the repository root is highest, but only after you trust the repo (see below).
 

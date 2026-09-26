@@ -176,7 +176,7 @@ claude-personal = "claude"
 claude-personal = "~/.claude-personal"
 ```
 
-The value is a host path. Host sessions use the directory itself; each sandboxed session gets a private `sandbox-v2/<instance-id>` child mounted at the agent's canonical container config path, so do not mount that tree through `sandbox.extra_volumes` and keep the config-dir variables AoE sets inside the container.
+The value is a host path. Host sessions use the directory itself; each sandboxed session gets a private `sandbox-v2/<instance-id>` child mounted at the agent's canonical container config path, so do not mount that tree through `sandbox.extra_volumes` and keep the config-dir variables AoE sets inside the container. A host Claude conversation that already recorded its store keeps resuming there, so repointing an entry moves new sessions only and the launch logs a warning naming both stores; see [Native Session Resume](session-resume.md#swapping-the-engine-on-a-restart) for the account swap that carries a conversation across.
 
 ### Status rules for custom agents
 
