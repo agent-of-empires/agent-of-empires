@@ -212,10 +212,10 @@ fn shared_account_roots_carry_the_selected_external_store() {
             agent: "claude".into(),
             stores: vec![source],
             configuration: vec![],
-            exported_default_store: false,
             cwd: project,
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         }),
     });
     let swap = classify(&instance, &profile, "b");
@@ -232,11 +232,25 @@ fn shared_account_roots_carry_the_selected_external_store() {
     assert_eq!(
         instance
             .agent_session_binding
+            .as_ref()
             .unwrap()
             .execution
+            .as_ref()
             .unwrap()
             .stores,
         vec![destination.canonicalize().unwrap()],
+    );
+    assert_eq!(
+        instance
+            .agent_session_binding
+            .as_ref()
+            .unwrap()
+            .execution
+            .as_ref()
+            .unwrap()
+            .exported_default_store,
+        None,
+        "a carry must not decide store export; only an attested launch may",
     );
 }
 
@@ -303,10 +317,10 @@ fn carry_preserves_known_conversation_already_in_destination() {
             agent: "claude".into(),
             stores: vec![destination.clone()],
             configuration: vec![],
-            exported_default_store: false,
             cwd: project,
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         }),
     });
     let ToolSwap::KeepConversation(Some(carry)) = classify(&instance, &profile, "b") else {
@@ -363,10 +377,10 @@ fn carry_refuses_unproven_destination_before_writing() {
             agent: "claude".into(),
             stores: vec![source],
             configuration: vec![],
-            exported_default_store: false,
             cwd: project,
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         }),
     });
     let mut violations = Vec::new();
@@ -388,6 +402,101 @@ fn carry_refuses_unproven_destination_before_writing() {
         violations.is_empty(),
         "unproven destinations accepted or written: {violations:?}"
     );
+}
+
+/// The marker records what a launch observed, not what the configuration
+/// derives. A same-store carry moves no transcript, so it must leave the
+/// marker exactly as it found it: an attested `Some(true)` survives, and a
+/// binding with no observation stays unobserved until the launch that follows
+/// stamps it.
+#[cfg(test)]
+#[test]
+#[serial_test::serial]
+fn same_store_carry_leaves_the_route_marker_to_the_launch() {
+    let _app = crate::session::test_support::isolate_app_dir();
+    let stub = tempfile::tempdir().unwrap();
+    let _claude = crate::session::test_support::install_login_shell_path_command(
+        stub.path(),
+        "claude",
+        "#!/bin/sh\nexit 1\n",
+    );
+    let home = dirs::home_dir().unwrap();
+    let app = crate::session::get_app_dir().unwrap();
+    std::fs::create_dir_all(&app).unwrap();
+    let store = home.join(".claude");
+    std::fs::create_dir_all(&store).unwrap();
+    // Both accounts declare a symlink to the built-in store, so the attested
+    // launch exports `CLAUDE_CONFIG_DIR` for a directory Claude opens anyway.
+    std::os::unix::fs::symlink(&store, home.join("claude-link")).unwrap();
+    std::fs::write(
+        app.join("config.toml"),
+        "[session.agent_detect_as]\na = \"claude\"\nb = \"claude\"\n\
+         [session.agent_config_dir]\na = \"~/claude-link\"\nb = \"~/claude-link\"\n",
+    )
+    .unwrap();
+    let profile = crate::session::config::effective_profile("");
+    let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+    crate::session::config::profile_config::resolve_config_or_warn(&profile);
+    let project = home.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let sid = "11111111-2222-3333-4444-555555555555";
+    let binding = |exported_default_store: Option<bool>| crate::session::ConversationBinding {
+        session_id: sid.into(),
+        provenance: crate::session::ConversationProvenance::Asserted,
+        transcript_path: None,
+        execution: Some(crate::session::ExecutionBinding {
+            agent: "claude".into(),
+            stores: vec![store.clone()],
+            configuration: vec![],
+            cwd: project.clone(),
+            cwd_filesystem: "host".into(),
+            filesystem: "host".into(),
+            exported_default_store,
+        }),
+    };
+    let instance = |exported_default_store: Option<bool>| {
+        let mut instance = Instance::new("carry", project.to_str().unwrap());
+        instance.source_profile = profile.clone();
+        instance.tool = "a".into();
+        instance.command = "claude".into();
+        instance.detect_as = "claude".into();
+        instance.agent_session_id = Some(sid.into());
+        instance.agent_session_binding = Some(binding(exported_default_store));
+        instance
+    };
+    let marker = |instance: &Instance| {
+        instance
+            .agent_session_binding
+            .as_ref()
+            .unwrap()
+            .execution
+            .as_ref()
+            .unwrap()
+            .exported_default_store
+    };
+    for start in [Some(true), Some(false), None] {
+        let mut instance = instance(start);
+        let ToolSwap::KeepConversation(Some(carry)) = classify(&instance, &profile, "b") else {
+            panic!("a known conversation still requires a route decision");
+        };
+        assert_eq!(carry.source_root, carry.target_root);
+        instance.swap_account("b");
+
+        assert!(!carry.run_for(&mut instance).unwrap());
+
+        assert_eq!(
+            marker(&instance),
+            start,
+            "a carry must not write a marker no launch observed"
+        );
+        if start == Some(true) {
+            let pin = instance.selected_claude_store_pin().unwrap();
+            assert!(crate::session::capture::exports_claude_store(
+                &pin,
+                Some(&home)
+            ));
+        }
+    }
 }
 
 impl ConversationCarry {
@@ -475,6 +584,9 @@ impl ConversationCarry {
             let source_root = execution.stores[0].canonicalize()?;
             let target_root = destination.stores[0].clone();
             if source_root == target_root {
+                // Nothing moves, and the marker is not ours to write: the
+                // route is only observed by a launch, which stamps it from
+                // the store it really routed to.
                 continue;
             }
             std::fs::create_dir_all(&target_root)?;

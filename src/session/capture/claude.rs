@@ -43,29 +43,65 @@ pub(crate) fn claude_home_for_host_environment(
     }
 }
 
-/// Whether `store` is Claude's built-in `<home>/.claude`. Exporting
-/// `CLAUDE_CONFIG_DIR` for it is not a no-op: Claude then reads its global
-/// config from `<home>/.claude/.claude.json` instead of `<home>/.claude.json`.
-pub(crate) fn is_default_claude_store(store: &Path, home: &Path) -> bool {
-    let identity = |path: &Path| {
-        super::canonicalize_allowing_missing_leaf(path).unwrap_or_else(|| path.to_path_buf())
-    };
-    identity(store) == identity(&home.join(".claude"))
+/// The identity a store path is compared by: symlinks resolved, a missing
+/// leaf compared lexically.
+fn claude_store_identity(path: &Path) -> PathBuf {
+    super::canonicalize_allowing_missing_leaf(path).unwrap_or_else(|| path.to_path_buf())
 }
 
-/// The store a host Claude worker is pinned to by its selected conversation.
+/// Whether `store` is Claude's built-in `<home>/.claude` store.
+pub(crate) fn is_default_claude_store(store: &Path, home: &Path) -> bool {
+    claude_store_identity(store) == claude_store_identity(&home.join(".claude"))
+}
+
+/// Whether the default store at `store` was *named* rather than left implicit
+/// (#4127), which is the only case that must keep exporting
+/// `CLAUDE_CONFIG_DIR`: Claude reads `$CLAUDE_CONFIG_DIR/.claude.json`
+/// whenever the variable is set, so an implicit default has to stay unset.
+///
+/// Both ways of naming it count, and the callers differ in which they observe:
+/// a launch routes from the declared `session.agent_config_dir` and the ambient
+/// `CLAUDE_CONFIG_DIR`, while a legacy binding is re-derived at read time from
+/// the same two sources. A declaration naming the built-in store outright
+/// (`<home>/.claude` itself) is not a name of it, only an alias of it is.
+pub(crate) fn is_explicit_claude_store_route(
+    store: &Path,
+    home: &Path,
+    declared: Option<&Path>,
+    ambient: Option<&Path>,
+) -> bool {
+    if !is_default_claude_store(store, home) {
+        return false;
+    }
+    let aliases_default = declared.is_some_and(|declared| {
+        is_default_claude_store(declared, home)
+            && crate::git::template::lexical_normalize(declared)
+                != crate::git::template::lexical_normalize(&home.join(".claude"))
+    });
+    aliases_default
+        || ambient
+            .is_some_and(|ambient| claude_store_identity(ambient) == claude_store_identity(store))
+}
+
+/// Whether the effective route for `pin` exports `CLAUDE_CONFIG_DIR` at `home`.
+pub(crate) fn exports_claude_store(pin: &ClaudeStorePin, home: Option<&Path>) -> bool {
+    !home.is_some_and(|home| {
+        is_default_claude_store(&pin.store, home) && pin.exported_default_store != Some(true)
+    })
+}
+
+/// The store and export provenance pinned by a conversation binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeStorePin {
     pub store: PathBuf,
-    /// The conversation's launch exported `CLAUDE_CONFIG_DIR` even for the default store.
-    pub explicit: bool,
+    pub exported_default_store: Option<bool>,
 }
 
 impl ClaudeStorePin {
     pub(crate) fn of(execution: &crate::session::ExecutionBinding) -> Option<Self> {
         Some(Self {
             store: execution.stores.first()?.clone(),
-            explicit: execution.exported_default_store,
+            exported_default_store: execution.exported_default_store,
         })
     }
 }

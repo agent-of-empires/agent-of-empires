@@ -390,7 +390,7 @@ impl<S: BroadcastSink> Drain<S> {
             return None;
         }
 
-        self.refresh_launch_env(&mut config).await;
+        Self::refresh_launch_env(&self.session_id, &mut config).await;
         if let Some((wrapper, base)) = &config.wrapper_substitution {
             log_wrapper_substitution(session_id, &config.tool, wrapper, base);
         }
@@ -480,8 +480,7 @@ impl<S: BroadcastSink> Drain<S> {
 
     /// Re-resolve what may have changed since the first launch: model pins,
     /// host hook env, and MCP servers.
-    async fn refresh_launch_env(&self, config: &mut SpawnConfig) {
-        let session_id = &self.session_id;
+    async fn refresh_launch_env(session_id: &str, config: &mut SpawnConfig) {
         let agent = config.agent_key.clone();
         let profile = config.source_profile.clone().unwrap_or_default();
         let cwd = config.cwd.clone();
@@ -502,11 +501,9 @@ impl<S: BroadcastSink> Drain<S> {
             ),
         }
 
-        let mut claude_config_dir = config
-            .claude_store_pin
-            .as_ref()
-            .map(|pin| pin.store.clone());
+        let mut claude_config_dir = None;
         if config.sandbox_info.is_none() {
+            let mut host_environment = config.base_host_environment.clone();
             let minted = before_session_env(
                 session_id,
                 &config.tool,
@@ -514,26 +511,30 @@ impl<S: BroadcastSink> Drain<S> {
                 config.cwd.clone(),
             )
             .await;
-            let error = match minted {
-                Ok(Ok(pairs)) => {
-                    overlay_env(&mut config.host_environment, pairs);
-                    None
+            match minted {
+                Ok(Ok(pairs)) => overlay_env(&mut host_environment, pairs),
+                Ok(Err(e)) => {
+                    host_environment = config.host_environment.clone();
+                    warn!(
+                        target: "acp.supervisor",
+                        session = %session_id,
+                        error = %e,
+                        "before_session hook failed on respawn; reusing the last known environment"
+                    )
                 }
-                Ok(Err(e)) => Some(("before_session hook failed", e.to_string())),
-                Err(e) => Some(("before_session hook task failed", e.to_string())),
-            };
-            if let Some((what, error)) = error {
-                warn!(
-                    target: "acp.supervisor",
-                    session = %session_id,
-                    error = %error,
-                    "{what} on respawn; reusing the environment from the prior launch"
-                );
+                Err(e) => {
+                    host_environment = config.host_environment.clone();
+                    warn!(
+                        target: "acp.supervisor",
+                        session = %session_id,
+                        error = %e,
+                        "before_session hook task failed on respawn; reusing the last known environment"
+                    )
+                }
             }
-            claude_config_dir = apply_claude_store_pin(
-                &mut config.host_environment,
-                config.claude_store_pin.as_ref(),
-            );
+            claude_config_dir =
+                apply_claude_store_pin(&mut host_environment, config.claude_store_pin.as_ref());
+            config.host_environment = host_environment;
         }
 
         config.mcp_servers = resolve_mcp_servers(
@@ -1120,6 +1121,66 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn respawn_drops_a_withdrawn_hook_route_and_realigns_native_mcp() {
+        use agent_client_protocol::schema::v1::McpServer;
+
+        let (_home, temp) = isolate_home();
+        let hook_store = temp.path().join("hook-store");
+        std::fs::create_dir_all(&hook_store).unwrap();
+        std::fs::write(
+            hook_store.join(".claude.json"),
+            r#"{ "mcpServers": { "stale": { "command": "stale" } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join(".claude.json"),
+            r#"{ "mcpServers": { "home": { "command": "home" } } }"#,
+        )
+        .unwrap();
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let hook_flag = temp.path().join("provide-route");
+        std::fs::write(
+            app_dir.join("config.toml"),
+            format!(
+                "[host_hooks]\nbefore_session = \"if [ -e {flag} ]; then printf 'CLAUDE_CONFIG_DIR={store}\\n'; fi\"\n",
+                flag = hook_flag.display(),
+                store = hook_store.display(),
+            ),
+        )
+        .unwrap();
+
+        let mut config = runner_config(worker_registry::socket_path_for("s-withdraw").unwrap());
+        config.base_host_environment = vec![("HOME".into(), temp.path().display().to_string())];
+        config.host_environment = vec![
+            ("HOME".into(), temp.path().display().to_string()),
+            ("CLAUDE_CONFIG_DIR".into(), hook_store.display().to_string()),
+        ];
+        config.claude_store_pin = Some(crate::session::capture::ClaudeStorePin {
+            store: temp.path().join(".claude"),
+            exported_default_store: Some(false),
+        });
+
+        Drain::<VecSink>::refresh_launch_env("s-withdraw", &mut config).await;
+        assert!(!config
+            .host_environment
+            .iter()
+            .any(|(key, _)| key == "CLAUDE_CONFIG_DIR"));
+        let names: Vec<_> = config
+            .mcp_servers
+            .iter()
+            .map(|server| match server {
+                McpServer::Stdio(server) => server.name.as_str(),
+                McpServer::Http(server) => server.name.as_str(),
+                McpServer::Sse(server) => server.name.as_str(),
+                _ => "unknown",
+            })
+            .collect();
+        assert_eq!(names, ["home"]);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn respawn_reapplies_selected_claude_store_before_native_mcp_discovery() {
         use agent_client_protocol::schema::v1::McpServer;
 
@@ -1178,9 +1239,10 @@ mod tests {
         let mut config = runner_config(socket);
         config.claude_store_pin = Some(crate::session::capture::ClaudeStorePin {
             store: selected.clone(),
-            explicit: false,
+            exported_default_store: None,
         });
         config.host_environment = vec![("CLAUDE_CONFIG_DIR".into(), "stale".into())];
+        config.base_host_environment = vec![("HOME".into(), temp.path().display().to_string())];
         let lease = sup
             .test_install_runner(
                 "s-store",

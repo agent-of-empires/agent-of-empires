@@ -297,10 +297,10 @@ mod tests {
             agent: "pi".into(),
             stores: vec![canonical_root.join("store")],
             configuration: Vec::new(),
-            exported_default_store: false,
             cwd: canonical_root.clone(),
             cwd_filesystem: "host".into(),
             filesystem: "host".into(),
+            exported_default_store: None,
         };
         let active = crate::session::instance::ActiveExecution {
             launch_id: launch.into(),

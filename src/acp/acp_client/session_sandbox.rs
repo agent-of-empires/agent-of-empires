@@ -155,14 +155,24 @@ pub(super) fn build_sandbox_docker_argv(
         .iter()
         .filter(|&(key, _)| request_env_denyreason(key).is_none())
         .cloned();
-    let adapter_allowlist = allowlisted_env_pairs(config)
-        .into_iter()
-        .filter(|(key, _)| !is_host_only_path_env(key));
+    let adapter_allowlist = allowlisted_env_pairs(config);
     for (key, value) in request_auth.chain(adapter_allowlist) {
-        if seen_keys.insert(key.clone()) {
-            docker_args.push("-e".into());
-            docker_args.push(key.clone());
-            inherit_env.push((key, value));
+        if forwards_into_container(&key) {
+            if seen_keys.insert(key.clone()) {
+                docker_args.push("-e".into());
+                docker_args.push(key.clone());
+                inherit_env.push((key, value));
+            }
+        } else if seen_keys.insert(key.clone()) {
+            // Only a key the sandbox env did not already claim is really
+            // dropped: one `docker_env_args` inlined keeps its value in argv,
+            // so logging here would cry over a variable that crossed.
+            tracing::warn!(
+                target: "acp",
+                key = %key,
+                reason = "names a host path and nothing inside the container",
+                "dropping host-only path variable from a sandboxed launch"
+            );
         }
     }
 
@@ -177,6 +187,13 @@ pub(super) fn build_sandbox_docker_argv(
         docker_args,
         inherit_env,
     })
+}
+
+/// A path-valued key names nothing inside the container, so a sandboxed launch
+/// drops it. `docs/structured-view.md` documents the drop; the caller names the
+/// key and the reason in the log, at the point the value is actually lost.
+fn forwards_into_container(key: &str) -> bool {
+    !is_host_only_path_env(key)
 }
 
 /// The `cwd` for `session/new` / `session/load` / `session/fork`. A sandboxed
@@ -408,5 +425,52 @@ mod tests {
         );
         // Never as `-e KEY=VALUE`, which would leak the secret into argv.
         assert_named_without_value(&argv, "ANTHROPIC_API_KEY", "sk-session-request");
+    }
+    #[test]
+    fn build_sandbox_docker_argv_rejects_host_only_provider_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = sandbox("aoe-sandbox-provider-host-only", None);
+        let mut config = sandbox_config(tmp.path(), &info);
+        config.provider_env = vec![
+            ("CODEX_HOME".into(), "/host/codex".into()),
+            ("AWS_CONFIG_FILE".into(), "/host/aws".into()),
+            ("ANTHROPIC_API_KEY".into(), "sk-request".into()),
+        ];
+
+        let argv = build_sandbox_docker_argv(&config, &info, "/workspace/proj").unwrap();
+
+        assert_absent(&argv, "CODEX_HOME");
+        assert_absent(&argv, "AWS_CONFIG_FILE");
+        assert_named_without_value(&argv, "ANTHROPIC_API_KEY", "sk-request");
+    }
+
+    /// A host-only key the sandbox env already inlined keeps its value in argv;
+    /// only the adapter allowlist declined to re-send it. Logging at the filter
+    /// cried over a variable that did cross, hiding the genuinely dropped ones.
+    #[test]
+    #[serial_test::serial]
+    fn host_only_key_inlined_by_sandbox_env_logs_nothing() {
+        let _env =
+            crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", "/host/claude")]);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut info = sandbox("aoe-sandbox-inlined-host-only", None);
+        info.extra_env = Some(vec!["CLAUDE_CONFIG_DIR=/host/claude".into()]);
+        let mut config = sandbox_config(tmp.path(), &info);
+        config.spec.env_allowlist = Some(vec!["CLAUDE_CONFIG_DIR".into()]);
+
+        let logs = crate::session::test_support::LogCapture::start();
+        let argv = build_sandbox_docker_argv(&config, &info, "/workspace/proj").unwrap();
+
+        assert!(
+            argv.docker_args
+                .iter()
+                .any(|a| a == "CLAUDE_CONFIG_DIR=/host/claude"),
+            "the inlined value must stay in argv, got {:?}",
+            argv.docker_args
+        );
+        assert!(
+            !logs.contents().contains("dropping host-only path variable"),
+            "a key that crossed must not be reported as dropped"
+        );
     }
 }
