@@ -856,36 +856,6 @@ fn fork_seed_and_structured_fork_guard_agree_per_agent() {
 }
 
 #[test]
-fn fork_denial_message_distinguishes_every_refusal_state() {
-    assert_eq!(
-        fork_denial_message(&crate::session::ForkDenied::AgentCannotFork),
-        "This agent has no native fork capability. Forkable agents: claude, codex, opencode."
-    );
-    assert_eq!(
-        fork_denial_message(&crate::session::ForkDenied::NoParentSession),
-        "This session has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id."
-    );
-    assert_eq!(
-        fork_denial_message(&crate::session::ForkDenied::UnqualifiedParent {
-            provenance: Some(crate::session::ConversationProvenance::Unknown),
-        }),
-        crate::session::fork::UNQUALIFIED_PARENT
-    );
-    // A pre-pinned id has no conversation to qualify, so the pin cannot be the remedy.
-    assert_eq!(
-        fork_denial_message(&crate::session::ForkDenied::UnqualifiedParent {
-            provenance: Some(crate::session::ConversationProvenance::Preallocated),
-        }),
-        "This session has no captured conversation to fork from. Send it at least one message first."
-    );
-    // A binding-less id can be neither qualified nor cleared, so it gets its own text.
-    assert_eq!(
-        fork_denial_message(&crate::session::ForkDenied::UnqualifiedParent { provenance: None }),
-        crate::session::fork::UNBOUND_PARENT
-    );
-}
-
-#[test]
 fn fork_from_an_unqualified_parent_is_refused_as_unqualified() {
     let mut parent = crate::session::Instance::new("parent", "/tmp");
     parent.agent_session_id = Some("parent-uuid".into());
@@ -913,31 +883,47 @@ fn fork_from_a_parent_with_no_binding_is_refused_without_provenance() {
     );
 }
 
-/// Two rows can record one conversation id. The qualified one decides the
-/// fork, whatever order `Storage::load()` returned the rows in.
+/// A pinned row carries the id it was pinned to, so the fork resolves on the
+/// conversation the row names, not the one `agent_session_id` still holds.
 #[test]
-fn fork_from_prefers_the_qualified_row_over_an_unqualified_one() {
-    let qualified = qualified_parent_binding();
-    let mut attested = crate::session::Instance::new("attested", "/tmp");
-    attested.agent_session_id = Some("parent-uuid".into());
-    attested.agent_session_binding = Some(qualified.clone());
-    let mut legacy = crate::session::Instance::new("legacy", "/tmp");
-    legacy.agent_session_id = Some("parent-uuid".into());
-    legacy.agent_session_binding =
-        Some(crate::session::ConversationBinding::unknown("parent-uuid"));
+fn fork_from_resolves_the_conversation_the_parent_carries() {
+    let carried = qualified_parent_binding();
+    let mut parent = crate::session::Instance::new("parent", "/tmp");
+    parent.agent_session_id = Some("pre-pin-uuid".into());
+    parent.resume_intent = crate::session::ResumeIntent::Use("parent-uuid".into());
+    parent.resume_binding = Some(carried.clone());
 
-    for parents in [
-        vec![legacy.clone(), attested.clone()],
-        vec![attested, legacy],
-    ] {
-        match resolve_create_fork_seed("parent-uuid", false, &parents)
-            .expect("the qualified row decides the fork")
-        {
-            crate::session::ForkSeed::Terminal { parent, .. } => {
-                assert_eq!(*parent, qualified)
-            }
-            crate::session::ForkSeed::Structured { .. } => panic!("expected Terminal seed"),
-        }
+    match resolve_create_fork_seed("parent-uuid", false, &[parent.clone()])
+        .expect("the pinned conversation is the one to fork")
+    {
+        crate::session::ForkSeed::Terminal { parent: seeded, .. } => assert_eq!(*seeded, carried),
+        crate::session::ForkSeed::Structured { .. } => panic!("expected Terminal seed"),
+    }
+    // The superseded id names no conversation the row carries, so it resolves
+    // nothing rather than a fork of the pinned one.
+    assert_eq!(
+        resolve_create_fork_seed("pre-pin-uuid", false, &[parent]),
+        Err(crate::session::ForkDenied::NoParentSession)
+    );
+}
+
+/// When every row carrying the id is unqualified, the refusal names the state
+/// the rows can still prove, whichever order the load returned them in.
+#[test]
+fn fork_from_unqualified_rows_is_refused_the_same_way_in_either_order() {
+    let mut bare = crate::session::Instance::new("bare", "/tmp");
+    bare.agent_session_id = Some("parent-uuid".into());
+    let mut stale = crate::session::Instance::new("stale", "/tmp");
+    stale.agent_session_id = Some("parent-uuid".into());
+    stale.agent_session_binding = Some(crate::session::ConversationBinding::unknown("parent-uuid"));
+
+    for parents in [vec![bare.clone(), stale.clone()], vec![stale, bare]] {
+        assert_eq!(
+            resolve_create_fork_seed("parent-uuid", false, &parents),
+            Err(crate::session::ForkDenied::UnqualifiedParent {
+                provenance: Some(crate::session::ConversationProvenance::Unknown)
+            })
+        );
     }
 }
 

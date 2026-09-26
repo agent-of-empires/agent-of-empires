@@ -1103,11 +1103,11 @@ impl Instance {
 }
 
 impl Instance {
-    /// The conversation an explicit fork would carry. A recorded id with no
-    /// binding at all, which a degraded launch leaves behind, is `Recorded`:
-    /// an unqualified recorded conversation, not nothing to fork, and not a
-    /// binding either, so nothing is invented for it.
-    pub(crate) fn fork_parent_binding(&self) -> Option<ForkParentRef<'_>> {
+    /// The conversation an explicit fork would carry, with the evidence for it:
+    /// `Bound` when a binding qualifies the recorded id, `Recorded` when the id
+    /// stands alone, so an unqualified parent reaches `terminal_fork_seed` and is
+    /// refused as such rather than as a session with no conversation.
+    pub(crate) fn fork_parent_ref(&self) -> Option<ForkParentRef<'_>> {
         let (sid, binding) = match &self.resume_intent {
             ResumeIntent::Fork { .. } => return None,
             ResumeIntent::Use(sid) => (Some(sid), self.resume_binding.as_ref()),
@@ -2592,14 +2592,14 @@ mod tests {
     /// A recorded id must reach `terminal_fork_seed` even unqualified, so the
     /// fork can say which state it is in instead of claiming nothing to fork.
     #[test]
-    fn fork_parent_binding_keeps_a_recorded_but_unqualified_conversation() {
+    fn fork_parent_ref_keeps_a_recorded_but_unqualified_conversation() {
         let mut instance = Instance::new("parent", "/tmp");
         instance.agent_session_id = Some("legacy-uuid".into());
         instance.agent_session_binding = Some(ConversationBinding::unknown("legacy-uuid"));
 
         assert_eq!(
             crate::session::fork::terminal_fork_seed(
-                instance.fork_parent_binding(),
+                instance.fork_parent_ref(),
                 "child-uuid".into()
             ),
             Err(crate::session::ForkDenied::UnqualifiedParent {
@@ -2612,19 +2612,19 @@ mod tests {
     /// still name that conversation, and must not read a provenance off a
     /// binding that no longer exists.
     #[test]
-    fn fork_parent_binding_reports_a_dropped_binding_for_a_recorded_id() {
+    fn fork_parent_ref_reports_a_dropped_binding_for_a_recorded_id() {
         let mut instance = Instance::new("parent", "/tmp");
         instance.agent_session_id = Some("legacy-uuid".into());
         instance.agent_session_binding = None;
 
         assert_eq!(
             crate::session::fork::terminal_fork_seed(
-                instance.fork_parent_binding(),
+                instance.fork_parent_ref(),
                 "child-uuid".into()
             ),
             Err(crate::session::ForkDenied::UnqualifiedParent { provenance: None })
         );
         instance.agent_session_id = None;
-        assert!(instance.fork_parent_binding().is_none());
+        assert!(instance.fork_parent_ref().is_none());
     }
 }

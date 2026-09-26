@@ -133,53 +133,52 @@ pub(super) fn resolve_create_fork_seed(
             parent_acp_session_id: parent_id.to_string(),
         });
     }
-    let candidates: Vec<crate::session::ForkParentRef<'_>> = parents
+    // The candidate is the conversation the row carries, which for a pinned row
+    // is the pinned id, not the one `agent_session_id` still names, so the id is
+    // read off the candidate. Lazy: a row carrying another id is dropped without
+    // materialising anything.
+    let candidates = parents
         .iter()
-        .filter(|parent| parent.agent_session_id.as_deref() == Some(parent_id))
-        .filter_map(|parent| parent.fork_parent_binding())
-        .collect();
-    if candidates.is_empty() {
+        .filter_map(|parent| parent.fork_parent_ref())
+        .filter(|candidate| candidate.session_id() == parent_id);
+    // A qualified row wins over an unqualified one carrying the same id, so the
+    // outcome does not depend on the order `Storage::load()` returned the rows
+    // in, and the ambiguity scan stays a qualified-row question.
+    let mut first = None;
+    let mut bound = None;
+    let mut chosen = None;
+    let mut ambiguous = false;
+    for candidate in candidates {
+        if first.is_none() {
+            first = Some(candidate);
+        }
+        if bound.is_none() && candidate.binding().is_some() {
+            bound = Some(candidate);
+        }
+        if !candidate.is_known() {
+            continue;
+        }
+        let Some(previous) = chosen else {
+            chosen = Some(candidate);
+            continue;
+        };
+        if candidate.binding().and_then(|binding| binding.key())
+            != previous.binding().and_then(|binding| binding.key())
+        {
+            ambiguous = true;
+        }
+    }
+    if ambiguous {
         return Err(crate::session::ForkDenied::NoParentSession);
     }
-    // A qualified row wins over an unqualified one holding the same id, so a
-    // fork that resolved resolves whatever order the rows loaded in; the
-    // ambiguity scan stays a qualified-row question.
-    let qualified = candidates.iter().position(|candidate| candidate.is_known());
-    if let Some(index) = qualified {
-        let chosen = candidates[index]
-            .binding()
-            .and_then(|binding| binding.key());
-        if candidates[index + 1..].iter().any(|candidate| {
-            candidate.is_known() && candidate.binding().and_then(|binding| binding.key()) != chosen
-        }) {
-            return Err(crate::session::ForkDenied::NoParentSession);
-        }
-    }
-    // An unqualified row is only selected so the refusal can name its state.
+    let parent = chosen
+        .or(bound)
+        .or(first)
+        .ok_or(crate::session::ForkDenied::NoParentSession)?;
     crate::session::fork::terminal_fork_seed(
-        Some(candidates[qualified.unwrap_or(0)]),
+        Some(parent),
         crate::session::capture::generate_session_uuid(),
     )
-}
-
-/// User-facing text for each refusal state, so an unqualified parent does not
-/// read as an unforkable agent.
-pub(super) fn fork_denial_message(denied: &crate::session::ForkDenied) -> &'static str {
-    match denied {
-        crate::session::ForkDenied::AgentCannotFork => {
-            "This agent has no native fork capability. Forkable agents: claude, codex, opencode."
-        }
-        crate::session::ForkDenied::NoParentSession => {
-            "This session has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id."
-        }
-        crate::session::ForkDenied::UnqualifiedParent { provenance } => match provenance {
-            Some(crate::session::ConversationProvenance::Preallocated) => {
-                "This session has no captured conversation to fork from. Send it at least one message first."
-            }
-            Some(_) => crate::session::fork::UNQUALIFIED_PARENT,
-            None => crate::session::fork::UNBOUND_PARENT,
-        },
-    }
 }
 
 /// True when a create asks to both import and fork. The two seed from
@@ -885,7 +884,7 @@ pub async fn create_session(
                     return api_error(
                         StatusCode::BAD_REQUEST,
                         "fork_unsupported",
-                        fork_denial_message(&denied),
+                        denied.user_message(),
                     );
                 }
             }

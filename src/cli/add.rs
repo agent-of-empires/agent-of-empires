@@ -289,55 +289,34 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         if !user_chose_tool {
             resolved_tool = source.tool.clone();
         }
-        let parent_binding = source.fork_parent_binding();
-        let parent_agent = parent_binding
-            .and_then(crate::session::ForkParentRef::binding)
-            .and_then(|binding| binding.execution.as_ref())
-            .map(|execution| execution.agent.clone())
-            .unwrap_or_else(|| source.tool.clone());
-        let recorded = parent_binding.map(|parent| parent.session_id());
+        let parent_ref = source.fork_parent_ref();
+        let recorded = parent_ref.map(|parent| parent.session_id());
         let seed = crate::session::fork::terminal_fork_seed(
-            parent_binding,
+            parent_ref,
             crate::session::capture::generate_session_uuid(),
         )
         .map_err(|denied| {
-            // A pre-pinned id is refused like a parent with no session at all, so both
-            // refusals share one message. Built per arm: the fork-capable refusal
-            // discards it.
-            let no_parent_session = || {
-                format!(
-                    "Nothing to fork: session '{}' has no captured agent session yet. Start a conversation in it first.",
-                    source.title
-                )
-            };
+            // The refusal sentence is the shared one, except where the CLI holds
+            // something it cannot: the parent's title, and the exact arguments of
+            // the pin the remedy names.
             let message = match denied {
-                crate::session::ForkDenied::AgentCannotFork => format!(
-                    "Agent '{}' does not support forking. Forkable agents: claude, codex, opencode.",
-                    parent_agent
+                crate::session::ForkDenied::UnqualifiedParent {
+                    provenance: Some(_),
+                } => {
+                    let recorded = recorded.expect("a bound parent records an id");
+                    format!(
+                        "Nothing to fork: session '{}' records conversation '{}' but it was never qualified against a native agent; run `aoe session set-session-id {} {}` to qualify it.",
+                        source.title,
+                        recorded,
+                        shell_words::quote(&source.title),
+                        shell_words::quote(recorded)
+                    )
+                }
+                other => format!(
+                    "Nothing to fork: session '{}'. {}",
+                    source.title,
+                    other.user_message()
                 ),
-                crate::session::ForkDenied::NoParentSession => no_parent_session(),
-                crate::session::ForkDenied::UnqualifiedParent { provenance } => match provenance {
-                    Some(crate::session::ConversationProvenance::Preallocated) => no_parent_session(),
-                    // Both arms read the id off the parent, which a recorded
-                    // conversation always has.
-                    Some(_) => {
-                        let recorded = recorded.expect("a bound provenance has a bound parent");
-                        format!(
-                            "Nothing to fork: session '{}' records conversation '{}' but it was never qualified against a native agent; run `aoe session set-session-id {} {}` to qualify it.",
-                            source.title,
-                            recorded,
-                            shell_words::quote(&source.title),
-                            shell_words::quote(recorded)
-                        )
-                    }
-                    None => {
-                        let recorded = recorded.expect("an unqualified parent still records an id");
-                        format!(
-                            "Nothing to fork: session '{}' records conversation '{}' but no binding qualifies it: the id was pinned before the session ever ran, or its binding was lost at a degraded launch.",
-                            source.title, recorded
-                        )
-                    }
-                },
             };
             anyhow::Error::msg(message)
         })?;

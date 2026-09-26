@@ -2863,7 +2863,7 @@ impl HomeView {
         if inst.is_structured() {
             crate::session::fork::structured_fork_capable(&inst.tool, inst.agent_name.as_deref())
         } else {
-            inst.fork_parent_binding().is_some_and(|parent| {
+            inst.fork_parent_ref().is_some_and(|parent| {
                 parent
                     .binding()
                     .and_then(|binding| binding.execution.as_ref())
@@ -3025,7 +3025,7 @@ impl HomeView {
             return;
         };
         let tool = parent.tool.clone();
-        let parent_binding = parent.fork_parent_binding();
+        let parent_ref = parent.fork_parent_ref();
         let repo_path = if parent.is_structured() {
             parent.repo_path().to_string()
         } else {
@@ -3064,36 +3064,17 @@ impl HomeView {
             }
         } else {
             let child_id = crate::session::capture::generate_session_uuid();
-            match crate::session::fork::terminal_fork_seed(parent_binding, child_id) {
+            match crate::session::fork::terminal_fork_seed(parent_ref, child_id) {
                 Ok(s) => s,
-                Err(crate::session::ForkDenied::AgentCannotFork) => {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Fork not supported",
-                        &format!(
-                            "The '{}' agent cannot fork a session. Fork is available for Claude, Codex, and OpenCode.",
-                            tool
-                        ),
-                    ));
-                    return;
-                }
-                Err(crate::session::ForkDenied::NoParentSession) => {
-                    self.info_dialog = Some(no_captured_conversation_dialog());
-                    return;
-                }
-                Err(crate::session::ForkDenied::UnqualifiedParent { provenance }) => {
-                    self.info_dialog = Some(match provenance {
-                        Some(crate::session::ConversationProvenance::Preallocated) => {
-                            no_captured_conversation_dialog()
+                Err(denied) => {
+                    let title = match denied {
+                        crate::session::ForkDenied::AgentCannotFork => "Fork not supported",
+                        crate::session::ForkDenied::NoParentSession => "Nothing to fork yet",
+                        crate::session::ForkDenied::UnqualifiedParent { .. } => {
+                            "Conversation not qualified"
                         }
-                        Some(_) => InfoDialog::new(
-                            "Conversation not qualified",
-                            crate::session::fork::UNQUALIFIED_PARENT,
-                        ),
-                        None => InfoDialog::new(
-                            "Conversation not qualified",
-                            crate::session::fork::UNBOUND_PARENT,
-                        ),
-                    });
+                    };
+                    self.info_dialog = Some(InfoDialog::new(title, denied.user_message()));
                     return;
                 }
             }

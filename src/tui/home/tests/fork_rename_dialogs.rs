@@ -50,12 +50,11 @@ fn fork_from_selection_seeds_terminal_fork_and_inherits_parent_context() {
     assert_eq!(dialog.path_value(), "/tmp/repo-worktrees/feature");
 }
 
-/// A launch that pre-pins a child id still records the execution it resolved, so the Fork
-/// row shows before any conversation is captured and the action explains the refusal
-/// instead of offering a pin that cannot qualify a pre-pinned id.
+/// A launch that pre-pins a child id still records the execution it resolved,
+/// so the Fork row shows before any conversation is captured.
 #[test]
 #[serial]
-fn fork_from_selection_offers_a_preallocated_parent_and_explains_the_refusal() {
+fn fork_row_offers_a_preallocated_parent() {
     let mut env = create_test_env_empty();
     let mut inst = observed_fork_parent("claude");
     inst.agent_session_binding.as_mut().unwrap().provenance =
@@ -68,73 +67,70 @@ fn fork_from_selection_offers_a_preallocated_parent_and_explains_the_refusal() {
         env.view.session_can_fork(&id),
         "a preallocated parent records its launch execution, so the row must show"
     );
-
-    env.view.open_fork_from_selection();
-
-    assert!(
-        env.view.new_dialog.is_none(),
-        "an unqualified pre-pinned parent must not open a fork dialog"
-    );
-    let dialog = env.view.info_dialog.as_ref().expect("info dialog");
-    assert_eq!(
-        dialog.title(),
-        "Nothing to fork yet",
-        "a pre-pinned id has never started a conversation, so it must not be told to pin one"
-    );
-    assert_eq!(
-        dialog.message(),
-        "This session has no captured conversation to fork from. Send it at least one message first."
-    );
 }
 
-/// A recorded id whose binding was never qualified names a conversation AoE
-/// cannot prove, so the refusal must offer the recovery assertion instead of
-/// telling the user to send a message and start over.
+/// A recorded conversation AoE cannot fork is refused three ways, and each
+/// names the remedy its own state admits: a pre-pinned id has no conversation
+/// to qualify, a never-qualified one can be re-asserted, and a binding-less
+/// one names no conversation to assert.
 #[test]
 #[serial]
-fn fork_from_selection_reports_an_unqualified_recorded_conversation() {
-    let mut env = create_test_env_empty();
-    let mut inst = observed_fork_parent("claude");
-    inst.agent_session_binding = Some(crate::session::ConversationBinding::unknown(
-        "parent-1111-2222-3333-444444444444",
-    ));
-    let id = inst.id.clone();
-    env.view.add_instance(inst);
-    env.view.selected_session = Some(id);
+fn fork_from_selection_reports_why_the_conversation_cannot_be_forked() {
+    /// The three ways a recorded conversation fails to qualify.
+    enum Binding {
+        /// Recorded by a launch that pre-pinned the id, which never ran.
+        Preallocated,
+        /// A binding that never got qualified.
+        Unknown,
+        /// No binding at all.
+        Absent,
+    }
+    let cases = [
+        (
+            Binding::Preallocated,
+            "Conversation not qualified",
+            "This session has no captured conversation to fork from. Send it at least one message first.",
+        ),
+        (
+            Binding::Unknown,
+            "Conversation not qualified",
+            "This session records a conversation id, but it was never qualified against a native agent. Run 'aoe session set-session-id <session> <id>' on it to qualify it.",
+        ),
+        (
+            Binding::Absent,
+            "Conversation not qualified",
+            "This session records a conversation id that nothing qualifies: no record says which agent, store or directory it belongs to, so which conversation it names is unknown. Re-assert the id with 'aoe session set-session-id <session> <id>'.",
+        ),
+    ];
+    for (binding, title, message) in cases {
+        let mut env = create_test_env_empty();
+        let mut inst = observed_fork_parent("claude");
+        match binding {
+            Binding::Preallocated => {
+                inst.agent_session_binding.as_mut().unwrap().provenance =
+                    crate::session::ConversationProvenance::Preallocated;
+            }
+            Binding::Unknown => {
+                inst.agent_session_binding = Some(crate::session::ConversationBinding::unknown(
+                    "parent-1111-2222-3333-444444444444",
+                ));
+            }
+            Binding::Absent => inst.agent_session_binding = None,
+        }
+        let id = inst.id.clone();
+        env.view.add_instance(inst);
+        env.view.selected_session = Some(id);
 
-    env.view.open_fork_from_selection();
+        env.view.open_fork_from_selection();
 
-    assert!(
-        env.view.new_dialog.is_none(),
-        "an unqualified parent must not open a fork dialog"
-    );
-    let dialog = env.view.info_dialog.as_ref().expect("info dialog");
-    assert_eq!(dialog.title(), "Conversation not qualified");
-    assert_eq!(dialog.message(), crate::session::fork::UNQUALIFIED_PARENT);
-}
-
-/// A recorded id whose binding is gone names a conversation AoE can neither
-/// qualify nor clear, so the refusal must not prescribe the pin that fabricates
-/// the provenance the missing binding would have carried.
-#[test]
-#[serial]
-fn fork_from_selection_reports_a_recorded_conversation_with_no_binding() {
-    let mut env = create_test_env_empty();
-    let mut inst = observed_fork_parent("claude");
-    inst.agent_session_binding = None;
-    let id = inst.id.clone();
-    env.view.add_instance(inst);
-    env.view.selected_session = Some(id);
-
-    env.view.open_fork_from_selection();
-
-    assert!(
-        env.view.new_dialog.is_none(),
-        "a recorded id with no binding must not open a fork dialog"
-    );
-    let dialog = env.view.info_dialog.as_ref().expect("info dialog");
-    assert_eq!(dialog.title(), "Conversation not qualified");
-    assert_eq!(dialog.message(), crate::session::fork::UNBOUND_PARENT);
+        assert!(
+            env.view.new_dialog.is_none(),
+            "an unqualified parent must not open a fork dialog"
+        );
+        let dialog = env.view.info_dialog.as_ref().expect("info dialog");
+        assert_eq!(dialog.title(), title);
+        assert_eq!(dialog.message(), message);
+    }
 }
 
 /// Unforkable parents get an explanatory info dialog instead of the fork form: a resume-only

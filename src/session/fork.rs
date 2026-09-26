@@ -26,11 +26,25 @@ pub enum ForkDenied {
     /// No conversation id is recorded for the parent at all.
     NoParentSession,
     /// A conversation id is recorded, but nothing qualifies it, so the id
-    /// cannot be shown to name a real conversation to fork. `None` when the
-    /// recorded id has no binding left to prove its origin.
+    /// cannot be shown to name a real conversation to fork. `None` when no
+    /// binding stands behind it, so nothing says which conversation it names.
     UnqualifiedParent {
         provenance: Option<ConversationProvenance>,
     },
+}
+
+impl ForkDenied {
+    /// The refusal phrased for a user. Every surface reads this, so a refusal
+    /// cannot read three ways.
+    pub fn user_message(&self) -> &'static str {
+        match self {
+            Self::AgentCannotFork => "This agent has no native fork capability. Forkable agents: claude, codex, opencode.",
+            Self::NoParentSession => "This session has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id.",
+            Self::UnqualifiedParent { provenance: None } => "This session records a conversation id that nothing qualifies: no record says which agent, store or directory it belongs to, so which conversation it names is unknown. Re-assert the id with 'aoe session set-session-id <session> <id>'.",
+            Self::UnqualifiedParent { provenance: Some(ConversationProvenance::Preallocated) } => "This session has no captured conversation to fork from. Send it at least one message first.",
+            Self::UnqualifiedParent { provenance: Some(_) } => "This session records a conversation id, but it was never qualified against a native agent. Run 'aoe session set-session-id <session> <id>' on it to qualify it.",
+        }
+    }
 }
 
 /// The conversation an explicit fork would carry, with the evidence for it
@@ -40,9 +54,10 @@ pub enum ForkDenied {
 pub enum ForkParentRef<'a> {
     /// The id has a binding, whose provenance says how far that binding is trusted.
     Bound(&'a crate::session::ConversationBinding),
-    /// The id is recorded but its binding is gone, so its origin is unknown: a
-    /// pre-pinned id that never ran and one a degraded launch left unbound
-    /// cannot be told apart.
+    /// The id is recorded but nothing qualifies it, so its origin cannot be
+    /// named: a pre-pinned id that never ran, an id whose binding a degraded
+    /// launch could not attest, and a live conversation seen outside a launch
+    /// all look alike here.
     Recorded(&'a str),
 }
 
@@ -69,13 +84,6 @@ impl<'a> ForkParentRef<'a> {
             .is_some_and(crate::session::ConversationBinding::is_known)
     }
 }
-
-/// Shared text for a recorded conversation that no binding qualifies, so the
-/// REST and TUI refusals cannot drift apart.
-pub const UNQUALIFIED_PARENT: &str = "This session records a conversation id, but it was never qualified against a native agent. Run 'aoe session set-session-id <session> <id>' on it to qualify it.";
-/// Text for a recorded id whose binding is gone: it can be neither qualified
-/// nor cleared, because the two origins that leave it that way look alike.
-pub const UNBOUND_PARENT: &str = "This session records a conversation id that no binding qualifies: it was pinned before the session ever ran, or its binding was lost at a degraded launch. There is no conversation to fork.";
 
 /// Process-wide default ACP registry, used only to answer "does this built-in tool have an ACP
 /// adapter?" for capability checks that have no profile-resolved config handy.
@@ -192,5 +200,41 @@ mod tests {
             terminal_fork_seed(Some(ForkParentRef::Bound(&parent)), "child-uuid".into()),
             Err(ForkDenied::AgentCannotFork)
         );
+    }
+
+    /// Every refusal state carries its own wording, and each names the remedy
+    /// that state admits: a preallocated id has no conversation to qualify, and
+    /// a binding-less one no provenance to assert.
+    #[test]
+    fn user_message_distinguishes_every_refusal_state() {
+        let cases = [
+            (
+                ForkDenied::AgentCannotFork,
+                "This agent has no native fork capability. Forkable agents: claude, codex, opencode.",
+            ),
+            (
+                ForkDenied::NoParentSession,
+                "This session has no single captured conversation to fork from: it has captured none, or more than one session records this conversation id.",
+            ),
+            (
+                ForkDenied::UnqualifiedParent {
+                    provenance: Some(ConversationProvenance::Preallocated),
+                },
+                "This session has no captured conversation to fork from. Send it at least one message first.",
+            ),
+            (
+                ForkDenied::UnqualifiedParent {
+                    provenance: Some(ConversationProvenance::Unknown),
+                },
+                "This session records a conversation id, but it was never qualified against a native agent. Run 'aoe session set-session-id <session> <id>' on it to qualify it.",
+            ),
+            (
+                ForkDenied::UnqualifiedParent { provenance: None },
+                "This session records a conversation id that nothing qualifies: no record says which agent, store or directory it belongs to, so which conversation it names is unknown. Re-assert the id with 'aoe session set-session-id <session> <id>'.",
+            ),
+        ];
+        for (denied, expected) in cases {
+            assert_eq!(denied.user_message(), expected);
+        }
     }
 }
