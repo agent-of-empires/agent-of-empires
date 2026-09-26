@@ -668,8 +668,8 @@ fn process_exists(pid: u32) -> bool {
 }
 
 /// Send SIGSTOP to a process and all its descendants. Used to pause
-/// the agent (claude) while a mobile client is reading tmux scrollback
-/// — without this, claude's continued output keeps pushing lines into
+/// the agent (claude) while a mobile client is reading tmux scrollback:
+/// without this, claude's continued output keeps pushing lines into
 /// scrollback under the reader and shifts what they're trying to read.
 ///
 /// Paired with [`continue_process_tree`] which sends SIGCONT. The web

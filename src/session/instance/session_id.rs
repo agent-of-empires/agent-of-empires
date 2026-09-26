@@ -1637,6 +1637,19 @@ work-opencode = "opencode"
             EnvGuard::set(&pairs)
         }
 
+        /// The transcript probe resolves the existing prefix of the project
+        /// path, so a literal `/tmp/...` fixture would be looked up under
+        /// `/private/tmp/...` on macOS. Create the directory and hand back its
+        /// canonical spelling so the fixture and the probe agree.
+        fn canonical_project(temp: &TempDir, name: &str) -> String {
+            let dir = temp.path().join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::canonicalize(dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        }
+
         fn write_transcript(claude_home: &Path, project_path: &str, sid: &str, age_secs: u64) {
             let dir = claude_home
                 .join("projects")
@@ -1751,11 +1764,11 @@ work-opencode = "opencode"
                 let temp = tempdir().unwrap();
                 let _home = claude_home_guard(&temp);
                 let (_hooks, _base, _hook_temp) = crate::hooks::test_support::BaseGuard::ready();
-                let project_path = "/tmp/aoe-test-verify-on-resume";
+                let project_path = canonical_project(&temp, "aoe-test-verify-on-resume");
                 for (sid, age) in transcripts {
-                    write_transcript(&temp.path().join(".claude"), project_path, sid, *age);
+                    write_transcript(&temp.path().join(".claude"), &project_path, sid, *age);
                 }
-                let mut inst = tool_instance(tool, project_path);
+                let mut inst = tool_instance(tool, &project_path);
                 inst.agent_session_id = Some(stored.to_string());
                 if sandboxed {
                     inst.sandbox_info = Some(test_sandbox("verify-sandbox", None));
@@ -1809,14 +1822,14 @@ work-opencode = "opencode"
         fn same_cwd_sessions_resume_their_own_profile_scoped_conversation() {
             let temp = tempdir().unwrap();
             let _guard = claude_home_guard(&temp);
-            let project_path = "/tmp/aoe-test-3399-shared-cwd";
+            let project_path = canonical_project(&temp, "aoe-test-3399-shared-cwd");
             let cases = [
                 ("aoe-3399-personal", "11111111-1111-4111-8111-111111111111"),
                 ("aoe-3399-work", "22222222-2222-4222-8222-222222222222"),
             ];
             let home_for = |profile: &str| temp.path().join(format!(".claude-{profile}"));
             for (profile, sid) in cases {
-                write_transcript(&home_for(profile), project_path, sid, 3600);
+                write_transcript(&home_for(profile), &project_path, sid, 3600);
                 let config_path = crate::session::get_profile_dir_path(profile)
                     .unwrap()
                     .join("config.toml");
@@ -1828,7 +1841,7 @@ work-opencode = "opencode"
                 fs::write(&config_path, config).unwrap();
             }
             let acquire = |profile: &str, sid: &str, minted: Option<&str>| {
-                let mut inst = tool_instance("claude", project_path);
+                let mut inst = tool_instance("claude", &project_path);
                 inst.source_profile = profile.to_string();
                 inst.agent_session_id = Some(sid.to_string());
                 inst.pending_host_env = minted

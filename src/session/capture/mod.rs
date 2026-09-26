@@ -366,6 +366,25 @@ mod tests {
         );
     }
 
+    /// The resolver normalizes the existing prefix of a path and re-appends
+    /// the missing leaf, so a path spelled through a symlink names the same
+    /// directory as the resolved spelling. Callers key on this: a caller that
+    /// spells a path one way must not silently disagree with a probe that
+    /// spells it the other way.
+    #[test]
+    fn canonicalize_or_raw_resolves_a_symlinked_prefix_for_a_missing_leaf() {
+        let temp = tempfile::tempdir().unwrap();
+        let alias = temp.path().join("alias");
+        let real = temp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        assert_eq!(
+            canonicalize_or_raw(alias.join("gone")),
+            canonicalize_or_raw(real.join("gone")),
+            "a path spelled through a symlink must name the resolved leaf"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn parked_conversation_exclusion_survives_alias_config_changes() {

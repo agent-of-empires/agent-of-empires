@@ -57,5 +57,19 @@ pub use search::*;
 pub use send::*;
 pub use update::*;
 
+/// Shell-metacharacter gate for the free-form spawn fields a client can set
+/// on a session, shared by the create and restart routes so the two cannot
+/// drift.
+///
+/// `command_override` is deliberately absent: it is an `argv[0]` program path
+/// rather than shell input, and the create route gates it on the agent
+/// registry and the ACP identity check instead (#7), never on metacharacters.
+pub(super) fn validate_shell_fields(checks: &[(&str, &str)]) -> Result<(), String> {
+    checks
+        .iter()
+        .find_map(|(value, name)| validate_no_shell_injection(value, name).err())
+        .map_or(Ok(()), Err)
+}
+
 #[cfg(test)]
 mod tests;

@@ -443,6 +443,10 @@ pub struct ServeLaunch {
     #[serde(default)]
     pub instance_id: Option<String>,
     pub profile: String,
+    /// Absent in records written before core-only launches existed (schema 2);
+    /// such a record is always a full daemon, so `false` is the value it
+    /// would have been persisted with.
+    #[serde(default)]
     pub core_only: bool,
     pub host: String,
     pub port: u16,
@@ -468,7 +472,7 @@ pub struct ServeLaunch {
     pub additional_fields: serde_json::Map<String, serde_json::Value>,
 }
 
-const SERVE_LAUNCH_SCHEMA: u32 = 4;
+pub(crate) const SERVE_LAUNCH_SCHEMA: u32 = 4;
 const SERVE_INSTANCE_ENV: &str = "AOE_SERVE_INSTANCE_ID";
 
 impl ServeLaunch {

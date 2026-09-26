@@ -306,11 +306,11 @@ async fn run(
     if cli.command.is_some() {
         if is_daemon_child {
             // The parent `aoe serve` already ran the migrations and is holding
-            // the daemon lifecycle transaction while this child starts. A
-            // migration that re-acquires that lock (v034, v035) would spin out
-            // its 60s deadline and then fail this process before it ever
-            // receives the transaction, so the daemon would never come up.
-            // Verify the schema instead of migrating, and fail closed.
+            // the daemon lifecycle transaction that this child is about to
+            // receive. A migration running here would race the parent on
+            // `.schema_version` and, for the one that writes the launch record,
+            // wait on the very lock the parent holds. Verify the schema instead
+            // of migrating, and fail closed.
             migrations::assert_schema_current()?;
         } else {
             let reporter = cli

@@ -449,7 +449,7 @@ fn read_drain_frame(mut stream: impl std::io::Read) -> std::io::Result<(u8, u64)
 
 /// One unbuffered `read(2)`, retried on `EINTR`, so pane bytes are either
 /// still in the stdin queue (visible to `FIONREAD`) or in the caller's
-/// buffer — never hidden inside a std buffer the snapshot fence cannot
+/// buffer, never hidden inside a std buffer the snapshot fence cannot
 /// observe.
 fn read_raw(fd: std::os::fd::RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
@@ -510,8 +510,8 @@ pub(crate) fn run_pipe(socket: &str) -> std::io::Result<()> {
 /// The barrier is the forwarder's leg of the snapshot ordering boundary
 /// (#3737): tmux queues pane output to `pipe-pane` before parsing it into
 /// the pane screen, so a capture can already contain bytes that are still
-/// inside this process — unread on stdin, or read into the buffer but not
-/// yet written to the socket — where no parent-side counter or `FIONREAD`
+/// inside this process (unread on stdin, or read into the buffer but not
+/// yet written to the socket) where no parent-side counter or `FIONREAD`
 /// can see them. A probe is therefore acknowledged only at the top of the
 /// loop, where this thread holds nothing, and only after forwarding the
 /// whole stdin backlog; a probe arriving mid-forward waits out the

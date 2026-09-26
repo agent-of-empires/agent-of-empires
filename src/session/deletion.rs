@@ -877,15 +877,35 @@ pub(crate) fn recover_committed_purge(
         })();
         match attempt {
             Ok(committed) => return Ok(Some(committed)),
-            Err(error) => {
-                attempted.insert(owner_token.clone());
-                tracing::warn!(
-                    target: "session.purge_recovery",
-                    owner_token = %owner_token,
-                    %error,
-                    "pending purge owner is not currently recoverable; trying the next owner"
-                );
-            }
+            Err(error) => match super::purge_owners::release_uncommitted(&plan) {
+                Ok(true) => {
+                    tracing::info!(
+                        target: "session.purge_recovery",
+                        owner_token = %owner_token,
+                        %error,
+                        "dropping an uncommitted purge plan; its row never left the registry"
+                    );
+                }
+                Ok(false) => {
+                    attempted.insert(owner_token.clone());
+                    tracing::warn!(
+                        target: "session.purge_recovery",
+                        owner_token = %owner_token,
+                        %error,
+                        "pending purge owner is not currently recoverable; trying the next owner"
+                    );
+                }
+                Err(release_error) => {
+                    attempted.insert(owner_token.clone());
+                    tracing::warn!(
+                        target: "session.purge_recovery",
+                        owner_token = %owner_token,
+                        %error,
+                        %release_error,
+                        "pending purge owner is not currently recoverable; trying the next owner"
+                    );
+                }
+            },
         }
     }
     Ok(None)
@@ -2925,6 +2945,85 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn an_uncommitted_purge_plan_is_reaped_instead_of_retaining_the_row() {
+        // A purge plan is journalled before its row is removed, so a crash in
+        // that window (or a failed release) leaves the plan behind with the
+        // row still registered. Recovery used to refuse such a plan forever,
+        // and the phantom then froze the references of the very session it
+        // was recorded for, keeping that session's worktree and branch on disk
+        // for good. The registered row already claims those references, so
+        // the plan has nothing left to hold and must be released.
+        let _home = crate::session::test_support::isolate_app_dir();
+        super::super::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let (_temp, main_repo, worktree, mut instance) = test_worktree_fixture("reaped-branch");
+        let profile = "purge-reap-uncommitted";
+        let storage = Storage::new_unwatched(profile).unwrap();
+        instance.source_profile = profile.into();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let request = DeletionRequest {
+            session_id: instance.id.clone(),
+            instance: instance.clone(),
+            delete_worktree: true,
+            delete_branch: true,
+            delete_sandbox: false,
+            force_delete: false,
+            detach_hooks: true,
+            keep_scratch: false,
+        };
+        // Exactly what `begin_irreversible` records, with the row left in
+        // place: the state a crash before the commit leaves behind.
+        let _plan = super::super::purge_owners::PurgeOwner::record_plan(
+            &storage,
+            &instance,
+            instance.lifecycle_generation,
+            Some(&request),
+            None,
+            super::super::purge_owners::PurgeCapture::new(&instance).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            recover_committed_purge(&mut HashSet::new())
+                .unwrap()
+                .is_none(),
+            "a plan with no committed purge has nothing to recover"
+        );
+        assert!(
+            super::super::purge_owners::recovery_plans()
+                .unwrap()
+                .is_empty(),
+            "the uncommitted plan must not survive the recovery pass"
+        );
+
+        let result = match PurgeTransaction::reserve(storage, request, None).unwrap() {
+            PurgeReservation::Reserved(transaction) => transaction.complete(),
+            PurgeReservation::Rejected(result) => {
+                panic!("purge rejected: {:?}", result.errors)
+            }
+        };
+        assert!(
+            result
+                .messages
+                .iter()
+                .all(|message| !message.contains("another session references")),
+            "the reaped plan still retained the session's own worktree: {:?}",
+            result.messages
+        );
+        assert!(
+            !worktree.exists(),
+            "the worktree must be gone: {:?}",
+            result.errors
+        );
+        assert!(!test_branch_exists(&main_repo, "reaped-branch"));
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn creation_rollback_keeps_post_provision_cleanup_flags() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
@@ -3923,8 +4022,23 @@ mod tests {
         /// agent and produced flaky permission errors and dirty-tree
         /// failures.
         #[test]
+        #[serial_test::serial]
         fn sandboxed_with_worktree_kills_tmux_and_container_before_worktree() {
             let _app_guard = crate::session::test_support::isolate_app_dir();
+            // The preclean probes the container runtime before the stages
+            // below run, and a host with no usable runtime answers that probe
+            // with a failure rather than with absence. A failure reads as
+            // "in-container cleanup blocked" and deliberately moves the
+            // host-side worktree removal ahead of the container, so the
+            // ordering this test pins would only hold on hosts that happen to
+            // have Docker. Stub the runtime so the probe always reports an
+            // absent container.
+            let stub = tempfile::TempDir::new().unwrap();
+            let _docker = crate::session::test_support::install_login_shell_path_command(
+                stub.path(),
+                "docker",
+                "#!/bin/sh\necho 'Error: No such container' >&2\nexit 1\n",
+            );
             // Exercise sandbox + worktree stage ordering with an explicitly
             // absent container. A nonexistent name alone is insufficient:
             // an unavailable runtime fails teardown and correctly prevents

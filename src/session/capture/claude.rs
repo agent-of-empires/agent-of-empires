@@ -119,9 +119,19 @@ mod tests {
     /// the agent rejects.
     #[test]
     fn transcript_absence_is_existence_only_in_the_declared_store() {
-        let store = tempfile::tempdir().unwrap();
-        let empty = tempfile::tempdir().unwrap();
-        let project_dir = store.path().join("projects").join("-tmp-myproject");
+        // The probe resolves the existing prefix of the project path, so on
+        // macOS a hardcoded `/tmp/...` fixture would resolve to
+        // `/private/tmp/...` and encode under a directory that does not
+        // exist. Drive both sides of the probe from a canonical spelling.
+        let store_dir = tempfile::tempdir().unwrap();
+        let empty_dir = tempfile::tempdir().unwrap();
+        let store = std::fs::canonicalize(store_dir.path()).unwrap();
+        let empty = std::fs::canonicalize(empty_dir.path()).unwrap();
+        let project = store.join("myproject");
+        let never = store.join("never-opened-project");
+        let project_dir = store
+            .join("projects")
+            .join(encode_claude_project_path(project.to_str().unwrap()));
         std::fs::create_dir_all(&project_dir).unwrap();
         let present = "11111111-2222-3333-4444-555555555555";
         let missing = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -134,16 +144,20 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(hour_ago))
             .unwrap();
+        let project = project.to_str().unwrap();
+        let never = never.to_str().unwrap();
         // (CLAUDE_CONFIG_DIR, declared dir, project, sid, confirmed absent)
         for (env, declared, project, sid, absent) in [
-            (&store, None, "/tmp/myproject", present, false),
-            (&store, None, "/tmp/myproject", missing, true),
-            (&store, None, "/tmp/never-opened-project", present, true),
-            (&empty, None, "/tmp/myproject", present, true),
-            (&empty, Some(store.path()), "/tmp/myproject", present, false),
+            (&store, None, project, present, false),
+            (&store, None, project, missing, true),
+            (&store, None, never, present, true),
+            (&empty, None, project, present, true),
+            (&empty, Some(store.as_path()), project, present, false),
         ] {
-            let _env =
-                crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", env.path())]);
+            let _env = crate::session::test_support::EnvGuard::set(&[(
+                "CLAUDE_CONFIG_DIR",
+                env.as_path(),
+            )]);
             assert_eq!(
                 claude_host_transcript_confirmed_absent(project, sid, &[], declared),
                 absent,

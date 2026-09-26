@@ -1,4 +1,4 @@
-//! Paired terminal sessions — host (`TerminalSession`) and sandbox (`ContainerTerminalSession`).
+//! Paired terminal sessions: host (`TerminalSession`) and sandbox (`ContainerTerminalSession`).
 //!
 //! The two session types have nearly identical lifecycles, so the
 //! implementation lives in [`PairedTerminal`] and the public types are thin

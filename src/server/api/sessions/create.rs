@@ -761,14 +761,12 @@ pub async fn create_session(
     if !body.scratch {
         shell_checks.push((body.path.as_str(), "path"));
     }
-    for (value, name) in shell_checks {
-        if let Err(msg) = validate_no_shell_injection(value, name) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "validation_failed", "message": msg})),
-            )
-                .into_response();
-        }
+    if let Err(msg) = super::validate_shell_fields(&shell_checks) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "validation_failed", "message": msg})),
+        )
+            .into_response();
     }
     // #2624: `title`/`group` are display labels, not shell input, so they
     // go through `validate_display_label` (control characters only)

@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use super::anchored_fs::ResolvedDataFile;
 use super::deletion::DeletionRequest;
 use super::path_identity::CleanupProtection;
-use super::storage::{acquire_open_storage_flock, app_dir_for_profile_dir};
+use super::storage::{
+    acquire_open_storage_flock, app_dir_for_profile_dir, try_acquire_storage_flock,
+};
 use super::{AnchoredDir, Instance, Storage};
 
 pub(crate) const FILE_NAME: &str = "pending-purge-owners.json";
@@ -157,9 +159,11 @@ struct Owner {
 
 pub(super) struct RecoveryPlan {
     pub(super) token: String,
+    pub(super) session_id: String,
     pub(super) profile: String,
     pub(super) request: Option<DeletionRequest>,
     pub(super) additional_protection: Option<CleanupProtection>,
+    pub(super) protection: CleanupProtection,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -378,12 +382,18 @@ impl PurgeOwner {
     }
 
     pub(crate) fn release(self) -> Result<()> {
-        let (lock, path) = self.file.open_sidecar()?;
-        let _guard = acquire_open_storage_flock(lock, &path)?;
-        let mut journal = decode(self.file.read()?.as_deref())?;
-        journal.owners.retain(|owner| owner.token != self.token);
-        save(&self.file, &journal)
+        remove_token(&self.file, &self.token)
     }
+}
+
+/// Drop one owner from the journal under its sidecar lock, the single edit
+/// path shared by an explicit release and by reaping an uncommitted plan.
+fn remove_token(file: &ResolvedDataFile, token: &str) -> Result<()> {
+    let (lock, path) = file.open_sidecar()?;
+    let _guard = acquire_open_storage_flock(lock, &path)?;
+    let mut journal = decode(file.read()?.as_deref())?;
+    journal.owners.retain(|owner| owner.token != token);
+    save(file, &journal)
 }
 
 pub(crate) fn protection(
@@ -413,11 +423,64 @@ pub(super) fn recovery_plans() -> Result<Vec<RecoveryPlan>> {
         .into_iter()
         .map(|owner| RecoveryPlan {
             token: owner.token,
+            session_id: owner.session_id,
             profile: owner.profile,
             request: owner.request,
             additional_protection: owner.additional_protection,
+            protection: owner.protection,
         })
         .collect())
+}
+
+/// Drop a plan whose row never left the registry.
+///
+/// A plan is journalled before its row is removed, so a crash in that window,
+/// or a failed release, leaves an owner that recovery refuses forever: the
+/// row is still there, so the identity guard rejects it on every pass, and
+/// nothing ever releases the token. Meanwhile the phantom freezes the
+/// resources of the very session it was recorded for, which is the row
+/// itself, so its worktree and branch survive its next deletion with a
+/// misleading "another session references" message. Reaping restores the
+/// invariant that an entry can only be retired while the registry still
+/// claims every reference it froze.
+///
+/// Returns `false` whenever the plan is not provably the still-registered
+/// row repeating itself, which keeps the identity-reuse guard fail-closed:
+/// an absent row is a real recovery handled by the caller, and a plan holding
+/// more than the live row claims (a create rollback reclaims branches no live
+/// row ever owned) stays.
+pub(super) fn release_uncommitted(plan: &RecoveryPlan) -> Result<bool> {
+    let store = Storage::open_unwatched(&plan.profile)?;
+    let profile_dir = store
+        .sessions_path()
+        .parent()
+        .context("profile directory missing")?;
+    // Never block here: a purge committing right now holds this lock and will
+    // settle its own token, so skipping costs one pass.
+    let Some(_guard) =
+        try_acquire_storage_flock(profile_dir, super::storage::STORAGE_LOCK_FILENAME)?
+    else {
+        return Ok(false);
+    };
+    let Some(row) = store
+        .load()?
+        .into_iter()
+        .find(|row| row.id == plan.session_id)
+    else {
+        return Ok(false);
+    };
+    if plan.additional_protection.is_some() {
+        return Ok(false);
+    }
+    if !CleanupProtection::new([&row])?.covers(&plan.protection) {
+        return Ok(false);
+    }
+    // The journal edit is a read-modify-write, so a concurrent release can
+    // still be lost and resurrect the entry. That is benign: an entry whose
+    // row is gone is picked up as a real recovery on the next pass, and the
+    // cleanup it drives is idempotent.
+    remove_token(&open_for(&store)?, &plan.token)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -604,7 +667,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn active_socket_without_registry_is_unresolved() -> Result<()> {
-        let root = tempfile::tempdir()?;
+        // Under /tmp, not $TMPDIR: macOS paths exceed the 104-byte sun_path limit.
+        let root = tempfile::TempDir::with_prefix_in("purge-owner-socket", "/tmp")?;
         let _home = crate::session::test_support::isolate_app_dir_at(root.path());
         let row = Instance::new(
             "socket-without-registry",

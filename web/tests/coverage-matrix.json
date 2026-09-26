@@ -3565,16 +3565,6 @@
       ]
     },
     {
-      "id": "story.wizard-project-registry-recovery",
-      "kind": "vitest",
-      "risk": "high",
-      "specs": ["src/components/session-wizard/__tests__/ProjectStep.saved-projects.test.tsx"],
-      "components": [
-        "web/src/components/session-wizard/steps/ProjectStep.tsx",
-        "web/src/components/session-wizard/steps/projectPicker.ts"
-      ]
-    },
-    {
       "id": "story.wizard-browse-disk",
       "kind": "mocked-playwright",
       "risk": "low",

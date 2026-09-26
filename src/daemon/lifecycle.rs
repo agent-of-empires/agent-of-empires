@@ -58,6 +58,31 @@ impl Transaction {
         }
     }
 
+    /// Acquire the transaction, giving up after `wait`.
+    ///
+    /// Short-waiting counterpart of `acquire_blocking`: a daemon transition
+    /// holds the lock for as long as it takes to start or stop, so a caller
+    /// that has no business waiting out a full lifecycle needs a bound and a
+    /// message naming the transition that is in the way.
+    pub(crate) fn acquire_blocking_for(wait: Duration) -> Result<Self> {
+        let file = open_lock("transaction.lock")?;
+        let deadline = Instant::now() + wait;
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self(file)),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "the aoe serve daemon is starting, restarting or stopping and holds the \
+                         daemon lifecycle lock; retry this command in a moment"
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     pub(crate) async fn acquire() -> Result<Self> {
         let file = open_lock("transaction.lock")?;
         let deadline = Instant::now() + Duration::from_secs(60);

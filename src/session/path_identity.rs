@@ -249,31 +249,39 @@ impl CleanupProtection {
     }
 
     pub(crate) fn references_exact_path(&self, target: &Path) -> bool {
-        if self.paths.is_empty() {
-            return false;
-        }
-        let target = PathIdentity::new(target);
+        self.covers_path(&PathIdentity::new(target))
+    }
+
+    /// Whether every reference frozen by `other` is still frozen here, i.e.
+    /// whether this protection can stand in for `other` as the reason to keep
+    /// resources alive. Used to tell a plan that merely repeats what a
+    /// still-registered row already claims from one that holds more.
+    pub(crate) fn covers(&self, other: &Self) -> bool {
+        other.paths.iter().all(|path| self.covers_path(path))
+            && other
+                .branches
+                .iter()
+                .all(|(index, name)| self.covers_branch(&other.paths[*index], name))
+    }
+
+    fn covers_path(&self, target: &PathIdentity) -> bool {
         self.paths.iter().any(|path| {
             path.spellings()
                 .any(|reference| target.spellings().any(|target| reference == target))
         })
     }
 
-    pub(crate) fn references_branch(&self, main_repo: &Path, branch: &str) -> bool {
-        let mut matching = self
-            .branches
-            .iter()
-            .filter(|(_, name)| name == branch)
-            .peekable();
-        if matching.peek().is_none() {
-            return false;
-        }
-        let main_repo = PathIdentity::new(main_repo);
-        matching.any(|(index, _)| {
-            self.paths[*index]
-                .spellings()
-                .any(|reference| main_repo.spellings().any(|target| reference == target))
+    fn covers_branch(&self, main_repo: &PathIdentity, branch: &str) -> bool {
+        self.branches.iter().any(|(index, name)| {
+            name == branch
+                && self.paths[*index]
+                    .spellings()
+                    .any(|reference| main_repo.spellings().any(|target| reference == target))
         })
+    }
+
+    pub(crate) fn references_branch(&self, main_repo: &Path, branch: &str) -> bool {
+        self.covers_branch(&PathIdentity::new(main_repo), branch)
     }
 }
 

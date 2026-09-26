@@ -4939,8 +4939,9 @@ Final prose line.\n";
 
     #[test]
     fn test_detect_hermes_status_idle_on_input_prompt() {
-        // The bare ❯/⚡ prompt means "ready for next message" — Idle in AoE
-        // semantics. Waiting is reserved for dangerous-command approval gates.
+        // The bare ❯/⚡ prompt means "ready for next message", which maps to
+        // Idle in AoE semantics. Waiting is reserved for dangerous-command
+        // approval gates.
         assert_eq!(detect_hermes_status("some output\n❯"), Status::Idle);
         assert_eq!(detect_hermes_status("some output\n❯ "), Status::Idle);
         assert_eq!(detect_hermes_status("some output\n⚡"), Status::Idle);

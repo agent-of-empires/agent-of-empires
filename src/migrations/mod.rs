@@ -47,7 +47,6 @@ mod v030_global_only_profile_settings;
 mod v031_conversation_provenance;
 mod v032_bound_capture_exclusions;
 pub(crate) mod v033_isolate_sandbox_content;
-mod v034_core_daemon_launch;
 mod v035_serve_passphrase_policy;
 mod v036_pending_purge_owners;
 mod v037_capture_purge_runners;
@@ -268,11 +267,6 @@ const MIGRATIONS: &[Migration] = &[
         run: v033_isolate_sandbox_content::run,
     },
     Migration {
-        version: 34,
-        name: "core_daemon_launch",
-        run: v034_core_daemon_launch::run,
-    },
-    Migration {
         version: 35,
         name: "serve_passphrase_policy",
         run: v035_serve_passphrase_policy::run,
@@ -312,10 +306,9 @@ pub fn has_pending_migrations() -> bool {
 ///
 /// This is the check the detached daemon child makes instead of migrating.
 /// Its parent `aoe serve` ran the migrations and still holds the daemon
-/// lifecycle transaction, so a migration that re-acquires that lock (v034 and
-/// v035 do) would spin out the full 60s deadline and then fail the child
-/// before it ever receives the transaction — the daemon would simply never
-/// come up. Verifying is the fail-closed alternative.
+/// lifecycle transaction, so migrating here would both race the parent on
+/// `.schema_version` and wait on the lock the parent is about to hand over.
+/// Verifying is the fail-closed alternative.
 pub fn assert_schema_current() -> Result<()> {
     let current = get_current_version();
     if current > CURRENT_VERSION {

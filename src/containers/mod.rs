@@ -276,7 +276,7 @@ impl DockerContainer {
     ///
     /// Must be called after container removal during session deletion. Named volumes are not
     /// removed by `docker rm -v`; they require explicit cleanup. Safe to call even when the
-    /// container is already gone — volumes can outlive their container.
+    /// container is already gone: volumes can outlive their container.
     pub fn remove_named_ignore_volumes(&self, session_id: &str) {
         let prefix = format!("aoe-vi-{}-", session_id);
         if let Err(e) = self.runtime.base.remove_named_ignore_volumes(&prefix) {

@@ -69,6 +69,49 @@ fn wait_for_file_contents(path: &Path, timeout: Duration) -> String {
     }
 }
 
+/// Wait until the daemon has published `generation` with no live lifecycle
+/// reservation for `id`.
+///
+/// This test process writes `sessions.json` directly, so the row only reaches
+/// the daemon's canonical in-memory state through its debounced disk watch.
+/// A mutation issued before that convergence is rejected as superseded, so
+/// callers that write the file out of process must wait for it first.
+async fn wait_for_lifecycle_published(
+    http: &reqwest::Client,
+    id: &str,
+    generation: u64,
+    timeout: Duration,
+) {
+    let start = Instant::now();
+    loop {
+        let snapshot: agent_of_empires::daemon::RuntimeSnapshot = http
+            .get("http://localhost/api/runtime/snapshot")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let published = snapshot
+            .contents
+            .sessions
+            .iter()
+            .find(|value| value.id == id)
+            .expect("session missing from the published snapshot");
+        if published.lifecycle_generation == generation && published.lifecycle_reservation.is_none()
+        {
+            return;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "generation {generation} without a reservation was not published"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[test]
 #[parallel]
 fn test_tool_picker_lists_configured_tools() {
@@ -548,6 +591,7 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
     assert_eq!(pane(), original_pane);
     row.release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation);
     persist(&row);
+    wait_for_lifecycle_published(&http, &row.id, generation, Duration::from_secs(10)).await;
     let config_path = app.join("config.toml");
     let config = fs::read_to_string(&config_path).unwrap();
     fs::write(

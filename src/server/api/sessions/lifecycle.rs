@@ -1223,6 +1223,18 @@ pub async fn restart_session(
         Ok(body) => body.map(|Json(body)| body).unwrap_or_default(),
         Err(error) => return error.into_response(),
     };
+    // The restart body sets the same spawn fields the create route accepts, so
+    // it answers with the same gate and the same `400 validation_failed`.
+    if let Err(message) = super::validate_shell_fields(&[(
+        body.extra_args.as_deref().unwrap_or_default(),
+        "extra_args",
+    )]) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "validation_failed", "message": message})),
+        )
+            .into_response();
+    }
     prepare_agent_session(
         state,
         id,
