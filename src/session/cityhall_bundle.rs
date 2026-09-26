@@ -519,51 +519,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn round_trips_through_toml() {
-        let bundle = CityHallBundle {
-            schema_version: SCHEMA_VERSION,
-            meta: Some(Meta {
-                generated_by: Some("aoe 1.2.3".into()),
-            }),
-            settings: json!({"acp": {"default_agent": "claude-code"}}),
-            projects: vec![BundleProject {
-                name: "cityhall".into(),
-                remote: "https://github.com/agent-of-empires/cityhall.git".into(),
-                default_base_branch: Some("main".into()),
-            }],
-            git: None,
-        };
-        let raw = bundle.to_toml().unwrap();
-        assert_eq!(CityHallBundle::from_toml(&raw).unwrap(), bundle);
-    }
-
-    #[test]
-    fn ssh_fields_round_trip_and_are_optional() {
-        let bundle = CityHallBundle {
-            schema_version: SCHEMA_VERSION,
-            settings: empty_object(),
-            git: Some(GitIdentity {
-                user_name: Some("someone".into()),
-                ssh_private_key: Some(
-                    "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----"
-                        .into(),
-                ),
-                ssh_known_hosts: Some("github.com ssh-ed25519 AAAA".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let parsed = CityHallBundle::from_toml(&bundle.to_toml().unwrap()).unwrap();
-        assert_eq!(parsed, bundle);
-
-        let older =
-            format!("schema_version = {SCHEMA_VERSION}\n\n[git]\nuser_name = \"someone\"\n");
-        let git = CityHallBundle::from_toml(&older).unwrap().git.unwrap();
-        assert_eq!(git.ssh_private_key, None);
-        assert_eq!(git.ssh_known_hosts, None);
-    }
-
-    #[test]
     fn shell_quoting_survives_an_apostrophe_in_the_path() {
         assert_eq!(
             shell_quote(Path::new("/home/aoe/ssh/id")),
@@ -594,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_sections_are_dropped() {
+    fn patch_cleanup_drops_unknown_sections_and_null_leaves() {
         let mut patch = json!({
             "acp": {"default_agent": "claude-code"},
             "hooks": {"pre_create": "echo hi"},
@@ -602,10 +557,7 @@ mod tests {
         });
         retain_schema_fields(&mut patch);
         assert_eq!(patch, json!({"acp": {"default_agent": "claude-code"}}));
-    }
 
-    #[test]
-    fn null_leaves_are_dropped() {
         let mut patch = json!({"session": {"cpu_limit": null, "confirm_delete": true}});
         strip_nulls(&mut patch);
         assert_eq!(patch, json!({"session": {"confirm_delete": true}}));

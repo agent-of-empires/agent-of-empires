@@ -43,21 +43,15 @@ describe("SessionGroupModal", () => {
     ["Save click", "", "  work/api  ", "work/api", "click"],
     ["Enter", "old", "new", "new", "enter"],
     ["blank value ungroups", "work", "   ", "", "click"],
-  ])("%s saves the trimmed value then closes", async (_name, current, typed, saved, via) => {
+    ["unchanged value closes without saving", "work", "  work  ", null, "click"],
+  ] as const)("%s: saves the trimmed value then closes", async (_name, current, typed, saved, via) => {
     const { input, saveBtn, onSave, onClose } = setup(current);
     fireEvent.change(input, { target: { value: typed } });
     if (via === "enter") fireEvent.keyDown(input, { key: "Enter" });
     else fireEvent.click(saveBtn);
-    expect(onSave).toHaveBeenCalledWith(saved);
+    if (saved == null) expect(onSave).not.toHaveBeenCalled();
+    else expect(onSave).toHaveBeenCalledWith(saved);
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
-  });
-
-  it.each(["work", "  work  "])("closes without saving when the value %j is unchanged", (typed) => {
-    const { input, saveBtn, onSave, onClose } = setup("work");
-    fireEvent.change(input, { target: { value: typed } });
-    fireEvent.click(saveBtn);
-    expect(onSave).not.toHaveBeenCalled();
-    expect(onClose).toHaveBeenCalledTimes(1);
   });
 
   it.each([

@@ -1,11 +1,9 @@
 // @vitest-environment jsdom
 
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
 
 import { EmptyTrashConfirm } from "../EmptyTrashConfirm";
-
-afterEach(cleanup);
 
 describe("EmptyTrashConfirm (#3167)", () => {
   it("fires onConfirm once under a synchronous double confirm (firedRef guard)", () => {
@@ -21,18 +19,14 @@ describe("EmptyTrashConfirm (#3167)", () => {
     expect(onConfirm).toHaveBeenCalledTimes(1);
   });
 
-  it("Escape calls onCancel", () => {
-    const onCancel = vi.fn();
-    render(<EmptyTrashConfirm sessionCount={2} onConfirm={vi.fn()} onCancel={onCancel} />);
-    fireEvent.keyDown(document, { key: "Escape" });
-    expect(onCancel).toHaveBeenCalledTimes(1);
-  });
-
-  it("Enter dispatched from the dialog body calls onConfirm", () => {
+  it("Escape cancels and Enter from the dialog body confirms", () => {
     // Fire from document (not the auto-focused confirm button), whose tagName is undefined, so the
     // INPUT/TEXTAREA/BUTTON guard is skipped and the keydown path reaches confirm().
     const onConfirm = vi.fn();
-    render(<EmptyTrashConfirm sessionCount={2} onConfirm={onConfirm} onCancel={vi.fn()} />);
+    const onCancel = vi.fn();
+    render(<EmptyTrashConfirm sessionCount={2} onConfirm={onConfirm} onCancel={onCancel} />);
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(onCancel).toHaveBeenCalledTimes(1);
     fireEvent.keyDown(document, { key: "Enter" });
     expect(onConfirm).toHaveBeenCalledTimes(1);
   });

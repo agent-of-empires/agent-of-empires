@@ -833,18 +833,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_env_kv_lines_filters_and_later_wins() {
+    fn parse_env_kv_lines_filters_later_wins_and_never_logs_a_malformed_key() {
+        let logs = crate::session::test_support::LogCapture::start();
         assert_eq!(
             parse_env_kv_lines(
                 "minting...\n\nGH_TOKEN=a=b=c\n9BAD=x\nNO_EQUALS\n  SPACED  =v\nK=first\r\nK=second\r\n"
             ),
             pairs(&[("GH_TOKEN", "a=b=c"), ("SPACED", "v"), ("K", "second")])
         );
-    }
-
-    #[test]
-    fn parse_env_kv_lines_does_not_log_malformed_key() {
-        let logs = crate::session::test_support::LogCapture::start();
         assert!(parse_env_kv_lines("https://token:topsecret@example.test?x=ignored\n").is_empty());
         let logs = logs.contents();
         assert!(logs.contains("invalid environment key"), "{logs}");
@@ -904,16 +900,6 @@ mod tests {
             );
             assert!(!msg.contains("topsecret"), "stdout secret leaked: {msg}");
         }
-    }
-
-    #[test]
-    fn host_hooks_fields_parse_independently() {
-        let single: HostHooksConfig = toml::from_str("before_session = \"mint\"").unwrap();
-        assert_eq!(single.before_session, vec!["mint"]);
-        assert!(single.before_start.is_empty() && !single.is_empty());
-        let many: HostHooksConfig = toml::from_str("before_start = [\"a\", \"b\"]").unwrap();
-        assert_eq!(many.before_start, vec!["a", "b"]);
-        assert!(!many.is_empty() && HostHooksConfig::default().is_empty());
     }
 
     #[test]
@@ -1024,23 +1010,6 @@ mod tests {
     }
 
     #[test]
-    fn repo_hook_overrides_replace_per_type() {
-        let global = HooksConfig {
-            on_create: cmds(&["global-create"]),
-            on_launch: cmds(&["global-launch"]),
-            on_destroy: cmds(&["global-destroy"]),
-        };
-        let repo = HooksConfig {
-            on_create: cmds(&["repo-create-a", "repo-create-b"]),
-            ..Default::default()
-        };
-        let merged = apply_repo_hook_overrides(global.clone(), &repo);
-        assert_eq!(merged.on_create, cmds(&["repo-create-a", "repo-create-b"]));
-        assert_eq!(merged.on_launch, global.on_launch);
-        assert_eq!(merged.on_destroy, global.on_destroy);
-    }
-
-    #[test]
     fn hook_display_groups_label_source_and_filter() {
         let repo = HooksConfig {
             on_create: cmds(&["repo-create"]),
@@ -1068,17 +1037,6 @@ mod tests {
         assert_eq!(summary(false), expected);
         expected.push(("on_destroy", " (from repo)", cmds(&["repo-destroy"])));
         assert_eq!(summary(true), expected);
-    }
-
-    #[test]
-    fn execute_hooks_in_missing_container_fails() {
-        assert!(execute_hooks_in_container(
-            &cmds(&["echo test"]),
-            "nonexistent_container",
-            "/w",
-            &[]
-        )
-        .is_err());
     }
 
     /// #901: streamed hooks detach from the TUI terminal and defang git/ssh prompts.

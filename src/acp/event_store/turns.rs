@@ -687,11 +687,7 @@ mod tests {
             store.latest_seed_status_event("s-3"),
             Some(Event::ThinkingStarted)
         ));
-    }
 
-    #[test]
-    fn last_event_at_takes_the_substantive_max_per_session() {
-        let (_tmp, store) = open_store(1000);
         record_from(
             &store,
             "s-lifecycle",
@@ -727,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_requests_exclude_resolved_nonces_per_session() {
+    fn unresolved_requests_and_background_launches_per_session() {
         use crate::acp::elicitations::{Elicitation, ElicitationOutcome};
         let (_tmp, store) = open_store(1000);
         let approval = |nonce: &str| Event::ApprovalRequested {
@@ -788,25 +784,8 @@ mod tests {
         assert_eq!(store.unresolved_elicitation_nonces("s-1"), [e_b]);
         assert!(store.unresolved_approval_nonces("s-2").is_empty());
         assert!(store.unresolved_elicitation_nonces("s-2").is_empty());
-    }
 
-    fn bg_launched(agent_id: &str, output_file: &str) -> Event {
-        Event::BackgroundAgentLaunched {
-            agent_id: agent_id.into(),
-            tool_call_id: format!("tc-{agent_id}"),
-            description: "map backend".into(),
-            prompt: "do it".into(),
-            model: "claude-opus-4-8".into(),
-            output_file: output_file.into(),
-            started_at: chrono::Utc::now(),
-        }
-    }
-
-    /// Background-agent parallel of `unresolved_approval_nonces`: a launch
-    /// whose id never saw a matching completion is orphaned, and the launches
-    /// variant carries the transcript path a resumed tailer needs.
-    #[test]
-    fn unresolved_background_agent_launches_find_orphans() {
+        // A background launch with no matching completion is orphaned.
         let (_tmp, store) = open_store(1000);
         record_from(
             &store,
@@ -845,18 +824,12 @@ mod tests {
         );
         assert!(store.unresolved_background_agent_ids("s-2").is_empty());
         assert!(store.unresolved_background_agent_launches("s-2").is_empty());
-    }
 
-    /// A completion row whose `agent_id` is not extractable (truncated
-    /// payload, schema drift) must not hide every other orphan: SQLite's
-    /// `NOT IN` goes `NULL` for the whole result once the subquery yields one
-    /// `NULL`, silently no-opping the detach scan. The store never writes
-    /// such a row, so insert one directly.
-    #[test]
-    fn unresolved_background_agent_ids_survive_an_unextractable_completed_row() {
-        let (_tmp, store) = open_store(1000);
+        // A completion row whose `agent_id` is not extractable must not blank
+        // the whole scan: SQLite's `NOT IN` goes `NULL` once the subquery
+        // yields one `NULL`. The store never writes such a row.
         store
-            .record("s-1", 1, &bg_launched("bg-real-orphan", ""))
+            .record("s-3", 1, &bg_launched("bg-real-orphan", ""))
             .unwrap();
         store
             .conn()
@@ -864,7 +837,7 @@ mod tests {
                 "INSERT INTO acp_events (session_id, seq, event_json, created_at, discriminant)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
-                    "s-1",
+                    "s-3",
                     2_i64,
                     "{\"BackgroundAgentCompleted\":{}}",
                     0_i64,
@@ -874,9 +847,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.unresolved_background_agent_ids("s-1"),
+            store.unresolved_background_agent_ids("s-3"),
             ["bg-real-orphan".to_string()],
             "an unextractable Completed row must not blank the whole scan"
         );
+    }
+
+    fn bg_launched(agent_id: &str, output_file: &str) -> Event {
+        Event::BackgroundAgentLaunched {
+            agent_id: agent_id.into(),
+            tool_call_id: format!("tc-{agent_id}"),
+            description: "map backend".into(),
+            prompt: "do it".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: output_file.into(),
+            started_at: chrono::Utc::now(),
+        }
     }
 }

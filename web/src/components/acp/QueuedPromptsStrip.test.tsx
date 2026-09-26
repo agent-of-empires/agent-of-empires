@@ -60,10 +60,6 @@ describe("QueuedPromptsStrip", () => {
     expect(queryAllByTestId("queued-clear-boundary")).toHaveLength(dividers);
   });
 
-  it("renders nothing when the queue is empty", () => {
-    expect(renderWithProfile("claude", []).container.firstChild).toBeNull();
-  });
-
   it.each([
     [["only"], false],
     [["first", "second"], true],
@@ -83,19 +79,20 @@ describe("QueuedPromptsStrip", () => {
     expect(sent).toEqual([row]);
   });
 
-  it("disables Send now when the session is down", () => {
-    const { getByTestId } = renderWithProfile("claude", [mk("a", "wait")], { canSendNow: false });
-    expect((getByTestId("queued-send-now") as HTMLButtonElement).disabled).toBe(true);
-  });
-
   it.each([
-    [false, "Send this queued message now"],
-    [true, "Stop the current turn and send this queued message"],
-  ])("labels Send now (interrupts=%s) and keeps it pressable", (sendNowInterrupts, label) => {
-    const btn = renderWithProfile("claude", [mk("a", "go")], { sendNowInterrupts }).getByTestId("queued-send-now");
-    expect(btn.getAttribute("aria-label")).toBe(label);
-    expect((btn as HTMLButtonElement).disabled).toBe(false);
-  });
+    [false, true, "Send this queued message now", false],
+    [true, true, "Stop the current turn and send this queued message", false],
+    [false, false, "Send this queued message now", true],
+  ])(
+    "labels Send now (interrupts=%s, canSendNow=%s) as %s, disabled=%s",
+    (sendNowInterrupts, canSendNow, label, disabled) => {
+      const btn = renderWithProfile("claude", [mk("a", "go")], { sendNowInterrupts, canSendNow }).getByTestId(
+        "queued-send-now",
+      );
+      expect(btn.getAttribute("aria-label")).toBe(label);
+      expect((btn as HTMLButtonElement).disabled).toBe(disabled);
+    },
+  );
 
   it("renders a thumbnail for an image attachment and no strip for text-only rows", () => {
     const withImage: QueuedPrompt = {

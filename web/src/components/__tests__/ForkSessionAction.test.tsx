@@ -20,21 +20,17 @@ afterEach(() => {
 
 describe("SessionRow Fork session", () => {
   it.each([
-    ["a structured, fork-capable row with a captured id", forkable, {}, true],
-    ["a structured row with no captured acp_session_id", { view: "structured", acp_can_fork: true }, {}, false],
+    ["a structured row with no captured acp_session_id", { view: "structured", acp_can_fork: true }, {}],
     // A resume-only agent mints an id but cannot session/fork.
-    ["a resume-only row", { ...forkable, acp_can_fork: false }, {}, false],
-    ["a terminal row", { view: "terminal" }, {}, false],
-    ["a read-only forkable row", forkable, { readOnly: true }, false],
-  ] as [string, Partial<SessionResponse>, { readOnly?: boolean }, boolean][])(
-    "on %s: offered=%s",
-    (_n, over, options, offered) => {
-      openRowMenu(ws(over), options);
-      expect(screen.queryByTestId("sidebar-context-menu-fork") != null).toBe(offered);
-    },
-  );
+    ["a resume-only row", { ...forkable, acp_can_fork: false }, {}],
+    ["a terminal row", { view: "terminal" }, {}],
+    ["a read-only forkable row", forkable, { readOnly: true }],
+  ] as [string, Partial<SessionResponse>, { readOnly?: boolean }][])("is hidden on %s", (_n, over, options) => {
+    openRowMenu(ws(over), options);
+    expect(screen.queryByTestId("sidebar-context-menu-fork")).toBeNull();
+  });
 
-  it("POSTs a structured create with fork_from", async () => {
+  it("offers fork on a structured, fork-capable row and POSTs a structured create with fork_from", async () => {
     openRowMenu(ws({ ...forkable, project_path: "/repo", profile: "work", acp_session_id: "acp-parent-42" }));
     fireEvent.click(screen.getByTestId("sidebar-context-menu-fork"));
     await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());

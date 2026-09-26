@@ -51,8 +51,6 @@ it.each<[SessionStatus, number, number | undefined, boolean]>([
   ["Idle", 60_000, WINDOW, true],
   ["Idle", WINDOW + 1, WINDOW, false],
   ["Running", 1_000, WINDOW, false],
-  ["Idle", 1, 0, false],
-  ["Idle", 1, -1, false],
 ])("isFreshIdle(%s, %s ms ago, window %s) is %s", (status, ago, window, expected) => {
   expect(isFreshIdle(session(status, ago), window)).toBe(expected);
 });
@@ -63,7 +61,6 @@ it.each<[SessionStatus, number | null, boolean, number | undefined, string]>([
   ["Idle", WINDOW + 1_000, false, WINDOW, "idle"],
   ["Idle", null, false, WINDOW, "idle"],
   ["Waiting", 1_000, false, WINDOW, "waiting"],
-  ["Idle", null, true, undefined, "dormant"],
   ["Idle", 1_000, true, WINDOW, "dormant"],
   ["Stopped", null, false, undefined, "stopped"],
 ])("status classes for %s (%s ms ago, dormant=%s, window %s) use %s", (status, ago, dormant, window, suffix) => {

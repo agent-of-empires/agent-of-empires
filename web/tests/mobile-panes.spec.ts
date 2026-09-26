@@ -57,87 +57,10 @@ test.describe("Mobile right panel picker (#1452)", () => {
         message: "paired terminal collapsed under the keyboard",
       })
       .toBeGreaterThan(150);
-  });
 
-  test("agent and paired terminals stay mounted across view switches", async ({ page }) => {
-    await openLiveTerminal(page, { mobile: true, settings: { mobileFontSize: 10 } });
-    await openPicker(page);
-    await page.getByTestId("mobile-right-panel-pick-paired").click();
-    await page.locator('[data-term="paired"]').waitFor({ state: "visible", timeout: 10_000 });
-
-    // The paired shell stays mounted, keeping its PTY and scrollback.
+    // Back to the agent: the paired shell stays mounted, keeping its PTY and scrollback.
     await backToAgent(page).click();
-    await expect(page.locator('[data-term="paired"]')).toHaveCount(1);
-    await expect(liveTerminal(page)).toBeVisible();
-  });
-
-  test("picker promotes the diff view, opens a file, and the back chip returns to the agent", async ({ page }) => {
-    const handle = await mockTerminalApis(page);
-    await page.route("**/api/sessions/*/diff/files", (r) =>
-      r.fulfill({
-        json: {
-          files: [{ path: "src/foo.ts", old_path: null, status: "modified", additions: 2, deletions: 1 }],
-          per_repo_bases: [{ base_branch: "main" }],
-          warning: null,
-        },
-      }),
-    );
-    await openLiveSession(page, handle, { mobile: true, settings: null });
-
-    await openPicker(page);
-    await page.getByTestId("mobile-right-panel-pick-diff").click();
-    await expect(picker(page)).toHaveCount(0);
-    await expect(backToAgent(page)).toBeVisible();
-
-    const row = page.locator('button[data-index="0"]').first();
-    await row.hover();
-    await row.click();
-    await expect(page.locator('button[data-index="0"]')).toHaveCount(0);
-    await expect(backToAgent(page)).toBeVisible();
-
-    await backToAgent(page).click();
-    await expect(backToAgent(page)).toHaveCount(0);
-    await expect(liveTerminal(page)).toBeVisible();
-  });
-
-  // #2514: a plugin "pane" slot rendered as a dock tab on desktop but had no
-  // path on mobile; the picker now lists plugin panes and promotes
-  // PluginPaneBody into the main pane.
-  test("picker lists a plugin pane and promotes it into the main pane (#2514)", async ({ page }) => {
-    // One pane scoped to the seeded session, shaped like the github plugin's
-    // `github_pane`. Its id resolves to "plugin:acme.kit:gh".
-    const entry = {
-      plugin_id: "acme.kit",
-      slot: "pane",
-      id: "gh",
-      session_id: "pinch-test",
-      payload: {
-        title: "GitHub",
-        default_location: "right",
-        icon: "git-pull-request",
-        blocks: [
-          { kind: "heading", text: "GitHub" },
-          { kind: "note", text: "PR #1 open" },
-        ],
-      },
-    };
-    const handle = await mockTerminalApis(page);
-    // Registered after mockTerminalApis so this handler wins for ui-state.
-    await page.route("**/api/plugins/ui-state", (r) => r.fulfill({ json: { entries: [entry], notifications: [] } }));
-    await openLiveSession(page, handle, { mobile: true, settings: null });
-    await openPicker(page);
-
-    const option = page.getByTestId("mobile-right-panel-pick-plugin:acme.kit:gh");
-    await expect(option).toBeVisible();
-    await expect(option).toContainText("GitHub");
-
-    await option.click();
-    await expect(picker(page)).toHaveCount(0);
-    await expect(page.getByTestId("plugin-pane-body")).toContainText("PR #1 open");
-    await expectSafeAreaInset(page, "mobile-plugin-layer");
-
-    await backToAgent(page).click();
-    await expect(backToAgent(page)).toHaveCount(0);
+    await expect(paired).toHaveCount(1);
     await expect(liveTerminal(page)).toBeVisible();
   });
 
@@ -170,21 +93,16 @@ test.describe("Mobile right panel picker (#1452)", () => {
 test.describe("Desktop right panel split is unchanged (#1452)", () => {
   test.use({ viewport: { width: 1400, height: 900 }, hasTouch: false });
 
-  test("renders the side-by-side split, not the mobile picker", async ({ page }) => {
+  // The mobile touch toolbar is gated on (pointer: coarse) in useMobileKeyboard,
+  // which never matches a desktop project even with a session open.
+  test("renders the side-by-side split and no mobile picker or touch toolbar", async ({ page }) => {
     await openLiveTerminal(page, { settings: null });
+    await expect(page).toHaveURL(/\/session\/pinch-test/, { timeout: 10_000 });
 
     await expect(page.getByTestId("content-split-resize-handle")).toBeVisible();
     await expect(page.getByTestId("activity-bar")).toBeVisible();
     await expect(page.getByRole("button", { name: "Toggle panels" })).toHaveCount(0);
     await expect(picker(page)).toHaveCount(0);
-  });
-
-  // The mobile touch toolbar is gated on (pointer: coarse) in useMobileKeyboard,
-  // which never matches a desktop project even with a session open.
-  test("the touch toolbar never renders on a desktop viewport", async ({ page }) => {
-    await openLiveTerminal(page, { settings: null });
-    await expect(page).toHaveURL(/\/session\/pinch-test/, { timeout: 10_000 });
-
     await expect(page.getByRole("button", { name: "Arrow up" })).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Ctrl+C interrupt" })).toHaveCount(0);
   });
@@ -197,19 +115,17 @@ test.describe("Mobile agent pane", () => {
   // view: real DOM text, native scrolling, no xterm.js and no canvases. This
   // sidesteps the WebKit WebGL corruption (xtermjs/xterm.js#5816) and gives iOS
   // native text selection.
-  test("iPhone agent pane renders the live view, not xterm", async ({ page }) => {
-    await openLiveTerminal(page, { mobile: true, settings: null });
+  test("no touch toolbar without a session; the agent pane renders the live view, not xterm", async ({ page }) => {
+    const handle = await mockTerminalApis(page);
+    await page.goto("/");
+    await expect(page.locator("header")).toBeVisible();
+    await expect(page.getByRole("button", { name: /Arrow/ })).toHaveCount(0);
 
+    await openLiveSession(page, handle, { mobile: true, settings: null });
     await expect(liveContent(page)).toBeAttached();
     await expect(page.locator("[data-live-terminal] canvas")).toHaveCount(0);
     await expect(page.locator(".xterm")).toHaveCount(0);
     await expect.poll(() => liveContent(page).first().innerText()).toContain("$ ready");
-  });
-
-  test("the touch toolbar does not render without an active session", async ({ page }) => {
-    await page.goto("/");
-    await expect(page.locator("header")).toBeVisible();
-    await expect(page.getByRole("button", { name: /Arrow/ })).toHaveCount(0);
   });
 });
 
@@ -295,7 +211,7 @@ test.describe("Mobile fullscreen-agent layout", () => {
 test.describe("Mobile settings header", () => {
   test.use(iPhone13);
 
-  test("Back and title sit on a row above the ProfileSelector, with room between them", async ({ page }) => {
+  test("Back and title sit on a row above the ProfileSelector and the header never overflows", async ({ page }) => {
     await page.goto("/settings");
     const backBtn = page.getByRole("button", { name: /Back/ });
     const profileLabel = page.getByText("Profile", { exact: true });
@@ -310,19 +226,17 @@ test.describe("Mobile settings header", () => {
     // gap-x-3 on the header (12px); anything above 6px proves the
     // cramped-against-left-edge regression is gone.
     expect(titleBox.x - (backBox.x + backBox.width)).toBeGreaterThan(6);
-  });
 
-  for (const width of [390, 320]) {
-    test(`header does not overflow at ${width}px`, async ({ page }) => {
+    // Overflow inside the ProfileSelector row is allowed via overflow-x-auto,
+    // but the header container itself must not push past the viewport edge.
+    const header = page.getByTestId("settings-header");
+    for (const width of [390, 320]) {
       await page.setViewportSize({ width, height: 640 });
-      await page.goto("/settings");
-      const header = page.getByTestId("settings-header");
-      await expect(header).toBeVisible();
-      // Overflow inside the ProfileSelector row is allowed via overflow-x-auto,
-      // but the header container itself must not push past the viewport edge.
-      const box = await header.evaluate((el) => ({ scrollWidth: el.scrollWidth, clientWidth: el.clientWidth }));
-      expect(box.scrollWidth).toBeLessThanOrEqual(box.clientWidth);
-      expect((await header.boundingBox())!.width).toBeLessThanOrEqual(width);
-    });
-  }
+      await expect
+        .poll(() =>
+          header.evaluate((el) => el.scrollWidth <= el.clientWidth && el.getBoundingClientRect().width <= innerWidth),
+        )
+        .toBe(true);
+    }
+  });
 });

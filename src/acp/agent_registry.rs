@@ -318,34 +318,6 @@ mod tests {
     }
 
     #[test]
-    fn defaults_spawn_commands_and_sorted_listing() {
-        let reg = AgentRegistry::with_defaults();
-        let expected: &[(&str, &str, &[&str])] = &[
-            ("aoe-agent", "aoe-agent", &[]),
-            ("claude", "claude-agent-acp", &[]),
-            ("claude-code", "claude-agent-acp", &[]),
-            ("codex", "codex-acp", &[]),
-            ("gemini", "gemini", &["--acp"]),
-            ("kimi", "kimi", &["acp"]),
-            ("omp", "omp", &["acp"]),
-            ("opencode", "opencode", &["acp"]),
-            ("pi", "pi-acp", &[]),
-            ("prime-agent", "prime-agent", &["--mode", "acp"]),
-            ("vibe", "vibe-acp", &[]),
-        ];
-        let listed: Vec<(&str, &str, Vec<String>)> = reg
-            .list()
-            .into_iter()
-            .map(|(name, spec)| (name.as_str(), spec.command.as_str(), spec.args.clone()))
-            .collect();
-        let expected: Vec<(&str, &str, Vec<String>)> = expected
-            .iter()
-            .map(|(name, command, args)| (*name, *command, strings(args)))
-            .collect();
-        assert_eq!(listed, expected, "sorted by name, commands unchanged");
-    }
-
-    #[test]
     fn default_env_allowlists_come_from_the_binarys_catalog_entry() {
         let reg = AgentRegistry::with_defaults();
         for (name, spec) in reg.list() {

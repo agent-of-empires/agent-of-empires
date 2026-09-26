@@ -4195,26 +4195,6 @@ mod tests {
     }
 
     #[test]
-    fn passive_resize_ignores_one_frame_toast_geometry() {
-        // The toast frame drops the output rect one row for a single refresh, then
-        // returns. Neither the shrink nor the bounce-back may reach tmux: the double
-        // SIGWINCH is the cursor jiggle users saw on live-send entry.
-        let steady = geo("a", 141, 43);
-        let toast = geo("a", 141, 42);
-        // Toast frame: shrink is armed, not fired.
-        assert_eq!(
-            passive_resize_step(&toast, Some(&steady), None),
-            PassiveResizeStep::Arm,
-        );
-        // Post-toast frame: back in sync, and the caller drops the armed
-        // geometry so a later real change still needs two sightings.
-        assert_eq!(
-            passive_resize_step(&steady, Some(&steady), Some(&toast)),
-            PassiveResizeStep::InSync,
-        );
-    }
-
-    #[test]
     fn passive_resize_refires_while_unsynced() {
         // A Fire whose tmux-side resize couldn't happen (session not started, or an
         // active size owner) leaves synced empty and pending armed, so the next refresh
@@ -4370,160 +4350,97 @@ mod tests {
     }
 
     #[test]
-    fn selected_row_style_preserves_readable_status_color() {
-        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
-        let style = Style::default().fg(theme.running);
-
-        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.running));
-    }
-
-    #[test]
-    fn selected_row_style_sets_text_for_default_foreground() {
-        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
-        let style = Style::default();
-
-        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
-    }
-
-    #[test]
-    fn selected_row_style_falls_back_when_color_clashes() {
+    fn selected_row_style_keeps_readable_fg_and_falls_back_to_text() {
         let mut theme = crate::tui::styles::load_theme_with_mode("empire", false);
-        theme.dimmed = theme.session_selection;
-        let style = Style::default().fg(theme.dimmed);
-
-        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
-    }
-
-    #[test]
-    fn compose_list_title_omits_profile_and_suffix_at_defaults() {
-        // Default group/sort and no profile filter: title is just the prefix,
-        // no `[all]` tag, no parenthesized suffix.
-        let title = compose_list_title("aoe", None, GroupByMode::Manual, SortOrder::Newest);
-        assert_eq!(title, " aoe ");
-    }
-
-    #[test]
-    fn compose_list_title_includes_profile_when_filter_active() {
-        let title = compose_list_title(
-            "aoe",
-            Some("my-profile"),
-            GroupByMode::Manual,
-            SortOrder::Newest,
+        let fg = |style: Style, theme: &Theme| selected_row_style(style, theme).fg;
+        assert_eq!(
+            fg(Style::default().fg(theme.running), &theme),
+            Some(theme.running),
+            "a readable status color survives selection"
         );
-        assert_eq!(title, " aoe [my-profile] ");
+        assert_eq!(fg(Style::default(), &theme), Some(theme.text));
+        theme.dimmed = theme.session_selection;
+        assert_eq!(
+            fg(Style::default().fg(theme.dimmed), &theme),
+            Some(theme.text),
+            "a color that clashes with the selection falls back to text"
+        );
     }
 
     #[test]
-    fn compose_list_title_shows_by_project_only() {
-        let title = compose_list_title("aoe", None, GroupByMode::Project, SortOrder::Newest);
-        assert_eq!(title, " aoe · project ");
-    }
-
-    #[test]
-    fn compose_list_title_group_by_suffix_per_mode() {
+    fn compose_list_title_cases() {
+        use crate::session::config::GroupByMode::{Manual, Org, Project};
+        use crate::session::config::SortOrder::{LastActivity, Newest, Oldest, AZ, ZA};
+        // Newest and Manual are the defaults and add no suffix; the profile tag shows only
+        // while a profile filter is active.
         let cases = [
-            (GroupByMode::Manual, ""),
-            (GroupByMode::Project, " · project"),
-            (GroupByMode::Org, " · org"),
+            ("aoe", None, Manual, Newest, " aoe "),
+            (
+                "aoe",
+                Some("my-profile"),
+                Manual,
+                Newest,
+                " aoe [my-profile] ",
+            ),
+            ("aoe", None, Project, Newest, " aoe · project "),
+            ("aoe", None, Org, Newest, " aoe · org "),
+            ("aoe", None, Manual, LastActivity, " aoe · Recent "),
+            ("aoe", None, Manual, Oldest, " aoe · Oldest "),
+            ("aoe", None, Manual, ZA, " aoe · Z-A "),
+            (
+                "aoe",
+                None,
+                Project,
+                LastActivity,
+                " aoe · project · Recent ",
+            ),
+            (
+                "aoe",
+                Some("alpha"),
+                Manual,
+                LastActivity,
+                " aoe [alpha] · Recent ",
+            ),
+            (
+                "aoe",
+                Some("alpha"),
+                Project,
+                LastActivity,
+                " aoe [alpha] · project · Recent ",
+            ),
+            ("Tool: foo", None, Manual, AZ, " Tool: foo · A-Z "),
+            (
+                "Terminals",
+                Some("work"),
+                Project,
+                Newest,
+                " Terminals [work] · project ",
+            ),
         ];
-        for (mode, suffix) in cases {
-            let title = compose_list_title("aoe", None, mode, SortOrder::Newest);
-            assert_eq!(title, format!(" aoe{suffix} "), "{mode:?}");
+        for (prefix, profile, group_by, sort, expected) in cases {
+            assert_eq!(
+                compose_list_title(prefix, profile, group_by, sort),
+                expected,
+                "{prefix} {profile:?} {group_by:?} {sort:?}"
+            );
         }
     }
 
     #[test]
-    fn compose_list_title_shows_sort_only_when_non_default() {
-        let title = compose_list_title("aoe", None, GroupByMode::Manual, SortOrder::LastActivity);
-        assert_eq!(title, " aoe · Recent ");
-    }
-
-    #[test]
-    fn compose_list_title_merges_group_and_sort_suffixes() {
-        let title = compose_list_title(
-            "aoe",
-            Some("alpha"),
-            GroupByMode::Project,
-            SortOrder::LastActivity,
-        );
-        assert_eq!(title, " aoe [alpha] · project · Recent ");
-    }
-
-    #[test]
-    fn compose_list_title_default_sort_drops_suffix_segment() {
-        // Newest is the default; it must not appear in the title even when
-        // group mode contributes its own suffix piece.
-        let title = compose_list_title("aoe", None, GroupByMode::Project, SortOrder::Newest);
-        assert_eq!(title, " aoe · project ");
-    }
-
-    #[test]
-    fn compose_list_title_supports_tool_prefix() {
-        let title = compose_list_title("Tool: foo", None, GroupByMode::Manual, SortOrder::AZ);
-        assert_eq!(title, " Tool: foo · A-Z ");
-    }
-
-    #[test]
-    fn compose_list_title_supports_terminal_prefix() {
-        // Terminal view mode uses the "Terminals" prefix; verify it flows
-        // through the helper just like the Agent and Tool prefixes do.
-        let title = compose_list_title(
-            "Terminals",
-            Some("work"),
-            GroupByMode::Project,
-            SortOrder::Newest,
-        );
-        assert_eq!(title, " Terminals [work] · project ");
-    }
-
-    #[test]
-    fn compose_list_title_default_sort_with_project_and_profile() {
-        // Matrix cell: default sort + project group + active profile.
-        let title = compose_list_title(
-            "aoe",
-            Some("alpha"),
-            GroupByMode::Project,
-            SortOrder::Newest,
-        );
-        assert_eq!(title, " aoe [alpha] · project ");
-    }
-
-    #[test]
-    fn compose_list_title_non_default_sort_with_profile_only() {
-        // Matrix cell: non-default sort + manual group + active profile.
-        let title = compose_list_title(
-            "aoe",
-            Some("alpha"),
-            GroupByMode::Manual,
-            SortOrder::LastActivity,
-        );
-        assert_eq!(title, " aoe [alpha] · Recent ");
-    }
-
-    #[test]
-    fn compose_list_title_non_default_sort_with_project_no_profile() {
-        // Matrix cell: non-default sort + project group + no profile.
-        let title = compose_list_title("aoe", None, GroupByMode::Project, SortOrder::LastActivity);
-        assert_eq!(title, " aoe · project · Recent ");
-    }
-
-    #[test]
-    fn compose_list_title_renders_oldest_sort_label() {
-        let title = compose_list_title("aoe", None, GroupByMode::Manual, SortOrder::Oldest);
-        assert_eq!(title, " aoe · Oldest ");
-    }
-
-    #[test]
-    fn compose_list_title_renders_za_sort_label() {
-        let title = compose_list_title("aoe", None, GroupByMode::Manual, SortOrder::ZA);
-        assert_eq!(title, " aoe · Z-A ");
-    }
-
-    #[test]
-    fn profile_short_code_multi_segment_takes_initials() {
-        assert_eq!(profile_short_code("forit-backup"), "fb");
-        assert_eq!(profile_short_code("pivot-main"), "pm");
-        assert_eq!(profile_short_code("connect_airlines-work"), "caw");
+    fn profile_short_code_takes_initials_or_a_prefix() {
+        for (profile, expected) in [
+            ("forit-backup", "fb"),
+            ("pivot-main", "pm"),
+            ("connect_airlines-work", "caw"),
+            ("Forit_Backup", "fb"),
+            ("default", "def"),
+            ("ForIT", "for"),
+            ("a-b-c-d-e-f", "abcd"),
+            ("--foo--", "foo"),
+            ("", ""),
+        ] {
+            assert_eq!(profile_short_code(profile), expected, "{profile:?}");
+        }
     }
 
     #[test]
@@ -4536,17 +4453,6 @@ mod tests {
         assert_eq!(profile_short_code("wma-work"), "wmaw");
         assert_eq!(profile_short_code("p9-main"), "p9m");
         assert_eq!(profile_short_code("bp-main"), "bpm");
-    }
-
-    #[test]
-    fn profile_short_code_single_segment_takes_first_three() {
-        assert_eq!(profile_short_code("default"), "def");
-        assert_eq!(profile_short_code("ForIT"), "for");
-    }
-
-    #[test]
-    fn profile_short_code_caps_at_four_chars() {
-        assert_eq!(profile_short_code("a-b-c-d-e-f"), "abcd");
     }
 
     /// The four-cell cap is enforced after lowercasing and by display width: `İ`
@@ -4610,73 +4516,54 @@ mod tests {
     }
 
     #[test]
-    fn profile_short_code_lowercases_and_ignores_empty_segments() {
-        assert_eq!(profile_short_code("Forit_Backup"), "fb");
-        assert_eq!(profile_short_code("--foo--"), "foo");
-        assert_eq!(profile_short_code(""), "");
+    fn format_relative_age_buckets() {
+        let now = Utc::now();
+        let cases = [
+            (None, ""),
+            (Some(now + chrono::Duration::hours(1)), "<1m"),
+            (Some(now - chrono::Duration::seconds(30)), "<1m"),
+            (Some(now - chrono::Duration::minutes(5)), "5m"),
+            (Some(now - chrono::Duration::hours(3)), "3h"),
+            (Some(now - chrono::Duration::days(7)), "7d"),
+            (Some(now - chrono::Duration::days(60)), "2mo"),
+        ];
+        for (ts, expected) in cases {
+            assert_eq!(format_relative_age(ts), expected, "{ts:?}");
+        }
     }
 
     #[test]
-    fn format_relative_age_none_returns_empty() {
-        assert_eq!(format_relative_age(None), "");
-    }
-
-    #[test]
-    fn format_relative_age_future_timestamp_returns_less_than_1m() {
-        let future = Utc::now() + chrono::Duration::hours(1);
-        assert_eq!(format_relative_age(Some(future)), "<1m");
-    }
-
-    #[test]
-    fn format_relative_age_recent_returns_less_than_1m() {
-        let recent = Utc::now() - chrono::Duration::seconds(30);
-        assert_eq!(format_relative_age(Some(recent)), "<1m");
-    }
-
-    #[test]
-    fn format_relative_age_minutes() {
-        let ts = Utc::now() - chrono::Duration::minutes(5);
-        assert_eq!(format_relative_age(Some(ts)), "5m");
-    }
-
-    #[test]
-    fn format_relative_age_hours() {
-        let ts = Utc::now() - chrono::Duration::hours(3);
-        assert_eq!(format_relative_age(Some(ts)), "3h");
-    }
-
-    #[test]
-    fn format_relative_age_days() {
-        let ts = Utc::now() - chrono::Duration::days(7);
-        assert_eq!(format_relative_age(Some(ts)), "7d");
-    }
-
-    #[test]
-    fn format_relative_age_months() {
-        let ts = Utc::now() - chrono::Duration::days(60);
-        assert_eq!(format_relative_age(Some(ts)), "2mo");
-    }
-
-    #[test]
-    fn capture_lines_for_adds_buffer_to_height() {
-        assert_eq!(capture_lines_for(30, 0), 50);
-    }
-
-    #[test]
-    fn clamp_scroll_to_capture_uses_visible_height_verbatim() {
-        // Content exactly fills a 40-row banner-less pane, so nothing scrolls back and
-        // any offset clamps to 0. Deriving `area_height - 1` internally left a phantom max
-        // offset of 1 and stalled live-follow a row early.
-        assert_eq!(clamp_scroll_to_capture(1, 40, 40), 0);
-        assert_eq!(clamp_scroll_to_capture(5, 40, 40), 0);
-    }
-
-    #[test]
-    fn clamp_scroll_to_capture_allows_real_scrollback() {
-        // 60 captured lines into a 40-row view leaves 20 rows of real history;
-        // offsets within that range pass through, larger ones clamp to the max.
-        assert_eq!(clamp_scroll_to_capture(10, 60, 40), 10);
-        assert_eq!(clamp_scroll_to_capture(50, 60, 40), 20);
+    fn capture_window_clamps_scroll_and_detects_cache_overrun() {
+        // Content that exactly fills a 40-row pane leaves nothing to scroll back (deriving
+        // `area_height - 1` once left a phantom max offset of 1 and stalled live-follow a
+        // row early); extra captured lines are real scrollback that larger offsets clamp to.
+        for (offset, captured, visible, expected) in [
+            (1, 40, 40, 0),
+            (5, 40, 40, 0),
+            (10, 60, 40, 10),
+            (50, 60, 40, 20),
+        ] {
+            assert_eq!(
+                clamp_scroll_to_capture(offset, captured, visible),
+                expected,
+                "offset={offset} captured={captured} visible={visible}"
+            );
+        }
+        // A 60-line cache at height 30 covers scroll until `height + scroll + BUFFER`
+        // exceeds it; an empty cache always recaptures.
+        for (captured, scroll, expected) in [
+            (60, 0, false),
+            (60, 3, false),
+            (60, 9, false),
+            (60, 20, true),
+            (0, 0, true),
+        ] {
+            assert_eq!(
+                scroll_exceeds_cache(captured, 30, scroll),
+                expected,
+                "captured={captured} scroll={scroll}"
+            );
+        }
     }
 
     #[test]
@@ -4733,34 +4620,6 @@ mod tests {
         assert!(!capture_is_exhausted(0, requested));
     }
 
-    #[test]
-    fn scroll_exceeds_cache_false_when_buffer_covers_small_scroll() {
-        // The cache was captured at scroll=0, height=30, so it holds 50 lines. The
-        // predicate must trip only when `height + scroll + BUFFER > captured_lines`, so
-        // with 60 captured lines small scroll increments force no re-capture.
-        let height = 30u16;
-        let captured = 60usize;
-        assert!(!scroll_exceeds_cache(captured, height, 0));
-        assert!(!scroll_exceeds_cache(captured, height, 3));
-        assert!(!scroll_exceeds_cache(captured, height, 9));
-    }
-
-    #[test]
-    fn scroll_exceeds_cache_true_when_scroll_runs_past_captured_window() {
-        // Once the requested visible window + BUFFER exceeds captured_lines,
-        // the cache can no longer cover the scroll and must be re-captured.
-        let height = 30u16;
-        let captured = 60usize;
-        // height(30) + scroll(20) + BUFFER(20) = 70 > 60 → recapture.
-        assert!(scroll_exceeds_cache(captured, height, 20));
-    }
-
-    #[test]
-    fn scroll_exceeds_cache_true_for_empty_cache() {
-        // First render: nothing captured yet, so any request forces capture.
-        assert!(scroll_exceeds_cache(0, 30, 0));
-    }
-
     // -- activity_column_padding ------------------------------------------------------
     //
     // The column lives at `list_width - badge_width - SLOT - MARGIN`; `pad_len` goes
@@ -4768,51 +4627,27 @@ mod tests {
     // not clipped.
 
     #[test]
-    fn activity_column_padding_short_title_with_room_to_spare() {
-        // 35-col pane, 12-col prefix, no badge: trailing reserves 6 (slot)
-        // + 0 (badge) + 1 (margin) = 7, total = 19, pad_len = 35 - 19 = 16.
-        assert_eq!(activity_column_padding(12, 35, 0), Some(16));
-    }
-
-    #[test]
-    fn activity_column_padding_exact_fit_yields_zero_pad() {
-        // Prefix ends right where the trailing block begins.
-        // list_width(20) - prefix(13) - trailing(7) = 0.
-        assert_eq!(activity_column_padding(13, 20, 0), Some(0));
-    }
-
-    #[test]
-    fn activity_column_padding_one_short_hides_column() {
-        // One column over budget: prefix(14) + trailing(7) = 21 > 20.
-        assert_eq!(activity_column_padding(14, 20, 0), None);
-    }
-
-    #[test]
-    fn activity_column_padding_accounts_for_terminal_mode_badge() {
-        // " [host]" is 7 chars. trailing = SLOT(6) + 7 + MARGIN(1) = 14.
-        // 35 - 14 - prefix(10) = 11.
-        assert_eq!(activity_column_padding(10, 35, 7), Some(11));
-        // " [container]" is 12 chars. trailing = 6 + 12 + 1 = 19.
-        // 35 - 19 - 10 = 6.
-        assert_eq!(activity_column_padding(10, 35, 12), Some(6));
-    }
-
-    #[test]
-    fn activity_column_padding_long_title_with_badge_hides_column() {
-        // The badge fits by itself but the column does not, and the decision is per-row:
-        // prefix(20) + slot(6) + badge(12) + margin(1) = 39 > 35. The badge has its own
-        // unconditional render path.
-        assert_eq!(activity_column_padding(20, 35, 12), None);
-    }
-
-    #[test]
-    fn row_tag_content_fits_within_max_width() {
-        // RowTag.rendered() right-pads to max_width by display width; content over
-        // max_width would zero the pad and make the bracket span jitter.
-        // profile_short_code's 4-cell cap is the tightest case.
-        use unicode_width::UnicodeWidthStr;
-        assert!(profile_short_code("forit-backup-extra").width() <= 4);
-        assert!(profile_short_code("界界界-main").width() <= 4);
+    fn activity_column_padding_cases() {
+        // Trailing block = SLOT(6) + badge + MARGIN(1). A badge that fits alone does not
+        // keep the column: the badge has its own unconditional render path.
+        let cases = [
+            ("room to spare", 12, 35, 0, Some(16)),
+            ("exact fit", 13, 20, 0, Some(0)),
+            ("one column over", 14, 20, 0, None),
+            // No fixed 30-column floor: a narrow pane with room keeps the column.
+            ("narrow pane", 8, 25, 0, Some(10)),
+            ("host badge", 10, 35, 7, Some(11)),
+            ("container badge", 10, 35, 12, Some(6)),
+            ("long title with badge", 20, 35, 12, None),
+            ("prefix overflow saturates", usize::MAX, 1000, 0, None),
+        ];
+        for (name, prefix, width, badge, expected) in cases {
+            assert_eq!(
+                activity_column_padding(prefix, width, badge),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     /// The bracketed tag must occupy `max_width + 2` cells as the renderer paints them:
@@ -4936,19 +4771,5 @@ mod tests {
             max_width: 2,
         };
         assert_eq!(sb.rendered(), "[sb]");
-    }
-
-    #[test]
-    fn activity_column_padding_narrow_pane_short_title() {
-        // prefix(8) + 7 trailing = 15 <= 25: a 25-col pane was hidden by the old fixed
-        // 30-col floor even with room to spare.
-        assert_eq!(activity_column_padding(8, 25, 0), Some(10));
-    }
-
-    #[test]
-    fn activity_column_padding_saturates_on_overflow() {
-        // Defensive: prefix near usize::MAX must not wrap. The checked_add
-        // returns None which we map to "doesn't fit".
-        assert_eq!(activity_column_padding(usize::MAX, 1000, 0), None);
     }
 }

@@ -64,67 +64,41 @@ fn clear_structured_error(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migrations::test_cases::assert_rewrites;
 
     #[test]
     fn clears_only_structured_error_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        fs::write(
-            &path,
-            r#"[
+        let corrupt = "{ not valid json";
+        assert_rewrites(
+            "sessions.json",
+            clear_structured_error,
+            &[
+                (
+                    Some(
+                        r#"[
                 {"id":"a","status":"error","view":"structured"},
                 {"id":"b","status":"error","view":"terminal"},
                 {"id":"c","status":"error"},
                 {"id":"d","status":"idle","view":"structured"},
                 {"id":"e","status":"stopped","view":"structured"}
             ]"#,
-        )
-        .unwrap();
-
-        clear_structured_error(&path).unwrap();
-
-        let v: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        let arr = v.as_array().unwrap();
-        // structured + error -> idle (the bug footprint)
-        assert_eq!(arr[0]["status"], "idle");
-        // explicit terminal error -> untouched (real tmux producer)
-        assert_eq!(arr[1]["status"], "error");
-        // absent view means terminal (View::is_terminal skips it) -> untouched
-        assert_eq!(arr[2]["status"], "error");
-        // structured non-error -> untouched
-        assert_eq!(arr[3]["status"], "idle");
-        assert_eq!(arr[4]["status"], "stopped");
-    }
-
-    #[test]
-    fn is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        fs::write(
-            &path,
-            r#"[{"id":"a","status":"error","view":"structured"}]"#,
-        )
-        .unwrap();
-        clear_structured_error(&path).unwrap();
-        let first = fs::read_to_string(&path).unwrap();
-        clear_structured_error(&path).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), first);
-    }
-
-    #[test]
-    fn missing_file_is_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        clear_structured_error(&dir.path().join("does-not-exist.json")).unwrap();
-    }
-
-    #[test]
-    fn corrupt_file_is_skipped_not_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sessions.json");
-        fs::write(&path, "{ not valid json").unwrap();
-        clear_structured_error(&path).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "{ not valid json");
+                    ),
+                    // Only structured + error settles; terminal errors, including
+                    // an absent view, come from a real tmux producer.
+                    Some(
+                        r#"[
+                {"id":"a","status":"idle","view":"structured"},
+                {"id":"b","status":"error","view":"terminal"},
+                {"id":"c","status":"error"},
+                {"id":"d","status":"idle","view":"structured"},
+                {"id":"e","status":"stopped","view":"structured"}
+            ]"#,
+                    ),
+                ),
+                (Some(corrupt), Some(corrupt)),
+                (None, None),
+            ],
+        );
     }
 
     #[test]

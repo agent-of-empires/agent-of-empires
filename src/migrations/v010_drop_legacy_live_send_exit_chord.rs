@@ -62,152 +62,28 @@ fn migrate_config_file(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-
-    fn write(content: &str) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        fs::write(&path, content).unwrap();
-        (dir, path)
-    }
+    use crate::migrations::test_cases::assert_rewrites;
 
     #[test]
-    fn shipped_1_9_0_default_is_dropped() {
-        let (_dir, path) = write(
-            r#"
-[session]
-live_send_exit_chord = "C-q,C-]"
-default_tool = "claude"
-"#,
+    fn drops_only_stuck_default_exit_chords() {
+        let unchanged = |toml: &'static str| (Some(toml), Some(toml));
+        let dropped =
+            |before: &'static str| (Some(before), Some("[session]\ndefault_tool = \"claude\"\n"));
+        assert_rewrites(
+            "config.toml",
+            migrate_config_file,
+            &[
+                dropped("[session]\nlive_send_exit_chord = \"C-q,C-]\"\ndefault_tool = \"claude\"\n"),
+                dropped("[session]\nlive_send_exit_chord = 'C-q,C-\\'\ndefault_tool = \"claude\"\n"),
+                dropped("[session]\nlive_send_exit_chord = \"Ctrl+Q, Ctrl+]\"\ndefault_tool = \"claude\"\n"),
+                // A customised list, the current default and an unrelated value are the user's.
+                unchanged("[session]\nlive_send_exit_chord = \"C-q,C-],F12\"\n"),
+                unchanged("[session]\nlive_send_exit_chord = \"C-q\"\n"),
+                unchanged("[session]\nlive_send_exit_chord = \"F12\"\n"),
+                unchanged("[session]\ndefault_tool = \"claude\"\n"),
+                unchanged("[updates]\nnotify_in_cli = true\n"),
+                (None, None),
+            ],
         );
-        migrate_config_file(&path).unwrap();
-        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert!(result["session"]
-            .as_table()
-            .unwrap()
-            .get("live_send_exit_chord")
-            .is_none());
-        // Other session fields untouched.
-        assert_eq!(result["session"]["default_tool"].as_str(), Some("claude"));
-    }
-
-    #[test]
-    fn in_dev_backslash_default_is_dropped() {
-        let (_dir, path) = write(
-            r#"
-[session]
-live_send_exit_chord = 'C-q,C-\'
-"#,
-        );
-        migrate_config_file(&path).unwrap();
-        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert!(result["session"]
-            .as_table()
-            .unwrap()
-            .get("live_send_exit_chord")
-            .is_none());
-    }
-
-    #[test]
-    fn long_form_modifier_names_are_recognized() {
-        let (_dir, path) = write(
-            r#"
-[session]
-live_send_exit_chord = "Ctrl+Q, Ctrl+]"
-"#,
-        );
-        migrate_config_file(&path).unwrap();
-        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert!(result["session"]
-            .as_table()
-            .unwrap()
-            .get("live_send_exit_chord")
-            .is_none());
-    }
-
-    #[test]
-    fn customized_chord_list_is_left_alone() {
-        // User added F12 on top of a stuck default. They clearly care
-        // about the chord list; don't touch it.
-        let (_dir, path) = write(
-            r#"
-[session]
-live_send_exit_chord = "C-q,C-],F12"
-"#,
-        );
-        migrate_config_file(&path).unwrap();
-        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(
-            result["session"]["live_send_exit_chord"].as_str(),
-            Some("C-q,C-],F12")
-        );
-    }
-
-    #[test]
-    fn current_default_value_is_left_alone() {
-        // User explicitly set the new default. Nothing to clean.
-        let (_dir, path) = write(
-            r#"
-[session]
-live_send_exit_chord = "C-q"
-"#,
-        );
-        migrate_config_file(&path).unwrap();
-        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(
-            result["session"]["live_send_exit_chord"].as_str(),
-            Some("C-q")
-        );
-    }
-
-    #[test]
-    fn unrelated_custom_value_is_left_alone() {
-        // F12-only is a legitimate user choice; leave it alone.
-        let (_dir, path) = write(
-            r#"
-[session]
-live_send_exit_chord = "F12"
-"#,
-        );
-        migrate_config_file(&path).unwrap();
-        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(
-            result["session"]["live_send_exit_chord"].as_str(),
-            Some("F12")
-        );
-    }
-
-    #[test]
-    fn missing_field_is_noop() {
-        let (_dir, path) = write(
-            r#"
-[session]
-default_tool = "claude"
-"#,
-        );
-        migrate_config_file(&path).unwrap();
-        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(result["session"]["default_tool"].as_str(), Some("claude"));
-    }
-
-    #[test]
-    fn no_session_section_is_noop() {
-        let (_dir, path) = write(
-            r#"
-[updates]
-notify_in_cli = true
-"#,
-        );
-        migrate_config_file(&path).unwrap();
-        let result: toml::Table = fs::read_to_string(&path).unwrap().parse().unwrap();
-        assert_eq!(result["updates"]["notify_in_cli"].as_bool(), Some(true));
-    }
-
-    #[test]
-    fn nonexistent_file_is_noop() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("nonexistent.toml");
-        migrate_config_file(&path).unwrap();
     }
 }

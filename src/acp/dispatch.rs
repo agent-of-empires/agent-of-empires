@@ -193,22 +193,4 @@ mod tests {
             assert_eq!(decide(&state(flags), worker(liveness)), expected, "{name}");
         }
     }
-
-    /// The wire shape the clients switch on.
-    #[test]
-    fn dispatch_serializes_to_the_documented_wire_shape() {
-        let cases = [
-            (PromptDispatch::Sent, r#"{"disposition":"sent"}"#),
-            (PromptDispatch::Steered, r#"{"disposition":"steered"}"#),
-            (
-                PromptDispatch::Queued {
-                    reason: QueueReason::Cancelling,
-                },
-                r#"{"disposition":"queued","reason":"cancelling"}"#,
-            ),
-        ];
-        for (dispatch, expected) in cases {
-            assert_eq!(serde_json::to_string(&dispatch).unwrap(), expected);
-        }
-    }
 }

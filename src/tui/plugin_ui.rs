@@ -738,89 +738,39 @@ mod tests {
     }
 
     #[test]
-    fn deserializes_wire_shape_with_omitted_optionals() {
+    fn entry_filters_and_payload_fields() {
         // session_id / body omitted on the wire (skip_serializing_if) must
         // still decode, not error.
         let snap = snapshot(
-            json!([{
-                "plugin_id": "p",
-                "slot": "status-bar",
-                "id": "x",
-                "payload": {"text": "ok", "tone": "success"}
-            }]),
-            json!([{"seq": 1, "plugin_id": "p", "tone": "info", "title": "hi"}]),
-        );
-        assert_eq!(snap.entries.len(), 1);
-        assert!(snap.entries[0].session_id.is_none());
-        assert!(snap.notifications[0].body.is_none());
-    }
-
-    #[test]
-    fn global_entries_exclude_per_session() {
-        let snap = snapshot(
             json!([
-                {"plugin_id": "p", "slot": "status-bar", "id": "g", "payload": {"text": "global"}},
-                {"plugin_id": "p", "slot": "status-bar", "id": "s", "session_id": "sess-1", "payload": {"text": "scoped"}}
-            ]),
-            json!([]),
-        );
-        let got: Vec<&str> = global_entries(&snap, UiSlot::StatusBar)
-            .filter_map(entry_text)
-            .collect();
-        assert_eq!(got, vec!["global"]);
-    }
-
-    #[test]
-    fn session_entries_require_exact_match() {
-        let snap = snapshot(
-            json!([
+                {"plugin_id": "p", "slot": "status-bar", "id": "g", "payload": {"text": "global", "tone": "danger"}},
+                {"plugin_id": "p", "slot": "status-bar", "id": "s", "session_id": "sess-1", "payload": {"text": "scoped"}},
+                {"plugin_id": "p", "slot": "status-bar", "id": "1", "payload": {"text": "   ", "tone": "chartreuse"}},
+                {"plugin_id": "p", "slot": "status-bar", "id": "2", "payload": {"text": 42}},
+                {"plugin_id": "p", "slot": "status-bar", "id": "3", "payload": {}},
                 {"plugin_id": "p", "slot": "detail-badge", "id": "a", "session_id": "sess-1", "payload": {"text": "mine"}},
                 {"plugin_id": "p", "slot": "detail-badge", "id": "b", "session_id": "sess-2", "payload": {"text": "other"}},
                 {"plugin_id": "p", "slot": "detail-badge", "id": "c", "payload": {"text": "no-session"}}
             ]),
-            json!([]),
+            json!([{"seq": 1, "plugin_id": "p", "tone": "info", "title": "hi"}]),
         );
-        let got: Vec<&str> = session_entries(&snap, UiSlot::DetailBadge, "sess-1")
+        assert!(snap.notifications[0].body.is_none());
+        assert_eq!(global_entries(&snap, UiSlot::StatusBar).count(), 4);
+        let global: Vec<&str> = global_entries(&snap, UiSlot::StatusBar)
             .filter_map(entry_text)
             .collect();
-        assert_eq!(got, vec!["mine"]);
-    }
-
-    #[test]
-    fn entry_text_ignores_missing_blank_or_nonstring() {
-        let snap = snapshot(
-            json!([
-                {"plugin_id": "p", "slot": "status-bar", "id": "1", "payload": {"text": "   "}},
-                {"plugin_id": "p", "slot": "status-bar", "id": "2", "payload": {"text": 42}},
-                {"plugin_id": "p", "slot": "status-bar", "id": "3", "payload": {}}
-            ]),
-            json!([]),
-        );
-        assert_eq!(global_entries(&snap, UiSlot::StatusBar).count(), 3);
-        assert_eq!(
-            global_entries(&snap, UiSlot::StatusBar)
-                .filter_map(entry_text)
-                .count(),
-            0
-        );
-    }
-
-    #[test]
-    fn entry_tone_parses_valid_and_drops_invalid() {
-        let snap = snapshot(
-            json!([
-                {"plugin_id": "p", "slot": "status-bar", "id": "1", "payload": {"text": "a", "tone": "danger"}},
-                {"plugin_id": "p", "slot": "status-bar", "id": "2", "payload": {"text": "b", "tone": "chartreuse"}},
-                {"plugin_id": "p", "slot": "status-bar", "id": "3", "payload": {"text": "c"}}
-            ]),
-            json!([]),
-        );
-        let tones: Vec<Option<Tone>> = snap.entries.iter().map(entry_tone).collect();
+        assert_eq!(global, vec!["global"]);
+        let mine: Vec<&str> = session_entries(&snap, UiSlot::DetailBadge, "sess-1")
+            .filter_map(entry_text)
+            .collect();
+        assert_eq!(mine, vec!["mine"]);
+        let tones: Vec<Option<Tone>> = snap.entries[..3].iter().map(entry_tone).collect();
         assert_eq!(tones, vec![Some(Tone::Danger), None, None]);
     }
 
     #[test]
     fn new_notifications_filters_by_seq_and_session_in_order() {
+        assert_eq!(max_notification_seq(&snapshot(json!([]), json!([]))), 0);
         let snap = snapshot(
             json!([]),
             json!([
@@ -836,12 +786,6 @@ mod tests {
             .collect();
         // seq>1, global or sess-1, ascending: seq 2 (mine) then seq 3 (global).
         assert_eq!(titles, vec!["mine", "global-new"]);
-    }
-
-    #[test]
-    fn max_seq_handles_empty() {
-        let snap = snapshot(json!([]), json!([]));
-        assert_eq!(max_notification_seq(&snap), 0);
     }
 
     fn pane_snapshot(entries: serde_json::Value) -> UiSnapshot {
@@ -931,178 +875,180 @@ mod tests {
     }
 
     #[test]
-    fn pane_simple_title_body_form() {
-        let snap = pane_snapshot(pane_entry(json!({"title": "Checks", "body": "all\ngood"})));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert_eq!(texts(&lines), vec!["Checks", "all", "good"]);
-    }
-
-    #[test]
-    fn pane_footer_renders_without_blocks_and_carries_an_all_dropped_entry() {
-        // The footer belongs to the entry, so the simple title/body form gets it
-        // too rather than only the `blocks` form.
-        let simple = pane_snapshot(pane_entry(json!({
-            "title": "GitHub", "body": "no PRs",
-            "footer": {"text": "refreshed 12:07", "value": "ready"}
-        })));
-        assert_eq!(
-            texts(&pane_lines(&simple, "s1", &Theme::default())),
-            vec!["GitHub", "no PRs", "refreshed 12:07 ready"]
-        );
-        // And a block list that all drops out still has a status line worth
-        // showing, so the footer keeps the entry (and its heading) alive.
-        let dropped = pane_snapshot(pane_entry(json!({
-            "title": "GitHub", "blocks": [{"kind": "row"}],
-            "footer": {"text": "refreshed 12:07"}
-        })));
-        assert_eq!(
-            texts(&pane_lines(&dropped, "s1", &Theme::default())),
-            vec!["GitHub", "refreshed 12:07"]
-        );
-    }
-
-    #[test]
-    fn pane_filters_by_session_exactly() {
-        let snap = pane_snapshot(json!([
-            {"plugin_id": "p", "slot": "pane", "id": "a", "session_id": "s1", "payload": {"title": "mine"}},
-            {"plugin_id": "p", "slot": "pane", "id": "b", "session_id": "s2", "payload": {"title": "other"}},
-            {"plugin_id": "p", "slot": "pane", "id": "c", "payload": {"title": "global"}}
-        ]));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert_eq!(texts(&lines), vec!["mine"]);
-    }
-
-    #[test]
-    fn pane_separates_multiple_entries_with_blank_line() {
-        let snap = pane_snapshot(json!([
-            {"plugin_id": "p", "slot": "pane", "id": "a", "session_id": "s1", "payload": {"title": "one"}},
-            {"plugin_id": "p", "slot": "pane", "id": "b", "session_id": "s1", "payload": {"title": "two"}}
-        ]));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert_eq!(texts(&lines), vec!["one", "", "two"]);
-    }
-
-    #[test]
-    fn pane_renders_known_block_kinds() {
-        let snap = pane_snapshot(pane_entry(json!({"title": "GH", "blocks": [
-            {"kind": "heading", "text": "GitHub"},
-            {"kind": "row", "label": "nexus", "value": "PR #12", "sublabel": "open"},
-            {"kind": "note", "text": "heads up", "tone": "warn"},
-            {"kind": "divider"},
-            {"kind": "action", "label": "Refresh", "method": "refresh"}
-        ]})));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        let t = texts(&lines);
-        assert_eq!(t[0], "GH");
-        assert_eq!(t[1], "GitHub");
-        assert_eq!(t[2], "nexus PR #12 open");
-        assert_eq!(t[3], "heads up");
-        assert_eq!(t[4], "─".repeat(DIVIDER_WIDTH));
-        // Action is inert: a label, not a fired button.
-        assert_eq!(t[5], "[action] Refresh");
-    }
-
-    #[test]
-    fn pane_renders_nested_section_indented() {
-        let snap = pane_snapshot(pane_entry(json!({"blocks": [
-            {"kind": "section", "title": "Reviews", "children": [
-                {"kind": "row", "label": "approved", "value": "2"}
-            ]}
-        ]})));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        let t = texts(&lines);
-        assert_eq!(t[1], "REVIEWS");
-        assert_eq!(t[2], "  approved 2");
-    }
-
-    #[test]
-    fn pane_renders_comment_header_and_body() {
-        let snap = pane_snapshot(pane_entry(json!({"blocks": [
-            {"kind": "comment", "author": "octocat", "path": "src/x.rs", "line": 9,
-             "resolved": false, "body": "needs a test"}
-        ]})));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        let t = texts(&lines);
-        assert_eq!(t[1], "octocat  src/x.rs:9  unresolved");
-        assert_eq!(t[2], "needs a test");
-    }
-
-    #[test]
-    fn pane_ignores_unknown_kinds_and_titles_the_entry() {
-        // Unknown kind drops out; the payload title heads the entry, and a
-        // stray `body` stays ignored while `blocks` is present (web parity).
-        let snap = pane_snapshot(pane_entry(json!({
-            "title": "GitHub",
-            "body": "ignored",
-            "blocks": [
-                {"kind": "some-future-kind", "whatever": true},
-                {"kind": "heading", "text": "kept"}
-            ]
-        })));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert_eq!(texts(&lines), vec!["GitHub", "kept"]);
-    }
-
-    #[test]
-    fn pane_entry_heading_falls_back_to_plugin_id() {
-        // No payload title: the heading names the plugin, so two plugins'
-        // stacked panes stay attributable without the web's dock tabs.
-        let snap = pane_snapshot(pane_entry(
-            json!({"blocks": [{"kind": "heading", "text": "Checks"}]}),
-        ));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert_eq!(texts(&lines), vec!["p", "Checks"]);
-    }
-
-    #[test]
-    fn pane_skips_blocks_missing_required_fields_without_panicking() {
-        let snap = pane_snapshot(pane_entry(json!({"blocks": [
-            {"kind": "heading"},
-            {"kind": "row"},
-            {"kind": "comment"},
-            {"kind": "callout"},
-            {"kind": "bar", "segments": [{"value": 0}, {"tone": "info"}]},
-            {"kind": "columns", "children": []},
-            {"kind": "note", "text": "  "}
-        ]})));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert!(lines.is_empty());
-    }
-
-    #[test]
-    fn pane_renders_the_api_12_block_kinds() {
-        let snap = pane_snapshot(pane_entry(json!({"blocks": [
-            {"kind": "callout", "tone": "danger", "icon": "circle-x",
-             "title": "2 required checks failing", "detail": "Blocked until Clippy passes.",
-             "actions": [{"kind": "action", "label": "Merge blocked", "method": "gh.merge", "disabled": true}]},
-            {"kind": "bar", "caption": "18 files", "segments": [
-                {"value": 750, "tone": "success"}, {"value": 250, "tone": "danger"}
-            ]},
-            // No side-by-side layout in a terminal: the children stack in order
-            // at the columns block's own indent.
-            {"kind": "columns", "children": [
-                {"kind": "row", "label": "DIFF", "value": "+842 -317"},
-                {"kind": "row", "prefix": "#3180", "label": "Stale daemon"}
-            ]}
-        ]})));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        // The bar's two tone-colored spans join into one full-width run of cells.
+    fn pane_lines_cases() {
+        let divider = "─".repeat(DIVIDER_WIDTH);
         let bar = "█".repeat(BAR_WIDTH);
-        assert_eq!(
-            texts(&lines),
-            vec![
-                "p",
-                "2 required checks failing",
-                "Blocked until Clippy passes.",
-                // A callout's actions get the same inert treatment as a
-                // top-level `action`; the TUI cannot fire either yet.
-                "[action] Merge blocked",
-                &bar,
-                "18 files",
-                "DIFF +842 -317",
-                "#3180 Stale daemon",
-            ]
-        );
+        let cases: Vec<(&str, serde_json::Value, Vec<&str>)> = vec![
+            (
+                "simple title/body",
+                pane_entry(json!({"title": "Checks", "body": "all\ngood"})),
+                vec!["Checks", "all", "good"],
+            ),
+            (
+                "footer belongs to the entry, not only the blocks form",
+                pane_entry(json!({
+                    "title": "GitHub", "body": "no PRs",
+                    "footer": {"text": "refreshed 12:07", "value": "ready"}
+                })),
+                vec!["GitHub", "no PRs", "refreshed 12:07 ready"],
+            ),
+            (
+                "footer keeps an entry whose blocks all drop",
+                pane_entry(json!({
+                    "title": "GitHub", "blocks": [{"kind": "row"}],
+                    "footer": {"text": "refreshed 12:07"}
+                })),
+                vec!["GitHub", "refreshed 12:07"],
+            ),
+            (
+                "filters by session exactly",
+                json!([
+                    {"plugin_id": "p", "slot": "pane", "id": "a", "session_id": "s1", "payload": {"title": "mine"}},
+                    {"plugin_id": "p", "slot": "pane", "id": "b", "session_id": "s2", "payload": {"title": "other"}},
+                    {"plugin_id": "p", "slot": "pane", "id": "c", "payload": {"title": "global"}}
+                ]),
+                vec!["mine"],
+            ),
+            (
+                "an empty middle entry adds no heading or extra separator",
+                json!([
+                    {"plugin_id": "p", "slot": "pane", "id": "a", "session_id": "s1", "payload": {"title": "one"}},
+                    {"plugin_id": "q", "slot": "pane", "id": "b", "session_id": "s1",
+                     "payload": {"title": "empty", "blocks": [{"kind": "row"}]}},
+                    {"plugin_id": "r", "slot": "pane", "id": "c", "session_id": "s1", "payload": {"title": "two"}}
+                ]),
+                vec!["one", "", "two"],
+            ),
+            (
+                // Actions are inert labels, not fired buttons.
+                "known block kinds",
+                pane_entry(json!({"title": "GH", "blocks": [
+                    {"kind": "heading", "text": "GitHub"},
+                    {"kind": "row", "label": "nexus", "value": "PR #12", "sublabel": "open"},
+                    {"kind": "note", "text": "heads up", "tone": "warn"},
+                    {"kind": "divider"},
+                    {"kind": "action", "label": "Refresh", "method": "refresh"}
+                ]})),
+                vec![
+                    "GH",
+                    "GitHub",
+                    "nexus PR #12 open",
+                    "heads up",
+                    &divider,
+                    "[action] Refresh",
+                ],
+            ),
+            (
+                "nested section indents",
+                pane_entry(json!({"blocks": [
+                    {"kind": "section", "title": "Reviews", "children": [
+                        {"kind": "row", "label": "approved", "value": "2"}
+                    ]}
+                ]})),
+                vec!["p", "REVIEWS", "  approved 2"],
+            ),
+            (
+                "comment header and body",
+                pane_entry(json!({"blocks": [
+                    {"kind": "comment", "author": "octocat", "path": "src/x.rs", "line": 9,
+                     "resolved": false, "body": "needs a test"}
+                ]})),
+                vec!["p", "octocat  src/x.rs:9  unresolved", "needs a test"],
+            ),
+            (
+                // A stray `body` stays ignored while `blocks` is present (web parity).
+                "unknown kinds drop and the title heads the entry",
+                pane_entry(json!({
+                    "title": "GitHub",
+                    "body": "ignored",
+                    "blocks": [
+                        {"kind": "some-future-kind", "whatever": true},
+                        {"kind": "heading", "text": "kept"}
+                    ]
+                })),
+                vec!["GitHub", "kept"],
+            ),
+            (
+                "blocks missing required fields drop without panicking",
+                pane_entry(json!({"blocks": [
+                    {"kind": "heading"},
+                    {"kind": "row"},
+                    {"kind": "comment"},
+                    {"kind": "callout"},
+                    {"kind": "bar", "segments": [{"value": 0}, {"tone": "info"}]},
+                    {"kind": "columns", "children": []},
+                    {"kind": "note", "text": "  "}
+                ]})),
+                vec![],
+            ),
+            (
+                // Web parity: a row needs label or value (no icons in a
+                // terminal); a comment needs only author or body.
+                "row needs label or value, comment needs one field",
+                pane_entry(json!({"blocks": [
+                    {"kind": "row", "sublabel": "orphan"},
+                    {"kind": "comment", "body": "no author"}
+                ]})),
+                vec!["p", "  unresolved", "no author"],
+            ),
+            (
+                // Callout actions are inert; columns stack in order.
+                "api 12 block kinds",
+                pane_entry(json!({"blocks": [
+                    {"kind": "callout", "tone": "danger", "icon": "circle-x",
+                     "title": "2 required checks failing", "detail": "Blocked until Clippy passes.",
+                     "actions": [{"kind": "action", "label": "Merge blocked", "method": "gh.merge", "disabled": true}]},
+                    {"kind": "bar", "caption": "18 files", "segments": [
+                        {"value": 750, "tone": "success"}, {"value": 250, "tone": "danger"}
+                    ]},
+                    {"kind": "columns", "children": [
+                        {"kind": "row", "label": "DIFF", "value": "+842 -317"},
+                        {"kind": "row", "prefix": "#3180", "label": "Stale daemon"}
+                    ]}
+                ]})),
+                vec![
+                    "p",
+                    "2 required checks failing",
+                    "Blocked until Clippy passes.",
+                    "[action] Merge blocked",
+                    &bar,
+                    "18 files",
+                    "DIFF +842 -317",
+                    "#3180 Stale daemon",
+                ],
+            ),
+            (
+                // Header summary trails the title; icon-only badges show
+                // nothing; `selected` becomes a leading marker.
+                "api 12 row and section fields",
+                pane_entry(json!({
+                    "blocks": [
+                        {"kind": "section", "title": "checks", "value": "1 of 2 approved", "value_tone": "warn",
+                         "badges": [{"text": "2 failing", "tone": "danger"}, {"icon": "check", "tone": "success"}],
+                         "children": [
+                            {"kind": "row", "prefix": "#3231", "label": "warn when daemon is stale",
+                             "sublabel": "japanese", "selected": true, "method": "gh.select_pr",
+                             "badges": [{"text": "ci", "tone": "danger"}, {"icon": "circle-x", "tone": "danger"}]}
+                         ]}
+                    ],
+                    "footer": {"text": "refreshed 12:07", "value": "blocked", "tone": "danger", "icon": "refresh-cw"}
+                })),
+                vec![
+                    "p",
+                    "CHECKS  1 of 2 approved  2 failing",
+                    "  ▸ #3231 warn when daemon is stale japanese ci",
+                    "refreshed 12:07 blocked",
+                ],
+            ),
+        ];
+        for (name, entries, want) in cases {
+            let snap = pane_snapshot(entries);
+            assert_eq!(
+                texts(&pane_lines(&snap, "s1", &Theme::default())),
+                want,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -1134,67 +1080,6 @@ mod tests {
         let width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         assert_eq!(width, crowded.len());
         assert!(spans.iter().all(|s| s.content.chars().count() == 1));
-    }
-
-    #[test]
-    fn pane_row_and_section_render_the_api_12_fields() {
-        let snap = pane_snapshot(pane_entry(json!({
-            "blocks": [
-                {"kind": "section", "title": "checks", "value": "1 of 2 approved", "value_tone": "warn",
-                 "badges": [{"text": "2 failing", "tone": "danger"}, {"icon": "check", "tone": "success"}],
-                 "children": [
-                    {"kind": "row", "prefix": "#3231", "label": "warn when daemon is stale",
-                     "sublabel": "japanese", "selected": true, "method": "gh.select_pr",
-                     "badges": [{"text": "ci", "tone": "danger"}, {"icon": "circle-x", "tone": "danger"}]}
-                 ]}
-            ],
-            "footer": {"text": "refreshed 12:07", "value": "blocked", "tone": "danger", "icon": "refresh-cw"}
-        })));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert_eq!(
-            texts(&lines),
-            vec![
-                "p",
-                // The header summary trails the title rather than pinning right;
-                // an icon-only badge has no text a terminal can show.
-                "CHECKS  1 of 2 approved  2 failing",
-                // `selected` becomes a leading marker (there is no ring to tint),
-                // and a `method` row is text, not a control.
-                "  ▸ #3231 warn when daemon is stale japanese ci",
-                "refreshed 12:07 blocked",
-            ]
-        );
-    }
-
-    #[test]
-    fn pane_entry_rendering_nothing_contributes_no_heading_or_separator() {
-        // A middle entry whose blocks all drop out must leave no heading and no
-        // blank-line gap: exactly one separator between the two that do render.
-        let snap = pane_snapshot(json!([
-            {"plugin_id": "p", "slot": "pane", "id": "a", "session_id": "s1", "payload": {"title": "one"}},
-            {"plugin_id": "q", "slot": "pane", "id": "b", "session_id": "s1",
-             "payload": {"title": "empty", "blocks": [{"kind": "row"}]}},
-            {"plugin_id": "r", "slot": "pane", "id": "c", "session_id": "s1", "payload": {"title": "two"}}
-        ]));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        assert_eq!(texts(&lines), vec!["one", "", "two"]);
-    }
-
-    #[test]
-    fn pane_row_needs_a_label_or_value_but_a_comment_needs_only_one_field() {
-        // Web parity: `BlockRow` bails on `!label && !value && !iconComp`, and
-        // the TUI renders no icons, so a sublabel-only row is dropped. A
-        // `BlockComment` bails only on `!author && !body`, so a body-only
-        // comment still renders.
-        let snap = pane_snapshot(pane_entry(json!({"blocks": [
-            {"kind": "row", "sublabel": "orphan"},
-            {"kind": "comment", "body": "no author"}
-        ]})));
-        let lines = pane_lines(&snap, "s1", &Theme::default());
-        let t = texts(&lines);
-        assert!(!t.iter().any(|l| l.contains("orphan")), "{t:?}");
-        assert_eq!(t[1], "  unresolved");
-        assert_eq!(t[2], "no author");
     }
 
     #[test]

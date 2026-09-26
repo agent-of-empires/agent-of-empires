@@ -577,6 +577,91 @@ mod tests {
             p.text.contains("first") && !p.text.contains("second") && !p.text.contains("excluded")
         );
         assert_eq!(p.included_turn_count, 1);
+
+        let p = primer(vec![
+            user("make a plan"),
+            plan(&[
+                ("investigate failure mode", PlanStepStatus::Done),
+                ("wire up endpoint", PlanStepStatus::InProgress),
+                ("c", PlanStepStatus::Pending),
+            ]),
+            done(),
+        ]);
+        for want in [
+            "Plan: 1 done, 1 in progress, 1 pending (3 steps)",
+            "[x] investigate failure mode",
+            "[~] wire up endpoint",
+            "[ ] c",
+        ] {
+            assert!(p.text.contains(want), "missing {want:?}");
+        }
+
+        // An unprocessed prompt is split out only when the agent never answered.
+        let startup_error = Event::AgentStartupError {
+            message: "ACP connection failed".into(),
+        };
+        // (events, unprocessed prompt, rendered turns)
+        let cases = [
+            (
+                vec![
+                    user("earlier turn"),
+                    assistant("earlier reply"),
+                    done(),
+                    user("Refactor it."),
+                    stopped("rate_limited"),
+                ],
+                Some("Refactor it."),
+                1,
+            ),
+            (
+                vec![
+                    user("earlier turn"),
+                    assistant("earlier reply"),
+                    done(),
+                    user("Refactor it."),
+                    stopped("rate_limited"),
+                    stopped(RATE_LIMIT_EXHAUSTED_RETRIES_REASON),
+                ],
+                Some("Refactor it."),
+                1,
+            ),
+            (
+                vec![user("Refactor it."), startup_error],
+                Some("Refactor it."),
+                0,
+            ),
+            (
+                vec![
+                    user("say hi"),
+                    assistant("hi back"),
+                    stopped("rate_limited"),
+                ],
+                None,
+                1,
+            ),
+            (
+                vec![
+                    user("first try"),
+                    stopped("rate_limited"),
+                    user("second try"),
+                    assistant("ok"),
+                    done(),
+                ],
+                None,
+                2,
+            ),
+        ];
+        for (i, (events, unprocessed, turns)) in cases.into_iter().enumerate() {
+            let p = primer(events);
+            assert_eq!(p.unprocessed_prompt.as_deref(), unprocessed, "case {i}");
+            assert_eq!(p.included_turn_count, turns, "case {i}");
+            if let Some(prompt) = unprocessed {
+                assert!(
+                    !p.text.contains(prompt),
+                    "case {i}: rendered as answered history"
+                );
+            }
+        }
     }
 
     #[test]
@@ -649,27 +734,6 @@ mod tests {
     }
 
     #[test]
-    fn plans_render_counts_and_step_titles() {
-        let p = primer(vec![
-            user("make a plan"),
-            plan(&[
-                ("investigate failure mode", PlanStepStatus::Done),
-                ("wire up endpoint", PlanStepStatus::InProgress),
-                ("c", PlanStepStatus::Pending),
-            ]),
-            done(),
-        ]);
-        for want in [
-            "Plan: 1 done, 1 in progress, 1 pending (3 steps)",
-            "[x] investigate failure mode",
-            "[~] wire up endpoint",
-            "[ ] c",
-        ] {
-            assert!(p.text.contains(want), "missing {want:?}");
-        }
-    }
-
-    #[test]
     fn budget_drops_oldest_turns_and_clips_long_text() {
         let events = (0..30)
             .flat_map(|i| {
@@ -718,75 +782,6 @@ mod tests {
                 },
             );
             assert!(p.text.chars().count() <= max, "max_chars={max}");
-        }
-    }
-
-    #[test]
-    fn unprocessed_prompt_is_split_out_only_when_the_agent_never_answered() {
-        let startup_error = Event::AgentStartupError {
-            message: "ACP connection failed".into(),
-        };
-        // (events, unprocessed prompt, rendered turns)
-        let cases = [
-            (
-                vec![
-                    user("earlier turn"),
-                    assistant("earlier reply"),
-                    done(),
-                    user("Refactor it."),
-                    stopped("rate_limited"),
-                ],
-                Some("Refactor it."),
-                1,
-            ),
-            (
-                vec![
-                    user("earlier turn"),
-                    assistant("earlier reply"),
-                    done(),
-                    user("Refactor it."),
-                    stopped("rate_limited"),
-                    stopped(RATE_LIMIT_EXHAUSTED_RETRIES_REASON),
-                ],
-                Some("Refactor it."),
-                1,
-            ),
-            (
-                vec![user("Refactor it."), startup_error],
-                Some("Refactor it."),
-                0,
-            ),
-            (
-                vec![
-                    user("say hi"),
-                    assistant("hi back"),
-                    stopped("rate_limited"),
-                ],
-                None,
-                1,
-            ),
-            (
-                vec![
-                    user("first try"),
-                    stopped("rate_limited"),
-                    user("second try"),
-                    assistant("ok"),
-                    done(),
-                ],
-                None,
-                2,
-            ),
-        ];
-        for (i, (events, unprocessed, turns)) in cases.into_iter().enumerate() {
-            let p = primer(events);
-            assert_eq!(p.unprocessed_prompt.as_deref(), unprocessed, "case {i}");
-            assert_eq!(p.included_turn_count, turns, "case {i}");
-            if let Some(prompt) = unprocessed {
-                assert!(
-                    !p.text.contains(prompt),
-                    "case {i}: rendered as answered history"
-                );
-            }
         }
     }
 }

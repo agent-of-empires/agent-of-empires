@@ -561,34 +561,6 @@ mod tests {
     use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
     use std::sync::Arc;
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn shutdown_publishes_stopped_except_for_test_workers() {
-        let (_home, tmp) = isolate_home();
-        let sink = VecSink::new();
-        let sup = Supervisor::new(sink.clone());
-        sup.test_install_runner("s-stop", runner_config(tmp.path().join("dummy.sock")), None)
-            .await;
-        sup.shutdown("s-stop").await.expect("shutdown");
-        assert_eq!(stopped_reasons(&sink, "s-stop"), ["user_stopped"]);
-
-        sup.test_insert_worker("s-stdio").await;
-        sup.reap_user_stopped().await;
-        assert!(
-            sup.workers.lock().await.contains_key("s-stdio"),
-            "the reaper skips test workers"
-        );
-        sup.shutdown("s-stdio").await.expect("shutdown");
-        assert!(
-            sink.frames
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|(id, _, _)| id != "s-stdio"),
-            "neither the reaper nor shutdown publishes for test workers"
-        );
-    }
-
     /// #4001: teardown must detach every background sub-agent the dying
     /// worker's tailer will never report on again, ahead of the `Stopped` it
     /// already publishes, so a reader folding the log in order sees

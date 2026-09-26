@@ -108,11 +108,15 @@ fn run_aoe(home: &Path, xdg: &Path, stub: &Path, args: &[&str]) -> std::process:
         .expect("run aoe")
 }
 
+/// `aoe agents` and `aoe acp doctor` both render the deprecation notice for
+/// the stubbed gemini. Captured output is piped, so it arrives as plain text:
+/// color is tty-only by contract.
 #[test]
 #[serial_test::parallel]
-fn aoe_agents_lists_deprecated_notice() {
+fn agents_and_acp_doctor_list_the_deprecated_notice() {
     let (_tmp, home, xdg) = isolated_dirs();
     let (_stub_tmp, stub) = stub_dir(&["gemini"]);
+
     let out = run_aoe(&home, &xdg, &stub, &["agents"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     // The ✓ mark carries its own color resets between glyph and name, so
@@ -123,29 +127,15 @@ fn aoe_agents_lists_deprecated_notice() {
         stdout.contains("consider switching to antigravity"),
         "{stdout}"
     );
-    assert!(
-        !stdout.contains("\x1b["),
-        "piped agents output must be escape-free"
-    );
+    assert!(!stdout.contains("\x1b["), "{stdout}");
     assert_eq!(stdout.matches("deprecated since").count(), 1, "{stdout}");
-}
 
-#[test]
-#[serial_test::parallel]
-fn acp_doctor_text_emits_amber_lifecycle_notice() {
-    let (_tmp, home, xdg) = isolated_dirs();
-    let (_stub_tmp, stub) = stub_dir(&["gemini"]);
+    // The stub makes command_present true; the notice rides on the same row.
     let out = run_aoe(&home, &xdg, &stub, &["acp", "doctor"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // The stub makes command_present true; the notice must ride along on
-    // the same row block. Captured output is piped, so it arrives as
-    // plain text: color is tty-only by contract.
     assert!(stdout.contains("[OK] gemini"), "{stdout}");
     assert!(stdout.contains("⚠ deprecated since 2026-06-18"), "{stdout}");
-    assert!(
-        !stdout.contains("\x1b[33m"),
-        "piped output must be escape-free"
-    );
+    assert!(!stdout.contains("\x1b[33m"), "{stdout}");
 }
 
 #[test]

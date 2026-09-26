@@ -380,37 +380,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_slug_reads_every_hosted_spelling() {
-        for url in [
-            "git@github.com:mozilla-ai/any-llm.git",
-            "https://github.com/mozilla-ai/any-llm.git",
-            "ssh://git@github.com/mozilla-ai/any-llm.git",
-            "https://github.com/mozilla-ai/any-llm",
-            "git@github.com:mozilla-ai/any-llm",
+    fn parse_slug_reads_only_owner_repo_remotes() {
+        let slug = Some("mozilla-ai/any-llm");
+        for (url, expected) in [
+            ("git@github.com:mozilla-ai/any-llm.git", slug),
+            ("https://github.com/mozilla-ai/any-llm.git", slug),
+            ("ssh://git@github.com/mozilla-ai/any-llm.git", slug),
+            ("https://github.com/mozilla-ai/any-llm", slug),
+            ("git@github.com:mozilla-ai/any-llm", slug),
+            ("", None),
+            ("git@github.com:owner", None),
+            ("https://github.com/owner", None),
+            ("file:///tmp/repo.git", None),
+            ("file://host/owner/repo.git", None),
+            ("https://example.com/group/sub/repo.git", None),
+            ("git@host:/foo/bar.git", None),
         ] {
             assert_eq!(
-                parse_slug_from_remote_url(url),
-                Some("mozilla-ai/any-llm".to_string()),
+                parse_slug_from_remote_url(url).as_deref(),
+                expected,
                 "{url}"
             );
-        }
-    }
-
-    /// Anything that is not a canonical hosted `owner/repo` yields no slug:
-    /// an incomplete path, a local scheme, a deeper path, or an SSH shorthand
-    /// whose target is an absolute filesystem path.
-    #[test]
-    fn parse_slug_rejects_anything_but_owner_repo() {
-        for url in [
-            "",
-            "git@github.com:owner",
-            "https://github.com/owner",
-            "file:///tmp/repo.git",
-            "file://host/owner/repo.git",
-            "https://example.com/group/sub/repo.git",
-            "git@host:/foo/bar.git",
-        ] {
-            assert_eq!(parse_slug_from_remote_url(url), None, "{url}");
         }
     }
 

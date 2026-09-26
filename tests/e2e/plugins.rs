@@ -14,117 +14,53 @@ use serial_test::parallel;
 
 use crate::harness::{require_tmux, TuiTestHarness};
 
-/// `plugin list` prints a header then one row per builtin. The only bundled
-/// plugin is `aoe.web`, which starts enabled.
-#[test]
-#[parallel]
-fn test_plugin_list_shows_builtins_with_state() {
-    let h = TuiTestHarness::new("plugin_list");
-    let output = h.run_cli(&["plugin", "list"]);
-    assert!(
-        output.status.success(),
-        "aoe plugin list failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("ID") && stdout.contains("VERSION") && stdout.contains("STATE"),
-        "missing header line:\n{stdout}"
-    );
-    let web_line = stdout
+fn web_row(h: &TuiTestHarness) -> String {
+    let stdout = h.run_cli_ok(&["plugin", "list"]);
+    stdout
         .lines()
         .find(|l| l.contains("aoe.web"))
-        .unwrap_or_else(|| panic!("missing aoe.web row:\n{stdout}"));
-    assert!(
-        web_line.contains("1.0.0"),
-        "aoe.web row missing version:\n{web_line}"
-    );
-    assert!(
-        web_line.contains("enabled"),
-        "aoe.web should start enabled:\n{web_line}"
-    );
+        .unwrap_or_else(|| panic!("missing aoe.web row:\n{stdout}"))
+        .to_string()
 }
 
-/// Disabling then re-enabling `aoe.web` flips its state in the list. Unknown
-/// ids error and name the fix.
+/// `plugin list` shows the builtin `aoe.web` with version and state,
+/// `plugin info` prints its manifest details, and disable/enable flip the
+/// listed state. Unknown ids error and name the fix.
 #[test]
 #[parallel]
-fn test_plugin_disable_enable_round_trip() {
-    let h = TuiTestHarness::new("plugin_toggle");
+fn test_plugin_cli_lists_describes_and_toggles_builtins() {
+    let h = TuiTestHarness::new("plugin_cli");
+    let list = h.run_cli_ok(&["plugin", "list"]);
+    assert!(
+        list.contains("ID") && list.contains("VERSION") && list.contains("STATE"),
+        "missing header line:\n{list}"
+    );
+    let row = web_row(&h);
+    assert!(row.contains("1.0.0") && row.contains("enabled"), "{row}");
 
-    let disable = h.run_cli(&["plugin", "disable", "aoe.web"]);
-    assert!(
-        disable.status.success(),
-        "disable failed: {}",
-        String::from_utf8_lossy(&disable.stderr)
-    );
-    let list = h.run_cli(&["plugin", "list"]);
-    let stdout = String::from_utf8_lossy(&list.stdout);
-    let web_line = stdout
-        .lines()
-        .find(|l| l.contains("aoe.web"))
-        .unwrap_or_else(|| panic!("aoe.web missing from list:\n{stdout}"));
-    assert!(
-        web_line.contains("disabled"),
-        "aoe.web should be disabled:\n{web_line}"
-    );
+    let info = h.run_cli_ok(&["plugin", "info", "aoe.web"]);
+    for needle in [
+        "Web Dashboard (aoe.web)",
+        "version:",
+        "1.0.0",
+        "state:",
+        "enabled",
+        "about:",
+    ] {
+        assert!(info.contains(needle), "{needle} missing:\n{info}");
+    }
 
-    let enable = h.run_cli(&["plugin", "enable", "aoe.web"]);
+    h.run_cli_ok(&["plugin", "disable", "aoe.web"]);
+    assert!(web_row(&h).contains("disabled"));
+    h.run_cli_ok(&["plugin", "enable", "aoe.web"]);
+    let row = web_row(&h);
     assert!(
-        enable.status.success(),
-        "enable failed: {}",
-        String::from_utf8_lossy(&enable.stderr)
-    );
-    let list = h.run_cli(&["plugin", "list"]);
-    let stdout = String::from_utf8_lossy(&list.stdout);
-    let web_line = stdout.lines().find(|l| l.contains("aoe.web")).unwrap();
-    assert!(
-        web_line.contains("enabled") && !web_line.contains("disabled"),
-        "aoe.web should be enabled again:\n{web_line}"
+        row.contains("enabled") && !row.contains("disabled"),
+        "{row}"
     );
 
-    // An unknown id errors and points at `plugin list`.
-    let bad = h.run_cli(&["plugin", "enable", "acme.nope"]);
-    assert!(
-        !bad.status.success(),
-        "enabling an unknown plugin must fail"
-    );
-    assert!(
-        String::from_utf8_lossy(&bad.stderr).contains("unknown plugin"),
-        "unknown-id error must name the problem:\n{}",
-        String::from_utf8_lossy(&bad.stderr)
-    );
-}
-
-/// `plugin info aoe.web` prints the manifest name/id header plus the version,
-/// state, and about lines.
-#[test]
-#[parallel]
-fn test_plugin_info_prints_manifest_details() {
-    let h = TuiTestHarness::new("plugin_info");
-    let output = h.run_cli(&["plugin", "info", "aoe.web"]);
-    assert!(
-        output.status.success(),
-        "info failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("Web Dashboard (aoe.web)"),
-        "name/id header missing:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("version:") && stdout.contains("1.0.0"),
-        "version line missing:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("state:") && stdout.contains("enabled"),
-        "state line missing:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("about:"),
-        "about line missing for a plugin with a description:\n{stdout}"
-    );
+    let stderr = h.run_cli_err(&["plugin", "enable", "acme.nope"]);
+    assert!(stderr.contains("unknown plugin"), "{stderr}");
 }
 
 /// `aoe.web` is a default plugin; disabling it must turn off the serve surface
@@ -181,32 +117,7 @@ fn test_serve_refuses_when_web_plugin_disabled() {
     assert!(stopped.status.success(), "serve --stop must succeed");
 }
 
-/// The command palette opens the plugin manager, which lists the bundled
-/// plugins by manifest name + version with their state. Palette-only (no
-/// default chord).
-#[test]
-#[parallel]
-fn test_palette_opens_plugin_manager_listing_builtins() {
-    require_tmux!();
-
-    let mut h = TuiTestHarness::new("plugin_manager_palette");
-    h.spawn_tui();
-
-    h.wait_for(" aoe ");
-    h.send_keys("C-k");
-    h.wait_for("Commands");
-    h.type_text("plugins");
-    h.wait_for("Manage plugins");
-    h.send_keys("Enter");
-
-    // The manager lists builtins by their manifest name + version and state.
-    h.wait_for(" Plugins ");
-    h.assert_screen_contains("Web Dashboard v1.0.0");
-    h.assert_screen_contains("enabled");
-}
-
-/// Open the plugin manager through the palette. Shared by the interactive
-/// manager tests below.
+/// Open the plugin manager through the palette (palette-only, no chord).
 fn open_manager(h: &TuiTestHarness) {
     h.wait_for(" aoe ");
     h.send_keys("C-k");
@@ -217,45 +128,34 @@ fn open_manager(h: &TuiTestHarness) {
     h.wait_for(" Plugins ");
 }
 
-/// Space in the manager toggles the selected plugin and reports where the
-/// write landed (no daemon here, so the plain local message).
+/// The manager lists builtins by manifest name and version with their state.
+/// Enter opens the details popup (`aoe plugin info`'s TUI twin) and Esc closes
+/// it; Space toggles the plugin and reports where the write landed (no daemon
+/// here, so the plain local message).
 #[test]
 #[parallel]
-fn test_tui_manager_toggle_round_trip() {
+fn test_tui_manager_lists_details_and_toggles() {
     require_tmux!();
 
-    let mut h = TuiTestHarness::new("plugin_manager_toggle");
+    let mut h = TuiTestHarness::new("plugin_manager");
     h.spawn_tui();
     open_manager(&h);
+    h.assert_screen_contains("Web Dashboard v1.0.0");
     h.assert_screen_contains("enabled");
-
-    h.send_keys("Space");
-    h.wait_for("Disabled aoe.web");
-    h.assert_screen_contains("disabled");
-
-    h.send_keys("Space");
-    h.wait_for("Enabled aoe.web");
-}
-
-/// Enter opens the details popup: the full manifest disclosure for the
-/// selected plugin (`aoe plugin info`'s TUI twin), Esc closes it.
-#[test]
-#[parallel]
-fn test_tui_manager_details_popup() {
-    require_tmux!();
-
-    let mut h = TuiTestHarness::new("plugin_manager_details");
-    h.spawn_tui();
-    open_manager(&h);
 
     h.send_keys("Enter");
     h.wait_for(" Plugin details ");
     h.assert_screen_contains("Web Dashboard v1.0.0 (aoe.web)");
     h.assert_screen_contains("Builtin plugin (compiled into aoe)");
     h.assert_screen_contains("No capabilities requested.");
-
     h.send_keys("Escape");
     h.wait_for_absent(" Plugin details ", std::time::Duration::from_secs(5));
+
+    h.send_keys("Space");
+    h.wait_for("Disabled aoe.web");
+    h.assert_screen_contains("disabled");
+    h.send_keys("Space");
+    h.wait_for("Enabled aoe.web");
 }
 
 /// The full external-plugin loop the manager now owns: a locally installed

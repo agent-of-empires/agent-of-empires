@@ -424,21 +424,21 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
-    }
 
-    /// A plugin pane action mutates no host state, so it is gated on read-only
-    /// mode only, never on elevation (#2454).
-    #[test]
-    fn plugin_action_does_not_require_elevation() {
+        // A plugin pane action mutates no host state, so it is gated on
+        // read-only mode only, never on elevation (#2454).
         let (_, body) = handler_source(include_str!("plugins.rs"), "invoke_plugin_action")
             .expect("invoke_plugin_action");
         for marker in ["mutation_gate", "is_elevated", "elevation_required"] {
-            assert!(!body.contains(marker), "found `{marker}`");
+            assert!(
+                !body.contains(marker),
+                "invoke_plugin_action: found `{marker}`"
+            );
         }
     }
 
     #[test]
-    fn shell_metacharacters_blocklist_is_exhaustive() {
+    fn input_validators_reject_shell_control_and_path_characters() {
         // Removing a character here is a security change, not a tidy-up.
         let expected: &[char] = &[
             ';', '&', '|', '$', '`', '(', ')', '{', '}', '<', '>', '\n', '\r', '\\', '"', '\'',
@@ -448,10 +448,7 @@ mod tests {
         for &c in SHELL_METACHARACTERS {
             assert!(validate_no_shell_injection(&format!("prefix{c}suffix"), "field").is_err());
         }
-    }
 
-    #[test]
-    fn display_label_validation() {
         // #2624: imported titles carry punctuation that is harmless in a label.
         for value in [
             "I've read @filename?",
@@ -477,10 +474,7 @@ mod tests {
                 "{value:?}"
             );
         }
-    }
 
-    #[test]
-    fn profile_name_validation() {
         for bad in ["../etc", "foo/bar", "..", ".hidden", ""] {
             assert!(validate_profile_name(bad).is_err(), "{bad:?}");
         }

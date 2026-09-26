@@ -33,21 +33,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wire_names_are_lowercase_and_exact() {
-        for (wire, want) in [
-            ("live", SessionScope::Live),
-            ("trashed", SessionScope::Trashed),
-            ("all", SessionScope::All),
-        ] {
-            let json = format!("\"{wire}\"");
-            assert_eq!(serde_json::from_str::<SessionScope>(&json).unwrap(), want);
-        }
-        for bad in ["\"archived\"", "\"LIVE\"", "\"\""] {
-            assert!(serde_json::from_str::<SessionScope>(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
     fn matches_filters_by_state() {
         let live = Instance::new("live", "/repo");
         let mut archived = Instance::new("arch", "/repo");

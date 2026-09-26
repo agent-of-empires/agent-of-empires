@@ -22,37 +22,24 @@ function setup(overrides: Partial<Parameters<typeof MobileRightPanelPicker>[0]> 
   return { onSelect, onClose };
 }
 
+const pluginPane = {
+  id: "plugin:acme.kit:gh" as const,
+  title: "GitHub",
+  defaultDock: "right" as const,
+  icon: undefined,
+  entry: { plugin_id: "acme.kit", slot: "pane" as const, id: "gh", session_id: "s1", payload: {} },
+};
+
 describe("MobileRightPanelPicker", () => {
-  it("renders nothing when closed", () => {
-    const { container } = render(
-      <MobileRightPanelPicker open={false} active="agent" pluginPanes={[]} onSelect={vi.fn()} onClose={vi.fn()} />,
-    );
-    expect(container.firstChild).toBeNull();
-  });
-
-  it("renders the three view entries with the active one marked", () => {
-    setup({ active: "paired" });
-    expect(screen.getByTestId("mobile-right-panel-picker")).toBeDefined();
-    expect(screen.getByTestId("mobile-right-panel-pick-agent")).toBeDefined();
-    expect(screen.getByTestId("mobile-right-panel-pick-diff")).toBeDefined();
-    const paired = screen.getByTestId("mobile-right-panel-pick-paired");
-    expect(paired.getAttribute("aria-current")).toBe("true");
-  });
-
-  it("calls onSelect with the chosen view", () => {
-    const { onSelect } = setup();
-    fireEvent.click(screen.getByTestId("mobile-right-panel-pick-diff"));
-    expect(onSelect).toHaveBeenCalledWith("diff");
-  });
-
-  it("hides gated entries not in availablePanes", () => {
-    setup({ availablePanes: [] });
+  it("hides gated entries not in availablePanes and marks the active one", () => {
+    setup({ availablePanes: [], active: "paired", pluginPanes: [pluginPane] });
     expect(screen.queryByTestId("mobile-right-panel-pick-agents")).toBeNull();
     expect(screen.queryByTestId("mobile-right-panel-pick-diff")).toBeNull();
     expect(screen.queryByTestId("mobile-right-panel-pick-files")).toBeNull();
+    expect(screen.queryByTestId("mobile-right-panel-pick-plugin:acme.kit:gh")).toBeNull();
     // The mobile-only pseudo-views are never gated.
     expect(screen.getByTestId("mobile-right-panel-pick-agent")).toBeDefined();
-    expect(screen.getByTestId("mobile-right-panel-pick-paired")).toBeDefined();
+    expect(screen.getByTestId("mobile-right-panel-pick-paired").getAttribute("aria-current")).toBe("true");
   });
 
   it("shows the Sub agents and Files entries and selects them when available", () => {
@@ -64,14 +51,11 @@ describe("MobileRightPanelPicker", () => {
   });
 
   it("lists plugin panes after the built-ins and selects them by id", () => {
-    const pane = {
-      id: "plugin:acme.kit:gh" as const,
-      title: "GitHub",
-      defaultDock: "right" as const,
-      icon: undefined,
-      entry: { plugin_id: "acme.kit", slot: "pane" as const, id: "gh", session_id: "s1", payload: {} },
-    };
-    const { onSelect } = setup({ pluginPanes: [pane], availablePanes: ["diff", pane.id], active: pane.id });
+    const { onSelect } = setup({
+      pluginPanes: [pluginPane],
+      availablePanes: ["diff", pluginPane.id],
+      active: pluginPane.id,
+    });
     const option = screen.getByTestId("mobile-right-panel-pick-plugin:acme.kit:gh");
     expect(option.textContent).toContain("GitHub");
     expect(option.getAttribute("aria-current")).toBe("true");
@@ -79,33 +63,13 @@ describe("MobileRightPanelPicker", () => {
     expect(onSelect).toHaveBeenCalledWith("plugin:acme.kit:gh");
   });
 
-  it("hides a plugin pane not present in availablePanes (e.g. CityHall mode)", () => {
-    const pane = {
-      id: "plugin:acme.kit:gh" as const,
-      title: "GitHub",
-      defaultDock: "right" as const,
-      icon: undefined,
-      entry: { plugin_id: "acme.kit", slot: "pane" as const, id: "gh", session_id: "s1", payload: {} },
-    };
-    setup({ pluginPanes: [pane], availablePanes: ["diff"] });
-    expect(screen.queryByTestId("mobile-right-panel-pick-plugin:acme.kit:gh")).toBeNull();
-  });
-
-  it("closes on backdrop click", () => {
-    const { onClose } = setup();
-    fireEvent.click(screen.getByTestId("mobile-right-panel-picker-backdrop"));
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
-  it("closes on Escape", () => {
-    const { onClose } = setup();
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
-  it("ignores non-Escape keys", () => {
+  it("closes on backdrop click and on Escape only", () => {
     const { onClose } = setup();
     fireEvent.keyDown(window, { key: "Enter" });
     expect(onClose).not.toHaveBeenCalled();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByTestId("mobile-right-panel-picker-backdrop"));
+    expect(onClose).toHaveBeenCalledTimes(2);
   });
 });

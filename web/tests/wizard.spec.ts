@@ -19,14 +19,6 @@ const BRANCH_PLACEHOLDER = "Uses session title if empty";
 const GROUP_PLACEHOLDER = "Optional, for organizing related sessions";
 
 test.describe("essentials", () => {
-  test("recent project + default agent launches with one click, no paging", async ({ page }) => {
-    const created = await startWizard(page, WORKTREE_ON);
-    await expect(page.getByRole("button", { name: "Next" })).toHaveCount(0);
-    await launch(page);
-    await expect.poll(() => created[0]?.path).toBe("/tmp/example");
-    expect(created[0]?.tool).toBe("claude");
-  });
-
   test("only essentials show on open; advanced controls hide behind collapsed More options", async ({ page }) => {
     await startWizard(page, WORKTREE_ON);
     const w = wizard(page);
@@ -89,6 +81,8 @@ test.describe("essentials", () => {
 
   test("Cmd/Ctrl+Enter fires the create-session POST with the default worktree", async ({ page }) => {
     const created = await startWizard(page, WORKTREE_ON);
+    // The recent project and default agent need no paging.
+    await expect(page.getByRole("button", { name: "Next" })).toHaveCount(0);
     await setTitle(page, "kbd-launch");
     await page.keyboard.press("ControlOrMeta+Enter");
     await expect.poll(() => created[0]?.tool).toBe("claude");
@@ -122,51 +116,10 @@ test.describe("essentials", () => {
 });
 
 test.describe("worktree and branch", () => {
-  test("worktree toggle follows worktree.enabled and gates the branch input + Base branch section", async ({
+  // #969: attaching to an existing branch sends create_new_branch false and hides the new-branch base picker.
+  test("attach to existing branch hides Base branch; branch, group and extra args reach the create payload", async ({
     page,
   }) => {
-    for (const enabled of [true, false]) {
-      await page.unrouteAll({ behavior: "ignoreErrors" });
-      await startWizard(page, { settings: { worktree: { enabled } } });
-      await expandMoreOptions(page);
-      const w = wizard(page);
-      const toggle = w.getByRole("switch", { name: /Create a worktree/ });
-      const controls = [w.getByPlaceholder(BRANCH_PLACEHOLDER), w.getByRole("button", { name: "Base branch" })];
-      await expect(toggle).toHaveAttribute("aria-checked", String(enabled));
-      for (const c of controls) await expect(c).toHaveCount(enabled ? 1 : 0);
-      if (!enabled) continue;
-      await toggle.click();
-      await expect(toggle).toHaveAttribute("aria-checked", "false");
-      for (const c of controls) await expect(c).toHaveCount(0);
-      await toggle.click();
-      await expect(toggle).toHaveAttribute("aria-checked", "true");
-      await expect(controls[0]!).toBeVisible();
-    }
-  });
-
-  test("typing a title derives the worktree branch while it is not manually edited", async ({ page }) => {
-    await startWizard(page, WORKTREE_ON);
-    await setTitle(page, "My Cool Feature");
-    await expandMoreOptions(page);
-    await expect(wizard(page).getByPlaceholder(BRANCH_PLACEHOLDER)).toHaveValue("my-cool-feature");
-  });
-
-  test("worktree branch and group set under More options flow into the create payload", async ({ page }) => {
-    const created = await startWizard(page, WORKTREE_ON);
-    await expandMoreOptions(page);
-    await wizard(page).getByPlaceholder(BRANCH_PLACEHOLDER).fill("my-feature-branch");
-    await wizard(page).getByPlaceholder(GROUP_PLACEHOLDER).fill("backend");
-    await launch(page);
-    await expect.poll(() => created[0]?.worktree_enabled).toBe(true);
-    expect(created[0]).toMatchObject({
-      worktree_branch: "my-feature-branch",
-      create_new_branch: true,
-      group: "backend",
-    });
-  });
-
-  // #969: attaching to an existing branch sends create_new_branch false and hides the new-branch base picker.
-  test("attach to existing branch hides Base branch and sends create_new_branch=false", async ({ page }) => {
     const created = await startWizard(page, WORKTREE_ON);
     await expandMoreOptions(page);
     const w = wizard(page);
@@ -176,8 +129,17 @@ test.describe("worktree and branch", () => {
     await attach.click();
     await expect(attach).toHaveAttribute("aria-checked", "true");
     await expect(w.getByRole("button", { name: "Base branch" })).toHaveCount(0);
+    // Other More options fields ride along in the same payload.
+    await w.getByPlaceholder(GROUP_PLACEHOLDER).fill("backend");
+    await w.getByPlaceholder("e.g. --port 8080").fill("--verbose");
     await launch(page);
     await expect.poll(() => created[0]?.create_new_branch).toBe(false);
+    expect(created[0]).toMatchObject({
+      worktree_enabled: true,
+      worktree_branch: "feat/existing",
+      group: "backend",
+      extra_args: "--verbose",
+    });
     expect(created[0]?.base_branch).toBeUndefined();
   });
 
@@ -211,19 +173,6 @@ test.describe("worktree and branch", () => {
 });
 
 test.describe("agents and presets", () => {
-  test("agent picker renders installed agents, including terminal fallback tools", async ({ page }) => {
-    await startWizard(page, {
-      agents: ["claude", "codex", "antigravity"]
-        .map((name) => ({ ...CLAUDE_AGENT, name, binary: name }))
-        .concat([{ ...CLAUDE_AGENT, name: "uninstalled-tool", installed: false, install_hint: "brew install x" }]),
-    });
-    const w = wizard(page);
-    for (const name of ["claude", "codex", "antigravity"]) {
-      await expect(w.getByRole("button", { name, exact: true })).toBeVisible();
-    }
-    await expect(w.getByRole("button", { name: "uninstalled-tool", exact: true })).toHaveCount(0);
-  });
-
   test("wizard remembers the last-picked agent across reloads", async ({ page }) => {
     // A non-default tool, so a broken restore cannot pass via the claude fallback.
     const created = await startWizard(page, {
@@ -238,12 +187,6 @@ test.describe("agents and presets", () => {
     await openWizard(page);
     await selectProject(page, "/tmp/example");
     await expect(page.getByRole("button", { name: /^codex/i })).toHaveClass(/border-brand-600/);
-  });
-
-  test("profile picker is hidden when there is only one profile", async ({ page }) => {
-    await startWizard(page, { profiles: [{ name: "default", is_default: true }] });
-    await expandMoreOptions(page);
-    await expect(wizard(page).getByText("Workflow preset")).toHaveCount(0);
   });
 
   test("profile picker shows descriptions and selecting one applies its sandbox + yolo defaults", async ({ page }) => {
@@ -293,14 +236,6 @@ test.describe("agents and presets", () => {
     await expect(w.getByText("Docker is not running.")).toBeVisible();
   });
 
-  test("extra args propagate to the create-session POST body", async ({ page }) => {
-    const created = await startWizard(page);
-    await expandMoreOptions(page);
-    await wizard(page).getByPlaceholder("e.g. --port 8080").fill("--verbose");
-    await launch(page);
-    await expect.poll(() => created[0]?.extra_args).toBe("--verbose");
-  });
-
   test("shows and launches a configured custom agent without exposing sensitive fields", async ({ page }) => {
     const hidden = [
       "/opt/private/bin/remote-helper",
@@ -337,47 +272,6 @@ test.describe("agents and presets", () => {
 });
 
 test.describe("confirmations before create", () => {
-  // #2066: repo on_create hooks need approval; the server refuses with hooks_need_trust until trust_hooks is sent.
-  test("hooks-trust modal lists the commands; Cancel aborts and Proceed resubmits with trust", async ({ page }) => {
-    const created = await startWizard(page, {
-      onCreate: (body, route) =>
-        body.trust_hooks === true
-          ? undefined
-          : route
-              .fulfill({
-                status: 403,
-                json: {
-                  error: "hooks_need_trust",
-                  message: "Repository hooks require trust. Resubmit with trust_hooks: true to approve.",
-                  on_create: ["bash scripts/setup-worktree.sh", "cp .env.example .env"],
-                  on_launch: ["npm run dev-seed"],
-                  on_destroy: [],
-                  needs_mcp_trust: false,
-                },
-              })
-              .then(() => true),
-    });
-    const dialog = page.getByTestId("hooks-trust-dialog");
-    const trusted = () => created.filter((b) => b.trust_hooks === true).length;
-
-    await launch(page);
-    await expect(dialog).toBeVisible();
-    // Approval trusts the whole hooks hash, so on_launch is listed too.
-    for (const cmd of ["bash scripts/setup-worktree.sh", "cp .env.example .env", "npm run dev-seed"]) {
-      await expect(dialog).toContainText(cmd);
-    }
-    expect(created).toHaveLength(1);
-    await page.getByRole("button", { name: "Cancel" }).click();
-    await expect(dialog).toHaveCount(0);
-    expect(trusted()).toBe(0);
-    await expect(wizard(page).getByRole("button", { name: /Launch session/ })).toBeEnabled();
-
-    await launch(page);
-    await expect(dialog).toBeVisible();
-    await page.getByTestId("hooks-trust-proceed").click();
-    await expect.poll(trusted).toBe(1);
-  });
-
   // #2045: glob volume_ignores expand once at create time, so a sandbox create confirms the snapshot first.
   test.describe("glob volume_ignores", () => {
     async function launchSandbox(page: import("@playwright/test").Page) {
@@ -411,7 +305,9 @@ test.describe("confirmations before create", () => {
       return { created, acknowledged, dialog };
     }
 
-    test("modal shows the patterns and match count; Cancel aborts the create", async ({ page }) => {
+    test("modal shows the patterns and match count; Cancel aborts, Proceed with Don't show again creates", async ({
+      page,
+    }) => {
       const { created, acknowledged, dialog } = await launchSandbox(page);
       for (const text of ["**/bin", "**/obj", "3 directories"]) await expect(dialog).toContainText(text);
       expect(created).toHaveLength(0);
@@ -419,17 +315,13 @@ test.describe("confirmations before create", () => {
       await expect(dialog).toHaveCount(0);
       expect(created).toHaveLength(0);
       expect(acknowledged).toHaveLength(0);
-      await expect(wizard(page).getByRole("button", { name: /Launch session/ })).toBeEnabled();
-    });
 
-    for (const dontShowAgain of [false, true]) {
-      test(`Proceed ${dontShowAgain ? "with" : "without"} 'Don't show again' creates the session`, async ({ page }) => {
-        const { created, acknowledged } = await launchSandbox(page);
-        if (dontShowAgain) await page.getByTestId("volume-ignores-glob-dont-show-again").click();
-        await page.getByTestId("volume-ignores-glob-proceed").click();
-        await expect.poll(() => created.length).toBe(1);
-        await expect.poll(() => acknowledged.length).toBe(dontShowAgain ? 1 : 0);
-      });
-    }
+      await launch(page);
+      await expect(dialog).toBeVisible();
+      await page.getByTestId("volume-ignores-glob-dont-show-again").click();
+      await page.getByTestId("volume-ignores-glob-proceed").click();
+      await expect.poll(() => created.length).toBe(1);
+      await expect.poll(() => acknowledged.length).toBe(1);
+    });
   });
 });

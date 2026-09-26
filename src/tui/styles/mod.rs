@@ -236,42 +236,34 @@ pub fn export_theme_toml(theme: &Theme) -> Result<String, toml::ser::Error> {
 mod tests {
     use super::*;
     use ratatui::style::Color;
-    use std::io::Write;
 
     #[test]
-    fn load_theme_with_mode_palette_yields_indexed() {
-        let theme = load_theme_with_mode("empire", true);
-        assert!(matches!(theme.title, Color::Indexed(_)));
+    fn load_theme_with_mode_picks_color_depth() {
+        assert!(matches!(
+            load_theme_with_mode("empire", true).title,
+            Color::Indexed(_)
+        ));
+        assert!(matches!(
+            load_theme_with_mode("empire", false).title,
+            Color::Rgb(_, _, _)
+        ));
     }
 
     #[test]
-    fn custom_theme_without_unread_inherits_accent() {
-        // A theme TOML that omits `unread` should fall back to that theme's
-        // own accent, not Empire's default blue.
-        let toml_str = "background = \"#1a1b26\"\naccent = \"#7aa2f7\"\n";
-        let theme: Theme = toml::from_str(toml_str).unwrap();
-        let theme = fill_unread_from_accent(toml_str, theme);
-        assert_eq!(theme.accent, Color::Rgb(0x7a, 0xa2, 0xf7));
-        assert_eq!(
-            theme.unread, theme.accent,
-            "omitted unread field should fall back to accent"
-        );
-    }
-
-    #[test]
-    fn custom_theme_with_explicit_unread_preserves_it() {
-        // An explicit `unread` must win over the accent fallback.
-        let toml_str = "background = \"#1a1b26\"\naccent = \"#7aa2f7\"\nunread = \"#ff0000\"\n";
-        let theme: Theme = toml::from_str(toml_str).unwrap();
-        let theme = fill_unread_from_accent(toml_str, theme);
-        assert_eq!(theme.unread, Color::Rgb(0xff, 0x00, 0x00));
-        assert_ne!(theme.unread, theme.accent);
-    }
-
-    #[test]
-    fn load_theme_with_mode_truecolor_yields_rgb() {
-        let theme = load_theme_with_mode("empire", false);
-        assert!(matches!(theme.title, Color::Rgb(_, _, _)));
+    fn omitted_unread_inherits_the_themes_own_accent() {
+        let accent = Color::Rgb(0x7a, 0xa2, 0xf7);
+        for (toml_str, want) in [
+            ("background = \"#1a1b26\"\naccent = \"#7aa2f7\"\n", accent),
+            (
+                "background = \"#1a1b26\"\naccent = \"#7aa2f7\"\nunread = \"#ff0000\"\n",
+                Color::Rgb(0xff, 0x00, 0x00),
+            ),
+        ] {
+            let theme: Theme = toml::from_str(toml_str).unwrap();
+            let theme = fill_unread_from_accent(toml_str, theme);
+            assert_eq!(theme.accent, accent);
+            assert_eq!(theme.unread, want, "{toml_str}");
+        }
     }
 
     /// Anchor colors for the builtin themes, `(name, background, title)`.
@@ -382,67 +374,36 @@ mod tests {
     }
 
     #[test]
-    fn all_builtins_parse_with_expected_anchors() {
+    fn all_builtins_parse_with_expected_anchors_and_roundtrip() {
         // Every entry in BUILTIN_THEMES must deserialize cleanly and match the
-        // expected background and title hex; otherwise a typo surfaces only at the
-        // first runtime load.
-        for (name, expected_bg, expected_title) in BUILTIN_COLOR_ANCHORS {
-            let theme = load_theme(name);
-            assert_eq!(
-                theme.background, *expected_bg,
-                "builtin theme '{}' background mismatch",
-                name
-            );
-            assert_eq!(
-                theme.title, *expected_title,
-                "builtin theme '{}' title mismatch",
-                name
-            );
-        }
-        // Defensive: ensure every builtin in BUILTIN_THEMES has an entry
-        // in BUILTIN_COLOR_ANCHORS so the test covers all builtins.
+        // expected anchors; otherwise a typo surfaces only at the first runtime
+        // load. Catppuccin Latte is the lone light builtin.
         let table_names: Vec<&str> = BUILTIN_COLOR_ANCHORS.iter().map(|(n, _, _)| *n).collect();
         for name in builtin_theme_names() {
             assert!(
                 table_names.contains(&name),
-                "builtin '{}' missing from BUILTIN_COLOR_ANCHORS test table",
-                name
+                "builtin '{name}' missing from BUILTIN_COLOR_ANCHORS test table"
             );
         }
-    }
-
-    #[test]
-    fn builtin_appearance_matches_palette() {
-        // Catppuccin Latte is the lone light builtin; the rest are dark.
-        for name in builtin_theme_names() {
+        for (name, expected_bg, expected_title) in BUILTIN_COLOR_ANCHORS {
             let theme = load_theme(name);
-            let expected = if name == "catppuccin-latte" {
-                Some(ThemeAppearance::Light)
+            assert_eq!(theme.background, *expected_bg, "{name} background");
+            assert_eq!(theme.title, *expected_title, "{name} title");
+            let expected_appearance = if *name == "catppuccin-latte" {
+                ThemeAppearance::Light
             } else {
-                Some(ThemeAppearance::Dark)
+                ThemeAppearance::Dark
             };
-            assert_eq!(
-                theme.appearance, expected,
-                "builtin theme '{}' appearance mismatch",
-                name
-            );
+            assert_eq!(theme.appearance, Some(expected_appearance), "{name}");
+            assert!(theme.syntax.shiki_theme.is_some(), "{name} shiki_theme");
+            let exported = export_theme_toml(&theme).unwrap();
+            let loaded: Theme = toml::from_str(&exported).unwrap();
+            assert_eq!(theme.color_fields(), loaded.color_fields(), "{name}");
         }
     }
 
     #[test]
-    fn builtin_syntax_shiki_theme_present() {
-        for name in builtin_theme_names() {
-            let theme = load_theme(name);
-            assert!(
-                theme.syntax.shiki_theme.is_some(),
-                "builtin theme '{}' missing [syntax].shiki_theme",
-                name
-            );
-        }
-    }
-
-    #[test]
-    fn partial_custom_theme_does_not_inherit_metadata() {
+    fn partial_custom_theme_takes_empire_colors_but_not_metadata() {
         // Container-level `#[serde(default)]` would have a missing `appearance`
         // fall back to Empire's `Dark`; the per-field defaults must override that
         // so absent metadata resolves to None / empty.
@@ -451,194 +412,29 @@ background = "#1a1b26"
 border = "#414868"
 "##;
         let theme: Theme = toml::from_str(toml_str).unwrap();
-        assert_eq!(
-            theme.appearance, None,
-            "partial custom TOML must not inherit Empire's appearance"
-        );
-        assert!(
-            theme.syntax.shiki_theme.is_none(),
-            "partial custom TOML must not inherit Empire's syntax.shiki_theme"
-        );
+        assert_eq!(theme.background, Color::Rgb(26, 27, 38));
+        assert_eq!(theme.title, load_theme("empire").title);
+        assert_eq!(theme.appearance, None);
+        assert!(theme.syntax.shiki_theme.is_none());
     }
 
     #[test]
     fn unknown_theme_falls_back_to_default() {
         let theme = load_theme("nonexistent-theme");
         let default = load_theme("zinc");
-        assert_eq!(
-            theme.color_fields(),
-            default.color_fields(),
-            "fallback theme color fields drifted from default"
-        );
+        assert_eq!(theme.color_fields(), default.color_fields());
     }
 
     #[test]
-    fn test_builtin_themes_count() {
-        assert_eq!(BUILTIN_THEMES.len(), 8);
-        let names: Vec<&str> = builtin_theme_names().collect();
-        assert!(names.contains(&"zinc"));
-        assert!(names.contains(&"empire"));
-        assert!(names.contains(&"phosphor"));
-        assert!(names.contains(&"tokyo-night-storm"));
-        assert!(names.contains(&"catppuccin-latte"));
-        assert!(names.contains(&"dracula"));
-        assert!(names.contains(&"rose-pine"));
-        assert!(names.contains(&"deep-ocean"));
-    }
-
-    #[test]
-    fn test_theme_serialize_roundtrip() {
-        let original = load_theme("empire");
-        let toml_str = export_theme_toml(&original).unwrap();
-        let loaded: Theme = toml::from_str(&toml_str).unwrap();
-
-        assert_eq!(original.background, loaded.background);
-        assert_eq!(original.title, loaded.title);
-        assert_eq!(original.running, loaded.running);
-        assert_eq!(original.error, loaded.error);
-        assert_eq!(original.diff_add, loaded.diff_add);
-        assert_eq!(original.sandbox, loaded.sandbox);
-    }
-
-    #[test]
-    fn test_theme_toml_format() {
-        let theme = load_theme("empire");
-        let toml_str = export_theme_toml(&theme).unwrap();
-
-        assert!(toml_str.contains(r##"background = "#0f172a""##));
-        assert!(toml_str.contains(r##"title = "#fbbf24""##));
-        assert!(toml_str.contains(r##"running = "#22c55e""##));
-    }
-
-    #[test]
-    fn test_load_custom_theme_from_file() {
+    fn load_custom_theme_reads_valid_and_rejects_invalid_files() {
         let dir = tempfile::tempdir().unwrap();
-        let theme_path = dir.path().join("my-theme.toml");
-        let toml_str = export_theme_toml(&load_theme("dracula")).unwrap();
-        std::fs::write(&theme_path, &toml_str).unwrap();
-
-        let loaded = load_custom_theme(&theme_path).unwrap();
+        let good = dir.path().join("my-theme.toml");
+        std::fs::write(&good, export_theme_toml(&load_theme("dracula")).unwrap()).unwrap();
+        let loaded = load_custom_theme(&good).unwrap();
         assert_eq!(loaded.background, Color::Rgb(40, 42, 54));
-        assert_eq!(loaded.title, Color::Rgb(189, 147, 249));
-    }
 
-    #[test]
-    fn test_load_custom_theme_invalid_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let theme_path = dir.path().join("bad.toml");
-        std::fs::write(&theme_path, "not valid theme data").unwrap();
-
-        assert!(load_custom_theme(&theme_path).is_none());
-    }
-
-    #[test]
-    fn test_discover_custom_themes_empty() {
-        // With no themes dir, should return empty
-        let themes = discover_custom_themes();
-        // May or may not be empty depending on test environment, just check it doesn't panic
-        let _ = themes;
-    }
-
-    #[test]
-    fn test_discover_custom_themes_from_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let themes_dir = dir.path().join("themes");
-        std::fs::create_dir_all(&themes_dir).unwrap();
-
-        // Write two valid theme files
-        let dracula_toml = export_theme_toml(&load_theme("dracula")).unwrap();
-        std::fs::write(themes_dir.join("my-dark.toml"), &dracula_toml).unwrap();
-        std::fs::write(themes_dir.join("my-light.toml"), &dracula_toml).unwrap();
-        // Write a non-toml file (should be ignored)
-        std::fs::write(themes_dir.join("readme.txt"), "not a theme").unwrap();
-
-        // `discover_custom_themes` uses get_app_dir(), so test the file parsing.
-        let loaded = load_custom_theme(&themes_dir.join("my-dark.toml"));
-        assert!(loaded.is_some());
-    }
-
-    #[test]
-    fn test_available_themes_includes_builtins() {
-        let themes = available_themes();
-        assert!(themes.len() >= 5);
-        assert!(themes.contains(&"empire".to_string()));
-        assert!(themes.contains(&"phosphor".to_string()));
-        assert!(themes.contains(&"tokyo-night-storm".to_string()));
-        assert!(themes.contains(&"catppuccin-latte".to_string()));
-        assert!(themes.contains(&"dracula".to_string()));
-    }
-
-    #[test]
-    fn test_all_builtin_themes_roundtrip() {
-        for name in builtin_theme_names() {
-            let theme = load_theme(name);
-            let toml_str = export_theme_toml(&theme)
-                .unwrap_or_else(|e| panic!("{} export failed: {}", name, e));
-            let _loaded: Theme = toml::from_str(&toml_str)
-                .unwrap_or_else(|e| panic!("{} roundtrip failed: {}", name, e));
-        }
-    }
-
-    #[test]
-    fn test_custom_theme_toml_parsing() {
-        let toml_str = r##"
-background = "#1a1b26"
-border = "#414868"
-terminal_border = "#7aa2f7"
-selection = "#283457"
-session_selection = "#414868"
-title = "#c0caf5"
-text = "#a9b1d6"
-dimmed = "#565f89"
-hint = "#565f89"
-running = "#9ece6a"
-waiting = "#e0af68"
-idle = "#565f89"
-error = "#f7768e"
-terminal_active = "#7aa2f7"
-group = "#7dcfff"
-search = "#bb9af7"
-accent = "#7aa2f7"
-diff_add = "#9ece6a"
-diff_delete = "#f7768e"
-diff_modified = "#e0af68"
-diff_header = "#7dcfff"
-help_key = "#e0af68"
-branch = "#7dcfff"
-sandbox = "#bb9af7"
-"##;
-        let theme: Theme = toml::from_str(toml_str).unwrap();
-        assert_eq!(theme.background, Color::Rgb(26, 27, 38));
-        assert_eq!(theme.title, Color::Rgb(192, 202, 245));
-        assert_eq!(theme.running, Color::Rgb(158, 206, 106));
-    }
-
-    #[test]
-    fn test_custom_theme_partial_uses_defaults() {
-        let toml_str = r##"
-background = "#1a1b26"
-border = "#414868"
-"##;
-        // Missing fields fall back to empire defaults (forward-compatible)
-        let theme: Theme = toml::from_str(toml_str).unwrap();
-        assert_eq!(theme.background, Color::Rgb(26, 27, 38));
-        assert_eq!(theme.border, Color::Rgb(65, 72, 104));
-        // Missing fields get empire defaults
-        assert_eq!(theme.title, load_theme("empire").title);
-        assert_eq!(theme.running, load_theme("empire").running);
-    }
-
-    #[test]
-    fn test_builtin_name_ignored_in_custom_dir() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Simulate a custom theme file named after a builtin
-        let path = dir.path().join("empire.toml");
-        let mut f = std::fs::File::create(&path).unwrap();
-        write!(f, "").unwrap();
-
-        // The file can be loaded directly, but discover_custom_themes
-        // filters out builtin names. We test the filter logic here.
-        assert!(is_builtin_theme("empire"));
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(&bad, "not valid theme data").unwrap();
+        assert!(load_custom_theme(&bad).is_none());
     }
 }

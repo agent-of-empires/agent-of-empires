@@ -834,6 +834,8 @@ mod tests {
             .arg(&sidecar)
             .arg(&normal)
             .arg(&store)
+            // A host session source redirects the normal publication to a suffixed file.
+            .env_remove(crate::hooks::SESSION_SOURCE_ENV)
             .output()
             .unwrap();
         assert!(

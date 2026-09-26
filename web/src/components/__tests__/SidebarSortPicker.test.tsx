@@ -33,18 +33,11 @@ describe("SidebarSortPicker", () => {
     expect(menu()).toBeNull();
   });
 
-  it.each<[SidebarSortMode, SidebarSortMode]>([
-    ["manual", "lastActivity"],
-    ["manual", "attention"],
-    ["lastActivity", "manual"],
-    ["lastActivity", "attention"],
-    ["attention", "manual"],
-    ["attention", "lastActivity"],
-  ])("from %s selecting %s fires onSortModeChange and closes", (current, next) => {
-    const onChange = setup(current);
+  it("selecting another mode fires onSortModeChange and closes", () => {
+    const onChange = setup("attention");
     fireEvent.click(trigger());
-    fireEvent.click(option(next));
-    expect(onChange.mock.calls).toEqual([[next]]);
+    fireEvent.click(option("manual"));
+    expect(onChange.mock.calls).toEqual([["manual"]]);
     expect(menu()).toBeNull();
   });
 
@@ -54,11 +47,6 @@ describe("SidebarSortPicker", () => {
     fireEvent.click(option("lastActivity"));
     expect(onChange).not.toHaveBeenCalled();
     expect(menu()).toBeNull();
-  });
-
-  it("dims the trigger in manual mode", () => {
-    setup("manual");
-    expect(trigger().className).toContain("text-text-dim");
   });
 
   it("closes on an outside mousedown or Escape, not an inside mousedown", () => {
@@ -73,7 +61,10 @@ describe("SidebarSortPicker", () => {
     expect(menu()).toBeNull();
   });
 
-  it("falls back to Manual for an unknown mode", () => {
+  it("dims the trigger in manual mode and labels an unknown mode as Manual", () => {
+    setup("manual");
+    expect(trigger().className).toContain("text-text-dim");
+    cleanup();
     setup("bogus" as SidebarSortMode);
     expect(trigger().getAttribute("aria-label")).toBe("Sort sessions, current: Manual");
   });

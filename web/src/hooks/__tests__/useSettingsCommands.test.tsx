@@ -98,6 +98,7 @@ describe("useSettingsCommands", () => {
     await waitFor(() => expect(toggle()?.subtitle).toBe("On · Global"));
     toggle()?.perform();
     await waitFor(() => expect(updateSettings).toHaveBeenCalledWith({ worktree: { auto_cleanup: false } }));
+    expect(updateProfileSettings).not.toHaveBeenCalled();
   });
 
   it("generates one Settings entry per writable field, omitting local_only", async () => {
@@ -145,23 +146,6 @@ describe("useSettingsCommands", () => {
       expect(updateProfileSettings).toHaveBeenLastCalledWith("alternate", { session: { live_send: false } });
       unmount();
     }
-  });
-
-  it("flips a writable toggle inline through the default profile", async () => {
-    const { result } = await render();
-    const toggle = result.current.find((a) => a.id === "setting:session.live_send");
-    expect(toggle?.subtitle).toBe("Off · main");
-    toggle?.perform();
-    await waitFor(() => expect(updateProfileSettings).toHaveBeenCalledWith("main", { session: { live_send: true } }));
-  });
-
-  it("saves a global-only toggle at the scope named in its subtitle", async () => {
-    const { result } = await render();
-    const toggle = result.current.find((a) => a.id === "setting:worktree.auto_cleanup");
-    expect(toggle?.subtitle).toBe("On · Global");
-    toggle?.perform();
-    await waitFor(() => expect(updateSettings).toHaveBeenCalledWith({ worktree: { auto_cleanup: false } }));
-    expect(updateProfileSettings).not.toHaveBeenCalled();
   });
 
   it("opens settings for non-toggle widgets, elevation, and telemetry consent", async () => {

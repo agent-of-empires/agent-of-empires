@@ -56,12 +56,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_index_parses() {
-        FeaturedIndex::from_toml_str(EMBEDDED).expect("embedded featured.toml must parse");
-    }
-
-    #[test]
     fn looks_up_by_id_and_verifies_any_vetted_hash() {
+        FeaturedIndex::from_toml_str(EMBEDDED).expect("embedded featured.toml must parse");
         let index = FeaturedIndex::from_toml_str(
             r#"
 [plugins."agent-of-empires.example"]

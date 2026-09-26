@@ -15,28 +15,11 @@ fn create_profile_with_session(h: &TuiTestHarness, profile: &str, title: &str) {
     std::fs::write(profile_dir.join("sessions.json"), session).expect("write sessions.json");
 }
 
+/// The default view lists every profile's sessions flat with no `[profile]`
+/// tag; the picker filters to one profile and its "all" entry returns.
 #[test]
 #[parallel]
-fn test_default_view_shows_all_profiles() {
-    require_tmux!();
-
-    let mut h = TuiTestHarness::new("unified_all");
-    create_profile_with_session(&h, "alpha", "Alpha Session");
-    create_profile_with_session(&h, "beta", "Beta Session");
-    h.spawn_tui();
-
-    h.wait_for(" aoe ");
-    // Default all-profiles mode has no `[profile]` tag in the title;
-    // the absence of the bracketed segment is the new "unfiltered" tell.
-    h.assert_screen_not_contains("[alpha]");
-    h.assert_screen_not_contains("[beta]");
-    h.assert_screen_contains("Alpha Session");
-    h.assert_screen_contains("Beta Session");
-}
-
-#[test]
-#[parallel]
-fn test_profile_filter_via_picker() {
+fn test_profile_filter_round_trip_via_picker() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("unified_filter");
@@ -45,70 +28,27 @@ fn test_profile_filter_via_picker() {
     h.spawn_tui();
 
     h.wait_for(" aoe ");
+    h.assert_screen_not_contains("[alpha]");
+    h.assert_screen_not_contains("[beta]");
+    h.assert_screen_contains("Alpha Session");
+    h.assert_screen_contains("Beta Session");
 
-    // Open picker and select "alpha"
+    // In all-mode the picker lists profiles directly; "alpha" sorts first.
     h.send_keys("P");
     h.wait_for("Profiles");
-    // In all-mode, profiles are listed directly (no "all" entry)
-    // "alpha" should be first alphabetically
     h.send_keys("Enter");
-
     h.wait_for("[alpha]");
     h.assert_screen_contains("Alpha Session");
     h.assert_screen_not_contains("Beta Session");
-}
 
-#[test]
-#[parallel]
-fn test_return_to_all_view_via_picker() {
-    require_tmux!();
-
-    let mut h = TuiTestHarness::new("unified_return");
-    create_profile_with_session(&h, "alpha", "Alpha Session");
-    create_profile_with_session(&h, "beta", "Beta Session");
-    h.spawn_tui();
-
-    h.wait_for(" aoe ");
-
-    // Filter to alpha
+    // In filtered mode "all" sits at the top of the picker.
     h.send_keys("P");
     h.wait_for("Profiles");
+    for _ in 0..3 {
+        h.send_keys("k");
+    }
     h.send_keys("Enter");
-    h.wait_for("[alpha]");
-
-    // Return to all via picker ("all" should be at top in filtered mode)
-    h.send_keys("P");
-    h.wait_for("Profiles");
-    // Navigate to top where "all" entry is and select it
-    h.send_keys("k");
-    std::thread::sleep(Duration::from_millis(50));
-    h.send_keys("k");
-    std::thread::sleep(Duration::from_millis(50));
-    h.send_keys("k");
-    std::thread::sleep(Duration::from_millis(50));
-    h.send_keys("Enter");
-
-    // Returning to all-profiles mode drops the `[alpha]` tag from the title.
     h.wait_for_absent("[alpha]", Duration::from_secs(5));
-    h.assert_screen_contains("Alpha Session");
-    h.assert_screen_contains("Beta Session");
-}
-
-/// Profile headers no longer exist -- verify sessions from all profiles
-/// are shown flat in the list without any collapsible headers.
-#[test]
-#[parallel]
-fn test_all_profiles_flat_view() {
-    require_tmux!();
-
-    let mut h = TuiTestHarness::new("unified_flat");
-    create_profile_with_session(&h, "alpha", "Alpha Session");
-    create_profile_with_session(&h, "beta", "Beta Session");
-    h.spawn_tui();
-
-    h.wait_for(" aoe ");
-
-    // Both sessions visible simultaneously with no headers to collapse
     h.assert_screen_contains("Alpha Session");
     h.assert_screen_contains("Beta Session");
 }

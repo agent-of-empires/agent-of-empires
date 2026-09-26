@@ -62,15 +62,6 @@ describe("useDiffFiles", () => {
     expect(mockGetFiles).not.toHaveBeenCalled();
   });
 
-  it("populates files, bases, and warning, and bumps revision", async () => {
-    const perRepoBases = [{ repo_name: "repo-a", base_branch: "dev" }];
-    const { result } = await mountLoaded(
-      resp({ files: [file("x.ts")], per_repo_bases: perRepoBases, warning: "heads up" }),
-    );
-    expect(result.current).toMatchObject({ perRepoBases, warning: "heads up", loading: false, revision: 1 });
-    expect(result.current.files.map((f) => f.path)).toEqual(["x.ts"]);
-  });
-
   it("reports diff_panel once per session, and only while the panel is enabled", async () => {
     const enabled = await mountLoaded(resp());
     await enabled.refetch(resp({ files: [file("b.ts")] }));

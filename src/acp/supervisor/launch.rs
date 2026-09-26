@@ -1729,7 +1729,9 @@ mod tests {
             None,
             vec![],
             vec![],
-            Some("acp-session".into()),
+            // No stored session: an allowed attach fails fast past the gate
+            // instead of dialing a control socket until the runner deadline.
+            None,
             None,
         );
         record.detached_at = Some(1);

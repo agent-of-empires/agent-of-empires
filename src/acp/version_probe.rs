@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_semver_reads_the_first_version_like_token() {
+    fn version_tokens_parse_like_spawn() {
         // (raw output, parsed version)
         let cases = [
             ("0.55.0", Some("0.55.0")),
@@ -284,10 +284,8 @@ mod tests {
             let got = extract_semver(raw).map(|v| v.to_string());
             assert_eq!(got.as_deref(), want, "{raw:?}");
         }
-    }
 
-    #[test]
-    fn whitespace_token_below_floor_mirrors_spawn_parsing() {
+        // `whitespace_token_below_floor` mirrors spawn parsing.
         let min = Version::parse(CLAUDE_AGENT_ACP_MIN_VERSION).unwrap();
         // (raw, below_floor)
         let cases = [
@@ -339,13 +337,26 @@ mod tests {
     }
 
     #[test]
-    fn gates_needed_by_instances_scopes_to_structured_sessions_and_dedupes() {
+    fn gates_needed_by_instances_scopes_to_host_structured_sessions_and_dedupes() {
         let mut terminal = Instance::new("terminal", "/tmp/terminal");
         terminal.tool = "claude".to_string();
         let mut custom_agent = structured("custom", "claude");
         custom_agent.agent_name = Some("custom-acp".to_string());
+        let mut sandboxed = structured("sandboxed", "opencode");
+        sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string(),
+            container_name: "aoe-sandbox-sandboxe".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+        });
+        assert!(gates_needed_by_instances(&[sandboxed.clone()]).is_empty());
 
         let gates = gates_needed_by_instances(&[
+            sandboxed,
             terminal,
             structured("structured", "claude"),
             structured("structured-2", "claude"),
@@ -358,29 +369,5 @@ mod tests {
             .iter()
             .any(|g| g.min_version == CLAUDE_AGENT_ACP_MIN_VERSION));
         assert!(gates.iter().any(|g| g.min_version == OPENCODE_MIN_VERSION));
-    }
-
-    #[test]
-    fn gates_needed_by_instances_skips_sandboxed_sessions() {
-        let mut sandboxed = structured("sandboxed", "claude");
-        sandboxed.sandbox_info = Some(crate::session::SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string(),
-            container_name: "aoe-sandbox-sandboxe".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            container_workdir: None,
-            before_start_env: Vec::new(),
-        });
-        assert!(sandboxed.is_sandboxed());
-
-        // Only the sandboxed claude session exists: no host gate is emitted.
-        assert!(gates_needed_by_instances(&[sandboxed.clone()]).is_empty());
-
-        // A host-run claude session alongside it still contributes its gate.
-        let gates = gates_needed_by_instances(&[sandboxed, structured("host", "claude")]);
-        assert_eq!(gates.len(), 1);
-        assert_eq!(gates[0].min_version, CLAUDE_AGENT_ACP_MIN_VERSION);
     }
 }

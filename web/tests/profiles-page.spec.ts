@@ -1,8 +1,6 @@
-// Profiles settings tab (/settings/profiles): CRUD, set-default, descriptions,
-// the `?profile=` deep link, the retired /profiles redirect, read-only mode, and
-// the hooks panel. A stateful in-route store stands in for the backend, so
-// "persists" means the store plus the post-reload UI. Component-level handler
-// details are pinned in ProfilesSection.test.tsx.
+// Profiles settings tab (/settings/profiles): create, set-default, the retired
+// /profiles redirect, and read-only mode, against a stateful in-route store.
+// Descriptions, deep links, and the hooks panel are pinned in ProfilesSection.test.tsx.
 
 import { test, expect } from "./helpers/mockedTest";
 import { mockSettingsApis } from "./helpers/apiMocks";
@@ -18,8 +16,6 @@ interface ProfilesPageMockHandle {
   profiles: ProfileState[];
   posts: Array<{ name?: string }>;
   defaultPatches: Array<{ name?: string }>;
-  /** Recorded PATCH /api/profiles/<name>/settings bodies. */
-  settingsPatches: Array<{ profile: string; body: Record<string, unknown> }>;
   readOnly: boolean;
 }
 
@@ -32,16 +28,10 @@ async function installProfilesPageMocks(
     profiles: names.map((name, i) => ({ name, is_default: i === 0, description: "" })),
     posts: [],
     defaultPatches: [],
-    settingsPatches: [],
     readOnly: !!opts.readOnly,
   };
 
-  // ProfilesPage reads `hooks` from global settings to build the inherited rows
-  // of the read-only hooks panel.
-  await mockSettingsApis(page, {
-    about: () => ({ read_only: handle.readOnly }),
-    settings: () => ({ hooks: { on_launch: ["echo global-hook"] } }),
-  });
+  await mockSettingsApis(page, { about: () => ({ read_only: handle.readOnly }) });
 
   await page.route(
     (url) => url.pathname === "/api/profiles",
@@ -62,20 +52,7 @@ async function installProfilesPageMocks(
     (route) => {
       const name = decodeURIComponent(new URL(route.request().url()).pathname.split("/")[3]);
       const profile = handle.profiles.find((p) => p.name === name);
-      if (route.request().method() === "PATCH") {
-        const body = route.request().postDataJSON() as Record<string, unknown>;
-        handle.settingsPatches.push({ profile: name, body });
-        if (profile && typeof body.description === "string") profile.description = body.description;
-        return route.fulfill({ json: { ok: true } });
-      }
-      return route.fulfill({
-        json: {
-          description: profile?.description ?? "",
-          // The GET deliberately includes hooks (reads are unfiltered) so the
-          // panel has something profile-scoped to render.
-          hooks: { on_create: ["echo profile-hook"] },
-        },
-      });
+      return route.fulfill({ json: { description: profile?.description ?? "" } });
     },
   );
   await page.route(
@@ -96,7 +73,7 @@ async function openProfiles(page: Page) {
   await expect(page.getByRole("heading", { name: "Profiles" })).toBeVisible();
 }
 
-test("create profile via + New profile POSTs and the rail gains the row", async ({ page }) => {
+test("+ New profile POSTs and the rail gains the row; Set as default PATCHes and moves the badge", async ({ page }) => {
   const handle = await installProfilesPageMocks(page);
   await openProfiles(page);
 
@@ -108,51 +85,13 @@ test("create profile via + New profile POSTs and the rail gains the row", async 
   await expect.poll(() => handle.posts).toEqual([{ name: "work" }]);
   await expect(page.getByRole("button", { name: "work", exact: true })).toBeVisible();
   expect(handle.profiles.map((p) => p.name).sort()).toEqual(["main", "work"]);
-});
-
-test("set as default PATCHes /api/default-profile and moves the badge", async ({ page }) => {
-  const handle = await installProfilesPageMocks(page, { profiles: ["main", "work"] });
-  await openProfiles(page);
 
   await page.getByRole("button", { name: "work", exact: true }).click();
   await page.getByRole("button", { name: "Set as default" }).click();
-
   await expect.poll(() => handle.defaultPatches).toEqual([{ name: "work" }]);
   // The page re-fetches the list after the PATCH; the badge follows the flag.
   await expect(page.getByRole("button", { name: "work default" })).toBeVisible();
   expect(handle.profiles.find((p) => p.name === "main")?.is_default).toBe(false);
-});
-
-test("description edit PATCHes only `description` and survives a reload", async ({ page }) => {
-  const handle = await installProfilesPageMocks(page, { profiles: ["main", "work"] });
-  await openProfiles(page);
-  await page.getByRole("button", { name: "work", exact: true }).click();
-
-  const desc = page.getByPlaceholder("What this profile is for");
-  await desc.fill("client repos");
-  await page.getByRole("button", { name: "Save" }).click();
-
-  await expect.poll(() => handle.settingsPatches).toEqual([{ profile: "work", body: { description: "client repos" } }]);
-
-  await page.reload();
-  await page.getByRole("button", { name: "work", exact: true }).click();
-  await expect(page.getByPlaceholder("What this profile is for")).toHaveValue("client repos");
-});
-
-test("Edit configuration deep-links into Settings scoped to the profile", async ({ page }) => {
-  await installProfilesPageMocks(page, { profiles: ["main", "work"] });
-  await openProfiles(page);
-
-  await page.getByRole("button", { name: "work", exact: true }).click();
-  // The arrow disambiguates the "Session ->" deep-link from the "Session" nav tab.
-  await page.getByRole("button", { name: "Session →" }).click();
-
-  await expect(page).toHaveURL(/\/settings\/session\?profile=work/);
-  const profileSelect = page
-    .locator("label", { hasText: /^Profile$/ })
-    .locator("..")
-    .locator("select");
-  await expect(profileSelect).toHaveValue("work");
 });
 
 test("the retired /profiles route redirects into the Settings Profiles tab", async ({ page }) => {
@@ -164,13 +103,6 @@ test("the retired /profiles route redirects into the Settings Profiles tab", asy
   // The redirect preserves any query string (e.g. a ?profile= deep link).
   await page.goto("/profiles?profile=work");
   await expect(page).toHaveURL(/\/settings\/profiles\?profile=work$/);
-});
-
-test("the dashboard sidebar footer no longer has a Profiles button", async ({ page }) => {
-  await installProfilesPageMocks(page);
-  await page.goto("/");
-  await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Profiles", exact: true })).toHaveCount(0);
 });
 
 test("read-only mode hides every mutation control", async ({ page }) => {
@@ -186,18 +118,4 @@ test("read-only mode hides every mutation control", async ({ page }) => {
   await expect(section.getByRole("button", { name: "Set as default" })).toHaveCount(0);
   await expect(section.getByRole("button", { name: "Rename" })).toHaveCount(0);
   await expect(section.getByRole("button", { name: "Save" })).toHaveCount(0);
-});
-
-test("lifecycle hooks render read-only with the explain-why note", async ({ page }) => {
-  await installProfilesPageMocks(page);
-  await openProfiles(page);
-  await page.getByRole("button", { name: /^main/ }).click();
-
-  const panel = page.locator("section", { hasText: "Lifecycle hooks" }).first();
-  await expect(panel).toBeVisible();
-  await expect(panel.getByText(/remote code execution/i)).toBeVisible();
-  await expect(panel.getByText("echo profile-hook")).toBeVisible();
-  await expect(panel.getByText("echo global-hook")).toBeVisible();
-  // Read-only invariant: the hooks panel exposes no form controls.
-  await expect(panel.locator("input, textarea, button, select")).toHaveCount(0);
 });

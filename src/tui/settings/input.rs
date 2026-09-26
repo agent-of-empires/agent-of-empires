@@ -953,74 +953,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_validate_agent_key_value() {
-        assert!(validate_agent_key_value("claude=my-wrapper").is_ok());
-        assert!(validate_agent_key_value("opencode=--port 8080").is_ok());
-        for (entry, expected) in [
-            ("just-a-command", "agent_name=value"),
-            ("=some-value", "cannot be empty"),
-            ("claude=", "cannot be empty"),
-            ("nonexistent=cmd", "not a known agent"),
-        ] {
-            let err = validate_agent_key_value(entry).unwrap_err();
-            assert!(err.contains(expected), "{entry:?} -> {err:?}");
+    fn list_entry_validators() {
+        type Validator = fn(&str) -> Result<(), String>;
+        let key_value: Validator = validate_agent_key_value;
+        let config_dir: Validator = validate_agent_config_dir_entry;
+        let custom: Validator = validate_custom_agent_entry;
+        let detect_as: Validator = validate_detect_as_entry;
+        // (validator, entry, error substrings; empty means Ok)
+        let cases: &[(Validator, &str, &[&str])] = &[
+            (key_value, "claude=my-wrapper", &[]),
+            (key_value, "opencode=--port 8080", &[]),
+            (key_value, "just-a-command", &["agent_name=value"]),
+            (key_value, "=some-value", &["cannot be empty"]),
+            (key_value, "claude=", &["cannot be empty"]),
+            (key_value, "nonexistent=cmd", &["not a known agent"]),
+            // A custom agent name is the point of the config-dir setting, so
+            // it is not checked against the registry.
+            (config_dir, "claude-personal=~/.claude-personal", &[]),
+            (config_dir, "claude=/opt/claude", &[]),
+            (config_dir, "claude=~", &[]),
+            (config_dir, "just-a-name", &["agent_name=dir"]),
+            (config_dir, "=~/.claude-personal", &["name cannot be empty"]),
+            (config_dir, "my-agent=", &["directory cannot be empty"]),
+            (config_dir, "my-agent=.claude-personal", &["absolute path"]),
+            // Another user's home: resolution would drop it without a word.
+            (config_dir, "my-agent=~bob/.claude", &["absolute path"]),
+            (custom, "lenovo-claude=ssh -t lenovo claude", &[]),
+            (custom, "my-wrapper=./run.sh", &[]),
+            (custom, "just-a-name", &["name=command"]),
+            (custom, "=ssh -t host claude", &["name cannot be empty"]),
+            (custom, "my-agent=", &["Command cannot be empty"]),
+            // Shadowing a builtin is redirected to the dedicated override.
+            (
+                custom,
+                "claude=my-wrapper",
+                &["built-in agent", "Agent Command Override"],
+            ),
+            (detect_as, "lenovo-claude=claude", &[]),
+            (detect_as, "just-a-name", &["name=builtin"]),
+            (detect_as, "=claude", &["name cannot be empty"]),
+            (detect_as, "my-agent=", &["cannot be empty"]),
+            // The error lists the valid builtins so the user can self-correct.
+            (
+                detect_as,
+                "my-agent=nonexistent",
+                &["not a known built-in agent", "Known agents:"],
+            ),
+        ];
+        for (validate, entry, errors) in cases {
+            match validate(entry) {
+                Ok(()) => assert!(errors.is_empty(), "{entry:?} unexpectedly ok"),
+                Err(err) => {
+                    assert!(!errors.is_empty(), "{entry:?} -> {err:?}");
+                    for want in *errors {
+                        assert!(err.contains(want), "{entry:?} -> {err:?}");
+                    }
+                }
+            }
         }
-    }
-
-    #[test]
-    fn test_validate_agent_config_dir_entry() {
-        // A custom agent name is the point of the setting, so the name is not
-        // checked against the registry the way agent_key_value does.
-        assert!(validate_agent_config_dir_entry("claude-personal=~/.claude-personal").is_ok());
-        assert!(validate_agent_config_dir_entry("claude=/opt/claude").is_ok());
-        assert!(validate_agent_config_dir_entry("claude=~").is_ok());
-        for (entry, expected) in [
-            ("just-a-name", "agent_name=dir"),
-            ("=~/.claude-personal", "name cannot be empty"),
-            ("my-agent=", "directory cannot be empty"),
-            ("my-agent=.claude-personal", "absolute path"),
-            // Another user's home: accepting it here would take a value
-            // resolution drops without a word.
-            ("my-agent=~bob/.claude", "absolute path"),
-        ] {
-            let err = validate_agent_config_dir_entry(entry).unwrap_err();
-            assert!(err.contains(expected), "{entry:?} -> {err:?}");
-        }
-    }
-
-    #[test]
-    fn test_validate_custom_agent_entry() {
-        assert!(validate_custom_agent_entry("lenovo-claude=ssh -t lenovo claude").is_ok());
-        assert!(validate_custom_agent_entry("my-wrapper=./run.sh").is_ok());
-        for (entry, expected) in [
-            ("just-a-name", "name=command"),
-            ("=ssh -t host claude", "name cannot be empty"),
-            ("my-agent=", "Command cannot be empty"),
-        ] {
-            let err = validate_custom_agent_entry(entry).unwrap_err();
-            assert!(err.contains(expected), "{entry:?} -> {err:?}");
-        }
-        // Shadowing a builtin is redirected to the dedicated override setting.
-        let err = validate_custom_agent_entry("claude=my-wrapper").unwrap_err();
-        assert!(err.contains("built-in agent"));
-        assert!(err.contains("Agent Command Override"));
-    }
-
-    #[test]
-    fn test_validate_detect_as_entry() {
-        assert!(validate_detect_as_entry("lenovo-claude=claude").is_ok());
-        for (entry, expected) in [
-            ("just-a-name", "name=builtin"),
-            ("=claude", "name cannot be empty"),
-            ("my-agent=", "cannot be empty"),
-        ] {
-            let err = validate_detect_as_entry(entry).unwrap_err();
-            assert!(err.contains(expected), "{entry:?} -> {err:?}");
-        }
-        // The error lists the valid builtins so the user can self-correct.
-        let err = validate_detect_as_entry("my-agent=nonexistent").unwrap_err();
-        assert!(err.contains("not a known built-in agent"));
-        assert!(err.contains("Known agents:"));
     }
 
     mod search_popup {
@@ -1041,42 +1031,30 @@ mod tests {
 
         #[test]
         #[serial]
-        fn slash_opens_search_popup() {
+        fn search_opens_filters_and_esc_restores_selection() {
             let (_t, _guard, mut view) = fresh_view();
+            let cat_before = view.selected_category;
+            let field_before = view.selected_field;
             assert!(view.search_input.is_none());
             press(&mut view, KeyCode::Char('/'));
             assert!(view.search_input.is_some(), "/ must enter search mode");
-            // An empty query lists every interactive field, so Enter has a
-            // target straight away.
-            assert!(
-                !view.search_hits.is_empty(),
-                "empty-query search should list every interactive field"
-            );
-        }
-
-        #[test]
-        #[serial]
-        fn typing_filters_hits() {
-            let (_t, _guard, mut view) = fresh_view();
-            press(&mut view, KeyCode::Char('/'));
+            // An empty query lists every interactive field, each with the
+            // value the popup renders, so Enter has a target straight away.
             let unfiltered = view.search_hits.len();
+            assert!(unfiltered > 0);
+            for hit in &view.search_hits {
+                assert!(!hit.value_display.is_empty(), "{:?}", hit.field_label);
+            }
             type_text(&mut view, "live");
-            assert!(
-                view.search_hits.len() < unfiltered,
-                "a query should narrow the hit list"
-            );
-            let labels: Vec<String> = view
-                .search_hits
-                .iter()
-                .map(|h| h.field_label.clone())
-                .collect();
-            assert!(
-                labels
-                    .iter()
-                    .any(|l| l.to_lowercase().contains("live-send exit chord")),
-                "search 'live' should surface the Live-Send Exit Chord field; got {:?}",
-                labels
-            );
+            assert!(view.search_hits.len() < unfiltered, "a query narrows hits");
+            assert!(view.search_hits.iter().any(|h| h
+                .field_label
+                .to_lowercase()
+                .contains("live-send exit chord")));
+            press(&mut view, KeyCode::Esc);
+            assert!(view.search_input.is_none());
+            assert_eq!(view.selected_category, cat_before);
+            assert_eq!(view.selected_field, field_before);
         }
 
         /// Default Tool lives on the Agents tab, so the jump also has to
@@ -1085,6 +1063,17 @@ mod tests {
         #[serial]
         fn enter_jumps_to_hit_category_and_field() {
             let (_t, _guard, mut view) = fresh_view();
+            press(&mut view, KeyCode::Char('/'));
+            // A category name ranks that tab's fields first.
+            type_text(&mut view, "sandbox");
+            let first = view.search_hits.first().expect("hits for 'sandbox'");
+            assert_eq!(
+                first.category,
+                crate::tui::settings::SettingsCategory::Sandbox,
+                "{:?}",
+                first.field_label
+            );
+            press(&mut view, KeyCode::Esc);
             press(&mut view, KeyCode::Char('/'));
             type_text(&mut view, "default tool");
             assert!(!view.search_hits.is_empty(), "no hits for 'default tool'");
@@ -1110,38 +1099,6 @@ mod tests {
                 "session.default_tool",
                 "must position the field cursor on Default Tool"
             );
-        }
-
-        #[test]
-        #[serial]
-        fn category_query_ranks_that_tab_first() {
-            let (_t, _guard, mut view) = fresh_view();
-            press(&mut view, KeyCode::Char('/'));
-            type_text(&mut view, "sandbox");
-            let first = view.search_hits.first().expect("hits for 'sandbox'");
-            assert_eq!(
-                first.category,
-                crate::tui::settings::SettingsCategory::Sandbox,
-                "the top hit for 'sandbox' should come from the Sandbox tab, got {:?}",
-                first.field_label
-            );
-        }
-
-        /// Every hit carries the field's value for the popup to render. Only
-        /// section headers have none, and they never become hits.
-        #[test]
-        #[serial]
-        fn hits_carry_current_field_values() {
-            let (_t, _guard, mut view) = fresh_view();
-            press(&mut view, KeyCode::Char('/'));
-            assert!(!view.search_hits.is_empty());
-            for hit in &view.search_hits {
-                assert!(
-                    !hit.value_display.is_empty(),
-                    "hit {:?} should carry a non-empty value display",
-                    hit.field_label
-                );
-            }
         }
 
         #[test]
@@ -1172,88 +1129,42 @@ mod tests {
             );
         }
 
-        /// The search-jump-edit flow end to end, down to the typed
-        /// characters landing in the add prompt.
+        /// The search-jump-edit flow end to end, down to the characters
+        /// landing in the add prompt. A paste must land there too rather than
+        /// falling through: terminals batch rapid keystrokes into pastes.
         #[test]
         #[serial]
-        fn jump_then_list_add_typing_lands_in_the_prompt() {
-            let (_t, _guard, mut view) = fresh_view();
-            press(&mut view, KeyCode::Char('/'));
-            type_text(&mut view, "sandbox environment");
-            let target_idx = view
-                .search_hits
-                .iter()
-                .position(|h| h.field_ident == "sandbox.environment")
-                .expect("sandbox.environment should appear in hits");
-            view.search_selected = target_idx;
-            press(&mut view, KeyCode::Enter);
-            assert!(
-                matches!(
+        fn jump_then_list_add_typing_or_paste_lands_in_the_prompt() {
+            for paste in [false, true] {
+                let (_t, _guard, mut view) = fresh_view();
+                press(&mut view, KeyCode::Char('/'));
+                type_text(&mut view, "sandbox environment");
+                let target_idx = view
+                    .search_hits
+                    .iter()
+                    .position(|h| h.field_ident == "sandbox.environment")
+                    .expect("sandbox.environment should appear in hits");
+                view.search_selected = target_idx;
+                press(&mut view, KeyCode::Enter);
+                assert!(matches!(
                     view.fields[view.selected_field].value,
                     crate::tui::settings::FieldValue::List(_)
-                ),
-                "the jump should land on the Sandbox Environment list, got {:?}",
-                view.fields[view.selected_field].label
-            );
-            press(&mut view, KeyCode::Enter);
-            assert!(view.list_edit_state.is_some(), "Enter expands the list");
-            press(&mut view, KeyCode::Char('a'));
-            type_text(&mut view, "FOO=bar");
-            let value = view
-                .list_edit_state
-                .as_ref()
-                .and_then(|s| s.editing_item.as_ref())
-                .map(|i| i.value().to_string());
-            assert_eq!(
-                value.as_deref(),
-                Some("FOO=bar"),
-                "typed characters must land in the add prompt"
-            );
-        }
-
-        /// A paste into the add prompt must land there rather than falling
-        /// through: terminals batch rapid keystrokes into pastes, so this is
-        /// also how typed-looking input arrives.
-        #[test]
-        #[serial]
-        fn paste_lands_in_the_list_item_prompt() {
-            let (_t, _guard, mut view) = fresh_view();
-            press(&mut view, KeyCode::Char('/'));
-            type_text(&mut view, "sandbox environment");
-            let target_idx = view
-                .search_hits
-                .iter()
-                .position(|h| h.field_ident == "sandbox.environment")
-                .expect("sandbox.environment should appear in hits");
-            view.search_selected = target_idx;
-            press(&mut view, KeyCode::Enter);
-            press(&mut view, KeyCode::Enter);
-            press(&mut view, KeyCode::Char('a'));
-            view.handle_paste("FOO=bar");
-            let value = view
-                .list_edit_state
-                .as_ref()
-                .and_then(|s| s.editing_item.as_ref())
-                .map(|i| i.value().to_string());
-            assert_eq!(
-                value.as_deref(),
-                Some("FOO=bar"),
-                "a paste must land in the add prompt"
-            );
-        }
-
-        #[test]
-        #[serial]
-        fn esc_closes_search_without_changing_selection() {
-            let (_t, _guard, mut view) = fresh_view();
-            let cat_before = view.selected_category;
-            let field_before = view.selected_field;
-            press(&mut view, KeyCode::Char('/'));
-            type_text(&mut view, "tmux");
-            press(&mut view, KeyCode::Esc);
-            assert!(view.search_input.is_none());
-            assert_eq!(view.selected_category, cat_before);
-            assert_eq!(view.selected_field, field_before);
+                ));
+                press(&mut view, KeyCode::Enter);
+                assert!(view.list_edit_state.is_some(), "Enter expands the list");
+                press(&mut view, KeyCode::Char('a'));
+                if paste {
+                    view.handle_paste("FOO=bar");
+                } else {
+                    type_text(&mut view, "FOO=bar");
+                }
+                let value = view
+                    .list_edit_state
+                    .as_ref()
+                    .and_then(|s| s.editing_item.as_ref())
+                    .map(|i| i.value().to_string());
+                assert_eq!(value.as_deref(), Some("FOO=bar"), "paste={paste}");
+            }
         }
     }
 
@@ -1266,37 +1177,34 @@ mod tests {
 
         #[test]
         #[serial]
-        fn click_on_scope_tab_switches_scope() {
+        fn scope_tab_click_switches_unless_unsaved_or_editing() {
+            let tab = (SettingsScope::Profile, Rect::new(40, 0, 18, 1));
             let (_t, _guard, mut view) = fresh_view();
-            view.scope_tab_rects
-                .push((SettingsScope::Profile, Rect::new(40, 0, 18, 1)));
+            view.scope_tab_rects.push(tab);
             assert_eq!(view.scope, SettingsScope::Global);
             view.handle_click(45, 0);
             assert_eq!(view.scope, SettingsScope::Profile);
-        }
 
-        #[test]
-        #[serial]
-        fn click_on_scope_tab_with_unsaved_changes_warns() {
             let (_t, _guard, mut view) = fresh_view();
             view.has_changes = true;
-            view.scope_tab_rects
-                .push((SettingsScope::Profile, Rect::new(40, 0, 18, 1)));
-            let result = view.handle_click(45, 0);
+            view.scope_tab_rects.push(tab);
             assert!(matches!(
-                result,
+                view.handle_click(45, 0),
                 Some(SettingsAction::UnsavedChangesWarning)
             ));
-            assert_eq!(
-                view.scope,
-                SettingsScope::Global,
-                "scope must not change while there are unsaved changes"
-            );
+            assert_eq!(view.scope, SettingsScope::Global);
+
+            // Esc and Enter own the exit from an edit.
+            let (_t, _guard, mut view) = fresh_view();
+            view.editing_input = Some(tui_input::Input::new("typing".to_string()));
+            view.scope_tab_rects.push(tab);
+            assert!(view.handle_click(45, 0).is_none());
+            assert_eq!(view.scope, SettingsScope::Global);
         }
 
         #[test]
         #[serial]
-        fn click_on_category_row_focuses_and_selects() {
+        fn click_on_category_or_field_focuses_and_selects() {
             let (_t, _guard, mut view) = fresh_view();
             view.focus = crate::tui::settings::SettingsFocus::Fields;
             let original = view.selected_category;
@@ -1314,11 +1222,7 @@ mod tests {
             view.handle_click(5, 10);
             assert_eq!(view.focus, crate::tui::settings::SettingsFocus::Categories);
             assert_eq!(view.selected_category, other_tab);
-        }
 
-        #[test]
-        #[serial]
-        fn click_on_field_focuses_and_selects() {
             let (_t, _guard, mut view) = fresh_view();
             view.field_rects.push((0, Rect::new(20, 5, 50, 2)));
             view.field_rects.push((1, Rect::new(20, 8, 50, 2)));
@@ -1399,7 +1303,7 @@ mod tests {
 
         #[test]
         #[serial]
-        fn click_on_popup_hit_jumps_to_it() {
+        fn popup_click_jumps_on_a_hit_keeps_open_inside_and_dismisses_outside() {
             let (_t, _guard, mut view) = fresh_view();
             view.open_search();
             // Staged as render would capture them: two hits on rows 7 and 8.
@@ -1417,11 +1321,7 @@ mod tests {
                 target,
                 "a hit click must jump to that hit's field"
             );
-        }
 
-        #[test]
-        #[serial]
-        fn popup_click_miss_keeps_open_and_outside_dismisses() {
             let (_t, _guard, mut view) = fresh_view();
             let cat_before = view.selected_category;
             let field_before = view.selected_field;
@@ -1448,6 +1348,16 @@ mod tests {
                 view.selected_field, field_before,
                 "dismissing by click must not select the field underneath"
             );
+
+            // A click on the idle search bar opens it, and a second click on
+            // the bar while the popup is open must not close it.
+            let (_t, _guard, mut view) = fresh_view();
+            view.search_bar_rect = Rect::new(0, 3, 170, 3);
+            view.handle_click(10, 4);
+            assert!(view.search_input.is_some());
+            view.search_popup_area = Rect::new(2, 6, 100, 20);
+            view.handle_click(10, 4);
+            assert!(view.search_input.is_some());
         }
 
         #[test]
@@ -1470,38 +1380,6 @@ mod tests {
                 "a hover outside the popup frame must not move the selection"
             );
             assert_eq!(view.search_selected, 1);
-        }
-
-        #[test]
-        #[serial]
-        fn click_on_bar_opens_search_and_does_not_dismiss_it() {
-            let (_t, _guard, mut view) = fresh_view();
-            view.search_bar_rect = Rect::new(0, 3, 170, 3);
-            assert!(view.search_input.is_none());
-            view.handle_click(10, 4);
-            assert!(
-                view.search_input.is_some(),
-                "a click on the idle bar must open the search"
-            );
-
-            view.search_popup_area = Rect::new(2, 6, 100, 20);
-            view.handle_click(10, 4);
-            assert!(
-                view.search_input.is_some(),
-                "a click on the bar while the popup is open must not close it"
-            );
-        }
-
-        #[test]
-        #[serial]
-        fn handle_click_returns_none_when_editing() {
-            let (_t, _guard, mut view) = fresh_view();
-            view.editing_input = Some(tui_input::Input::new("typing".to_string()));
-            view.scope_tab_rects
-                .push((SettingsScope::Profile, Rect::new(40, 0, 18, 1)));
-            // Esc and Enter own the exit from an edit.
-            assert!(view.handle_click(45, 0).is_none());
-            assert_eq!(view.scope, SettingsScope::Global);
         }
 
         /// Hover paints a highlight and nothing else: it must never shift

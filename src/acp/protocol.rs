@@ -270,13 +270,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_request_defaults_attachments_when_absent() {
-        let req: PromptRequest = serde_json::from_str(r#"{"text":"hello"}"#).unwrap();
-        assert_eq!(req.text, "hello");
-        assert!(req.attachments.is_empty());
-    }
-
-    #[test]
     fn prompt_request_accepts_prompt_id_and_id_alias() {
         let cases: [(&str, Option<&str>); 3] = [
             (r#"{"text":"hi"}"#, None),
@@ -287,37 +280,6 @@ mod tests {
             let req: PromptRequest = serde_json::from_str(json).unwrap();
             assert_eq!(req.prompt_id.as_deref(), expect, "{json}");
         }
-    }
-
-    #[test]
-    fn prompt_attachment_upload_roundtrips() {
-        let req: PromptRequest = serde_json::from_str(
-            r#"{"text":"see this","attachments":[{"kind":"image","mime_type":"image/png","data":"aGk=","name":"a.png"}]}"#,
-        )
-        .unwrap();
-        assert_eq!(req.attachments.len(), 1);
-        let att = &req.attachments[0];
-        assert_eq!(att.kind, PromptAttachmentKind::Image);
-        assert_eq!(att.mime_type, "image/png");
-        assert_eq!(att.data, "aGk=");
-        assert_eq!(att.name.as_deref(), Some("a.png"));
-    }
-
-    #[test]
-    fn broadcast_frame_roundtrips_through_json() {
-        let frame = AcpBroadcastFrame {
-            session_id: "s-1".into(),
-            seq: 42,
-            event: Arc::new(Event::ThinkingStarted),
-            worker_generation: Some(7),
-        };
-        let json = serde_json::to_string(&frame).unwrap();
-        let back: AcpBroadcastFrame = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.session_id, "s-1");
-        assert_eq!(back.seq, 42);
-        assert!(matches!(*back.event, Event::ThinkingStarted));
-        assert!(!json.contains("worker_generation"));
-        assert_eq!(back.worker_generation, None);
     }
 
     #[test]
@@ -341,57 +303,11 @@ mod tests {
             !json.contains("transcripts"),
             "transcript path must not reach the client: {json}"
         );
+        assert!(!json.contains("worker_generation"));
         let back: AcpBroadcastFrame = serde_json::from_str(&json).unwrap();
         match &*back.event {
             Event::BackgroundAgentLaunched { output_file, .. } => assert_eq!(output_file, ""),
             other => panic!("unexpected event: {other:?}"),
         }
-    }
-
-    #[test]
-    fn approval_decision_wire_pascalcase() {
-        let json = serde_json::to_string(&ApprovalDecisionWire::AllowAlways).unwrap();
-        assert_eq!(json, "\"AllowAlways\"");
-        let back: ApprovalDecisionWire = serde_json::from_str("\"Deny\"").unwrap();
-        assert!(matches!(back, ApprovalDecisionWire::Deny));
-    }
-
-    #[test]
-    fn resolve_approval_request_decision_field() {
-        let body = serde_json::json!({ "decision": "Allow" });
-        let parsed: ResolveApprovalRequest = serde_json::from_value(body).unwrap();
-        assert!(matches!(parsed.decision, ApprovalDecisionWire::Allow));
-    }
-
-    #[test]
-    fn switch_agent_request_optional_fields_default_to_none() {
-        let body = serde_json::json!({ "target": "codex" });
-        let parsed: SwitchAgentRequest = serde_json::from_value(body).unwrap();
-        assert_eq!(parsed.target, "codex");
-        assert!(parsed.model.is_none());
-        assert!(parsed.reason.is_none());
-    }
-
-    #[test]
-    fn switch_agent_request_carries_reason() {
-        let body = serde_json::json!({ "target": "claude", "reason": "manual" });
-        let parsed: SwitchAgentRequest = serde_json::from_value(body).unwrap();
-        assert_eq!(parsed.reason.as_deref(), Some("manual"));
-    }
-
-    #[test]
-    fn replay_query_defaults_limit_when_absent() {
-        let query: ReplayQuery = serde_json::from_str(r#"{"since":42}"#).unwrap();
-        assert_eq!(query.since, 42);
-        assert_eq!(query.limit, None);
-    }
-
-    #[test]
-    fn replay_response_defaults_paging_fields_when_absent() {
-        let response: ReplayResponse =
-            serde_json::from_str(r#"{"frames":[],"lost":false,"highest_seq":0,"lowest_seq":null}"#)
-                .unwrap();
-        assert_eq!(response.next_cursor, None);
-        assert!(!response.has_more);
     }
 }

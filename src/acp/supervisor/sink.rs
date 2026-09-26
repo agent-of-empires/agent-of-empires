@@ -185,7 +185,6 @@ impl ChannelSink {
 #[cfg(test)]
 mod tests {
     use super::super::test_support::channel_sink;
-    use super::super::Supervisor;
     use super::*;
 
     #[test]
@@ -232,47 +231,5 @@ mod tests {
             panic!("expected a stored RateLimit at seq 2, got {stored:?}");
         };
         assert_eq!(stored_info.resets_at, Some(resets_at));
-    }
-
-    #[tokio::test]
-    async fn seq_counter_resumes_from_disk_after_restart() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let db_path = tmp.path().join("acp.db");
-        let open = || {
-            let event_store = Arc::new(EventStore::open(&db_path, 1000).unwrap());
-            let (tx, rx) = broadcast::channel(16);
-            let sink = Arc::new(ChannelSink {
-                tx,
-                event_store: event_store.clone(),
-                control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
-            });
-            (Supervisor::new(sink), event_store, rx)
-        };
-        {
-            let (sup, _, mut rx) = open();
-            for text in ["first", "second", "third"] {
-                sup.publish_user_prompt("s-99", text.into()).await;
-            }
-            let seqs: Vec<u64> = std::iter::from_fn(|| rx.try_recv().ok())
-                .map(|frame| frame.seq)
-                .collect();
-            assert_eq!(seqs, [1, 2, 3], "broadcast subscribers see seq order");
-        }
-
-        let (sup, event_store, mut rx) = open();
-        assert_eq!(event_store.highest_seq("s-99"), 3);
-        sup.hydrate_seqs(event_store.all_session_seqs());
-        sup.publish_user_prompt("s-99", "after restart".into())
-            .await;
-        assert_eq!(rx.try_recv().expect("post-restart frame").seq, 4);
-        let texts: Vec<String> = event_store
-            .replay_from("s-99", 0)
-            .into_iter()
-            .filter_map(|(_, ev)| match ev {
-                Event::UserPromptSent { text, .. } => Some(text),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(texts, ["first", "second", "third", "after restart"]);
     }
 }

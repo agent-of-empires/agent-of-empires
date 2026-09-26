@@ -92,6 +92,8 @@ fn wait_with_timeout_inner(
     let termination_grace = (timeout / 4).min(PROCESS_GROUP_TERMINATION_GRACE);
     let terminate_at = deadline.checked_sub(termination_grace).unwrap_or(deadline);
     let mut termination_requested = false;
+    // Most children exit within a few ms; start fine and back off to the cap.
+    let mut poll = Duration::from_millis(1);
     loop {
         if let Some(status) = child.try_wait()? {
             if !termination_requested {
@@ -112,7 +114,8 @@ fn wait_with_timeout_inner(
             let _ = child.wait();
             return Ok(None);
         }
-        std::thread::sleep(WAIT_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+        std::thread::sleep(poll.min(deadline.saturating_duration_since(now)));
+        poll = (poll * 2).min(WAIT_POLL_INTERVAL);
     }
 }
 

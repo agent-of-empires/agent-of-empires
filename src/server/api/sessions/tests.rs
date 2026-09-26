@@ -48,125 +48,126 @@ fn build_rename_test_state(
     (storage, state)
 }
 
+/// #3411: a rename to a duplicate title, or a tied rename whose derived path
+/// collides with another session's worktree, is refused.
 #[tokio::test]
 #[serial_test::serial]
-async fn rename_session_rejects_duplicate_and_preserves_newer_cache() {
-    use axum::body::to_bytes;
+async fn rename_session_rejects_duplicates_and_preserves_newer_cache() {
+    {
+        use axum::body::to_bytes;
 
-    let _guard = crate::session::test_support::isolate_app_dir();
-    let mut existing = Instance::new("main branch", "/tmp/repo/");
-    existing.source_profile = "default".to_string();
-    let mut target = Instance::new("throwaway", "/tmp/repo");
-    target.source_profile = "default".to_string();
-    let target_id = target.id.clone();
-    let mut stale_existing = existing.clone();
-    stale_existing.title = "previous title".to_string();
-    let mut stale_target = target.clone();
-    stale_target.project_path = "/tmp/stale".to_string();
-    let (storage, state) =
-        build_rename_test_state(vec![existing, target], vec![stale_existing, stale_target]);
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let mut existing = Instance::new("main branch", "/tmp/repo/");
+        existing.source_profile = "default".to_string();
+        let mut target = Instance::new("throwaway", "/tmp/repo");
+        target.source_profile = "default".to_string();
+        let target_id = target.id.clone();
+        let mut stale_existing = existing.clone();
+        stale_existing.title = "previous title".to_string();
+        let mut stale_target = target.clone();
+        stale_target.project_path = "/tmp/stale".to_string();
+        let (storage, state) =
+            build_rename_test_state(vec![existing, target], vec![stale_existing, stale_target]);
 
-    let response = rename_session(
-        State(state.clone()),
-        Path(target_id.clone()),
-        Ok(Json(RenameSessionBody {
-            title: "main branch".to_string(),
-            rename_branch: false,
-        })),
-    )
-    .await
-    .into_response();
+        let response = rename_session(
+            State(state.clone()),
+            Path(target_id.clone()),
+            Ok(Json(RenameSessionBody {
+                title: "main branch".to_string(),
+                rename_branch: false,
+            })),
+        )
+        .await
+        .into_response();
 
-    assert_eq!(response.status(), StatusCode::CONFLICT);
-    let body = to_bytes(response.into_body(), 2048).await.unwrap();
-    assert!(String::from_utf8_lossy(&body).contains("duplicate_session"));
-    assert_eq!(
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), 2048).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("duplicate_session"));
+        assert_eq!(
+            state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|instance| instance.id == target_id)
+                .unwrap()
+                .title,
+            "throwaway"
+        );
+
+        storage
+            .update(|instances, _groups| {
+                instances
+                    .iter_mut()
+                    .find(|instance| instance.id != target_id)
+                    .unwrap()
+                    .title = "other".to_string();
+                Ok(())
+            })
+            .unwrap();
+        // A user action can advance the live cache while the disk snapshot still
+        // has the older row, so publication must patch only rename-owned identity
+        // fields.
         state
             .instances
-            .read()
+            .write()
             .await
-            .iter()
+            .iter_mut()
             .find(|instance| instance.id == target_id)
             .unwrap()
-            .title,
-        "throwaway"
-    );
-
-    storage
-        .update(|instances, _groups| {
-            instances
-                .iter_mut()
-                .find(|instance| instance.id != target_id)
-                .unwrap()
-                .title = "other".to_string();
-            Ok(())
-        })
-        .unwrap();
-    // A user action can advance the live cache while the disk snapshot still
-    // has the older row, so publication must patch only rename-owned identity
-    // fields.
-    state
-        .instances
-        .write()
+            .favorite();
+        let response = rename_session(
+            State(state.clone()),
+            Path(target_id.clone()),
+            Ok(Json(RenameSessionBody {
+                title: "main branch".to_string(),
+                rename_branch: false,
+            })),
+        )
         .await
-        .iter_mut()
-        .find(|instance| instance.id == target_id)
-        .unwrap()
-        .favorite();
-    let response = rename_session(
-        State(state.clone()),
-        Path(target_id.clone()),
-        Ok(Json(RenameSessionBody {
-            title: "main branch".to_string(),
-            rename_branch: false,
-        })),
-    )
-    .await
-    .into_response();
+        .into_response();
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let instances = state.instances.read().await;
-    let target = instances
-        .iter()
-        .find(|instance| instance.id == target_id)
-        .unwrap();
-    assert_eq!(target.title, "main branch");
-    assert_eq!(target.project_path, "/tmp/repo");
-    assert_eq!(target.source_profile, "default");
-    assert!(
-        target.is_favorited(),
-        "newer cached user action must survive rename publication"
-    );
-}
+        assert_eq!(response.status(), StatusCode::OK);
+        let instances = state.instances.read().await;
+        let target = instances
+            .iter()
+            .find(|instance| instance.id == target_id)
+            .unwrap();
+        assert_eq!(target.title, "main branch");
+        assert_eq!(target.project_path, "/tmp/repo");
+        assert_eq!(target.source_profile, "default");
+        assert!(
+            target.is_favorited(),
+            "newer cached user action must survive rename publication"
+        );
+    }
+    {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(true);
+        let mut existing = Instance::new("main branch", "/tmp/worktrees/main-branch");
+        existing.source_profile = "default".to_string();
+        let mut drifted = Instance::new("main branch", "/tmp/worktrees/drifted");
+        drifted.source_profile = "default".to_string();
+        drifted.worktree_info = Some(worktree("main-branch", "/tmp/repo".to_string(), None));
+        let drifted_id = drifted.id.clone();
+        let (_storage, state) = build_rename_test_state(
+            vec![existing.clone(), drifted.clone()],
+            vec![existing, drifted],
+        );
 
-#[tokio::test]
-#[serial_test::serial]
-async fn rename_session_rejects_tied_drifted_path_collision() {
-    let _guard = crate::session::test_support::isolate_app_dir();
-    let _tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(true);
-    let mut existing = Instance::new("main branch", "/tmp/worktrees/main-branch");
-    existing.source_profile = "default".to_string();
-    let mut drifted = Instance::new("main branch", "/tmp/worktrees/drifted");
-    drifted.source_profile = "default".to_string();
-    drifted.worktree_info = Some(worktree("main-branch", "/tmp/repo".to_string(), None));
-    let drifted_id = drifted.id.clone();
-    let (_storage, state) = build_rename_test_state(
-        vec![existing.clone(), drifted.clone()],
-        vec![existing, drifted],
-    );
+        let response = rename_session(
+            State(state),
+            Path(drifted_id),
+            Ok(Json(RenameSessionBody {
+                title: "main branch".to_string(),
+                rename_branch: false,
+            })),
+        )
+        .await
+        .into_response();
 
-    let response = rename_session(
-        State(state),
-        Path(drifted_id),
-        Ok(Json(RenameSessionBody {
-            title: "main branch".to_string(),
-            rename_branch: false,
-        })),
-    )
-    .await
-    .into_response();
-
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
 }
 
 #[tokio::test]
@@ -256,17 +257,16 @@ mod workspace_deletion {
 
     #[test]
     fn owner_is_last_and_siblings_are_record_only() {
-        let ids = vec!["owner".to_string(), "sib1".to_string(), "sib2".to_string()];
-        let plan = order_workspace_deletion(&ids, &body());
-
+        let plan = order_workspace_deletion(
+            &["owner".to_string(), "sib1".to_string(), "sib2".to_string()],
+            &body(),
+        );
         let order: Vec<&str> = plan.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
             order,
             vec!["sib1", "sib2", "owner"],
             "siblings must precede the owner so the worktree owner is torn down last"
         );
-
-        // Siblings never touch the shared worktree/branch.
         for (id, b) in &plan[..2] {
             assert!(
                 !b.delete_worktree,
@@ -278,71 +278,31 @@ mod workspace_deletion {
                 "sibling {id} still tears down its own sandbox"
             );
         }
-        // The owner (last) carries the caller's worktree/branch flags.
-        let (owner_id, owner_body) = plan.last().unwrap();
-        assert_eq!(owner_id, "owner");
-        assert!(owner_body.delete_worktree);
-        assert!(owner_body.delete_branch);
-    }
-
-    #[test]
-    fn single_session_is_owner_only_with_full_flags() {
-        let ids = vec!["solo".to_string()];
-        let plan = order_workspace_deletion(&ids, &body());
-        assert_eq!(plan.len(), 1);
-        let (id, b) = &plan[0];
-        assert_eq!(id, "solo");
-        assert!(
-            b.delete_worktree,
-            "the only session owns the worktree cleanup"
-        );
-        assert!(b.delete_branch);
-    }
-
-    #[test]
-    fn empty_input_is_empty_plan() {
-        assert!(order_workspace_deletion(&[], &body()).is_empty());
-    }
-
-    #[test]
-    fn worktree_flags_off_stay_off_for_owner() {
-        let mut b = body();
-        b.delete_worktree = false;
-        b.delete_branch = false;
-        let ids = vec!["owner".to_string(), "sib".to_string()];
-        let plan = order_workspace_deletion(&ids, &b);
         let (_, owner_body) = plan.last().unwrap();
-        assert!(!owner_body.delete_worktree);
-        assert!(!owner_body.delete_branch);
-    }
+        assert!(owner_body.delete_worktree && owner_body.delete_branch);
 
-    #[test]
-    fn dedupe_drops_repeats_preserving_first_seen_order() {
-        let ids = vec![
-            "a".to_string(),
-            "b".to_string(),
-            "a".to_string(),
-            "c".to_string(),
-            "b".to_string(),
-        ];
+        let mut off = body();
+        off.delete_worktree = false;
+        off.delete_branch = false;
+        let plan = order_workspace_deletion(&["owner".to_string(), "sib".to_string()], &off);
+        let (_, owner_body) = plan.last().unwrap();
+        assert!(!owner_body.delete_worktree && !owner_body.delete_branch);
+
+        assert!(order_workspace_deletion(&[], &body()).is_empty());
+        let ids = ["a", "b", "a", "c", "b"].map(String::from);
         assert_eq!(dedupe_session_ids(&ids), vec!["a", "b", "c"]);
-    }
 
-    #[test]
-    fn duplicate_owner_still_removes_the_worktree() {
-        // #2536 review: after dedupe the single owner entry keeps the real
-        // worktree flags rather than the record-only sibling ones.
+        // #2536 review: a deduped lone owner (also the single-session case)
+        // keeps the real worktree flags rather than the record-only ones.
         let ids = dedupe_session_ids(&["owner".to_string(), "owner".to_string()]);
-        assert_eq!(ids, vec!["owner"]);
         let plan = order_workspace_deletion(&ids, &body());
         assert_eq!(plan.len(), 1);
         let (id, b) = &plan[0];
         assert_eq!(id, "owner");
         assert!(
-            b.delete_worktree,
+            b.delete_worktree && b.delete_branch,
             "the deduped owner must still own the worktree cleanup"
         );
-        assert!(b.delete_branch);
     }
 }
 
@@ -353,75 +313,57 @@ mod cityhall_capability {
     use crate::session::test_support::isolate_app_dir;
     use serial_test::serial;
 
-    #[test]
-    fn builtin_agent_is_acp_capable() {
-        // Built-in ACP agents resolve via the registry without reading config.
-        assert!(agent_is_acp_capable(
-            "default",
-            std::path::Path::new("/nonexistent"),
-            "claude",
-            None,
-        ));
-    }
-
+    /// `acp_enable` gates on this predicate, not `pick_agent_for_tool`: the
+    /// default-agent fallback always names a registry entry, so a post-fallback
+    /// lookup would report every tool capable (#3583).
     #[test]
     #[serial]
-    fn an_explicit_agent_name_keys_the_custom_acp_cmd_lookup() {
-        // An explicit `agent_name` can point at a different `agent_acp_cmd`
-        // entry than `tool`, so keying the lookup off `tool` reported
-        // not-capable for an agent that spawns fine.
-        let _tmp = isolate_app_dir();
-        crate::session::config::update_config(|c| {
-            c.session
-                .agent_acp_cmd
-                .insert("acp-helper".into(), "acp-helper --acp".into());
-        })
-        .unwrap();
-        let path = std::path::Path::new("/nonexistent");
-        assert!(agent_is_acp_capable(
-            "default",
-            path,
-            "plain-tool",
-            Some("acp-helper"),
-        ));
-        // Without the override there is nothing to resolve to, so the same
-        // tool stays not-capable.
-        assert!(!agent_is_acp_capable("default", path, "plain-tool", None));
-    }
-
-    #[test]
-    #[serial]
-    fn unknown_tool_is_not_acp_capable() {
-        let _tmp = isolate_app_dir();
-        assert!(!agent_is_acp_capable(
-            "default",
-            std::path::Path::new("/nonexistent"),
-            "definitely-not-a-real-tool",
-            None,
-        ));
-    }
-
-    /// Why `acp_enable` gates on this predicate and not `pick_agent_for_tool`:
-    /// the default-agent fallback always names a registry entry, so a
-    /// post-fallback lookup reports every tool capable and would switch a
-    /// terminal-only session into a structured one running some other agent.
-    #[test]
-    #[serial]
-    fn the_default_agent_fallback_is_not_a_capability_signal() {
-        let _tmp = isolate_app_dir();
-        let fallback = crate::session::config::DEFAULT_ACP_AGENT;
-        assert!(
-            crate::acp::AgentRegistry::with_defaults()
-                .get(fallback)
-                .is_some(),
-            "the fallback must be spawnable, which is what makes it useless as a gate"
-        );
-        assert!(!agent_is_acp_capable(
-            "default",
-            std::path::Path::new("/nonexistent"),
-            "plain-tool",
-            None,
-        ));
+    fn acp_capability_follows_agent_name_not_the_default_fallback() {
+        {
+            // An explicit `agent_name` can point at a different `agent_acp_cmd`
+            // entry than `tool`, so keying the lookup off `tool` reported
+            // not-capable for an agent that spawns fine.
+            let _tmp = isolate_app_dir();
+            crate::session::config::update_config(|c| {
+                c.session
+                    .agent_acp_cmd
+                    .insert("acp-helper".into(), "acp-helper --acp".into());
+            })
+            .unwrap();
+            let path = std::path::Path::new("/nonexistent");
+            assert!(agent_is_acp_capable(
+                "default",
+                path,
+                "plain-tool",
+                Some("acp-helper"),
+            ));
+            // Without the override there is nothing to resolve to, so the same
+            // tool stays not-capable.
+            assert!(!agent_is_acp_capable("default", path, "plain-tool", None));
+        }
+        {
+            let _tmp = isolate_app_dir();
+            let fallback = crate::session::config::DEFAULT_ACP_AGENT;
+            assert!(
+                crate::acp::AgentRegistry::with_defaults()
+                    .get(fallback)
+                    .is_some(),
+                "the fallback must be spawnable, which is what makes it useless as a gate"
+            );
+            assert!(!agent_is_acp_capable(
+                "default",
+                std::path::Path::new("/nonexistent"),
+                "plain-tool",
+                None,
+            ));
+            // Built-in agents resolve via the registry without reading config.
+            assert!(agent_is_acp_capable(
+                "default",
+                std::path::Path::new("/nonexistent"),
+                "claude",
+                None,
+            ));
+        }
     }
 }
 
@@ -536,11 +478,70 @@ fn worktree(
 // asserts the body message rather than the status.
 #[tokio::test]
 #[serial_test::serial]
-async fn force_smart_rename_preflight_sees_command_override_but_not_from_a_repo() {
-    use axum::body::to_bytes;
+async fn force_smart_rename_preflight_skips_name_gate_and_sees_only_user_override() {
+    {
+        use axum::body::to_bytes;
 
-    async fn preflight_message(repo: &std::path::Path) -> String {
-        let mut inst = Instance::new("Vikings", repo.to_str().unwrap());
+        async fn preflight_message(repo: &std::path::Path) -> String {
+            let mut inst = Instance::new("Vikings", repo.to_str().unwrap());
+            inst.tool = "claude".to_string();
+            inst.source_profile = "default".to_string();
+            inst.view = crate::session::View::Structured;
+            let id = inst.id.clone();
+
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let resp = force_smart_rename(axum::extract::State(state), axum::extract::Path(id))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+            String::from_utf8_lossy(&body).to_string()
+        }
+
+        let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+        let repo = tempfile::tempdir().expect("tempdir repo");
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+
+        // A repo declaring the override changes nothing: command-bearing
+        // session fields are not repo-overridable (#3154).
+        let cfg_dir = repo.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "[session.agent_command_override]\nclaude = \"wrapper-3058\"\n",
+        )
+        .unwrap();
+        let msg = preflight_message(repo.path()).await;
+        assert!(
+            !msg.contains("command is overridden"),
+            "a repo must not be able to declare the agent command override; got: {msg}"
+        );
+
+        // The user's own override is still seen through the repo-aware
+        // resolution the preflight routes through (#3058).
+        let app_dir = crate::session::get_app_dir().expect("isolated app dir");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "[session.agent_command_override]\nclaude = \"wrapper-3058\"\n",
+        )
+        .unwrap();
+        let msg = preflight_message(repo.path()).await;
+        assert!(
+            msg.contains("command is overridden"),
+            "preflight must see the user's override via repo-aware resolution; got: {msg}"
+        );
+    }
+    {
+        use axum::body::to_bytes;
+
+        let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+
+        // "Auto-name now" regenerates over a custom title, so the preflight
+        // falls through to the next gate instead of `NameNotDefault`.
+        let mut inst = Instance::new("Vikings", "/tmp/custom-name-regen");
+        inst.title = "Fix login bug".to_string();
         inst.tool = "claude".to_string();
         inst.source_profile = "default".to_string();
         inst.view = crate::session::View::Structured;
@@ -552,80 +553,16 @@ async fn force_smart_rename_preflight_sees_command_override_but_not_from_a_repo(
             .into_response();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
-        String::from_utf8_lossy(&body).to_string()
+        let msg = String::from_utf8_lossy(&body);
+        assert!(
+            !msg.contains("custom name"),
+            "manual regenerate must not refuse a custom-named session; got: {msg}"
+        );
+        assert!(
+            msg.contains("No prompt to name this session from yet"),
+            "must fall through to the next gate instead; got: {msg}"
+        );
     }
-
-    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
-    let repo = tempfile::tempdir().expect("tempdir repo");
-    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
-
-    // A repo declaring the override changes nothing: command-bearing
-    // session fields are not repo-overridable (#3154).
-    let cfg_dir = repo.path().join(".agent-of-empires");
-    std::fs::create_dir_all(&cfg_dir).unwrap();
-    std::fs::write(
-        cfg_dir.join("config.toml"),
-        "[session.agent_command_override]\nclaude = \"wrapper-3058\"\n",
-    )
-    .unwrap();
-    let msg = preflight_message(repo.path()).await;
-    assert!(
-        !msg.contains("command is overridden"),
-        "a repo must not be able to declare the agent command override; got: {msg}"
-    );
-
-    // The user's own override is still seen through the repo-aware
-    // resolution the preflight routes through (#3058).
-    let app_dir = crate::session::get_app_dir().expect("isolated app dir");
-    std::fs::create_dir_all(&app_dir).unwrap();
-    std::fs::write(
-        app_dir.join("config.toml"),
-        "[session.agent_command_override]\nclaude = \"wrapper-3058\"\n",
-    )
-    .unwrap();
-    let msg = preflight_message(repo.path()).await;
-    assert!(
-        msg.contains("command is overridden"),
-        "preflight must see the user's override via repo-aware resolution; got: {msg}"
-    );
-}
-
-// The manual "Auto-name now" action regenerates a title even over one already
-// chosen (a real request from a user who found the old "hide until eligible"
-// behavior useless: the whole point of the always-shown action is to be able
-// to re-roll a name on demand). The preflight must not reject a custom-named
-// session with `NameNotDefault`; it falls through to the next gate instead
-// (here, "no prompt yet", since this test seeds no ACP event-store data).
-#[tokio::test]
-#[serial_test::serial]
-async fn force_smart_rename_ignores_a_custom_name() {
-    use axum::body::to_bytes;
-
-    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
-    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
-
-    let mut inst = Instance::new("Vikings", "/tmp/custom-name-regen");
-    inst.title = "Fix login bug".to_string();
-    inst.tool = "claude".to_string();
-    inst.source_profile = "default".to_string();
-    inst.view = crate::session::View::Structured;
-    let id = inst.id.clone();
-
-    let state = crate::server::test_support::build_test_app_state(vec![inst]);
-    let resp = force_smart_rename(axum::extract::State(state), axum::extract::Path(id))
-        .await
-        .into_response();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
-    let body = to_bytes(resp.into_body(), 1024).await.unwrap();
-    let msg = String::from_utf8_lossy(&body);
-    assert!(
-        !msg.contains("custom name"),
-        "manual regenerate must not refuse a custom-named session; got: {msg}"
-    );
-    assert!(
-        msg.contains("No prompt to name this session from yet"),
-        "must fall through to the next gate instead; got: {msg}"
-    );
 }
 
 #[tokio::test]
@@ -732,23 +669,6 @@ async fn list_sessions_state_filter() {
     );
 }
 
-#[tokio::test]
-async fn wait_until_left_starting_returns_immediately_if_already_left() {
-    let mut inst = Instance::new("already-running", "/tmp/wait-a");
-    inst.id = "wait-already-left".to_string();
-    inst.status = Status::Running;
-    let state = crate::server::test_support::build_test_app_state(vec![inst]);
-
-    let result = wait_until_left_starting(
-        &state,
-        "wait-already-left",
-        std::time::Duration::from_secs(5),
-    );
-    tokio::pin!(result);
-    let result = futures_util::poll!(&mut result).map(|value| value.map(|i| i.status));
-    assert_eq!(result, std::task::Poll::Ready(Some(Status::Running)));
-}
-
 #[tokio::test(start_paused = true)]
 async fn wait_until_left_starting_resolves_on_broadcast() {
     let mut inst = Instance::new("starting", "/tmp/wait-b");
@@ -786,12 +706,33 @@ async fn wait_until_left_starting_resolves_on_broadcast() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn wait_until_left_starting_times_out_with_current_status() {
+async fn wait_until_left_starting_returns_now_or_with_current_status_at_timeout() {
+    let mut inst = Instance::new("already-running", "/tmp/wait-a");
+    inst.id = "wait-already-left".to_string();
+    inst.status = Status::Running;
+    let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+    let result = wait_until_left_starting(
+        &state,
+        "wait-already-left",
+        std::time::Duration::from_secs(5),
+    );
+    tokio::pin!(result);
+    let result = futures_util::poll!(&mut result).map(|value| value.map(|i| i.status));
+    assert_eq!(result, std::task::Poll::Ready(Some(Status::Running)));
+
+    let vanished =
+        wait_until_left_starting(&state, "never-existed", std::time::Duration::from_secs(5));
+    tokio::pin!(vanished);
+    assert!(matches!(
+        futures_util::poll!(&mut vanished),
+        std::task::Poll::Ready(None)
+    ));
+
     let mut inst = Instance::new("stuck", "/tmp/wait-c");
     inst.id = "wait-timeout".to_string();
     inst.status = Status::Starting;
     let state = crate::server::test_support::build_test_app_state(vec![inst]);
-
     let timeout = std::time::Duration::from_millis(150);
     let waiter = wait_until_left_starting(&state, "wait-timeout", timeout);
     tokio::pin!(waiter);
@@ -800,18 +741,6 @@ async fn wait_until_left_starting_times_out_with_current_status() {
     assert!(futures_util::poll!(waiter.as_mut()).is_pending());
     tokio::time::advance(timeout).await;
     assert_eq!(waiter.await.map(|i| i.status), Some(Status::Waiting));
-}
-
-#[tokio::test]
-async fn wait_until_left_starting_returns_none_if_instance_vanished() {
-    let state = crate::server::test_support::build_test_app_state(vec![]);
-    let result = wait_until_left_starting(
-        &state,
-        "never-existed",
-        std::time::Duration::from_millis(100),
-    )
-    .await;
-    assert!(result.is_none());
 }
 
 #[test]
@@ -833,220 +762,160 @@ fn find_by_idempotency_key_matches_trashed_but_not_missing() {
 }
 
 #[test]
-fn fork_from_builds_terminal_seed_for_claude() {
-    let parent_binding = crate::session::ConversationBinding {
-        session_id: "parent-uuid".into(),
-        execution: Some(crate::session::ExecutionBinding {
-            agent: "claude".into(),
-            stores: vec!["/tmp/claude-store".into()],
-            configuration: Vec::new(),
-            exported_default_store: false,
-            cwd: "/tmp".into(),
-            cwd_filesystem: "host".into(),
-            filesystem: "host".into(),
-        }),
-        provenance: crate::session::ConversationProvenance::Observed,
-        transcript_path: None,
-    };
-    let mut parent = crate::session::Instance::new("parent", "/tmp");
-    parent.agent_session_id = Some(parent_binding.session_id.clone());
-    parent.agent_session_binding = Some(parent_binding.clone());
+fn fork_seed_and_structured_fork_guard_agree_per_agent() {
+    {
+        let parent_binding = crate::session::ConversationBinding {
+            session_id: "parent-uuid".into(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec!["/tmp/claude-store".into()],
+                configuration: Vec::new(),
+                exported_default_store: false,
+                cwd: "/tmp".into(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+            }),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        };
+        let mut parent = crate::session::Instance::new("parent", "/tmp");
+        parent.agent_session_id = Some(parent_binding.session_id.clone());
+        parent.agent_session_binding = Some(parent_binding.clone());
 
-    let seed = resolve_create_fork_seed("parent-uuid", false, &[parent])
-        .expect("claude terminal fork allowed");
-    match seed {
-        crate::session::ForkSeed::Terminal {
-            parent,
-            child_session_id,
-        } => {
-            assert_eq!(*parent, parent_binding);
-            assert!(crate::session::capture::is_valid_session_id(
-                &child_session_id
-            ));
+        let seed = resolve_create_fork_seed("parent-uuid", false, &[parent])
+            .expect("claude terminal fork allowed");
+        match seed {
+            crate::session::ForkSeed::Terminal {
+                parent,
+                child_session_id,
+            } => {
+                assert_eq!(*parent, parent_binding);
+                assert!(crate::session::capture::is_valid_session_id(
+                    &child_session_id
+                ));
+            }
+            _ => panic!("expected Terminal seed"),
         }
-        _ => panic!("expected Terminal seed"),
-    }
-}
 
-#[test]
-fn fork_from_builds_structured_seed_when_view_is_structured() {
-    let seed = resolve_create_fork_seed("parent-acp-id", true, &[])
-        .expect("structured fork seed is always allowed at create time");
-    assert_eq!(
-        seed,
-        crate::session::ForkSeed::Structured {
-            parent_acp_session_id: "parent-acp-id".into(),
-        }
-    );
-}
-
-fn create_body_from_json(value: serde_json::Value) -> CreateSessionBody {
-    serde_json::from_value(value).expect("valid CreateSessionBody")
-}
-
-#[test]
-fn worktree_enabled_true_opts_in_without_branch() {
-    let body = create_body_from_json(serde_json::json!({
-        "path": "/tmp/p",
-        "tool": "claude",
-        "worktree_enabled": true,
-    }));
-
-    assert!(create_body_uses_worktree(&body));
-    assert!(body.worktree_branch.is_none());
-}
-
-#[test]
-fn worktree_branch_preserves_legacy_worktree_opt_in() {
-    let explicit = create_body_from_json(serde_json::json!({
-        "path": "/tmp/p",
-        "tool": "claude",
-        "worktree_branch": "feat/api",
-    }));
-    assert!(create_body_uses_worktree(&explicit));
-
-    let empty = create_body_from_json(serde_json::json!({
-        "path": "/tmp/p",
-        "tool": "claude",
-        "worktree_branch": "",
-    }));
-    assert!(create_body_uses_worktree(&empty));
-}
-
-#[test]
-fn worktree_defaults_off_without_flag_or_branch() {
-    let body = create_body_from_json(serde_json::json!({
-        "path": "/tmp/p",
-        "tool": "claude",
-    }));
-
-    assert!(!create_body_uses_worktree(&body));
-}
-
-#[test]
-fn worktree_enabled_conflicts_with_scratch() {
-    let body = create_body_from_json(serde_json::json!({
-        "path": "",
-        "tool": "claude",
-        "scratch": true,
-        "worktree_enabled": true,
-    }));
-
-    assert!(create_body_combines_scratch_and_worktree(&body));
-}
-
-#[test]
-fn both_import_and_fork_rejected() {
-    // A request that sets both seeds the session from two contradictory
-    // sources; the create handler rejects it before doing any work.
-    let body = create_body_from_json(serde_json::json!({
-        "path": "/tmp/p",
-        "tool": "claude",
-        "import_acp_session_id": "import-id",
-        "fork_from": "parent-id",
-    }));
-    assert!(both_import_and_fork_set(&body));
-
-    // Either alone is fine; trailing whitespace counts as unset.
-    let import_only = create_body_from_json(serde_json::json!({
-        "path": "/tmp/p", "tool": "claude", "import_acp_session_id": "import-id",
-    }));
-    assert!(!both_import_and_fork_set(&import_only));
-    let fork_only = create_body_from_json(serde_json::json!({
-        "path": "/tmp/p", "tool": "claude", "fork_from": "parent-id",
-    }));
-    assert!(!both_import_and_fork_set(&fork_only));
-    let blank_fork = create_body_from_json(serde_json::json!({
-        "path": "/tmp/p",
-        "tool": "claude",
-        "import_acp_session_id": "import-id",
-        "fork_from": "   ",
-    }));
-    assert!(!both_import_and_fork_set(&blank_fork));
-}
-
-#[test]
-fn invalid_fork_id_is_rejected_by_create_guard() {
-    // `fork_from` is gated on `is_valid_session_id`, so a malformed id cannot
-    // reach `build_fork_flags`, which fails closed and would silently start a
-    // fresh session.
-    use crate::session::capture::is_valid_session_id;
-    assert!(!is_valid_session_id("../etc/passwd"));
-    assert!(!is_valid_session_id("has spaces"));
-    assert!(!is_valid_session_id("slash/id"));
-    // A well-formed id still passes the same gate.
-    assert!(is_valid_session_id("parent-uuid_123.v2"));
-}
-
-#[test]
-fn structured_fork_create_guard_matches_acp_can_fork() {
-    // The create-time guard and the web `acp_can_fork` projection share
-    // `agent_is_structured_fork_capable`, so they must agree per agent.
-    // claude is ACP-capable with a real fork strategy: forkable.
-    assert!(agent_is_structured_fork_capable("claude", None));
-    // aoe-agent is ACP-capable but resume-only (no fork strategy), so the
-    // create guard must reject a structured fork for it just as the web
-    // suppresses the Fork affordance; gating on ACP-capability alone would
-    // accept a create that can only fail later at the `session/fork`
-    // handshake.
-    assert!(!agent_is_structured_fork_capable("aoe-agent", None));
-    // codex and opencode are ACP-registered AND declare a real terminal
-    // ForkStrategy (used by the CLI `--fork-from` path), but neither ACP
-    // adapter is verified to implement `session/fork`. Gating on
-    // "fork_strategy != Unsupported" alone would report them forkable and
-    // reproduce the same dead-end-handshake failure this function exists
-    // to prevent for aoe-agent.
-    assert!(!agent_is_structured_fork_capable("codex", None));
-    assert!(!agent_is_structured_fork_capable("opencode", None));
-    // A non-ACP tool is neither ACP-capable nor fork-capable.
-    assert!(!agent_is_structured_fork_capable(
-        "definitely-not-an-acp-agent",
-        None
-    ));
-
-    // The two surfaces must report the same capability for each agent.
-    for tool in [
-        "claude",
-        "aoe-agent",
-        "codex",
-        "opencode",
-        "definitely-not-an-acp-agent",
-    ] {
-        let mut inst = make_test_instance();
-        inst.tool = tool.to_string();
+        let seed = resolve_create_fork_seed("parent-acp-id", true, &[])
+            .expect("structured fork seed is always allowed at create time");
         assert_eq!(
-            SessionResponse::from_instance(&inst, false).acp_can_fork,
-            agent_is_structured_fork_capable(tool, None),
-            "acp_can_fork and the create guard disagree for '{tool}'"
+            seed,
+            crate::session::ForkSeed::Structured {
+                parent_acp_session_id: "parent-acp-id".into(),
+            }
         );
     }
+    {
+        // The create-time guard and the web `acp_can_fork` projection share
+        // `agent_is_structured_fork_capable`, so they must agree per agent.
+        // claude is ACP-capable with a real fork strategy: forkable.
+        assert!(agent_is_structured_fork_capable("claude", None));
+        // aoe-agent is ACP-capable but resume-only (no fork strategy), so the
+        // create guard must reject a structured fork for it just as the web
+        // suppresses the Fork affordance; gating on ACP-capability alone would
+        // accept a create that can only fail later at the `session/fork`
+        // handshake.
+        assert!(!agent_is_structured_fork_capable("aoe-agent", None));
+        // codex and opencode are ACP-registered AND declare a real terminal
+        // ForkStrategy (used by the CLI `--fork-from` path), but neither ACP
+        // adapter is verified to implement `session/fork`. Gating on
+        // "fork_strategy != Unsupported" alone would report them forkable and
+        // reproduce the same dead-end-handshake failure this function exists
+        // to prevent for aoe-agent.
+        assert!(!agent_is_structured_fork_capable("codex", None));
+        assert!(!agent_is_structured_fork_capable("opencode", None));
+        // A non-ACP tool is neither ACP-capable nor fork-capable.
+        assert!(!agent_is_structured_fork_capable(
+            "definitely-not-an-acp-agent",
+            None
+        ));
+
+        // The two surfaces must report the same capability for each agent.
+        for tool in [
+            "claude",
+            "aoe-agent",
+            "codex",
+            "opencode",
+            "definitely-not-an-acp-agent",
+        ] {
+            let mut inst = make_test_instance();
+            inst.tool = tool.to_string();
+            assert_eq!(
+                SessionResponse::from_instance(&inst, false).acp_can_fork,
+                agent_is_structured_fork_capable(tool, None),
+                "acp_can_fork and the create guard disagree for '{tool}'"
+            );
+        }
+    }
 }
 
 #[test]
-fn acp_can_fork_tracks_acp_capable_and_fork_strategy() {
-    // claude is ACP-capable AND declares a real fork strategy, so the web
-    // gets a forkable signal.
-    let mut claude = make_test_instance();
-    claude.tool = "claude".to_string();
-    assert!(SessionResponse::from_instance(&claude, false).acp_can_fork);
-
-    // aoe-agent is ACP-capable but declares no fork strategy, so it is NOT
-    // forkable. Gating the web Fork action on acp_session_id alone would offer
-    // a dead-end button for it.
-    let mut aoe_agent = make_test_instance();
-    aoe_agent.tool = "aoe-agent".to_string();
-    assert!(!SessionResponse::from_instance(&aoe_agent, false).acp_can_fork);
-
-    // codex has a terminal fork strategy but its ACP adapter is not verified
-    // to implement `session/fork`, so the web signal stays false.
-    let mut codex = make_test_instance();
-    codex.tool = "codex".to_string();
-    assert!(!SessionResponse::from_instance(&codex, false).acp_can_fork);
-
-    // A non-ACP agent is neither ACP-capable nor fork-capable.
-    let mut other = make_test_instance();
-    other.tool = "definitely-not-an-acp-agent".to_string();
-    assert!(!SessionResponse::from_instance(&other, false).acp_can_fork);
+fn create_body_flags_resolve_worktree_scratch_and_seed_conflicts() {
+    // (body extras, uses worktree, scratch+worktree conflict, import+fork conflict)
+    let cases = [
+        (
+            serde_json::json!({ "worktree_enabled": true }),
+            true,
+            false,
+            false,
+        ),
+        // A legacy branch field opts in, even when empty.
+        (
+            serde_json::json!({ "worktree_branch": "feat/api" }),
+            true,
+            false,
+            false,
+        ),
+        (
+            serde_json::json!({ "worktree_branch": "" }),
+            true,
+            false,
+            false,
+        ),
+        (serde_json::json!({}), false, false, false),
+        (
+            serde_json::json!({ "scratch": true, "worktree_enabled": true }),
+            true,
+            true,
+            false,
+        ),
+        (
+            serde_json::json!({ "import_acp_session_id": "i", "fork_from": "p" }),
+            false,
+            false,
+            true,
+        ),
+        (
+            serde_json::json!({ "import_acp_session_id": "i" }),
+            false,
+            false,
+            false,
+        ),
+        (serde_json::json!({ "fork_from": "p" }), false, false, false),
+        // Whitespace counts as unset.
+        (
+            serde_json::json!({ "import_acp_session_id": "i", "fork_from": "   " }),
+            false,
+            false,
+            false,
+        ),
+    ];
+    for (extra, worktree, scratch_conflict, seed_conflict) in cases {
+        let mut value = serde_json::json!({ "path": "/tmp/p", "tool": "claude" });
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let body: CreateSessionBody = serde_json::from_value(value).expect("valid body");
+        assert_eq!(create_body_uses_worktree(&body), worktree, "{extra}");
+        assert_eq!(
+            create_body_combines_scratch_and_worktree(&body),
+            scratch_conflict,
+            "{extra}"
+        );
+        assert_eq!(both_import_and_fork_set(&body), seed_conflict, "{extra}");
+    }
 }
 
 #[test]
@@ -1067,7 +936,7 @@ fn trash_body_default_keeps_kill_pane_true() {
 }
 
 #[test]
-fn upsert_instance_replaces_same_id_instead_of_duplicating() {
+fn upsert_instance_replaces_same_id_and_appends_new_ones() {
     // `create_session` persists to disk before pushing the in-memory copy, so
     // a `status_poll_loop` tick can insert the row first. The handler's insert
     // must replace that entry, not append a duplicate id.
@@ -1092,11 +961,7 @@ fn upsert_instance_replaces_same_id_instead_of_duplicating() {
         Status::Starting,
         "handler copy must win"
     );
-}
 
-#[test]
-fn upsert_instance_appends_a_new_id() {
-    let mut instances = vec![make_test_instance()];
     let other = Instance::new("other-session", "/tmp/other-project");
     let other_id = other.id.clone();
     upsert_instance(&mut instances, other);
@@ -1168,7 +1033,7 @@ fn from_instance_surfaces_hook_urgent_flag() {
 }
 
 #[test]
-fn public_create_session_error_forwards_whitelisted_git_errors() {
+fn public_create_session_error_forwards_whitelisted_git_errors_only() {
     let dup: anyhow::Error =
         GitError::WorktreeAlreadyExists(std::path::PathBuf::from("/tmp/repo-worktrees/foo")).into();
     assert_eq!(
@@ -1189,10 +1054,7 @@ fn public_create_session_error_forwards_whitelisted_git_errors() {
         public_create_session_error(&wrapped),
         "Branch 'nope' not found"
     );
-}
 
-#[test]
-fn public_create_session_error_hides_unsafe_messages() {
     // Raw git stderr (even already-sanitized) must not reach the client.
     let cmd: anyhow::Error = GitError::WorktreeCommandFailed(
         "fatal: unable to access 'https://<redacted>@host/repo.git'".to_string(),
@@ -1218,40 +1080,6 @@ fn public_create_session_error_hides_unsafe_messages() {
 }
 
 #[test]
-fn session_response_projects_core_instance_fields() {
-    let inst = make_test_instance();
-    let resp = SessionResponse::from_instance(&inst, false);
-
-    assert_eq!(resp.id, inst.id);
-    assert_eq!(resp.title, "test-session");
-    assert_eq!(resp.project_path, "/tmp/test-project");
-    assert_eq!(resp.tool, "claude");
-    assert_eq!(resp.status, "Running");
-    assert_eq!(resp.group_path, "work/projects");
-    assert!(!resp.is_sandboxed);
-    assert!(!resp.has_terminal);
-}
-
-#[test]
-fn session_response_status_variants() {
-    let mut inst = make_test_instance();
-    for (status, expected) in [
-        (Status::Running, "Running"),
-        (Status::Waiting, "Waiting"),
-        (Status::Error, "Error"),
-        (Status::Stopped, "Stopped"),
-        (Status::Idle, "Idle"),
-        (Status::Starting, "Starting"),
-    ] {
-        inst.status = status;
-        assert_eq!(
-            SessionResponse::from_instance(&inst, false).status,
-            expected
-        );
-    }
-}
-
-#[test]
 fn session_response_dormant_reflects_shown_dormant() {
     let mut inst = make_test_instance();
     inst.status = Status::Idle;
@@ -1263,35 +1091,6 @@ fn session_response_dormant_reflects_shown_dormant() {
     // A deliberate stop keeps the neutral Stopped dot rather than dormant (#2250).
     inst.status = Status::Stopped;
     assert!(!SessionResponse::from_instance(&inst, false).dormant);
-}
-
-#[test]
-fn session_response_surfaces_worktree_branch_and_bases() {
-    let mut inst = make_test_instance();
-    let resp = SessionResponse::from_instance(&inst, false);
-    assert!(resp.branch.is_none());
-    assert!(resp.base_branch.is_none());
-
-    inst.worktree_info = Some(worktree("feature/test", "/tmp/repo", None));
-    let resp = SessionResponse::from_instance(&inst, false);
-    assert_eq!(resp.branch.as_deref(), Some("feature/test"));
-    assert!(resp.base_branch.is_none());
-
-    inst.worktree_info = Some(worktree("feature/test", "/tmp/repo", Some("release-1.2")));
-    assert_eq!(
-        SessionResponse::from_instance(&inst, false)
-            .base_branch
-            .as_deref(),
-        Some("release-1.2")
-    );
-
-    inst.base_branch_override = Some("upstream/main".to_string());
-    assert_eq!(
-        SessionResponse::from_instance(&inst, false)
-            .base_branch_override
-            .as_deref(),
-        Some("upstream/main")
-    );
 }
 
 #[test]
@@ -1442,74 +1241,6 @@ fn apply_diff_base_override_writes_only_the_named_repo() {
     assert_eq!(inst.base_branch_override.as_deref(), Some("develop"));
 }
 
-#[test]
-fn session_response_serializes_to_json() {
-    let json =
-        serde_json::to_value(SessionResponse::from_instance(&make_test_instance(), false)).unwrap();
-    assert!(json.get("id").is_some());
-    assert_eq!(json["tool"], "claude");
-    assert_eq!(json["status"], "Running");
-    assert_eq!(json["is_sandboxed"], false);
-    assert_eq!(json["claude_fullscreen"], false);
-}
-
-/// Optional fields stay off the wire until they are set, so old clients never
-/// see a flood of nulls.
-#[test]
-fn session_response_omits_unset_optional_fields() {
-    let cases: [(&str, fn(&mut Instance)); 5] = [
-        ("base_branch", |i| {
-            i.worktree_info = Some(worktree("feature/test", "/tmp/repo", Some("release-1.2")))
-        }),
-        ("base_branch_override", |i| {
-            i.base_branch_override = Some("upstream/main".to_string())
-        }),
-        ("pinned_at", |i| i.pin()),
-        ("archived_at", |i| i.archive()),
-        ("snoozed_until", |i| i.snooze(30)),
-    ];
-
-    for (field, set) in cases {
-        let mut inst = make_test_instance();
-        let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
-        assert!(
-            json.get(field).is_none(),
-            "{field} must be omitted while unset, got: {json}"
-        );
-
-        set(&mut inst);
-        let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
-        assert!(
-            json.get(field).is_some(),
-            "{field} must appear once set, got: {json}"
-        );
-    }
-}
-
-#[test]
-fn session_response_warnings_omitted_when_empty_and_listed_when_set() {
-    let mut resp = SessionResponse::from_instance(&make_test_instance(), false);
-    assert!(resp.warnings.is_empty());
-    let json = serde_json::to_value(&resp).unwrap();
-    assert!(
-        json.get("warnings").is_none(),
-        "empty warnings must be omitted, got: {json}"
-    );
-
-    resp.warnings = vec![
-        "post-checkout hook failed for repo-a".to_string(),
-        "post-checkout hook failed for repo-b".to_string(),
-    ];
-    let json = serde_json::to_value(&resp).unwrap();
-    assert_eq!(
-        json["warnings"],
-        serde_json::json!([
-            "post-checkout hook failed for repo-a",
-            "post-checkout hook failed for repo-b"
-        ])
-    );
-}
-
 /// An expired snooze stays on disk for the next mutation to rewrite, but the
 /// wire value is gated on `is_snoozed()` so the web never renders "snoozed 0m".
 #[test]
@@ -1526,139 +1257,69 @@ fn session_response_gates_snoozed_until_on_active_snooze() {
         .is_none());
 }
 
+/// #3411: a title-only rename must not clobber a newer cached path and branch;
+/// a tied rename publishes the path and branch it owns.
 #[test]
-fn claude_fullscreen_needs_both_claude_and_the_setting() {
-    for (tool, enabled, expected) in [
-        ("claude", true, true),
-        ("claude", false, false),
-        ("cursor", true, false),
-    ] {
-        let mut inst = make_test_instance();
-        inst.tool = tool.to_string();
+fn rename_cache_patch_publishes_only_rename_owned_fields() {
+    {
+        let mut cached = make_test_instance();
+        cached.title = "Old title".to_string();
+        cached.project_path = "/tmp/worktrees/concurrent".to_string();
+        cached.worktree_info = Some(worktree("concurrent-branch", "/tmp/repo".to_string(), None));
+
+        apply_session_rename_cache_patch(
+            &mut cached,
+            SessionRenameCachePatch {
+                title: "New title",
+                initial_path: "/tmp/worktrees/initial",
+                initial_branch: Some("initial-branch"),
+                authoritative_path: "/tmp/worktrees/earlier-snapshot",
+                authoritative_branch: Some("earlier-snapshot-branch"),
+                renamed_path: None,
+                renamed_branch: None,
+            },
+        );
+
+        assert_eq!(cached.title, "New title");
+        assert_eq!(cached.project_path, "/tmp/worktrees/concurrent");
         assert_eq!(
-            SessionResponse::from_instance(&inst, enabled).claude_fullscreen,
-            expected,
-            "tool={tool} enabled={enabled}"
+            cached
+                .worktree_info
+                .as_ref()
+                .map(|worktree| worktree.branch.as_str()),
+            Some("concurrent-branch")
+        );
+        let response = SessionResponse::from_instance(&cached, false);
+        assert_eq!(response.title, "New title");
+    }
+    {
+        let mut cached = make_test_instance();
+        cached.project_path = "/tmp/worktrees/concurrent".to_string();
+        cached.worktree_info = Some(worktree("concurrent-branch", "/tmp/repo".to_string(), None));
+
+        apply_session_rename_cache_patch(
+            &mut cached,
+            SessionRenameCachePatch {
+                title: "New title",
+                initial_path: "/tmp/worktrees/initial",
+                initial_branch: Some("initial-branch"),
+                authoritative_path: "/tmp/worktrees/renamed",
+                authoritative_branch: Some("renamed-branch"),
+                renamed_path: Some("/tmp/worktrees/renamed"),
+                renamed_branch: Some("renamed-branch"),
+            },
+        );
+
+        assert_eq!(cached.title, "New title");
+        assert_eq!(cached.project_path, "/tmp/worktrees/renamed");
+        assert_eq!(
+            cached
+                .worktree_info
+                .as_ref()
+                .map(|worktree| worktree.branch.as_str()),
+            Some("renamed-branch")
         );
     }
-}
-
-#[test]
-fn update_bodies_parse_with_their_defaults() {
-    for (body, expected) in [
-        (r#"{"pinned": true}"#, true),
-        (r#"{"pinned": false}"#, false),
-    ] {
-        let parsed: UpdatePinBody = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.pinned, expected);
-    }
-
-    // kill_pane defaults to true so callers that omit it get TUI/CLI parity.
-    let archive: UpdateArchiveBody = serde_json::from_str(r#"{"archived": true}"#).unwrap();
-    assert!(archive.archived && archive.kill_pane);
-    let archive: UpdateArchiveBody =
-        serde_json::from_str(r#"{"archived": true, "kill_pane": false}"#).unwrap();
-    assert!(!archive.kill_pane);
-
-    // `{"minutes": null}` and an empty body both mean unsnooze.
-    for (body, expected) in [
-        (r#"{"minutes": 60}"#, Some(60)),
-        (r#"{"minutes": null}"#, None),
-        ("{}", None),
-    ] {
-        let parsed: UpdateSnoozeBody = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.minutes, expected);
-    }
-}
-
-/// Mirrors the TUI snooze dialog presets, so a regression in the shared
-/// validator shape is caught here too.
-#[test]
-fn update_snooze_validates_against_shared_bounds() {
-    assert!(crate::session::validate_snooze_duration(0).is_err());
-    for &m in &[60u64, 120, 180, 240, 300, 360, 1440, 7 * 1440] {
-        assert!(
-            crate::session::validate_snooze_duration(m).is_ok(),
-            "preset {m} min must pass the validator"
-        );
-    }
-}
-
-#[test]
-fn rename_updates_title_without_changing_worktree_branch() {
-    let mut inst = make_test_instance();
-    inst.worktree_info = Some(worktree("feature/test", "/tmp/repo".to_string(), None));
-
-    apply_session_title_rename(&mut inst, "Renamed Session".to_string());
-
-    assert_eq!(inst.title, "Renamed Session");
-    assert_eq!(
-        inst.worktree_info.as_ref().map(|wt| wt.branch.as_str()),
-        Some("feature/test")
-    );
-}
-
-#[test]
-fn title_only_rename_cache_patch_preserves_newer_path_and_branch() {
-    let mut cached = make_test_instance();
-    cached.title = "Old title".to_string();
-    cached.project_path = "/tmp/worktrees/concurrent".to_string();
-    cached.worktree_info = Some(worktree("concurrent-branch", "/tmp/repo".to_string(), None));
-
-    apply_session_rename_cache_patch(
-        &mut cached,
-        SessionRenameCachePatch {
-            title: "New title",
-            initial_path: "/tmp/worktrees/initial",
-            initial_branch: Some("initial-branch"),
-            authoritative_path: "/tmp/worktrees/earlier-snapshot",
-            authoritative_branch: Some("earlier-snapshot-branch"),
-            renamed_path: None,
-            renamed_branch: None,
-        },
-    );
-
-    assert_eq!(cached.title, "New title");
-    assert_eq!(cached.project_path, "/tmp/worktrees/concurrent");
-    assert_eq!(
-        cached
-            .worktree_info
-            .as_ref()
-            .map(|worktree| worktree.branch.as_str()),
-        Some("concurrent-branch")
-    );
-    let response = SessionResponse::from_instance(&cached, false);
-    assert_eq!(response.title, "New title");
-}
-
-#[test]
-fn tied_rename_cache_patch_publishes_owned_path_and_branch() {
-    let mut cached = make_test_instance();
-    cached.project_path = "/tmp/worktrees/concurrent".to_string();
-    cached.worktree_info = Some(worktree("concurrent-branch", "/tmp/repo".to_string(), None));
-
-    apply_session_rename_cache_patch(
-        &mut cached,
-        SessionRenameCachePatch {
-            title: "New title",
-            initial_path: "/tmp/worktrees/initial",
-            initial_branch: Some("initial-branch"),
-            authoritative_path: "/tmp/worktrees/renamed",
-            authoritative_branch: Some("renamed-branch"),
-            renamed_path: Some("/tmp/worktrees/renamed"),
-            renamed_branch: Some("renamed-branch"),
-        },
-    );
-
-    assert_eq!(cached.title, "New title");
-    assert_eq!(cached.project_path, "/tmp/worktrees/renamed");
-    assert_eq!(
-        cached
-            .worktree_info
-            .as_ref()
-            .map(|worktree| worktree.branch.as_str()),
-        Some("renamed-branch")
-    );
 }
 
 #[tokio::test]
@@ -1778,221 +1439,194 @@ async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn rename_session_quiesces_structured_worker_only_when_its_cwd_moves() {
-    // Invariant #2260: a live structured worker is pinned to its cwd, so a
-    // tied rename that MOVES the worktree must stop the worker first, while one
-    // that leaves the cwd in place must not interrupt it. The quiesce runs
-    // before the git edit, so the assertion holds even though the edit then
-    // fails on a fixture with no real worktree to move.
-    let _app_dir = crate::session::test_support::isolate_app_dir();
+async fn worktree_edits_quiesce_structured_worker_only_when_its_cwd_moves() {
+    {
+        // Invariant #2260: a live structured worker is pinned to its cwd, so a
+        // tied rename that MOVES the worktree must stop the worker first, while one
+        // that leaves the cwd in place must not interrupt it. The quiesce runs
+        // before the git edit, so the assertion holds even though the edit then
+        // fails on a fixture with no real worktree to move.
+        let _app_dir = crate::session::test_support::isolate_app_dir();
 
-    struct Case {
-        id: &'static str,
-        leaf: &'static str,
-        new_title: &'static str,
-        // Whether the new title's slug relocates the worktree directory.
-        moves_cwd: bool,
-    }
-    // The cwd-stable row's slug ("my-session") equals the existing leaf, so
-    // the edit is a no-op move; the cwd-moving row's slug differs, forcing
-    // a relocation.
-    let cases = [
-        Case {
-            id: "quiesce-cwd-stable",
-            leaf: "my-session",
-            new_title: "My Session!",
-            moves_cwd: false,
-        },
-        Case {
-            id: "quiesce-cwd-moving",
-            leaf: "old-leaf",
-            new_title: "A Brand New Name",
-            moves_cwd: true,
-        },
-    ];
-
-    for case in cases {
-        let paths = tempfile::tempdir().unwrap();
-        let project_path = paths.path().join(case.leaf);
-        let mut inst = Instance::new(
-            "Original title",
-            project_path.to_str().expect("UTF-8 temp path"),
-        );
-        inst.id = case.id.to_string();
-        // Idle, not Running: a structured session the user "stopped" sits at
-        // Idle yet still owns a live worker, the gap `blocks_worktree_edit`
-        // misses and quiesce closes.
-        inst.status = Status::Idle;
-        inst.view = crate::session::View::Structured;
-        inst.worktree_info = Some(worktree(
-            case.leaf,
-            paths
-                .path()
-                .join("missing-repo")
-                .to_string_lossy()
-                .into_owned(),
-            None,
-        ));
-
-        let (_storage, state) = build_rename_test_state(vec![inst.clone()], vec![inst]);
-        state.acp_supervisor.test_insert_worker(case.id).await;
-
-        let _ = rename_session(
-            State(state.clone()),
-            Path(case.id.to_string()),
-            Ok(Json(RenameSessionBody {
-                title: case.new_title.to_string(),
-                rename_branch: false,
-            })),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(
-            state.acp_supervisor.is_running(case.id).await,
-            !case.moves_cwd,
-            "{}: worker should be {} for moves_cwd={}",
-            case.id,
-            if case.moves_cwd {
-                "stopped"
-            } else {
-                "preserved"
+        struct Case {
+            id: &'static str,
+            leaf: &'static str,
+            new_title: &'static str,
+            // Whether the new title's slug relocates the worktree directory.
+            moves_cwd: bool,
+        }
+        // The cwd-stable row's slug ("my-session") equals the existing leaf, so
+        // the edit is a no-op move; the cwd-moving row's slug differs, forcing
+        // a relocation.
+        let cases = [
+            Case {
+                id: "quiesce-cwd-stable",
+                leaf: "my-session",
+                new_title: "My Session!",
+                moves_cwd: false,
             },
-            case.moves_cwd
-        );
-    }
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn set_worktree_name_quiesces_structured_worker_only_when_its_cwd_moves() {
-    // The standalone-endpoint mirror of the rename_session gate above: both
-    // stop a live structured worker only when the edit actually moves the cwd
-    // (#2260). The quiesce precedes the git edit, so the assertion holds even
-    // though the edit then fails on a fixture with no real worktree.
-    let _app_dir = crate::session::test_support::isolate_app_dir();
-    // set_worktree_name refuses a tied managed worktree (tied callers must
-    // go through rename_session), so untie the profile to reach the worker
-    // gate that this test exercises.
-    let mut overrides = serde_json::Map::new();
-    overrides.insert(
-        "session".to_string(),
-        serde_json::json!({ "tie_workdir_to_name": false }),
-    );
-    crate::session::config::profile_config::save_profile_config(
-        "test",
-        &crate::session::config::profile_config::ProfileConfig {
-            description: None,
-            overrides,
-        },
-    )
-    .expect("write test profile override");
-
-    struct Case {
-        id: &'static str,
-        leaf: &'static str,
-        new_name: &'static str,
-        // Whether the requested name relocates the worktree directory.
-        moves_cwd: bool,
-    }
-    // The cwd-stable row's name equals the existing leaf (a no-op move); the
-    // cwd-moving row's name differs, forcing a relocation.
-    let cases = [
-        Case {
-            id: "sw-cwd-stable",
-            leaf: "my-session",
-            new_name: "my-session",
-            moves_cwd: false,
-        },
-        Case {
-            id: "sw-cwd-moving",
-            leaf: "old-leaf",
-            new_name: "new-leaf",
-            moves_cwd: true,
-        },
-    ];
-
-    for case in cases {
-        let paths = tempfile::tempdir().unwrap();
-        let project_path = paths.path().join(case.leaf);
-        let mut inst = Instance::new(
-            "Original title",
-            project_path.to_str().expect("UTF-8 temp path"),
-        );
-        inst.id = case.id.to_string();
-        inst.source_profile = "test".to_string();
-        inst.status = Status::Idle;
-        inst.view = crate::session::View::Structured;
-        inst.worktree_info = Some(worktree(
-            case.leaf,
-            paths
-                .path()
-                .join("missing-repo")
-                .to_string_lossy()
-                .into_owned(),
-            None,
-        ));
-
-        let storage = Storage::new_unwatched("test").unwrap();
-        storage
-            .update(|instances, _groups| {
-                *instances = vec![inst.clone()];
-                Ok(())
-            })
-            .unwrap();
-        let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        state.acp_supervisor.test_insert_worker(case.id).await;
-
-        let _ = set_worktree_name(
-            State(state.clone()),
-            Path(case.id.to_string()),
-            Ok(Json(SetWorktreeNameBody {
-                name: case.new_name.to_string(),
-                rename_branch: false,
-            })),
-        )
-        .await
-        .into_response();
-
-        assert_eq!(
-            state.acp_supervisor.is_running(case.id).await,
-            !case.moves_cwd,
-            "{}: worker should be {} for moves_cwd={}",
-            case.id,
-            if case.moves_cwd {
-                "stopped"
-            } else {
-                "preserved"
+            Case {
+                id: "quiesce-cwd-moving",
+                leaf: "old-leaf",
+                new_title: "A Brand New Name",
+                moves_cwd: true,
             },
-            case.moves_cwd
-        );
+        ];
+
+        for case in cases {
+            let paths = tempfile::tempdir().unwrap();
+            let project_path = paths.path().join(case.leaf);
+            let mut inst = Instance::new(
+                "Original title",
+                project_path.to_str().expect("UTF-8 temp path"),
+            );
+            inst.id = case.id.to_string();
+            // Idle, not Running: a structured session the user "stopped" sits at
+            // Idle yet still owns a live worker, the gap `blocks_worktree_edit`
+            // misses and quiesce closes.
+            inst.status = Status::Idle;
+            inst.view = crate::session::View::Structured;
+            inst.worktree_info = Some(worktree(
+                case.leaf,
+                paths
+                    .path()
+                    .join("missing-repo")
+                    .to_string_lossy()
+                    .into_owned(),
+                None,
+            ));
+
+            let (_storage, state) = build_rename_test_state(vec![inst.clone()], vec![inst]);
+            state.acp_supervisor.test_insert_worker(case.id).await;
+
+            let _ = rename_session(
+                State(state.clone()),
+                Path(case.id.to_string()),
+                Ok(Json(RenameSessionBody {
+                    title: case.new_title.to_string(),
+                    rename_branch: false,
+                })),
+            )
+            .await
+            .into_response();
+
+            assert_eq!(
+                state.acp_supervisor.is_running(case.id).await,
+                !case.moves_cwd,
+                "{}: worker should be {} for moves_cwd={}",
+                case.id,
+                if case.moves_cwd {
+                    "stopped"
+                } else {
+                    "preserved"
+                },
+                case.moves_cwd
+            );
+        }
     }
-}
+    {
+        // The standalone-endpoint mirror of the rename_session gate above: both
+        // stop a live structured worker only when the edit actually moves the cwd
+        // (#2260). The quiesce precedes the git edit, so the assertion holds even
+        // though the edit then fails on a fixture with no real worktree.
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        // set_worktree_name refuses a tied managed worktree (tied callers must
+        // go through rename_session), so untie the profile to reach the worker
+        // gate that this test exercises.
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "session".to_string(),
+            serde_json::json!({ "tie_workdir_to_name": false }),
+        );
+        crate::session::config::profile_config::save_profile_config(
+            "test",
+            &crate::session::config::profile_config::ProfileConfig {
+                description: None,
+                overrides,
+            },
+        )
+        .expect("write test profile override");
 
-#[test]
-fn worktree_name_edit_updates_path_and_optionally_branch() {
-    let mut inst = make_test_instance();
-    inst.project_path = "/tmp/repo-worktrees/old".to_string();
-    inst.title = "My Session".to_string();
-    inst.worktree_info = Some(worktree("old", "/tmp/repo".to_string(), None));
+        struct Case {
+            id: &'static str,
+            leaf: &'static str,
+            new_name: &'static str,
+            // Whether the requested name relocates the worktree directory.
+            moves_cwd: bool,
+        }
+        // The cwd-stable row's name equals the existing leaf (a no-op move); the
+        // cwd-moving row's name differs, forcing a relocation.
+        let cases = [
+            Case {
+                id: "sw-cwd-stable",
+                leaf: "my-session",
+                new_name: "my-session",
+                moves_cwd: false,
+            },
+            Case {
+                id: "sw-cwd-moving",
+                leaf: "old-leaf",
+                new_name: "new-leaf",
+                moves_cwd: true,
+            },
+        ];
 
-    // Path-only edit leaves the branch and title untouched.
-    apply_worktree_name_edit(&mut inst, "/tmp/repo-worktrees/new", None);
-    assert_eq!(inst.project_path, "/tmp/repo-worktrees/new");
-    assert_eq!(inst.title, "My Session");
-    assert_eq!(
-        inst.worktree_info.as_ref().map(|wt| wt.branch.as_str()),
-        Some("old")
-    );
+        for case in cases {
+            let paths = tempfile::tempdir().unwrap();
+            let project_path = paths.path().join(case.leaf);
+            let mut inst = Instance::new(
+                "Original title",
+                project_path.to_str().expect("UTF-8 temp path"),
+            );
+            inst.id = case.id.to_string();
+            inst.source_profile = "test".to_string();
+            inst.status = Status::Idle;
+            inst.view = crate::session::View::Structured;
+            inst.worktree_info = Some(worktree(
+                case.leaf,
+                paths
+                    .path()
+                    .join("missing-repo")
+                    .to_string_lossy()
+                    .into_owned(),
+                None,
+            ));
 
-    // Branch rename also updates worktree_info.branch.
-    apply_worktree_name_edit(&mut inst, "/tmp/repo-worktrees/newer", Some("newer"));
-    assert_eq!(inst.project_path, "/tmp/repo-worktrees/newer");
-    assert_eq!(inst.title, "My Session");
-    assert_eq!(
-        inst.worktree_info.as_ref().map(|wt| wt.branch.as_str()),
-        Some("newer")
-    );
+            let storage = Storage::new_unwatched("test").unwrap();
+            storage
+                .update(|instances, _groups| {
+                    *instances = vec![inst.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            state.acp_supervisor.test_insert_worker(case.id).await;
+
+            let _ = set_worktree_name(
+                State(state.clone()),
+                Path(case.id.to_string()),
+                Ok(Json(SetWorktreeNameBody {
+                    name: case.new_name.to_string(),
+                    rename_branch: false,
+                })),
+            )
+            .await
+            .into_response();
+
+            assert_eq!(
+                state.acp_supervisor.is_running(case.id).await,
+                !case.moves_cwd,
+                "{}: worker should be {} for moves_cwd={}",
+                case.id,
+                if case.moves_cwd {
+                    "stopped"
+                } else {
+                    "preserved"
+                },
+                case.moves_cwd
+            );
+        }
+    }
 }
 
 #[test]
@@ -2112,100 +1746,127 @@ fn apply_post_restart_identity_sync_clears_repair_backoff_when_restart_poller_ru
         .stop();
 }
 
-#[test]
-fn apply_post_restart_sync_overwrites_stale_session_id() {
-    // When the in-memory id is non-None and the start path produced a newer
-    // one, `started` wins. In practice acquire_session_id reuses the existing
-    // id, but that is the contract.
-    let mut live = make_test_instance();
-    live.agent_session_id = Some("stale-id".to_string());
-    let before = live.clone();
-
-    let mut started = make_test_instance();
-    started.agent_session_id = Some("fresh-id".to_string());
-
-    apply_post_restart_sync(&mut live, &before, &started);
-
-    assert_eq!(live.agent_session_id.as_deref(), Some("fresh-id"));
+fn sync_row(
+    status: Status,
+    last_error: Option<&str>,
+    sid: Option<&str>,
+    failed_sid: Option<&str>,
+) -> Instance {
+    let mut inst = make_test_instance();
+    inst.status = status;
+    inst.last_error = last_error.map(str::to_string);
+    inst.agent_session_id = sid.map(str::to_string);
+    inst.resume_probe_failed_sid = failed_sid.map(str::to_string);
+    inst
 }
 
+type SyncCase = (
+    &'static str,
+    Instance,
+    Instance,
+    Instance,
+    (Status, Option<&'static str>, &'static str, &'static str),
+);
+
+/// Restart and cascade syncs take the start outcome's sid and resume-failed
+/// marker unless a peer already wrote a newer sid (or the marker for the same
+/// sid). Only the restart sync also carries status and error.
 #[test]
-fn apply_post_restart_sync_propagates_resume_failed_marker_and_error() {
-    let mut live = make_test_instance();
-    live.status = Status::Running;
-    live.last_error = Some("prior failure".to_string());
-    live.agent_session_id = Some("sid-before".to_string());
-    live.resume_probe_failed_sid = None;
-    let before = live.clone();
-
-    let mut started = make_test_instance();
-    started.status = Status::Error;
-    started.agent_session_id = Some("sid-after".to_string());
-    started.resume_probe_failed_sid = Some("sid-after".to_string());
-    started.last_error =
-        Some("resume failed for sid sid-after; preserved for explicit retry".to_string());
-    started.last_error_check = Some(std::time::Instant::now());
-
-    apply_post_restart_sync(&mut live, &before, &started);
-
-    assert_eq!(live.status, Status::Error);
-    assert_eq!(
-        live.last_error.as_deref(),
-        Some("resume failed for sid sid-after; preserved for explicit retry")
+fn restart_and_cascade_syncs_take_the_start_outcome_but_keep_peer_writes() {
+    use Status::{Error, Running, Starting};
+    let resumed = sync_row(Running, Some("prior failure"), Some("sid-before"), None);
+    let mut failed = sync_row(
+        Error,
+        Some("resume failed"),
+        Some("sid-after"),
+        Some("sid-after"),
     );
-    assert!(live.last_error_check.is_some());
-    assert_eq!(live.agent_session_id.as_deref(), Some("sid-after"));
-    assert_eq!(live.resume_probe_failed_sid.as_deref(), Some("sid-after"));
-}
-
-#[test]
-fn apply_cascade_state_sync_propagates_marker_without_status() {
-    let mut live = make_test_instance();
-    live.status = Status::Running;
-    live.last_error = Some("keep me".to_string());
-    live.agent_session_id = Some("sid-before".to_string());
-    live.resume_probe_failed_sid = None;
-    let before = live.clone();
-
-    let mut started = make_test_instance();
-    started.status = Status::Error;
-    started.last_error = Some("resume failed".to_string());
-    started.agent_session_id = Some("sid-after".to_string());
-    started.resume_probe_failed_sid = Some("sid-after".to_string());
-
-    apply_cascade_state_sync(&mut live, &before, &started);
-
-    assert_eq!(live.status, Status::Running);
-    assert_eq!(live.last_error.as_deref(), Some("keep me"));
-    assert_eq!(live.agent_session_id.as_deref(), Some("sid-after"));
-    assert_eq!(live.resume_probe_failed_sid.as_deref(), Some("sid-after"));
-}
-
-#[test]
-fn apply_post_restart_sync_preserves_peer_sid_write() {
-    let mut before = make_test_instance();
-    before.agent_session_id = Some("stale-restart-sid".to_string());
-    before.resume_probe_failed_sid = None;
-
-    let mut live = make_test_instance();
-    live.agent_session_id = Some("peer-fresh-sid".to_string());
-    live.resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
-
-    let mut started = make_test_instance();
-    started.status = Status::Error;
-    started.agent_session_id = Some("stale-restart-sid".to_string());
-    started.resume_probe_failed_sid = Some("stale-restart-sid".to_string());
-    started.last_error = Some("resume failed".to_string());
-
-    apply_post_restart_sync(&mut live, &before, &started);
-
-    assert_eq!(live.status, Status::Error);
-    assert_eq!(live.last_error.as_deref(), Some("resume failed"));
-    assert_eq!(live.agent_session_id.as_deref(), Some("peer-fresh-sid"));
-    assert_eq!(
-        live.resume_probe_failed_sid.as_deref(),
-        Some("peer-fresh-sid")
+    failed.last_error_check = Some(std::time::Instant::now());
+    let stale_before = sync_row(Running, None, Some("stale-sid"), None);
+    let stale_started = sync_row(
+        Error,
+        Some("resume failed"),
+        Some("stale-sid"),
+        Some("stale-sid"),
     );
+    let peer = sync_row(Running, Some("keep me"), Some("peer-sid"), Some("peer-sid"));
+    let same = sync_row(Running, None, Some("same-sid"), None);
+    let mut same_marked = same.clone();
+    same_marked.resume_probe_failed_sid = Some("same-sid".to_string());
+    let mut same_started = same.clone();
+    same_started.status = Starting;
+
+    let restart: [SyncCase; 3] = [
+        (
+            "failed resume propagates",
+            resumed.clone(),
+            resumed.clone(),
+            failed.clone(),
+            (Error, Some("resume failed"), "sid-after", "sid-after"),
+        ),
+        (
+            "peer sid write survives",
+            stale_before.clone(),
+            peer.clone(),
+            stale_started.clone(),
+            (Error, Some("resume failed"), "peer-sid", "peer-sid"),
+        ),
+        (
+            "peer marker for the same sid survives",
+            same.clone(),
+            same_marked,
+            same_started,
+            (Starting, None, "same-sid", "same-sid"),
+        ),
+    ];
+    for (label, before, mut live, started, (status, error, sid, failed_sid)) in restart {
+        apply_post_restart_sync(&mut live, &before, &started);
+        assert_eq!(live.status, status, "{label}");
+        assert_eq!(live.last_error.as_deref(), error, "{label}");
+        assert_eq!(live.agent_session_id.as_deref(), Some(sid), "{label}");
+        assert_eq!(
+            live.resume_probe_failed_sid.as_deref(),
+            Some(failed_sid),
+            "{label}"
+        );
+        if label == "failed resume propagates" {
+            assert!(live.last_error_check.is_some());
+        }
+    }
+
+    let mut cascade_live = resumed.clone();
+    cascade_live.last_error = Some("keep me".to_string());
+    let cascade: [SyncCase; 2] = [
+        (
+            "marker propagates without status",
+            cascade_live.clone(),
+            cascade_live,
+            failed,
+            (Running, Some("keep me"), "sid-after", "sid-after"),
+        ),
+        (
+            "peer sid write survives",
+            stale_before,
+            peer,
+            stale_started,
+            (Running, Some("keep me"), "peer-sid", "peer-sid"),
+        ),
+    ];
+    for (label, before, mut live, started, (status, error, sid, failed_sid)) in cascade {
+        apply_cascade_state_sync(&mut live, &before, &started);
+        assert_eq!(live.status, status, "cascade: {label}");
+        assert_eq!(live.last_error.as_deref(), error, "cascade: {label}");
+        assert_eq!(
+            live.agent_session_id.as_deref(),
+            Some(sid),
+            "cascade: {label}"
+        );
+        assert_eq!(
+            live.resume_probe_failed_sid.as_deref(),
+            Some(failed_sid),
+            "cascade: {label}"
+        );
+    }
 }
 
 #[test]
@@ -2243,107 +1904,6 @@ fn restart_sync_rejects_an_older_lifecycle_generation() {
         )]
         .into()
     );
-}
-
-#[test]
-fn apply_post_restart_sync_preserves_peer_marker_for_same_sid() {
-    let mut before = make_test_instance();
-    before.agent_session_id = Some("same-sid".to_string());
-    before.resume_probe_failed_sid = None;
-
-    let mut live = before.clone();
-    live.resume_probe_failed_sid = Some("same-sid".to_string());
-
-    let mut started = before.clone();
-    started.status = Status::Starting;
-    started.resume_probe_failed_sid = None;
-
-    apply_post_restart_sync(&mut live, &before, &started);
-
-    assert_eq!(live.status, Status::Starting);
-    assert_eq!(live.agent_session_id.as_deref(), Some("same-sid"));
-    assert_eq!(live.resume_probe_failed_sid.as_deref(), Some("same-sid"));
-}
-
-#[test]
-fn apply_cascade_state_sync_preserves_peer_sid_write() {
-    let mut before = make_test_instance();
-    before.agent_session_id = Some("stale-restart-sid".to_string());
-    before.resume_probe_failed_sid = None;
-
-    let mut live = make_test_instance();
-    live.status = Status::Running;
-    live.last_error = Some("keep me".to_string());
-    live.agent_session_id = Some("peer-fresh-sid".to_string());
-    live.resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
-
-    let mut started = make_test_instance();
-    started.status = Status::Error;
-    started.last_error = Some("resume failed".to_string());
-    started.agent_session_id = Some("stale-restart-sid".to_string());
-    started.resume_probe_failed_sid = Some("stale-restart-sid".to_string());
-
-    apply_cascade_state_sync(&mut live, &before, &started);
-
-    assert_eq!(live.status, Status::Running);
-    assert_eq!(live.last_error.as_deref(), Some("keep me"));
-    assert_eq!(live.agent_session_id.as_deref(), Some("peer-fresh-sid"));
-    assert_eq!(
-        live.resume_probe_failed_sid.as_deref(),
-        Some("peer-fresh-sid")
-    );
-}
-
-#[test]
-#[serial_test::serial]
-fn send_message_post_restart_save_preserves_peer_sid_write() {
-    let temp_home = tempfile::tempdir().unwrap();
-    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
-    let _ = crate::session::get_app_dir().expect("isolated app dir");
-
-    let profile = "send-post-restart-peer-sid";
-    let storage = Storage::new_unwatched(profile).unwrap();
-    let mut seed = make_test_instance();
-    let id = seed.id.clone();
-    seed.agent_session_id = Some("peer-fresh-sid".to_string());
-    seed.resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
-    storage
-        .update(|instances, _groups| {
-            instances.push(seed.clone());
-            Ok(())
-        })
-        .unwrap();
-
-    let mut sync_base_for_save = make_test_instance();
-    sync_base_for_save.id = id.clone();
-    sync_base_for_save.agent_session_id = Some("stale-restart-sid".to_string());
-    sync_base_for_save.resume_probe_failed_sid = None;
-
-    let mut started_for_save = make_test_instance();
-    started_for_save.id = id.clone();
-    started_for_save.status = Status::Starting;
-    started_for_save.agent_session_id = Some("stale-restart-sid".to_string());
-    started_for_save.resume_probe_failed_sid = None;
-
-    storage
-        .update(|all, _groups| {
-            if let Some(disk_inst) = all.iter_mut().find(|i| i.id == id) {
-                apply_post_restart_sync(disk_inst, &sync_base_for_save, &started_for_save);
-                disk_inst.touch_last_accessed();
-            }
-            Ok(())
-        })
-        .unwrap();
-
-    let reloaded = storage.load().unwrap();
-    let disk = reloaded.iter().find(|i| i.id == seed.id).unwrap();
-    assert_eq!(disk.status, Status::Starting);
-    assert_eq!(disk.agent_session_id.as_deref(), Some("peer-fresh-sid"));
-    assert_eq!(
-        disk.resume_probe_failed_sid.as_deref(),
-        Some("peer-fresh-sid")
-    );
-    assert!(disk.last_accessed_at.is_some());
 }
 
 /// A tool name must resolve to a built-in agent, or to a custom agent whose
@@ -2386,77 +1946,77 @@ fn session_tool_identity_accepts_builtins_and_non_empty_custom_agents() {
     }
 }
 
-/// A custom agent declared under one profile is invisible from another.
+/// A custom agent declared under one profile is invisible from another, and
+/// one declared by a repo does not exist at all (#3154).
 #[test]
 #[serial_test::serial]
-fn session_tool_identity_uses_requested_profile() {
-    let temp_home = tempfile::tempdir().unwrap();
-    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
-    let app_dir = crate::session::get_app_dir().expect("isolated app dir");
-    let work_profile = app_dir.join("profiles").join("work");
-    std::fs::create_dir_all(&work_profile).unwrap();
-    std::fs::write(
-        work_profile.join("config.toml"),
-        r#"
+fn session_tool_identity_is_profile_scoped_and_ignores_repo_custom_agents() {
+    {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let app_dir = crate::session::get_app_dir().expect("isolated app dir");
+        let work_profile = app_dir.join("profiles").join("work");
+        std::fs::create_dir_all(&work_profile).unwrap();
+        std::fs::write(
+            work_profile.join("config.toml"),
+            r#"
             [session.custom_agents]
             work-agent = "ssh -t work claude"
         "#,
-    )
-    .unwrap();
-    let project = tempfile::tempdir().unwrap();
+        )
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
 
-    assert!(!validate_session_tool_identity(
-        "work-agent",
-        "default",
-        project.path()
-    ));
-    assert!(validate_session_tool_identity(
-        "work-agent",
-        "work",
-        project.path()
-    ));
-}
-
-#[test]
-#[serial_test::serial]
-fn session_tool_identity_uses_repo_aware_config_but_not_repo_custom_agents() {
-    let temp_home = tempfile::tempdir().unwrap();
-    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
-    let app_dir = crate::session::get_app_dir().expect("isolated app dir");
-    std::fs::create_dir_all(&app_dir).unwrap();
-    std::fs::write(
-        app_dir.join("config.toml"),
-        r#"
+        assert!(!validate_session_tool_identity(
+            "work-agent",
+            "default",
+            project.path()
+        ));
+        assert!(validate_session_tool_identity(
+            "work-agent",
+            "work",
+            project.path()
+        ));
+    }
+    {
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let app_dir = crate::session::get_app_dir().expect("isolated app dir");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            r#"
             [session.custom_agents]
             my-agent = "ssh -t lenovo claude"
         "#,
-    )
-    .unwrap();
+        )
+        .unwrap();
 
-    let project = tempfile::tempdir().unwrap();
-    let repo_config_dir = project.path().join(".agent-of-empires");
-    std::fs::create_dir_all(&repo_config_dir).unwrap();
-    std::fs::write(
-        repo_config_dir.join("config.toml"),
-        r#"
+        let project = tempfile::tempdir().unwrap();
+        let repo_config_dir = project.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&repo_config_dir).unwrap();
+        std::fs::write(
+            repo_config_dir.join("config.toml"),
+            r#"
             [session.custom_agents]
             repo-agent = "ssh -t repo claude"
         "#,
-    )
-    .unwrap();
+        )
+        .unwrap();
 
-    // The user's own custom agent resolves through the repo-aware path.
-    assert!(validate_session_tool_identity(
-        "my-agent",
-        "default",
-        project.path()
-    ));
-    // A repo-defined one does not exist as far as AoE is concerned (#3154).
-    assert!(!validate_session_tool_identity(
-        "repo-agent",
-        "default",
-        project.path()
-    ));
+        // The user's own custom agent resolves through the repo-aware path.
+        assert!(validate_session_tool_identity(
+            "my-agent",
+            "default",
+            project.path()
+        ));
+        // A repo-defined one does not exist as far as AoE is concerned (#3154).
+        assert!(!validate_session_tool_identity(
+            "repo-agent",
+            "default",
+            project.path()
+        ));
+    }
 }
 
 /// Build one structured, idle session with an empty `source_profile`, so
@@ -2829,33 +2389,13 @@ fn create_session_validates_tool_before_builder_or_persistence() {
     assert!(!create_source[validation..spawn_blocking].contains("command_override"));
 }
 
+/// Session and terminal handlers must take the per-session lock before
+/// snapshotting the instance; a read-then-lock order lets a concurrent mutation
+/// land between the two and hands `spawn_blocking` a stale clone.
 #[tokio::test]
-async fn ensure_session_refreshes_instance_after_instance_lock() {
+async fn handlers_take_instance_lock_before_snapshot() {
     let _home = crate::session::test_support::isolate_app_dir();
-    let inst = make_test_instance();
-    let id = inst.id.clone();
-    let state = crate::server::test_support::build_test_app_state(vec![inst]);
-    let lock = state.instance_lock(&id).await;
-    let held = lock.lock().await;
-    let handler = ensure_session(State(state.clone()), Path(id.clone()));
-    tokio::pin!(handler);
-    assert!(futures_util::poll!(&mut handler).is_pending());
-    state.instances.write().await.clear();
-    drop(held);
-    assert_eq!(
-        handler.await.into_response().status(),
-        StatusCode::NOT_FOUND
-    );
-}
-
-/// The three terminal handlers must take the per-session lock before
-/// snapshotting the instance, like `ensure_session`; a read-then-lock order
-/// lets a concurrent mutation land between the two and hands `spawn_blocking`
-/// a stale clone.
-#[tokio::test]
-async fn terminal_handlers_take_instance_lock_before_snapshot() {
-    let _home = crate::session::test_support::isolate_app_dir();
-    for which in ["ensure", "container", "kill"] {
+    for which in ["session", "send", "ensure", "container", "kill"] {
         let inst = make_test_instance();
         let id = inst.id.clone();
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
@@ -2865,6 +2405,19 @@ async fn terminal_handlers_take_instance_lock_before_snapshot() {
             let query =
                 axum::extract::Query(crate::server::live_ws::TerminalIndexQuery { index: 1 });
             match which {
+                "session" => ensure_session(State(state.clone()), Path(id.clone()))
+                    .await
+                    .into_response(),
+                "send" => send_message(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    Ok(Json(SendMessageRequest {
+                        message: "hello".into(),
+                        revive: false,
+                    })),
+                )
+                .await
+                .into_response(),
                 "ensure" => ensure_terminal(State(state.clone()), Path(id.clone()), query)
                     .await
                     .into_response(),
@@ -3174,62 +2727,58 @@ fn changed(paths: &[&str]) -> Vec<DiffFile> {
         .collect()
 }
 
-#[test]
-fn validate_diff_path_rejects_unsafe_shapes() {
-    let dir = TempDir::new().unwrap();
-    for path in [
-        "/etc/passwd",
-        "../../etc/passwd",
-        "src/../../etc/passwd",
-        "",
-    ] {
-        let err = validate_diff_path(
-            dir.path(),
-            std::path::Path::new(path),
-            &changed(&["src/main.rs"]),
-        )
-        .unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST, "path={path:?}");
-    }
-}
-
 /// An in-repo file that exists but is not in the changed set is accepted for the
 /// full-file fallback (#1810), flagged `is_changed = false`. A changed file
 /// deleted from disk stays diffable, so the validator falls back to the
-/// non-canonical path when `canonicalize()` fails.
+/// non-canonical path when `canonicalize()` fails. A file neither changed nor
+/// on disk has nothing to show.
 #[test]
-fn validate_diff_path_accepts_in_repo_and_changed_files() {
-    let dir = TempDir::new().unwrap();
-    std::fs::write(dir.path().join("existing.txt"), "hello").unwrap();
-    std::fs::write(dir.path().join("changed.txt"), "hello").unwrap();
-
-    // (requested path, changed set, expected is_changed)
-    for (path, changed_set, expected) in [
-        ("existing.txt", &["src/main.rs"][..], false),
-        ("changed.txt", &["changed.txt"][..], true),
-        ("deleted.txt", &["deleted.txt"][..], true),
-    ] {
-        let (_, is_changed) = validate_diff_path(
-            dir.path(),
-            std::path::Path::new(path),
-            &changed(changed_set),
-        )
-        .unwrap_or_else(|e| panic!("{path} should validate, got {:?}", e.0));
-        assert_eq!(is_changed, expected, "path={path}");
+fn validate_diff_path_rejects_unsafe_and_classifies_in_repo_files() {
+    {
+        let dir = TempDir::new().unwrap();
+        for path in [
+            "/etc/passwd",
+            "../../etc/passwd",
+            "src/../../etc/passwd",
+            "",
+        ] {
+            let err = validate_diff_path(
+                dir.path(),
+                std::path::Path::new(path),
+                &changed(&["src/main.rs"]),
+            )
+            .unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "path={path:?}");
+        }
     }
-}
+    {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("existing.txt"), "hello").unwrap();
+        std::fs::write(dir.path().join("changed.txt"), "hello").unwrap();
 
-/// Not in the changed set and not on disk: nothing to show.
-#[test]
-fn validate_diff_path_rejects_nonexistent_unchanged_file() {
-    let dir = TempDir::new().unwrap();
-    let err = validate_diff_path(
-        dir.path(),
-        std::path::Path::new("ghost.txt"),
-        &changed(&["src/main.rs"]),
-    )
-    .unwrap_err();
-    assert_eq!(err.0, StatusCode::NOT_FOUND);
+        // (requested path, changed set, expected is_changed)
+        for (path, changed_set, expected) in [
+            ("existing.txt", &["src/main.rs"][..], false),
+            ("changed.txt", &["changed.txt"][..], true),
+            ("deleted.txt", &["deleted.txt"][..], true),
+        ] {
+            let (_, is_changed) = validate_diff_path(
+                dir.path(),
+                std::path::Path::new(path),
+                &changed(changed_set),
+            )
+            .unwrap_or_else(|e| panic!("{path} should validate, got {:?}", e.0));
+            assert_eq!(is_changed, expected, "path={path}");
+        }
+
+        let err = validate_diff_path(
+            dir.path(),
+            std::path::Path::new("ghost.txt"),
+            &changed(&["src/main.rs"]),
+        )
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
 }
 
 #[test]
@@ -3250,18 +2799,6 @@ fn truncate_title_truncates_on_character_boundaries() {
         assert_eq!(out, expected, "input={input} limit={limit}");
         assert!(out.chars().count() <= limit);
     }
-}
-#[test]
-fn session_response_serializes_unread_marker() {
-    use crate::session::Instance;
-    let mut inst = Instance::new("t", "/tmp");
-    // Read: the field is omitted from the wire (skip_serializing_if false).
-    let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
-    assert!(json.get("unread").is_none());
-    // Unread serializes as a bare boolean the web reads directly.
-    inst.unread = true;
-    let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
-    assert_eq!(json["unread"], serde_json::json!(true));
 }
 
 fn step(
@@ -3328,19 +2865,6 @@ fn plan_summary_counts_done_and_picks_the_first_non_done_step() {
     }
 }
 
-#[test]
-fn plan_summary_truncates_a_long_current_step_title() {
-    use crate::acp::state::PlanStepStatus::Pending;
-    let plan = crate::acp::state::Plan {
-        plan_id: "p1".into(),
-        version: 1,
-        steps: vec![step("a", &"x".repeat(120), Pending)],
-    };
-    let title = plan_summary_from_plan(plan).current_step_title.unwrap();
-    assert_eq!(title.chars().count(), 80);
-    assert!(title.ends_with('\u{2026}'));
-}
-
 // --- persist_session_update (the persist-first contract from #1589) ---
 //
 // The session-mutation PATCH handlers route every write through this helper and
@@ -3361,47 +2885,6 @@ fn rename_persistence_reports_missing_authoritative_row() {
     assert!(
         storage.load().unwrap().is_empty(),
         "a missing row must not be synthesized by rename persistence"
-    );
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn persist_session_update_writes_to_disk() {
-    let temp_home = tempfile::tempdir().unwrap();
-    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
-    let _ = crate::session::get_app_dir().expect("isolated app dir");
-
-    let profile = "persist-success";
-    let storage = Storage::new_unwatched(profile).unwrap();
-    let seed = make_test_instance();
-    let id = seed.id.clone();
-    storage
-        .update(|instances, _groups| {
-            instances.push(seed.clone());
-            Ok(())
-        })
-        .unwrap();
-
-    let persist_id = id.clone();
-    persist_session_update(
-        profile.to_string(),
-        "test",
-        crate::file_watch::FileWatchService::noop(),
-        move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                inst.base_branch_override = Some("release/x".to_string());
-            }
-        },
-    )
-    .await
-    .expect("persist should succeed");
-
-    let reloaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
-    let inst = reloaded.iter().find(|i| i.id == id).unwrap();
-    assert_eq!(
-        inst.base_branch_override.as_deref(),
-        Some("release/x"),
-        "mutation must be durable on disk"
     );
 }
 
@@ -3517,74 +3000,73 @@ fn project_with_on_create_hooks(commands: &[&str]) -> tempfile::TempDir {
 
 #[test]
 #[serial_test::serial]
-fn resolve_hook_plan_refuses_untrusted_repo_hooks() {
-    // #2066: the web API used to skip hooks entirely. The plan must refuse an
-    // untrusted repo with hooks unless trust_hooks is passed, so the caller can
-    // prompt rather than silently get an un-bootstrapped worktree.
-    let temp_home = tempfile::tempdir().unwrap();
-    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
-    let _app_dir = crate::session::get_app_dir().expect("isolated app dir");
-    let project = project_with_on_create_hooks(&["bash scripts/setup-worktree.sh"]);
-    // Approval trusts the whole hooks hash, so the refusal must surface
-    // every hook type, not just on_create.
-    std::fs::write(
+fn resolve_hook_plan_refuses_untrusted_repo_hooks_until_trusted() {
+    {
+        // #2066: the web API used to skip hooks entirely. The plan must refuse an
+        // untrusted repo with hooks unless trust_hooks is passed, so the caller can
+        // prompt rather than silently get an un-bootstrapped worktree.
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let _app_dir = crate::session::get_app_dir().expect("isolated app dir");
+        let project = project_with_on_create_hooks(&["bash scripts/setup-worktree.sh"]);
+        // Approval trusts the whole hooks hash, so the refusal must surface
+        // every hook type, not just on_create.
+        std::fs::write(
         project.path().join(".agent-of-empires/config.toml"),
         "[hooks]\non_create = [\"bash scripts/setup-worktree.sh\"]\non_launch = [\"npm start\"]\non_destroy = [\"rm -rf /tmp/seed\"]\n",
     )
     .unwrap();
 
-    let err = resolve_create_hook_plan("default", project.path(), false, false)
-        .expect_err("untrusted hooks must be refused");
-    let needs_trust = err
-        .downcast_ref::<HooksNeedTrust>()
-        .expect("error must be HooksNeedTrust");
-    assert_eq!(
-        needs_trust.on_create,
-        vec!["bash scripts/setup-worktree.sh".to_string()],
-        "the refused error must carry the commands for the prompt"
-    );
-    assert_eq!(
-        needs_trust.on_launch,
-        vec!["npm start".to_string()],
-        "approval also trusts on_launch, so the prompt must show it"
-    );
-    assert_eq!(needs_trust.on_destroy, vec!["rm -rf /tmp/seed".to_string()]);
-    assert!(!needs_trust.needs_mcp_trust);
-}
+        let err = resolve_create_hook_plan("default", project.path(), false, false)
+            .expect_err("untrusted hooks must be refused");
+        let needs_trust = err
+            .downcast_ref::<HooksNeedTrust>()
+            .expect("error must be HooksNeedTrust");
+        assert_eq!(
+            needs_trust.on_create,
+            vec!["bash scripts/setup-worktree.sh".to_string()],
+            "the refused error must carry the commands for the prompt"
+        );
+        assert_eq!(
+            needs_trust.on_launch,
+            vec!["npm start".to_string()],
+            "approval also trusts on_launch, so the prompt must show it"
+        );
+        assert_eq!(needs_trust.on_destroy, vec!["rm -rf /tmp/seed".to_string()]);
+        assert!(!needs_trust.needs_mcp_trust);
+    }
+    {
+        // trust_hooks: true mirrors the CLI --trust-hooks flag: approve, record
+        // trust, and return the commands to run.
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+        let _app_dir = crate::session::get_app_dir().expect("isolated app dir");
+        let project = project_with_on_create_hooks(&["echo hi"]);
 
-#[test]
-#[serial_test::serial]
-fn resolve_hook_plan_trusts_and_runs_with_trust_hooks() {
-    // trust_hooks: true mirrors the CLI --trust-hooks flag: approve, record
-    // trust, and return the commands to run.
-    let temp_home = tempfile::tempdir().unwrap();
-    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
-    let _app_dir = crate::session::get_app_dir().expect("isolated app dir");
-    let project = project_with_on_create_hooks(&["echo hi"]);
+        let plan = resolve_create_hook_plan("default", project.path(), false, true)
+            .expect("trust_hooks: true must approve");
+        assert_eq!(plan.on_create(), vec!["echo hi".to_string()]);
+        let (hooks_hash, mcp_hash) = plan
+            .trust_write
+            .expect("a newly-approved repo must record trust");
+        assert!(hooks_hash.is_some(), "hooks hash must be recorded");
+        assert!(mcp_hash.is_none(), "no .mcp.json means no mcp hash");
 
-    let plan = resolve_create_hook_plan("default", project.path(), false, true)
-        .expect("trust_hooks: true must approve");
-    assert_eq!(plan.on_create(), vec!["echo hi".to_string()]);
-    let (hooks_hash, mcp_hash) = plan
-        .trust_write
-        .expect("a newly-approved repo must record trust");
-    assert!(hooks_hash.is_some(), "hooks hash must be recorded");
-    assert!(mcp_hash.is_none(), "no .mcp.json means no mcp hash");
-
-    // And the recorded trust makes a later create succeed without opting in.
-    crate::session::config::repo_config::trust_repo(
-        project.path(),
-        hooks_hash.as_deref(),
-        mcp_hash.as_deref(),
-    )
-    .unwrap();
-    let plan2 = resolve_create_hook_plan("default", project.path(), false, false)
-        .expect("already-trusted hooks must run without trust_hooks");
-    assert_eq!(plan2.on_create(), vec!["echo hi".to_string()]);
-    assert!(
-        plan2.trust_write.is_none(),
-        "already-trusted repo needs no new trust record"
-    );
+        // And the recorded trust makes a later create succeed without opting in.
+        crate::session::config::repo_config::trust_repo(
+            project.path(),
+            hooks_hash.as_deref(),
+            mcp_hash.as_deref(),
+        )
+        .unwrap();
+        let plan2 = resolve_create_hook_plan("default", project.path(), false, false)
+            .expect("already-trusted hooks must run without trust_hooks");
+        assert_eq!(plan2.on_create(), vec!["echo hi".to_string()]);
+        assert!(
+            plan2.trust_write.is_none(),
+            "already-trusted repo needs no new trust record"
+        );
+    }
 }
 
 /// None of these refuse a create. A scratch session has no repo config anchor,

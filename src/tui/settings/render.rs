@@ -1428,8 +1428,11 @@ mod tests {
             ("hello      world      again", 40, &["hello world again"]),
             ("anything", 0, &["anything"]),
         ];
+        // The height must agree with the line count, or `field_height` paints
+        // values over the description in a real render.
         for (text, width, want) in cases {
             assert_eq!(wrap_description_lines(text, *width), *want, "{text:?}");
+            assert_eq!(wrap_description_height(text, *width), want.len() as u16);
         }
 
         let lines = wrap_description_lines(LONG, 120);
@@ -1437,26 +1440,10 @@ mod tests {
         for line in &lines {
             assert!(line.chars().count() <= 120, "{line:?} exceeds the width");
         }
-    }
-
-    /// The two must agree for every input, or `field_height` paints values
-    /// over the description in a real render.
-    #[test]
-    fn wrap_description_height_matches_the_line_count() {
-        for (text, width) in [
-            ("", 40),
-            ("short text", 40),
-            ("one two three four", 8),
-            ("hello      world      again", 40),
-            ("anything", 0),
-            (LONG, 40),
-        ] {
-            assert_eq!(
-                wrap_description_height(text, width),
-                wrap_description_lines(text, width).len() as u16,
-                "{text:?} at width {width}"
-            );
-        }
+        assert_eq!(
+            wrap_description_height(LONG, 40),
+            wrap_description_lines(LONG, 40).len() as u16
+        );
     }
 }
 
@@ -1468,7 +1455,8 @@ mod field_height_tests {
     use serial_test::serial;
 
     /// Locks the contract between the height the scroll math uses and what
-    /// the render pass paints: a narrower panel grows it by the extra rows.
+    /// the render pass paints: a narrower panel grows it by the extra rows. A
+    /// section header has no value row, so it is the label plus the subtitle.
     #[test]
     #[serial]
     fn field_height_grows_with_wrapped_description() {
@@ -1498,14 +1486,6 @@ mod field_height_tests {
             4,
             "narrow panel: label + 2-line desc + value"
         );
-    }
-
-    /// A section header has no value row, so its height is the label plus
-    /// the wrapped subtitle.
-    #[test]
-    #[serial]
-    fn field_height_section_header_tracks_wrapped_subtitle() {
-        let (_temp, _guard, mut view) = fresh_view();
 
         let header = SettingField {
             kind: FieldKind::SectionMarker,
@@ -1664,7 +1644,7 @@ mod status_message_tests {
     /// The toast auto-dismisses once its window passes; an error is sticky.
     #[test]
     #[serial]
-    fn tick_status_expires_success_but_keeps_error() {
+    fn save_toast_expires_but_errors_stay() {
         let (_temp, _guard, mut view) = fresh_view();
 
         view.success_message = Some("Settings saved".to_string());
@@ -1690,13 +1670,8 @@ mod status_message_tests {
             view.success_message.is_some(),
             "the toast should still show"
         );
-    }
 
-    /// A successful save arms the auto-dismiss timer alongside the toast.
-    #[test]
-    #[serial]
-    fn save_arms_the_success_toast_timer() {
-        let (_temp, _guard, mut view) = fresh_view();
+        // A successful save arms the auto-dismiss timer alongside the toast.
         // Profile scope avoids the Global telemetry side effect, and no fields
         // means validation passes straight through to a real write.
         view.scope = SettingsScope::Profile;
@@ -1715,8 +1690,8 @@ mod status_message_tests {
     /// advertises it rather than the `?` overlay hiding it.
     #[test]
     #[serial]
-    fn footer_advertises_search_in_normal_mode() {
-        let (_temp, _guard, view) = fresh_view();
+    fn footer_and_idle_bar_advertise_search() {
+        let (_temp, _guard, mut view) = fresh_view();
         let theme = load_theme("empire");
         let area = Rect::new(0, 0, 120, 3);
 
@@ -1728,6 +1703,15 @@ mod status_message_tests {
         assert!(
             hints.contains("/: search"),
             "normal-mode footer should advertise the search overlay, got {hints:?}"
+        );
+
+        let area = Rect::new(0, 0, 110, 40);
+        let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+        terminal.draw(|f| view.render(f, area, &theme)).unwrap();
+        let all = buffer_text(terminal.backend().buffer());
+        assert!(
+            all.contains("Press / to search settings"),
+            "the idle bar should show the placeholder, got:\n{all}"
         );
     }
 
@@ -1882,22 +1866,6 @@ mod status_message_tests {
     }
 
     /// The bar is permanent: idle, it advertises `/`.
-    #[test]
-    #[serial]
-    fn idle_search_bar_shows_placeholder() {
-        let (_temp, _guard, mut view) = fresh_view();
-        let theme = load_theme("empire");
-
-        let area = Rect::new(0, 0, 110, 40);
-        let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
-        terminal.draw(|f| view.render(f, area, &theme)).unwrap();
-        let all = buffer_text(terminal.backend().buffer());
-        assert!(
-            all.contains("Press / to search settings"),
-            "the idle bar should show the placeholder, got:\n{all}"
-        );
-    }
-
     /// The add prompt owns the only cursor, so the previously selected item
     /// drops its `>` marker.
     #[test]

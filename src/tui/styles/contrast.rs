@@ -59,53 +59,34 @@ mod tests {
     }
 
     #[test]
-    fn black_on_white_is_max_contrast() {
-        let r = contrast_ratio(rgb(0x000000), rgb(0xffffff)).unwrap();
-        assert!((r - 21.0).abs() < 0.01, "expected ~21, got {r}");
-    }
-
-    #[test]
-    fn identical_colors_are_one() {
-        let r = contrast_ratio(rgb(0x6272a4), rgb(0x6272a4)).unwrap();
-        assert!((r - 1.0).abs() < 0.001, "identical → 1.0, got {r}");
-    }
-
-    #[test]
-    fn ratio_is_symmetric() {
+    fn contrast_ratio_math() {
+        for (fg, bg, want) in [(0x000000, 0xffffff, 21.0), (0x6272a4, 0x6272a4, 1.0)] {
+            let r = contrast_ratio(rgb(fg), rgb(bg)).unwrap();
+            assert!((r - want).abs() < 0.01, "{fg:06x}/{bg:06x}: {r}");
+        }
         let a = contrast_ratio(rgb(0x3c3c3c), rgb(0x50785a)).unwrap();
         let b = contrast_ratio(rgb(0x50785a), rgb(0x3c3c3c)).unwrap();
-        assert!((a - b).abs() < 0.001);
-    }
-
-    #[test]
-    fn dracula_dim_invisible_against_session_selection() {
-        // dim == session_selection (#6272a4): contrast 1.0, must not pass
-        // ANY positive threshold.
-        assert!(!has_min_contrast(rgb(0x6272a4), rgb(0x6272a4), 3.0));
-        assert!(!has_min_contrast(rgb(0x6272a4), rgb(0x6272a4), 1.5));
-    }
-
-    #[test]
-    fn phosphor_running_against_session_selection_passes() {
-        // running (#00ffb4) vs session_selection (#3c3c3c) — contrast ~8.4
-        // by WCAG math, well above 3:1.
-        assert!(has_min_contrast(rgb(0x00ffb4), rgb(0x3c3c3c), 3.0));
-    }
-
-    #[test]
-    fn phosphor_dim_against_session_selection_fails() {
-        // dim (#50785a) vs session_selection (#3c3c3c) — contrast ~2.19,
-        // below 3:1. This is the case that motivated the original
-        // override-to-theme.text fix.
-        assert!(!has_min_contrast(rgb(0x50785a), rgb(0x3c3c3c), 3.0));
-    }
-
-    #[test]
-    fn non_rgb_colors_return_none() {
+        assert!((a - b).abs() < 0.001, "symmetric");
         assert!(contrast_ratio(Color::Reset, rgb(0xffffff)).is_none());
         assert!(contrast_ratio(rgb(0xffffff), Color::Indexed(10)).is_none());
-        assert!(!has_min_contrast(Color::Reset, rgb(0xffffff), 3.0));
-        // Palette-mode (Indexed) falls into the conservative-override path.
-        assert!(!has_min_contrast(Color::Indexed(2), rgb(0x3c3c3c), 3.0));
+    }
+
+    #[test]
+    fn has_min_contrast_cases() {
+        let cases = [
+            // dracula dim == session_selection: 1.0 fails any positive floor.
+            (rgb(0x6272a4), rgb(0x6272a4), 1.5, false),
+            // phosphor running vs session_selection: ~8.4.
+            (rgb(0x00ffb4), rgb(0x3c3c3c), 3.0, true),
+            // phosphor dim vs session_selection: ~2.19, the case that
+            // motivated the override-to-theme.text fix.
+            (rgb(0x50785a), rgb(0x3c3c3c), 3.0, false),
+            // Non-RGB and palette-mode colors take the conservative path.
+            (Color::Reset, rgb(0xffffff), 3.0, false),
+            (Color::Indexed(2), rgb(0x3c3c3c), 3.0, false),
+        ];
+        for (fg, bg, min, want) in cases {
+            assert_eq!(has_min_contrast(fg, bg, min), want, "{fg:?} on {bg:?}");
+        }
     }
 }

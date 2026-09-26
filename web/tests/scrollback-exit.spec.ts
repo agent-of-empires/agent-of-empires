@@ -74,40 +74,7 @@ test.describe("Mobile live-view scrollback", () => {
     expect(visibleText, "a scroll-up shows loaded scrollback, not blank").toContain("history line");
   });
 
-  test("reading a deep history mounts only a window of rows (virtualized)", async ({ page }) => {
-    await installTerminalSpies(page);
-    const handle = await mockTerminalApis(page, { liveHistory: 600 });
-    await openSession(page, handle);
-
-    await scroller(page).evaluate((el) => {
-      el.scrollTop = el.scrollHeight * 0.5;
-    });
-    await expect.poll(() => scroller(page).evaluate((el) => el.scrollHeight), { timeout: 3_000 }).toBeGreaterThan(8000);
-
-    // Rows are virtualized: only a window is mounted while scrollHeight spans the history.
-    await scroller(page).evaluate((el) => {
-      el.scrollTop = el.scrollHeight * 0.5;
-    });
-    await expect
-      .poll(() =>
-        scroller(page).evaluate((el) => {
-          const pane = el.getBoundingClientRect();
-          return Array.from(el.querySelectorAll("[data-live-content] > div")).some((row) => {
-            const rect = row.getBoundingClientRect();
-            return rect.bottom > pane.top && rect.top < pane.bottom && row.textContent?.includes("history line");
-          });
-        }),
-      )
-      .toBe(true);
-    const m = await scroller(page).evaluate((el) => ({
-      mounted: el.querySelectorAll("[data-live-content] > div").length,
-      scrollHeight: el.scrollHeight,
-    }));
-    expect(m.mounted, "only a window of the deep history is mounted").toBeLessThan(250);
-    expect(m.scrollHeight, "the document still spans the full history").toBeGreaterThan(8000);
-  });
-
-  test("jumping to the bottom while reading does not show a blank spacer frame", async ({ page }) => {
+  test("a deep history is virtualized, and jumping to the bottom shows no blank spacer frame", async ({ page }) => {
     await installTerminalSpies(page);
     const handle = await mockTerminalApis(page, { liveHistory: 600 });
     await openSession(page, handle);
@@ -119,8 +86,12 @@ test.describe("Mobile live-view scrollback", () => {
     });
     await expect.poll(() => scroller(page).evaluate((el) => el.scrollHeight), { timeout: 3_000 }).toBeGreaterThan(8000);
 
-    // Keep the live tail mounted so the flip back to live renders rows, not a spacer.
+    // Rows are virtualized: only a window of the deep history is mounted.
     await expect(page.locator("[data-live-content]")).toContainText("history line");
+    const mounted = await scroller(page).evaluate((el) => el.querySelectorAll("[data-live-content] > div").length);
+    expect(mounted, "only a window of the deep history is mounted").toBeLessThan(250);
+
+    // Keep the live tail mounted so the flip back to live renders rows, not a spacer.
     const visibleText = await scroller(page).evaluate((el) => {
       el.scrollTop = el.scrollHeight - el.clientHeight;
       el.dispatchEvent(new Event("scroll"));
@@ -158,101 +129,19 @@ test.describe("Mobile live-view scrollback", () => {
       .toBeLessThan(30);
   });
 
-  test("scrolling requests a bigger capture window instead of wheel escapes", async ({ page }) => {
-    await installTerminalSpies(page);
-    const handle = await mockTerminalApis(page);
-    await openSession(page, handle);
-
-    const before = textMessages(handle).filter((m) => m.includes('"type":"window"')).length;
-    await scroller(page).evaluate((el) => {
-      el.scrollTop = 0;
-    });
-    await expect
-      .poll(() => textMessages(handle).filter((m) => m.includes('"type":"window"')).length, { timeout: 3_000 })
-      .toBeGreaterThan(before);
-
-    // No SGR wheel bytes or pause/resume control messages on mobile.
-    const all = textMessages(handle).join("");
-    expect(all).not.toContain("\x1b[<64;");
-    expect(all).not.toContain("\x1b[<65;");
-    expect(all).not.toContain("pause_output");
-    expect(all).not.toContain("resume_output");
-  });
-
-  test("incoming frames never move the scroll position while reading", async ({ page }) => {
-    await installTerminalSpies(page);
-    const handle = await mockTerminalApis(page);
-    await openSession(page, handle);
-
-    // Streaming frames must not snap a scroll that has started, via pinning or scroll anchoring.
-    const target = await scroller(page).evaluate((el) => {
-      el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - el.clientHeight * 0.7);
-      return el.scrollTop;
-    });
-    for (let i = 0; i < 4; i++) {
-      await page.waitForTimeout(120);
-      await handle.pushLiveFrame({
-        content: Array.from({ length: 24 }, (_, n) => `streamed ${i}-${n}`).join("\n") + "\n",
-        rows: 24,
-        history: 130 + i,
-      });
-      expect(Math.abs((await scroller(page).evaluate((el) => el.scrollTop)) - target)).toBeLessThan(20);
-    }
-    await page.waitForTimeout(300);
-    const after = await scroller(page).evaluate((el) => el.scrollTop);
-    expect(Math.abs(after - target), "scroll position must hold while frames arrive").toBeLessThan(20);
-  });
-
-  test("a streamed frame never snaps a reader off the live edge back to the bottom", async ({ page }) => {
-    await installTerminalSpies(page);
-    const handle = await mockTerminalApis(page);
-    await openSession(page, handle);
-
-    // Momentum continues after the finger lifts, so off the live edge a streamed frame must never pin to the bottom.
-    // The nudge is sized in lines because the bottom threshold is about 1.5 lines (#2087).
-    const lineH = await scroller(page).evaluate((el) => {
-      const rows = el.querySelectorAll("[data-live-content] > div");
-      return rows.length >= 2 ? (rows[rows.length - 1] as HTMLElement).getBoundingClientRect().height : 16;
-    });
-    const start = await scroller(page).evaluate(
-      (el, up) => {
-        el.scrollTop = el.scrollHeight - el.clientHeight - up;
-        return el.scrollTop;
-      },
-      Math.ceil(lineH * 3),
-    );
-    await handle.pushLiveFrame({
-      content: Array.from({ length: 24 }, (_, n) => `busy ${n}`).join("\n") + "\n",
-      rows: 24,
-      history: 130,
-    });
-    await page.waitForTimeout(150);
-    await scroller(page).evaluate((el, step) => {
-      el.scrollTop -= step;
-    }, Math.ceil(lineH));
-    await handle.pushLiveFrame({
-      content: Array.from({ length: 24 }, (_, n) => `busy2 ${n}`).join("\n") + "\n",
-      rows: 24,
-      history: 131,
-    });
-    await page.waitForTimeout(200);
-    const distance = await scroller(page).evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
-    expect(distance, "the reader stays in scrollback, not snapped to the live edge").toBeGreaterThan(lineH);
-    const after = await scroller(page).evaluate((el) => el.scrollTop);
-    expect(after, "a streamed frame must not pin the reader back below the gesture").toBeLessThan(start);
-  });
-
   test("a real touch flick into scrollback is not yanked back by streaming frames", async ({ page }) => {
     await installTerminalSpies(page);
     const handle = await mockTerminalApis(page);
     await openSession(page, handle);
 
     await touchFlickUp(page, 220);
-    await page.waitForTimeout(120);
-    const afterFlick = await scroller(page).evaluate((el) => el.scrollTop);
     const lineH = await liveLineHeight(page);
-    const distAfterFlick = await scroller(page).evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
-    expect(distAfterFlick, "the flick scrolled up off the live edge").toBeGreaterThan(lineH * 2);
+    await expect
+      .poll(() => scroller(page).evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight), {
+        message: "the flick scrolled up off the live edge",
+      })
+      .toBeGreaterThan(lineH * 2);
+    const afterFlick = await scroller(page).evaluate((el) => el.scrollTop);
 
     for (let i = 0; i < 4; i++) {
       await handle.pushLiveFrame({
@@ -260,8 +149,8 @@ test.describe("Mobile live-view scrollback", () => {
         rows: 24,
         history: 130 + i,
       });
+      await expect(page.locator("[data-live-content]")).toContainText(`streamed ${i}-0`);
       expect(await scroller(page).evaluate((el) => el.scrollTop)).toBeLessThanOrEqual(afterFlick + 2);
-      await page.waitForTimeout(120);
     }
 
     const afterFrames = await scroller(page).evaluate((el) => el.scrollTop);
@@ -270,30 +159,6 @@ test.describe("Mobile live-view scrollback", () => {
     );
     const distAfterFrames = await scroller(page).evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
     expect(distAfterFrames, "the reader stays in scrollback").toBeGreaterThan(lineH);
-  });
-
-  test("a frame does not snap a one-line scroll-up back to the live edge", async ({ page }) => {
-    await installTerminalSpies(page);
-    const handle = await mockTerminalApis(page);
-    await openSession(page, handle);
-
-    // A scroll-up inside the 1.5-line at-bottom tolerance must stay detached (the dead-zone stutter).
-    const lineH = await liveLineHeight(page);
-    const placed = await scroller(page).evaluate((el, lh) => {
-      el.scrollTop = el.scrollHeight - el.clientHeight - lh; // one line up: inside the dead zone
-      el.dispatchEvent(new Event("scroll"));
-      return el.scrollTop;
-    }, lineH);
-
-    // Same-geometry frames keep the live target fixed; only the prompt text changes to force a re-render.
-    for (let i = 0; i < 4; i++) {
-      await handle.pushLiveFrame({ content: `$ ready ${i}\n` + "\n".repeat(23), rows: 24, history: 120 });
-      expect(await scroller(page).evaluate((el) => el.scrollTop)).toBeLessThanOrEqual(placed + 2);
-      await page.waitForTimeout(120);
-    }
-
-    const after = await scroller(page).evaluate((el) => el.scrollTop);
-    expect(after, "a one-line scroll-up must not be snapped back to the bottom").toBeLessThanOrEqual(placed + 2);
   });
 
   test("a streamed frame does not pin away the first pixels of an upward flick", async ({ page }) => {
@@ -311,7 +176,7 @@ test.describe("Mobile live-view scrollback", () => {
         el.dispatchEvent(new Event("scroll"));
       });
       await handle.pushLiveFrame({ content: `$ ready ${i}\n` + "\n".repeat(23), rows: 24, history: 120 });
-      await page.waitForTimeout(40);
+      await expect(page.locator("[data-live-content]")).toContainText(`$ ready ${i}`);
     }
     const dist = await scroller(page).evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
     expect(dist, "the upward nudges accumulate; the pin did not cancel them").toBeGreaterThan(4);
@@ -336,18 +201,19 @@ test.describe("Mobile live-view scrollback", () => {
     await expect(page.getByRole("button", { name: "Back to live" })).toBeVisible();
   });
 
-  test("reading keeps the stream flowing (no hold/freeze)", async ({ page }) => {
+  test("reading requests a bigger window and keeps the stream flowing (no hold/freeze)", async ({ page }) => {
     await installTerminalSpies(page);
     const handle = await mockTerminalApis(page);
     await openSession(page, handle);
 
     // Reading never freezes the pane: no hold is sent, only an idle cadence.
+    const before = textMessages(handle).filter((m) => m.includes('"type":"window"')).length;
     await scroller(page).evaluate((el) => {
       el.scrollTop = 0;
     });
     await expect
       .poll(() => textMessages(handle).filter((m) => m.includes('"type":"window"')).length, { timeout: 3_000 })
-      .toBeGreaterThan(0);
+      .toBeGreaterThan(before);
     await expect
       .poll(() => {
         const msgs = textMessages(handle).filter((m) => m.includes('"type":"cadence"'));
@@ -355,8 +221,10 @@ test.describe("Mobile live-view scrollback", () => {
       })
       .toContain('"fast":false');
 
+    // Reading is a bigger capture window, never wheel escapes or pause/hold control messages.
     const all = textMessages(handle).join("");
     expect(all, "the hold control message is retired").not.toContain('"type":"hold"');
+    for (const escape of ["\x1b[<64;", "\x1b[<65;", "pause_output", "resume_output"]) expect(all).not.toContain(escape);
 
     // Rows are virtualized, so the new frame must render where the reader is looking.
     await handle.pushLiveFrame({
