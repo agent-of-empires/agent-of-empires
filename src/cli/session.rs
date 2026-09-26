@@ -1157,8 +1157,16 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     let mut failed: Vec<(String, String)> = Vec::new();
     let mut fresh_after_failed_resume: Vec<(String, String)> = Vec::new();
     let mut restarted: Vec<crate::session::Instance> = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
     while let Some(joined) = join_set.join_next().await {
         let (title, inst_opt, result) = joined.expect("JoinSet shouldn't panic on join itself");
+        // Archived or trashed after selection: the launch refused before touching anything.
+        if let Err(e) = &result {
+            if let Some(blocked) = e.downcast_ref::<crate::session::StartBlocked>() {
+                skipped.push((title, blocked.to_string()));
+                continue;
+            }
+        }
         let id = inst_opt.as_ref().map(|i| i.id.clone()).unwrap_or_default();
         if let Some(inst) = inst_opt {
             restarted.push(inst);
@@ -1219,6 +1227,12 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
             println!("  · {}", title);
         }
     }
+    if !skipped.is_empty() {
+        println!("⏭ {} skipped:", skipped.len());
+        for (title, reason) in &skipped {
+            println!("  · {}: {}", title, reason);
+        }
+    }
     if !failed.is_empty() {
         println!("✗ {} failed:", failed.len());
         for (title, err) in &failed {
@@ -1235,7 +1249,7 @@ fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<S
     instances
         .iter()
         .filter(|i| !matches!(i.status, Status::Deleting | Status::Creating))
-        .filter(|i| !i.is_structured())
+        .filter(|i| !i.is_structured() && i.ensure_startable().is_ok())
         .map(|i| i.id.clone())
         .collect()
 }
@@ -2976,7 +2990,7 @@ mod target_filter_tests {
     use crate::session::{Instance, Status};
 
     #[test]
-    fn restart_all_skips_deleting_and_creating() {
+    fn restart_all_skips_transient_archived_and_trashed() {
         let instance = |id: &str, status: Status| {
             let mut inst = Instance::new(id, "/tmp");
             inst.id = id.to_string();
@@ -2993,6 +3007,16 @@ mod target_filter_tests {
             instance("unknown", Status::Unknown),
             instance("deleting", Status::Deleting),
             instance("creating", Status::Creating),
+            {
+                let mut inst = instance("archived", Status::Idle);
+                inst.archive();
+                inst
+            },
+            {
+                let mut inst = instance("trashed", Status::Stopped);
+                inst.trash();
+                inst
+            },
         ];
         let mut picked = pick_targets_for_restart_all(&instances);
         picked.sort();
@@ -3001,6 +3025,53 @@ mod target_filter_tests {
             ["error", "idle", "running", "starting", "stopped", "unknown", "waiting"]
         );
         assert!(pick_targets_for_restart_all(&[]).is_empty());
+    }
+}
+
+/// #4116: CLI start and restart refuse an archived or trashed session.
+#[cfg(test)]
+mod start_blocked_tests {
+    use super::{restart_session, start_session, SessionIdArgs};
+    use crate::session::{Instance, Storage};
+    use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn start_and_restart_refuse_archived_and_trashed_sessions() {
+        let dismissals: [(fn(&mut Instance), &str); 2] = [
+            (Instance::archive, "session is archived; unarchive it first"),
+            (Instance::trash, "session is in trash; restore it first"),
+        ];
+        for (dismiss, message) in dismissals {
+            for restart in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+                let profile = "start-blocked";
+                let mut inst = Instance::new("dismissed", "/tmp/x");
+                dismiss(&mut inst);
+                let id = inst.id.clone();
+                Storage::new_unwatched(profile)
+                    .unwrap()
+                    .update(|rows, _| {
+                        *rows = vec![inst.clone()];
+                        Ok(())
+                    })
+                    .unwrap();
+
+                let args = SessionIdArgs {
+                    identifier: id.clone(),
+                };
+                let err = if restart {
+                    restart_session(profile, args).await
+                } else {
+                    start_session(profile, args).await
+                }
+                .unwrap_err();
+                assert_eq!(err.to_string(), message, "restart={restart}");
+                let tmux = crate::tmux::Session::new(&id, &inst.title).unwrap();
+                assert!(!tmux.exists());
+            }
+        }
     }
 }
 

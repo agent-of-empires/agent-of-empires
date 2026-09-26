@@ -4485,6 +4485,12 @@ impl HomeView {
                     return true;
                 }
             }
+            if let super::Item::Session { id, .. } = &self.flat_items[idx] {
+                if self.get_instance(id).is_some_and(|inst| inst.is_trashed()) {
+                    self.context_menu = Some(ContextMenuDialog::for_trashed_session(anchor));
+                    return true;
+                }
+            }
             let is_group = matches!(self.flat_items[idx], super::Item::Group { .. });
             // A real project header in project view gets the pin menu; the cursor was
             // just moved onto this row, so `project_group_at_cursor` reflects it.
@@ -4638,6 +4644,7 @@ impl HomeView {
                 Some(SidebarSection::Archived) => self.unarchive_all(),
                 None => {}
             },
+            ContextMenuAction::Restore => self.restore_selected_from_trash(),
             ContextMenuAction::ToggleSectionCollapse => match self.section_at_cursor() {
                 Some(SidebarSection::Trash) => self.toggle_trashed_section(),
                 Some(SidebarSection::Archived) => self.toggle_archived_section(),

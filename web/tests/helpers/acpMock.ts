@@ -19,6 +19,8 @@ export interface AcpSessionMockOptions {
   about?: Record<string, unknown>;
   /** Report the session trashed with a stopped worker (#2529). */
   trashedAt?: string;
+  /** Report the session archived with a stopped worker (#4116). */
+  archivedAt?: string;
 }
 
 export interface AcpSessionMock {
@@ -178,7 +180,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
             project_path: `/tmp/${title}`,
             group_path: "/tmp",
             tool: "claude",
-            status: opts.trashedAt ? "Stopped" : "Running",
+            status: opts.trashedAt || opts.archivedAt ? "Stopped" : "Running",
             yolo_mode: false,
             created_at: new Date().toISOString(),
             last_accessed_at: null,
@@ -189,9 +191,10 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
             has_terminal: true,
             profile: "default",
             trashed_at: opts.trashedAt ?? null,
+            archived_at: opts.archivedAt ?? null,
             workspace_repos: [],
             view: "structured",
-            acp_worker_state: opts.trashedAt ? "stopped" : "running",
+            acp_worker_state: opts.trashedAt || opts.archivedAt ? "stopped" : "running",
             claude_fullscreen: false,
           },
         ],

@@ -57,6 +57,11 @@ impl HomeView {
         }
     }
 
+    /// Why the session's agent must not start or take input, if it is archived or trashed.
+    pub(super) fn start_blocked(&self, session_id: &str) -> Option<crate::session::StartBlocked> {
+        self.get_instance(session_id)?.ensure_startable().err()
+    }
+
     /// Run the send-message work after the dialog is dismissed: `ensure_pane_ready` (which
     /// may auto-start or respawn), then deliver the keystrokes. Errors surface via
     /// `info_dialog`, so the caller only has to clear its transient status.
@@ -73,6 +78,11 @@ impl HomeView {
         let boot_size = self.live_send_boot_size();
         match &target {
             live_send::LiveSendTarget::Agent => {
+                // An archived or trashed agent takes no input, even with a live pane.
+                if let Some(blocked) = self.start_blocked(session_id) {
+                    self.info_dialog = Some(InfoDialog::new("Send Failed", &blocked.to_string()));
+                    return;
+                }
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
                     inst.ensure_pane_ready_with_size(boot_size)
                         .map_err(Into::into)
@@ -161,6 +171,17 @@ impl HomeView {
             live_send::LiveSendTarget::Terminal
             | live_send::LiveSendTarget::ContainerTerminal
             | live_send::LiveSendTarget::Tool(_) => 0,
+        };
+        // Rechecks the stored row and keeps a CLI or TUI archive out until the keys land.
+        let _input_lock = match &target {
+            live_send::LiveSendTarget::Agent => match inst.lock_for_input() {
+                Ok(lock) => Some(lock),
+                Err(e) => {
+                    self.info_dialog = Some(InfoDialog::new("Send Failed", &e.to_string()));
+                    return;
+                }
+            },
+            _ => None,
         };
         if let Err(e) = tmux_session.send_keys_with_delay(message, delay) {
             self.info_dialog = Some(InfoDialog::new(

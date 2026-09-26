@@ -89,6 +89,44 @@ pub(crate) fn api_error(status: StatusCode, code: &str, message: impl Into<Strin
         .into_response()
 }
 
+/// The stored row, which can differ from the daemon's cache when a peer such as the CLI
+/// archived, trashed, or purged it.
+pub(crate) async fn load_persisted_instance(
+    state: &AppState,
+    profile: &str,
+    id: &str,
+) -> Result<Option<crate::session::Instance>, Response> {
+    let id_for_load = id.to_string();
+    let profile_for_load = profile.to_string();
+    let file_watch = state.file_watch.clone();
+    let persisted = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<Option<crate::session::Instance>> {
+            let storage = crate::session::Storage::new(&profile_for_load, file_watch)?;
+            Ok(storage
+                .load()?
+                .into_iter()
+                .find(|candidate| candidate.id == id_for_load))
+        },
+    )
+    .await;
+    let error = match persisted {
+        Ok(Ok(found)) => return Ok(found),
+        Ok(Err(error)) => format!("{error:#}"),
+        Err(join_error) => join_error.to_string(),
+    };
+    tracing::error!(target: "http.api", session = %id, "load persisted session: {error}");
+    Err(api_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal",
+        "failed to read session state",
+    ))
+}
+
+/// 409 for a start or resume refused because the session is archived or trashed.
+pub(crate) fn start_blocked_response(blocked: crate::session::StartBlocked) -> Response {
+    api_error(StatusCode::CONFLICT, blocked.code(), blocked.to_string())
+}
+
 pub(super) fn session_not_found() -> Response {
     api_error(StatusCode::NOT_FOUND, "not_found", "Session not found")
 }

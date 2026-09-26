@@ -103,6 +103,9 @@ pub async fn acp_enable(
     if instance.is_structured() {
         return view_response(id, View::Structured);
     }
+    if let Err(blocked) = instance.ensure_startable() {
+        return crate::server::api::start_blocked_response(blocked);
+    }
 
     // Judged on the explicit agent (or the tool), not `pick_agent_for_tool`'s
     // default fallback, which would accept every tool.
@@ -358,7 +361,7 @@ pub async fn acp_disable(
     if !instance.is_structured() {
         // A reload may have cached a pre-enable terminal snapshot; trust the
         // durable row before answering idempotently.
-        match load_persisted_instance(&state, &profile, &id).await {
+        match crate::server::api::load_persisted_instance(&state, &profile, &id).await {
             Ok(Some(durable)) if durable.is_structured() => {
                 instance = adopt_persisted_structured_instance(instance, durable, &profile);
             }
@@ -441,6 +444,8 @@ pub async fn acp_disable(
 
     match tokio::task::spawn_blocking(move || instance.start()).await {
         Ok(Ok(())) => {}
+        // An archived or trashed session switches views without starting.
+        Ok(Err(e)) if e.downcast_ref::<crate::session::StartBlocked>().is_some() => {}
         Ok(Err(e)) => {
             tracing::warn!(target: "acp.switch", session = %id, "tmux start after disable: {e}");
         }
@@ -449,35 +454,6 @@ pub async fn acp_disable(
         }
     }
     view_response(id, View::Terminal)
-}
-
-async fn load_persisted_instance(
-    state: &AppState,
-    profile: &str,
-    id: &str,
-) -> Result<Option<Instance>, Response> {
-    let id_for_load = id.to_string();
-    let profile_for_load = profile.to_string();
-    let file_watch = state.file_watch.clone();
-    let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Instance>> {
-        let storage = crate::session::Storage::new(&profile_for_load, file_watch)?;
-        Ok(storage
-            .load()?
-            .into_iter()
-            .find(|candidate| candidate.id == id_for_load))
-    })
-    .await;
-    match persisted {
-        Ok(Ok(found)) => Ok(found),
-        Ok(Err(error)) => {
-            tracing::error!(target: "acp.switch", session = %id, "load before disable: {error:#}");
-            Err(internal_error("failed to read session state"))
-        }
-        Err(join_error) => {
-            tracing::error!(target: "acp.switch", session = %id, "load before disable panicked: {join_error}");
-            Err(internal_error("failed to read session state"))
-        }
-    }
 }
 
 /// Persist the terminal handoff with compare-and-swap guards on both cache and disk.

@@ -220,9 +220,15 @@ impl Instance {
                 return;
             }
         };
+        self.stop_all_tmux_sessions_locked(&storage);
+    }
+
+    /// [`Self::kill_all_tmux_sessions`] for a caller already holding this instance's lifecycle
+    /// lock, so it can commit its next state (an archive) before a peer launch or send gets in.
+    pub(crate) fn stop_all_tmux_sessions_locked(&self, storage: &crate::session::storage::Storage) {
         let mut lifecycle = self.clone();
         if let Err(error) =
-            lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)
+            lifecycle.acquire_lifecycle_reservation(storage, LifecycleOperation::Stop, None)
         {
             tracing::warn!(
                 target: "session.tmux_cleanup",
@@ -234,7 +240,7 @@ impl Instance {
         }
         self.kill_all_tmux_sessions_locked();
         if let Err(error) =
-            lifecycle.commit_lifecycle_status(&storage, LifecycleOperation::Stop, Status::Stopped)
+            lifecycle.commit_lifecycle_status(storage, LifecycleOperation::Stop, Status::Stopped)
         {
             tracing::warn!(
                 target: "session.tmux_cleanup",

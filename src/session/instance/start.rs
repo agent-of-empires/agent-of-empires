@@ -120,6 +120,7 @@ impl Instance {
         if self.is_structured() {
             return Ok(LaunchSidOutcome::Skipped);
         }
+        self.ensure_startable()?;
         let session = self.tmux_session()?;
         let corpse_pane = if session.exists() {
             if !session.is_pane_dead() {
@@ -564,6 +565,60 @@ mod tests {
         inst.view = View::Structured;
         let outcome = inst.start_with_size_opts(None, false).unwrap();
         assert_eq!(outcome, LaunchSidOutcome::Skipped);
+    }
+
+    /// #4116: every launch funnel rereads the row and refuses an archived or
+    /// trashed session, even when the caller holds a stale live copy.
+    #[test]
+    #[serial_test::serial]
+    fn launch_funnels_refuse_archived_and_trashed_sessions() {
+        type Launch = fn(&mut Instance) -> Option<StartBlocked>;
+        let launches: &[(&str, Launch)] = &[
+            ("start", |i| i.start().err()?.downcast_ref().copied()),
+            ("restart", |i| {
+                i.restart_with_resume_policy(None, false, ResumeAttemptPolicy::Allow)
+                    .err()?
+                    .downcast_ref()
+                    .copied()
+            }),
+            ("ensure_pane_ready", |i| match i.ensure_pane_ready() {
+                Err(EnsureReadyError::Blocked(blocked)) => Some(blocked),
+                _ => None,
+            }),
+        ];
+        let dismissals: &[(fn(&mut Instance), StartBlocked, &str)] = &[
+            (
+                Instance::archive,
+                StartBlocked::Archived,
+                "session is archived; unarchive it first",
+            ),
+            (
+                Instance::trash,
+                StartBlocked::Trashed,
+                "session is in trash; restore it first",
+            ),
+        ];
+        for (dismiss, want, message) in dismissals {
+            for (label, launch) in launches {
+                let temp = tempfile::tempdir().unwrap();
+                let _home = crate::session::test_support::isolate_home(temp.path());
+                let profile = "start-blocked";
+                let mut inst = Instance::new(label, "/tmp/x");
+                inst.source_profile = profile.to_string();
+                crate::session::instance::test_helpers::seed_disk_for_sidecar_test(profile, &inst);
+                crate::session::storage::Storage::new_unwatched(profile)
+                    .unwrap()
+                    .update(|rows, _| {
+                        dismiss(&mut rows[0]);
+                        Ok(())
+                    })
+                    .unwrap();
+
+                assert_eq!(launch(&mut inst), Some(*want), "{label}");
+                assert_eq!(want.to_string(), *message);
+                assert!(!inst.tmux_session().unwrap().exists(), "{label}");
+            }
+        }
     }
 
     fn instance_with_id(id: &str) -> Instance {

@@ -440,6 +440,42 @@ pub(crate) fn observe_lock_contention_for_test(
 }
 
 #[cfg(test)]
+type UpdateObserver = Box<dyn FnMut(&Storage)>;
+
+#[cfg(test)]
+thread_local! {
+    static UPDATE_OBSERVER: std::cell::RefCell<Option<UpdateObserver>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Call `observer` at the start of every `Storage::update` on this thread until the guard drops.
+#[cfg(test)]
+pub(crate) fn observe_updates_for_test(observer: impl FnMut(&Storage) + 'static) -> impl Drop {
+    struct Observer(std::marker::PhantomData<std::rc::Rc<()>>);
+    impl Drop for Observer {
+        fn drop(&mut self) {
+            UPDATE_OBSERVER.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    UPDATE_OBSERVER.with(|slot| {
+        assert!(slot.borrow_mut().replace(Box::new(observer)).is_none());
+    });
+    Observer(std::marker::PhantomData)
+}
+
+#[cfg(test)]
+fn report_update_for_test(storage: &Storage) {
+    // Taken out while it runs, so an update inside the observer does not re-enter it.
+    let Some(mut observer) = UPDATE_OBSERVER.with(|slot| slot.borrow_mut().take()) else {
+        return;
+    };
+    observer(storage);
+    UPDATE_OBSERVER.with(|slot| {
+        slot.borrow_mut().get_or_insert(observer);
+    });
+}
+
+#[cfg(test)]
 fn report_lock_contention_for_test(path: &Path) {
     LOCK_CONTENTION_OBSERVER.with(|slot| {
         if let Some(sender) = slot.borrow_mut().take() {
@@ -863,6 +899,18 @@ impl Storage {
         )
     }
 
+    /// Whether some holder currently has `instance_id`'s lifecycle lock.
+    #[cfg(test)]
+    pub(crate) fn instance_lifecycle_lock_is_held_for_test(&self, instance_id: &str) -> bool {
+        let profile_dir = self.sessions_path.parent().expect("profile directory");
+        try_acquire_storage_flock(
+            profile_dir,
+            &format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock"),
+        )
+        .expect("probe lifecycle lock")
+        .is_none()
+    }
+
     #[cfg(test)]
     pub(crate) fn set_fail_writes_for_test(&mut self, fail: bool) {
         self.fail_writes_for_test = fail;
@@ -1006,6 +1054,8 @@ impl Storage {
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
+        #[cfg(test)]
+        report_update_for_test(self);
         #[cfg(test)]
         let _mu = crate::session::test_support::lock_reporting_contention(&self.save_lock, || {
             report_lock_contention_for_test(&self.sessions_path)

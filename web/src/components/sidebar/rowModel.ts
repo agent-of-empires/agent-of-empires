@@ -135,7 +135,8 @@ export function deriveRowModel(
       firstSession?.status !== "Creating" &&
       firstSession?.status !== "Deleting",
     canStop: !["Stopped", "Deleting", "Creating"].includes(status),
-    canStart: status === "Stopped",
+    // Archived and trashed sessions must be unarchived or restored before they start (#4116).
+    canStart: status === "Stopped" && !effectiveArchived && !firstSession?.trashed_at,
   };
 }
 

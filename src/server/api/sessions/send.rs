@@ -24,6 +24,8 @@ enum SendKeysError {
     ResumeFailed(String),
     Transient(Status),
     StructuredView,
+    Blocked(crate::session::StartBlocked),
+    Gone,
     Tmux(anyhow::Error),
 }
 
@@ -65,6 +67,11 @@ pub async fn send_message(
         return bare_not_found();
     };
 
+    // Covers `revive: false` and a live pane too; an archived session takes no input.
+    if let Err(blocked) = instance.ensure_startable() {
+        return crate::server::api::start_blocked_response(blocked);
+    }
+
     let sync_base = instance.clone();
     let tool = instance.tool.clone();
     let message = req.message;
@@ -86,6 +93,7 @@ pub async fn send_message(
                     let mapped = match e {
                         EnsureReadyError::Transient(s) => SendKeysError::Transient(s),
                         EnsureReadyError::StructuredView => SendKeysError::StructuredView,
+                        EnsureReadyError::Blocked(b) => SendKeysError::Blocked(b),
                         EnsureReadyError::Tmux(e) => SendKeysError::Tmux(e),
                     };
                     // Tagged AlreadyAlive because ensure_pane_ready did not
@@ -118,6 +126,19 @@ pub async fn send_message(
         if !tmux_session.exists() {
             return Err(Box::new((inst_owned, outcome, SendKeysError::NotRunning)));
         }
+        let _input_lock = match inst_owned.lock_for_input() {
+            Ok(lock) => lock,
+            Err(e) => {
+                let err = if let Some(blocked) = e.downcast_ref::<crate::session::StartBlocked>() {
+                    SendKeysError::Blocked(*blocked)
+                } else if e.is::<crate::session::SessionGone>() {
+                    SendKeysError::Gone
+                } else {
+                    SendKeysError::Tmux(e)
+                };
+                return Err(Box::new((inst_owned, outcome, err)));
+            }
+        };
         let delay = crate::agents::send_keys_enter_delay(&tool);
         if let Err(e) = tmux_session.send_keys_with_delay(&message, delay) {
             return Err(Box::new((inst_owned, outcome, SendKeysError::Tmux(e))));
@@ -138,7 +159,7 @@ pub async fn send_message(
                 if !matches!(outcome, EnsureReadyOutcome::AlreadyAlive) {
                     apply_post_restart_sync(i, &sync_base, &started);
                 }
-                i.touch_last_accessed();
+                i.touch_after_input();
                 i.source_profile.clone()
             } else {
                 // Deleted between the send and the stamp; nothing to persist.
@@ -160,7 +181,7 @@ pub async fn send_message(
                                     &started_for_save,
                                 );
                             }
-                            disk_inst.touch_last_accessed();
+                            disk_inst.touch_after_input();
                         }
                         Ok(())
                     }) {
@@ -223,6 +244,17 @@ pub async fn send_message(
                     Json(serde_json::json!({"error": "acp_mode_unsupported"})),
                 )
                     .into_response(),
+                SendKeysError::Blocked(blocked) => {
+                    // A peer dismissed the row after a revive launched: keep the launch identity.
+                    if did_work {
+                        let mut instances = state.instances.write().await;
+                        if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
+                            apply_cascade_state_sync(i, &sync_base, &started);
+                        }
+                    }
+                    crate::server::api::start_blocked_response(blocked)
+                }
+                SendKeysError::Gone => bare_not_found(),
                 SendKeysError::Tmux(e) => {
                     tracing::error!(target: "http.api.sessions", "send_message: tmux error for {id}: {e}");
                     let msg = e.to_string();

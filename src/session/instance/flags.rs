@@ -20,13 +20,52 @@ pub enum SessionBucket {
     Trashed,
 }
 
+/// Why an archived or trashed session refuses to launch its agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum StartBlocked {
+    #[error("session is archived; unarchive it first")]
+    Archived,
+    #[error("session is in trash; restore it first")]
+    Trashed,
+}
+
+impl StartBlocked {
+    /// Stable machine-readable code for API error bodies.
+    pub fn code(self) -> &'static str {
+        match self {
+            StartBlocked::Archived => "session_archived",
+            StartBlocked::Trashed => "session_trashed",
+        }
+    }
+}
+
 impl Instance {
+    /// Archived and trashed sessions must be unarchived or restored before any
+    /// path starts or resumes their agent. Snooze is not a block: it expires on its own.
+    pub fn ensure_startable(&self) -> Result<(), StartBlocked> {
+        match self.effective_bucket() {
+            SessionBucket::Active => Ok(()),
+            SessionBucket::Archived => Err(StartBlocked::Archived),
+            SessionBucket::Trashed => Err(StartBlocked::Trashed),
+        }
+    }
+
     /// Stamp `last_accessed_at` to the current time AND wake the session from any sink state.
     pub fn touch_last_accessed(&mut self) {
         self.last_accessed_at = Some(Utc::now());
         self.archived_at = None;
         self.snoozed_until = None;
         self.idle_dormant_since = None;
+    }
+
+    /// Stamp recency after input reached a live pane. A web archive does not take the
+    /// lifecycle lock `lock_for_input` holds, so one may have landed since; never clear it.
+    pub fn touch_after_input(&mut self) {
+        if self.ensure_startable().is_ok() {
+            self.touch_last_accessed();
+        } else {
+            self.last_accessed_at = Some(Utc::now());
+        }
     }
 
     /// Whether this session's structured view worker was auto-stopped for inactivity and should not

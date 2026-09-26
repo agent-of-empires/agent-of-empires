@@ -391,6 +391,32 @@ test.describe("trashed structured session is read-only", () => {
     await expect(page.getByTestId("composer-footer")).toHaveCount(0);
     await expect(page.getByRole("button", { name: "Send message" })).toHaveCount(0);
   });
+
+  // #4116: an archived session cannot start either, so it gets no composer that would drop a prompt.
+  test("renders the archived banner and no composer", async ({ page }) => {
+    const mock = await mockAcpSession(page, {
+      title: "story-archived",
+      archivedAt: new Date().toISOString(),
+      initialEvents: [agentMessageChunk("earlier reply"), stopped("user_stopped")],
+    });
+    await openStructuredSession(page, mock);
+
+    await expect(page.getByTestId(`acp-archived-banner-${mock.sessionId}`)).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText("earlier reply")).toBeVisible();
+    await expect(page.getByTestId("composer-footer")).toHaveCount(0);
+  });
+
+  test("an empty archived session offers no starter prompts", async ({ page }) => {
+    const mock = await mockAcpSession(page, {
+      title: "story-archived-empty",
+      archivedAt: new Date().toISOString(),
+      initialEvents: [stopped("user_stopped")],
+    });
+    await openStructuredSession(page, mock);
+
+    await expect(page.getByTestId(`acp-archived-banner-${mock.sessionId}`)).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText("Ask the agent anything about this workspace.")).toHaveCount(0);
+  });
 });
 
 // ────────────────────────── seen telemetry ────────────────────────

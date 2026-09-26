@@ -74,6 +74,26 @@ async fn rate_limit_resume_probe(state: &AppState, id: &str) -> Option<DateTime<
     })
 }
 
+/// The memory check runs before the handler's awaits, during which a peer such as
+/// `aoe session archive` or `aoe rm --purge` can dismiss or remove the stored row, so
+/// recheck it right before spawning.
+async fn refuse_if_stored_row_dismissed(
+    state: &AppState,
+    instance: &crate::session::Instance,
+) -> Option<Response> {
+    match crate::server::api::load_persisted_instance(state, &instance.source_profile, &instance.id)
+        .await
+    {
+        // A purge removes the row while the cache may still hold it.
+        Ok(None) => Some(session_not_found()),
+        Ok(Some(stored)) => stored
+            .ensure_startable()
+            .err()
+            .map(crate::server::api::start_blocked_response),
+        Err(resp) => Some(resp),
+    }
+}
+
 pub async fn spawn_acp(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -100,6 +120,9 @@ pub async fn spawn_acp(
     };
     if !instance.is_structured() {
         return not_structured_response();
+    }
+    if let Err(blocked) = instance.ensure_startable() {
+        return crate::server::api::start_blocked_response(blocked);
     }
 
     let explicit = req.agent.clone().or_else(|| instance.agent_name.clone());
@@ -135,6 +158,9 @@ pub async fn spawn_acp(
         model: req.model.or_else(|| instance.agent_model.clone()),
         ..spawn_request_for(&instance, agent.clone(), sandbox_info)
     };
+    if let Some(resp) = refuse_if_stored_row_dismissed(&state, &instance).await {
+        return resp;
+    }
     match state.acp_supervisor.spawn(request).await {
         Ok(()) => {}
         Err(SupervisorError::AlreadyRunning(_)) if rate_limit_resume_resets_at.is_some() => {}
@@ -339,6 +365,9 @@ pub async fn switch_acp_agent(
     let Some(instance) = find_instance(&state, &id).await else {
         return session_not_found();
     };
+    if let Err(blocked) = instance.ensure_startable() {
+        return crate::server::api::start_blocked_response(blocked);
+    }
     let from_agent = match check_switch_target(&state, &instance, &target).await {
         Ok(agent) => agent,
         Err(resp) => return resp,
@@ -397,6 +426,9 @@ pub async fn switch_acp_agent(
         claude_store_pin: None,
         ..spawn_request_for(&instance, target.clone(), sandbox_info)
     };
+    if let Some(resp) = refuse_if_stored_row_dismissed(&state, &instance).await {
+        return resp;
+    }
     if let Err(e) = state.acp_supervisor.spawn(request).await {
         return supervisor_error_response("spawn failed", &e);
     }

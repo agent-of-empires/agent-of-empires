@@ -2706,6 +2706,274 @@ async fn send_message_refreshes_instance_after_instance_lock() {
         StatusCode::NOT_FOUND
     );
 }
+/// #4116: the web start, attach-ensure and send-revive endpoints refuse to launch an archived or
+/// trashed session, and leave its status alone.
+#[tokio::test]
+async fn start_paths_refuse_archived_and_trashed_sessions() {
+    use axum::body::to_bytes;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let dismissals: [(fn(&mut Instance), &str, &str); 2] = [
+        (
+            Instance::archive,
+            "session_archived",
+            "session is archived; unarchive it first",
+        ),
+        (
+            Instance::trash,
+            "session_trashed",
+            "session is in trash; restore it first",
+        ),
+    ];
+    for (dismiss, code, message) in dismissals {
+        for which in ["start", "ensure", "send"] {
+            let mut inst = make_test_instance();
+            dismiss(&mut inst);
+            inst.status = Status::Stopped;
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let response = match which {
+                "start" => start_session(State(state.clone()), Path(id.clone()))
+                    .await
+                    .into_response(),
+                "ensure" => ensure_session(State(state.clone()), Path(id.clone()))
+                    .await
+                    .into_response(),
+                _ => send_message(
+                    State(state.clone()),
+                    Path(id.clone()),
+                    Ok(Json(SendMessageRequest {
+                        message: "hello".into(),
+                        revive: true,
+                    })),
+                )
+                .await
+                .into_response(),
+            };
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{which} {code}");
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"], code, "{which}");
+            assert_eq!(body["message"], message, "{which}");
+            let after = &state.instances.read().await[0];
+            assert_eq!(after.status, Status::Stopped, "{which} {code}");
+            assert!(!after.tmux_session().unwrap().exists(), "{which} {code}");
+        }
+    }
+}
+
+/// #4116: a peer (e.g. `aoe session archive`) can dismiss the stored row after the daemon's
+/// memory check. Structured start and prompt-wake recheck that row inside their write, refuse,
+/// and leave `archived_at` in place.
+#[tokio::test]
+#[serial_test::serial]
+async fn structured_start_and_prompt_wake_recheck_the_stored_row() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let profile = "default";
+    for which in ["start", "prompt"] {
+        let mut inst = Instance::new("peer-archived", "/tmp/aoe-4116-peer");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        inst.status = Status::Stopped;
+        // Snoozed in memory so the prompt path would wake (and persist) it.
+        inst.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+        let id = inst.id.clone();
+        let mut peer = inst.clone();
+        peer.archive();
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = vec![peer];
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let refused = match which {
+            "start" => {
+                start_session(State(state.clone()), Path(id.clone()))
+                    .await
+                    .into_response()
+                    .status()
+                    == StatusCode::CONFLICT
+            }
+            _ => matches!(
+                state
+                    .session_service
+                    .touch_and_wake_on_prompt(&id, false)
+                    .await,
+                crate::server::session_service::PromptTouch::Blocked(
+                    crate::session::StartBlocked::Archived
+                )
+            ),
+        };
+        assert!(refused, "{which} must refuse a row archived on disk");
+        let stored = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap();
+        assert!(
+            stored.is_archived(),
+            "{which} must not clear the peer's archive"
+        );
+        assert_eq!(
+            stored.status,
+            Status::Stopped,
+            "{which} must not mark it Idle"
+        );
+    }
+}
+
+/// #4116: `/start` answers from the stored row, not a stale cache: a row a peer archived is
+/// refused and a purged one is not found, whether or not the cached session is stopped.
+#[tokio::test]
+#[serial_test::serial]
+async fn start_rechecks_the_stored_row() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let profile = "default";
+    let cases = [
+        (
+            "stopped structured, purged",
+            Status::Stopped,
+            true,
+            false,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "running, archived on disk",
+            Status::Running,
+            false,
+            true,
+            StatusCode::CONFLICT,
+        ),
+        (
+            "running, purged",
+            Status::Running,
+            false,
+            false,
+            StatusCode::NOT_FOUND,
+        ),
+    ];
+    for (label, status, structured, stored_row, want) in cases {
+        let mut inst = Instance::new("stale-cache", "/tmp/aoe-4116-stale");
+        inst.source_profile = profile.to_string();
+        inst.status = status;
+        if structured {
+            inst.view = crate::session::View::Structured;
+        }
+        let id = inst.id.clone();
+        let mut peer = inst.clone();
+        peer.archive();
+        Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|rows, _| {
+                *rows = if stored_row { vec![peer] } else { Vec::new() };
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let response = start_session(State(state.clone()), Path(id.clone()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), want, "{label}");
+        assert_eq!(state.instances.read().await[0].status, status, "{label}");
+    }
+}
+
+/// #4116: web `/send` rechecks the stored row under the lifecycle lock, so a peer's archive or
+/// purge of a session with a live pane refuses the keystrokes, and an archive survives the send.
+#[tokio::test]
+#[serial_test::serial]
+async fn send_refuses_a_live_pane_a_peer_dismissed() {
+    if crate::tmux::tmux_command().arg("-V").output().is_err() {
+        eprintln!("tmux not available; skipping");
+        return;
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    let profile = "default";
+    for (stored_row, want) in [(true, StatusCode::CONFLICT), (false, StatusCode::NOT_FOUND)] {
+        let mut inst = make_test_instance();
+        inst.source_profile = profile.to_string();
+        let id = inst.id.clone();
+        let mut peer = inst.clone();
+        peer.archive();
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|rows, _| {
+                *rows = if stored_row { vec![peer] } else { Vec::new() };
+                Ok(())
+            })
+            .unwrap();
+        let pane = crate::tmux::Session::generate_name(&id, &inst.title);
+        let created = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &pane, "sleep", "60"])
+            .status();
+        if !created.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("tmux new-session failed; skipping");
+            return;
+        }
+        crate::tmux::refresh_session_cache();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let response = send_message(
+            State(state.clone()),
+            Path(id.clone()),
+            Ok(Json(SendMessageRequest {
+                message: "hello".into(),
+                revive: false,
+            })),
+        )
+        .await
+        .into_response();
+        let _ = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", &pane])
+            .output();
+        assert_eq!(response.status(), want, "stored_row={stored_row}");
+        if stored_row {
+            assert!(storage.load().unwrap()[0].is_archived());
+        }
+    }
+}
+
+/// #4116: web archive persists under the lifecycle lock `aoe send` holds while it types, so an
+/// archive cannot land mid-send; it waits for the send, then applies.
+#[test]
+#[serial_test::serial]
+fn archive_persist_waits_for_an_in_flight_send() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let profile = "default";
+    let mut inst = make_test_instance();
+    inst.source_profile = profile.to_string();
+    let id = inst.id.clone();
+    let storage = Storage::new_unwatched(profile).unwrap();
+    storage
+        .update(|rows, _| {
+            *rows = vec![inst.clone()];
+            Ok(())
+        })
+        .unwrap();
+    let stored_archived = || storage.load().unwrap()[0].is_archived();
+
+    let sending = inst.lock_for_input().unwrap();
+    let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+    let archive = std::thread::spawn(move || {
+        let _observer = crate::session::observe_lock_contention_for_test(contended_tx);
+        let storage = Storage::new_unwatched(profile).unwrap();
+        super::update::persist_blocking(&storage, Some(&id), |rows| rows[0].archive())
+    });
+    contended_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the archive must reach the lock the send holds");
+    assert!(!stored_archived(), "the archive must wait for the send");
+
+    drop(sending);
+    archive.join().unwrap().unwrap();
+    assert!(stored_archived());
+}
+
 // Regression for a path-traversal vulnerability in the first cut of
 // `/api/sessions/{id}/diff/file?path=...`, where any authenticated user could
 // pass `?path=/etc/passwd` and have the server dump it in a diff response.

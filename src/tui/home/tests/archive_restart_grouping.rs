@@ -3689,3 +3689,105 @@ fn a_failed_reload_keeps_the_repair_pending_and_the_gate_shut() {
         assert!(!view.pending_reconcile_reload);
     }
 }
+
+/// #4116: TUI archive, single and group, persists while holding each session's lifecycle lock,
+/// which `aoe send` takes to relaunch or type, so no send lands between teardown and archive.
+#[test]
+#[serial]
+fn archive_persists_under_the_lifecycle_lock() {
+    fn held_at_every_write(env: &mut TestEnv, ids: Vec<String>, archive: fn(&mut HomeView)) {
+        let held = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = std::rc::Rc::clone(&held);
+        let observer = crate::session::observe_updates_for_test(move |storage| {
+            observed.borrow_mut().push(
+                ids.iter()
+                    .all(|id| storage.instance_lifecycle_lock_is_held_for_test(id)),
+            );
+        });
+        archive(&mut env.view);
+        drop(observer);
+        let held = held.borrow();
+        assert!(!held.is_empty(), "the archive must persist");
+        assert!(held.iter().all(|h| *h), "writes and lock held: {held:?}");
+    }
+
+    let mut env = create_test_env_with_sessions(1);
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+    held_at_every_write(&mut env, vec![id.clone()], |view| {
+        view.toggle_archive_at_cursor().unwrap();
+    });
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+
+    let mut env = create_test_env_with_group_sessions();
+    let group_row = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { path, .. } if path == "work"))
+        .expect("work group row");
+    env.view.cursor = group_row;
+    env.view.update_selected();
+    let ids = env.view.active_sessions_in_selected_group();
+    assert_eq!(ids.len(), 3);
+    held_at_every_write(&mut env, ids.clone(), |view| {
+        view.archive_selected_group().unwrap();
+    });
+    for id in &ids {
+        assert!(env.view.get_instance(id).unwrap().is_archived());
+    }
+}
+
+/// #4116: the send dialog and live-send entry refuse an archived or trashed agent, even with its
+/// pane still live, with the CLI and web wording, and leave the session dismissed.
+#[test]
+#[serial]
+fn tui_send_refuses_a_dismissed_live_pane() {
+    if crate::tmux::tmux_command().arg("-V").output().is_err() {
+        eprintln!("tmux not available; skipping");
+        return;
+    }
+    let dismissals: [(fn(&mut Instance), &str); 2] = [
+        (Instance::archive, "session is archived; unarchive it first"),
+        (Instance::trash, "session is in trash; restore it first"),
+    ];
+    for (dismiss, message) in dismissals {
+        for live_send in [false, true] {
+            let mut env = create_test_env_with_sessions(1);
+            let inst = env.view.instance_at(0).clone();
+            env.view.apply_user_action(&inst.id, dismiss).unwrap();
+            let pane = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let created = crate::tmux::tmux_command()
+                .args(["new-session", "-d", "-s", &pane, "sleep", "60"])
+                .status();
+            if !created.map(|s| s.success()).unwrap_or(false) {
+                eprintln!("tmux new-session failed; skipping");
+                return;
+            }
+            crate::tmux::refresh_session_cache();
+
+            let title = if live_send {
+                assert!(env.view.prepare_live_send(&inst.id).is_err());
+                "Live send failed"
+            } else {
+                env.view.execute_send_message(&inst.id, "hello");
+                "Send Failed"
+            };
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &pane])
+                .output();
+            let dialog = env.view.info_dialog.as_ref().expect("refusal dialog");
+            assert_eq!(dialog.title(), title);
+            assert_eq!(dialog.message(), message, "live_send={live_send}");
+            assert!(
+                env.view
+                    .get_instance(&inst.id)
+                    .unwrap()
+                    .ensure_startable()
+                    .is_err(),
+                "live_send={live_send}: the session must stay dismissed"
+            );
+        }
+    }
+}

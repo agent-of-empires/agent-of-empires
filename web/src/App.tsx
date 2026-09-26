@@ -807,17 +807,17 @@ function AppContent({
   const diffComments = useDiffComments(activeSessionId);
   const commentsEnabled = activeSession?.view === "structured";
   // Sending does not require a live worker: the diff-comments handler runs the
-  // same auto-wake as a plain composer prompt (touch_on_prompt_and_wake_if_sunk +
-  // trigger_resume_background, #1748), so an archived / snoozed / idle-dormant
-  // session respawns its worker on send instead of sinking the prompt. A
-  // trashed session is the one exception: the reconciler never resumes it, so
-  // there is nothing to drain into.
-  const commentSendEnabled = commentsEnabled && !activeSession?.trashed_at;
+  // same auto-wake as a plain composer prompt, so a snoozed or idle-dormant
+  // session respawns its worker on send. Archived and trashed sessions never
+  // start on a prompt (#4116); they must be unarchived or restored first.
+  const commentSendEnabled = commentsEnabled && !activeSession?.trashed_at && !activeSession?.archived_at;
   // Every disabled state names its cause and what the user can do about it: a
   // tooltip that only says "unavailable" leaves them staring at a dead button.
   const commentSendDisabledReason = !commentsEnabled
     ? "Diff comments can only be sent from the agent view. Switch this session to the agent view first."
-    : "This session is in the trash. Restore it to send comments to the agent.";
+    : activeSession?.trashed_at
+      ? "This session is in the trash. Restore it to send comments to the agent."
+      : "This session is archived. Unarchive it to send comments to the agent.";
   const commentsIsMultiRepo = (activeSession?.workspace_repos.length ?? 0) > 0;
   const [sendDialogOpen, setSendDialogOpen] = useState(false);
 
@@ -1311,12 +1311,13 @@ function AppContent({
       // Optimistic Starting; the status poller reconciles to the real state.
       setSessionStatus(sessionId, "Starting");
       const result = await startSession(sessionId);
-      if (!result) {
-        setSessionStatus(sessionId, "Error");
-        toastBus.handler?.error("Failed to start session");
+      if (!result.ok) {
+        // A refused start (archived or trashed) left the session as it was.
+        setSessionStatus(sessionId, result.refused ? "Stopped" : "Error");
+        toastBus.handler?.error(result.message ?? "Failed to start session");
         return;
       }
-      toastBus.handler?.info(result.message ?? "Session started");
+      toastBus.handler?.info(result.session.message ?? "Session started");
     },
     [setSessionStatus],
   );

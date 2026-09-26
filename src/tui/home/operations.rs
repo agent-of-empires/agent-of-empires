@@ -4,7 +4,7 @@ use crate::session::builder::{self, InstanceParams};
 use crate::session::conversation_carry;
 use crate::session::{
     acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, list_profiles,
-    GroupMovePlan, Instance, Item, LifecycleOperation, Status, Storage,
+    GroupMovePlan, Instance, Item, LifecycleOperation, StartBlocked, Status, Storage,
 };
 use crate::tui::deletion_poller::DeletionRequest;
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
@@ -282,6 +282,33 @@ impl HomeView {
         Ok(session_id)
     }
 
+    /// A trashed/archived row's agent was stopped deliberately, so refuse a start
+    /// visibly and point at the restore key instead of swallowing the press.
+    pub(in crate::tui) fn refuse_start_if_shelved(&mut self, id: &str) -> bool {
+        let shelved = self.get_instance(id).and_then(|inst| {
+            // A row mid-purge gets no restore hint: it would race the in-flight delete.
+            if inst.status == Status::Deleting {
+                return None;
+            }
+            match inst.ensure_startable() {
+                Err(StartBlocked::Trashed) => Some(("Session in trash", "in the trash", "restore")),
+                Err(StartBlocked::Archived) => Some(("Session archived", "archived", "unarchive")),
+                Ok(()) => None,
+            }
+        });
+        let Some((dialog_title, state, verb)) = shelved else {
+            return false;
+        };
+        let key = if self.strict_hotkeys { "Z" } else { "z" };
+        self.info_dialog = Some(InfoDialog::new(
+            dialog_title,
+            &format!(
+                "This session is {state}; its agent stays stopped. Press {key} to {verb} it first."
+            ),
+        ));
+        true
+    }
+
     /// Restart the cursor's session, optionally migrating to a new profile and/or
     /// swapping the AI engine first.
     ///
@@ -318,27 +345,7 @@ impl HomeView {
             return Ok(());
         }
 
-        // A trashed/archived row's agent was stopped deliberately, so refuse visibly and
-        // point at the restore key instead of swallowing the press.
-        let shelved = self.get_instance(&id).and_then(|inst| {
-            // A row mid-purge gets no restore hint: it would race the in-flight delete.
-            // Falls through to the transient skip below, which drops Deleting silently.
-            if inst.status == Status::Deleting {
-                None
-            } else if inst.is_trashed() {
-                Some(("Session in trash", "in the trash", "restore"))
-            } else if inst.is_archived() {
-                Some(("Session archived", "archived", "unarchive"))
-            } else {
-                None
-            }
-        });
-        if let Some((dialog_title, state, verb)) = shelved {
-            let key = if self.strict_hotkeys { "Z" } else { "z" };
-            self.info_dialog = Some(InfoDialog::new(
-                dialog_title,
-                &format!("This session is {state}; its agent stays stopped. Press {key} to {verb} it first."),
-            ));
+        if self.refuse_start_if_shelved(&id) {
             return Ok(());
         }
 
@@ -1819,10 +1826,17 @@ impl HomeView {
             return Ok(());
         }
 
-        // Tear down all tmux before flipping archived. #1868.
-        if let Some(inst) = self.instances.get(&id) {
-            inst.kill_all_tmux_sessions();
-        }
+        // Tear down all tmux before flipping archived (#1868), holding the lifecycle lock
+        // through the archive so `aoe send` cannot relaunch or type into the session between.
+        let lifecycle_lock = match self.instances.get(&id) {
+            Some(inst) => {
+                let storage = Storage::new(&inst.effective_profile(), self.file_watch.clone())?;
+                let lock = storage.acquire_instance_lifecycle_lock(&id)?;
+                inst.stop_all_tmux_sessions_locked(&storage);
+                Some(lock)
+            }
+            None => None,
+        };
 
         // Decide where the cursor lands before the row sinks, against the pre-archive
         // list. Only the non-Attention branch uses it; Attention re-picks from the top.
@@ -1831,6 +1845,7 @@ impl HomeView {
             .flatten();
 
         self.apply_user_action(&id, |inst| inst.archive())?;
+        drop(lifecycle_lock);
         if self.sort_order == crate::session::config::SortOrder::Attention {
             // Attention sort is a triage flow: the cursor advances to the next item
             // that needs attention, which is always a live row.
@@ -2162,19 +2177,29 @@ impl HomeView {
         }
     }
 
-    /// Archive every active session under the selected group: tmux teardown
-    /// runs off-thread, persist runs inline. Confirmation upstream. See #1868.
+    /// Archive every active session under the selected group: persist runs inline, then tmux
+    /// teardown runs off-thread. Confirmation upstream. See #1868.
     pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
         let ids = self.active_sessions_in_selected_group();
         if ids.is_empty() {
             return Ok(());
         }
-        // Off-thread tmux teardown so N x 4 shellouts don't block the input
-        // thread. Mirrors `force_remove_session`.
         let kill_targets: Vec<_> = ids
             .iter()
             .filter_map(|id| self.instances.get(id).cloned())
             .collect();
+        // Persist under every member's lifecycle lock so `aoe send` cannot relaunch or type
+        // into one mid-archive, and tear down only after: a send that won the lock finishes
+        // first and its pane is then killed.
+        let mut lifecycle_locks = Vec::with_capacity(kill_targets.len());
+        for inst in &kill_targets {
+            let storage = Storage::new(&inst.effective_profile(), self.file_watch.clone())?;
+            lifecycle_locks.push(storage.acquire_instance_lifecycle_lock(&inst.id)?);
+        }
+        self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
+        drop(lifecycle_locks);
+        // Off-thread tmux teardown so N x 4 shellouts don't block the input
+        // thread. Mirrors `force_remove_session`.
         std::thread::spawn(move || {
             for inst in kill_targets {
                 if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2189,7 +2214,6 @@ impl HomeView {
                 }
             }
         });
-        self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
         self.reveal_archived_section();
         self.rebuild_flat_items();
         // The project header vanishes once its last active member is archived, so the
