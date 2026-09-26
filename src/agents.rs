@@ -103,8 +103,9 @@ impl SessionCaptureSpec {
     /// The single decision every sidecar consumer (poller, retroactive capture, reconciliation,
     /// sidecar cleanup, wrapper attribution) goes through, so none of them can disagree about
     /// where an id comes from. Codex is context-dependent: a host pane publishes from its
-    /// `SessionStart` hook, while a sandboxed one keeps the isolated managed-store scan, so it
-    /// reads the sidecar only when `PaneScoped`.
+    /// `SessionStart` hook, which Codex fires when the conversation starts at the first turn
+    /// (not at launch), while a sandboxed one keeps the isolated managed-store scan, so it reads
+    /// the sidecar only when `PaneScoped`.
     pub(crate) fn reads_hook_sidecar(&self, context: SessionCaptureContext) -> bool {
         match self.backend {
             SessionCaptureBackend::Claude | SessionCaptureBackend::HookSidecar => true,
@@ -197,6 +198,9 @@ pub struct ResolvedHookEvent {
     pub status: Option<HookStatus>,
     pub identity_field: Option<HookIdentityField>,
     pub waiting_tools: Vec<String>,
+    /// Binary of the agent whose config declares this event. The identity publisher carries it
+    /// so a nested agent of another kind cannot publish into the pane's sidecar.
+    pub publisher: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,9 +377,10 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
     // Codex's SessionStart payload carries a top-level string `session_id`
     // (alongside `transcript_path`, `cwd`, `hook_event_name`), so the pane can
     // publish its own conversation the way Claude's does instead of leaving
-    // host capture to a shared-store scan. The status writer stays: unlike
-    // Claude, whose SessionStart is identity-only, Codex has no other event
-    // that settles the pane to idle at launch.
+    // host capture to a shared-store scan. Codex fires it when the
+    // conversation starts, at the first turn rather than at launch, so the id
+    // appears once the user has sent a prompt. The existing idle status writer
+    // on this event is kept alongside the publisher.
     HookEvent {
         identity_field: Some(HookIdentityField::SessionId),
         ..hook("SessionStart", HookStatus::Idle)
@@ -1063,6 +1068,7 @@ fn append_configured_status_events(
                 status: Some(*status),
                 identity_field: None,
                 waiting_tools: Vec::new(),
+                publisher: None,
             });
         }
     }
@@ -1103,6 +1109,7 @@ pub fn resolved_hook_events(
                 .or(event.status),
             identity_field: event.identity_field,
             waiting_tools: event.waiting_tools.iter().map(|t| t.to_string()).collect(),
+            publisher: Some(agent.binary),
         })
         .collect();
     append_configured_status_events(&mut events, overrides);
@@ -1130,6 +1137,7 @@ pub fn resolved_sidecar_hook_events(
             ),
             identity_field: event.identity_field,
             waiting_tools: Vec::new(),
+            publisher: Some(agent.binary),
         })
         .collect();
     append_configured_status_events(&mut events, overrides);
@@ -1491,9 +1499,9 @@ mod tests {
 
     /// Codex publishes a top-level string `session_id` on `SessionStart`, so
     /// the pane can name its own conversation instead of leaving host capture
-    /// to a shared-store scan. The status writer has to survive alongside it:
-    /// `SessionStart` is Codex's only launch-time idle signal, unlike Claude's,
-    /// which is identity-only because `Stop` settles that pane.
+    /// to a shared-store scan. Adding the publisher must not drop the idle
+    /// status writer the event already carried, unlike Claude's `SessionStart`,
+    /// which is identity-only.
     #[test]
     fn codex_session_start_publishes_identity_and_still_writes_status() {
         let codex = get_agent("codex").unwrap();

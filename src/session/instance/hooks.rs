@@ -969,6 +969,13 @@ mod tests {
             inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as), None);
 
             let hooks = tmp.path().join(".codex").join("hooks.json");
+            // The publisher names Codex, the pane's `AOE_AGENT_BIN`, even under a wrapper.
+            assert!(
+                std::fs::read_to_string(&hooks)
+                    .unwrap()
+                    .contains("__extract-session-id --field session-id --agent codex"),
+                "{tool} {profile:?}"
+            );
             if status_hooks {
                 assert_aoe_codex_hooks(&hooks);
             } else {

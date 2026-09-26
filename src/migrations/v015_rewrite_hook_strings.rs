@@ -203,6 +203,7 @@ mod tests {
                             canonical_set.push(hook_command_session_id(
                                 HookInstallTarget::Host,
                                 crate::agents::HookIdentityField::SessionId,
+                                crate::agents::get_agent("claude").map(|agent| agent.binary),
                             ));
                         }
                         if let Some(status) = event_def.status {
