@@ -275,16 +275,33 @@ impl PluginHost {
     }
 
     async fn teardown_workers(&self, workers: Vec<(String, RunningWorker)>) {
-        futures_util::future::join_all(workers.into_iter().map(|(plugin_id, w)| async move {
-            w.task.abort();
-            let _ = w.task.await;
-            if let Some(generation) = w.ui_generation {
-                self.api.clear_ui(&plugin_id, generation);
+        let session_service = self
+            .session_rpc
+            .as_ref()
+            .map(|deps| deps.session_service.clone());
+        futures_util::future::join_all(workers.into_iter().map(|(plugin_id, w)| {
+            let session_service = session_service.clone();
+            async move {
+                w.task.abort();
+                let _ = w.task.await;
+                if let Some(generation) = w.ui_generation {
+                    self.api.clear_ui(&plugin_id, generation);
+                }
+                if w.pid != 0 {
+                    worker::reap_group_escalating(w.pid, REAP_GRACE).await;
+                }
+                // The worker is gone, so no session it was reviving will ever report a real
+                // status again; apply_status_intent has nothing left to clear this on.
+                if let Some(session_service) = session_service {
+                    let mut instances = session_service.instances.write().await;
+                    for inst in instances.iter_mut() {
+                        if inst.created_by_plugin.as_deref() == Some(plugin_id.as_str()) {
+                            inst.plugin_revival_pending = false;
+                        }
+                    }
+                }
+                tracing::debug!(target: "plugin.host", plugin = %plugin_id, "stopped plugin worker");
             }
-            if w.pid != 0 {
-                worker::reap_group_escalating(w.pid, REAP_GRACE).await;
-            }
-            tracing::debug!(target: "plugin.host", plugin = %plugin_id, "stopped plugin worker");
         }))
         .await;
     }

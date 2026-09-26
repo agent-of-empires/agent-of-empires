@@ -102,24 +102,22 @@ impl AutomationPolicy {
         plugin_id: &str,
         active_sessions: usize,
     ) -> Result<CreateReservation, DispatchError> {
-        {
-            let mut reservations = self
-                .reservations
-                .lock()
-                .expect("reservations mutex poisoned");
-            let outstanding = reservations.get(plugin_id).copied().unwrap_or(0);
-            if active_sessions + outstanding >= MAX_ACTIVE_PLUGIN_SESSIONS {
-                return Err(DispatchError::with_kind(
-                    codes::RATE_LIMITED,
-                    "concurrency_limited",
-                    format!(
-                        "plugin {plugin_id} already has {} active or pending sessions (limit {MAX_ACTIVE_PLUGIN_SESSIONS})",
-                        active_sessions + outstanding
-                    ),
-                ));
-            }
-            *reservations.entry(plugin_id.to_string()).or_insert(0) += 1;
+        let mut reservations = self
+            .reservations
+            .lock()
+            .expect("reservations mutex poisoned");
+        let outstanding = reservations.get(plugin_id).copied().unwrap_or(0);
+        if active_sessions + outstanding >= MAX_ACTIVE_PLUGIN_SESSIONS {
+            return Err(DispatchError::with_kind(
+                codes::RATE_LIMITED,
+                "concurrency_limited",
+                format!(
+                    "plugin {plugin_id} already has {} active or pending sessions (limit {MAX_ACTIVE_PLUGIN_SESSIONS})",
+                    active_sessions + outstanding
+                ),
+            ));
         }
+        *reservations.entry(plugin_id.to_string()).or_insert(0) += 1;
         let reservation = CreateReservation {
             policy: std::sync::Arc::clone(self),
             plugin_id: plugin_id.to_string(),

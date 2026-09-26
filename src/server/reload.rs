@@ -67,6 +67,7 @@ pub(super) fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Inst
         fresh.last_error = prior.last_error;
     }
     fresh.acp_load_session_capable = prior.acp_load_session_capable;
+    fresh.plugin_revival_pending = prior.plugin_revival_pending;
     fresh
 }
 
@@ -736,6 +737,20 @@ mod tests {
         prior.acp_load_session_capable = Some(true);
         let merged = merge_runtime_fields(prior, Instance::new("seed", "/tmp/seed"));
         assert_eq!(merged.acp_load_session_capable, Some(true));
+    }
+
+    /// `plugin_revival_pending` is `#[serde(skip)]`, so every 2s status-poll tick's fresh
+    /// disk load defaults it to `false`; without carrying it here, a revival slower than one
+    /// tick would silently stop counting toward its plugin's concurrency cap.
+    #[test]
+    fn merge_runtime_fields_preserves_plugin_revival_pending() {
+        let mut prior = Instance::new("seed", "/tmp/seed");
+        prior.plugin_revival_pending = true;
+
+        let fresh = Instance::new("seed", "/tmp/seed");
+        let merged = merge_runtime_fields(prior, fresh);
+
+        assert!(merged.plugin_revival_pending);
     }
 
     #[tokio::test]

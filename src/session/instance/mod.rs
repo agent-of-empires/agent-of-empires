@@ -216,6 +216,13 @@ pub struct Instance {
     pub created_by_plugin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_create_idempotency: Option<PluginCreateIdempotency>,
+    /// Set by a plugin's `sessions.turn.send` right before waking a resting session, under the
+    /// same `instances` write lock that decides to revive it, so the plugin active-session cap
+    /// treats it as occupying a slot immediately rather than waiting for a status to land.
+    /// Cleared by the next real status transition this session gets, whatever it turns out to
+    /// be (`Running`, `Error`, ...); never persisted.
+    #[serde(skip)]
+    pub(crate) plugin_revival_pending: bool,
 
     /// A turn persisted with the session and not yet delivered to the agent:
     /// either the initial prompt from session create (#2897), or a
