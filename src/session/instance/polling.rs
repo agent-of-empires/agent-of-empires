@@ -1211,7 +1211,7 @@ mod tests {
                     agent: "gemini".into(),
                     stores: vec![store.to_path_buf()],
                     configuration: Vec::new(),
-                    exported_default_store: false,
+                    exported_default_store: None,
                     cwd: "/workspace".into(),
                     cwd_filesystem: "host".into(),
                     filesystem: "host".into(),
