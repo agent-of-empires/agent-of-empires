@@ -1961,6 +1961,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn cleanup_tears_down_id_keyed_resources_when_ownership_is_unknown() {
+        crate::tmux::test_helpers::require_tmux!();
         use std::os::unix::fs::PermissionsExt as _;
         let _app_guard = crate::session::test_support::isolate_app_dir();
         let temp = tempfile::TempDir::new().unwrap();
@@ -1997,6 +1998,26 @@ mod tests {
             before_start_env: Vec::new(),
         });
 
+        // The agent session is keyed on the same id, so it belongs to the
+        // id-keyed teardown that runs before the ownership verdict.
+        let tmux_session = crate::tmux::Session::generate_name(&id, "Unknown");
+        let tmux_guard =
+            crate::tmux::test_helpers::TmuxTestSession::from_name(tmux_session.clone());
+        let output = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &tmux_session, "sleep 60"])
+            .output()
+            .expect("tmux new-session");
+        assert!(
+            output.status.success(),
+            "failed to create tmux session {tmux_session}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        crate::tmux::refresh_session_cache();
+        assert!(
+            crate::tmux::Session::from_name(&tmux_session).exists(),
+            "the failed create's tmux session must exist before cleanup"
+        );
+
         // A failed profile listing is the cheapest way to force the ownership
         // scan to answer `Unknown`.
         let _fail_listing = crate::session::FailNextListProfilesGuard::new();
@@ -2009,9 +2030,15 @@ mod tests {
              unknown; runtime invocations were {invocations:?}"
         );
         assert!(
+            !crate::tmux::Session::from_name(&tmux_session).exists(),
+            "the failed create's tmux session must be torn down even when path ownership \
+             is unknown"
+        );
+        assert!(
             scratch_path.exists(),
             "an unknown ownership verdict must still leave the candidate paths in place"
         );
+        drop(tmux_guard);
     }
 
     #[test]

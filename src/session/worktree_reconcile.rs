@@ -105,8 +105,10 @@ pub fn reconcile_and_persist(
             let id = inst.id.clone();
             let stale = inst.project_path.clone();
             let new_path = found.to_string_lossy().into_owned();
-            // Both guards below need the storage lock the git lookup ran
-            // without, so they live inside the update rather than beside it.
+            // The git lookup above ran without the storage lock, so the path can go
+            // stale before the update below claims it. The ownership scan therefore
+            // runs here, outside the update, and the update's own compare-and-set is
+            // what makes the adoption safe.
             let mut claimed_by: Option<String> = None;
             if let Err(error) =
                 crate::session::deletion::ensure_unclaimed_paths(&id, std::slice::from_ref(found))

@@ -956,21 +956,12 @@ impl Storage {
 
     /// Read all rows for a destructive ownership check without lossy quarantine.
     pub(crate) fn load_strict_for_worktree_ownership_locked(&self) -> Result<Vec<Instance>> {
-        let quarantine_path = self.sessions_path.with_file_name("sessions.corrupt.jsonl");
-        match fs::metadata(&quarantine_path) {
-            Ok(metadata) if metadata.len() > 0 => {
-                anyhow::bail!(
-                    "session ownership inventory is quarantined at {}",
-                    quarantine_path.display()
-                );
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("checking {}", quarantine_path.display()));
-            }
-        }
+        // `sessions.corrupt.jsonl` is a write-only forensic sidecar: nothing ever reads it
+        // back, and no path truncates it, so its mere presence says nothing about the
+        // current inventory. The fail-closed guarantee lives in the row-by-row parse and
+        // duplicate-id check below: while the corrupt row is still in `sessions.json` the
+        // bail comes from that row, and once a later write dropped it the sidecar is stale
+        // and bailing on it would be a false positive.
         if !self.sessions_path.exists() {
             return Ok(Vec::new());
         }
@@ -3041,6 +3032,54 @@ mod tests {
                 assert_eq!(mode(quarantine), 0o600);
             }
         }
+        Ok(())
+    }
+
+    /// A non-empty quarantine sidecar is a write-only forensic artifact, never an
+    /// input: once a later write dropped the corrupt row from `sessions.json`, the
+    /// inventory on disk is fully readable and must be usable for a destructive
+    /// ownership check.
+    #[test]
+    #[serial]
+    fn ownership_inventory_ignores_a_stale_quarantine_sidecar() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("test-profile")?;
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        let sessions = serde_json::json!([
+            Instance::new("alpha", "/tmp/alpha"),
+            Instance::new("beta", "/tmp/beta"),
+        ]);
+        fs::write(&storage.sessions_path, serde_json::to_vec(&sessions)?)?;
+        fs::write(
+            storage
+                .sessions_path
+                .with_file_name("sessions.corrupt.jsonl"),
+            "{\"title\":\"long-gone\"}\n",
+        )?;
+
+        let inventory = storage.load_strict_for_worktree_ownership_locked()?;
+        let titles: Vec<_> = inventory.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(titles, ["alpha", "beta"]);
+        Ok(())
+    }
+
+    /// The fail-closed guarantee the sidecar check used to imply still holds where it
+    /// counts: a row still sitting in `sessions.json` that will not deserialize.
+    #[test]
+    #[serial]
+    fn ownership_inventory_still_refuses_a_corrupt_row_in_sessions_json() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let storage = Storage::new_unwatched("test-profile")?;
+        fs::create_dir_all(storage.sessions_path.parent().unwrap())?;
+        let sessions = serde_json::json!([
+            Instance::new("alpha", "/tmp/alpha"),
+            { "title": "corrupt-no-id" },
+        ]);
+        fs::write(&storage.sessions_path, serde_json::to_vec(&sessions)?)?;
+
+        assert!(storage.load_strict_for_worktree_ownership_locked().is_err());
         Ok(())
     }
 

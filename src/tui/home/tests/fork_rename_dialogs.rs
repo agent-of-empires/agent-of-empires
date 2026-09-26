@@ -985,9 +985,12 @@ fn creation_result_does_not_carry_the_ownership_flocks() {
     );
 
     // Probe from another thread while the result is still held, exactly as
-    // `apply_creation_results` holds it.
+    // `apply_creation_results` holds it. The probe blocks on the flock, so the
+    // handle is kept and joined once the assertion has passed; on the failing
+    // path the thread is still parked in the flock wait and must be left
+    // detached rather than joined, or the test would hang instead of fail.
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    let probe = std::thread::spawn(move || {
         let acquired = crate::session::acquire_session_workspace_claim_lock()
             .and_then(|claim| {
                 crate::session::acquire_session_identity_lock().map(|identity| (claim, identity))
@@ -1000,6 +1003,9 @@ fn creation_result_does_not_carry_the_ownership_flocks() {
             .unwrap_or(false),
         "a delivered creation result must not hold the workspace-claim or identity flock"
     );
+    if probe.is_finished() {
+        probe.join().unwrap();
+    }
 }
 
 #[test]

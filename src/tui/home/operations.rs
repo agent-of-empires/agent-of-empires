@@ -268,7 +268,7 @@ impl HomeView {
         let _workspace_claim_lock = match acquire_session_workspace_claim_lock() {
             Ok(lock) => lock,
             Err(error) => {
-                builder::cleanup_instance(
+                builder::cleanup_instance_locked(
                     &instance,
                     created_worktree.as_ref(),
                     &created_workspace_worktrees,
@@ -280,7 +280,10 @@ impl HomeView {
         let _identity_lock = match acquire_session_identity_lock() {
             Ok(lock) => lock,
             Err(error) => {
-                builder::cleanup_instance(
+                // Only the workspace-claim flock is held; release it so the
+                // cleanup path can take the pair itself.
+                drop(_workspace_claim_lock);
+                builder::cleanup_instance_locked(
                     &instance,
                     created_worktree.as_ref(),
                     &created_workspace_worktrees,
@@ -345,6 +348,12 @@ impl HomeView {
             }
         }
         self.save_with_storage()?;
+        // `reload()` reconciles cross-profile duplicates, and a journal-driven repair
+        // re-acquires the identity flock. Releasing both here keeps the publication
+        // path inside one lock window, the same way `apply_creation_results` does
+        // for a delivered creation result.
+        drop(_workspace_claim_lock);
+        drop(_identity_lock);
 
         self.reload()?;
         // reload()'s selection fallback lands on the nearest index, often the new
@@ -543,6 +552,10 @@ impl HomeView {
                     carry.retarget(conversation_carry::conversation_ids(moved));
                 }
             }
+            // `reload()` reconciles cross-profile duplicates, and a journal-driven
+            // repair re-acquires the identity flock; the title and lifecycle flocks
+            // below are not needed for the reload itself, so they stay held.
+            drop(profile_move_identity);
             self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
         } else {
             // Outside Attention sort, restart on a snoozed row clears the
@@ -587,8 +600,8 @@ impl HomeView {
         // publishing that status here would make it reject its own request.
         self.save_with_storage()?;
         // The canonical profile locks are already released; publish the final launch
-        // edit while identity, title and lifecycle are still guarded.
-        drop(profile_move_identity);
+        // edit while the session's title and lifecycle flocks are still guarded. The
+        // identity flock went out with the profile-move reload above.
         drop(profile_move_guards);
 
         // The cascade shells out to docker and runs the before_start hook, so it stays
@@ -1153,9 +1166,12 @@ impl HomeView {
                     },
                 )?;
             }
-            self.reload_preserving_profile_move_runtime(&affected_ids)?;
+            // `reload()` reconciles cross-profile duplicates, and a journal-driven
+            // repair re-acquires the identity, title and lifecycle flocks these guards
+            // hold. The transaction above is already committed, so release them first.
             drop(identity_guard);
             drop(mutation_guards);
+            self.reload_preserving_profile_move_runtime(&affected_ids)?;
             return Ok(());
         }
 
@@ -1689,8 +1705,11 @@ impl HomeView {
                         Ok(())
                     },
                 )?;
-                self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
+                // `reload()` reconciles cross-profile duplicates, and a journal-driven
+                // repair re-acquires the identity flock this guard holds. The tmux
+                // rekey below is a tmux-side operation, so it does not need it.
                 drop(_identity_lock);
+                self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
                 let tmux_warning = rekey_tmux_after_persist(&id, &current_title, &effective_title);
                 drop(_mutation_guards);
                 if let Some(warning) = tmux_warning {

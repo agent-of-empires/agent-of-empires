@@ -454,12 +454,13 @@ pub async fn acp_disable(
             .into_response();
     }
     // The tmux pane reprints a kept conversation, so the ACP projection goes.
+    // The view switch is committed and the runner is proven dead, so a failed event
+    // deletion must not strand the session in a wedged state. Drop the ACP projection
+    // best-effort and always forget the session and restart its tmux pane; the
+    // residual transcript is swept later, the same way the purge path treats a
+    // post-commit sidecar failure.
     if let Err(error) = state.acp_event_store.delete_session(&id) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to delete ACP events: {error}"),
-        )
-            .into_response();
+        tracing::warn!(target: "acp.switch", session = %id, "ACP event deletion failed after the view switch: {error}");
     }
     state.acp_supervisor.forget_session(&id);
 
