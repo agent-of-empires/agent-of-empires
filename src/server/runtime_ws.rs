@@ -10,7 +10,7 @@
 //! frames are also served over the daemon's own UNIX socket, where the peer is
 //! the same uid the daemon runs as, so that transport declares the local owner.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio::net::UnixStream;
 
@@ -159,7 +159,7 @@ async fn run_read(
     let runtime = &RUNTIME;
     // Single-flight: a second connection waits for the in-flight sample instead of
     // publishing a second revision, so one sample is one revision and one cursor step.
-    let _flight = runtime.flight.lock().await;
+    let flight = runtime.flight.lock().await;
 
     let instances: Vec<Instance> = state.instances.read().await.clone();
     let active_profile = state.profile.clone();
@@ -167,6 +167,10 @@ async fn run_read(
         build_snapshot(runtime, &active_profile, &instances, owner)
     })
     .await;
+
+    // The sample is the only work the flight serializes. A reader that stalls
+    // mid-write must not keep the next one from sampling.
+    drop(flight);
 
     let snapshot = match sampled {
         Ok(snapshot) => snapshot,
@@ -377,6 +381,7 @@ fn build_snapshot(
 
     sessions.retain(|row| names.contains(&row.profile));
     sessions.sort_by(|left, right| left.id.cmp(&right.id));
+    reconcile_legacy_rows(&mut sessions);
     for row in &mut sessions {
         row.cleanup_defaults = disk[&row.profile].cleanup;
     }
@@ -452,6 +457,93 @@ fn build_snapshot(
             status_freshness: freshness,
         },
     }
+}
+
+/// Reconcile the stored rows against the rules a read projects under, field by
+/// field, so one legacy row cannot make the client refuse a whole snapshot.
+///
+/// A parent is kept only when it names a row of the same profile and the
+/// relation it forms is acyclic; otherwise the child nests at the top level,
+/// which is what the local `aoe list` shows for a parent it cannot resolve. A
+/// project path is spelled the way the store itself compares paths, trailing
+/// separators aside. Every other field is projected as stored, so the client's
+/// validation stays fail-closed rather than learning to tolerate more.
+fn reconcile_legacy_rows(sessions: &mut [SessionRead]) {
+    for row in sessions.iter_mut() {
+        row.project_path = comparable_project_path(&row.project_path);
+    }
+    let index: HashMap<&str, usize> = sessions
+        .iter()
+        .enumerate()
+        .map(|(position, row)| (row.id.as_str(), position))
+        .collect();
+    let mut parents: HashMap<usize, &str> = sessions
+        .iter()
+        .enumerate()
+        .filter_map(|(position, row)| {
+            row.parent_session_id
+                .as_deref()
+                .map(|parent| (position, parent))
+        })
+        .collect();
+    let severed = cycle_entries(&index, &mut parents);
+    let resolved: Vec<bool> = sessions
+        .iter()
+        .enumerate()
+        .map(|(position, row)| {
+            !severed.contains(&position)
+                && parents.get(&position).is_some_and(|parent| {
+                    index
+                        .get(parent)
+                        .is_some_and(|parent| sessions[*parent].profile == row.profile)
+                })
+        })
+        .collect();
+    for (row, resolved) in sessions.iter_mut().zip(resolved) {
+        if !resolved {
+            row.parent_session_id = None;
+        }
+    }
+}
+
+/// The trailing-separator-free spelling the store compares project paths by
+/// (`Storage` treats `/repo` and `/repo/` as one project).
+fn comparable_project_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// The row at which each parent cycle closes. The relation gives every row at
+/// most one parent, so a walk from any row that enters a cycle meets that
+/// cycle's entry again, and severing that one edge breaks the cycle while every
+/// tail below it stays nested. Walks start in row order, and rows are already
+/// sorted by id, so the entry chosen for a cycle is the same on every run.
+fn cycle_entries(
+    index: &HashMap<&str, usize>,
+    parents: &mut HashMap<usize, &str>,
+) -> HashSet<usize> {
+    let mut entries = HashSet::new();
+    for start in parents.keys().copied().collect::<BTreeSet<_>>() {
+        let mut walked = HashSet::new();
+        let mut cursor = Some(start);
+        while let Some(row) = cursor {
+            if !walked.insert(row) {
+                // Severed as it is found, so the next walk down the same cycle
+                // sees the break rather than reporting the cycle again.
+                entries.insert(row);
+                parents.remove(&row);
+                break;
+            }
+            cursor = parents
+                .get(&row)
+                .and_then(|parent| index.get(parent).copied());
+        }
+    }
+    entries
 }
 
 fn component(healthy: bool, code: HealthCode) -> ComponentHealth {
@@ -1060,6 +1152,85 @@ mod tests {
         assert_eq!(projects[0].path, "/repo");
         assert_eq!(projects[0].name, "repo");
         assert_eq!(projects[0].scope, ProjectScope::Profile);
+    }
+
+    /// `Instance::new` mints its own id, so a fixture row sets the one the test
+    /// reads back.
+    fn named(id: &str, profile: &str) -> Instance {
+        let mut inst = instance(id, profile);
+        inst.id = id.to_string();
+        inst
+    }
+
+    fn row(id: &str, parent: Option<&str>, path: &str) -> SessionRead {
+        let mut row = SessionRead::from_instance(&named(id, "main"));
+        row.parent_session_id = parent.map(str::to_string);
+        row.project_path = path.to_string();
+        row
+    }
+
+    /// One stored row the read cannot project must not cost every other row its
+    /// read: an orphan parent nests at the top level and a legacy trailing
+    /// separator is spelled the way the store compares paths, and the client
+    /// then accepts the snapshot unchanged.
+    #[test]
+    #[serial_test::serial]
+    fn a_legacy_row_is_reconciled_and_the_client_still_accepts_the_snapshot() {
+        let _home = TempHome::new();
+        let mut orphan = named("orphan", "main");
+        orphan.parent_session_id = Some("deleted".into());
+        let mut trailing = named("trailing", "main");
+        trailing.project_path = "/repo/".into();
+        let instances = vec![named("a", "main"), orphan, trailing];
+
+        let sampled = build_snapshot(&RuntimeState::new(), "main", &instances, Owner::remote());
+
+        let snapshot =
+            parse_snapshot(&snapshot_frame(&sampled)).expect("client accepts the Snapshot");
+        validate_snapshot(&snapshot).expect("the reconciled snapshot is projectable");
+        let reconciled: Vec<(&str, Option<&str>, &str)> = snapshot
+            .sessions
+            .iter()
+            .map(|row| {
+                (
+                    row.id.as_str(),
+                    row.parent_session_id.as_deref(),
+                    row.project_path.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            reconciled,
+            vec![
+                ("a", None, "/repo"),
+                ("orphan", None, "/repo"),
+                ("trailing", None, "/repo"),
+            ]
+        );
+    }
+
+    /// A parent that names a row of another profile, and a cycle, are the two
+    /// relations the client refuses. Both are severed at the row that closes
+    /// them, and both choices are the same on every run.
+    #[test]
+    fn cross_profile_parents_and_cycles_are_severed_at_the_closing_row() {
+        let mut cross = row("a", Some("b"), "/repo");
+        cross.profile = "other".into();
+        let mut cycle = vec![row("x", Some("y"), "/repo"), row("y", Some("x"), "/repo")];
+        cycle.push(row("z", Some("x"), "/repo"));
+        let mut rows = vec![cross];
+        rows.append(&mut cycle);
+
+        reconcile_legacy_rows(&mut rows);
+
+        let parents: Vec<(&str, Option<&str>)> = rows
+            .iter()
+            .map(|row| (row.id.as_str(), row.parent_session_id.as_deref()))
+            .collect();
+        assert_eq!(
+            parents,
+            vec![("a", None), ("x", None), ("y", Some("x")), ("z", Some("x"))]
+        );
     }
 
     #[test]
